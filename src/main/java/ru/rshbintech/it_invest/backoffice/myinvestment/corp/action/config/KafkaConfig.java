@@ -37,20 +37,22 @@ public class KafkaConfig {
     @Bean
     public ConsumerFactory<String, CorporateActionNotificationDto> internalNotificationConsumerFactory() {
         JsonDeserializer<CorporateActionNotificationDto> deserializer = new JsonDeserializer<>(CorporateActionNotificationDto.class, objectMapper);
-        deserializer.addTrustedPackages("*");
+        deserializer.addTrustedPackages("ru.rshbintech.it_invest.backoffice.myinvestment.corp.action.dto");
         return createConsumerFactory(kafkaProperties.getInternalNotification().getConsumer(), new StringDeserializer(), deserializer);
     }
 
     @Bean
     public ConsumerFactory<String, CorporateActionNotificationDto> internalNotificationOwnerBalanceConsumerFactory() {
         JsonDeserializer<CorporateActionNotificationDto> deserializer = new JsonDeserializer<>(CorporateActionNotificationDto.class, objectMapper);
-        deserializer.addTrustedPackages("*");
+        deserializer.addTrustedPackages("ru.rshbintech.it_invest.backoffice.myinvestment.corp.action.dto");
         return createConsumerFactory(kafkaProperties.getInternalNotificationOwnerBalance().getConsumer(), new StringDeserializer(), deserializer);
     }
 
     @Bean
     public ConsumerFactory<String, CorporateActionInstructionRequest> internalInstructionConsumerFactory() {
-        return createConsumerFactory(kafkaProperties.getInternalInstruction().getConsumer());
+        JsonDeserializer<CorporateActionInstructionRequest> deserializer = new JsonDeserializer<>(CorporateActionInstructionRequest.class, objectMapper);
+        deserializer.addTrustedPackages("ru.rshbintech.it_invest.backoffice.myinvestment.corp.action.dto");
+        return createConsumerFactory(kafkaProperties.getInternalInstruction().getConsumer(), new StringDeserializer(), deserializer);
     }
 
     private <T>ConsumerFactory<String, T> createConsumerFactory(CustomKafkaProperties.Consumer consumerProps) {

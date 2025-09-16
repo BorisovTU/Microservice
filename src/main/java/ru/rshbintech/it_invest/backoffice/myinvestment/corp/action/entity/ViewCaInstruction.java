@@ -11,7 +11,7 @@ import java.util.UUID;
 @Entity
 @Table(name = "view_ca_instruction")
 @Data
-public class ViewInstruction {
+public class ViewCaInstruction {
     @Id
     @GeneratedValue(strategy = GenerationType.AUTO)
     private UUID id;

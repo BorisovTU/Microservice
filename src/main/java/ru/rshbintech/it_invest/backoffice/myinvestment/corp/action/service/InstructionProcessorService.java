@@ -1,28 +1,35 @@
 package ru.rshbintech.it_invest.backoffice.myinvestment.corp.action.service;
 
+import com.fasterxml.jackson.core.JsonProcessingException;
 import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.kafka.core.KafkaTemplate;
 import org.springframework.stereotype.Service;
+import ru.rshbintech.it_invest.backoffice.myinvestment.corp.action.dao.CorporateActionInstructionDao;
 import ru.rshbintech.it_invest.backoffice.myinvestment.corp.action.dto.CorporateActionInstruction;
 import ru.rshbintech.it_invest.backoffice.myinvestment.corp.action.dto.CorporateActionInstructionRequest;
 import ru.rshbintech.it_invest.backoffice.myinvestment.corp.action.dto.CorporateActionNotification;
-import ru.rshbintech.it_invest.backoffice.myinvestment.corp.action.exception.FlkException;
+import ru.rshbintech.it_invest.backoffice.myinvestment.corp.action.mapper.InstructionMapper;
+import ru.rshbintech.it_invest.backoffice.myinvestment.corp.action.property.CustomKafkaProperties;
 
+@Slf4j
 @Service
 @RequiredArgsConstructor
 public class InstructionProcessorService {
     private final KafkaTemplate<String, CorporateActionInstruction> instructionToDiasoftKafkaTemplate;
     private final CorporateActionInstructionAdapter corporateActionInstructionAdapter;
-
+    private final CustomKafkaProperties customKafkaProperties;
+    private final InstructionMapper instructionMapper;
+    private final CorporateActionInstructionDao corporateActionInstructionDao;
     public void processInstruction(CorporateActionInstructionRequest instructionRequest) {
         String ownerSecurityID = instructionRequest.getBnfclOwnrDtls().getOwnerSecurityID();
         CorporateActionNotification corporateActionNotification = corporateActionInstructionAdapter.getCorporateActionNotification(Long.parseLong(ownerSecurityID));
-        String optnNb = instructionRequest.getCorpActnOptnDtls().getOptnNb();
-        CorporateActionNotification.CorpActnOptnDtls corpActnOptnDtls = corporateActionNotification.getCorpActnOptnDtls().stream()
-                .filter(dtls -> optnNb.equals(dtls.getOptnNb())).findFirst().orElseThrow(()-> new FlkException("corpActnOptnDtls_NOT_AVAILABLE","Опция не найдена " + optnNb));
-        CorporateActionNotification.BnfclOwnrDtls ownerSecurityIdNotAvailable = corporateActionNotification.getBnfclOwnrDtls().stream().filter(bnfclOwnrDtls -> bnfclOwnrDtls.getOwnerSecurityID().equals(ownerSecurityID))
-                .findFirst()
-                .orElseThrow(() -> new FlkException("OwnerSecurityId_NOT_AVAILABLE", "Owner Security Id не  найден " + ownerSecurityID));
-
+        CorporateActionInstruction corporateActionInstruction = instructionMapper.map(instructionRequest, corporateActionNotification);
+        try {
+            corporateActionInstructionDao.saveInstruction(corporateActionInstruction);
+        } catch (JsonProcessingException e) {
+            log.error("Error saving instruction", e);
+        }
+        instructionToDiasoftKafkaTemplate.send(customKafkaProperties.getInstructionToDiasoft().getTopic(), corporateActionInstruction);
     }
 }
