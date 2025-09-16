@@ -1,0 +1,9 @@
+package ru.rshbintech.it_invest.backoffice.myinvestment.corp.action.constant;
+
+public class BeanConstants {
+    public static final String NOTIFICATION_FROM_DIASOFT_CONSUMER_FACTORY = "NOTIFICATION_FROM_DIASOFT_CONSUMER_FACTORY";
+    public static final String INTERNAL_NOTIFICATION_FACTORY = "INTERNAL_NOTIFICATION_FACTORY";
+    public static final String INTERNAL_NOTIFICATION_OWNER_BALANCE = "INTERNAL_NOTIFICATION_OWNER_SECURITY_FACTORY";
+
+    public static final String INTERNAL_INSTRUCTION_CONSUMER_FACTORY = "INTERNAL_INSTRUCTION_CONSUMER_FACTORY";
+}

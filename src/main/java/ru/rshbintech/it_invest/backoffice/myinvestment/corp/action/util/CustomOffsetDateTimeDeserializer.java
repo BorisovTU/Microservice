@@ -1,9 +1,8 @@
 package ru.rshbintech.it_invest.backoffice.myinvestment.corp.action.util;
 
-import jakarta.validation.ValidationException;
-import lombok.experimental.UtilityClass;
-import lombok.extern.slf4j.Slf4j;
-import org.springframework.util.StringUtils;
+import com.fasterxml.jackson.core.JsonParser;
+import com.fasterxml.jackson.databind.DeserializationContext;
+import com.fasterxml.jackson.databind.JsonDeserializer;
 
 import java.io.IOException;
 import java.time.LocalDate;
@@ -13,46 +12,21 @@ import java.time.ZoneOffset;
 import java.time.format.DateTimeFormatter;
 import java.time.format.DateTimeParseException;
 
-@UtilityClass
-@Slf4j
-public final class ParseUtil {
+public class CustomOffsetDateTimeDeserializer extends JsonDeserializer<OffsetDateTime> {
+
     private static final DateTimeFormatter[] FORMATTERS = {
             DateTimeFormatter.ISO_OFFSET_DATE_TIME,
             DateTimeFormatter.ISO_LOCAL_DATE_TIME,
             DateTimeFormatter.ISO_LOCAL_DATE
     };
 
-    public static String toString(Object val) {
-        if (val != null) {
-            return val.toString();
+    @Override
+    public OffsetDateTime deserialize(JsonParser p, DeserializationContext ctxt) throws IOException {
+        String value = p.getValueAsString();
+        if (value == null || value.trim().isEmpty()) {
+            return null;
         }
-        return null;
-    }
 
-    public static Long parseLong(String payload, String message) {
-        if (StringUtils.hasText(payload)) {
-            try {
-                return Long.parseLong(payload);
-            } catch (NumberFormatException e) {
-                log.error(message, payload);
-            }
-        }
-        return null;
-    }
-
-    public static LocalDate parseLocalDate(String payload, String message) {
-        if (StringUtils.hasText(payload)) {
-            try {
-                return LocalDate.parse(payload);
-            } catch (Exception e) {
-                log.error(message, payload);
-            }
-        }
-        return null;
-    }
-
-
-    public static OffsetDateTime parseOffsetDateTime(String value, String message) throws IOException {
         for (DateTimeFormatter formatter : FORMATTERS) {
             try {
                 if (formatter == DateTimeFormatter.ISO_LOCAL_DATE) {
@@ -65,7 +39,7 @@ public final class ParseUtil {
                     return OffsetDateTime.parse(value, formatter);
                 }
             } catch (DateTimeParseException ignored) {
-                log.error(message, value);
+                ignored.printStackTrace();
             }
         }
 
