@@ -5,6 +5,6 @@ import java.util.List;
 
 @Data
 public class CorporateActionResponse {
-    private List<CorporateActionNotificationDto> data;
+    private List<CorporateActionNotification> data;
     private String nextId;
 }

@@ -1,13 +1,17 @@
 package ru.rshbintech.it_invest.backoffice.myinvestment.corp.action.controller;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
+import io.swagger.v3.oas.annotations.Operation;
+import io.swagger.v3.oas.annotations.media.Content;
+import io.swagger.v3.oas.annotations.media.Schema;
+import io.swagger.v3.oas.annotations.responses.ApiResponse;
+import io.swagger.v3.oas.annotations.responses.ApiResponses;
 import jakarta.validation.Valid;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
-import ru.rshbintech.it_invest.backoffice.myinvestment.corp.action.dto.CorporateActionInstruction;
-import ru.rshbintech.it_invest.backoffice.myinvestment.corp.action.dto.CorporateActionInstructionRequest;
+import ru.rshbintech.it_invest.backoffice.myinvestment.corp.action.dto.*;
 import ru.rshbintech.it_invest.backoffice.myinvestment.corp.action.service.CorporateActionInstructionAdapter;
 import ru.rshbintech.it_invest.backoffice.myinvestment.corp.action.service.InstructionViewService;
 
@@ -22,6 +26,14 @@ public class CorporateActionInstructionController {
 
     private final CorporateActionInstructionAdapter instructionService;
 
+    @Operation(summary = "Добавление инструкции")
+    @ApiResponses(value = {
+            @ApiResponse(responseCode = "201", description = "Успешно добавлена"),
+            @ApiResponse(responseCode = "400", description = "Ошибка валидации",
+                    content = @Content(schema = @Schema(implementation = ValidationErrorResponseDto.class))),
+            @ApiResponse(responseCode = "500", description = "Внутренняя ошибка сервера",
+                    content = @Content(schema = @Schema(implementation = ErrorResponseDto.class)))
+    })
     @PostMapping("/instructions")
     public ResponseEntity<?> postCorporateActionInstruction(
             @Valid @RequestBody CorporateActionInstructionRequest instructionRequest) throws JsonProcessingException {
@@ -33,6 +45,15 @@ public class CorporateActionInstructionController {
 
     private final InstructionViewService instructionViewService;
 
+    @Operation(summary = "Получение инструкции")
+    @ApiResponses(value = {
+            @ApiResponse(responseCode = "200", description = "Успешная обработка",
+                    content = @Content(schema = @Schema(implementation = CorporateActionInstruction.class))),
+            @ApiResponse(responseCode = "400", description = "Ошибка валидации",
+                    content = @Content(schema = @Schema(implementation = ValidationErrorResponseDto.class))),
+            @ApiResponse(responseCode = "500", description = "Внутренняя ошибка сервера",
+                    content = @Content(schema = @Schema(implementation = ErrorResponseDto.class)))
+    })
     @GetMapping("/instructions/{instrNmb}")
     public ResponseEntity<CorporateActionInstruction> getCorporateActionInstruction(
             @PathVariable("instrNmb") String instrNmb) {
@@ -44,6 +65,15 @@ public class CorporateActionInstructionController {
                 .orElseGet(() -> ResponseEntity.notFound().build());
     }
 
+    @Operation(summary = "Получение инструкций")
+    @ApiResponses(value = {
+            @ApiResponse(responseCode = "200", description = "Успешная обработка",
+                    content = @Content(schema = @Schema(implementation = CorporateActionInstruction.class))),
+            @ApiResponse(responseCode = "400", description = "Ошибка валидации",
+                    content = @Content(schema = @Schema(implementation = ValidationErrorResponseDto.class))),
+            @ApiResponse(responseCode = "500", description = "Внутренняя ошибка сервера",
+                    content = @Content(schema = @Schema(implementation = ErrorResponseDto.class)))
+    })
     @GetMapping("/instructions")
     public ResponseEntity<?> getCorporateActionInstructions(
             @RequestParam(value = "cftid", required = false) String cftid,

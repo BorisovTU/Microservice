@@ -13,24 +13,20 @@ import java.util.Optional;
 public class CorporateActionNotificationDao {
     private final ViewCANotificationRepository viewCanotificationRepository;
 
-    public String getByCaIdAndCftId(String corporateActionIssuerId, String cftid) {
-        return getByCaIdAndCftId(Long.parseLong(corporateActionIssuerId), Long.parseLong(cftid));
-    }
-
     public String getByCaIdAndCftId(Long corporateActionIssuerId, Long cftid) {
         Optional<ViewCANotification> optional =
                 viewCanotificationRepository.getFirstByCaidAndCftidOrderByCreateDateTimeDesc(corporateActionIssuerId, cftid);
         return optional.map(ViewCANotification::getPayload).orElse(null);
     }
 
-    public List<ViewCANotification> findAllBy(String cftid, Boolean active, int limit, String sort, String from) {
+    public List<ViewCANotification> findAllBy(Long cftid, Boolean active, int limit, String sort, String from) {
         Long fromLong = null;
         if (from != null && !from.trim().isEmpty()) {
             fromLong = Long.valueOf(from);
         }
 
         return viewCanotificationRepository.findAllByCftidWithFilters(
-                Long.parseLong(cftid),
+                cftid,
                 active,
                 fromLong,
                 limit
