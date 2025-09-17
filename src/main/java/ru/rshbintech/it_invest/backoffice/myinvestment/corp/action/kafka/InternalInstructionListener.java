@@ -8,13 +8,8 @@ import org.springframework.stereotype.Component;
 import org.springframework.transaction.annotation.Transactional;
 import ru.rshbintech.it_invest.backoffice.myinvestment.corp.action.constant.BeanConstants;
 import ru.rshbintech.it_invest.backoffice.myinvestment.corp.action.dto.CorporateActionInstructionRequest;
-import ru.rshbintech.it_invest.backoffice.myinvestment.corp.action.dto.CorporateActionNotificationDto;
-import ru.rshbintech.it_invest.backoffice.myinvestment.corp.action.entity.ViewCANotification;
-import ru.rshbintech.it_invest.backoffice.myinvestment.corp.action.mapper.NotificationMapper;
-import ru.rshbintech.it_invest.backoffice.myinvestment.corp.action.repository.ViewCANotificationRepository;
 import ru.rshbintech.it_invest.backoffice.myinvestment.corp.action.service.InstructionProcessorService;
-
-import java.util.List;
+import ru.rshbintech.it_invest.backoffice.myinvestment.corp.action.service.InstructionViewService;
 
 @EnableKafka
 @Component
@@ -22,15 +17,26 @@ import java.util.List;
 @RequiredArgsConstructor
 public class InternalInstructionListener {
 
-    private final InstructionProcessorService instructionProcessorService;
+    private final InstructionProcessorService instructionService;
+    private final InstructionViewService instructionViewService;
+
+    @KafkaListener(
+            groupId = "${kafka.internal-instruction-view.consumer.group-id}",
+            topics = "${kafka.internal-instruction-view.topic}",
+            containerFactory = BeanConstants.INTERNAL_INSTRUCTION_VIEW_CONSUMER_FACTORY
+    )
+    @Transactional
+    public void processInstructionView(CorporateActionInstructionRequest instructionRequest) {
+        instructionViewService.postView(instructionRequest);
+    }
 
     @KafkaListener(
             groupId = "${kafka.internal-instruction.consumer.group-id}",
             topics = "${kafka.internal-instruction.topic}",
-            containerFactory = BeanConstants.INTERNAL_INSTRUCTION_CONSUMER_FACTORY
+            containerFactory = BeanConstants.INTERNAL_INSTRUCTION_VIEW_CONSUMER_FACTORY
     )
     @Transactional
-    public void processInternalInstruction(CorporateActionInstructionRequest instructionRequest) {
-        instructionProcessorService.processInstruction(instructionRequest);
+    public void processInstruction(CorporateActionInstructionRequest instructionRequest) {
+        instructionService.processInstruction(instructionRequest);
     }
 }

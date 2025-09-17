@@ -16,6 +16,7 @@ import org.springframework.kafka.support.serializer.JsonSerializer;
 import ru.rshbintech.it_invest.backoffice.myinvestment.corp.action.dto.CorporateActionInstruction;
 import ru.rshbintech.it_invest.backoffice.myinvestment.corp.action.dto.CorporateActionInstructionRequest;
 import ru.rshbintech.it_invest.backoffice.myinvestment.corp.action.dto.CorporateActionNotificationDto;
+import ru.rshbintech.it_invest.backoffice.myinvestment.corp.action.dto.SendCorpActionsAssignmentReq;
 import ru.rshbintech.it_invest.backoffice.myinvestment.corp.action.property.CustomKafkaProperties;
 
 import java.util.HashMap;
@@ -32,6 +33,13 @@ public class KafkaConfig {
     @Bean
     public ConsumerFactory<String, String> notificationFromDiasoftConsumerFactory() {
         return createConsumerFactory(kafkaProperties.getNotificationFromDiasoft().getConsumer());
+    }
+
+    @Bean
+    public ConsumerFactory<String, CorporateActionInstructionRequest> instructionViewConsumerFactory() {
+        JsonDeserializer<CorporateActionInstructionRequest> deserializer = new JsonDeserializer<>(CorporateActionInstructionRequest.class, objectMapper);
+        deserializer.addTrustedPackages("ru.rshbintech.it_invest.backoffice.myinvestment.corp.action.dto");
+        return createConsumerFactory(kafkaProperties.getInternalInstructionView().getConsumer(), new StringDeserializer(), deserializer);
     }
 
     @Bean
@@ -89,6 +97,12 @@ public class KafkaConfig {
     public ConcurrentKafkaListenerContainerFactory<String, String> notificationFromDiasoftKafkaListenerContainerFactory() {
         return createListenerContainerFactory(notificationFromDiasoftConsumerFactory(),
                 kafkaProperties.getNotificationFromDiasoft().getConsumer().getConcurrency());
+    }
+
+    @Bean(name = INTERNAL_INSTRUCTION_VIEW_CONSUMER_FACTORY)
+    public ConcurrentKafkaListenerContainerFactory<String, CorporateActionInstructionRequest> instuctionViewKafkaListenerContainerFactory() {
+        return createListenerContainerFactory(instructionViewConsumerFactory(),
+                kafkaProperties.getInternalInstructionView().getConsumer().getConcurrency());
     }
 
     @Bean(name = INTERNAL_NOTIFICATION_FACTORY)
@@ -166,7 +180,7 @@ public class KafkaConfig {
     }
 
     @Bean
-    public KafkaTemplate<String, CorporateActionInstruction> instructionToDiasoftKafkaTemplate() {
+    public KafkaTemplate<String, SendCorpActionsAssignmentReq> instructionToDiasoftKafkaTemplate() {
         return new KafkaTemplate(instructionToDiasoftProducerFactory());
     }
 }

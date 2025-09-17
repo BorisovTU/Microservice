@@ -9,17 +9,18 @@ import java.time.OffsetDateTime;
 import java.util.UUID;
 
 @Entity
-@Table(name = "view_ca_instruction")
+@Table(name = "storage_ca_instruction")
 @Data
-public class ViewCaInstruction {
+public class DataCAInstruction {
     @Id
     @GeneratedValue(strategy = GenerationType.AUTO)
     private UUID id;
 
-    private Long cftid;
-    private Long instrNmb;
-    private OffsetDateTime instrDt;
-    private String status;
+    private Long ownerSecurityId;
+
+    @Column(name = "create_date_time")
+    private OffsetDateTime createDateTime;
+
     @Column(columnDefinition = "jsonb")
     @JdbcTypeCode(SqlTypes.JSON)
     private String payload;

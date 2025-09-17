@@ -13,47 +13,35 @@ import java.util.Map;
 @Component
 @ConfigurationProperties(prefix = "kafka")
 public class CustomKafkaProperties {
-    private NotificationFromDiasoft notificationFromDiasoft = new NotificationFromDiasoft();
-    private InternalNotification internalNotification = new InternalNotification();
-    private InternalNotificationOwnerBalance internalNotificationOwnerBalance = new InternalNotificationOwnerBalance();
-    private InternalInstruction internalInstruction = new InternalInstruction();
-    private InstructionToDiasoft instructionToDiasoft = new InstructionToDiasoft();
-
+    private ConsumerConfig notificationFromDiasoft = new ConsumerConfig();
+    private ConsumerProducerConfig internalNotification = new ConsumerProducerConfig();
+    private ConsumerConfig internalNotificationOwnerBalance = new ConsumerConfig();
+    private ConsumerProducerConfig internalInstruction = new ConsumerProducerConfig();
+    private ProducerConfig instructionToDiasoft = new ProducerConfig();
+    private ConsumerConfig internalInstructionView = new ConsumerConfig();
+    // Базовый класс для конфигураций с Consumer
     @Setter
     @Getter
-    public static class NotificationFromDiasoft {
+    public static class ConsumerConfig {
         private String topic;
-        private String topicDlq;
+        private String topicDlq; // Опциональное поле для DLQ
         private Consumer consumer = new Consumer();
     }
 
+    // Базовый класс для конфигураций с Producer
     @Setter
     @Getter
-    public static class InternalNotification {
+    public static class ProducerConfig {
         private String topic;
-        private Consumer consumer = new Consumer();
         private Producer producer = new Producer();
     }
 
+    // Базовый класс для конфигураций с Consumer и Producer
     @Setter
     @Getter
-    public static class InternalInstruction {
+    public static class ConsumerProducerConfig {
         private String topic;
         private Consumer consumer = new Consumer();
-        private Producer producer = new Producer();
-    }
-
-    @Setter
-    @Getter
-    public static class InternalNotificationOwnerBalance {
-        private String topic;
-        private Consumer consumer = new Consumer();
-    }
-
-    @Setter
-    @Getter
-    public static class InstructionToDiasoft {
-        private String topic;
         private Producer producer = new Producer();
     }
 

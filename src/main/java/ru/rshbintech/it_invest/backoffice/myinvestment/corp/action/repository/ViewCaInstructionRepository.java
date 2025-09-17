@@ -17,15 +17,18 @@ public interface ViewCaInstructionRepository extends JpaRepository<ViewCaInstruc
     Optional<ViewCaInstruction> findByInstrNmb(Long instrNmb);
 
     @Query("SELECT v FROM ViewCaInstruction v WHERE " +
-            "(:nextid IS NULL OR v.instrNmb > :nextid) " +
+            "(:nextid IS NULL OR v.instrNmb > :nextid) AND " +
+            "(:cftid IS NULL OR v.cftid = :cftid) " +
             "ORDER BY v.instrNmb DESC")
-    List<ViewCaInstruction> findWithPagination(@Param("nextid") Long nextid, Pageable pageable);
+    List<ViewCaInstruction> findWithPagination(@Param("cftid") Long cftid, @Param("nextid") Long nextid, Pageable pageable);
 
     @Query("SELECT v FROM ViewCaInstruction v WHERE " +
             "v.status = :status AND " +
-            "(:nextid IS NULL OR v.instrNmb > :nextid) " +
+            "(:nextid IS NULL OR v.instrNmb > :nextid) AND " +
+            "(:cftid IS NULL OR v.cftid = :cftid) " +
             "ORDER BY v.instrNmb DESC")
-    List<ViewCaInstruction> findByStatusWithPagination(@Param("status") String status,
+    List<ViewCaInstruction> findByStatusWithPagination(@Param("cftid") Long cftid,
+                                                       @Param("status") String status,
                                                        @Param("nextid") Long nextid,
                                                        Pageable pageable);
 }

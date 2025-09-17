@@ -7,11 +7,16 @@ import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Component;
 import ru.rshbintech.it_invest.backoffice.myinvestment.corp.action.dto.CorporateActionInstruction;
+import ru.rshbintech.it_invest.backoffice.myinvestment.corp.action.dto.SendCorpActionsAssignmentReq;
+import ru.rshbintech.it_invest.backoffice.myinvestment.corp.action.entity.DataCAInstruction;
 import ru.rshbintech.it_invest.backoffice.myinvestment.corp.action.entity.DataCaOwnerBalance;
 import ru.rshbintech.it_invest.backoffice.myinvestment.corp.action.entity.ViewCaInstruction;
 import ru.rshbintech.it_invest.backoffice.myinvestment.corp.action.exception.FlkException;
+import ru.rshbintech.it_invest.backoffice.myinvestment.corp.action.repository.DataCAInstructionRepository;
 import ru.rshbintech.it_invest.backoffice.myinvestment.corp.action.repository.DataCaOwnerBalanceRepository;
 import ru.rshbintech.it_invest.backoffice.myinvestment.corp.action.repository.ViewCaInstructionRepository;
+
+import java.time.OffsetDateTime;
 
 import static ru.rshbintech.it_invest.backoffice.myinvestment.corp.action.util.ParseUtil.parseLong;
 
@@ -23,22 +28,42 @@ public class CorporateActionInstructionDao {
     private final DataCaOwnerBalanceRepository dataCaOwnerBalanceRepository;
     private final CorporateActionNotificationDao corporateActionNotificationDao;
     private final ViewCaInstructionRepository viewInstructionRepository;
+    private final DataCAInstructionRepository dataCAInstructionRepository;
+
     public String getNotificationPayload(Long ownerId) {
         DataCaOwnerBalance referenceById = dataCaOwnerBalanceRepository.getReferenceById(ownerId);
         if (referenceById == null) {
             log.error("Can't find reference by id {}", ownerId);
-            throw new FlkException("Entity not found","No owner balance found for id: " + ownerId);
+            throw new FlkException("Entity not found", "No owner balance found for id: " + ownerId);
         }
         return corporateActionNotificationDao.getByCaIdAndCftId(referenceById.getCaid(), referenceById.getCftid());
     }
 
     @Transactional
-    public void saveInstruction(CorporateActionInstruction instruction) throws JsonProcessingException {
+    public void saveInstructionView(CorporateActionInstruction instruction) throws JsonProcessingException {
         ViewCaInstruction viewInstruction = new ViewCaInstruction();
         String payload = objectMapper.writeValueAsString(instruction);
         viewInstruction.setPayload(payload);
         viewInstruction.setInstrDt(instruction.getInstrDt());
-        viewInstruction.setInstrNmb(parseLong(instruction.getInstrNmb(),"InstrNmb is not valid: {}"));
+        if (instruction.getBnfclOwnrDtls() != null) {
+            viewInstruction.setCftid(parseLong(instruction.getBnfclOwnrDtls().getCftid(), "cftid is not valid: {}"));
+        }
+        viewInstruction.setInstrNmb(parseLong(instruction.getInstrNmb(), "InstrNmb is not valid: {}"));
         viewInstructionRepository.save(viewInstruction);
+    }
+
+    @Transactional
+    public void saveInstruction(SendCorpActionsAssignmentReq corporateActionInstruction) throws JsonProcessingException {
+        DataCAInstruction dataCAInstruction = new DataCAInstruction();
+        String payload = objectMapper.writeValueAsString(corporateActionInstruction);
+        dataCAInstruction.setPayload(payload);
+        dataCAInstruction.setCreateDateTime(OffsetDateTime.now());
+        if (corporateActionInstruction != null
+                && corporateActionInstruction.getSendCorpActionsAssignmentReq() != null
+                && corporateActionInstruction.getSendCorpActionsAssignmentReq().getCorporateActionInstruction() != null) {
+            String ownerSecurityID = corporateActionInstruction.getSendCorpActionsAssignmentReq().getCorporateActionInstruction().getOwnerSecurityID();
+            dataCAInstruction.setOwnerSecurityId(parseLong(ownerSecurityID, "ownerSecurityId is not valid: {}"));
+        }
+        dataCAInstructionRepository.save(dataCAInstruction);
     }
 }

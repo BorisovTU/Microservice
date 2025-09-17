@@ -55,7 +55,7 @@ public class CorporateActionInstructionController {
                 cftid, limit, sort, nextid);
 
         // Параметр cftid пока не используется, так как в таблице нет этого поля
-        List<CorporateActionInstruction> instructions = instructionViewService.getInstructions(null, limit, nextid);
+        List<CorporateActionInstruction> instructions = instructionViewService.getInstructions(null, limit, cftid, nextid);
         String nextId = instructionViewService.getNextId(instructions, limit);
 
         // Создаем ответ согласно спецификации API
