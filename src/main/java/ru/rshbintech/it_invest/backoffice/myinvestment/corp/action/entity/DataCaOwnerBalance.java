@@ -4,6 +4,8 @@ import lombok.Data;
 import org.hibernate.annotations.Type;
 
 import jakarta.persistence.*;
+
+import java.math.BigDecimal;
 import java.time.OffsetDateTime;
 
 @Entity
@@ -14,7 +16,7 @@ public class DataCaOwnerBalance {
     @Column(name = "owner_security_id")
     private Long ownerSecurityId;
 
-    private Long bal;
+    private BigDecimal bal;
 
     @Column(name = "create_date_time")
     private OffsetDateTime createDateTime;

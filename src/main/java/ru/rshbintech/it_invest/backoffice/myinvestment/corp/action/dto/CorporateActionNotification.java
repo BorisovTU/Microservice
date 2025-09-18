@@ -127,6 +127,6 @@ public class CorporateActionNotification {
         private String subAcct;
 
         @JsonProperty("Bal")
-        private String bal;
+        private BigDecimal bal;
     }
 }

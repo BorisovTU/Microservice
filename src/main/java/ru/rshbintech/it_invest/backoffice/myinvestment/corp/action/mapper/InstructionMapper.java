@@ -20,6 +20,7 @@ public class InstructionMapper {
         CorporateActionInstruction.CorpActnOptnDtlsRequest corpActnOptnDtls = new CorporateActionInstruction.CorpActnOptnDtlsRequest();
         corpActnOptnDtls.setOptnNb(optnNb);
         result.setCorpActnOptnDtls(corpActnOptnDtls);
+        result.setStatus("ACCEPTED");
         result.setBnfclOwnrDtls(bnfclOwnrDtlsShort);
         result.setBal(instruction.getBal());
         result.setInstrDt(instruction.getInstrDt());

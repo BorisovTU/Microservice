@@ -24,7 +24,7 @@ public class OwnerBalanceMapper {
             notificationDto.getCorporateActionNotification().getBnfclOwnrDtls().forEach(owner -> {
                 DataCaOwnerBalance entity = new DataCaOwnerBalance();
                 entity.setOwnerSecurityId(Long.parseLong(owner.getOwnerSecurityID()));
-                entity.setBal(parseLong(owner.getBal(),"Bal is not Long:{}"));
+                entity.setBal(owner.getBal());
                 entity.setCreateDateTime(OffsetDateTime.now());
                 entity.setCaid(caid);
                 entity.setCftid(Long.parseLong(owner.getCftid()));
