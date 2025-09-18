@@ -8,10 +8,16 @@ import io.swagger.v3.oas.annotations.responses.ApiResponse;
 import io.swagger.v3.oas.annotations.responses.ApiResponses;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.context.support.DefaultMessageSourceResolvable;
+import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.MethodArgumentNotValidException;
 import org.springframework.web.bind.annotation.*;
 import ru.rshbintech.it_invest.backoffice.myinvestment.corp.action.dto.*;
+import ru.rshbintech.it_invest.backoffice.myinvestment.corp.action.exception.FlkException;
 import ru.rshbintech.it_invest.backoffice.myinvestment.corp.action.service.NotificationViewService;
+
+import java.util.stream.Collectors;
 
 @RestController
 @RequestMapping("/api/v1")
@@ -62,5 +68,12 @@ public class CorporateActionController {
 
         CorporateActionResponse response = notificationViewService.getCorporateActions(cftid, active, limit, sort, nextid);
         return ResponseEntity.ok(response);
+    }
+
+    @ExceptionHandler(FlkException.class)
+    @ResponseStatus(HttpStatus.BAD_REQUEST)
+    public ValidationErrorResponseDto handleValidationExceptions(FlkException ex) {
+        log.error("MethodArgumentNotValidException", ex);
+        return new ValidationErrorResponseDto(ex.getMessage(), ex.getCode());
     }
 }
