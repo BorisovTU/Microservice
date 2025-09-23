@@ -11,6 +11,7 @@ import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.MissingServletRequestParameterException;
 import org.springframework.web.bind.annotation.*;
 import ru.rshbintech.it_invest.backoffice.myinvestment.corp.action.dto.*;
 import ru.rshbintech.it_invest.backoffice.myinvestment.corp.action.exception.FlkException;
@@ -110,5 +111,14 @@ public class CorporateActionInstructionController {
     public ValidationErrorResponseDto handleValidationExceptions(FlkException ex) {
         log.error("MethodArgumentNotValidException", ex);
         return new ValidationErrorResponseDto(ex.getMessage(), ex.getCode());
+    }
+
+    @ExceptionHandler(MissingServletRequestParameterException.class)
+    @ResponseStatus(HttpStatus.BAD_REQUEST)
+    public ValidationErrorResponseDto handleMissingParams(MissingServletRequestParameterException ex) {
+        String parameterName = ex.getParameterName();
+        String errorMessage = String.format("Обязательный параметр '%s' отсутствует в запросе", parameterName);
+        log.error("MissingServletRequestParameterException: {}", errorMessage);
+        return new ValidationErrorResponseDto(errorMessage, "MISSING_PARAMETER");
     }
 }

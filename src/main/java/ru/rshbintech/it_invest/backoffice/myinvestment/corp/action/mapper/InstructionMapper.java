@@ -93,7 +93,7 @@ public class InstructionMapper {
         corpActionNotificationShort.setCorpActnEvtId(notification.getCorpActnEvtId());
         corpActionNotificationShort.setMndtryVlntryEvtTp(notification.getMndtryVlntryEvtTp());
         corpActionNotificationShort.setFinInstrmId(notification.getFinInstrmId());
-        corpActionNotificationShort.setFinInstrmId(notification.getFinInstrmId());
+        corpActionNotificationShort.setActnPrd(notification.getActnPrd());
         return corpActionNotificationShort;
     }
 

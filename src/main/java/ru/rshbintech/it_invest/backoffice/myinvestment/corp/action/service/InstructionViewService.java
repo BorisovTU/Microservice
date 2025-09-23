@@ -16,6 +16,7 @@ import ru.rshbintech.it_invest.backoffice.myinvestment.corp.action.repository.Vi
 
 import java.util.List;
 import java.util.Optional;
+import java.util.UUID;
 import java.util.stream.Collectors;
 
 import static ru.rshbintech.it_invest.backoffice.myinvestment.corp.action.util.ParseUtil.parseLong;
@@ -33,7 +34,7 @@ public class InstructionViewService {
 
     public Optional<CorporateActionInstruction> getInstructionByNumber(String instrNmb) {
         try {
-            Long instrNumber = Long.parseLong(instrNmb);
+            UUID instrNumber = UUID.fromString(instrNmb);
             Optional<ViewCaInstruction> instruction = instructionRepository.findByInstrNmb(instrNumber);
 
             return instruction.map(viewInstruction -> {
@@ -55,7 +56,7 @@ public class InstructionViewService {
                                                             String cftid,
                                                             String nextid) {
         try {
-            Long nextIdLong = nextid != null ? Long.parseLong(nextid) : null;
+            UUID nextIdLong = nextid != null ? UUID.fromString(nextid) : null;
             PageRequest pageRequest = PageRequest.of(0, limit != null ? limit : 50);
 
             List<ViewCaInstruction> instructions;

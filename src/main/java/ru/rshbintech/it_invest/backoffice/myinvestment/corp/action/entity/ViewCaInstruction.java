@@ -17,7 +17,7 @@ public class ViewCaInstruction {
     private UUID id;
 
     private Long cftid;
-    private Long instrNmb;
+    private UUID instrNmb;
     private OffsetDateTime instrDt;
     private String status;
     @Column(columnDefinition = "jsonb")

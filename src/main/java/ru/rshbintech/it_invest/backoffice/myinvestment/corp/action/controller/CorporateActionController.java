@@ -12,6 +12,7 @@ import org.springframework.context.support.DefaultMessageSourceResolvable;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.MethodArgumentNotValidException;
+import org.springframework.web.bind.MissingServletRequestParameterException;
 import org.springframework.web.bind.annotation.*;
 import ru.rshbintech.it_invest.backoffice.myinvestment.corp.action.dto.*;
 import ru.rshbintech.it_invest.backoffice.myinvestment.corp.action.exception.FlkException;
@@ -68,6 +69,15 @@ public class CorporateActionController {
 
         CorporateActionResponse response = notificationViewService.getCorporateActions(cftid, active, limit, sort, nextid);
         return ResponseEntity.ok(response);
+    }
+
+    @ExceptionHandler(MissingServletRequestParameterException.class)
+    @ResponseStatus(HttpStatus.BAD_REQUEST)
+    public ValidationErrorResponseDto handleMissingParams(MissingServletRequestParameterException ex) {
+        String parameterName = ex.getParameterName();
+        String errorMessage = String.format("Обязательный параметр '%s' отсутствует в запросе", parameterName);
+        log.error("MissingServletRequestParameterException: {}", errorMessage);
+        return new ValidationErrorResponseDto(errorMessage, "MISSING_PARAMETER");
     }
 
     @ExceptionHandler(FlkException.class)

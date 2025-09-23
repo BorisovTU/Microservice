@@ -17,6 +17,7 @@ import ru.rshbintech.it_invest.backoffice.myinvestment.corp.action.repository.Da
 import ru.rshbintech.it_invest.backoffice.myinvestment.corp.action.repository.ViewCaInstructionRepository;
 
 import java.time.OffsetDateTime;
+import java.util.UUID;
 
 import static ru.rshbintech.it_invest.backoffice.myinvestment.corp.action.util.ParseUtil.parseLong;
 
@@ -45,10 +46,11 @@ public class CorporateActionInstructionDao {
         String payload = objectMapper.writeValueAsString(instruction);
         viewInstruction.setPayload(payload);
         viewInstruction.setInstrDt(instruction.getInstrDt());
+        viewInstruction.setStatus(instruction.getStatus());
         if (instruction.getBnfclOwnrDtls() != null) {
             viewInstruction.setCftid(parseLong(instruction.getBnfclOwnrDtls().getCftid(), "cftid is not valid: {}"));
         }
-        viewInstruction.setInstrNmb(parseLong(instruction.getInstrNmb(), "InstrNmb is not valid: {}"));
+        viewInstruction.setInstrNmb(UUID.fromString(instruction.getInstrNmb()));
         viewInstructionRepository.save(viewInstruction);
     }
 
