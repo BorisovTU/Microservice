@@ -3,6 +3,7 @@ package ru.rshbintech.it_invest.backoffice.myinvestment.corp.action.util;
 import com.fasterxml.jackson.core.JsonParser;
 import com.fasterxml.jackson.databind.DeserializationContext;
 import com.fasterxml.jackson.databind.JsonDeserializer;
+import lombok.extern.slf4j.Slf4j;
 
 import java.io.IOException;
 import java.time.LocalDate;
@@ -12,6 +13,7 @@ import java.time.ZoneOffset;
 import java.time.format.DateTimeFormatter;
 import java.time.format.DateTimeParseException;
 
+@Slf4j
 public class CustomOffsetDateTimeDeserializer extends JsonDeserializer<OffsetDateTime> {
 
     private static final DateTimeFormatter[] FORMATTERS = {
@@ -39,7 +41,7 @@ public class CustomOffsetDateTimeDeserializer extends JsonDeserializer<OffsetDat
                     return OffsetDateTime.parse(value, formatter);
                 }
             } catch (DateTimeParseException ignored) {
-                ignored.printStackTrace();
+                log.error("Invalid datatime format: " + value, ignored);
             }
         }
 
