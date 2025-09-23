@@ -35,7 +35,7 @@ public class CorporateActionInstructionRequest {
     @Valid
     @NotNull(message = "CorpActnOptnDtls is required")
     @JsonProperty("CorpActnOptnDtls")
-    private CorpActnOptnDtls corpActnOptnDtls;
+    private CorpActnOptnDtlsReq corpActnOptnDtls;
 
     @Data
     @JsonIgnoreProperties(ignoreUnknown = true)
@@ -47,7 +47,7 @@ public class CorporateActionInstructionRequest {
 
     @Data
     @JsonIgnoreProperties(ignoreUnknown = true)
-    public static class CorpActnOptnDtls {
+    public static class CorpActnOptnDtlsReq {
         @NotBlank(message = "OptnNb is required")
         @JsonProperty("OptnNb")
         private String optnNb;
