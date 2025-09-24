@@ -19,6 +19,7 @@ public class CustomKafkaProperties {
     private ConsumerProducerConfig internalInstruction = new ConsumerProducerConfig();
     private ProducerConfig instructionToDiasoft = new ProducerConfig();
     private ConsumerConfig internalInstructionView = new ConsumerConfig();
+
     // Базовый класс для конфигураций с Consumer
     @Setter
     @Getter

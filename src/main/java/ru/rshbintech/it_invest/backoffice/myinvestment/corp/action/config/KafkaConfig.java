@@ -62,7 +62,7 @@ public class KafkaConfig {
         return createConsumerFactory(kafkaProperties.getInternalInstruction().getConsumer(), new StringDeserializer(), deserializer);
     }
 
-    private <T>ConsumerFactory<String, T> createConsumerFactory(CustomKafkaProperties.Consumer consumerProps) {
+    private <T> ConsumerFactory<String, T> createConsumerFactory(CustomKafkaProperties.Consumer consumerProps) {
         Map<String, Object> props = new HashMap<>();
         props.put(ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, consumerProps.getBootstrapServers());
         props.put(ConsumerConfig.GROUP_ID_CONFIG, consumerProps.getGroupId());
@@ -79,7 +79,7 @@ public class KafkaConfig {
         return new DefaultKafkaConsumerFactory<>(props);
     }
 
-    private <T>ConsumerFactory<String, T> createConsumerFactory(CustomKafkaProperties.Consumer consumerProps, Deserializer<String> keyDesirializer, Deserializer<T> valueDesirializer) {
+    private <T> ConsumerFactory<String, T> createConsumerFactory(CustomKafkaProperties.Consumer consumerProps, Deserializer<String> keyDesirializer, Deserializer<T> valueDesirializer) {
         Map<String, Object> props = new HashMap<>();
         props.put(ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, consumerProps.getBootstrapServers());
         props.put(ConsumerConfig.GROUP_ID_CONFIG, consumerProps.getGroupId());
@@ -122,7 +122,7 @@ public class KafkaConfig {
                 kafkaProperties.getInternalInstruction().getConsumer().getConcurrency());
     }
 
-    private <T>ConcurrentKafkaListenerContainerFactory<String, T> createListenerContainerFactory(
+    private <T> ConcurrentKafkaListenerContainerFactory<String, T> createListenerContainerFactory(
             ConsumerFactory<String, T> consumerFactory, int concurrency) {
         ConcurrentKafkaListenerContainerFactory<String, T> factory =
                 new ConcurrentKafkaListenerContainerFactory<>();

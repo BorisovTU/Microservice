@@ -13,7 +13,10 @@ import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.MissingServletRequestParameterException;
 import org.springframework.web.bind.annotation.*;
-import ru.rshbintech.it_invest.backoffice.myinvestment.corp.action.dto.*;
+import ru.rshbintech.it_invest.backoffice.myinvestment.corp.action.dto.CorporateActionInstructionRequest;
+import ru.rshbintech.it_invest.backoffice.myinvestment.corp.action.dto.CorporateActionViewInstruction;
+import ru.rshbintech.it_invest.backoffice.myinvestment.corp.action.dto.ErrorResponseDto;
+import ru.rshbintech.it_invest.backoffice.myinvestment.corp.action.dto.ValidationErrorResponseDto;
 import ru.rshbintech.it_invest.backoffice.myinvestment.corp.action.exception.FlkException;
 import ru.rshbintech.it_invest.backoffice.myinvestment.corp.action.service.CorporateActionInstructionAdapter;
 import ru.rshbintech.it_invest.backoffice.myinvestment.corp.action.service.InstructionViewService;
@@ -28,6 +31,7 @@ import java.util.Optional;
 public class CorporateActionInstructionController {
 
     private final CorporateActionInstructionAdapter instructionService;
+    private final InstructionViewService instructionViewService;
 
     @Operation(summary = "Добавление инструкции")
     @ApiResponses(value = {
@@ -45,8 +49,6 @@ public class CorporateActionInstructionController {
         instructionService.processInstruction(instructionRequest);
         return ResponseEntity.status(201).build();
     }
-
-    private final InstructionViewService instructionViewService;
 
     @Operation(summary = "Получение инструкции")
     @ApiResponses(value = {
@@ -99,13 +101,6 @@ public class CorporateActionInstructionController {
         return ResponseEntity.ok(response);
     }
 
-    // Вспомогательный класс для ответа со списком инструкций
-    @lombok.Data
-    public static class CorporateActionInstructionResponse {
-        private List<CorporateActionViewInstruction> data;
-        private String nextId;
-    }
-
     @ExceptionHandler(FlkException.class)
     @ResponseStatus(HttpStatus.BAD_REQUEST)
     public ValidationErrorResponseDto handleValidationExceptions(FlkException ex) {
@@ -120,5 +115,12 @@ public class CorporateActionInstructionController {
         String errorMessage = String.format("Обязательный параметр '%s' отсутствует в запросе", parameterName);
         log.error("MissingServletRequestParameterException: {}", errorMessage);
         return new ValidationErrorResponseDto(errorMessage, "MISSING_PARAMETER");
+    }
+
+    // Вспомогательный класс для ответа со списком инструкций
+    @lombok.Data
+    public static class CorporateActionInstructionResponse {
+        private List<CorporateActionViewInstruction> data;
+        private String nextId;
     }
 }

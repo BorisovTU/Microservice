@@ -16,16 +16,16 @@ public interface ViewCANotificationRepository extends JpaRepository<ViewCANotifi
     Optional<ViewCANotification> getFirstByCaidAndCftidOrderByCreateDateTimeDesc(long caid, long cftId);
 
     @Query(value = """
-        SELECT * FROM view_ca_notification 
-        WHERE cftid = :cftid 
-        AND (:active = false OR (
-            (CURRENT_DATE BETWEEN start_dt AND rspnddln::date) 
-            OR (rspnddln IS NULL AND CURRENT_DATE >= start_dt)
-        ))
-        AND (:from IS NULL OR caid >= :from)
-        ORDER BY start_dt DESC, caid ASC 
-        LIMIT :limit
-    """, nativeQuery = true)
+                SELECT * FROM view_ca_notification 
+                WHERE cftid = :cftid 
+                AND (:active = false OR (
+                    (CURRENT_DATE BETWEEN start_dt AND rspnddln::date) 
+                    OR (rspnddln IS NULL AND CURRENT_DATE >= start_dt)
+                ))
+                AND (:from IS NULL OR caid >= :from)
+                ORDER BY start_dt DESC, caid ASC 
+                LIMIT :limit
+            """, nativeQuery = true)
     List<ViewCANotification> findAllByCftidWithFilters(
             @Param("cftid") Long cftid,
             @Param("active") Boolean active,

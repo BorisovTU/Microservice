@@ -1,8 +1,7 @@
 package ru.rshbintech.it_invest.backoffice.myinvestment.corp.action.entity;
 
-import lombok.Data;
-
 import jakarta.persistence.*;
+import lombok.Data;
 import org.hibernate.annotations.JdbcTypeCode;
 import org.hibernate.type.SqlTypes;
 

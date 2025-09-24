@@ -9,8 +9,6 @@ import java.time.OffsetDateTime;
 import java.util.ArrayList;
 import java.util.List;
 
-import static ru.rshbintech.it_invest.backoffice.myinvestment.corp.action.util.ParseUtil.parseLong;
-
 @Service
 @RequiredArgsConstructor
 public class OwnerBalanceMapper {

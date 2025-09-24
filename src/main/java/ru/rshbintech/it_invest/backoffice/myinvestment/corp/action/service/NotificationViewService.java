@@ -23,15 +23,6 @@ import static ru.rshbintech.it_invest.backoffice.myinvestment.corp.action.util.P
 public class NotificationViewService {
     private final CorporateActionNotificationDao corporateActionNotificationDao;
     private final ObjectMapper objectMapper;
-    public CorporateActionNotification getCorporateActionById(String corporateActionIssuerId, String cftid) throws JsonProcessingException {
-        Long caid = getRequiredLong(corporateActionIssuerId, "corporateActionIssuerId is not valid");
-        Long cft = getRequiredLong(cftid, "cft is not valid");
-        String payload = corporateActionNotificationDao.getByCaIdAndCftId(caid, cft);
-        if (payload == null) {
-            throw new FlkException("ENTITY_NOT_FOUND","Запись не найдена");
-        }
-        return objectMapper.readValue(payload, CorporateActionNotificationDto.class).getCorporateActionNotification();
-    }
 
     private static Long getRequiredLong(String cftid, String message) {
         Long cft = parseLong(cftid, message + ":{}");
@@ -41,8 +32,18 @@ public class NotificationViewService {
         return cft;
     }
 
+    public CorporateActionNotification getCorporateActionById(String corporateActionIssuerId, String cftid) throws JsonProcessingException {
+        Long caid = getRequiredLong(corporateActionIssuerId, "corporateActionIssuerId is not valid");
+        Long cft = getRequiredLong(cftid, "cft is not valid");
+        String payload = corporateActionNotificationDao.getByCaIdAndCftId(caid, cft);
+        if (payload == null) {
+            throw new FlkException("ENTITY_NOT_FOUND", "Запись не найдена");
+        }
+        return objectMapper.readValue(payload, CorporateActionNotificationDto.class).getCorporateActionNotification();
+    }
+
     public CorporateActionResponse getCorporateActions(String cft, Boolean active, Integer limit, String sort, String from) {
-        Long cftid = getRequiredLong(cft,  "cftid is not valid");
+        Long cftid = getRequiredLong(cft, "cftid is not valid");
         List<ViewCANotification> list = corporateActionNotificationDao.findAllBy(cftid, active, limit + 1, sort, from);
         boolean hasNextPage = list.size() > limit;
         List<CorporateActionNotification> data = list.stream().map(ViewCANotification::getPayload)
@@ -58,7 +59,7 @@ public class NotificationViewService {
         corporateActionResponse.setData(data);
         if (hasNextPage) {
             Long nextId = list.get(list.size() - 1).getCaid();
-            corporateActionResponse.setNextId(Objects.toString(nextId.toString()));
+            corporateActionResponse.setNextId(nextId.toString());
         }
         return corporateActionResponse;
     }

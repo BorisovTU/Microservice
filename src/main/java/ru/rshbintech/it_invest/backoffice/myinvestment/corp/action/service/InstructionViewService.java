@@ -7,9 +7,9 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.data.domain.PageRequest;
 import org.springframework.stereotype.Service;
 import ru.rshbintech.it_invest.backoffice.myinvestment.corp.action.dao.CorporateActionInstructionDao;
-import ru.rshbintech.it_invest.backoffice.myinvestment.corp.action.dto.CorporateActionViewInstruction;
 import ru.rshbintech.it_invest.backoffice.myinvestment.corp.action.dto.CorporateActionInstructionRequest;
 import ru.rshbintech.it_invest.backoffice.myinvestment.corp.action.dto.CorporateActionNotification;
+import ru.rshbintech.it_invest.backoffice.myinvestment.corp.action.dto.CorporateActionViewInstruction;
 import ru.rshbintech.it_invest.backoffice.myinvestment.corp.action.entity.ViewCaInstruction;
 import ru.rshbintech.it_invest.backoffice.myinvestment.corp.action.mapper.InstructionMapper;
 import ru.rshbintech.it_invest.backoffice.myinvestment.corp.action.repository.ViewCaInstructionRepository;
@@ -61,9 +61,9 @@ public class InstructionViewService {
 
             List<ViewCaInstruction> instructions;
             if (status != null) {
-                instructions = instructionRepository.findByStatusWithPagination(parseLong(cftid,"cftid error format:{}"), status, nextIdLong, pageRequest);
+                instructions = instructionRepository.findByStatusWithPagination(parseLong(cftid, "cftid error format:{}"), status, nextIdLong, pageRequest);
             } else {
-                instructions = instructionRepository.findWithPagination(parseLong(cftid,"cftid error format:{}"),nextIdLong, pageRequest);
+                instructions = instructionRepository.findWithPagination(parseLong(cftid, "cftid error format:{}"), nextIdLong, pageRequest);
             }
 
             return instructions.stream()
@@ -95,7 +95,7 @@ public class InstructionViewService {
     public void postView(CorporateActionInstructionRequest instructionRequest) {
         String ownerSecurityID = instructionRequest.getBnfclOwnrDtls().getOwnerSecurityID();
         CorporateActionNotification corporateActionNotification = corporateActionInstructionAdapter.getCorporateActionNotification(Long.parseLong(ownerSecurityID));
-        CorporateActionViewInstruction corporateActionViewInstruction = instructionMapper.map(instructionRequest, corporateActionNotification);
+        CorporateActionViewInstruction corporateActionViewInstruction = instructionMapper.mapToInstructionView(instructionRequest, corporateActionNotification);
         try {
             corporateActionInstructionDao.saveInstructionView(corporateActionViewInstruction);
         } catch (JsonProcessingException e) {

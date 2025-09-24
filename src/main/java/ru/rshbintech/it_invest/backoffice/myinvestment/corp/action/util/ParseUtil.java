@@ -1,6 +1,5 @@
 package ru.rshbintech.it_invest.backoffice.myinvestment.corp.action.util;
 
-import jakarta.validation.ValidationException;
 import lombok.experimental.UtilityClass;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.util.StringUtils;
@@ -51,7 +50,6 @@ public final class ParseUtil {
         return null;
     }
 
-
     public static OffsetDateTime parseOffsetDateTime(String value, String message) throws IOException {
         for (DateTimeFormatter formatter : FORMATTERS) {
             try {
@@ -68,7 +66,6 @@ public final class ParseUtil {
                 log.error(message, value);
             }
         }
-
         return null;
     }
 }

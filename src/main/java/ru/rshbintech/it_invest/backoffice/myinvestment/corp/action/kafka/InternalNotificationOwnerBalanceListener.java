@@ -38,8 +38,7 @@ public class InternalNotificationOwnerBalanceListener {
                 repository.saveAll(ownerEntities);
                 log.info("Saved {} internal owner balances {}",
                         ownerEntities.size(), notification.getCorporateActionNotification().getCorporateActionIssuerID());
-            }
-            else {
+            } else {
                 log.info("No internal owner balances found");
             }
         } catch (Exception e) {

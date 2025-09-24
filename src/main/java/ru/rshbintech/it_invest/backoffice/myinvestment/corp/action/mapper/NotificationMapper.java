@@ -12,7 +12,6 @@ import java.time.OffsetDateTime;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
-import java.util.UUID;
 import java.util.stream.Collectors;
 
 import static ru.rshbintech.it_invest.backoffice.myinvestment.corp.action.util.ParseUtil.parseLocalDate;
@@ -48,8 +47,8 @@ public class NotificationMapper {
                 viewEntity.setCreateDateTime(OffsetDateTime.now());
                 viewEntity.setCftid(Long.parseLong(cftId));
                 if (corporateActionNotification.getActnPrd() != null) {
-                    viewEntity.setStartDt(parseLocalDate(corporateActionNotification.getActnPrd().getStartDt(),"Invalid StartDt format: {}"));
-                    viewEntity.setRspnddln(parseOffsetDateTime(corporateActionNotification.getActnPrd().getRspnDdln(),"Invalid Rspnddln format: {}"));
+                    viewEntity.setStartDt(parseLocalDate(corporateActionNotification.getActnPrd().getStartDt(), "Invalid StartDt format: {}"));
+                    viewEntity.setRspnddln(parseOffsetDateTime(corporateActionNotification.getActnPrd().getRspnDdln(), "Invalid Rspnddln format: {}"));
                 }
                 String payload = objectMapper.writeValueAsString(notificationForCftId);
                 log.info("Notification Payload: {}", payload);

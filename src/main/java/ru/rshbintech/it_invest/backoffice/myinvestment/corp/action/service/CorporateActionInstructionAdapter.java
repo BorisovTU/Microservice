@@ -30,29 +30,29 @@ public class CorporateActionInstructionAdapter {
     public void processInstruction(@Valid CorporateActionInstructionRequest instructionRequest) throws JsonProcessingException {
         validate(instructionRequest);
         String topic = customKafkaProperties.getInternalInstruction().getTopic();
-        internalInstructionKafkaTemplate.send(topic,instructionRequest.getBnfclOwnrDtls().getOwnerSecurityID(), instructionRequest);
+        internalInstructionKafkaTemplate.send(topic, instructionRequest.getBnfclOwnrDtls().getOwnerSecurityID(), instructionRequest);
     }
 
-    private void validate(CorporateActionInstructionRequest instructionRequest)  {
+    private void validate(CorporateActionInstructionRequest instructionRequest) {
         long ownerSecurityID = Long.parseLong(instructionRequest.getBnfclOwnrDtls().getOwnerSecurityID());
         CorporateActionNotification corporateActionNotification = getCorporateActionNotification(ownerSecurityID);
         String optnNb = instructionRequest.getCorpActnOptnDtls().getOptnNb();
         if (corporateActionNotification.getCorpActnOptnDtls() != null) {
-        CorporateActionNotification.CorpActnOptnDtls corpActnOptnDtls = corporateActionNotification.getCorpActnOptnDtls().stream()
-                .filter(dtls -> optnNb.equals(dtls.getOptnNb())).findFirst().orElseThrow(()-> new FlkException("corpActnOptnDtls_NOT_AVAILABLE","Опция не найдена " + optnNb));
-        if (corpActnOptnDtls.getActnPrd() != null) {
-            LocalDate localStartDate = parseLocalDate(corpActnOptnDtls.getActnPrd().getStartDt(), "invalid startDt format: {}");
-            if (localStartDate != null && localStartDate.isAfter(LocalDate.now())) {
-                log.error("Дата начала действия опции еще не наступила");
-                throw new FlkException("DATE_NOT_STARTED", "Дата начала действия опции еще не наступила");
-            }
-            if (corpActnOptnDtls.getActnPrd().getEndDt() != null) {
-                LocalDate localEndDate = parseLocalDate(corpActnOptnDtls.getActnPrd().getEndDt(), "invalid startDt format: {}");
-                if (localEndDate != null && localEndDate.isBefore(LocalDate.now())) {
-                    log.error("Время действия предложения уже завершилось или было отменено");
-                    throw new FlkException("DATE_ALREADY_END", "Время действия предложения уже завершилось или было отменено");
+            CorporateActionNotification.CorpActnOptnDtls corpActnOptnDtls = corporateActionNotification.getCorpActnOptnDtls().stream()
+                    .filter(dtls -> optnNb.equals(dtls.getOptnNb())).findFirst().orElseThrow(() -> new FlkException("corpActnOptnDtls_NOT_AVAILABLE", "Опция не найдена " + optnNb));
+            if (corpActnOptnDtls.getActnPrd() != null) {
+                LocalDate localStartDate = parseLocalDate(corpActnOptnDtls.getActnPrd().getStartDt(), "invalid startDt format: {}");
+                if (localStartDate != null && localStartDate.isAfter(LocalDate.now())) {
+                    log.error("Дата начала действия опции еще не наступила");
+                    throw new FlkException("DATE_NOT_STARTED", "Дата начала действия опции еще не наступила");
                 }
-            }
+                if (corpActnOptnDtls.getActnPrd().getEndDt() != null) {
+                    LocalDate localEndDate = parseLocalDate(corpActnOptnDtls.getActnPrd().getEndDt(), "invalid startDt format: {}");
+                    if (localEndDate != null && localEndDate.isBefore(LocalDate.now())) {
+                        log.error("Время действия предложения уже завершилось или было отменено");
+                        throw new FlkException("DATE_ALREADY_END", "Время действия предложения уже завершилось или было отменено");
+                    }
+                }
             }
         }
     }
