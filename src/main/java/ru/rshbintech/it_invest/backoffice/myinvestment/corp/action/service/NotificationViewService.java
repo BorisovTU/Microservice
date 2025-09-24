@@ -27,6 +27,9 @@ public class NotificationViewService {
         Long caid = getRequiredLong(corporateActionIssuerId, "corporateActionIssuerId is not valid");
         Long cft = getRequiredLong(cftid, "cft is not valid");
         String payload = corporateActionNotificationDao.getByCaIdAndCftId(caid, cft);
+        if (payload == null) {
+            throw new FlkException("ENTITY_NOT_FOUND","Запись не найдена");
+        }
         return objectMapper.readValue(payload, CorporateActionNotificationDto.class).getCorporateActionNotification();
     }
 

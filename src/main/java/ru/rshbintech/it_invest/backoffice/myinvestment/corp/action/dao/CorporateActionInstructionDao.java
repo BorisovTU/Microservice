@@ -6,7 +6,7 @@ import jakarta.transaction.Transactional;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Component;
-import ru.rshbintech.it_invest.backoffice.myinvestment.corp.action.dto.CorporateActionInstruction;
+import ru.rshbintech.it_invest.backoffice.myinvestment.corp.action.dto.CorporateActionViewInstruction;
 import ru.rshbintech.it_invest.backoffice.myinvestment.corp.action.dto.SendCorpActionsAssignmentReq;
 import ru.rshbintech.it_invest.backoffice.myinvestment.corp.action.entity.DataCAInstruction;
 import ru.rshbintech.it_invest.backoffice.myinvestment.corp.action.entity.DataCaOwnerBalance;
@@ -41,7 +41,7 @@ public class CorporateActionInstructionDao {
     }
 
     @Transactional
-    public void saveInstructionView(CorporateActionInstruction instruction) throws JsonProcessingException {
+    public void saveInstructionView(CorporateActionViewInstruction instruction) throws JsonProcessingException {
         ViewCaInstruction viewInstruction = new ViewCaInstruction();
         String payload = objectMapper.writeValueAsString(instruction);
         viewInstruction.setPayload(payload);

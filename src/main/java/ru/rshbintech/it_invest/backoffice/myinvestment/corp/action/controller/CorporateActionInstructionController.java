@@ -51,18 +51,18 @@ public class CorporateActionInstructionController {
     @Operation(summary = "Получение инструкции")
     @ApiResponses(value = {
             @ApiResponse(responseCode = "200", description = "Успешная обработка",
-                    content = @Content(schema = @Schema(implementation = CorporateActionInstruction.class))),
+                    content = @Content(schema = @Schema(implementation = CorporateActionViewInstruction.class))),
             @ApiResponse(responseCode = "400", description = "Ошибка валидации",
                     content = @Content(schema = @Schema(implementation = ValidationErrorResponseDto.class))),
             @ApiResponse(responseCode = "500", description = "Внутренняя ошибка сервера",
                     content = @Content(schema = @Schema(implementation = ErrorResponseDto.class)))
     })
     @GetMapping("/instructions/{instrNmb}")
-    public ResponseEntity<CorporateActionInstruction> getCorporateActionInstruction(
+    public ResponseEntity<CorporateActionViewInstruction> getCorporateActionInstruction(
             @PathVariable("instrNmb") String instrNmb) {
 
         log.info("GET /instructions/{}", instrNmb);
-        Optional<CorporateActionInstruction> instruction = instructionViewService.getInstructionByNumber(instrNmb);
+        Optional<CorporateActionViewInstruction> instruction = instructionViewService.getInstructionByNumber(instrNmb);
 
         return instruction.map(ResponseEntity::ok)
                 .orElseGet(() -> ResponseEntity.notFound().build());
@@ -71,7 +71,7 @@ public class CorporateActionInstructionController {
     @Operation(summary = "Получение инструкций")
     @ApiResponses(value = {
             @ApiResponse(responseCode = "200", description = "Успешная обработка",
-                    content = @Content(schema = @Schema(implementation = CorporateActionInstruction.class))),
+                    content = @Content(schema = @Schema(implementation = CorporateActionViewInstruction.class))),
             @ApiResponse(responseCode = "400", description = "Ошибка валидации",
                     content = @Content(schema = @Schema(implementation = ValidationErrorResponseDto.class))),
             @ApiResponse(responseCode = "500", description = "Внутренняя ошибка сервера",
@@ -79,7 +79,7 @@ public class CorporateActionInstructionController {
     })
     @GetMapping("/instructions")
     public ResponseEntity<?> getCorporateActionInstructions(
-            @RequestParam(value = "cftid", required = false) String cftid,
+            @RequestParam(value = "cftid") String cftid,
             @RequestParam(value = "limit", defaultValue = "50") Integer limit,
             @RequestParam(value = "sort", defaultValue = "InstrDt") String sort,
             @RequestParam(value = "nextid", required = false) String nextid) {
@@ -88,7 +88,7 @@ public class CorporateActionInstructionController {
                 cftid, limit, sort, nextid);
 
         // Параметр cftid пока не используется, так как в таблице нет этого поля
-        List<CorporateActionInstruction> instructions = instructionViewService.getInstructions(null, limit, cftid, nextid);
+        List<CorporateActionViewInstruction> instructions = instructionViewService.getInstructions(null, limit, cftid, nextid);
         String nextId = instructionViewService.getNextId(instructions, limit);
 
         // Создаем ответ согласно спецификации API
@@ -102,7 +102,7 @@ public class CorporateActionInstructionController {
     // Вспомогательный класс для ответа со списком инструкций
     @lombok.Data
     public static class CorporateActionInstructionResponse {
-        private List<CorporateActionInstruction> data;
+        private List<CorporateActionViewInstruction> data;
         private String nextId;
     }
 

@@ -7,7 +7,7 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.data.domain.PageRequest;
 import org.springframework.stereotype.Service;
 import ru.rshbintech.it_invest.backoffice.myinvestment.corp.action.dao.CorporateActionInstructionDao;
-import ru.rshbintech.it_invest.backoffice.myinvestment.corp.action.dto.CorporateActionInstruction;
+import ru.rshbintech.it_invest.backoffice.myinvestment.corp.action.dto.CorporateActionViewInstruction;
 import ru.rshbintech.it_invest.backoffice.myinvestment.corp.action.dto.CorporateActionInstructionRequest;
 import ru.rshbintech.it_invest.backoffice.myinvestment.corp.action.dto.CorporateActionNotification;
 import ru.rshbintech.it_invest.backoffice.myinvestment.corp.action.entity.ViewCaInstruction;
@@ -32,14 +32,14 @@ public class InstructionViewService {
     private final ViewCaInstructionRepository instructionRepository;
     private final ObjectMapper objectMapper;
 
-    public Optional<CorporateActionInstruction> getInstructionByNumber(String instrNmb) {
+    public Optional<CorporateActionViewInstruction> getInstructionByNumber(String instrNmb) {
         try {
             UUID instrNumber = UUID.fromString(instrNmb);
             Optional<ViewCaInstruction> instruction = instructionRepository.findByInstrNmb(instrNumber);
 
             return instruction.map(viewInstruction -> {
                 try {
-                    return objectMapper.readValue(viewInstruction.getPayload(), CorporateActionInstruction.class);
+                    return objectMapper.readValue(viewInstruction.getPayload(), CorporateActionViewInstruction.class);
                 } catch (Exception e) {
                     log.error("Failed to deserialize instruction payload: {}", viewInstruction.getPayload(), e);
                     return null;
@@ -51,10 +51,10 @@ public class InstructionViewService {
         }
     }
 
-    public List<CorporateActionInstruction> getInstructions(String status,
-                                                            Integer limit,
-                                                            String cftid,
-                                                            String nextid) {
+    public List<CorporateActionViewInstruction> getInstructions(String status,
+                                                                Integer limit,
+                                                                String cftid,
+                                                                String nextid) {
         try {
             UUID nextIdLong = nextid != null ? UUID.fromString(nextid) : null;
             PageRequest pageRequest = PageRequest.of(0, limit != null ? limit : 50);
@@ -69,7 +69,7 @@ public class InstructionViewService {
             return instructions.stream()
                     .map(viewInstruction -> {
                         try {
-                            return objectMapper.readValue(viewInstruction.getPayload(), CorporateActionInstruction.class);
+                            return objectMapper.readValue(viewInstruction.getPayload(), CorporateActionViewInstruction.class);
                         } catch (Exception e) {
                             log.error("Failed to deserialize instruction payload: {}", viewInstruction.getPayload(), e);
                             return null;
@@ -83,21 +83,21 @@ public class InstructionViewService {
         }
     }
 
-    public String getNextId(List<CorporateActionInstruction> instructions, Integer limit) {
+    public String getNextId(List<CorporateActionViewInstruction> instructions, Integer limit) {
         if (instructions.size() < limit) {
             return null;
         }
 
-        CorporateActionInstruction lastInstruction = instructions.get(instructions.size() - 1);
+        CorporateActionViewInstruction lastInstruction = instructions.get(instructions.size() - 1);
         return lastInstruction.getInstrNmb();
     }
 
     public void postView(CorporateActionInstructionRequest instructionRequest) {
         String ownerSecurityID = instructionRequest.getBnfclOwnrDtls().getOwnerSecurityID();
         CorporateActionNotification corporateActionNotification = corporateActionInstructionAdapter.getCorporateActionNotification(Long.parseLong(ownerSecurityID));
-        CorporateActionInstruction corporateActionInstruction = instructionMapper.map(instructionRequest, corporateActionNotification);
+        CorporateActionViewInstruction corporateActionViewInstruction = instructionMapper.map(instructionRequest, corporateActionNotification);
         try {
-            corporateActionInstructionDao.saveInstructionView(corporateActionInstruction);
+            corporateActionInstructionDao.saveInstructionView(corporateActionViewInstruction);
         } catch (JsonProcessingException e) {
             log.error("Error saving viewInstruction", e);
         }

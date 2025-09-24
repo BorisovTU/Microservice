@@ -1,12 +1,14 @@
 package ru.rshbintech.it_invest.backoffice.myinvestment.corp.action.dto;
 
 import com.fasterxml.jackson.annotation.JsonFormat;
+import com.fasterxml.jackson.annotation.JsonProperty;
 import lombok.Data;
 
+import java.math.BigDecimal;
 import java.time.OffsetDateTime;
 
 @Data
-public class CorporateActionInstruction {
+public class CorporateActionViewInstruction {
     private String instrNmb;
 
     @JsonFormat(shape = JsonFormat.Shape.STRING, pattern = "yyyy-MM-dd'T'HH:mm:ssXXX")
@@ -40,5 +42,10 @@ public class CorporateActionInstruction {
     @Data
     public static class CorpActnOptnDtlsRequest {
         private String optnNb;
+        @JsonProperty("PricVal")
+        private BigDecimal pricVal;
+
+        @JsonProperty("PricValCcy")
+        private String pricValCcy;
     }
 }

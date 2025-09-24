@@ -1,7 +1,7 @@
 package ru.rshbintech.it_invest.backoffice.myinvestment.corp.action.mapper;
 
 import org.springframework.stereotype.Component;
-import ru.rshbintech.it_invest.backoffice.myinvestment.corp.action.dto.CorporateActionInstruction;
+import ru.rshbintech.it_invest.backoffice.myinvestment.corp.action.dto.CorporateActionViewInstruction;
 import ru.rshbintech.it_invest.backoffice.myinvestment.corp.action.dto.CorporateActionInstructionRequest;
 import ru.rshbintech.it_invest.backoffice.myinvestment.corp.action.dto.CorporateActionNotification;
 import ru.rshbintech.it_invest.backoffice.myinvestment.corp.action.dto.SendCorpActionsAssignmentReq;
@@ -9,16 +9,21 @@ import ru.rshbintech.it_invest.backoffice.myinvestment.corp.action.exception.Flk
 
 @Component
 public class InstructionMapper {
-    public CorporateActionInstruction map(CorporateActionInstructionRequest instruction, CorporateActionNotification notification) {
+    public CorporateActionViewInstruction map(CorporateActionInstructionRequest instruction, CorporateActionNotification notification) {
         String ownerSecurityID = instruction.getBnfclOwnrDtls().getOwnerSecurityID();
         String optnNb = instruction.getCorpActnOptnDtls().getOptnNb();
+        CorporateActionNotification.CorpActnOptnDtls optionDetails = getCorpActionOptDetailByOptNb(notification, optnNb);
 
-        CorporateActionInstruction.CorporateActionNotificationShort corpActionNotificationShort = mapCorporateActionNotificationShort(notification);
-        CorporateActionInstruction.BnfclOwnrDtlsShort bnfclOwnrDtlsShort = mapBnfclOwnrDtlsShort(notification, ownerSecurityID);
+        CorporateActionViewInstruction.CorporateActionNotificationShort corpActionNotificationShort = mapCorporateActionNotificationShort(notification);
+        CorporateActionViewInstruction.BnfclOwnrDtlsShort bnfclOwnrDtlsShort = mapBnfclOwnrDtlsShort(notification, ownerSecurityID);
 
-        CorporateActionInstruction result = new CorporateActionInstruction();
-        CorporateActionInstruction.CorpActnOptnDtlsRequest corpActnOptnDtls = new CorporateActionInstruction.CorpActnOptnDtlsRequest();
+        CorporateActionViewInstruction result = new CorporateActionViewInstruction();
+        CorporateActionViewInstruction.CorpActnOptnDtlsRequest corpActnOptnDtls = new CorporateActionViewInstruction.CorpActnOptnDtlsRequest();
         corpActnOptnDtls.setOptnNb(optnNb);
+        if (optionDetails != null) {
+            corpActnOptnDtls.setPricValCcy(optionDetails.getPricValCcy());
+            corpActnOptnDtls.setPricVal(optionDetails.getPricVal());
+        }
         result.setCorpActnOptnDtls(corpActnOptnDtls);
         result.setStatus("ACCEPTED");
         result.setBnfclOwnrDtls(bnfclOwnrDtlsShort);
@@ -40,10 +45,7 @@ public class InstructionMapper {
                 .orElseThrow(() -> new FlkException("OwnerSecurityId_NOT_AVAILABLE", "Owner Security Id не найден " + ownerSecurityID));
 
         // Находим данные варианта корпоративного действия
-        CorporateActionNotification.CorpActnOptnDtls optionDetails = notification.getCorpActnOptnDtls().stream()
-                .filter(corpActnOptnDtls -> corpActnOptnDtls.getOptnNb().equals(optnNb))
-                .findFirst()
-                .orElseThrow(() -> new FlkException("OptionNb_NOT_AVAILABLE", "Option Nb не найден " + optnNb));
+        CorporateActionNotification.CorpActnOptnDtls optionDetails = getCorpActionOptDetailByOptNb(notification, optnNb);
 
         SendCorpActionsAssignmentReq result = new SendCorpActionsAssignmentReq();
         SendCorpActionsAssignmentReq.SendCorpActionsAssignmentReqData reqData = new SendCorpActionsAssignmentReq.SendCorpActionsAssignmentReqData();
@@ -84,8 +86,15 @@ public class InstructionMapper {
         return result;
     }
 
-    private static CorporateActionInstruction.CorporateActionNotificationShort mapCorporateActionNotificationShort(CorporateActionNotification notification) {
-        CorporateActionInstruction.CorporateActionNotificationShort corpActionNotificationShort = new CorporateActionInstruction.CorporateActionNotificationShort();
+    private static CorporateActionNotification.CorpActnOptnDtls getCorpActionOptDetailByOptNb(CorporateActionNotification notification, String optnNb) {
+        return notification.getCorpActnOptnDtls().stream()
+                .filter(corpActnOptnDtls -> corpActnOptnDtls.getOptnNb().equals(optnNb))
+                .findFirst()
+                .orElseThrow(() -> new FlkException("OptionNb_NOT_AVAILABLE", "Option Nb не найден " + optnNb));
+    }
+
+    private static CorporateActionViewInstruction.CorporateActionNotificationShort mapCorporateActionNotificationShort(CorporateActionNotification notification) {
+        CorporateActionViewInstruction.CorporateActionNotificationShort corpActionNotificationShort = new CorporateActionViewInstruction.CorporateActionNotificationShort();
         corpActionNotificationShort.setCorpActnEvtId(notification.getCorpActnEvtId());
         corpActionNotificationShort.setAddtlInf(notification.getAddtlInf());
         corpActionNotificationShort.setCorporateActionType(notification.getCorporateActionType());
@@ -97,11 +106,11 @@ public class InstructionMapper {
         return corpActionNotificationShort;
     }
 
-    private static CorporateActionInstruction.BnfclOwnrDtlsShort mapBnfclOwnrDtlsShort(CorporateActionNotification notification, String ownerSecurityID) {
-        CorporateActionInstruction.BnfclOwnrDtlsShort bnfclOwnrDtlsShort = notification.getBnfclOwnrDtls().stream().filter(bnfclOwnrDtls -> bnfclOwnrDtls.getOwnerSecurityID().equals(ownerSecurityID))
+    private static CorporateActionViewInstruction.BnfclOwnrDtlsShort mapBnfclOwnrDtlsShort(CorporateActionNotification notification, String ownerSecurityID) {
+        CorporateActionViewInstruction.BnfclOwnrDtlsShort bnfclOwnrDtlsShort = notification.getBnfclOwnrDtls().stream().filter(bnfclOwnrDtls -> bnfclOwnrDtls.getOwnerSecurityID().equals(ownerSecurityID))
                 .findFirst()
                 .map(notifBnfclOwnrDtls -> {
-                    CorporateActionInstruction.BnfclOwnrDtlsShort result = new CorporateActionInstruction.BnfclOwnrDtlsShort();
+                    CorporateActionViewInstruction.BnfclOwnrDtlsShort result = new CorporateActionViewInstruction.BnfclOwnrDtlsShort();
                     result.setOwnerSecurityID(notifBnfclOwnrDtls.getOwnerSecurityID());
                     result.setAcct(notifBnfclOwnrDtls.getAcct());
                     result.setCftid(notifBnfclOwnrDtls.getCftid());
