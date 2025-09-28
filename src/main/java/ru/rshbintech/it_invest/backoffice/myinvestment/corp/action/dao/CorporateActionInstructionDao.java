@@ -16,6 +16,7 @@ import ru.rshbintech.it_invest.backoffice.myinvestment.corp.action.repository.Da
 import ru.rshbintech.it_invest.backoffice.myinvestment.corp.action.repository.DataCaOwnerBalanceRepository;
 import ru.rshbintech.it_invest.backoffice.myinvestment.corp.action.repository.ViewCaInstructionRepository;
 
+import java.math.BigDecimal;
 import java.time.OffsetDateTime;
 import java.util.UUID;
 
@@ -67,5 +68,14 @@ public class CorporateActionInstructionDao {
             dataCAInstruction.setOwnerSecurityId(parseLong(ownerSecurityID, "ownerSecurityId is not valid: {}"));
         }
         dataCAInstructionRepository.save(dataCAInstruction);
+    }
+
+    @Transactional
+    public BigDecimal getOwnerSecurityBalance(Long ownerSecurityID) {
+        DataCaOwnerBalance referenceById = dataCaOwnerBalanceRepository.getReferenceById(ownerSecurityID);
+        if (referenceById == null) {
+            return null;
+        }
+        return referenceById.getBal();
     }
 }

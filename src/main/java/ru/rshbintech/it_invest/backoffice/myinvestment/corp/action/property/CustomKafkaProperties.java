@@ -19,7 +19,7 @@ public class CustomKafkaProperties {
     private ConsumerProducerConfig internalInstruction = new ConsumerProducerConfig();
     private ProducerConfig instructionToDiasoft = new ProducerConfig();
     private ConsumerConfig internalInstructionView = new ConsumerConfig();
-
+    private StreamConsumerProducerConfig internalInstructionBalance = new StreamConsumerProducerConfig();
     // Базовый класс для конфигураций с Consumer
     @Setter
     @Getter
@@ -37,6 +37,14 @@ public class CustomKafkaProperties {
         private Producer producer = new Producer();
     }
 
+    @Getter
+    @Setter
+    public static class StreamConsumerProducerConfig {
+        private String topic;
+        private ShortConsumer consumer = new ShortConsumer();
+        private Producer producer = new Producer();
+    }
+
     // Базовый класс для конфигураций с Consumer и Producer
     @Setter
     @Getter
@@ -44,6 +52,13 @@ public class CustomKafkaProperties {
         private String topic;
         private Consumer consumer = new Consumer();
         private Producer producer = new Producer();
+    }
+
+    @Setter
+    @Getter
+    public static class ShortConsumer {
+        private String bootstrapServers;
+        private String groupId;
     }
 
     @Setter

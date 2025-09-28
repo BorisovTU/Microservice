@@ -13,10 +13,7 @@ import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.MissingServletRequestParameterException;
 import org.springframework.web.bind.annotation.*;
-import ru.rshbintech.it_invest.backoffice.myinvestment.corp.action.dto.CorporateActionInstructionRequest;
-import ru.rshbintech.it_invest.backoffice.myinvestment.corp.action.dto.CorporateActionViewInstruction;
-import ru.rshbintech.it_invest.backoffice.myinvestment.corp.action.dto.ErrorResponseDto;
-import ru.rshbintech.it_invest.backoffice.myinvestment.corp.action.dto.ValidationErrorResponseDto;
+import ru.rshbintech.it_invest.backoffice.myinvestment.corp.action.dto.*;
 import ru.rshbintech.it_invest.backoffice.myinvestment.corp.action.exception.FlkException;
 import ru.rshbintech.it_invest.backoffice.myinvestment.corp.action.service.CorporateActionInstructionAdapter;
 import ru.rshbintech.it_invest.backoffice.myinvestment.corp.action.service.InstructionViewService;
@@ -73,30 +70,28 @@ public class CorporateActionInstructionController {
     @Operation(summary = "Получение инструкций")
     @ApiResponses(value = {
             @ApiResponse(responseCode = "200", description = "Успешная обработка",
-                    content = @Content(schema = @Schema(implementation = CorporateActionViewInstruction.class))),
+                    content = @Content(schema = @Schema(implementation = CorporateActionInstructionResponse.class))),
             @ApiResponse(responseCode = "400", description = "Ошибка валидации",
                     content = @Content(schema = @Schema(implementation = ValidationErrorResponseDto.class))),
             @ApiResponse(responseCode = "500", description = "Внутренняя ошибка сервера",
                     content = @Content(schema = @Schema(implementation = ErrorResponseDto.class)))
     })
     @GetMapping("/instructions")
-    public ResponseEntity<?> getCorporateActionInstructions(
+    public ResponseEntity<CorporateActionInstructionResponse> getCorporateActionInstructions(
             @RequestParam(value = "cftid") String cftid,
             @RequestParam(value = "limit", defaultValue = "50") Integer limit,
-            @RequestParam(value = "sort", defaultValue = "InstrDt") String sort,
+            @RequestParam(value = "sort", defaultValue = "InstrDt") InstructionSortType sort,
             @RequestParam(value = "nextid", required = false) String nextid) {
 
         log.info("GET /instructions with cftid: {}, limit: {}, sort: {}, nextid: {}",
                 cftid, limit, sort, nextid);
 
-        // Параметр cftid пока не используется, так как в таблице нет этого поля
-        List<CorporateActionViewInstruction> instructions = instructionViewService.getInstructions(null, limit, cftid, nextid);
-        String nextId = instructionViewService.getNextId(instructions, limit);
+        InstructionViewService.PaginatedInstructionsResult result =
+                instructionViewService.getPaginatedInstructions(null, limit, cftid, sort.getValue(), nextid);
 
-        // Создаем ответ согласно спецификации API
         CorporateActionInstructionResponse response = new CorporateActionInstructionResponse();
-        response.setData(instructions);
-        response.setNextId(nextId);
+        response.setData(result.getInstructions());
+        response.setNextId(result.getNextId());
 
         return ResponseEntity.ok(response);
     }

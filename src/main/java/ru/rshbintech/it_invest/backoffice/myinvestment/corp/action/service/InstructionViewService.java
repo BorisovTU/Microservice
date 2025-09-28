@@ -2,9 +2,9 @@ package ru.rshbintech.it_invest.backoffice.myinvestment.corp.action.service;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import lombok.Data;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
-import org.springframework.data.domain.PageRequest;
 import org.springframework.stereotype.Service;
 import ru.rshbintech.it_invest.backoffice.myinvestment.corp.action.dao.CorporateActionInstructionDao;
 import ru.rshbintech.it_invest.backoffice.myinvestment.corp.action.dto.CorporateActionInstructionRequest;
@@ -13,11 +13,13 @@ import ru.rshbintech.it_invest.backoffice.myinvestment.corp.action.dto.Corporate
 import ru.rshbintech.it_invest.backoffice.myinvestment.corp.action.entity.ViewCaInstruction;
 import ru.rshbintech.it_invest.backoffice.myinvestment.corp.action.mapper.InstructionMapper;
 import ru.rshbintech.it_invest.backoffice.myinvestment.corp.action.repository.ViewCaInstructionRepository;
+import ru.rshbintech.it_invest.backoffice.myinvestment.corp.action.service.pagination.instruction.PaginationRequest;
+import ru.rshbintech.it_invest.backoffice.myinvestment.corp.action.service.pagination.instruction.InstructionPaginationStrategy;
+import ru.rshbintech.it_invest.backoffice.myinvestment.corp.action.service.pagination.instruction.PaginationStrategyFactory;
 
 import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
-import java.util.stream.Collectors;
 
 import static ru.rshbintech.it_invest.backoffice.myinvestment.corp.action.util.ParseUtil.parseLong;
 
@@ -31,6 +33,7 @@ public class InstructionViewService {
     private final CorporateActionInstructionDao corporateActionInstructionDao;
     private final ViewCaInstructionRepository instructionRepository;
     private final ObjectMapper objectMapper;
+    private final PaginationStrategyFactory paginationStrategyFactory;
 
     public Optional<CorporateActionViewInstruction> getInstructionByNumber(String instrNmb) {
         try {
@@ -51,45 +54,18 @@ public class InstructionViewService {
         }
     }
 
-    public List<CorporateActionViewInstruction> getInstructions(String status,
-                                                                Integer limit,
-                                                                String cftid,
-                                                                String nextid) {
+    public PaginatedInstructionsResult getPaginatedInstructions(String status, Integer limit,
+                                                                String cftid, String sort, String nextid) {
         try {
-            UUID nextIdLong = nextid != null ? UUID.fromString(nextid) : null;
-            PageRequest pageRequest = PageRequest.of(0, limit != null ? limit : 50);
+            Long cftidLong = parseLong(cftid, "cftid error format:{}");
+            PaginationRequest request = new PaginationRequest(cftidLong, status, limit, sort, nextid);
+            InstructionPaginationStrategy strategy = paginationStrategyFactory.getStrategy(request.getInstructionSortType());
 
-            List<ViewCaInstruction> instructions;
-            if (status != null) {
-                instructions = instructionRepository.findByStatusWithPagination(parseLong(cftid, "cftid error format:{}"), status, nextIdLong, pageRequest);
-            } else {
-                instructions = instructionRepository.findWithPagination(parseLong(cftid, "cftid error format:{}"), nextIdLong, pageRequest);
-            }
-
-            return instructions.stream()
-                    .map(viewInstruction -> {
-                        try {
-                            return objectMapper.readValue(viewInstruction.getPayload(), CorporateActionViewInstruction.class);
-                        } catch (Exception e) {
-                            log.error("Failed to deserialize instruction payload: {}", viewInstruction.getPayload(), e);
-                            return null;
-                        }
-                    })
-                    .filter(instruction -> instruction != null)
-                    .collect(Collectors.toList());
-        } catch (NumberFormatException e) {
-            log.error("Invalid nextid format: {}", nextid, e);
-            return List.of();
+            return strategy.getPaginatedInstructions(request, instructionRepository, objectMapper);
+        } catch (Exception e) {
+            log.error("Error getting paginated instructions: {}", e.getMessage(), e);
+            return new PaginatedInstructionsResult(List.of(), null);
         }
-    }
-
-    public String getNextId(List<CorporateActionViewInstruction> instructions, Integer limit) {
-        if (instructions.size() < limit) {
-            return null;
-        }
-
-        CorporateActionViewInstruction lastInstruction = instructions.get(instructions.size() - 1);
-        return lastInstruction.getInstrNmb();
     }
 
     public void postView(CorporateActionInstructionRequest instructionRequest) {
@@ -101,5 +77,11 @@ public class InstructionViewService {
         } catch (JsonProcessingException e) {
             log.error("Error saving viewInstruction", e);
         }
+    }
+
+    @Data
+    public static class PaginatedInstructionsResult {
+        private final List<CorporateActionViewInstruction> instructions;
+        private final String nextId;
     }
 }

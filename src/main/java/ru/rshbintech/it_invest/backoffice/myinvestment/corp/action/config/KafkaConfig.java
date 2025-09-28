@@ -1,30 +1,42 @@
 package ru.rshbintech.it_invest.backoffice.myinvestment.corp.action.config;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import jakarta.annotation.PostConstruct;
 import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
 import org.apache.kafka.clients.consumer.ConsumerConfig;
 import org.apache.kafka.clients.producer.ProducerConfig;
 import org.apache.kafka.common.serialization.Deserializer;
+import org.apache.kafka.common.serialization.Serdes;
 import org.apache.kafka.common.serialization.StringDeserializer;
 import org.apache.kafka.common.serialization.StringSerializer;
+import org.apache.kafka.streams.StreamsConfig;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.kafka.config.ConcurrentKafkaListenerContainerFactory;
+import org.springframework.kafka.config.StreamsBuilderFactoryBeanConfigurer;
 import org.springframework.kafka.core.*;
 import org.springframework.kafka.support.serializer.JsonDeserializer;
+import org.springframework.kafka.support.serializer.JsonSerde;
 import org.springframework.kafka.support.serializer.JsonSerializer;
 import ru.rshbintech.it_invest.backoffice.myinvestment.corp.action.dto.CorporateActionInstructionRequest;
 import ru.rshbintech.it_invest.backoffice.myinvestment.corp.action.dto.CorporateActionNotificationDto;
 import ru.rshbintech.it_invest.backoffice.myinvestment.corp.action.dto.SendCorpActionsAssignmentReq;
 import ru.rshbintech.it_invest.backoffice.myinvestment.corp.action.property.CustomKafkaProperties;
 
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
 import java.util.HashMap;
 import java.util.Map;
+import java.util.Properties;
 
 import static ru.rshbintech.it_invest.backoffice.myinvestment.corp.action.constant.BeanConstants.*;
 
 @Configuration
 @RequiredArgsConstructor
+@Slf4j
 public class KafkaConfig {
     private final CustomKafkaProperties kafkaProperties;
     private final ObjectMapper objectMapper;
@@ -122,6 +134,13 @@ public class KafkaConfig {
                 kafkaProperties.getInternalInstruction().getConsumer().getConcurrency());
     }
 
+    @Bean(name = INTERNAL_INSTRUCTION_BALANCE_VERIFIYER_CONSUMER_FACTORY)
+    public StreamsBuilderFactoryBeanConfigurer configurer() {
+        return factoryBean -> {
+            factoryBean.setStreamsConfiguration(getStreamsConfig());
+        };
+    }
+
     private <T> ConcurrentKafkaListenerContainerFactory<String, T> createListenerContainerFactory(
             ConsumerFactory<String, T> consumerFactory, int concurrency) {
         ConcurrentKafkaListenerContainerFactory<String, T> factory =
@@ -139,6 +158,11 @@ public class KafkaConfig {
     @Bean
     public ProducerFactory<String, Object> internalInstructionProducerFactory() {
         return createProducerFactory(kafkaProperties.getInternalInstruction().getProducer());
+    }
+
+    @Bean
+    public ProducerFactory<String, CorporateActionNotificationDto> internalInstructionBalanceProducerFactory() {
+        return createProducerFactory(kafkaProperties.getInternalInstructionBalance().getProducer());
     }
 
     @Bean
@@ -179,7 +203,23 @@ public class KafkaConfig {
     }
 
     @Bean
+    public KafkaTemplate<String, CorporateActionInstructionRequest> internalInstructionBalanceKafkaTemplate() {
+        return new KafkaTemplate(internalInstructionBalanceProducerFactory());
+    }
+
+    @Bean
     public KafkaTemplate<String, SendCorpActionsAssignmentReq> instructionToDiasoftKafkaTemplate() {
         return new KafkaTemplate(instructionToDiasoftProducerFactory());
+    }
+
+    private Properties getStreamsConfig() {
+        Properties props = new Properties();
+        props.put(StreamsConfig.APPLICATION_ID_CONFIG, "instruction-processor");
+        props.put(StreamsConfig.BOOTSTRAP_SERVERS_CONFIG, kafkaProperties.getInternalInstructionBalance().getConsumer().getBootstrapServers());
+        props.put(StreamsConfig.DEFAULT_KEY_SERDE_CLASS_CONFIG, Serdes.String().getClass());
+        props.put(StreamsConfig.DEFAULT_VALUE_SERDE_CLASS_CONFIG, JsonSerde.class);
+        props.put(JsonDeserializer.VALUE_DEFAULT_TYPE, CorporateActionInstructionRequest.class);
+        props.put(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "earliest");
+        return props;
     }
 }

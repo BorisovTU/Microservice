@@ -12,6 +12,8 @@ import ru.rshbintech.it_invest.backoffice.myinvestment.corp.action.dto.SendCorpA
 import ru.rshbintech.it_invest.backoffice.myinvestment.corp.action.mapper.InstructionMapper;
 import ru.rshbintech.it_invest.backoffice.myinvestment.corp.action.property.CustomKafkaProperties;
 
+import java.math.BigDecimal;
+
 @Slf4j
 @Service
 @RequiredArgsConstructor
@@ -32,5 +34,9 @@ public class InstructionProcessorService {
         } catch (JsonProcessingException e) {
             log.error("Error saving instruction", e);
         }
+    }
+
+    public BigDecimal getInternalInstructionLimit(Long ownerSecurityID) {
+        return corporateActionInstructionDao.getOwnerSecurityBalance(ownerSecurityID);
     }
 }

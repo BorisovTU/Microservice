@@ -8,6 +8,7 @@ import jakarta.validation.constraints.NotBlank;
 import jakarta.validation.constraints.NotNull;
 import lombok.Data;
 
+import java.math.BigDecimal;
 import java.time.OffsetDateTime;
 
 @Data
@@ -25,7 +26,7 @@ public class CorporateActionInstructionRequest {
 
     @NotNull(message = "Bal is required")
     @JsonProperty("Bal")
-    private Number bal;
+    private BigDecimal bal;
 
     @Valid
     @NotNull(message = "BnfclOwnrDtls is required")

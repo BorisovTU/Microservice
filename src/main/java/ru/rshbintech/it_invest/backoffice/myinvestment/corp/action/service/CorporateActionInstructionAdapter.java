@@ -24,13 +24,13 @@ import static ru.rshbintech.it_invest.backoffice.myinvestment.corp.action.util.P
 public class CorporateActionInstructionAdapter {
     private final ObjectMapper objectMapper;
     private final CorporateActionInstructionDao corporateActionInstructionDao;
-    private final KafkaTemplate<String, CorporateActionInstructionRequest> internalInstructionKafkaTemplate;
+    private final KafkaTemplate<String, CorporateActionInstructionRequest> internalInstructionBalanceKafkaTemplate;
     private final CustomKafkaProperties customKafkaProperties;
 
     public void processInstruction(@Valid CorporateActionInstructionRequest instructionRequest) throws JsonProcessingException {
         validate(instructionRequest);
-        String topic = customKafkaProperties.getInternalInstruction().getTopic();
-        internalInstructionKafkaTemplate.send(topic, instructionRequest.getBnfclOwnrDtls().getOwnerSecurityID(), instructionRequest);
+        String topic = customKafkaProperties.getInternalInstructionBalance().getTopic();
+        internalInstructionBalanceKafkaTemplate.send(topic, instructionRequest.getBnfclOwnrDtls().getOwnerSecurityID(), instructionRequest);
     }
 
     private void validate(CorporateActionInstructionRequest instructionRequest) {
