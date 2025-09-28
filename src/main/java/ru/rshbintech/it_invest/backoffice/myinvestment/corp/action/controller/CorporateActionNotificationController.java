@@ -20,7 +20,7 @@ import ru.rshbintech.it_invest.backoffice.myinvestment.corp.action.service.Notif
 @RequestMapping("/api/v1")
 @RequiredArgsConstructor
 @Slf4j
-public class CorporateActionController {
+public class CorporateActionNotificationController {
 
     private final NotificationViewService notificationViewService;
 
