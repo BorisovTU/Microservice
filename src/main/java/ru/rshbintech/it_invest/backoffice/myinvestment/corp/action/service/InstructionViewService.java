@@ -13,8 +13,8 @@ import ru.rshbintech.it_invest.backoffice.myinvestment.corp.action.dto.Corporate
 import ru.rshbintech.it_invest.backoffice.myinvestment.corp.action.entity.ViewCaInstruction;
 import ru.rshbintech.it_invest.backoffice.myinvestment.corp.action.mapper.InstructionMapper;
 import ru.rshbintech.it_invest.backoffice.myinvestment.corp.action.repository.ViewCaInstructionRepository;
-import ru.rshbintech.it_invest.backoffice.myinvestment.corp.action.service.pagination.instruction.PaginationRequest;
 import ru.rshbintech.it_invest.backoffice.myinvestment.corp.action.service.pagination.instruction.InstructionPaginationStrategy;
+import ru.rshbintech.it_invest.backoffice.myinvestment.corp.action.service.pagination.instruction.PaginationRequest;
 import ru.rshbintech.it_invest.backoffice.myinvestment.corp.action.service.pagination.instruction.PaginationStrategyFactory;
 
 import java.util.List;

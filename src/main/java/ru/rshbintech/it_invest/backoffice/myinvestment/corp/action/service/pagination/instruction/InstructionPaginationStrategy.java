@@ -7,6 +7,7 @@ import ru.rshbintech.it_invest.backoffice.myinvestment.corp.action.repository.Vi
 import ru.rshbintech.it_invest.backoffice.myinvestment.corp.action.service.InstructionViewService;
 
 import java.util.List;
+import java.util.Objects;
 import java.util.stream.Collectors;
 
 public interface InstructionPaginationStrategy {
@@ -25,7 +26,7 @@ public interface InstructionPaginationStrategy {
                         return null;
                     }
                 })
-                .filter(instruction -> instruction != null)
+                .filter(Objects::nonNull)
                 .collect(Collectors.toList());
     }
 }

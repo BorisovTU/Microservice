@@ -1,6 +1,5 @@
 package ru.rshbintech.it_invest.backoffice.myinvestment.corp.action.repository;
 
-import org.springframework.data.domain.Pageable;
 import org.springframework.data.jpa.repository.JpaRepository;
 import org.springframework.data.jpa.repository.Query;
 import org.springframework.data.repository.query.Param;
@@ -28,7 +27,7 @@ public interface ViewCaInstructionRepository extends JpaRepository<ViewCaInstruc
     ORDER BY
         v.instr_dt ASC,
         v.instr_nmb ASC
-	fetch first :limit row only
+   fetch first :limit row only
 """, nativeQuery = true)
     List<ViewCaInstruction> findWithInstrDtPagination(@Param("cftid") Long cftid,
                                                       @Param("nextInstrDt") OffsetDateTime nextInstrDt,
@@ -47,7 +46,7 @@ public interface ViewCaInstructionRepository extends JpaRepository<ViewCaInstruc
     ORDER BY
         v.instr_dt ASC,
         v.instr_nmb ASC
-	fetch first :limit row only
+   fetch first :limit row only
 """, nativeQuery = true)
     List<ViewCaInstruction> findByStatusWithInstrDtPagination(@Param("cftid") Long cftid,
                                                               @Param("status") String status,

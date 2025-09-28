@@ -1,7 +1,6 @@
 package ru.rshbintech.it_invest.backoffice.myinvestment.corp.action.config;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
-import jakarta.annotation.PostConstruct;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.kafka.clients.consumer.ConsumerConfig;
@@ -24,10 +23,6 @@ import ru.rshbintech.it_invest.backoffice.myinvestment.corp.action.dto.Corporate
 import ru.rshbintech.it_invest.backoffice.myinvestment.corp.action.dto.SendCorpActionsAssignmentReq;
 import ru.rshbintech.it_invest.backoffice.myinvestment.corp.action.property.CustomKafkaProperties;
 
-import java.io.IOException;
-import java.nio.file.Files;
-import java.nio.file.Path;
-import java.nio.file.Paths;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.Properties;
@@ -136,9 +131,8 @@ public class KafkaConfig {
 
     @Bean(name = INTERNAL_INSTRUCTION_BALANCE_VERIFIYER_CONSUMER_FACTORY)
     public StreamsBuilderFactoryBeanConfigurer configurer() {
-        return factoryBean -> {
+        return factoryBean ->
             factoryBean.setStreamsConfiguration(getStreamsConfig());
-        };
     }
 
     private <T> ConcurrentKafkaListenerContainerFactory<String, T> createListenerContainerFactory(
