@@ -42,7 +42,6 @@ public class NotificationMapper {
                 notificationForCftId.getCorporateActionNotification().setBnfclOwnrDtls(ownersForCftId);
 
                 ViewCANotification viewEntity = new ViewCANotification();
-//                viewEntity.setId(UUID.randomUUID());
                 viewEntity.setCaid(Long.parseLong(corporateActionNotification.getCorporateActionIssuerID()));
                 viewEntity.setCreateDateTime(OffsetDateTime.now());
                 viewEntity.setCftid(Long.parseLong(cftId));
