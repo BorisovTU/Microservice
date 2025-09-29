@@ -33,8 +33,13 @@ public class OwnerBalanceMapper {
                 entity.setBal(owner.getBal());
                 entity.setCreateDateTime(OffsetDateTime.now());
                 entity.setCaid(caid);
-                entity.setCftid(Long.parseLong(owner.getCftid()));
-
+                try {
+                    entity.setCftid(Long.parseLong(owner.getCftid()));
+                } catch (NumberFormatException e) {
+                    log.info("Error while parsing cftId. Number format exception for: {}",
+                            owner);
+                    return;
+                }
                 entities.add(entity);
             });
         }
