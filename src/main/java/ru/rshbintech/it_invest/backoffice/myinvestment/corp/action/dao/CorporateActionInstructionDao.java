@@ -18,6 +18,7 @@ import ru.rshbintech.it_invest.backoffice.myinvestment.corp.action.repository.Vi
 
 import java.math.BigDecimal;
 import java.time.OffsetDateTime;
+import java.util.Optional;
 import java.util.UUID;
 
 import static ru.rshbintech.it_invest.backoffice.myinvestment.corp.action.util.ParseUtil.parseLong;
@@ -33,12 +34,12 @@ public class CorporateActionInstructionDao {
     private final DataCAInstructionRepository dataCAInstructionRepository;
 
     public String getNotificationPayload(Long ownerId) {
-        DataCaOwnerBalance referenceById = dataCaOwnerBalanceRepository.getReferenceById(ownerId);
-        if (referenceById == null) {
+        Optional<DataCaOwnerBalance> referenceById = dataCaOwnerBalanceRepository.findById(ownerId);
+        if (referenceById.isEmpty()) {
             log.error("Can't find reference by id {}", ownerId);
             throw new FlkException("Entity not found", "No owner balance found for id: " + ownerId);
         }
-        return corporateActionNotificationDao.getByCaIdAndCftId(referenceById.getCaid(), referenceById.getCftid());
+        return corporateActionNotificationDao.getByCaIdAndCftId(referenceById.get().getCaid(), referenceById.get().getCftid());
     }
 
     @Transactional
@@ -51,7 +52,7 @@ public class CorporateActionInstructionDao {
         if (instruction.getBnfclOwnrDtls() != null) {
             viewInstruction.setCftid(parseLong(instruction.getBnfclOwnrDtls().getCftid(), "cftid is not valid: {}"));
         }
-        viewInstruction.setInstrNmb(UUID.fromString(instruction.getInstrNmb()));
+        viewInstruction.setInstrNmb(instruction.getInstrNmb());
         viewInstructionRepository.save(viewInstruction);
     }
 
@@ -72,10 +73,10 @@ public class CorporateActionInstructionDao {
 
     @Transactional
     public BigDecimal getOwnerSecurityBalance(Long ownerSecurityID) {
-        DataCaOwnerBalance referenceById = dataCaOwnerBalanceRepository.getReferenceById(ownerSecurityID);
-        if (referenceById == null) {
+        Optional<DataCaOwnerBalance> referenceById = dataCaOwnerBalanceRepository.findById(ownerSecurityID);
+        if (referenceById.isEmpty()) {
             return null;
         }
-        return referenceById.getBal();
+        return referenceById.get().getBal();
     }
 }

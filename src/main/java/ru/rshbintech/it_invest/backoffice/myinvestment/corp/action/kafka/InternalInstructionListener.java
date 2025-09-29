@@ -28,6 +28,7 @@ import ru.rshbintech.it_invest.backoffice.myinvestment.corp.action.service.Instr
 import ru.rshbintech.it_invest.backoffice.myinvestment.corp.action.service.InstructionViewService;
 
 import java.math.BigDecimal;
+import java.util.UUID;
 
 @EnableKafka
 @EnableKafkaStreams
@@ -108,7 +109,7 @@ public class InternalInstructionListener {
                 });
 
         // 4. Объединяем с агрегированными балансами и проверяем лимит
-        KStream<String, CorporateActionInstructionRequest> validatedInstructions = validationStream
+        KStream<UUID, CorporateActionInstructionRequest> validatedInstructions = validationStream
                 .leftJoin(clientBalances,
                         (instruction, totalBalance) -> {
                             if (totalBalance == null) {
@@ -138,14 +139,14 @@ public class InternalInstructionListener {
                     return isValid;
                 })
                 .map((clientId, validationResult) -> {
-                    // Возвращаем оригинальный ключ или создаем новый
-                    String originalKey = validationResult.getInstruction().getInstrNmb(); // или другой уникальный идентификатор
+
+                    UUID originalKey = UUID.fromString(validationResult.getInstruction().getInstrNmb());
                     return KeyValue.pair(originalKey, validationResult.getInstruction());
                 });
 
         // 5. Отправляем validated инструкции в выходной топик
         validatedInstructions.to(kafkaProperties.getInternalInstruction().getTopic(),
-                Produced.with(Serdes.String(), new JsonSerde<>(CorporateActionInstructionRequest.class)));
+                Produced.with(Serdes.UUID(), new JsonSerde<>(CorporateActionInstructionRequest.class)));
 
         log.info("Processing Balance Validation finished");
     }

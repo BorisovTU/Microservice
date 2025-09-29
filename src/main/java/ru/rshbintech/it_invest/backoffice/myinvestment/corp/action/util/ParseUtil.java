@@ -5,10 +5,7 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.util.StringUtils;
 
 import java.io.IOException;
-import java.time.LocalDate;
-import java.time.LocalDateTime;
-import java.time.OffsetDateTime;
-import java.time.ZoneOffset;
+import java.time.*;
 import java.time.format.DateTimeFormatter;
 import java.time.format.DateTimeParseException;
 
@@ -17,6 +14,8 @@ import java.time.format.DateTimeParseException;
 public final class ParseUtil {
     private static final DateTimeFormatter[] FORMATTERS = {
             DateTimeFormatter.ISO_OFFSET_DATE_TIME,
+            DateTimeFormatter.ofPattern("yyyy-MM-dd'T'HH:mm:ss.SSSX"),
+            DateTimeFormatter.ofPattern("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'"),
             DateTimeFormatter.ISO_LOCAL_DATE_TIME,
             DateTimeFormatter.ISO_LOCAL_DATE
     };
@@ -66,6 +65,14 @@ public final class ParseUtil {
                 log.error(message, value);
             }
         }
+
+        try {
+            Instant instant = Instant.parse(value);
+            return OffsetDateTime.ofInstant(instant, ZoneOffset.UTC);
+        } catch (DateTimeParseException e) {
+            log.error("{}: {}", message, value, e);
+        }
+
         return null;
     }
 }

@@ -7,6 +7,8 @@ import ru.rshbintech.it_invest.backoffice.myinvestment.corp.action.dto.Corporate
 import ru.rshbintech.it_invest.backoffice.myinvestment.corp.action.dto.SendCorpActionsAssignmentReq;
 import ru.rshbintech.it_invest.backoffice.myinvestment.corp.action.exception.FlkException;
 
+import java.util.UUID;
+
 @Component
 public class InstructionMapper {
     private static CorporateActionNotification.CorpActnOptnDtls getCorpActionOptDetailByOptNb(CorporateActionNotification notification, String optnNb) {
@@ -64,7 +66,7 @@ public class InstructionMapper {
         result.setBnfclOwnrDtls(bnfclOwnrDtlsShort);
         result.setBal(instruction.getBal());
         result.setInstrDt(instruction.getInstrDt());
-        result.setInstrNmb(instruction.getInstrNmb());
+        result.setInstrNmb(UUID.fromString(instruction.getInstrNmb()));
         result.setCorporateActionNotification(corpActionNotificationShort);
         return result;
     }
@@ -92,7 +94,7 @@ public class InstructionMapper {
         instructionData.setCftid(ownerDetails.getCftid());
         instructionData.setOwnerSecurityID(ownerSecurityID);
         instructionData.setInstrDt(instruction.getInstrDt());
-        instructionData.setInstrNmb(instruction.getInstrNmb());
+        instructionData.setInstrNmb(UUID.fromString(instruction.getInstrNmb()));
 
         // Заполняем финансовый инструмент
         SendCorpActionsAssignmentReq.FinInstrmIdData finInstrmIdData = new SendCorpActionsAssignmentReq.FinInstrmIdData();

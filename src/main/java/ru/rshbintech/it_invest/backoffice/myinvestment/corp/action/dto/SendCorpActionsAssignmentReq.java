@@ -6,6 +6,7 @@ import com.fasterxml.jackson.annotation.JsonProperty;
 import lombok.Data;
 
 import java.time.OffsetDateTime;
+import java.util.UUID;
 
 @Data
 @JsonIgnoreProperties(ignoreUnknown = true)
@@ -41,7 +42,7 @@ public class SendCorpActionsAssignmentReq {
         private OffsetDateTime instrDt;
 
         @JsonProperty("InstrNmb")
-        private String instrNmb;
+        private UUID instrNmb;
 
         @JsonProperty("FinInstrmId")
         private FinInstrmIdData finInstrmId;
