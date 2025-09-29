@@ -13,6 +13,8 @@ import java.util.Map;
 @Component
 @ConfigurationProperties(prefix = "kafka")
 public class CustomKafkaProperties {
+    private String streamTopicPrefix;
+    private String streamTopicClientBalancesGlobal;
     private ConsumerConfig notificationFromDiasoft = new ConsumerConfig();
     private ConsumerProducerConfig internalNotification = new ConsumerProducerConfig();
     private ConsumerConfig internalNotificationOwnerBalance = new ConsumerConfig();
@@ -20,6 +22,9 @@ public class CustomKafkaProperties {
     private ProducerConfig instructionToDiasoft = new ProducerConfig();
     private ConsumerConfig internalInstructionView = new ConsumerConfig();
     private StreamConsumerProducerConfig internalInstructionBalance = new StreamConsumerProducerConfig();
+
+    public String ClientBalancesStore;
+
     // Базовый класс для конфигураций с Consumer
     @Setter
     @Getter

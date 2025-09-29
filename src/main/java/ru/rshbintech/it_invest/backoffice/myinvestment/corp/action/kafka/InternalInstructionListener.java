@@ -63,7 +63,7 @@ public class InternalInstructionListener {
 
     @Autowired
     public void processBalanceValidation(StreamsBuilder streamsBuilder) {
-        log.info("Processing Balance Validation started");
+        log.info("Processing Balance Validation with GlobalKTable started");
 
         // Создаем Serde для BigDecimal
         Serde<BigDecimal> bigDecimalSerde = Serdes.serdeFrom(
@@ -71,49 +71,69 @@ public class InternalInstructionListener {
                 new BigDecimalDeserializer()
         );
 
-        // 1. Сначала маппим в пары (clientId, balance)
-        KStream<String, BigDecimal> instructionBalances = streamsBuilder
+        // 1. Агрегируем ВСЕ записи из топика в KTable
+        KTable<String, BigDecimal> clientBalancesTable = streamsBuilder
                 .stream(kafkaProperties.getInternalInstruction().getTopic(),
                         Consumed.with(Serdes.String(), new JsonSerde<>(CorporateActionInstructionRequest.class)))
                 .map((key, instruction) -> {
                     String clientId = instruction.getBnfclOwnrDtls().getOwnerSecurityID();
                     BigDecimal balance = instruction.getBal();
-                    log.info("MAPPING - clientId: {}, balance: {}", clientId, balance);
+                    log.info("PROCESSING RECORD - clientId: {}, balance: {}, instructionId: {}",
+                            clientId, balance, instruction.getInstrNmb());
                     return KeyValue.pair(clientId, balance);
-                });
-
-        // 2. Группируем по ключу и агрегируем суммы
-        KTable<String, BigDecimal> clientBalances = instructionBalances
+                }, Named.as("balance-mapper"))
                 .groupByKey(Grouped.with(Serdes.String(), bigDecimalSerde))
                 .aggregate(
-                        () -> BigDecimal.ZERO,
+                        () -> {
+                            log.info("INITIALIZING AGGREGATE for new client");
+                            return BigDecimal.ZERO;
+                        },
                         (clientId, newBalance, aggregate) -> {
                             BigDecimal result = aggregate.add(newBalance);
-                            log.info("AGGREGATE - clientId: {}, newBalance: {}, previousTotal: {}, newTotal: {}",
+                            log.info("AGGREGATE UPDATE - clientId: {}, newBalance: {}, previousTotal: {}, newTotal: {}",
                                     clientId, newBalance, aggregate, result);
                             return result;
                         },
-                        Materialized.<String, BigDecimal, KeyValueStore<Bytes, byte[]>>as("client-balances-aggregate")
+                        Materialized.<String, BigDecimal, KeyValueStore<Bytes, byte[]>>as(kafkaProperties.getClientBalancesStore())
                                 .withKeySerde(Serdes.String())
                                 .withValueSerde(bigDecimalSerde)
                 );
 
-        // 3. Обрабатываем входящие инструкции для проверки баланса
+        // 2. Преобразуем KTable в поток обновлений и записываем в топик для GlobalKTable
+        String globalTableTopic = kafkaProperties.getStreamTopicClientBalancesGlobal();
+        clientBalancesTable
+                .toStream()
+                .to(globalTableTopic, Produced.with(Serdes.String(), bigDecimalSerde));
+
+        // 3. Создаем GlobalKTable из топика с агрегированными балансами
+        GlobalKTable<String, BigDecimal> clientBalancesGlobal = streamsBuilder
+                .globalTable(globalTableTopic,
+                        Consumed.with(Serdes.String(), bigDecimalSerde),
+                        Materialized.<String, BigDecimal, KeyValueStore<Bytes, byte[]>>as("client-balances-global-store")
+                                .withKeySerde(Serdes.String())
+                                .withValueSerde(bigDecimalSerde));
+
+        // 4. Обрабатываем входящие инструкции для проверки баланса
         KStream<String, CorporateActionInstructionRequest> validationStream = streamsBuilder
                 .stream(kafkaProperties.getInternalInstructionBalance().getTopic(),
                         Consumed.with(Serdes.String(), new JsonSerde<>(CorporateActionInstructionRequest.class)))
                 .map((key, instruction) -> {
-                    // Используем clientId как ключ для join
                     String clientId = instruction.getBnfclOwnrDtls().getOwnerSecurityID();
+                    log.info("VALIDATION INPUT - clientId: {}, instructionId: {}",
+                            clientId, instruction.getInstrNmb());
                     return KeyValue.pair(clientId, instruction);
-                });
+                }, Named.as("validation-mapper"));
 
-        // 4. Объединяем с агрегированными балансами и проверяем лимит
+        // 5. Объединяем с GlobalKTable и проверяем лимит
         KStream<UUID, CorporateActionInstructionRequest> validatedInstructions = validationStream
-                .leftJoin(clientBalances,
+                .leftJoin(clientBalancesGlobal,
+                        (clientId, instruction) -> clientId,
                         (instruction, totalBalance) -> {
+                            // Если баланс не найден, значит клиент новый или нет операций
                             if (totalBalance == null) {
                                 totalBalance = BigDecimal.ZERO;
+                                log.info("NO PREVIOUS BALANCE FOUND for client: {}",
+                                        instruction.getBnfclOwnrDtls().getOwnerSecurityID());
                             }
 
                             BigDecimal clientLimit = instructionService.getInternalInstructionLimit(
@@ -126,29 +146,30 @@ public class InternalInstructionListener {
                                     instruction.getBal(), newTotal, clientLimit);
 
                             return new ValidationResult(instruction, newTotal, clientLimit);
-                        },
-                        Joined.with(
-                                Serdes.String(), // Key
-                                new JsonSerde<>(CorporateActionInstructionRequest.class), // Left value
-                                bigDecimalSerde // Right value
-                        ))
+                        })
                 .filter((clientId, validationResult) -> {
                     boolean isValid = validationResult.getNewTotal().compareTo(validationResult.getClientLimit()) <= 0;
-                    log.info("FILTER - clientId: {}, newTotal: {}, limit: {}, valid: {}",
-                            clientId, validationResult.getNewTotal(), validationResult.getClientLimit(), isValid);
+                    if (isValid) {
+                        log.info("VALIDATION PASSED - clientId: {}, newTotal: {}, limit: {}",
+                                clientId, validationResult.getNewTotal(), validationResult.getClientLimit());
+                    } else {
+                        log.warn("VALIDATION FAILED - clientId: {}, newTotal: {}, limit: {}",
+                                clientId, validationResult.getNewTotal(), validationResult.getClientLimit());
+                    }
                     return isValid;
-                })
+                }, Named.as("balance-validator"))
                 .map((clientId, validationResult) -> {
-
                     UUID originalKey = UUID.fromString(validationResult.getInstruction().getInstrNmb());
+                    log.info("SENDING VALIDATED INSTRUCTION - instructionId: {}, clientId: {}",
+                            originalKey, clientId);
                     return KeyValue.pair(originalKey, validationResult.getInstruction());
-                });
+                }, Named.as("result-mapper"));
 
-        // 5. Отправляем validated инструкции в выходной топик
+        // 6. Отправляем validated инструкции в выходной топик
         validatedInstructions.to(kafkaProperties.getInternalInstruction().getTopic(),
                 Produced.with(Serdes.UUID(), new JsonSerde<>(CorporateActionInstructionRequest.class)));
 
-        log.info("Processing Balance Validation finished");
+        log.info("Processing Balance Validation with GlobalKTable finished");
     }
 
     @Data
