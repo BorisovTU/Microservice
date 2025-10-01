@@ -6,6 +6,7 @@ import lombok.Data;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
+import org.springframework.util.StringUtils;
 import ru.rshbintech.it_invest.backoffice.myinvestment.corp.action.dao.CorporateActionInstructionDao;
 import ru.rshbintech.it_invest.backoffice.myinvestment.corp.action.dto.CorporateActionInstructionRequest;
 import ru.rshbintech.it_invest.backoffice.myinvestment.corp.action.dto.CorporateActionNotification;
@@ -70,12 +71,22 @@ public class InstructionViewService {
 
     public void postView(CorporateActionInstructionRequest instructionRequest) {
         String ownerSecurityID = instructionRequest.getBnfclOwnrDtls().getOwnerSecurityID();
-        CorporateActionNotification corporateActionNotification = corporateActionInstructionAdapter.getCorporateActionNotification(Long.parseLong(ownerSecurityID));
-        CorporateActionViewInstruction corporateActionViewInstruction = instructionMapper.mapToInstructionView(instructionRequest, corporateActionNotification);
+        if (!StringUtils.hasText(ownerSecurityID)) {
+            log.error("OwnerSecutityId must not be empty");
+            return;
+        }
         try {
+            long ownerSecurityIDLong = Long.parseLong(ownerSecurityID);
+            CorporateActionNotification corporateActionNotification = corporateActionInstructionAdapter.getCorporateActionNotification(ownerSecurityIDLong);
+            CorporateActionViewInstruction corporateActionViewInstruction = instructionMapper.mapToInstructionView(instructionRequest, corporateActionNotification);
             corporateActionInstructionDao.saveInstructionView(corporateActionViewInstruction);
+
+        } catch (NumberFormatException e) {
+            log.error("OwnerSecutityId format exception:{}", ownerSecurityID);
+            throw new RuntimeException(e);
         } catch (JsonProcessingException e) {
             log.error("Error saving viewInstruction", e);
+            throw new RuntimeException(e);
         }
     }
 

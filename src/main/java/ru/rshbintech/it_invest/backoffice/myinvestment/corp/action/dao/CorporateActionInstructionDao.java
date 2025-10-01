@@ -19,7 +19,6 @@ import ru.rshbintech.it_invest.backoffice.myinvestment.corp.action.repository.Vi
 import java.math.BigDecimal;
 import java.time.OffsetDateTime;
 import java.util.Optional;
-import java.util.UUID;
 
 import static ru.rshbintech.it_invest.backoffice.myinvestment.corp.action.util.ParseUtil.parseLong;
 

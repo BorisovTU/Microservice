@@ -53,10 +53,7 @@ public final class ParseUtil {
         for (DateTimeFormatter formatter : FORMATTERS) {
             try {
                 if (formatter == DateTimeFormatter.ISO_LOCAL_DATE) {
-                    log.info("Parsing ISO_LOCAL_DATE start: {}", value);
                     LocalDate localDate = LocalDate.parse(value, formatter);
-                    log.info("localDate: {}", localDate);
-
                     return localDate.atStartOfDay(ZoneOffset.UTC).toOffsetDateTime();
                 } else if (formatter == DateTimeFormatter.ISO_LOCAL_DATE_TIME) {
                     LocalDateTime localDateTime = LocalDateTime.parse(value, formatter);
