@@ -48,7 +48,7 @@ public class InternalInstructionListener {
     )
     @Transactional
     public void processInstructionView(CorporateActionInstructionRequest instructionRequest) {
-        instructionViewService.postView(instructionRequest);
+        instructionViewService.postSuccessView(instructionRequest);
     }
 
     @KafkaListener(
@@ -59,6 +59,17 @@ public class InternalInstructionListener {
     @Transactional
     public void processInstruction(CorporateActionInstructionRequest instructionRequest) {
         instructionService.processInstruction(instructionRequest);
+    }
+
+    @KafkaListener(
+            groupId = "${kafka.internal-instruction.consumer.group-id}",
+            topics = "${kafka.internal-instruction.topic-dlq}",
+            containerFactory = BeanConstants.INTERNAL_INSTRUCTION_VIEW_CONSUMER_FACTORY
+    )
+    @Transactional
+    public void processInstructionBadView(CorporateActionInstructionRequest instructionRequest) {
+        instructionViewService.postBadView(instructionRequest);
+
     }
 
     @Autowired
@@ -125,7 +136,7 @@ public class InternalInstructionListener {
                 }, Named.as("validation-mapper"));
 
         // 5. Объединяем с GlobalKTable и проверяем лимит
-        KStream<UUID, CorporateActionInstructionRequest> validatedInstructions = validationStream
+        KStream<String, ValidationResult> validationResults = validationStream
                 .leftJoin(clientBalancesGlobal,
                         (clientId, instruction) -> clientId,
                         (instruction, totalBalance) -> {
@@ -146,27 +157,56 @@ public class InternalInstructionListener {
                                     instruction.getBal(), newTotal, clientLimit);
 
                             return new ValidationResult(instruction, newTotal, clientLimit);
-                        })
-                .filter((clientId, validationResult) -> {
-                    boolean isValid = validationResult.getNewTotal().compareTo(validationResult.getClientLimit()) <= 0;
-                    if (isValid) {
-                        log.info("VALIDATION PASSED - clientId: {}, newTotal: {}, limit: {}",
-                                clientId, validationResult.getNewTotal(), validationResult.getClientLimit());
-                    } else {
-                        log.warn("VALIDATION FAILED - clientId: {}, newTotal: {}, limit: {}",
-                                clientId, validationResult.getNewTotal(), validationResult.getClientLimit());
-                    }
-                    return isValid;
-                }, Named.as("balance-validator"))
+                        });
+
+        // 6. Разделяем поток на валидные и невалидные инструкции используя branch()
+        @SuppressWarnings("unchecked")
+        KStream<String, ValidationResult>[] branches = validationResults
+                .branch(
+                        (clientId, validationResult) -> {
+                            // Первая ветка - валидные инструкции
+                            boolean isValid = validationResult.getNewTotal().compareTo(validationResult.getClientLimit()) <= 0;
+                            if (isValid) {
+                                log.info("VALIDATION PASSED - clientId: {}, newTotal: {}, limit: {}",
+                                        clientId, validationResult.getNewTotal(), validationResult.getClientLimit());
+                            }
+                            return isValid;
+                        },
+                        (clientId, validationResult) -> {
+                            // Вторая ветка - невалидные инструкции
+                            boolean isValid = validationResult.getNewTotal().compareTo(validationResult.getClientLimit()) <= 0;
+                            if (!isValid) {
+                                log.warn("VALIDATION FAILED - clientId: {}, newTotal: {}, limit: {}",
+                                        clientId, validationResult.getNewTotal(), validationResult.getClientLimit());
+                            }
+                            return !isValid;
+                        }
+                );
+
+        // 7. Обрабатываем валидные инструкции
+        KStream<UUID, CorporateActionInstructionRequest> validatedInstructions = branches[0]
                 .map((clientId, validationResult) -> {
                     UUID originalKey = UUID.fromString(validationResult.getInstruction().getInstrNmb());
                     log.info("SENDING VALIDATED INSTRUCTION - instructionId: {}, clientId: {}",
                             originalKey, clientId);
                     return KeyValue.pair(originalKey, validationResult.getInstruction());
-                }, Named.as("result-mapper"));
+                }, Named.as("valid-result-mapper"));
 
-        // 6. Отправляем validated инструкции в выходной топик
+        // 8. Обрабатываем невалидные инструкции
+        KStream<UUID, CorporateActionInstructionRequest> rejectedInstructions = branches[1]
+                .map((clientId, validationResult) -> {
+                    UUID originalKey = UUID.fromString(validationResult.getInstruction().getInstrNmb());
+                    log.warn("SENDING REJECTED INSTRUCTION TO DLQ - instructionId: {}, clientId: {}, newTotal: {}, limit: {}",
+                            originalKey, clientId, validationResult.getNewTotal(), validationResult.getClientLimit());
+                    return KeyValue.pair(originalKey, validationResult.getInstruction());
+                }, Named.as("rejected-result-mapper"));
+
+        // 9. Отправляем validated инструкции в выходной топик
         validatedInstructions.to(kafkaProperties.getInternalInstruction().getTopic(),
+                Produced.with(Serdes.UUID(), new JsonSerde<>(CorporateActionInstructionRequest.class)));
+
+        // 10. Отправляем rejected инструкции в DLQ топик
+        rejectedInstructions.to(kafkaProperties.getInternalInstruction().getTopicDlq(),
                 Produced.with(Serdes.UUID(), new JsonSerde<>(CorporateActionInstructionRequest.class)));
 
         log.info("Processing Balance Validation with GlobalKTable finished");

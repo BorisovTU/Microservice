@@ -11,6 +11,7 @@ import ru.rshbintech.it_invest.backoffice.myinvestment.corp.action.dao.Corporate
 import ru.rshbintech.it_invest.backoffice.myinvestment.corp.action.dto.CorporateActionInstructionRequest;
 import ru.rshbintech.it_invest.backoffice.myinvestment.corp.action.dto.CorporateActionNotification;
 import ru.rshbintech.it_invest.backoffice.myinvestment.corp.action.dto.CorporateActionViewInstruction;
+import ru.rshbintech.it_invest.backoffice.myinvestment.corp.action.dto.InsgtructionBalanceStatus;
 import ru.rshbintech.it_invest.backoffice.myinvestment.corp.action.entity.ViewCaInstruction;
 import ru.rshbintech.it_invest.backoffice.myinvestment.corp.action.mapper.InstructionMapper;
 import ru.rshbintech.it_invest.backoffice.myinvestment.corp.action.repository.ViewCaInstructionRepository;
@@ -69,7 +70,12 @@ public class InstructionViewService {
         }
     }
 
-    public void postView(CorporateActionInstructionRequest instructionRequest) {
+    public void postSuccessView(CorporateActionInstructionRequest instructionRequest) {
+        InsgtructionBalanceStatus status = InsgtructionBalanceStatus.ACCEPTED;
+        postView(instructionRequest, status);
+    }
+
+    private void postView(CorporateActionInstructionRequest instructionRequest, InsgtructionBalanceStatus status) {
         String ownerSecurityID = instructionRequest.getBnfclOwnrDtls().getOwnerSecurityID();
         if (!StringUtils.hasText(ownerSecurityID)) {
             log.error("OwnerSecutityId must not be empty");
@@ -78,7 +84,7 @@ public class InstructionViewService {
         try {
             long ownerSecurityIDLong = Long.parseLong(ownerSecurityID);
             CorporateActionNotification corporateActionNotification = corporateActionInstructionAdapter.getCorporateActionNotification(ownerSecurityIDLong);
-            CorporateActionViewInstruction corporateActionViewInstruction = instructionMapper.mapToInstructionView(instructionRequest, corporateActionNotification);
+            CorporateActionViewInstruction corporateActionViewInstruction = instructionMapper.mapToInstructionView(instructionRequest, corporateActionNotification, status);
             corporateActionInstructionDao.saveInstructionView(corporateActionViewInstruction);
 
         } catch (NumberFormatException e) {
@@ -88,6 +94,11 @@ public class InstructionViewService {
             log.error("Error saving viewInstruction", e);
             throw new RuntimeException(e);
         }
+    }
+
+    public void postBadView(CorporateActionInstructionRequest instructionRequest) {
+        InsgtructionBalanceStatus status = InsgtructionBalanceStatus.OUT_OF_BALANCE;
+        postView(instructionRequest, status);
     }
 
     @Data

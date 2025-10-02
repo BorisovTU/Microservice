@@ -18,7 +18,7 @@ public class CustomKafkaProperties {
     private ConsumerConfig notificationFromDiasoft = new ConsumerConfig();
     private ConsumerProducerConfig internalNotification = new ConsumerProducerConfig();
     private ConsumerConfig internalNotificationOwnerBalance = new ConsumerConfig();
-    private ConsumerProducerConfig internalInstruction = new ConsumerProducerConfig();
+    private ConsumerProducerConfigDlq internalInstruction = new ConsumerProducerConfigDlq();
     private ProducerConfig instructionToDiasoft = new ProducerConfig();
     private ConsumerConfig internalInstructionView = new ConsumerConfig();
     private StreamConsumerProducerConfig internalInstructionBalance = new StreamConsumerProducerConfig();
@@ -57,6 +57,12 @@ public class CustomKafkaProperties {
         private String topic;
         private Consumer consumer = new Consumer();
         private Producer producer = new Producer();
+    }
+
+    @Setter
+    @Getter
+    public static class ConsumerProducerConfigDlq extends ConsumerProducerConfig {
+        private String topicDlq;
     }
 
     @Setter

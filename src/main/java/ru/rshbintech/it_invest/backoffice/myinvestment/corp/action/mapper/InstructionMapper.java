@@ -1,10 +1,7 @@
 package ru.rshbintech.it_invest.backoffice.myinvestment.corp.action.mapper;
 
 import org.springframework.stereotype.Component;
-import ru.rshbintech.it_invest.backoffice.myinvestment.corp.action.dto.CorporateActionInstructionRequest;
-import ru.rshbintech.it_invest.backoffice.myinvestment.corp.action.dto.CorporateActionNotification;
-import ru.rshbintech.it_invest.backoffice.myinvestment.corp.action.dto.CorporateActionViewInstruction;
-import ru.rshbintech.it_invest.backoffice.myinvestment.corp.action.dto.SendCorpActionsAssignmentReq;
+import ru.rshbintech.it_invest.backoffice.myinvestment.corp.action.dto.*;
 import ru.rshbintech.it_invest.backoffice.myinvestment.corp.action.exception.FlkException;
 
 import java.util.UUID;
@@ -46,7 +43,9 @@ public class InstructionMapper {
         return bnfclOwnrDtlsShort;
     }
 
-    public CorporateActionViewInstruction mapToInstructionView(CorporateActionInstructionRequest instruction, CorporateActionNotification notification) {
+    public CorporateActionViewInstruction mapToInstructionView(CorporateActionInstructionRequest instruction,
+                                                               CorporateActionNotification notification,
+                                                               InsgtructionBalanceStatus status) {
         String ownerSecurityID = instruction.getBnfclOwnrDtls().getOwnerSecurityID();
         String optnNb = instruction.getCorpActnOptnDtls().getOptnNb();
         CorporateActionNotification.CorpActnOptnDtls optionDetails = getCorpActionOptDetailByOptNb(notification, optnNb);
@@ -62,7 +61,7 @@ public class InstructionMapper {
             corpActnOptnDtls.setPricVal(optionDetails.getPricVal());
         }
         result.setCorpActnOptnDtls(corpActnOptnDtls);
-        result.setStatus("ACCEPTED");
+        result.setStatus(status.name());
         result.setBnfclOwnrDtls(bnfclOwnrDtlsShort);
         result.setBal(instruction.getBal());
         result.setInstrDt(instruction.getInstrDt());
