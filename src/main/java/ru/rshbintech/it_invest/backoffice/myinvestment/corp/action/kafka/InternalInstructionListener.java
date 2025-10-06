@@ -92,7 +92,7 @@ public class InternalInstructionListener {
                     log.info("PROCESSING RECORD - clientId: {}, balance: {}, instructionId: {}",
                             clientId, balance, instruction.getInstrNmb());
                     return KeyValue.pair(clientId, balance);
-                }, Named.as("balance-mapper"))
+                }, Named.as("balance-mapper-new"))
                 .groupByKey(Grouped.with(Serdes.String(), bigDecimalSerde))
                 .aggregate(
                         () -> {
@@ -120,7 +120,7 @@ public class InternalInstructionListener {
         GlobalKTable<String, BigDecimal> clientBalancesGlobal = streamsBuilder
                 .globalTable(globalTableTopic,
                         Consumed.with(Serdes.String(), bigDecimalSerde),
-                        Materialized.<String, BigDecimal, KeyValueStore<Bytes, byte[]>>as("client-balances-global-store")
+                        Materialized.<String, BigDecimal, KeyValueStore<Bytes, byte[]>>as("client-balances-global-store-new")
                                 .withKeySerde(Serdes.String())
                                 .withValueSerde(bigDecimalSerde));
 
@@ -190,7 +190,7 @@ public class InternalInstructionListener {
                     log.info("SENDING VALIDATED INSTRUCTION - instructionId: {}, clientId: {}",
                             originalKey, clientId);
                     return KeyValue.pair(originalKey, validationResult.getInstruction());
-                }, Named.as("valid-result-mapper"));
+                }, Named.as("valid-result-mapper-new"));
 
         // 8. Обрабатываем невалидные инструкции
         KStream<UUID, CorporateActionInstructionRequest> rejectedInstructions = branches[1]
@@ -199,12 +199,13 @@ public class InternalInstructionListener {
                     log.warn("SENDING REJECTED INSTRUCTION TO DLQ - instructionId: {}, clientId: {}, newTotal: {}, limit: {}",
                             originalKey, clientId, validationResult.getNewTotal(), validationResult.getClientLimit());
                     return KeyValue.pair(originalKey, validationResult.getInstruction());
-                }, Named.as("rejected-result-mapper"));
+                }, Named.as("rejected-result-mapper-new"));
 
+        log.info("validated instructions: {}", validatedInstructions);
         // 9. Отправляем validated инструкции в выходной топик
         validatedInstructions.to(kafkaProperties.getInternalInstruction().getTopic(),
                 Produced.with(Serdes.UUID(), new JsonSerde<>(CorporateActionInstructionRequest.class)));
-
+        log.info("rejected instructions: {}", rejectedInstructions);
         // 10. Отправляем rejected инструкции в DLQ топик
         rejectedInstructions.to(kafkaProperties.getInternalInstruction().getTopicDlq(),
                 Produced.with(Serdes.UUID(), new JsonSerde<>(CorporateActionInstructionRequest.class)));

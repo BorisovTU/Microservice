@@ -17,6 +17,7 @@ public class DataCAInstruction {
     private UUID id;
 
     private Long ownerSecurityId;
+    private UUID instrNmb;
 
     @Column(name = "create_date_time")
     private OffsetDateTime createDateTime;

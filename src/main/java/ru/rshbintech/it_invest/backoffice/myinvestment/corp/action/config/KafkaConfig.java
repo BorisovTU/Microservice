@@ -210,6 +210,7 @@ public class KafkaConfig {
         Properties props = new Properties();
         props.put(StreamsConfig.APPLICATION_ID_CONFIG, kafkaProperties.getStreamTopicPrefix());
         props.put(StreamsConfig.BOOTSTRAP_SERVERS_CONFIG, kafkaProperties.getInternalInstructionBalance().getConsumer().getBootstrapServers());
+        props.put(ConsumerConfig.GROUP_ID_CONFIG, kafkaProperties.getInternalInstructionBalance().getConsumer().getGroupId());
         props.put(StreamsConfig.DEFAULT_KEY_SERDE_CLASS_CONFIG, Serdes.String().getClass());
         props.put(StreamsConfig.DEFAULT_VALUE_SERDE_CLASS_CONFIG, JsonSerde.class);
         props.put(JsonDeserializer.VALUE_DEFAULT_TYPE, CorporateActionInstructionRequest.class);

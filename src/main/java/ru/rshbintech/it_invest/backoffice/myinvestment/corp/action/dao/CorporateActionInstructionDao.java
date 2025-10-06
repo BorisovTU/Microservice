@@ -19,6 +19,7 @@ import ru.rshbintech.it_invest.backoffice.myinvestment.corp.action.repository.Vi
 import java.math.BigDecimal;
 import java.time.OffsetDateTime;
 import java.util.Optional;
+import java.util.UUID;
 
 import static ru.rshbintech.it_invest.backoffice.myinvestment.corp.action.util.ParseUtil.parseLong;
 
@@ -66,6 +67,7 @@ public class CorporateActionInstructionDao {
                 && corporateActionInstruction.getSendCorpActionsAssignmentReq().getCorporateActionInstruction() != null) {
             String ownerSecurityID = corporateActionInstruction.getSendCorpActionsAssignmentReq().getCorporateActionInstruction().getOwnerSecurityID();
             dataCAInstruction.setOwnerSecurityId(parseLong(ownerSecurityID, "ownerSecurityId is not valid: {}"));
+            dataCAInstruction.setInstrNmb(corporateActionInstruction.getSendCorpActionsAssignmentReq().getCorporateActionInstruction().getInstrNmb());
         }
         dataCAInstructionRepository.save(dataCAInstruction);
     }
@@ -77,5 +79,13 @@ public class CorporateActionInstructionDao {
             return null;
         }
         return referenceById.get().getBal();
+    }
+
+    public boolean existsInstructionViewByInstrNmb(UUID instrNmb) {
+        return viewInstructionRepository.existsByInstrNmb(instrNmb);
+    }
+
+    public boolean existsInstructionByInstrNmb(UUID instrNmb) {
+        return dataCAInstructionRepository.existsByInstrNmb(instrNmb);
     }
 }

@@ -13,6 +13,7 @@ import ru.rshbintech.it_invest.backoffice.myinvestment.corp.action.mapper.Instru
 import ru.rshbintech.it_invest.backoffice.myinvestment.corp.action.property.CustomKafkaProperties;
 
 import java.math.BigDecimal;
+import java.util.UUID;
 
 @Slf4j
 @Service
@@ -25,6 +26,15 @@ public class InstructionProcessorService {
     private final CorporateActionInstructionDao corporateActionInstructionDao;
 
     public void processInstruction(CorporateActionInstructionRequest instructionRequest) {
+        if (instructionRequest.getInstrNmb() == null) {
+            log.error("No instrument number");
+            return;
+        }
+        UUID instrNmber = UUID.fromString(instructionRequest.getInstrNmb());
+        if (corporateActionInstructionDao.existsInstructionByInstrNmb(instrNmber)) {
+            log.error("Duplicate instrument number");
+            return;
+        }
         String ownerSecurityID = instructionRequest.getBnfclOwnrDtls().getOwnerSecurityID();
         CorporateActionNotification corporateActionNotification = corporateActionInstructionAdapter.getCorporateActionNotification(Long.parseLong(ownerSecurityID));
         SendCorpActionsAssignmentReq corporateActionInstruction = instructionMapper.mapToSendCorpActionsAssignmentReq(instructionRequest, corporateActionNotification);

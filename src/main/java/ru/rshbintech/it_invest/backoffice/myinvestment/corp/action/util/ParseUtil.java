@@ -49,7 +49,7 @@ public final class ParseUtil {
         return null;
     }
 
-    public static OffsetDateTime parseOffsetDateTime(String value, String message) throws IOException {
+    public static OffsetDateTime parseOffsetDateTime(String value, String message) {
         for (DateTimeFormatter formatter : FORMATTERS) {
             try {
                 if (formatter == DateTimeFormatter.ISO_LOCAL_DATE) {

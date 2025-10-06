@@ -100,4 +100,5 @@ public interface ViewCaInstructionRepository extends JpaRepository<ViewCaInstruc
                                                              @Param("nextInstrNmb") UUID nextInstrNmb,
                                                              @Param("limit") Integer limit);
 
+    boolean existsByInstrNmb(UUID instrNmb);
 }

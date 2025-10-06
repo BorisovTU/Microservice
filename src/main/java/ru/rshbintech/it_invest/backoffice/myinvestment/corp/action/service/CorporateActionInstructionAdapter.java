@@ -15,8 +15,11 @@ import ru.rshbintech.it_invest.backoffice.myinvestment.corp.action.exception.Flk
 import ru.rshbintech.it_invest.backoffice.myinvestment.corp.action.property.CustomKafkaProperties;
 
 import java.time.LocalDate;
+import java.time.OffsetDateTime;
+import java.util.UUID;
 
 import static ru.rshbintech.it_invest.backoffice.myinvestment.corp.action.util.ParseUtil.parseLocalDate;
+import static ru.rshbintech.it_invest.backoffice.myinvestment.corp.action.util.ParseUtil.parseOffsetDateTime;
 
 @Slf4j
 @Service
@@ -34,9 +37,33 @@ public class CorporateActionInstructionAdapter {
     }
 
     private void validate(CorporateActionInstructionRequest instructionRequest) {
+        if (corporateActionInstructionDao.existsInstructionViewByInstrNmb(UUID.fromString(instructionRequest.getInstrNmb()))) {
+            throw new FlkException("DUBLICATE","Инструкция с данным instrNmb уже существует");
+        }
         long ownerSecurityID = Long.parseLong(instructionRequest.getBnfclOwnrDtls().getOwnerSecurityID());
         CorporateActionNotification corporateActionNotification = getCorporateActionNotification(ownerSecurityID);
         String optnNb = instructionRequest.getCorpActnOptnDtls().getOptnNb();
+        validateOptDate(corporateActionNotification, optnNb);
+        validateCaDateTime(corporateActionNotification);
+    }
+
+    private static void validateCaDateTime(CorporateActionNotification corporateActionNotification) {
+        CorporateActionNotification.RspnPrd actnPrd = corporateActionNotification.getActnPrd();
+        if (actnPrd != null) {
+            LocalDate caStart = parseLocalDate(actnPrd.getStartDt(), "invalid startDt format: {}");
+            if (caStart != null && caStart.isAfter(LocalDate.now())) {
+                log.error("Дата начала действия опции еще не наступила");
+                throw new FlkException("DATE_NOT_STARTED", "Дата начала действия КД еще не наступила");
+            }
+            OffsetDateTime caEnd = parseOffsetDateTime(actnPrd.getRspnDdln(),"Время действия предложения уже завершилось или было отменено");
+            if (caEnd != null && caEnd.isBefore(OffsetDateTime.now())) {
+                log.error("Время действия предложения уже завершилось или было отменено");
+                throw new FlkException("DATE_ALREADY_END", "Время действия КД уже завершилось или было отменено");
+            }
+        }
+    }
+
+    private static void validateOptDate(CorporateActionNotification corporateActionNotification, String optnNb) {
         if (corporateActionNotification.getCorpActnOptnDtls() != null) {
             CorporateActionNotification.CorpActnOptnDtls corpActnOptnDtls = corporateActionNotification.getCorpActnOptnDtls().stream()
                     .filter(dtls -> optnNb.equals(dtls.getOptnNb())).findFirst().orElseThrow(() -> new FlkException("corpActnOptnDtls_NOT_AVAILABLE", "Опция не найдена " + optnNb));
