@@ -17,6 +17,7 @@ public class CorporateActionViewInstruction {
 
     private Number bal;
     private String status;
+    private String rejectedReason;
     private CorporateActionNotificationShort corporateActionNotification;
     private BnfclOwnrDtlsShort bnfclOwnrDtls;
     private CorpActnOptnDtlsRequest corpActnOptnDtls;

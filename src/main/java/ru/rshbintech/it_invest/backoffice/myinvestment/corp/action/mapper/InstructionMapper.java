@@ -6,6 +6,8 @@ import ru.rshbintech.it_invest.backoffice.myinvestment.corp.action.exception.Flk
 
 import java.util.UUID;
 
+import static ru.rshbintech.it_invest.backoffice.myinvestment.corp.action.dto.InsgtructionBalanceStatus.ACCEPTED;
+
 @Component
 public class InstructionMapper {
     private static CorporateActionNotification.CorpActnOptnDtls getCorpActionOptDetailByOptNb(CorporateActionNotification notification, String optnNb) {
@@ -61,7 +63,10 @@ public class InstructionMapper {
             corpActnOptnDtls.setPricVal(optionDetails.getPricVal());
         }
         result.setCorpActnOptnDtls(corpActnOptnDtls);
-        result.setStatus(status.name());
+        result.setStatus(status.getName());
+        if (!ACCEPTED.equals(status)) {
+            result.setRejectedReason(status.getDescription());
+        }
         result.setBnfclOwnrDtls(bnfclOwnrDtlsShort);
         result.setBal(instruction.getBal());
         result.setInstrDt(instruction.getInstrDt());
