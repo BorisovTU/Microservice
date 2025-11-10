@@ -1,3 +1,5 @@
+https://gitlab.rshbdev.ru/rshbintech/it-invest/backoffice/micro/sofr-micro/rsbankws-proxy/-/merge_requests/35
+
 # Прокси-сервис для RSBankWS
 
 [[_TOC_]]
