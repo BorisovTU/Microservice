@@ -4,10 +4,11 @@ import org.apache.ibatis.annotations.Mapper;
 import org.springframework.lang.NonNull;
 import ru.rshbintech.rsbankws.proxy.model.storedproc.CondorGetLastSofrSequenceDealCall;
 
+import java.util.Map;
+
 @Mapper
 public interface CondorSofrBufferTableDao {
 
-    void callCondorGetLastSofrSequenceDeal(
+    Map<String, Object> callCondorGetLastSofrSequenceDeal(
             @NonNull CondorGetLastSofrSequenceDealCall condorGetLastSofrSequenceDealCall);
-
 }
