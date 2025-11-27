@@ -1,0 +1,734 @@
+/*
+ $Name: nptxrectb010.mac
+ $Module: Ценные бумаги
+ $Description: Операция пересчета СНОБ. Шаг "Пересчет"
+ */
+
+import DealsInter, "nptxstbfun.mac";
+
+PRIVATE MACRO Error( ErrStr:STRING ):INTEGER
+  DL_NPTX_PutMsg( ErrStr, 10 );
+  MsgBox( ErrStr );
+  return 1;
+END;
+
+PRIVATE MACRO LoadTBByStorID(stb, ClientID:integer, SNOBRecordID:string)
+  var query, cmd, DataSet;
+
+  stb.Clear();
+
+  query =   " select * "
+          + "   from dnptxtotalbase_dbt "
+          + "  where t_ClientID = ? "
+          + "    and t_StorID = ? ";
+
+  cmd = DL_RSDCommand(query);
+  cmd.AddParam(ClientID);
+  cmd.AddParam(SNOBRecordID);
+
+  DataSet = cmd.Execute();
+  if(DataSet.moveNext())
+    DataSet.GetRecord().CopyTo(stb.rec);
+  end;   
+END;
+
+private macro GetSystDateTime(SystDate:@date, SystTime:@time)
+  var cmd = DL_RSDCommand("select sysdate dt from dual");
+  var DataSet = cmd.execute();
+
+  DataSet.moveNext();
+
+  DtTmSplit(DataSet.dt, SystDate, SystTime);
+end;
+
+private macro YesNoWin(msg:string)
+  Array Text;
+  Array Button;
+  Button(0) = "Нет";
+  Button(1) = "Да";
+  var but, ind = 0;
+
+  Text(ind) = msg;
+  but = ConfWin(Text,Button);
+  
+  return but;
+end;
+
+private macro SetTbBuffStateProcInOp(nptxop, BFID)
+  var err = 0;
+
+  err = DL_ChangeStatusTbBuf(BFID, NPTXTBBUF_STATUS_PROCESSED);
+  if(not err)
+    //Запомним обработанную в операции запись буферной таблицы
+    if(DL_SetDocGrDeal(0, DL_TBBFREC, BFID, nptxop.rec.DocKind, nptxop.rec.ID) != 0)
+      err = Error( "Ошибка при сохранении информации об обработанной записи из буферной таблицы с ID = " + BFID );
+    end;
+  end;
+
+  return err;
+end; 
+
+private macro CheckAndCancelFindSTB(nptxop, FindSTB)
+  var err = 0;
+
+  if(FindSTB.rec.ConfirmState == NPTXTOTALBASE_CONFIRMSTATE_CONFIRMED)
+    if(FindSTB.rec.StorState == NPTXTOTALBASE_STORSTATE_ACTIVE)
+      FindSTB.rec.ConfirmState = NPTXTOTALBASE_CONFIRMSTATE_NOTCONFIRMED; //Не подтверждена
+      FindSTB.rec.StorState    = NPTXTOTALBASE_STORSTATE_CANCELED;        //Отмененная
+      FindSTB.rec.IdentErrStr  = "";
+      FindSTB.rec.NeedRecalc   = "";
+      
+      err = CheckAndSaveSTB(FindSTB);
+      if(err)
+        err = Error("   Ошибка при обновлении записи события СНОБ с ID = " + FindSTB.rec.TBID);
+      else
+        DL_NPTX_PutMsg( "   Для записи события СНОБ с ID = "+FindSTB.rec.TBID+" установлен статус \"Отмененная\"", 0 );
+      end;
+    elif(FindSTB.rec.StorState == NPTXTOTALBASE_STORSTATE_CANCELED)
+      DL_NPTX_PutMsg( "Запись с ID "+FindSTB.rec.StorID+" в Хранилище СОФР имеет статус отменена. Повторный пересчет будет возможен, после восстановления записи в Хранилище СОФР.\n", 20 );
+      
+      //Запомним клиента, чтобы пропустить по нему оставшиеся записи
+      if(DL_SetDocGrDeal(0, DLDOC_PARTY, FindSTB.rec.ClientID, nptxop.rec.DocKind, nptxop.rec.ID) != 0)
+        err = Error( "Ошибка при сохранении информации об обработке клиента с ID = " + FindSTB.rec.ClientID );
+      end;
+      
+      return err;
+    end;
+  else 
+    DL_NPTX_PutMsg( "Запись с ID "+FindSTB.rec.StorID+" в Хранилище СОФР имеет статус отменена. Повторный пересчет будет возможен, после восстановления записи в Хранилище СОФР.\n", 20 );
+    
+    //Запомним клиента, чтобы пропустить по нему оставшиеся записи
+    if(DL_SetDocGrDeal(0, DLDOC_PARTY, FindSTB.rec.ClientID, nptxop.rec.DocKind, nptxop.rec.ID) != 0)
+      err = Error( "Ошибка при сохранении информации об обработке клиента с ID = " + FindSTB.rec.ClientID );
+    end;
+    
+    return err;
+  end;
+
+  return err;
+end;
+
+private macro ПересчетПриИзмененииРезидентства(nptxop, tbbuf, FindSTB, ClientName)
+  var addFindSTB = TRecHandler("nptxtotalbase.dbt");
+  var STB = TRecHandler("nptxtotalbase.dbt");
+  var STB_2 = TRecHandler("nptxtotalbase.dbt");
+  var STB_3 = TRecHandler("nptxtotalbase.dbt");
+  var Доход_13 = $0;
+  var Доход_15 = $0;
+  var Доход_30 = $0;
+  var err = 0;
+  var skipClientID = -1;
+  var ДоходСуммарный_13 = $0, НалогИсчСуммарный_13 = $0;
+  var ДоходСуммарный_15 = $0, НалогИсчСуммарный_15 = $0;
+  var ДоходСуммарный_30 = $0, НалогИсчСуммарный_30 = $0;
+  var WasSkip = false;
+  var addFindSTBArr = TArray();
+
+  var FindTaxBaseKind = FindSTB.rec.TaxBaseKind;
+
+  if((FindSTB.rec.TaxBaseKind != NPTXTOTALBASE_TAXBASEKIND_IIS) and (РАБОТА_В_РЕЖИМЕ_СНОБ() == true))
+    FindTaxBaseKind = string(NPTXTOTALBASE_TAXBASEKIND_BROK) + ", " + string(NPTXTOTALBASE_TAXBASEKIND_ONB);
+  end;
+
+  addFindSTB.Clear();
+  
+  STB_LoadAddSTBArr(@addFindSTBArr, FindSTB);
+  if(addFindSTBArr.size > 0)
+    copy(addFindSTB, addFindSTBArr[0]);
+  end;
+
+  err = CheckAndCancelFindSTB(nptxop, FindSTB);
+  if((not err) and (addFindSTB.rec.TBID > 0))
+    err = CheckAndCancelFindSTB(nptxop, addFindSTB);
+  end;
+
+  if(not err)
+    err = SetTbBuffStateProcInOp(nptxop, tbbuf.rec.BFID);
+    if(not err)
+      STB_GetSumTB(FindSTB.rec.ClientID, FindTaxBaseKind, FindSTB.rec.TaxPeriod, int(NPTXGENTAXRATE_RESIDENT*100),    FindSTB.rec.TBID, @ДоходСуммарный_13, @НалогИсчСуммарный_13);
+      STB_GetSumTB(FindSTB.rec.ClientID, FindTaxBaseKind, FindSTB.rec.TaxPeriod, int(NPTXGENTAXRATE_RESIDENT_15*100), FindSTB.rec.TBID, @ДоходСуммарный_15, @НалогИсчСуммарный_15);
+      STB_GetSumTB(FindSTB.rec.ClientID, FindTaxBaseKind, FindSTB.rec.TaxPeriod, int(NPTXGENTAXRATE_NOTRESIDENT*100), FindSTB.rec.TBID, @ДоходСуммарный_30, @НалогИсчСуммарный_30);
+      
+      STB_InitSTBByFindSTB(STB, FindSTB, NULL, nptxop, tbbuf);
+
+      if(STB_IsResidentStatus(tbbuf.rec.TaxResidentFlag) == true)
+        Доход_13 = max(0, min(STB.rec.RecSTaxBase + FindSTB.rec.TaxBaseCurrPay + addFindSTB.rec.TaxBaseCurrPay, NPTX_LIMINCOME_MAX15) - STB.rec.RecSTaxBase);
+        Доход_15 = FindSTB.rec.TaxBaseCurrPay + addFindSTB.rec.TaxBaseCurrPay - Доход_13;
+      else
+        Доход_30 = FindSTB.rec.TaxBaseCurrPay + addFindSTB.rec.TaxBaseCurrPay;
+      end;
+
+      if(STB_IsResidentStatus(tbbuf.rec.TaxResidentFlag) == false) //Новый статус - нерезидент
+        if(FindSTB.rec.RateCalcPITax == int(NPTXGENTAXRATE_RESIDENT*100)) //13 -> 30, 13,15 -> 30
+          STB.rec.TaxBaseCurrPay      = Доход_30;
+          STB.rec.RateCalcPITax       = int(NPTXGENTAXRATE_NOTRESIDENT*100);
+          STB.rec.CalcPITax           = money(round((ДоходСуммарный_30+Доход_30)*STB.rec.RateCalcPITax/100 - НалогИсчСуммарный_30, 0));
+          STB.rec.RateHoldPITax       = STB.rec.RateCalcPITax;
+          STB.rec.ApplSTaxBaseInclude = STB.rec.ApplSTaxBaseExclude + STB.rec.TaxBaseCurrPay;
+
+          err = CheckAndSaveSTB(STB, @WasSkip);
+          if(err)
+            err = Error("   Ошибка при создании записи");
+          elif(WasSkip == false)
+            DL_NPTX_PutMsg( "   Сформирована новая запись о событии СНОБ по ставке " + STB.rec.RateCalcPITax + "% для клиента " + ClientName, 50 );
+          end;
+
+          if(not err)
+            if((addFindSTB.rec.TBID > 0) and (addFindSTB.rec.RateCalcPITax == int(NPTXGENTAXRATE_RESIDENT_15*100)))
+              STB_InitSTBByFindSTB(STB_2, FindSTB, addFindSTB, nptxop, tbbuf);
+
+              STB_2.rec.TaxBaseCurrPay = $0;
+              STB_2.rec.CalcPITax      = $0;
+              STB_2.rec.ApplSTaxBaseInclude = STB.rec.ApplSTaxBaseInclude/*именно STB*/ + STB_2.rec.TaxBaseCurrPay;
+
+              err = CheckAndSaveSTB(STB_2, @WasSkip);
+              if(err)
+                err = Error("   Ошибка при создании записи");
+              elif(WasSkip == false)
+                DL_NPTX_PutMsg( "   Сформирована новая запись о событии СНОБ по ставке " + STB_2.rec.RateCalcPITax + "% для клиента " + ClientName, 50 );
+              end;
+            end;
+          end;
+        elif(FindSTB.rec.RateCalcPITax == int(NPTXGENTAXRATE_RESIDENT_15*100)) //15 -> 30
+          STB.rec.TaxBaseCurrPay = Доход_30;
+          STB.rec.RateCalcPITax  = int(NPTXGENTAXRATE_NOTRESIDENT*100);
+          STB.rec.CalcPITax      = money(round((ДоходСуммарный_30+Доход_30)*STB.rec.RateCalcPITax/100 - НалогИсчСуммарный_30, 0));
+          STB.rec.RateHoldPITax  = STB.rec.RateCalcPITax;
+          STB.rec.HoldPITax      = $0;
+          STB.rec.BCCCalcPITax   = NPTXKBK_MAIN; //КБК исчисленного НДФЛ
+          STB.rec.BCCHoldPITax   = NPTXKBK_MAIN; //КБК удержанного НДФЛ
+          STB.rec.ApplSTaxBaseInclude = STB.rec.ApplSTaxBaseExclude + STB.rec.TaxBaseCurrPay;
+
+          err = CheckAndSaveSTB(STB, @WasSkip);
+          if(err)
+            err = Error("   Ошибка при создании записи");
+          elif(WasSkip == false)
+            DL_NPTX_PutMsg( "   Сформирована новая запись о событии СНОБ по ставке " + STB.rec.RateCalcPITax + "% для клиента " + ClientName, 50 );
+          end;
+
+          if(not err)
+            STB_InitSTBByFindSTB(STB_2, FindSTB, NULL, nptxop, tbbuf);
+
+            STB_2.rec.TaxBaseCurrPay = $0;
+            STB_2.rec.CalcPITax      = $0;
+            STB_2.rec.ApplSTaxBaseInclude = STB.rec.ApplSTaxBaseInclude/*именно STB*/ + STB_2.rec.TaxBaseCurrPay;
+
+            err = CheckAndSaveSTB(STB_2, @WasSkip);
+            if(err)
+              err = Error("   Ошибка при создании записи");
+            elif(WasSkip == false)
+              DL_NPTX_PutMsg( "   Сформирована новая запись о событии СНОБ по ставке " + STB_2.rec.RateCalcPITax + "% для клиента " + ClientName, 50 );
+            end;
+          end;
+        end;
+      else //Новый статус - резидент
+        if((Доход_13 == 0) and (Доход_15 == 0) and (STB.rec.HoldPITax != 0)) //Если запись без дохода, но с удержанным налогом
+          var Налог_13 = $0, Налог_15 = $0;
+          
+          if(ДоходСуммарный_15 > 0)
+            //Если уже есть общий доход по 15%, то считаем, что мы уже перевалили в НОБ по повышенной ставке и создаем запись с удержанным налогом по 15%
+            Налог_15 = STB.rec.HoldPITax;
+          else
+            //Определяем, сколько мы можем взять по 13% и сколько по 15%
+            Налог_13 = STB.rec.HoldPITax;
+            if((Налог_13+НалогИсчСуммарный_13) > (NPTX_LIMINCOME_MAX15*NPTXGENTAXRATE_RESIDENT))
+              Налог_13 = min(Налог_13, max((NPTX_LIMINCOME_MAX15*NPTXGENTAXRATE_RESIDENT - НалогИсчСуммарный_13), $0));
+            end;
+
+            Налог_15 = STB.rec.HoldPITax - Налог_13;
+          end;
+
+          if(Налог_13 != 0)
+            STB.rec.RateCalcPITax  = int(NPTXGENTAXRATE_RESIDENT*100);
+            STB.rec.RateHoldPITax  = STB.rec.RateCalcPITax;
+            STB.rec.HoldPITax      = Налог_13;
+            STB.rec.BCCCalcPITax   = NPTXKBK_MAIN; //КБК исчисленного НДФЛ
+            STB.rec.BCCHoldPITax   = NPTXKBK_MAIN; //КБК исчисленного НДФЛ
+
+            err = CheckAndSaveSTB(STB, @WasSkip);
+            if(err)
+              err = Error("   Ошибка при создании записи");
+            elif(WasSkip == false)
+              DL_NPTX_PutMsg( "   Сформирована новая запись о событии СНОБ по ставке " + STB.rec.RateCalcPITax + "% для клиента " + ClientName, 50 );
+            end;
+          end;
+
+          if((not err) and (Налог_15 != 0))
+            STB_InitSTBByFindSTB(STB_2, FindSTB, NULL, nptxop, tbbuf);
+
+            STB_2.rec.RateCalcPITax  = int(NPTXGENTAXRATE_RESIDENT_15*100);
+            STB_2.rec.RateHoldPITax  = STB_2.rec.RateCalcPITax;
+            STB_2.rec.HoldPITax      = Налог_15;
+            STB_2.rec.BCCCalcPITax   = NPTXKBK_15; //КБК исчисленного НДФЛ
+            STB_2.rec.BCCHoldPITax   = NPTXKBK_15; //КБК исчисленного НДФЛ
+
+            err = CheckAndSaveSTB(STB_2, @WasSkip);
+            if(err)
+              err = Error("   Ошибка при создании записи");
+            elif(WasSkip == false)
+              DL_NPTX_PutMsg( "   Сформирована новая запись о событии СНОБ по ставке " + STB_2.rec.RateCalcPITax + "% для клиента " + ClientName, 50 );
+            end;
+          end;
+        elif((Доход_13 != 0) and (Доход_15 != 0))
+
+          STB.rec.TaxBaseCurrPay = Доход_13;
+          STB.rec.RateCalcPITax  = int(NPTXGENTAXRATE_RESIDENT*100);
+          STB.rec.CalcPITax      = money(round((ДоходСуммарный_13+Доход_13)*STB.rec.RateCalcPITax/100 - НалогИсчСуммарный_13, 0));
+          STB.rec.RateHoldPITax  = STB.rec.RateCalcPITax;
+          STB.rec.ApplSTaxBaseInclude = STB.rec.ApplSTaxBaseExclude + STB.rec.TaxBaseCurrPay;
+
+          err = CheckAndSaveSTB(STB, @WasSkip);
+          if(err)
+            err = Error("   Ошибка при создании записи");
+          elif(WasSkip == false)
+            DL_NPTX_PutMsg( "   Сформирована новая запись о событии СНОБ по ставке " + STB.rec.RateCalcPITax + "% для клиента " + ClientName, 50 );
+          end;
+
+          if(not err)
+            STB_InitSTBByFindSTB(STB_2, FindSTB, IIF(addFindSTB.rec.TBID > 0, addFindSTB, NULL), nptxop, tbbuf);
+
+            STB_2.rec.TaxBaseCurrPay = Доход_15;
+            STB_2.rec.RateCalcPITax  = int(NPTXGENTAXRATE_RESIDENT_15*100);
+            STB_2.rec.CalcPITax      = money(round((ДоходСуммарный_15+Доход_15)*STB_2.rec.RateCalcPITax/100 - НалогИсчСуммарный_15, 0));
+            STB_2.rec.RateHoldPITax  = STB_2.rec.RateCalcPITax;
+            STB_2.rec.BCCCalcPITax   = NPTXKBK_15; //КБК исчисленного НДФЛ
+            STB_2.rec.BCCHoldPITax   = NPTXKBK_15; //КБК исчисленного НДФЛ
+            STB_2.rec.ApplSTaxBaseInclude = STB.rec.ApplSTaxBaseInclude/*именно STB*/ + STB_2.rec.TaxBaseCurrPay;
+
+            err = CheckAndSaveSTB(STB_2, @WasSkip);
+            if(err)
+              err = Error("   Ошибка при создании записи");
+            elif(WasSkip == false)
+              DL_NPTX_PutMsg( "   Сформирована новая запись о событии СНОБ по ставке " + STB_2.rec.RateCalcPITax + "% для клиента " + ClientName, 50 );
+            end;
+          end;
+        elif(Доход_13 != 0)
+          STB.rec.TaxBaseCurrPay = Доход_13;
+          STB.rec.RateCalcPITax  = int(NPTXGENTAXRATE_RESIDENT*100);
+          STB.rec.CalcPITax      = money(round((ДоходСуммарный_13+Доход_13)*STB.rec.RateCalcPITax/100 - НалогИсчСуммарный_13, 0));
+          STB.rec.RateHoldPITax  = STB.rec.RateCalcPITax;
+          STB.rec.ApplSTaxBaseInclude = STB.rec.ApplSTaxBaseExclude + STB.rec.TaxBaseCurrPay;
+
+          err = CheckAndSaveSTB(STB, @WasSkip);
+          if(err)
+            err = Error("   Ошибка при создании записи");
+          elif(WasSkip == false)
+            DL_NPTX_PutMsg( "   Сформирована новая запись о событии СНОБ по ставке " + STB.rec.RateCalcPITax + "% для клиента " + ClientName, 50 );
+          end;
+        elif(Доход_15 != 0)
+          STB.rec.TaxBaseCurrPay = $0;
+          STB.rec.RateCalcPITax  = int(NPTXGENTAXRATE_RESIDENT*100);
+          STB.rec.CalcPITax      = $0;
+          STB.rec.RateHoldPITax  = STB.rec.RateCalcPITax;
+          STB.rec.ApplSTaxBaseInclude = STB.rec.ApplSTaxBaseExclude + STB.rec.TaxBaseCurrPay;
+
+          err = CheckAndSaveSTB(STB, @WasSkip);
+          if(err)
+            err = Error("   Ошибка при создании записи");
+          elif(WasSkip == false)
+            DL_NPTX_PutMsg( "   Сформирована новая запись о событии СНОБ по ставке " + STB.rec.RateCalcPITax + "% для клиента " + ClientName, 50 );
+          end;
+
+          if(not err)
+            STB_InitSTBByFindSTB(STB_2, FindSTB, NULL, nptxop, tbbuf);
+
+            STB_2.rec.TaxBaseCurrPay = Доход_15;
+            STB_2.rec.RateCalcPITax  = int(NPTXGENTAXRATE_RESIDENT_15*100);
+            STB_2.rec.CalcPITax      = money(round((ДоходСуммарный_15+Доход_15)*STB_2.rec.RateCalcPITax/100 - НалогИсчСуммарный_15, 0));
+            STB_2.rec.RateHoldPITax  = STB_2.rec.RateCalcPITax;
+            STB_2.rec.BCCCalcPITax   = NPTXKBK_15; //КБК исчисленного НДФЛ
+            STB_2.rec.BCCHoldPITax   = NPTXKBK_15; //КБК исчисленного НДФЛ
+            STB_2.rec.HoldPITax      = $0;
+            STB_2.rec.ApplSTaxBaseInclude = STB.rec.ApplSTaxBaseInclude/*именно STB*/ + STB_2.rec.TaxBaseCurrPay;
+
+            err = CheckAndSaveSTB(STB_2, @WasSkip);
+            if(err)
+              err = Error("   Ошибка при создании записи");
+            elif(WasSkip == false)
+              DL_NPTX_PutMsg( "   Сформирована новая запись о событии СНОБ по ставке " + STB_2.rec.RateCalcPITax + "% для клиента " + ClientName, 50 );
+            end;
+          end;
+
+          if((not err) and (addFindSTB.rec.TBID > 0))
+            STB_InitSTBByFindSTB(STB_3, FindSTB, addFindSTB, nptxop, tbbuf);
+
+            STB_3.rec.TaxBaseCurrPay = $0;
+            STB_3.rec.CalcPITax      = $0;
+
+            err = CheckAndSaveSTB(STB_3, @WasSkip);
+            if(err)
+              err = Error("   Ошибка при создании записи");
+            elif(WasSkip == false)
+              DL_NPTX_PutMsg( "   Сформирована новая запись о событии СНОБ по ставке " + STB_3.rec.RateCalcPITax + "% для клиента " + ClientName, 50 );
+            end;
+          end;
+        end;
+      end;
+    end;
+  end;
+
+  return err;
+end;
+
+private macro ПересчетПриИзмененииСНОБ(nptxop, tbbuf, FindSTB, ClientName)
+  var addFindSTB = TRecHandler("nptxtotalbase.dbt");
+  var addFindSTBArr = TArray();
+  var err = 0, ErrStr = "";
+
+  addFindSTB.Clear();
+
+  STB_LoadAddSTBArr(@addFindSTBArr, FindSTB);
+
+  if((addFindSTBArr.size > 0) and (addFindSTBArr[0].rec.TBID > 0))
+    copy(addFindSTB, addFindSTBArr[0]);
+  end;
+
+  err = CheckAndCancelFindSTB(nptxop, FindSTB);
+  if((not err) and (addFindSTB.rec.TBID > 0))
+    err = CheckAndCancelFindSTB(nptxop, addFindSTB);
+  end;
+
+  if(not err)
+    err = SetTbBuffStateProcInOp(nptxop, tbbuf.rec.BFID);
+    if(not err)
+      err = STB_RecalcByChangeSNOB(FindSTB, addFindSTB, nptxop, tbbuf, @ErrStr);
+      if(err)
+        err = Error("   " + ErrStr);
+      end;
+    end;
+  end;
+
+  return err;
+end;
+
+private macro ПересчетУниверсальный(nptxop, tbbuf, FindSTB, ClientName)
+  var addFindSTBArr = TArray();
+  var err = 0, ErrStr = "";
+  var i = 0;
+
+  STB_LoadAddSTBArr(@addFindSTBArr, FindSTB);
+
+  err = CheckAndCancelFindSTB(nptxop, FindSTB);
+  if((not err) and (addFindSTBArr.size > 0))
+    i = 0;
+    while((not err) and (i < addFindSTBArr.size))
+      if((not err) and (addFindSTBArr[i].rec.TBID > 0))
+        err = CheckAndCancelFindSTB(nptxop, addFindSTBArr[i]);
+      end; 
+
+      i = i + 1;
+    end;  
+  end;
+
+  if(not err)
+    err = SetTbBuffStateProcInOp(nptxop, tbbuf.rec.BFID);
+    if(not err)
+      err = STB_Recalc(FindSTB, addFindSTBArr, nptxop, tbbuf, @ErrStr);
+      if(err)
+        err = Error("   " + ErrStr);
+      end;
+    end;
+  end;
+
+  return err;
+end;
+
+macro ExecuteStep( doc, FDoc, DocKind, ID_Operation, ID_Step )
+  var err = 0;
+  var nptxop = TRecHandler("nptxop.dbt");
+  var tbbuf  = TRecHandler("nptxtbbuf.dbt");
+  var query, cmd, DataSet;
+  var needSendToStor = false;
+  var AmountSNOB = $0;
+  var cnt = 0, i = 0;
+  var SystDate, SystTime;
+  var findCalcClosedTaxPeriods = 0, findExecDefaultTbRecs = 0, findNeedManualRecalClosedPeriods = 0;
+  var CalcClosedTaxPeriods = 0, ExecDefaultTbRecs = 0, NeedManualRecalClosedPeriods = 0;
+  var AlgByClient = 0;
+  var prevClientID = -1, prevTaxPeriod = 0, skipClientID = -1, skipTBID = 0;
+  var wasRecalc = false;
+  var isLastClient = true;
+  var ClientID = -1;
+  var LastClientRec = false;
+  var RecTaxPeriod = 0, RecIncDate = date(0,0,0);
+
+  SetBuff( nptxop, FDoc );
+
+  GetLastOpSTBVal(nptxop.rec.DocKind, nptxop.rec.ID, NPTXVAL_KIND_CALCCLOSEDTAXPERIODS,         @findCalcClosedTaxPeriods,         NULL, NULL);
+  GetLastOpSTBVal(nptxop.rec.DocKind, nptxop.rec.ID, NPTXVAL_KIND_EXECDEFAULTTBRECS,            @findExecDefaultTbRecs,            NULL, NULL);
+  GetLastOpSTBVal(nptxop.rec.DocKind, nptxop.rec.ID, NPTXVAL_KIND_NEEDMANUALRECALCLOSEDPERIODS, @findNeedManualRecalClosedPeriods, NULL, NULL);
+
+  cmd = DL_RSDCommand();
+
+  query =   " select tbbuf.*, pt.t_Name as ClientName, tb.t_TaxPeriod "
+          + "   from dnptxtbbuf_dbt tbbuf, dnptxtotalbase_dbt tb, dparty_dbt pt "
+          + "  where tbbuf.t_Status = " + NPTXTBBUF_STATUS_NOTPROCESSED
+          + "    and pt.t_PartyID = tbbuf.t_ClientID "
+          + "    and Not Exists(select 1 "
+          + "                     from ddlgrdoc_dbt grd "
+          + "                    where grd.t_ServDocKind = ? " 
+          + "                      and grd.t_ServDocID = ? "
+          + "                      and grd.t_DocKind = " + DL_TBBFREC
+          + "                      and grd.t_DocID = tbbuf.t_BFID " 
+          + "                  ) "
+          + "    and Not Exists(select 1 "
+          + "                     from ddlgrdoc_dbt grd "
+          + "                    where grd.t_ServDocKind = ? " 
+          + "                      and grd.t_ServDocID = ? "
+          + "                      and grd.t_DocKind = " + DLDOC_PARTY
+          + "                      and grd.t_DocID = tbbuf.t_ClientID " 
+          + "                  ) ";
+
+  cmd.AddParam(nptxop.rec.DocKind);
+  cmd.AddParam(nptxop.rec.ID);
+  cmd.AddParam(nptxop.rec.DocKind);
+  cmd.AddParam(nptxop.rec.ID);
+
+  if(nptxop.rec.Client > 0)
+    query = query + " and tbbuf.t_ClientID = ? ";
+    cmd.addParam(nptxop.rec.Client);
+  end;
+
+  query = query + " and tb.t_StorID(+) = tbbuf.t_SNOBRecordID "
+                + " order by tbbuf.t_ClientID ASC, tb.t_TaxPeriod ASC, tb.t_IncDate ASC, tb.t_IncTime ASC, (CASE WHEN tb.t_RateCalcPITax IN (13, 30) THEN 1 ELSE 2 END) ASC, tbbuf.t_EventID ASC, tbbuf.t_BFID ASC";
+
+  //На шаге обрабатываем только одну запись из буферной таблицы по клиенту
+  //Далее планиуем шаг Отправки в Хранилище
+
+  DataSet = cmd.Execute(query);
+  
+  while((not err) and (DataSet.moveNext()))
+    var FindSTB = TRecHandler("nptxtotalbase.dbt");
+    var CurrYear = 0;
+
+    wasRecalc = false;
+
+    DataSet.GetRecord().CopyTo(tbbuf.rec);
+
+    LoadTBByStorID(FindSTB, tbbuf.rec.ClientID, tbbuf.rec.SNOBRecordID);
+
+    ClientID = tbbuf.rec.ClientID;
+
+    if(FindSTB.rec.TBID <= 0)
+      DL_NPTX_PutMsg( "Запись с ID <"+tbbuf.rec.SNOBRecordID+"> в Хранилище СНОБ отсутствует в СИ. Повторный пересчет будет возможен, после восстановления записей в Хранилище СОФР\n", 20 );
+
+      err = SetTbBuffStateProcInOp(nptxop, tbbuf.rec.BFID);
+
+      //В этом случае цикл не прерываем, чтобы не плодить шаги, т.к. по текущей записи фактически ничего не делали.
+      continue;
+    else
+      RecTaxPeriod = FindSTB.rec.TaxPeriod;
+      RecIncDate   = FindSTB.rec.IncDate;
+
+      DL_NPTX_TbAddMsg(FindSTB.rec.TBID, "Пересчет в операции пересчета с номером " + nptxop.rec.Code, 2);
+
+      if((FindSTB.rec.ID_Operation == ID_Operation) or (FindSTB.rec.StorState == NPTXTOTALBASE_STORSTATE_CANCELED))
+        //Если событие СНОБ уже было обновлено в этой операции или обработано (т.е. отменено), но в другой, 
+        //то просто для буферной записи ставим статус "Обработана"
+        //Такая ситуация возможна, если это была запись по ставке 15% и обрабатывалась совместно с 13%
+
+        err = SetTbBuffStateProcInOp(nptxop, tbbuf.rec.BFID);
+        
+        //В этом случае цикл не прерываем, чтобы не плодить шаги, т.к. по текущей записи фактически ничего не делали.
+        continue;
+      end;
+    end;
+
+    GetSystDateTime(@SystDate, @SystTime); 
+    datesplit(SystDate, NULL, NULL, CurrYear);
+
+    if(FindSTB.rec.TaxPeriod < CurrYear) //Закрытый налоговый период
+      if(IsShedulerRunning())
+        NeedManualRecalClosedPeriods = 1;
+      elif(GetDialogFlag() == 0)
+        CalcClosedTaxPeriods = 1;
+        ExecDefaultTbRecs = 1;
+      else
+        if((ExecDefaultTbRecs == 0) and (findExecDefaultTbRecs == 0))
+          if(YesNoWin("Пересчет выполняется по записям в закрытом налоговом периоде " + string(int(FindSTB.rec.TaxPeriod)) + ". Пересчитать закрытые налоговые периоды?"))
+            CalcClosedTaxPeriods = 1;
+            ExecDefaultTbRecs = 1;
+          else
+            ExecDefaultTbRecs = 1;
+          end;
+        elif(findExecDefaultTbRecs == 1)
+          ExecDefaultTbRecs = 1;
+          CalcClosedTaxPeriods = findCalcClosedTaxPeriods;
+        end;
+      end;
+
+      if(NeedManualRecalClosedPeriods) //Требуется ручной пересчет
+        //Обновляем событие СНОБ
+        FindSTB.rec.NeedRecalc = "Необходим ручной пересчет!";
+
+        err = CheckAndSaveSTB(FindSTB);
+        if(err)
+          err = Error("   Ошибка при обновлении записи");
+        else
+          DL_NPTX_PutMsg( "   Для записи события СНОБ с ID = "+ FindSTB.rec.TBID +" установлен признак необходимости ручного пересчета", 0 );
+        end;
+
+        if(not err)
+          //Статус записи в буферной таблице не меняем, но запоминаем его, чтобы исключить из повторной обработки в этой же операции
+          if(DL_SetDocGrDeal(0, DL_TBBFREC, tbbuf.rec.BFID, nptxop.rec.DocKind, nptxop.rec.ID) != 0)
+            err = Error( "Ошибка при сохранении информации об обработанной записи из буферной таблицы с ID = " + tbbuf.rec.BFID );
+          end;
+        end;
+
+        //Так как по этой записи мы ничего не делали, то на этом же шаге обработаем и следующую запись, чтобы не плодить лишние шаги
+        continue;
+      end;
+
+      if(CalcClosedTaxPeriods == 0) //Не пересчитывать закрытые периоды
+        //Статус записи в буферной таблице не меняем, но запоминаем его, чтобы исключить из повторной обработки в этой же операции
+        if(DL_SetDocGrDeal(0, DL_TBBFREC, tbbuf.rec.BFID, nptxop.rec.DocKind, nptxop.rec.ID) != 0)
+          err = Error( "Ошибка при сохранении информации об обработанной записи из буферной таблицы с ID = " + tbbuf.rec.BFID );
+        end;
+
+        //Так как по этой записи мы ничего не делали, то на этом же шаге обработаем и следующую запись, чтобы не плодить лишние шаги
+        continue;
+      end;
+    end;
+
+    if(not err)
+      //Здесь сохраняем не денежные значения в DNPTXVAL_DBT, чтобы не плодить новых таблиц
+      if(CalcClosedTaxPeriods != findCalcClosedTaxPeriods)
+        if(DL_InsertNPTXVAL(nptxop.rec.DocKind, nptxop.rec.ID, NPTXVAL_KIND_CALCCLOSEDTAXPERIODS, date(0,0,0), time(0), money(CalcClosedTaxPeriods), 0) != 0)
+          return Error( "Ошибка при сохранении значения СНОБ" );
+        end;
+      end;
+
+      if(ExecDefaultTbRecs != findExecDefaultTbRecs)
+        if(DL_InsertNPTXVAL(nptxop.rec.DocKind, nptxop.rec.ID, NPTXVAL_KIND_EXECDEFAULTTBRECS, date(0,0,0), time(0), money(ExecDefaultTbRecs), 0) != 0)
+          return Error( "Ошибка при сохранении значения СНОБ" );
+        end;
+      end;
+
+      if(NeedManualRecalClosedPeriods != findNeedManualRecalClosedPeriods)
+        if(DL_InsertNPTXVAL(nptxop.rec.DocKind, nptxop.rec.ID, NPTXVAL_KIND_NEEDMANUALRECALCLOSEDPERIODS, date(0,0,0), time(0), money(NeedManualRecalClosedPeriods), 0) != 0)
+          return Error( "Ошибка при сохранении значения СНОБ" );
+        end;
+      end;
+    end;
+
+    if(not err)
+      if( IsUseProgressScale(FindSTB.rec.IncDate) )
+        if((tbbuf.rec.IsResidentChange == UNSET_CHAR) or ((tbbuf.rec.IsResidentChange == SET_CHAR) and (tbbuf.rec.TaxResidentFlag == STB_GetClientTaxPayerStatus(tbbuf.rec.ClientID))))
+          err = ПересчетУниверсальный(nptxop, tbbuf, FindSTB, DataSet.ClientName);
+        else
+          DL_NPTX_PutMsg( "Пересчет для клиента "+DataSet.ClientName+" выполнить невозможно. Клиент имеет отличный налоговый статус в анкете субъекта в СОФР.\n", 20 );
+          
+          //Запомним клиента, чтобы пропустить по нему оставшиеся записи
+          if(DL_SetDocGrDeal(0, DLDOC_PARTY, tbbuf.rec.ClientID, nptxop.rec.DocKind, nptxop.rec.ID) != 0)
+            err = Error( "Ошибка при сохранении информации об обработанной записи из буферной таблицы с ID = " + tbbuf.rec.BFID );
+          end;
+
+          skipClientID = tbbuf.rec.ClientID;
+          break;
+        end;
+      else
+        if(tbbuf.rec.IsResidentChange == SET_CHAR)
+          if(tbbuf.rec.TaxResidentFlag != STB_GetClientTaxPayerStatus(tbbuf.rec.ClientID))
+            DL_NPTX_PutMsg( "Пересчет для клиента "+DataSet.ClientName+" выполнить невозможно. Клиент имеет отличный налоговый статус в анкете субъекта в СОФР.\n", 20 );
+
+            //Запомним клиента, чтобы пропустить по нему оставшиеся записи
+            if(DL_SetDocGrDeal(0, DLDOC_PARTY, tbbuf.rec.ClientID, nptxop.rec.DocKind, nptxop.rec.ID) != 0)
+              err = Error( "Ошибка при сохранении информации об обработанной записи из буферной таблицы с ID = " + tbbuf.rec.BFID );
+            end;
+
+            skipClientID = tbbuf.rec.ClientID;
+          
+            break;
+          end;
+          if(not err)
+            err = ПересчетПриИзмененииРезидентства(nptxop, tbbuf, FindSTB, DataSet.ClientName);
+          end;
+        else
+          err = ПересчетПриИзмененииСНОБ(nptxop, tbbuf, FindSTB, DataSet.ClientName);
+        end;
+      end;
+      wasRecalc = true;
+
+      break;
+    end;
+  end;
+
+  if(not err)
+    if(wasRecalc == true) 
+      //Планируем шаг отправки в Хранилище, если был пересчет
+      needSendToStor = true;
+    end;
+
+    var stat = DataSet.moveNext();
+    if(not stat) //Записи закончились
+      isLastClient = true;
+      
+      //Устанавливаем операции признак, что больше пересчет после отправки планировать не нужно
+      if(DL_InsertNPTXVAL(nptxop.rec.DocKind, nptxop.rec.ID, NPTXVAL_KIND_NOTPLANRECALCSTEP, date(0,0,0), time(0), money(1), 0) != 0)
+        return Error( "Ошибка при сохранении значения СНОБ" );
+      end;
+    else
+      //Если записи не закончились, но далее идут записи только по тому же клиенту, которого мы сейчас пропускаем, а других нет, то будем считать, что они закончились и далее пересчет планировать не нужно
+      if(skipClientID > 0)
+        isLastClient = false;
+        if(DataSet.ClientID == skipClientID)
+          isLastClient = true;
+          while(DataSet.moveNext())
+            if(DataSet.ClientID != skipClientID)
+              isLastClient = false;
+              break;
+            end;
+          end;
+        end;
+      else
+        //Если клиента для пропуска нет, но далее идут записи по другому киенту, то запомним это
+        if(DataSet.ClientID != ClientID)
+          LastClientRec = true;
+        end;
+      end;
+    end;
+  end;
+
+  if(not err)
+    err = DL_NPTX_SaveTbMes();
+    if(not err)
+      if(needSendToStor == true)
+        if( not InsertOprStatus(46461, 5)) //Установить ДО = Отправка в Хранилище
+           err = Error( "Ошибка при установке статуса вида \"Документооборот\" операции" );        
+        else
+           DL_NPTX_PutMsg( "   Запланирована отправка в Хранилище обновленной и новых записей о событиях СНОБ", 50 );
+        end;
+      else
+        if((isLastClient == true) and (wasRecalc == false)) ///<Если это последний клиент и пересчета по нему реально не было
+          
+          if((STB_CanNettOp(nptxop.rec.DocKind, nptxop.rec.ID) == true) and (NeedNptxNettOp(ClientID, RecTaxPeriod, RecIncDate) == true)) //Если по клиенту требуется зачет, и это последний клиент, то делаем зачет
+            if( not InsertOprStatus(46461, 6)) //Установить ДО = Зачет удержанного НДФЛ
+               return Error( "Ошибка при установке статуса вида \"Документооборот\" операции" );        
+            end;
+          else
+            if( not InsertOprStatus(46461, 2)) //Установить ДО = Закрыт
+              return Error( "Ошибка при установке статуса вида \"Документооборот\" операции" );        
+            end;
+          end;
+        else
+          //Если клиент не последний, но следующим идет другой клиент, а по данному клиенту отправки не было, но требуется зачет, то делаем зачет
+          if((LastClientRec == true) and (STB_CanNettOp(nptxop.rec.DocKind, nptxop.rec.ID) == true) and (NeedNptxNettOp(ClientID, RecTaxPeriod, RecIncDate) == true))
+            if( not InsertOprStatus(46461, 6)) //Установить ДО = Зачет удержанного НДФЛ
+               return Error( "Ошибка при установке статуса вида \"Документооборот\" операции" );        
+            end;
+          else
+            if( not InsertOprStatus(46461, 4)) //Установить ДО = Пересчет
+               err = Error( "Ошибка при установке статуса вида \"Документооборот\" операции" );        
+            end;
+          end;
+        end;
+      end;
+    else
+      err = Error("   Ошибка при сохранении собщений для событий СНОБ");
+    end;
+  end;
+
+  DL_NPTX_SaveOperLog(nptxop.rec.ID, ID_Step);
+
+  return err;
+end;

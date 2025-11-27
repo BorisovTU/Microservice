@@ -1,0 +1,160 @@
+/*
+$Name:        gtExRS50.mac
+$Module:      Шлюз Securities
+$Description: Макрос выгрузки в MVODB
+*/
+
+import rgtgtrec, rgtgtlog, gt_repl, GateInter;
+import Reporting;
+
+var SysLog;
+
+Macro GetCount(SeanceID)
+    var Count:integer = 0;
+    var cmd = RsdCommand();
+    var ds;
+    
+    cmd.CmdText = "SELECT COUNT(*) AS NRec FROM DGTRECORD_DBT, DGTSNCREC_DBT WHERE " +
+                  " DGTRECORD_DBT.T_RECORDID = DGTSNCREC_DBT.T_RECORDID AND " +
+                  " DGTSNCREC_DBT.T_SEANCEID = ? AND DGTRECORD_DBT.T_STATUSID = 7 ";
+    
+    cmd.AddParam("", RSDBP_IN, SeanceID);                          
+    cmd.Execute();
+    
+    ds = TRsbDataSet(cmd);                     
+    
+    if (ds.next)
+        Count = ds.NRec;
+    end;  
+    
+    return Count;  
+end;
+
+private Macro UpdateRecordStatus(con, RecordID, StatusID)
+var cmd = RsdCommand(con, "UPDATE dgtrecord_dbt SET T_STATUSID = ? WHERE T_RECORDID = ?");
+    cmd.AddParam("", RSDBP_IN, StatusID);
+    cmd.AddParam("", RSDBP_IN, RecordID);
+    cmd.Execute();
+end;
+
+Macro Export(InfObject)
+  var stat = ExportFromGate_Execute(InfObject);
+  return stat;
+OnError(ErrObj)
+  stat          = ErrObj.Code;
+  ErrorMessage  = ErrObj.Message;
+  return stat;
+end;
+
+/* Метод инициализирующий сервер для получения информации по платежам */
+Macro InitDocInfoServer()
+   docInfoServer = RepDocInfoServer(PTCK_ALL);
+   var query = " SELECT a.* FROM DACCTRN_DBT a, DGTCODE_DBT gc, DGTRECORD_DBT R "  +
+               " WHERE a.t_AccTrnID = TO_NUMBER(gc.t_ObjectCode)  "+
+               "   AND gc.T_OBJECTID = r.T_OBJECTID " + 
+               "   AND r.T_STATUSID = 7 " + 
+               "   AND (gc.t_objectkind = 13 OR gc.t_objectkind = 55)";
+/*
+" SELECT a.* FROM DGTCODE_DBT GC JOIN DARHDOC_DBT A ON (TO_NUMBER (GC.T_OBJECTCODE) = " +
+" TO_NUMBER (A.T_IAPPLICATIONKIND || A.T_APPLICATIONKEY)) " +
+" JOIN DGTRECORD_DBT R ON (GC.T_OBJECTID = R.T_OBJECTID) " +
+" WHERE R.T_STATUSID = 7 AND (gc.t_objectkind = 13 OR gc.t_objectkind = 55)  " +
+" UNION " +
+" SELECT a.* FROM DGTCODE_DBT GC JOIN DARHDOC$_DBT A ON (TO_NUMBER (GC.T_OBJECTCODE) = " +
+" TO_NUMBER (A.T_IAPPLICATIONKIND || A.T_APPLICATIONKEY)) " +
+" JOIN DGTRECORD_DBT R ON (GC.T_OBJECTID = R.T_OBJECTID) " +
+" WHERE R.T_STATUSID = 7 AND (gc.t_objectkind = 13 OR gc.t_objectkind = 55) "; 
+*/
+   /* Кешируем все рублевые и валютные проводки */
+   docInfoServer.cacheInformation(query);
+end;
+
+Macro Deliver (SeanceID, Parm)
+
+    SysLog = TGtLog(SeanceID);                                                      
+
+    var ConString = GetIniString("CONNSTRING", "rsreq.ini");    
+    var con = RsdConnection(ConString);                         
+        con.Open();
+        con.BeginTrans();
+
+    var cmd = RsdCommand(con, "SELECT DGTRECORD_DBT.* FROM DGTRECORD_DBT WHERE " +
+                              " DGTRECORD_DBT.T_RECORDID IN (SELECT T1.T_RECORDID FROM DGTSNCREC_DBT T1 WHERE T1.T_SEANCEID = ?) " +
+                              " AND DGTRECORD_DBT.T_STATUSID = 7 " +
+                              " FOR UPDATE NOWAIT");    
+
+    cmd.AddParam("", RSDBP_IN, SeanceID);
+    
+    var Records = TRsbDataSet(cmd);
+    var stat = 0;
+    var ErrString = "";
+    var Count : integer;
+    var nRecsProcessed : integer = 0;    
+
+    ExportFromGate_Begin();
+
+    if (true)
+        /* Инициализируем сервер информации по платежам */
+        InitDocInfoServer(); 
+    
+        Count = GetCount(SeanceID);
+        InitProgress(Count, "", "Репликация в МВОДБ");
+
+        // главный цикл: бегаем по записям сеанса и экспортируем их в МВОДБ
+        while(Records.next())
+
+            InfObject.RecordID           = Records.RecordID;
+            InfObject.ObjectID           = Records.ObjectID;
+            InfObject.ApplicationID_From = Records.ApplicationID_From;
+            InfObject.ApplicationID_To   = Records.ApplicationID_To;
+            InfObject.ActionID           = Records.ActionID;
+            InfObject.StatusID           = Records.StatusID;
+            InfObject.SysDate            = Records.SysDate;
+            InfObject.SysTime            = Records.SysTime;
+
+            stat = Export(InfObject);
+            
+            nRecsProcessed = nRecsProcessed + 1;
+            UseProgress(nRecsProcessed);
+
+            if (stat)
+                ErrString = ErrorMessage;
+
+                // выставляем статус "Отказ в обработке" (экспорт)
+                UpdateRecordStatus(con, InfObject.RecordID, 9);
+
+                SysLog.AddDelivery(InfObject.RecordID, ErrString, FAULT);
+            else
+                // выставляем статус "обработан" (экспорт)                
+                UpdateRecordStatus(con, InfObject.RecordID, 8);
+                SysLog.AddDelivery(InfObject.RecordID, "", SUCCESS);
+            end;
+
+        end;
+
+        RemProgress();
+
+        if (NOT SysLog.Save())
+            SysLog.PrintLine("Системная ошибка", Time(), SysLog.LastError);
+        end;
+    end;
+   
+    ExportFromGate_End();
+
+    con.CommitTrans();   
+   
+    OnError(err)
+        ErrString = err.Message;
+    
+        if (err.Code == 56)
+            ErrString = ErrString + "\nОписание: ошибка при получении набора ЗР. ";
+            ErrString = ErrString + "Возможно, процедура экспорта уже запущена другим операционистом.";
+        end;
+    
+        SysLog.PrintLine("Системная ошибка", Time(), ErrString);
+        SysLog.Save();      
+        
+        RemProgress();
+        
+        con.CommitTrans();        
+end;

@@ -1,0 +1,1479 @@
+/*
+$Name:        scchdateacc.mac
+$Module:      Ценные бумаги
+$Description: Шаг изменения сроков исполнения
+*/
+import InsCarryDoc, FIInter, PTInter, "sp_class.mac", "sp_caracc.mac", "sp_car2.mac";
+
+private record tick (dl_tick);
+private record AccBuf(account);
+
+/*виды зависимостей дат ТО*/
+private const SP_ALG_FROMDATE_UNDEF  = 0, /*не зависит*/
+              SP_ALG_FROMDATE_PAY    = 1, /*от оплаты*/
+              SP_ALG_FROMDATE_STATE  = 2, /*от поставки */
+              SP_ALG_FROMDATE_AVANCE = 3; /*от аванса*/
+
+
+
+private macro SayLotError( State1, State2 )
+   var err = "Статус части сделки не подходит для заданного изменения сроков.";
+   MsgBox( err );
+end;
+
+private macro ПроверитьЛот( FD, State1_1, State1_2, State2_1, State2_2 )
+   /*если на лоте установлен признак "Отложенное исполнение"*/
+   if( FD.БылоОтложенноеИсполнение() )
+      if( (FD.dl_leg.rec.OperState != DL_LEG_OUTBAL) AND   /*На внебалансе*/
+          (FD.dl_leg.rec.OperState != DL_LEG_BALANCE) AND  /*На балансе*/
+          (FD.dl_leg.rec.OperState != DL_LEG_FORM )       /*Поставлен*/
+        )
+         SayLotError( DL_LEG_OUTBAL );
+         return false;
+      end;
+   else
+      /*если на лоте НЕ установлен признак "исполнение не в срок"*/
+      if( not FD.БылоДосрочноеИсполнение() )
+         if( (FD.dl_leg.rec.OperState < State1_1) OR (FD.dl_leg.rec.OperState > State1_2) )
+            SayLotError( State1_1, State1_2 );
+            return false;
+         end;
+      else /*если признак "исполнение не в срок" установлен */
+         if( (FD.dl_leg.rec.OperState < State2_1) OR (FD.dl_leg.rec.OperState > State2_2) )
+            SayLotError( State2_1, State2_2 );
+            return false;
+         end;
+      end;
+   end;
+   return true;
+end;
+
+macro БУ_ПроводкиИзмененияСроковИсполнения_ДляСделки( FD:SPFirstDoc, Action:Integer, FactDate:Date, PlanDate:Date, ExecDate:Date, GrDealID:integer )
+  var AvanceSum = $0, PaySum = $0, CarrySum, DealType, Ground;
+  var DebetAcc, CreditAcc, ChdAcc, FIRole, ForvAcc, ForvAccMinus, ForvAccPlus;
+  var ExistLink = false, NeedInsertDepoDraft = false, err, stat, RegistrDate;
+  var Sum, N = 0, MinDate = date(0,0,0);
+
+  var FD1, FD2, save_BegDateM = null, save_FinDateM = null, save_BegDateP = null, save_FinDateP = null;
+  var MnOD = TRecHandler("account");
+  var PlOD = TRecHandler("account");
+  var MnOD_2 = TRecHandler("account");
+  var PlOD_2 = TRecHandler("account");
+  var UpdateAcc = true, i = 0;
+  var DateKind = 0;
+  var ReqOrCom = "";
+
+  if( Action == DEALCALC_ACTION_BEFORE_PAY ) /*досрочная оплата*/
+       
+       if( (ТОЗакрыто( FD.GetRQ(DLRQ_TYPE_DELIVERY) ) != true) AND 
+           (FD.DateArray[DATE_DEALSETAVOIRISS_PLAN] == FactDate)
+         )  /*SCR 58456*/
+          if( MsgBoxEx( "Плановая дата поставки равна дате досрочной оплаты.|Выполнять досрочную оплату ?",
+              MB_YES+MB_NO, IND_NO, 
+              "Досрочная оплата", "Подтверждение начала операции" ) != IND_YES ) 
+             return 1; 
+          end;
+       end;
+
+       if( not IsREPO(FD.Group) )
+          if( not IsClientDeal(FD.tick.rec) )  /*Для собственных сделок*/
+             if( not ПроверитьЛот( FD, 
+                                   DL_LEG_OUTBAL, DL_LEG_FORM, 
+                                   DL_LEG_BALANCE, DL_LEG_FORM) )
+                return 1;
+             end;
+          else                                     /*Для клиентских сделок*/
+             if( not ПроверитьЛот( FD, 
+                                   DL_LEG_INITIAL, DL_LEG_FORM, 
+                                   DL_LEG_INITIAL, DL_LEG_BALANCE) )
+                return 1;
+             end;
+          end;
+       end;
+
+
+  elif( Action == DEALCALC_ACTION_BEFORE_SET ) /*досрочная поставка*/
+
+       if( FD.БылоДосрочноеИсполнение() AND 
+           (FD.DateArray[DATE_DEALPAY] == FactDate) AND
+           (FD.DateArray[DATE_DEALPAY] < FD.DateArray[DATE_DEALPAY_PLAN])
+         )  /*SCR 58456*/
+          if( MsgBoxEx( "За дату " + string(FactDate) + " уже выполнена досрочная оплата.|Выполнять досрочную поставку ?",
+              MB_YES+MB_NO, IND_NO, 
+              "Досрочная поставка", "Подтверждение начала операции" ) != IND_YES ) 
+             return 1; 
+          end;
+       end;
+
+       /*См. 104217:
+         Нельзя выполнять досрочную поставку, если поручение должно формироваться  
+         ("Формировать предварительно поручение депо?" == да), но не сформировано, 
+         или сформировано, но дата его формирования больше фактической даты поставки.
+       */
+       NeedInsertDepoDraft = НужноПредФормПоручДЕПО(FD, err);
+       if (err > 0)
+          return 1;
+       end;
+
+       if (NeedInsertDepoDraft == true)
+          stat = ExecMacroFile("dpdrutl.mac", "SP_GetDraftDate", FD.GetRQ(DLRQ_TYPE_DELIVERY), RegistrDate);
+
+          if( stat == false)
+             MsgBox("Нельзя выполнять досрочную поставку, пока не сформировано поручение депо");
+             return 1;
+          else
+             if (RegistrDate > FactDate)
+                MsgBox("Нельзя выполнять досрочную поставку: дата формирования поручения депо больше даты поставки");
+                return 1;
+             end;
+          end;
+       end;
+
+       if( IsREPO(FD.Group) )
+          if( IsEXCHANGE(FD.Group) )
+             if( not ПроверитьЛот( FD, 
+                                   DL_LEG_INITIAL, DL_LEG_BALANCE, 
+                                   DL_LEG_INITIAL, DL_LEG_BALANCE) )
+                return 1;
+             end;
+          end;
+       else
+          if( not IsClientDeal(FD.tick.rec) )  /*Для собственных сделок*/
+             if( not ПроверитьЛот( FD, 
+                                   DL_LEG_OUTBAL, DL_LEG_BALANCE, 
+                                   DL_LEG_BALANCE, DL_LEG_BALANCE) )
+                return 1;
+             end;
+          else                                     /*Для клиентских сделок*/
+             if( not ПроверитьЛот( FD, 
+                                   DL_LEG_INITIAL, DL_LEG_BALANCE, 
+                                   DL_LEG_INITIAL, DL_LEG_BALANCE) )
+                return 1;
+             end;
+          end;     
+       end;
+
+
+       if(FD.IsBack == true)
+         DateKind = DLGR_DATEKIND_DELIVERY2;
+       else
+         DateKind = DLGR_DATEKIND_DELIVERY;
+       end;
+
+       if(DL_SetDateGrDeal( FD.tick.rec.BOfficeKind, FD.tick.rec.DealID, DateKind, FactDate) != 0 )
+         return 1;
+       end;
+
+       if(SetTransferGrDeal(FD, FactDate, FD.tick.rec.PFI) != 0)
+         return 1;
+       end;
+               
+   elif( Action == DEALCALC_ACTION_BEFORE_AVANCE ) /*досрочный аванс*/
+
+       if( not IsREPO(FD.Group) )
+          if( not IsClientDeal(FD.tick.rec) )  /*Для собственных сделок*/
+             if( not ПроверитьЛот( FD, 
+                                   DL_LEG_OUTBAL, DL_LEG_FORM, 
+                                   DL_LEG_BALANCE, DL_LEG_FORM) )
+                return 1;
+             end;
+          else                                     /*Для клиентских сделок*/
+             if( not ПроверитьЛот( FD, 
+                                   DL_LEG_INITIAL, DL_LEG_FORM, 
+                                   DL_LEG_INITIAL, DL_LEG_FORM) )
+                return 1;
+             end;
+          end;
+
+          /*Если статус лота -"На балансе" или "Поставлен" то дата должна быть не 
+            меньше даты начата исполнения*/
+          if( (FD.dl_leg.rec.OperState == DL_LEG_BALANCE) OR
+              (FD.dl_leg.rec.OperState == DL_LEG_FORM )
+            ) 
+             if( FactDate < FD.DateArray[DATE_DEALBEGINEXEC] )
+                MsgBox( "Дата должна быть не меньше даты начата исполнения " + string(FD.DateArray[DATE_DEALBEGINEXEC]) );
+                return 1;
+             end;
+          end;
+       end;   
+
+/* Добавлено закомментаренным по 134623. 
+   Можно будет раскомментарить когда доработают КУ и можно будет открыть счет ОД более ранней датой
+       if( not FD.IsBack )
+          if( (not IsClientDeal(FD.tick.rec)) and IsREPO(FD.Group) )
+             if( FD.IsBack )
+                FD1 = SPFirstDoc( FD.Tick, false );   
+                FD2 = FD;   
+             else
+                FD1 = FD;   
+                FD2 = SPFirstDoc( FD.Tick, true );   
+             end;
+
+             ПолучитьПараметрыОД( FD, FD2, FactDate, PlOD, PlOD_2, MnOD, MnOD_2, @save_BegDateM, @save_BegDateP, @save_FinDateM, @save_FinDateP );
+          end;
+       end;
+*/
+
+       if(FD.IsBack)
+         DateKind = DLGR_DATEKIND_AVANCE2;
+       else
+         DateKind = DLGR_DATEKIND_AVANCE;
+       end;
+
+       if(DL_SetDateGrDeal( FD.tick.rec.BOfficeKind, FD.tick.rec.DealID, DateKind, FactDate) != 0 )
+         return 1;
+       end;
+
+       if(SetTransferGrDeal(FD, FactDate, FD.tick.rec.PFI) != 0)
+         return 1;
+       end;
+
+/* Добавлено закомментаренным по 134623.
+       if( not FD.IsBack )
+          if( (not IsClientDeal(FD.tick.rec)) and IsREPO(FD.Group) )
+             FD1.pm_avance.rec.ValueDate = ExecDate;
+
+             if( ИзменитьСрочностьОД( Doc, FactDate, FD1, FD2, PlOD, PlOD_2, MnOD, MnOD_2, save_BegDateP, save_FinDateP, save_BegDateM, save_FinDateM ) != 0 )
+                return 1;
+             end;
+          end;
+       end;
+*/
+
+  elif( Action == DEALCALC_ACTION_BEFORE_DEPOSIT ) /*досрочный задаток*/
+
+
+
+  elif( Action == DEALCALC_ACTION_OVERDUE_AVANCE ) /*Просрочка аванса*/   
+      /*Операция недопустима, если аванс зависит от поставки и поставка не исполнена */
+      if( (FD.dl_leg.rec.StartBase == SP_ALG_FROMDATE_STATE) AND (not ТОЗакрыто(FD.GetRQ(DLRQ_TYPE_DELIVERY))) )
+         MsgBox( "Запрещено выполнение операции. ТО аванса зависит от поставки, а поставка не исполнена" );
+         return 1;
+      end;
+
+      if( (FD.dl_leg.rec.OperState != DL_LEG_BALANCE) AND (FD.dl_leg.rec.OperState != DL_LEG_FORM) AND (not IsREPO(FD.Group)) )/*???*/
+         msgbox("Статус части сделки не подходит для заданного изменения сроков.|" +
+                "Сделка должна иметь статус \" На балансе " + 
+                "\" или \" Поставлен \"");
+         return 1;
+      end;
+
+      if( not IsClientDeal(FD.tick.rec) )
+         if( SmartConvertSum( AvanceSum, FD.GetRQ(DLRQ_TYPE_AVANCE).rec.Amount, ExecDate, FD.GetRQ(DLRQ_TYPE_AVANCE).rec.FIID, FD.GetPayFIID(), true ) == false ) 
+            return 1;
+         end;
+
+         if( IsREPO(FD.Group) )
+            if( FD.IsBack )
+               if( IsBUY(FD.Group) )
+                  if( FD.IsExistAccount(IIF(IsBasket(FD.Group), "+ОД, Корзина", "+ОД"), null, null, null, AccBuf, null, ExecDate, FD.GetPayFIID() ) == true )
+
+                     if( not FD.OpenAccount(IIF(IsBasket(FD.Group), "Треб. с н.с., корзина", "Треб. с н.с."), null, null, null, null, ExecDate, FD.GetPayFIID()) )
+                        return 1;
+                     end;
+
+                     if(not БУ_ПроводкаПоКатегориямУчета( FD, 
+                            IIF(IsBasket(FD.Group), "Треб. с н.с., корзина", "Треб. с н.с."), IIF(IsBasket(FD.Group), "+ОД, Корзина", "+ОД"), /* КатегДеб , КатегКредит*/
+                            ExecDate,      /* Дата */
+                            1,                                /* Глава */
+                            FD.GetPayFIID(),                  /* Валюта */
+                            FD.GetRQ(DLRQ_TYPE_AVANCE).rec.Amount, 
+                            INPCARRY,             /* Result_Carry */
+                            " 1",                 /* Kind_Oper */
+                            FD.tick.rec.DealCode, /* Numb_Document */
+                            "Оплата просрочена"     /* Ground */               
+                           ) )
+                         return 1;
+                     end;
+                  end;
+               else
+                  if( FD.IsExistAccount(IIF(IsBasket(FD.Group), "-ОД, Корзина", "-ОД"), null, null, null, AccBuf, null, ExecDate, FD.GetPayFIID() ) == true )
+
+                     if( not FD.OpenAccount(IIF(IsBasket(FD.Group), "Обяз. с н.с., корзина", "Обяз. с н.с."), null, null, null, null, ExecDate, FD.GetPayFIID() ) )
+                        return 1;
+                     end;
+
+                     if(not БУ_ПроводкаПоКатегориямУчета( FD, 
+                            IIF(IsBasket(FD.Group), "-ОД, Корзина", "-ОД"), IIF(IsBasket(FD.Group), "Обяз. с н.с., корзина", "Обяз. с н.с."), /* КатегДеб , КатегКредит*/
+                            ExecDate,      /* Дата */
+                            1,                                /* Глава */
+                            FD.GetPayFIID(),                  /* Валюта */
+                            FD.GetRQ(DLRQ_TYPE_AVANCE).rec.Amount, 
+                            INPCARRY,             /* Result_Carry */
+                            " 1",                 /* Kind_Oper */
+                            FD.tick.rec.DealCode, /* Numb_Document */
+                            "Оплата просрочена"     /* Ground */               
+                           ) )
+                         return 1;
+                     end;
+                  end;
+               end;
+            end;
+         else
+            if( FD.BuySale == DEAL_TYPE_BUY )/*покупка*/
+               if( not FD.OpenAccount(IIF(IsBasket(FD.Group), "Обяз. с н.с., корзина", "Обяз. с н.с."), null, null, null, null, ExecDate ) )
+                  return 1;
+               end;
+
+               if(not БУ_ПроводкаПоКатегориямУчета( FD, 
+                      "-Форвард, расчеты", IIF(IsBasket(FD.Group), "Обяз. с н.с., корзина", "Обяз. с н.с."), /* КатегДеб , КатегКредит*/
+                      ExecDate,      /* Дата */
+                      1,                                  /* Глава */
+                      FD.GetPayFIID(),                    /* Валюта */
+                      AvanceSum,          
+                      INPCARRY,             /* Result_Carry */
+                      " 1",                 /* Kind_Oper */
+                      FD.tick.rec.DealCode, /* Numb_Document */
+                      "Аванс просрочен"     /* Ground */               
+                     ) )
+                   return 1;
+               end;
+            elif( FD.BuySale == DEAL_TYPE_SALE ) /*продажа*/
+               if( not FD.OpenAccount(IIF(IsBasket(FD.Group), "Треб. с н.с., корзина", "Треб. с н.с."), null, null, null, null, ExecDate ) )
+                  return 1;
+               end;
+               if(not БУ_ПроводкаПоКатегориямУчета( FD, 
+                      IIF(IsBasket(FD.Group), "Треб. с н.с., корзина", "Треб. с н.с."),"+Форвард, расчеты", /* КатегДеб , КатегКредит*/
+                      ExecDate,      /* Дата */
+                      1,                                  /* Глава */
+                      FD.GetPayFIID(),                    /* Валюта */
+                      AvanceSum,          
+                      INPCARRY,             /* Result_Carry */
+                      " 1",                 /* Kind_Oper */
+                      FD.tick.rec.DealCode, /* Numb_Document */
+                      "Аванс просрочен"     /* Ground */               
+                     ) )
+                   return 1;
+               end; 
+
+               if( not БУ_СписатьРезерв( FD, ExecDate, true ) )
+                  return 1;
+               end;
+
+            end;
+         end;
+      end;
+
+  elif( Action == DEALCALC_ACTION_REMOVR_AVANCE ) /*Снятие с просрочки аванса*/
+
+     if( not IsClientDeal(FD.tick.rec) )
+        if( not FD.IsBack )
+           if( IsREPO(FD.Group) )
+              FD1 = FD;
+              FD2 = SPFirstDoc(FD.Tick, true);
+              FD2.SetCurPFI(FD.CurPFI());
+
+              FD.BeforeProlong = FD2.BeforeProlong = true;
+              ПолучитьПараметрыОД(FD, FD2, FactDate, PlOD, PlOD_2, MnOD, MnOD_2, @save_BegDateM, @save_BegDateP, @save_FinDateM, @save_FinDateP);
+              FD.BeforeProlong = FD2.BeforeProlong = false;
+
+              if( БУ_ИзменитьСрочностьОД(FactDate, FD1, FD2, PlOD, PlOD_2, MnOD, MnOD_2, save_BegDateP, save_FinDateP, save_BegDateM, save_FinDateM) != 0 )
+                 return 1;
+              end;
+           end;
+        end;
+     end;
+
+  elif( Action == DEALCALC_ACTION_OVERDUE_PAY ) /*Просрочка оплаты*/
+
+     /*Нельзя переносить на просрочку оплату, если 
+     [оплата зависит от поставки, или (оплата зависит от аванса и аванс зависит от 
+     поставки и аванс не исполнен) ] и статус поставки не равен "Закрыт", 
+     "Закрыт без движения", "Готов к отправке"*/
+     if( ( ( FD.dl_leg.rec.Base == SP_ALG_FROMDATE_STATE  ) OR
+           ( ( FD.dl_leg.rec.Base      == SP_ALG_FROMDATE_AVANCE) AND
+             ( FD.dl_leg.rec.StartBase == SP_ALG_FROMDATE_STATE) AND
+             (not ТОЗакрыто(FD.GetRQ(DLRQ_TYPE_AVANCE)))
+           )
+         ) AND
+         (not ТОЗакрыто(FD.GetRQ(DLRQ_TYPE_DELIVERY)))
+       )
+        msgbox("Запрещено выполнение операции.|Есть зависящие от поставки ТО, а ТО поставки не исполнено");
+        return 1;
+     end;
+     /* Нельзя переносить на просрочку оплату, если 
+     [оплата зависит от аванса, или (оплата зависит от поставки и поставка зависит 
+     от аванса и поставка не исполнена) ] и статус аванса не равен "Закрыт", 
+     "Закрыт без движения", "Готов к отправке"*/
+     if( ( ( FD.dl_leg.rec.Base == SP_ALG_FROMDATE_AVANCE) OR
+           ( ( FD.dl_leg.rec.Base == SP_ALG_FROMDATE_STATE) AND
+             ( FD.dl_leg.rec.PrincipalBase == SP_ALG_FROMDATE_AVANCE) AND
+             (not ТОЗакрыто(FD.GetRQ(DLRQ_TYPE_DELIVERY)))
+           )
+         ) AND
+         (not ТОЗакрыто(FD.GetRQ(DLRQ_TYPE_AVANCE)))
+       )
+        msgbox("Запрещено выполнение операции.|Есть зависящие от аванса ТО, а ТО по авансу не исполнено");
+        return 1;
+     end;
+
+     if( not IsClientDeal(FD.tick.rec) )
+        if( IsREPO(FD.Group) )
+           if( FD.IsBack )
+              if( IsBUY(FD.Group) )
+                 if( FD.IsExistAccount( "+% к погашению", null, true, null, AccBuf, null, ExecDate, FD.GetPayFIID() ) == true )
+      
+                    if( not FD.OpenAccount( "+% с н.с.", null, null, null, null, ExecDate, NATCUR ) )
+                       return 1;
+                    end;
+      
+                    if(not БУ_ПроводкаПоКатегориямУчета( FD, 
+                           "+% с н.с.", "+% к погашению", /* КатегДеб , КатегКредит*/
+                           ExecDate,      /* Дата */
+                           1,                                /* Глава */
+                           FD.GetPayFIID(),                  /* Валюта */
+                           ABS(GetRestAccount( AccBuf, ExecDate )),  
+                           INPCARRY,             /* Result_Carry */
+                           " 1",                 /* Kind_Oper */
+                           FD.tick.rec.DealCode, /* Numb_Document */
+                           "Проценты просрочены",     /* Ground */               
+                           null,
+                           null, null,
+                           NATCUR, FD.GetPayFIID()
+                          ) )
+                        return 1;
+                    end;
+                 end;
+      
+                 if( FD.IsExistAccount( "-% к погашению", null, true, null, AccBuf, null, ExecDate, FD.GetPayFIID() ) == true )
+      
+                    if( not FD.OpenAccount( "-% с н.с.", null, null, null, null, ExecDate, NATCUR ) )
+                       return 1;
+                    end;
+      
+                    if(not БУ_ПроводкаПоКатегориямУчета( FD, 
+                           "-% к погашению", "-% с н.с.", /* КатегДеб , КатегКредит*/
+                           ExecDate,      /* Дата */
+                           1,                                /* Глава */
+                           FD.GetPayFIID(),                  /* Валюта */
+                           ABS(GetRestAccount( AccBuf, ExecDate )),  
+                           INPCARRY,             /* Result_Carry */
+                           " 1",                 /* Kind_Oper */
+                           FD.tick.rec.DealCode, /* Numb_Document */
+                           "Проценты просрочены",     /* Ground */               
+                           null,
+                           null, null,
+                           FD.GetPayFIID(), NATCUR
+                          ) )
+                        return 1;
+                    end;
+                 end;
+      
+                 if( FD.IsExistAccount("+ОД", null, null, null, AccBuf, null, ExecDate, FD.GetPayFIID() ) == true )
+                    if( not FD.OpenAccount("Треб. с н.с.", null, null, null, null, ExecDate, FD.GetPayFIID()) )
+                       return 1;
+                    end;
+      
+                    CarrySum = FD.GetRQ(DLRQ_TYPE_PAYMENT).rec.Amount;
+                    if( SmartConvertSum(CarrySum, CarrySum, FD.GetRQ(DLRQ_TYPE_PAYMENT).rec.PlanDate, FD.GetRQ(DLRQ_TYPE_PAYMENT).rec.FIID, FD.GetPayFIID(), true) != true )
+                       return 1;
+                    end;
+      
+                    if(not БУ_ПроводкаПоКатегориямУчета( FD, 
+                                                         "Треб. с н.с.", "+ОД", /* КатегДеб , КатегКредит*/
+                                                         ExecDate,              /* Дата */
+                                                         1,                     /* Глава */
+                                                         FD.GetPayFIID(),       /* Валюта */
+                                                         CarrySum,
+                                                         INPCARRY,              /* Result_Carry */
+                                                         " 1",                  /* Kind_Oper */
+                                                         FD.tick.rec.DealCode,  /* Numb_Document */
+                                                         "Оплата просрочена"    /* Ground */
+                                                       )
+                      )
+                        return 1;
+                    end;
+                 end;
+      
+                 if( not БУ_СписатьРезерв( FD, PlanDate, false ) )
+                    return 1;
+                 end;
+      
+              else
+                 if( FD.IsExistAccount("-ОД", null, null, null, AccBuf, null, ExecDate, FD.GetPayFIID() ) == true )
+                    if( not FD.OpenAccount("Обяз. с н.с.", null, null, null, null, ExecDate, FD.GetPayFIID() ) )
+                       return 1;
+                    end;
+      
+                    CarrySum = FD.GetRQ(DLRQ_TYPE_PAYMENT).rec.Amount;
+                    if( SmartConvertSum(CarrySum, CarrySum, FD.GetRQ(DLRQ_TYPE_PAYMENT).rec.PlanDate, FD.GetRQ(DLRQ_TYPE_PAYMENT).rec.FIID, FD.GetPayFIID(), true) != true )
+                       return 1;
+                    end;
+      
+                    var Sод_rest = 0.0;
+                    if( FD.dl_leg.rec.IncomeRate < 0.0 )
+                      if( FD.IsExistAccount( "+% к погашению", null, true, null, AccBuf, null, ExecDate, FD.GetPayFIID() ) == true )
+                        Sод_rest = ABS(GetRestAccount( AccBuf, ExecDate));
+                        if(not БУ_ПроводкаПоКатегориямУчета( FD,
+                                                        "-ОД", "+% к погашению", /* КатегДеб , КатегКредит*/
+                                                        ExecDate,              /* Дата */
+                                                        1,                     /* Глава */
+                                                        FD.GetPayFIID(),       /* Валюта */
+                                                        Sод_rest,
+                                                        INPCARRY,              /* Result_Carry */
+                                                        " 1",                    /* Kind_Oper */
+                                                        FD.tick.rec.DealCode,  /* Numb_Document */
+                                                        "Проценты просрочены"    /* Ground */
+                                                      )
+                          )
+                          return 1;
+                        end; 
+                      end;
+                    end;
+      
+                    if(not БУ_ПроводкаПоКатегориямУчета( FD,
+                                                         "-ОД", "Обяз. с н.с.", /* КатегДеб , КатегКредит*/
+                                                         ExecDate,              /* Дата */
+                                                         1,                     /* Глава */
+                                                         FD.GetPayFIID(),       /* Валюта */
+                                                         (CarrySum - Sод_rest),
+                                                         INPCARRY,              /* Result_Carry */
+                                                         " 1",                  /* Kind_Oper */
+                                                         FD.tick.rec.DealCode,  /* Numb_Document */
+                                                         "Оплата просрочена"    /* Ground */
+                                                       )
+                      )
+                        return 1;
+                    end;
+                 end;
+
+              end;
+           end;
+        else
+      
+           PlanDate = FD.GetRQ(DLRQ_TYPE_PAYMENT).rec.PlanDate;
+      
+           if( SmartConvertSum( PaySum, FD.dl_leg.rec.TotalCost, FD.DateArray[DATE_DEALBEGINEXEC], FD.dl_leg.rec.CFI, FD.GetPayFIID(), true ) == false ) 
+              return 1;
+           end;
+           if( FD.ExistAvance == true )  
+              if( SmartConvertSum( AvanceSum, FD.GetRQ(DLRQ_TYPE_AVANCE).rec.Amount, PlanDate, FD.GetRQ(DLRQ_TYPE_AVANCE).rec.FIID, FD.GetPayFIID(), true ) == false ) 
+                 return 1;
+              end; 
+           elif( FD.ExistDeposit == true )  
+              if( SmartConvertSum( AvanceSum, FD.GetRQ(DLRQ_TYPE_DEPOSIT).rec.Amount, PlanDate, FD.GetRQ(DLRQ_TYPE_DEPOSIT).rec.FIID, FD.GetPayFIID(), true ) == false ) 
+                 return 1;
+              end; 
+           end;
+      
+           CarrySum = PaySum - AvanceSum;
+      
+           if( FD.BuySale == DEAL_TYPE_BUY )/*покупка*/
+      
+              if( CarrySum > 0 )
+                 if( not FD.OpenAccount("Обяз. с н.с.", null, null, null, null, PlanDate ) )
+                    return 1;
+                 end;
+                 if(not БУ_ПроводкаПоКатегориямУчета( FD, 
+                        "-Форвард, расчеты", "Обяз. с н.с.", /* КатегДеб , КатегКредит*/
+                        PlanDate,                           /* Дата */
+                        1,                                  /* Глава */
+                        FD.GetPayFIID(),                    /* Валюта */
+                        CarrySum, 
+                        INPCARRY,                           /* Result_Carry */
+                        " 1",                               /* Kind_Oper */
+                        FD.tick.rec.DealCode,               /* Numb_Document */
+                        "Оплата просрочена"                 /* Ground */
+                       ) )
+                     return 1;
+                 end;
+              end;
+      
+              if( FD.ExistDeposit == true )
+                 /*есть платеж задатка - выполним его зачет*/
+                 if(not БУ_ПроводкаПоКатегориямУчета( FD, 
+                        "-Форвард, расчеты", "+Расчеты",  /* КатегДеб , КатегКредит*/
+                        PlanDate,                         /* Дата  */
+                        1 ,                               /* Глава */
+                        FD.GetRQ(DLRQ_TYPE_DEPOSIT).rec.FIID,   /* Валюта*/
+                        FD.GetRQ(DLRQ_TYPE_DEPOSIT).rec.Amount, /* Сумма */
+                        INPCARRY,                         /* Result_Carry   */
+                        " 1",                             /* Kind_Oper      */
+                        FD.tick.rec.DealCode,             /* Numb_Document */
+                        "Зачет суммы уплаченного задатка",/* Ground */
+                        NULL
+                       ))
+                     return 1;
+                 end;         
+              end; 
+      
+           elif( FD.BuySale == DEAL_TYPE_SALE )
+      
+              if( CarrySum > 0 )
+                 if( not FD.OpenAccount("Треб. с н.с.", null, null, null, null, PlanDate) )
+                    return 1;
+                 end;
+                 if(not БУ_ПроводкаПоКатегориямУчета( FD, 
+                        "Треб. с н.с.","+Форвард, расчеты", /* КатегДеб , КатегКредит*/
+                        PlanDate,                           /* Дата */
+                        1,                                  /* Глава */
+                        FD.GetPayFIID(),                    /* Валюта */
+                        CarrySum,          
+                        INPCARRY,                           /* Result_Carry */
+                        " 1",                               /* Kind_Oper */
+                        FD.tick.rec.DealCode,               /* Numb_Document */
+                        "Оплата просрочена"                 /* Ground */
+                       ) )
+                   return 1;
+                 end;      
+              end;
+      
+              if( FD.ExistDeposit == true ) 
+                 /*есть платеж задатка - выполним его зачет*/
+                 if(not БУ_ПроводкаПоКатегориямУчета( FD, 
+                        "-Расчеты", "+Форвард, расчеты",  /* КатегДеб , КатегКредит*/
+                        PlanDate,                         /* Дата  */
+                        1 ,                               /* Глава */
+                        FD.GetRQ(DLRQ_TYPE_DEPOSIT).rec.FIID,   /* Валюта*/
+                        FD.GetRQ(DLRQ_TYPE_DEPOSIT).rec.Amount, /* Сумма */
+                        INPCARRY,                         /* Result_Carry   */
+                        " 1",                             /* Kind_Oper      */
+                        FD.tick.rec.DealCode,             /* Numb_Document */
+                        "Зачет суммы уплаченного задатка",/* Ground */
+                        NULL
+                   ))
+                     return 1;
+                 end;         
+              end; 
+      
+              if( not БУ_СписатьРезерв(FD, PlanDate, false) )
+                 return 1;
+              end;
+      
+           end;
+        end;
+     end;
+
+  elif( Action == DEALCALC_ACTION_REMOVR_PAY ) /*Снятие с просрочки оплаты*/
+
+     if( FD.ExistAvance == true )
+        if( ТОЗакрыто(FD.GetRQ(DLRQ_TYPE_AVANCE)) != true )  
+           msgbox("Статус ТО по авансу не подходит для заданного изменения сроков");
+           return 1;
+        end;
+     elif( FD.ExistDeposit == true )
+        if( ТОЗакрыто(FD.GetRQ(DLRQ_TYPE_DEPOSIT)) != true )  
+           msgbox("Статус ТО по депозиту не подходит для заданного изменения сроков");
+           return 1;
+        end;    
+     end;    
+
+     if( not IsClientDeal(FD.tick.rec) )
+        if( not FD.IsBack )
+           if( IsREPO(FD.Group) )
+              FD1 = FD;
+              FD2 = SPFirstDoc(FD.Tick, true);
+              FD2.SetCurPFI(FD.CurPFI());
+
+              FD.BeforeProlong = FD2.BeforeProlong = true;
+              ПолучитьПараметрыОД(FD, FD2, FactDate, PlOD, PlOD_2, MnOD, MnOD_2, @save_BegDateM, @save_BegDateP, @save_FinDateM, @save_FinDateP);
+              FD.BeforeProlong = FD2.BeforeProlong = false;
+
+              if( БУ_ИзменитьСрочностьОД(FactDate, FD1, FD2, PlOD, PlOD_2, MnOD, MnOD_2, save_BegDateP, save_FinDateP, save_BegDateM, save_FinDateM) != 0 )
+                 return 1;
+              end;
+           end;
+        end;
+     end;
+
+  elif( Action == DEALCALC_ACTION_OVERDUE_SET ) /*Просрочка поставки*/     
+
+     if( IsREPO(FD.Group) and IsEXCHANGE(FD.Group) )
+        /*Проверим, что исполнение (поставка и оплата) не выполнено, не просрочено, не пролонгировано*/
+        if (ТОЗакрыто(FD.GetRQ(DLRQ_TYPE_DELIVERY)) or ТОЗакрыто(FD.GetRQ(DLRQ_TYPE_PAYMENT)))
+           msgbox("Запрещено выполнение операции.|2 часть сделки уже исполнена");
+           return 1;
+        end;
+
+        if ((FD.GetRQ(DLRQ_TYPE_DELIVERY).rec.State == DLRQ_STATE_DELAYED) or (FD.GetRQ(DLRQ_TYPE_PAYMENT).rec.State == DLRQ_STATE_DELAYED))
+           msgbox("Запрещено выполнение операции.|2 часть сделки пролонгирована");
+           return 1;
+        end;
+     else
+        /*Нельзя переносить на просрочку поставку, если 
+        [поставка зависит от аванса, или (поставка  зависит от оплаты и оплата  
+         зависит от аванса и оплата не исполнена) ] и статус аванса не равен 
+        "Закрыт", "Закрыт без движения", "Готов к отправке" */
+        if( ( ( FD.dl_leg.rec.PrincipalBase == SP_ALG_FROMDATE_AVANCE) OR
+              ( ( FD.dl_leg.rec.PrincipalBase == SP_ALG_FROMDATE_PAY) AND
+                ( FD.dl_leg.rec.Base == SP_ALG_FROMDATE_AVANCE) AND
+                (not ТОЗакрыто(FD.GetRQ(DLRQ_TYPE_PAYMENT)))
+              )
+            ) AND
+            (not ТОЗакрыто(FD.GetRQ(DLRQ_TYPE_AVANCE)))
+          )
+           msgbox("Запрещено выполнение операции.|Есть зависящие от аванса ТО, а ТО по авансу не исполнено");
+           return 1;
+        end;
+
+        /*Нельзя переносить на просрочку поставку, если 
+          [поставка зависит от оплаты, или (поставка зависит от аванса и аванс 
+          зависит от оплаты и аванс не исполнен ) ] и статус оплаты не равен 
+          "Закрыт", "Закрыт без движения", "Готов к отправке"*/
+        if( ( ( FD.dl_leg.rec.PrincipalBase == SP_ALG_FROMDATE_PAY) OR
+              ( ( FD.dl_leg.rec.PrincipalBase == SP_ALG_FROMDATE_AVANCE) AND
+                ( FD.dl_leg.rec.StartBase == SP_ALG_FROMDATE_PAY) AND
+                (not ТОЗакрыто(FD.GetRQ(DLRQ_TYPE_AVANCE)))
+              )
+            ) AND
+            (not ТОЗакрыто(FD.GetRQ(DLRQ_TYPE_PAYMENT)))
+          )
+           msgbox("Запрещено выполнение операции.|Есть зависящие от оплаты ТО, а ТО по оплате не исполнено");
+           return 1;
+        end;
+     end;
+
+     if( not IsClientDeal(FD.tick.rec) )
+
+        if( SmartConvertSum( PaySum, FD.dl_leg.rec.TotalCost, FD.DateArray[DATE_DEALBEGINEXEC], FD.dl_leg.rec.CFI, FD.GetPayFIID(), true ) == false ) 
+           return 1;
+        end;
+        
+        if( IsREPO(FD.Group) )
+           if( FD.IsBack )
+              /*Непосредственно просрочка поставки*/
+              if( IsBUY(FD.Group) ) // ОРЕПО
+                 if( FD.IsExistAccount(IIF(IsBasket(FD.Group), "Ц/б, Корзина ПВО", "Ц/б, ПВО"), null, null, FIROLE_BA, AccBuf, null, ExecDate, FD.FaceFIID() ) == true )
+     
+                    if( not FD.OpenAccount(IIF(IsBasket(FD.Group), "Ц/б, Корзина ПВО", "Ц/б, ПВО"), null, null, FIROLE_BA_OVERDUE, null, ExecDate, FD.FaceFIID() ) )
+                       return 1;
+                    end;
+     
+                    if(not БУ_ПроводкаПоКатегориямУчета( FD, 
+                           IIF(IsBasket(FD.Group), "Ц/б, Корзина ПВО", "Ц/б, ПВО"), IIF(IsBasket(FD.Group), "Ц/б, Корзина ПВО", "Ц/б, ПВО"), /* КатегДеб , КатегКредит*/
+                           ExecDate,      /* Дата */
+                           3,                                /* Глава */
+                           FD.FaceFIID(),                  /* Валюта */
+                           $0, 
+                           INPCARRY,             /* Result_Carry */
+                           " 1",                 /* Kind_Oper */
+                           FD.tick.rec.DealCode, /* Numb_Document */
+                           "Поставка просрочена",     /* Ground */               
+                           GETRESTACC_DEBET,
+                           FIROLE_BA, FIROLE_BA_OVERDUE
+                          ) )
+                        return 1;
+                    end;
+                 end;
+
+                   if( FD.IsExistAccount(IIF(IsBasket(FD.Group), "-ОД, Корзина", "-ОД"), null, true, null, AccBuf, null, ExecDate, FD.FaceFIID() ) == true )
+
+                      if( not FD.OpenAccount(IIF(IsBasket(FD.Group), "Обяз. с н.с., корзина", "Обяз. с н.с."), null, null, null, null, ExecDate, FD.FaceFIID() ) )
+                         return 1;
+                      end;
+
+                      if(not БУ_ПроводкаПоКатегориямУчета( FD, 
+                             IIF(IsBasket(FD.Group), "-ОД, Корзина", "-ОД"), IIF(IsBasket(FD.Group), "Обяз. с н.с., корзина", "Обяз. с н.с."), /* КатегДеб , КатегКредит*/
+                             ExecDate,      /* Дата */
+                             1,                                /* Глава */
+                             FD.FaceFIID(),                  /* Валюта */
+                             $0, 
+                             INPCARRY,             /* Result_Carry */
+                             " 1",                 /* Kind_Oper */
+                             FD.tick.rec.DealCode, /* Numb_Document */
+                             "Поставка просрочена",     /* Ground */               
+                             GETRESTACC_DEBET
+                            ) )
+                          return 1;
+                      end;
+                   end;
+
+              elif( IsSALE(FD.Group) ) // ПРЕПО
+                 if( FD.IsExistAccount(IIF(IsBasket(FD.Group), "Ц/б, Корзина БПП", "Ц/б, БПП"), null, true, GetFIRoleByPortfolio( KINDPORT_TRADE ), AccBuf, null, ExecDate, FD.FaceFIID()) == true )
+                    if( not FD.OpenAccount(IIF(IsBasket(FD.Group), "Ц/б, Корзина БПП", "Ц/б, БПП"), null, null, GetFIRoleByPortfolio( KINDPORT_TRADE, null, null, null, true ), null, ExecDate, FD.FaceFIID()) )
+                       return 1;
+                    end;
+     
+                    if(not БУ_ПроводкаПоКатегориямУчета( FD, 
+                                                         IIF(IsBasket(FD.Group), "Ц/б, Корзина БПП", "Ц/б, БПП"), /*КатегДеб*/
+                                                         IIF(IsBasket(FD.Group), "Ц/б, Корзина БПП", "Ц/б, БПП"), /*КатегКредит*/
+                                                         ExecDate,              /* Дата */
+                                                         1,                     /* Глава */
+                                                         FD.FaceFIID(),         /* Валюта */
+                                                         $0,
+                                                         INPCARRY,              /* Result_Carry */
+                                                         " 1",                  /* Kind_Oper */
+                                                         FD.tick.rec.DealCode,  /* Numb_Document */
+                                                         "Поставка просрочена", /* Ground */
+                                                         GETRESTACC_CREDIT,
+                                                         GetFIRoleByPortfolio( KINDPORT_TRADE, null, null, null, true ), 
+                                                         GetFIRoleByPortfolio( KINDPORT_TRADE )
+                                                       )
+                      )
+                        return 1;
+                    end;
+                 end;
+
+                 if( FD.IsExistAccount(IIF(IsBasket(FD.Group), "Ц/б, Корзина БПП", "Ц/б, БПП"), null, true, GetFIRoleByPortfolio( KINDPORT_SALE ), AccBuf, null, ExecDate, FD.FaceFIID()) == true )
+                    if( not FD.OpenAccount(IIF(IsBasket(FD.Group), "Ц/б, Корзина БПП", "Ц/б, БПП"), null, null, GetFIRoleByPortfolio( KINDPORT_SALE, null, null, null, true ), null, ExecDate, FD.FaceFIID()) )
+                       return 1;
+                    end;
+     
+                    if(not БУ_ПроводкаПоКатегориямУчета( FD, 
+                                                         IIF(IsBasket(FD.Group), "Ц/б, Корзина БПП", "Ц/б, БПП"), /*КатегДеб*/
+                                                         IIF(IsBasket(FD.Group), "Ц/б, Корзина БПП", "Ц/б, БПП"), /*КатегКредит*/
+                                                         ExecDate,              /* Дата */
+                                                         1,                     /* Глава */
+                                                         FD.FaceFIID(),         /* Валюта */
+                                                         $0,
+                                                         INPCARRY,              /* Result_Carry */
+                                                         " 1",                  /* Kind_Oper */
+                                                         FD.tick.rec.DealCode,  /* Numb_Document */
+                                                         "Поставка просрочена", /* Ground */               
+                                                         GETRESTACC_CREDIT,
+                                                         GetFIRoleByPortfolio( KINDPORT_SALE, null, null, null, true ), 
+                                                         GetFIRoleByPortfolio( KINDPORT_SALE )
+                                                       )
+                      )
+                        return 1;
+                    end;
+                 end;
+
+                 if( FD.IsExistAccount(IIF(IsBasket(FD.Group), "Ц/б, Корзина БПП", "Ц/б, БПП"), null, true, GetFIRoleByPortfolio( KINDPORT_RETIRE ), AccBuf, null, ExecDate, FD.FaceFIID()) == true )
+                    if( not FD.OpenAccount(IIF(IsBasket(FD.Group), "Ц/б, Корзина БПП", "Ц/б, БПП"), null, null, GetFIRoleByPortfolio( KINDPORT_RETIRE, null, null, null, true ), null, ExecDate, FD.FaceFIID()) )
+                       return 1;
+                    end;
+
+                    if(not БУ_ПроводкаПоКатегориямУчета( FD, 
+                                                         IIF(IsBasket(FD.Group), "Ц/б, Корзина БПП", "Ц/б, БПП"), /*КатегДеб*/
+                                                         IIF(IsBasket(FD.Group), "Ц/б, Корзина БПП", "Ц/б, БПП"), /*КатегКредит*/
+                                                         ExecDate,              /* Дата */
+                                                         1,                     /* Глава */
+                                                         FD.FaceFIID(),         /* Валюта */
+                                                         $0,
+                                                         INPCARRY,              /* Result_Carry */
+                                                         " 1",                  /* Kind_Oper */
+                                                         FD.tick.rec.DealCode,  /* Numb_Document */
+                                                         "Поставка просрочена", /* Ground */               
+                                                         GETRESTACC_CREDIT,
+                                                         GetFIRoleByPortfolio( KINDPORT_RETIRE, null, null, null, true ), 
+                                                         GetFIRoleByPortfolio( KINDPORT_RETIRE )
+                                                       )
+                      )
+                        return 1;
+                    end;
+                 end;
+
+                 if( FD.IsExistAccount(IIF(IsBasket(FD.Group), "Уплач. НКД, Корзина БПП", "Уплаченный НКД, БПП"), null, true, GetFIRoleByPortfolio( KINDPORT_TRADE ), AccBuf, null, ExecDate, FD.FaceFIID()) == true )
+     
+                    if( not FD.OpenAccount(IIF(IsBasket(FD.Group), "Уплач. НКД, Корзина БПП", "Уплаченный НКД, БПП"), null, null, GetFIRoleByPortfolio( KINDPORT_TRADE, null, null, null, true ), null, ExecDate, FD.FaceFIID()) )
+                       return 1;
+                    end;
+     
+                    if(not БУ_ПроводкаПоКатегориямУчета( FD, 
+                                                         IIF(IsBasket(FD.Group), "Уплач. НКД, Корзина БПП", "Уплаченный НКД, БПП"), /*КатегДеб*/
+                                                         IIF(IsBasket(FD.Group), "Уплач. НКД, Корзина БПП", "Уплаченный НКД, БПП"), /*КатегКредит*/
+                                                         ExecDate,              /* Дата */
+                                                         1,                     /* Глава */
+                                                         FD.FaceFIID(),         /* Валюта */
+                                                         $0, 
+                                                         INPCARRY,              /* Result_Carry */
+                                                         " 1",                  /* Kind_Oper */
+                                                         FD.tick.rec.DealCode,  /* Numb_Document */
+                                                         "Поставка просрочена", /* Ground */               
+                                                         GETRESTACC_CREDIT,
+                                                         GetFIRoleByPortfolio( KINDPORT_TRADE, null, null, null, true ), 
+                                                         GetFIRoleByPortfolio( KINDPORT_TRADE )
+                                                       )
+                      )
+                        return 1;
+                    end;
+                 end;
+
+                 if( FD.IsExistAccount(IIF(IsBasket(FD.Group), "Уплач. НКД, Корзина БПП", "Уплаченный НКД, БПП"), null, true, GetFIRoleByPortfolio( KINDPORT_SALE ), AccBuf, null, ExecDate, FD.FaceFIID()) == true )
+     
+                    if( not FD.OpenAccount(IIF(IsBasket(FD.Group), "Уплач. НКД, Корзина БПП", "Уплаченный НКД, БПП"), null, null, GetFIRoleByPortfolio( KINDPORT_SALE, null, null, null, true ), null, ExecDate, FD.FaceFIID()) )
+                       return 1;
+                    end;
+     
+                    if(not БУ_ПроводкаПоКатегориямУчета( FD, 
+                                                         IIF(IsBasket(FD.Group), "Уплач. НКД, Корзина БПП", "Уплаченный НКД, БПП"), /*КатегДеб*/
+                                                         IIF(IsBasket(FD.Group), "Уплач. НКД, Корзина БПП", "Уплаченный НКД, БПП"), /*КатегКредит*/
+                                                         ExecDate,              /* Дата */
+                                                         1,                     /* Глава */
+                                                         FD.FaceFIID(),         /* Валюта */
+                                                         $0, 
+                                                         INPCARRY,              /* Result_Carry */
+                                                         " 1",                  /* Kind_Oper */
+                                                         FD.tick.rec.DealCode,  /* Numb_Document */
+                                                         "Поставка просрочена", /* Ground */               
+                                                         GETRESTACC_CREDIT,
+                                                         GetFIRoleByPortfolio( KINDPORT_SALE, null, null, null, true ), 
+                                                         GetFIRoleByPortfolio( KINDPORT_SALE )
+                                                       )
+                      )
+                        return 1;
+                    end;
+                 end;
+
+                 if( FD.IsExistAccount(IIF(IsBasket(FD.Group), "Уплач. НКД, Корзина БПП", "Уплаченный НКД, БПП"), null, true, GetFIRoleByPortfolio( KINDPORT_RETIRE ), AccBuf, null, ExecDate, FD.FaceFIID()) == true )
+
+                    if( not FD.OpenAccount(IIF(IsBasket(FD.Group), "Уплач. НКД, Корзина БПП", "Уплаченный НКД, БПП"), null, null, GetFIRoleByPortfolio( KINDPORT_RETIRE, null, null, null, true ), null, ExecDate, FD.FaceFIID()) )
+                       return 1;
+                    end;
+
+                    if(not БУ_ПроводкаПоКатегориямУчета( FD, 
+                                                         IIF(IsBasket(FD.Group), "Уплач. НКД, Корзина БПП", "Уплаченный НКД, БПП"), /*КатегДеб*/
+                                                         IIF(IsBasket(FD.Group), "Уплач. НКД, Корзина БПП", "Уплаченный НКД, БПП"), /*КатегКредит*/
+                                                         ExecDate,              /* Дата */
+                                                         1,                     /* Глава */
+                                                         FD.FaceFIID(),         /* Валюта */
+                                                         $0,
+                                                         INPCARRY,              /* Result_Carry */
+                                                         " 1",                  /* Kind_Oper */
+                                                         FD.tick.rec.DealCode,  /* Numb_Document */
+                                                         "Поставка просрочена", /* Ground */               
+                                                         GETRESTACC_CREDIT,
+                                                         GetFIRoleByPortfolio( KINDPORT_RETIRE, null, null, null, true ), 
+                                                         GetFIRoleByPortfolio( KINDPORT_RETIRE )
+                                                       )
+                      )
+                        return 1;
+                    end;
+                 end;
+                 
+                 if(GetSecurNewRepoDate() > ExecDate) //Проводку для нового учета РЕПО не формируем
+                   if( FD.IsExistAccount(IIF(IsBasket(FD.Group), "+ОД, Корзина", "+ОД"), null, true, null, AccBuf, null, ExecDate, FD.FaceFIID() ) == true )
+                      if( not FD.OpenAccount(IIF(IsBasket(FD.Group), "Треб. с н.с., корзина", "Треб. с н.с."), null, null, null, null, ExecDate, FD.FaceFIID() ) )
+                         return 1;
+                      end;
+
+                      if(not БУ_ПроводкаПоКатегориямУчета( FD, 
+                             IIF(IsBasket(FD.Group), "Треб. с н.с., корзина", "Треб. с н.с."), IIF(IsBasket(FD.Group), "+ОД, Корзина", "+ОД"), /* КатегДеб , КатегКредит*/
+                             ExecDate,      /* Дата */
+                             1,                                /* Глава */
+                             FD.FaceFIID(),                  /* Валюта */
+                             $0, 
+                             INPCARRY,             /* Result_Carry */
+                             " 1",                 /* Kind_Oper */
+                             FD.tick.rec.DealCode, /* Numb_Document */
+                             "Поставка просрочена",     /* Ground */               
+                             GETRESTACC_CREDIT
+                            ) )
+                          return 1;
+                      end;
+                   end;
+                 end;
+
+                 if( FD.IsExistAccount(IIF(IsBasket(FD.Group), "Ц/б, ПВО_БПП, Корзина", "Ц/б, ПВО_БПП"), null, true, GetFIRoleByPortfolio(IIF(IsDealKSU(FD.Group), KINDPORT_BACK_KSU, KINDPORT_BACK)), AccBuf, null, ExecDate, FD.FaceFIID()) == true )
+                    if( not FD.OpenAccount(IIF(IsBasket(FD.Group), "Ц/б, ПВО_БПП, Корзина", "Ц/б, ПВО_БПП"), null, null, FIROLE_BA_OVERDUE, null, ExecDate, FD.FaceFIID()) )
+                       return 1;
+                    end;
+
+                    if( not БУ_ПроводкаПоКатегориямУчета( FD,
+                                                          IIF(IsBasket(FD.Group), "Ц/б, ПВО_БПП, Корзина", "Ц/б, ПВО_БПП"), /* КатегДеб */
+                                                          IIF(IsBasket(FD.Group), "Ц/б, ПВО_БПП, Корзина", "Ц/б, ПВО_БПП"), /* КатегКредит */
+                                                          ExecDate,              /* Дата */
+                                                          3,                     /* Глава */
+                                                          FD.FaceFIID(),         /* Валюта */
+                                                          $0, 
+                                                          INPCARRY,              /* Result_Carry */
+                                                          " 1",                  /* Kind_Oper */
+                                                          FD.tick.rec.DealCode,  /* Numb_Document */
+                                                          "Поставка просрочена", /* Ground */               
+                                                          GETRESTACC_CREDIT,
+                                                          FIROLE_BA_OVERDUE,
+                                                          GetFIRoleByPortfolio(IIF(IsDealKSU(FD.Group), KINDPORT_BACK_KSU, KINDPORT_BACK))
+                                                        )
+                      )
+                       return 1;
+                    end;
+                 end;
+
+                 if( FD.IsExistAccount(IIF(IsBasket(FD.Group), "Ц/б, Корзина ПКУ БПП", "Ц/б, ПКУ БПП"), null, true, GetFIRoleByPortfolio(KINDPORT_CONTR), AccBuf, null, ExecDate, NATCUR) == true )
+                    if( not FD.OpenAccount(IIF(IsBasket(FD.Group), "Ц/б, Корзина ПКУ БПП", "Ц/б, ПКУ БПП"), null, null, GetFIRoleByPortfolio(KINDPORT_CONTR, null, null, null, true), null, ExecDate, NATCUR) )
+                       return 1;
+                    end;
+
+                    if( not БУ_ПроводкаПоКатегориямУчета( FD,
+                                                          IIF(IsBasket(FD.Group), "Ц/б, Корзина ПКУ БПП", "Ц/б, ПКУ БПП"), /* КатегДеб */
+                                                          IIF(IsBasket(FD.Group), "Ц/б, Корзина ПКУ БПП", "Ц/б, ПКУ БПП"), /* КатегКредит */
+                                                          ExecDate,              /* Дата */
+                                                          1,                     /* Глава */
+                                                          NATCUR,                /* Валюта */
+                                                          $0, 
+                                                          INPCARRY,              /* Result_Carry */
+                                                          " 1",                  /* Kind_Oper */
+                                                          FD.tick.rec.DealCode,  /* Numb_Document */
+                                                          "Поставка просрочена", /* Ground */               
+                                                          GETRESTACC_CREDIT,
+                                                          GetFIRoleByPortfolio(KINDPORT_CONTR, null, null, null, true),
+                                                          GetFIRoleByPortfolio(KINDPORT_CONTR)
+                                                        )
+                      )
+                       return 1;
+                    end;
+                 end;
+
+                 if( not БУ_СписатьРезерв( FD, ExecDate, false ) )
+                    return 1;
+                 end;
+
+                 if( FD.dl_leg.rec.IncomeRate > 0.0 )
+                   if( FD.IsExistAccount( "-% к погашению", null, true, null, AccBuf, null, ExecDate, FD.GetPayFIID() ) == true )
+
+                      if( not FD.OpenAccount( "-% с н.с.", null, null, null, null, ExecDate, NATCUR ) )
+                         return 1;
+                      end;
+
+                      if(not БУ_ПроводкаПоКатегориямУчета( FD, 
+                             "-% к погашению", "-% с н.с.", /* КатегДеб , КатегКредит*/
+                             ExecDate,      /* Дата */
+                             1,                                /* Глава */
+                             FD.GetPayFIID(),                  /* Валюта */
+                             ABS(GetRestAccount( AccBuf, ExecDate)),  
+                             INPCARRY,             /* Result_Carry */
+                             " 1",                 /* Kind_Oper */
+                             FD.tick.rec.DealCode, /* Numb_Document */
+                             "Проценты просрочены",     /* Ground */               
+                             null,
+                             null, null,
+                             FD.GetPayFIID(), NATCUR
+                            ) )
+                          return 1;
+                      end;
+                   end;
+                 end;
+              end;
+           end;
+
+        else
+           if( FD.BuySale == DEAL_TYPE_SALE )/*продажа*/
+
+              if( FD.IsExistAccount( "-Форвард, расчеты", null, null, null, AccBuf, null, ExecDate, null) == true )
+
+                 if( not FD.OpenAccount(IIF(IsBasket(FD.Group), "Обяз. с н.с., корзина", "Обяз. с н.с."), null, null, null, null, ExecDate ) )
+                    return 1;
+                 end;
+
+                 var DVSSCost = $0;
+                 if( FD.tick.rec.IsPFI )
+                    DVSSCost = FD.GetFrValSumLastAccountedOnDate(ExecDate);
+                    if( SmartConvertSum(DVSSCost, DVSSCost, ExecDate, NATCUR, FD.GetPayFIID(), true) != true )
+                    return 1;
+                 end;
+                 end;
+
+                 if( not БУ_ПроводкаПоКатегориямУчета( FD,
+                                                       "-Форвард, расчеты", IIF(IsBasket(FD.Group), "Обяз. с н.с., корзина", "Обяз. с н.с."), /* КатегДеб , КатегКредит*/
+                                                       ExecDate,             /* Дата */
+                                                       1,                    /* Глава */
+                                                       FD.GetPayFIID(),      /* Валюта */
+                                                       PaySum + DVSSCost,
+                                                       INPCARRY,             /* Result_Carry */
+                                                       " 1",                 /* Kind_Oper */
+                                                       FD.tick.rec.DealCode, /* Numb_Document */
+                                                       "Поставка просрочена",/* Ground */
+                                                       null, null, null,
+                                                       FD.GetPayFIID(), FD.GetPayFIID()
+
+                                                     )
+                   )
+                    return 1;
+                 end;
+              else
+                 return 1;
+              end;
+           elif( FD.BuySale == DEAL_TYPE_BUY )
+
+              if( FD.IsExistAccount( "+Форвард, расчеты", null, null, null, AccBuf, null, ExecDate, null ) == true )
+
+                 if( not FD.OpenAccount(IIF(IsBasket(FD.Group), "Треб. с н.с., корзина", "Треб. с н.с."), null, null, null, null, ExecDate ) )
+                    return 1;
+                 end;
+
+                 if(not БУ_ПроводкаПоКатегориямУчета( FD, 
+                        IIF(IsBasket(FD.Group), "Треб. с н.с., корзина", "Треб. с н.с."),"+Форвард, расчеты", /* КатегДеб , КатегКредит*/
+                        ExecDate,      /* Дата */
+                        1,                                  /* Глава */
+                        FD.GetPayFIID(),                    /* Валюта */
+                        PaySum,          
+                        INPCARRY,             /* Result_Carry */
+                        " 1",                 /* Kind_Oper */
+                        FD.tick.rec.DealCode, /* Numb_Document */
+                        "Поставка просрочена",    /* Ground */               
+                         null, null, null,
+                         FD.GetPayFIID(), FD.GetPayFIID()
+                       ) )
+                   return 1;
+                 end;      
+              else
+                 return 1;
+              end;  
+
+              if( not БУ_СписатьРезерв( FD, ExecDate, false ) )
+                 return 1;
+              end;
+            end;
+        end;          
+     end;
+
+
+  elif( Action == DEALCALC_ACTION_REMOVR_SET ) /*Снятие с просрочки поставки*/     
+
+     if( FD.IsBack == true )
+        DateKind = DLGR_DATEKIND_DELIVERY2;
+     else
+        DateKind = DLGR_DATEKIND_DELIVERY;
+     end;
+
+     if( DL_SetDateGrDeal(FD.tick.rec.BOfficeKind, FD.tick.rec.DealID, DateKind, FactDate) != 0 )
+        return 1;
+     end;
+
+  elif( Action == DEALCALC_ACTION_LONGPAY ) /*Отложенные аванс/оплата*/     
+     if( IsREPO(FD.Group) )
+        if( (not IsClientDeal(FD.tick.rec)) and FD.IsBack )
+           if( FD.IsBack )
+              FD1 = SPFirstDoc( FD.Tick, false );   
+              FD2 = FD;   
+              FD1.SetCurPFI(FD.CurPFI());
+           else
+              FD1 = FD;   
+              FD2 = SPFirstDoc( FD.Tick, true );   
+              FD2.SetCurPFI(FD.CurPFI());
+           end;
+
+           FD1.BeforeProlong = FD2.BeforeProlong = true;
+           ПолучитьПараметрыОД( FD1, FD2, PlanDate, PlOD, PlOD_2, MnOD, MnOD_2, @Save_BegDateM, @Save_BegDateP, @Save_FinDateM, @Save_FinDateP );
+           FD1.BeforeProlong = FD2.BeforeProlong = false;
+        end;
+     end;
+
+     if( (FD.dl_leg.rec.PrincipalBase == SP_ALG_FROMDATE_AVANCE) OR
+         (FD.dl_leg.rec.PrincipalBase == SP_ALG_FROMDATE_PAY) 
+       ) 
+        ExistLink = true;
+     end;
+
+     if( PlanDate == null ) /*Может быть уже задана при рекурсивном вызове если есть зависимые ТО*/
+        if( FD.ExistAvance and (not ТОЗакрыто(FD.GetRQ(DLRQ_TYPE_AVANCE))))
+           PlanDate = FD.GetRQ(DLRQ_TYPE_AVANCE).rec.PlanDate;
+        else
+           PlanDate = FD.GetRQ(DLRQ_TYPE_PAYMENT).rec.PlanDate;
+        end;
+     end;
+
+     if( not IsClientDeal(FD.tick.rec) )
+        if( IsREPO(FD.Group) )
+        else
+           if (FD.dl_leg.rec.OperState != DL_LEG_OUTBAL) /*GAA:523731*/
+               return 0;
+           else
+
+           DealType = FD.ВидСрочностиСделки();
+
+           if( FD.DealAsResultDVExe == false )
+              ForvAccMinus = "-Форвард, прочие";
+              ForvAccPlus  = "+Форвард, прочие";
+           else
+              ForvAccMinus = "-Форвард, дрейф";
+              ForvAccPlus  = "+Форвард, дрейф";
+           end;
+
+           if( FD.BuySale == DEAL_TYPE_BUY )
+              ChdAcc    = "-Форвард, ОИ";
+              FIRole    = FIROLE_FICOM;
+              Ground    = "обязательство";
+              ForvAcc   = ForvAccMinus;
+              DebetAcc  = ForvAcc;
+              CreditAcc = ChdAcc;
+              ReqOrCom  = "О";
+           else
+              ChdAcc    = "+Форвард, ОИ";
+              FIRole    = FIROLE_FIREQ;
+              Ground    = "требование";
+              ForvAcc   = ForvAccPlus;
+              DebetAcc  = ChdAcc;
+              CreditAcc = ForvAcc;
+              ReqOrCom  = "Т";
+           end;
+
+           if( FD.IsExistAccount( ForvAcc, null, null, FIRole, AccBuf, null, PlanDate ) )
+/*
+              if( not FD.OpenAccount( ChdAcc, null, null, FIRole, null, PlanDate) )
+                 return 1;
+              end;
+*/
+              CarrySum = ABS(GetRestAccount( AccBuf, PlanDate ));
+              /*BPV не нужна проводка */
+              /*
+              if(not БУ_ПроводкаПоКатегориямУчета( FD, 
+                        DebetAcc, CreditAcc,  /* КатегДеб , КатегКредит*/
+                        PlanDate,             /* Дата */
+                        AccBuf.Chapter,       /* Глава */
+                        AccBuf.Code_Currency, /* Валюта */
+                        CarrySum,          
+                        INPCARRY,             /* Result_Carry */
+                        " 1",                 /* Kind_Oper */
+                        FD.tick.rec.DealCode, /* Numb_Document */
+                        "Отложено " + Ground,  /* Ground */               
+                        null, FIRole, FIRole
+                       ) )
+                return 1;
+              end;  
+              */
+           else
+              return 1;
+           end;
+           end;  /*GAA:523731*/
+        end;
+     end;
+
+     /* Если поставка зависит от аванса или оплаты, установить статус на 
+        ТО по базовому активу "Пролонгирован" */
+     if( ExistLink ) 
+        if( БУ_ПроводкиИзмененияСроковИсполнения_ДляСделки( FD, DEALCALC_ACTION_LONGSET, FactDate, PlanDate, ExecDate, GrDealID ) != 0 )
+           return 1;
+        end;
+     end;
+      
+     if( IsREPO(FD.Group) ) 
+        if( (not IsClientDeal(FD.tick.rec)) and FD.IsBack )
+           if( ExecDate >= GetSecurNewRepoDate() ) /*новый учёт*/
+              if( IsSALE(FD.Group) ) /*В ПРЕПО срочность +ОД меняем только ДО нового учета РЕПО*/
+                 PlOD.Clear();
+                 PlOD_2.Clear();
+              end;
+
+              if( IsBUY(FD.Group) ) /*В ОРЕПО срочность -ОД меняем только ДО нового учета РЕПО*/
+                 MnOD.Clear();
+                 MnOD_2.Clear();
+              end;
+           end;
+           if( БУ_ИзменитьСрочностьОД( PlanDate, FD1, FD2, PlOD, PlOD_2, MnOD, MnOD_2, Save_BegDateP, Save_FinDateP, Save_BegDateM, Save_FinDateM ) != 0 )
+              return 1;
+           end;
+        end;
+     end;
+
+  elif( Action == DEALCALC_ACTION_EXECLONGPAY ) /*Исполнение отложенных аванса/оплаты*/     
+
+     if( FD.GetRQ(DLRQ_TYPE_PAYMENT).rec.State != DLRQ_STATE_DELAYED )
+        MsgBox( "Для выполнения операции ТО по оплате должно иметь статус \"исполнение отложено\"" );
+        return 1;
+     end;
+
+     if( FD.ExistAvance )
+        if( FactDate < FD.DateArray[DATE_DEALAVANCE_PLAN] )
+           msgbox( "Дата исполнения не должна быть меньше плановой даты аванса" );
+           return 1;
+        end;
+     else 
+        if( FactDate < FD.DateArray[DATE_DEALPAY_PLAN] )
+           msgbox( "Дата исполнения не должна быть меньше плановой даты оплаты" );
+           return 1;
+        end;
+     end;
+
+     if( not FD.IsBack )
+        if( (not IsClientDeal(FD.tick.rec)) and IsREPO(FD.Group) )
+           if( FD.IsBack )
+              FD1 = SPFirstDoc( FD.Tick, false );   
+              FD2 = FD;   
+              FD1.SetCurPFI(FD.CurPFI());
+           else
+              FD1 = FD;   
+              FD2 = SPFirstDoc( FD.Tick, true );   
+              FD2.SetCurPFI(FD.CurPFI());
+           end;
+
+           FD.BeforeProlong = FD2.BeforeProlong = true;
+           ПолучитьПараметрыОД( FD, FD2, FactDate, PlOD, PlOD_2, MnOD, MnOD_2, @save_BegDateM, @save_BegDateP, @save_FinDateM, @save_FinDateP );
+           FD.BeforeProlong = FD2.BeforeProlong = false;
+
+           if( БУ_ИзменитьСрочностьОД( FactDate, FD1, FD2, PlOD, PlOD_2, MnOD, MnOD_2, save_BegDateP, save_FinDateP, save_BegDateM, save_FinDateM ) != 0 )
+              return 1;
+           end;
+        end;
+     end;
+
+     if( (FD.dl_leg.rec.StartBase == SP_ALG_FROMDATE_STATE) OR
+         ( (FD.ExistAvance == false) AND
+           (FD.dl_leg.rec.Base == SP_ALG_FROMDATE_STATE) 
+         )
+       ) 
+        ExistLink = true;
+     end;
+
+     if( ExistLink )
+        if( (not ТОЗакрыто(FD.GetRQ(DLRQ_TYPE_DELIVERY))) AND 
+            (FD.GetRQ(DLRQ_TYPE_DELIVERY).rec.State != DLRQ_STATE_OVERDUE)
+          )
+           if( IsOprMultiExec() )
+              return 1;
+           end;
+
+           if( MsgBoxEx( "ТО по поставке ц/б должно имееть статус|\"Исполнено\" или  \"Просрочено\".|Продолжить выполнение операции ?",
+                          MB_YES+MB_NO, IND_NO, 
+                         "", "Подтверждение выполнения операции" ) != IND_YES ) 
+              return 1; 
+           end;
+        end;
+     end;
+
+  elif( Action == DEALCALC_ACTION_LONGSET ) /*Отложенная поставка*/     
+
+     if( IsREPO(FD.Group) )
+        if( (not IsClientDeal(FD.tick.rec)) and FD.IsBack )
+           if( FD.IsBack )
+              FD1 = SPFirstDoc( FD.Tick, false );   
+              FD2 = FD;   
+              FD1.SetCurPFI(FD.CurPFI());
+           else
+              FD1 = FD;   
+              FD2 = SPFirstDoc( FD.Tick, true );   
+              FD2.SetCurPFI(FD.CurPFI());
+           end;
+           FD1.BeforeProlong = FD2.BeforeProlong = true;
+           ПолучитьПараметрыОД( FD1, FD2, PlanDate, PlOD, PlOD_2, MnOD, MnOD_2, @Save_BegDateM, @Save_BegDateP, @Save_FinDateM, @Save_FinDateP );
+           FD2.BeforeProlong = FD2.BeforeProlong = false;
+        end;
+     end;
+     /*В рамках даного пункта - оплата зависима <=> ТО по авансу зависит от 
+       ТО по пставке или (аванса нет и оплата зависит от ТО по поставке)*/
+     if( (FD.dl_leg.rec.StartBase == SP_ALG_FROMDATE_STATE) OR
+         ( (FD.ExistAvance == false) AND
+           (FD.dl_leg.rec.Base == SP_ALG_FROMDATE_STATE) 
+         )
+       ) 
+        ExistLink = true;
+     end;
+
+     if( PlanDate == null ) /*Может быть уже задана при рекурсивном вызове если есть зависимые ТО*/
+        PlanDate = FD.GetRQ(DLRQ_TYPE_DELIVERY).rec.PlanDate;
+     end;
+
+     if( not IsClientDeal(FD.tick.rec) ) 
+        if( IsREPO(FD.Group) )
+        else
+           DealType = FD.ВидСрочностиСделки();
+
+           if( FD.DealAsResultDVExe == false )
+              ForvAccMinus = "-Форвард, прочие";
+              ForvAccPlus  = "+Форвард, прочие";
+           else
+              ForvAccMinus = "-Форвард, дрейф";
+              ForvAccPlus  = "+Форвард, дрейф";
+           end;
+
+           if( FD.BuySale == DEAL_TYPE_SALE )
+              ChdAcc    = "-Форвард, ОИ";
+              FIRole    = FIROLE_FICOM;
+              Ground    = "обязательство";
+              ForvAcc   = ForvAccMinus;
+              DebetAcc  = ForvAcc;
+              CreditAcc = ChdAcc;
+              ReqOrCom  = "О";
+           else
+              ChdAcc    = "+Форвард, ОИ";
+              FIRole    = FIROLE_FIREQ;
+              Ground    = "требование";
+              ForvAcc   = ForvAccPlus;
+              DebetAcc  = ChdAcc;
+              CreditAcc = ForvAcc;
+              ReqOrCom  = "Т";
+           end;
+
+           if( FD.IsExistAccount( ForvAcc, null, null, FIRole, AccBuf, null, PlanDate ) )
+/*
+              if( not FD.OpenAccount( ChdAcc, null, null, FIRole, null, PlanDate) )
+                 return 1;
+              end;
+*/
+              CarrySum = ABS(GetRestAccount( AccBuf, PlanDate ));
+              /*BPV не нужна проводка */
+              /*
+              if(not БУ_ПроводкаПоКатегориямУчета( FD, 
+                        DebetAcc, CreditAcc,  /* КатегДеб , КатегКредит*/
+                        PlanDate,             /* Дата */
+                        AccBuf.Chapter,       /* Глава */
+                        AccBuf.Code_Currency, /* Валюта */
+                        CarrySum,          
+                        INPCARRY,             /* Result_Carry */
+                        " 1",                 /* Kind_Oper */
+                        FD.tick.rec.DealCode, /* Numb_Document */
+                        "Отложено " + Ground,  /* Ground */               
+                        null, FIRole, FIRole
+                       ) )
+                return 1;
+              end;
+              */
+           else
+              return 1;
+           end;
+        end;
+     end;
+
+     /*Если оплата зависима, то установить статус на ТО по авансу и 
+       оплате  "Пролонгирован" */
+     if( ExistLink ) 
+        if( БУ_ПроводкиИзмененияСроковИсполнения_ДляСделки( FD, DEALCALC_ACTION_LONGPAY, FactDate, PlanDate, ExecDate, GrDealID ) != 0 )
+           return 1;
+        end;
+     end;
+
+     if( IsREPO(FD.Group) ) 
+        if( (not IsClientDeal(FD.tick.rec)) and FD.IsBack )
+           if( GetSecurNewRepoDate() > ExecDate ) /*старый учет*/
+             if( БУ_ИзменитьСрочностьОД( PlanDate, FD1, FD2, PlOD, PlOD_2, MnOD, MnOD_2, Save_BegDateP, Save_FinDateP, Save_BegDateM, Save_FinDateM ) != 0 )
+                return 1;
+             end;
+           end;
+        end;
+     end;
+
+  elif( Action == DEALCALC_ACTION_EXECLONGSET ) /*Исполнение отложенной поставки*/     
+
+     if( not (IsREPO(FD.Group) and IsEXCHANGE(FD.Group)) )
+        if( FD.GetRQ(DLRQ_TYPE_DELIVERY).rec.State != DLRQ_STATE_DELAYED )
+           MsgBox( "Для выполнения операции ТО по поставке ц/б|должно иметь статус \"исполнение отложено\"" );
+           return 1;
+        end;
+
+        if( FactDate < FD.DateArray[DATE_DEALSETAVOIRISS_PLAN] )
+           msgbox( "Дата исполнения не должна быть меньше плановой даты поставки" );
+           return 1;
+        end;
+     else
+        if( (FD.GetRQ(DLRQ_TYPE_DELIVERY).rec.State != DLRQ_STATE_DELAYED) or (FD.GetRQ(DLRQ_TYPE_PAYMENT).rec.State != DLRQ_STATE_DELAYED) )
+           MsgBox( "Для выполнения операции ТО по поставке и оплате ц/б|должны иметь статус \"исполнение отложено\"" );
+           return 1;
+        end;
+
+        if( (FactDate < FD.DateArray[DATE_DEALSETAVOIRISS_PLAN]) or (FactDate < FD.DateArray[DATE_DEALPAY_PLAN]) )
+           msgbox( "Дата исполнения не должна быть меньше плановой даты исполнения 2ч" );
+           return 1;
+        end;
+     end;
+
+     if( (FD.dl_leg.rec.PrincipalBase == SP_ALG_FROMDATE_PAY) OR
+         (FD.dl_leg.rec.PrincipalBase == SP_ALG_FROMDATE_AVANCE) 
+       ) 
+        ExistLink = true;
+     end;
+
+     if( ExistLink )
+        if( (not ТОЗакрыто(FD.GetRQ(DLRQ_TYPE_PAYMENT))) AND 
+            (FD.GetRQ(DLRQ_TYPE_PAYMENT).rec.State != DLRQ_STATE_OVERDUE)
+          )
+           if( IsOprMultiExec() )
+              return 1;
+           end;
+
+           if( MsgBoxEx( "ТО по оплате ц/б должно имееть статус|\"Исполнено\",  или  \"Просрочено\".|Продолжить выполнение операции ?",
+                          MB_YES+MB_NO, IND_NO, 
+                         "", "Подтверждение выполнения операции" ) != IND_YES ) 
+              return 1; 
+           end;
+        end;
+     end;
+     
+  else
+     msgbox( "Неопределен вид действия операции расчетов по сделке."); 
+     return 1;
+  end;
+
+  return 0;
+end;
+

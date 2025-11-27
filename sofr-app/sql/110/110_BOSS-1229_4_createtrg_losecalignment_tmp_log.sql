@@ -1,0 +1,15 @@
+CREATE OR REPLACE TRIGGER "LOSECALIGNMENT_TMP_LOG_T0_AINC"
+ BEFORE INSERT OR UPDATE OF t_id ON LOSECALIGNMENT_TMP_LOG FOR EACH ROW
+DECLARE
+ v_id INTEGER;
+BEGIN
+ IF (:new.t_id = 0 OR :new.t_id IS NULL) THEN
+ SELECT LOSECALIGNMENT_TMP_LOG_seq.nextval INTO :new.t_id FROM dual;
+ ELSE
+ select last_number into v_id from user_sequences where sequence_name = upper ('LOSECALIGNMENT_TMP_LOG_SEQ');
+ IF :new.t_id >= v_id THEN
+ RAISE DUP_VAL_ON_INDEX;
+ END IF;
+ END IF;
+END;
+/

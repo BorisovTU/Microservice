@@ -1,0 +1,591 @@
+/**
+ @file dbo_qi_ExclusionNotification.mac
+ @brief Функционал отправки уведомления об исключении лица из реестра квалифицированных инвесторов.
+ 
+ Файл содержит функционал для формирования уведомления об исключении лица из реестра
+ квалифицированных инвесторов и его отправки по e-mail.
+ 
+  # tag
+ - functional_block:Отчетность_Клиент
+ - code_type:API
+ - code_type:Report
+ - Квалификация
+ - КИ
+ - Квалифицированный инвестор
+ 
+  # changeLog
+ |date       |author         |tasks                                                     |note                                                        
+ |-----------|---------------|----------------------------------------------------------|-------------------------------------------------------------
+ |20.12.2023 |Топорков Д.В.  |BIQ-16875 BOSS-194 BOSS-1285                              | Создание
+ |29.01.2024 |Гераськина Т.В.|DEF-60620                                                 | Укорочено наименование файла resultFileName для исключения
+ */
+ 
+import rsd;
+import "dbo_qi_func.mac"; // CSigner, CClient
+import "dlcnst.inc";
+import "logger.mac";
+import "dlutils.mac";
+import "dlwreps.mac";
+
+private const NOTIFICATION_NAME = "899-ОД-1-6"; ///< Наименование бланка уведомления/имя шаблона
+
+/// Константы содержимого для e-mail
+private const QIEXCLUSION_EMAIL_SUBJECT = "Уведомление об исключении лица из реестра лиц, признанных квалифицированными инвесторами";
+private const QIEXCLUSION_EMAIL_BODY = 
+  "Добрый день!\n" +
+  "\n" +
+  "В соответствии с условиями Регламента принятия решения о признании лица квалифицированным инвестором в АО \x22Россельхозбанк\x22 " +
+  "направляем Вам Уведомление об исключении из Реестра квалифицированных инвесторов АО \x22Россельхозбанк\x22.\n" +
+  "\n";
+
+private var logger;
+
+/**
+@brief Функция выбора значения в зависимости от условия
+@param[in] condition Условие для выбора (true/false !0/0)
+@param[in] valueTrue Значение которое вернет функция при condition = true (тип Variant)
+@param[in] valueFalse Значение которое вернет функция при condition = false (тип Variant)
+@return valueTrue при condition=true, valueFalse при condition=false (тип Variant)
+*/
+private macro IIF(condition, resultOnTrue, resultOnFalse)
+   if (condition)
+      return resultOnTrue;
+   else
+      return resultOnFalse;
+   end;
+end;
+
+/**
+@brief Функция записи сообщения в логгер
+@param[in] msg - Сообщение
+@param[in] logType - Тип сообщения (если не указано, то будет интерпритировано как LOGTYPE_INFO
+@return Переданное значение msg
+*/
+private macro LogMessage(msg, logType)
+  logger.log(msg, logType);
+  return msg;
+end;
+
+/**
+@brief Процедура записи в логгер параметров Уведомления об исключении
+@param[in] exclusionParams Параметры уведомления об исключении
+*/
+private macro LogQIExclusionParams(exclusionParams: CQINotificationParams)
+  LogMessage("Формирование уведомления для клиента " + exclusionParams.client.shortName);
+  LogMessage("Дата : " + exclusionParams.notificationDate);
+  LogMessage("Подписант : " + exclusionParams.signer.oper + ", " + exclusionParams.signer.name + ", " + exclusionParams.signer.post);
+end;
+
+/**
+@brief Функция проверки параметров Уведомления об ислючении
+@param[in] exclusionParams Параметры уведомления об исключении
+@param[out] error Текст ошибки
+@return true В случае корректных параметров
+@return false Параметры некорректны (см. error)
+*/
+private macro CheckQIExclusionConditions(exclusionParams: CQINotificationParams, storage: CStorageInfo, error: @String): Bool
+  error = "";
+  /// Общие проверки
+  if (StrLen(error) == 0)
+    if ((ValType(exclusionParams.dlContrID) == V_UNDEF) or (exclusionParams.dlContrID <= 0))
+      error = "Не задан договор обслуживания";
+    //DEF-63715 проверка почты вынесена в SendQIExclusionEmail, если почта не указана, все равно сформируем файл и сообщение на договоре
+    elif ((ValType(exclusionParams.notificationDate) == V_UNDEF) or (exclusionParams.notificationDate == date(0,0,0)))
+      error = "Не задана дата исключения";
+    elif ((ValType(exclusionParams.signer) == V_UNDEF) or (exclusionParams.signer.oper <= 0))
+      error = "Не заданы системные настройки процесса: Подписант по умолчанию";
+    elif (StrLen(storage.GetDirectory(RESULTTAG).path) <= 1)
+      error = "Не заданы системные настройки процесса: Директория";
+    end;
+  end;
+  /// Проверки подписанта
+  if (StrLen(error) == 0)
+    if ((ValType(exclusionParams.signer.post) != V_STRING) or (StrLen(exclusionParams.signer.post) == 0))
+      error = "Не заполнена должность подписанта по умолчанию";
+    elif ((ValType(exclusionParams.signer.signStampImageID) != V_INTEGER) or (exclusionParams.signer.signStampImageID == 0))
+      error = "Отсутствует изображение подписи подписанта по умолчанию";
+    end;
+  end;
+  /// Проверка наличия договора в реестре квалифицированных инвесторов
+  if (StrLen(error) == 0)
+    var sql;
+    if(not GetRegValueSwitchQI()) //NEW PARAM
+      sql = "SELECT * FROM dScQinv_dbt WHERE t_sfContrID = (SELECT t_sfContrID FROM dDlContr_dbt WHERE t_dlContrID = " + exclusionParams.dlContrID + ") ORDER BY t_regDate DESC";
+    else
+      sql = " SELECT * " +
+              "  FROM dScQinv_dbt   " +
+              " WHERE t_partyid  = (SELECT sf.t_partyid   " +
+              "                      FROM dDlContr_dbt d JOIN dsfcontr_dbt sf ON d.t_sfcontrid = sf.t_id   " +
+              "                      WHERE t_dlContrID = " + exclusionParams.dlContrID + ") " +
+              " ORDER BY t_regDate DESC ";
+    end;
+
+    var qInvRec = TRsbDataSet(sql);
+    
+    if(not GetRegValueSwitchQI()) //NEW PARAM
+      if (qInvRec.MoveNext())
+        if (qInvRec.state == 1)
+          error = "Договор находится в реестре КИ со статусом \"Включен\"";
+        elif (qInvRec.state != 0)
+          error = "Неизвестный статус договора в реестре квалифицированных инвесторов";
+        end;
+      else
+        error = "Договор отсутствует в реестре квалифицированных инвесторов";
+      end;
+    else
+      if (qInvRec.MoveNext())
+        if (qInvRec.state == 1)
+          error = "Клиент находится в реестре КИ со статусом \"Включен\"";
+        elif (qInvRec.state != 0)
+          error = "Неизвестный статус клиента в реестре квалифицированных инвесторов";
+        end;
+      else
+        error = "Клиент отсутствует в реестре квалифицированных инвесторов";
+      end;
+    end;
+  end;
+
+  if (StrLen(error) > 0)
+    return false;
+  end;
+
+  return true;
+end;
+
+/**
+@brief Функция получения объекта класса CStorageInfo (данные об используемых директориях и файлах в них)
+@param[in] exclusionParams Параметры уведомления об исключении
+@return Настроенный объекта класса CStorageInfo
+
+# Предполагается следующее использование директорий:
+- WORKTAG   Директория WorkFile сервера приложений (установлена в конструкторе CStorageInfo)
+- RESULTTAG Директория для итогового хранения файлов согласно настроек банка (либо значение установленное в конструкторе CStorageInfo)
+- TXTTAG    Директория TxtFile сервера приложений (установлена в конструкторе CStorageInfo)
+# Предполагается следующее использование файлов:
+- WORKTAG/WORKTAG     Временный файл данных отчета для заполнения шаблона
+- WORKTAG/SIGNTAG     Временный файл изображение подписи и печати для вставки в Уведомление
+- RESULTTAG/RESULTTAG Файл уведомления в формате DOC (не формируется)
+- RESULTTAG/PDFTAG    Файл уведомления в формате PDF
+- TXTTAG/LOGTAG       Файл для записи лога (возможно удаляется в случае отсутствия ошибок)
+*/
+private macro GetQIStorageInfo(exclusionParams: CQINotificationParams): CStorageInfo
+  var fileTag: String = "Уведомление_квал_инвест_";
+  var cleanClientName: String = CleanStringForFilename(exclusionParams.client.shortName);
+  if ((ValType(exclusionParams) != V_UNDEF) and (ValType(exclusionParams.client) != V_UNDEF) and (ValType(exclusionParams.client.shortName) == V_STRING))
+    fileTag = fileTag + cleanClientName;
+  end;
+  
+  var storageInfo: CStorageInfo = CStorageInfo(fileTag);
+  var errCode: Integer;
+  var targetDirectory: String;
+    
+   /// Если задана настройка директории сохранения файлов, то установим ее в RESULTTAG
+   GetRegistryValue(QI_REGISTRY_DIRECTORY, V_STRING, targetDirectory, errCode);
+   if ((errCode == 0) and (ValType(targetDirectory) == V_STRING))
+     targetDirectory = Trim(targetDirectory);
+     if (StrLen(targetDirectory) > 0)
+       storageInfo.AddDirectory(RESULTTAG, NormalizePath(targetDirectory, false), false);
+     else
+       LogMessage("Не задана настройка " + QI_REGISTRY_DIRECTORY);
+       storageInfo.AddDirectory(RESULTTAG, "", false);
+     end;
+   end;
+  
+  /// Переопределим имена файлов с меткой RESULTTAG в директории RESULTTAG
+  var resultFileName: String = "Уведомление об исключении из реестра КИ " + StrSubst(cleanClientName, "_", " ");
+  
+  SplitFile(GetUnexistedFileName(toANSI(storageInfo.GetDirectory(RESULTTAG).Path + resultFileName + ".pdf")), resultFileName); // т.к. целевой pdf, то ориентируемся на него
+  storageInfo.AddFile(RESULTTAG, RESULTTAG, resultFileName, "doc", false);
+  storageInfo.AddFile(RESULTTAG, PDFTAG, resultFileName, "pdf", false);
+  /// Добавим информацию для файла логирования
+  storageInfo.AddFile(TXTTAG, LOGTAG, "QiExclusion_" + GetDateTimeMark(Date(), Time()) + "_" + String(Random(999)), "txt", false);
+  return storageInfo;
+end;
+
+/**
+@brief Процедура создания файла уведомления 
+@param[in] exclusionParams Параметры уведомления об исключении
+@param[in] storage Данные об используемых директориях/файлах
+@param[out] error Текст ошибки
+@return True в случае успешного создания файла уведомления, false в случае ошибки
+*/
+private macro CreateQIExclusionNotification(exclusionParams: CQINotificationParams, storage: CStorageInfo, error: @String): Bool
+  var RealFileName = ""; 
+  var fTxt, fNameTxtMess = "", pdfName = "";
+  var tplName = NOTIFICATION_NAME + ".dotx"; //FindTemplate(NOTIFICATION_NAME + ".dotx");
+  fNameTxtMess = storage.FilePath(TXTTAG, TXTTAG);
+
+  fTxt = TStreamDoc(fNameTxtMess, "C", "rsoem ", 1/*unix*/);
+  if ( ValType(fTxt) != V_UNDEF )
+  else
+    error = "Текстовый файл вывода не открыт " + fNameTxtMess;
+    return false;
+  end;
+
+  fTxt.WriteLine(tplName);     //Шаблон dotx
+  fTxt.WriteLine(SubStr(tplName, 1, index(tplName, ".dot")-1) + "_" + String(exclusionParams.client.partyID));   //Файл docx
+
+  fTxt.WriteLine("~Client");
+  fTxt.WriteLine(IIF(exclusionParams.client.legalForm == PTLEGF_PERSN, exclusionParams.client.fullName, exclusionParams.client.shortName));
+
+  fTxt.WriteLine("~IsExclusion");
+  fTxt.WriteLine("[  ]"); // StrFor(82) Символ [V] шрифта Wingdings 2
+
+  fTxt.WriteLine("~IsFull");
+  fTxt.WriteLine("[X]"); // Символ [V] шрифта Wingdings 2
+  //Droid Sans Fallback 16 02610, 02611
+  //Carlito
+
+  fTxt.WriteLine("~IsPartly");
+  fTxt.WriteLine("[X]");
+
+  fTxt.WriteLine("~IsType");
+  fTxt.WriteLine("[  ]"); 
+
+  fTxt.WriteLine("~Reason_2");
+  fTxt.WriteLine("  ");
+  
+  fTxt.WriteLine("~Reason_2_1");
+  fTxt.WriteLine("  ");
+  
+  fTxt.WriteLine("~ClientBody");
+  fTxt.WriteLine(exclusionParams.client.fullName);
+
+  fTxt.WriteLine("~Post");
+  fTxt.WriteLine(exclusionParams.signer.post);
+
+  fTxt.WriteLine("~InsertImage");
+  fTxt.WriteLine("Sign#"+storage.FilePath(WORKTAG, SIGNTAG)+"#154#142"); //Имя_закладки#Полный путь к файлу с картинкой#258#238 //60%
+
+  fTxt.WriteLine("~SignerName");
+  fTxt.WriteLine(exclusionParams.signer.name);
+
+  fTxt.WriteLine("~Date");
+  fTxt.WriteLine(String(exclusionParams.notificationDate:f));
+
+  //удаляем пустые строки, которые были нужня для форматирования
+  fTxt.WriteLine("~DeleteRows");
+  fTxt.WriteLine(string(2)); //Номер таблицы
+  fTxt.WriteLine("%");
+  fTxt.WriteLine(String(2)); //номер первой удаляемой строки
+  fTxt.WriteLine(String(3)); //номер последней удаляемой строки
+
+  fTxt.WriteLine("~DeleteRows");
+  fTxt.WriteLine(string(2)); //Номер таблицы
+  fTxt.WriteLine("%");
+  fTxt.WriteLine(String(3)); //номер первой удаляемой строки
+  fTxt.WriteLine(String(4)); //номер последней удаляемой строки
+
+  fTxt.WriteLine("~DeleteRows");
+  fTxt.WriteLine(string(2)); //Номер таблицы
+  fTxt.WriteLine("%");
+  fTxt.WriteLine(String(4)); //номер первой удаляемой строки
+  fTxt.WriteLine(String(5)); //номер последней удаляемой строки
+
+  fTxt.WriteLine("~DeleteRows");
+  fTxt.WriteLine(string(2)); //Номер таблицы
+  fTxt.WriteLine("%");
+  fTxt.WriteLine(String(5)); //номер первой удаляемой строки
+  fTxt.WriteLine(String(5)); //номер последней удаляемой строки
+
+  fTxt.WriteLine("~DeleteRows");
+  fTxt.WriteLine(string(2)); //Номер таблицы
+  fTxt.WriteLine("%");
+  fTxt.WriteLine(String(17)); //номер первой удаляемой строки
+  fTxt.WriteLine(String(17)); //номер последней удаляемой строки
+
+   //удаляем пустые строки в подписях
+  fTxt.WriteLine("~DeleteRows");
+  fTxt.WriteLine(string(3)); //Номер таблицы
+  fTxt.WriteLine("%");
+  fTxt.WriteLine(String(3+1)); //номер первой удаляемой строки
+  fTxt.WriteLine(String(3+1)); //номер последней удаляемой строки
+
+  fTxt.WriteLine("~DeleteRows");
+  fTxt.WriteLine(string(3)); //Номер таблицы
+  fTxt.WriteLine("%");
+  fTxt.WriteLine(String(7+1-1)); //номер первой удаляемой строки
+  fTxt.WriteLine(String(7+1-1)); //номер последней удаляемой строки
+
+  //эмуляция метода close
+  fTxt = TStreamDoc(fNameTxtMess, "R", "rsoem ", 1/*unix*/);
+
+  pdfName = SubStr(fNameTxtMess, 1, index(fNameTxtMess, ".")-1) + ".pdf";
+
+  //Вызов функции из dlwreps.mac 
+  DLWREPS_PrintReportFromTagFile( fNameTxtMess, @RealFileName, Null/*CloseDoc*/, True/*SaveDocTwice*/ , Null/*UsePoiMode*/, pdfName/*FileNamePDF*/, Null/*FileNameHTML*/, False/*ShowDoc*/);
+ 
+  if (not CopyFile(pdfName, storage.FilePath(RESULTTAG, PDFTAG), True /*Индикатор*/, "Копируем файл для отправки"))
+    error = "Не удалось скопировать файл " + pdfName + " в директорию " + string(storage.FilePath(RESULTTAG, PDFTAG));
+  else
+     //MsgBox("Успешно скопирован файл из "+pdfName+" в директорию "+ string(storage.FilePath(RESULTTAG, PDFTAG));
+  end;            
+
+  //exclusionParams.resultFileName = RealFileName;
+
+  DelFile(fNameTxtMess);
+  DelFile(pdfName);
+  
+  return StrLen(error) == 0;
+  
+onError(err)
+  error = LogMessage("Ошибка выполнения:|" + err.Module + " строка " + err.Line + "|" + err.message, LOGTYPE_ERROR);
+  
+  return false;
+end;
+
+
+/**
+@brief Поиск существующего неотправленного сообщения на договоре при исключении
+@param[in] exclusionParams Параметры уведомления об исключении
+@return Индекс записи в таблице dDlContrMsg_dbt
+@return 0 В случае ошибки
+*/
+private macro FindQIExclusionDBOMessage(exclusionParams: CQINotificationParams)
+  var sql = "Select t_id from ddlcontrmsg_dbt where t_dlcontrid = :pdlid and t_kind = :pkind and t_senddate = to_date('01010001','ddmmyyyy') order by t_id desc";
+  var cmd, rs;
+  var dlContrMsgID = 0;
+
+  cmd = RSDCommand(sql);
+  cmd.AddParam("pdlid", RSDBP_IN, exclusionParams.dlContrID);
+  cmd.AddParam("pkind", RSDBP_IN, EXCLUSION_QI);
+  rs = RSDRecordSet(cmd);
+  if (rs.movenext())
+    dlContrMsgID = rs.value("t_id");
+    LogMessage("Найдено неотправленное сообщение ДБО с ID = " + dlContrMsgID);
+  end;
+
+  return dlContrMsgID;
+end;
+
+
+/**
+@brief Прикрепление файла уведомления к сообщению для ДБО. Имеющиеся файлы сообщения очищаются
+@param[in] dlContrMsgID Индекс записи в таблице dDlContrMsg_dbt
+@param[in] storage Данные об используемых директориях/файлах
+@param[out] error Текст ошибки
+@return true
+@return false В случае ошибки записи
+
+Предполагается, что файл уведомления RESULTTAG/PDFTAG уже создан
+*/
+private macro AttachFileQIExclusionDBOMessage(dlContrMsgID: Integer, storage: CStorageInfo, error: @String)
+  if (not DeleteObjectImages(OBJTYPE_BSCMSG_DL, String(dlContrMsgID:o:34), 1))
+    if (ValType(error) == V_STRING)
+      error = IIF(StrLen(error) > 0, error + "|", "") + "Не удалось удалить файлы, прикрепленные к записи о сообщении ДБО";
+    end;
+    
+    return false;
+  end;
+  
+  if(not LoadImageObj(storage.FilePath(RESULTTAG, PDFTAG), OBJTYPE_BSCMSG_DL, String(dlContrMsgID:o:34), 1))
+    if (ValType(error) == V_STRING)
+      var errorInfo = AL_GetErrorInfo();
+      error = IIF(StrLen(error) > 0, error + "|", "") + "К записи о сообщении ДБО не удалось прикрепить файл (" + errorInfo.stat + ": " + errorInfo.message + ")";
+    end;
+  
+    return false;
+  end;
+
+  return true;
+end;
+
+
+/**
+@brief Функция создания сообщения для ДБО с прикрепленным файлом уведомления
+@param[in] exclusionParams Параметры уведомления об исключении
+@param[in] storage Данные об используемых директориях/файлах
+@param[out] error Текст ошибки
+@return Индекс записи в таблице dDlContrMsg_dbt
+@return null В случае ошибки записи
+
+Предполагается, что файл уведомления RESULTTAG/PDFTAG уже создан
+*/
+private macro CreateQIExclusionDBOMessage(exclusionParams: CQINotificationParams, storage: CStorageInfo, error: @String)
+  var dlContrMsg = Tbfile("dlcontrmsg.dbt", "W", 0);
+  
+  dlContrMsg.clear();
+  dlContrMsg.rec.DlContrID = exclusionParams.dlContrID;
+  dlContrMsg.rec.Kind = EXCLUSION_QI;
+  dlContrMsg.rec.CreateDate = Date();
+  dlContrMsg.rec.CreateTime = Time();
+  dlContrMsg.rec.SendDate = Date(0,0,0);
+  dlContrMsg.rec.SendTime = Time(0,0,0);
+  dlContrMsg.rec.IsOnlineSendMes = UNSET_CHAR;
+  dlContrMsg.rec.MarketID = -1;
+  dlContrMsg.rec.SendMesState = 0;
+  if(not dlContrMsg.insert())
+    return 0;
+  end;
+  
+  LogMessage("Создано сообщение к ДБО с ID = " + dlContrMsg.rec.ID);
+
+  return dlContrMsg.rec.ID;
+end;
+
+/**
+@brief Процедура отправки e-mail
+@param[in] exclusionParams Параметры уведомления об исключении
+@param[in] storage Данные об используемых директориях/файлах
+@param[out] error Текст ошибки
+@param[out] error_code Код ошибки
+
+Предполагается, что файл уведомления RESULTTAG/PDFTAG уже создан
+*/
+private macro SendQIExclusionEmail(exclusionParams: CQINotificationParams, storage: CStorageInfo, error: @String, error_code: @integer)
+  var emailProcessor = c_email_proc_env();
+  var isLegalPerson: Bool = exclusionParams.client.legalForm == PTLEGF_INST;
+  var registryPath: String = GetHiddenRecipientsRegistryPath(isLegalPerson);
+  var hiddenRecipients: TArray = GetHiddenRecipients(registryPath);
+  
+  //DEF-63715 проверка почты перенесена из CheckQIExclusionConditions, отсутствие почты не влияет на формирование файла и сообщения на договоре
+  if ((ValType(exclusionParams.client) == V_UNDEF) or (ValType(exclusionParams.client.emails) == V_UNDEF) or (exclusionParams.client.emails.size == 0))
+    error = "У клиента отсутствует электронная почта для рассылки";
+  elif (not CheckEmails(exclusionParams.client.emails))
+    error = "Некорректный емейл"; 
+  end;
+
+  if (StrLen(error) > 0)
+    error = "Ошибка проверки параметров:|" + error;
+    error_code = 10;
+    return;
+  end;
+
+  if (hiddenRecipients.size == 0)
+    error = "Не заданы системные настройки процесса: Направлять скрытую копию по " + IIF(isLegalPerson, "ЮЛ", "ФЛ");
+    error_code = 10;
+    return;
+  end;
+
+  /// Формируем письмо
+  RunProcByParamArray(R2M(emailProcessor, "m_add_email_to_list"), exclusionParams.client.emails); ///< Список получателей
+  RunProcByParamArray(R2M(emailProcessor, "m_add_email_to_bcc_list"), hiddenRecipients);          ///< Список получателей скрытой копии
+  if(not GetRegValueSwitchQI())
+    emailProcessor.m_set_msg_head(QIEXCLUSION_EMAIL_SUBJECT + " " + exclusionParams.client.shortName + " " + exclusionParams.client.contractNumber); ///< Тема письма
+  else 
+    emailProcessor.m_set_msg_head(QIEXCLUSION_EMAIL_SUBJECT + " " + exclusionParams.client.shortName); ///< Тема письма
+  end;
+  emailProcessor.m_add_row_to_msg_text(QIEXCLUSION_EMAIL_BODY);                                   ///< Текст 
+  emailProcessor.m_add_attach_to_list(storage.FilePath(RESULTTAG, PDFTAG));                       ///< Прикрепленный файл
+
+  /// Сохраняем для отправки плановой процедурой 
+  emailProcessor.m_save_to_submit_synch();
+  /// Отправляем
+  emailProcessor.m_submit_email_synch();
+
+  if(emailProcessor.m_get_error_status())
+    if (ValType(error) == V_STRING)
+      error_code = 20;
+      error = IIF(StrLen(error) > 0, error + "|", "") + "Сообщение сформировано, но не отправлено: " + emailProcessor.get_service_msg();
+    end;
+  else
+    LogMessage("Письмо отправлено");
+  end;
+end;
+
+/**
+@brief Процедура отправки данных в IPS Фабрику документов для формирования уведомления
+@param[in] exclusionParams Параметры уведомления о признании
+*/
+private macro QIExclusionNotifyIPS(exclusionParams: CQINotificationParams)
+  var error: String = ""; // Возможную ошибку пока игнорируем
+  
+  if ((exclusionParams.client.legalForm == PTLEGF_INST) or IsIndividualEmployer(exclusionParams.client.partyID))
+    var errorCode = QINotifyIPS(exclusionParams.client.partyId, EXCLUSION_QI, exclusionParams.notificationDate, exclusionParams.signer.oper, null, null, @error);
+    
+    if (errorCode != 0)
+      LogMessage("Ошибка формирования уведомления через Фабрику документов (IPS): " + error, LOGTYPE_ERROR);
+    end;
+  end;
+end;
+
+/**
+@brief Функция формирования и отправки Уведомления об исключении из реестра квалифицированных инвесторов
+@param[in] exclusionParams Параметры уведомления об ислючении
+@param[out] ResultParams Параметры результата
+@return V_STRING Текст ошибки
+*/
+macro QIExclusionNotification(exclusionParams: CQINotificationParams): String
+  logger = CTxtLogger();
+  
+  var storage: CStorageInfo = GetQIStorageInfo(exclusionParams);
+  var error: String = "";
+
+  var ResultParams = CQINotificationResultParams();
+
+  logger.InitFile(storage.FilePath(TXTTAG, LOGTAG));
+  LogQIExclusionParams(exclusionParams);
+  
+  // DEF-63715 сначала сформируем уведомление, а файл добавим позже
+  /// Поиск последнего неотправленного сообщения по договору
+  var dlContrMsgID: Integer = FindQIExclusionDBOMessage(exclusionParams);
+
+  /// Создание сообщения dDlContrMsg
+  if (dlContrMsgID == 0)
+    dlContrMsgID = CreateQIExclusionDBOMessage(exclusionParams, storage, @error);
+  end;
+  ResultParams.MessageId = dlContrMsgID;
+
+  /// Проверка параметров операции
+  if (not CheckQIExclusionConditions(exclusionParams, storage, @error))
+    ResultParams.Error_code = 10;
+    SetParm(1, ResultParams);
+    return LogMessage("Ошибка проверки параметров:|" + error, LOGTYPE_ERROR);
+  end;
+  
+  /// Отправка данных для создания уведомления через Фабрику документов (IPS)
+  QIExclusionNotifyIPS(exclusionParams);
+  
+  if (ImageUpload(storage, exclusionParams.signer.signStampImageID, @error))
+    LogMessage("Создан файл подписи " + storage.FilePath(WORKTAG, SIGNTAG));
+  else
+    ResultParams.Error_code = 20;
+    SetParm(1, ResultParams);
+    return LogMessage("Ошибка при загрузке файла подписи (id = " + exclusionParams.signer.signStampImageID + ") " + error, LOGTYPE_ERROR);
+  end;
+
+  /// формирование файла уведомления
+  if (not CreateQIExclusionNotification(exclusionParams, storage, @error))
+    ResultParams.Error_code = 20;
+    SetParm(1, ResultParams);
+    return LogMessage("Ошибка формирования файла уведомления " + error);
+  end;
+  ResultParams.Path = storage.FilePath(RESULTTAG, PDFTAG);  
+  LogMessage("Сформирован файл PDF " + storage.FilePath(RESULTTAG, PDFTAG));
+
+  /// Прикрепление файла
+  if (dlContrMsgID > 0)
+    AttachFileQIExclusionDBOMessage(dlContrMsgID, storage, @error);
+  end;
+  
+  /// Отправка e-mail
+  var errLength = StrLen(error);
+  SendQIExclusionEmail(exclusionParams, storage, @error, @ResultParams.Error_code);
+  
+  if ((errLength == StrLen(error)) and (dlContrMsgID > 0)) // При отправке не добавилось ошибок и сообщение на договоре было сохранено
+    // Обновим дату отправки сообщения
+    ExecSql("UPDATE dDlContrMsg_dbt SET t_sendDate = ?, t_sendTime = ? WHERE t_ID = ? ", makeArray(SQLParam("", Date()), SQLParam("", Time()), SQLParam("", dlContrMsgID)));
+  end;
+  
+  if (StrLen(error) > 0)
+    LogMessage(error, LOGTYPE_ERROR);
+  end;
+  
+  logger.close();
+  /// Если нет ошибок, то отметим файл лога на удаление
+  if ((logger.GetMessagesCount(LOGTYPE_WARNING) == 0) and (logger.GetMessagesCount(LOGTYPE_ERROR) == 0))
+    storage.GetFile(TXTTAG, LOGTAG).IsTemporary = true;
+  end;
+
+  SetParm(1, ResultParams);
+  
+  return error;
+  
+onError (err)
+  error = LogMessage("Ошибка выполнения:|" + err.Module + " строка " + err.Line + "|" + err.message, LOGTYPE_ERROR);
+  LogMessage(GetFullErrorMessage(err), LOGTYPE_ERROR);
+  logger.close();
+
+  SetParm(1, ResultParams);  
+  return error;
+end;

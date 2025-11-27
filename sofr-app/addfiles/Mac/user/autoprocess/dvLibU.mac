@@ -1,0 +1,1499 @@
+import rsd,"cb_sql.mac";
+import dvInter, dllog_xml, "FuncObj.mac", "dlcontrfunc.mac", "AutoProcess.mac", "genholdopbycllist.mac";
+
+private var erru;
+/* стандартный IIF*/
+private macro IIF(expr,var1,var2)
+  if (expr)
+    return var1;
+  else
+    return var2;
+  end;
+end;
+
+private macro GetIsClientFilterForDVOper(IsClient)
+  if (ValType(IsClient) == V_BOOL)
+    return IIF(IsClient, " T_FLAG1 = 2", " T_FLAG1 = 1");
+  end;
+  return null;
+end;
+
+/*проверяет наличие необработанных сделок в указаном дне DEF-43423*/
+PRIVATE MACRO CheckDealDate(CheckDate:date, errmsg:@string, result_protocol:@TStrCollector, wrnrecs:@integer)
+ var sql,cmd,rs;
+ errmsg = "";
+
+  sql = " SELECT Count(t.t_ID) resc "+
+        " FROM ddvndeal_dbt t "+
+        " WHERE t.t_State in (1) "+
+        " AND t.t_Client > 0 "+
+        " AND t.t_Sector = chr(88) "+
+        " AND t.t_MarketKind = " + DV_MARKETKIND_CURRENCY +
+        " AND EXISTS "+
+        "       (SELECT 1 "+
+        "          FROM doprstep_dbt step, doproper_dbt opr "+
+        "         WHERE     step.t_id_operation = opr.T_ID_OPERATION "+
+        "               AND opr.T_DOCKIND = t.T_DOCKIND "+
+        "               AND opr.T_KIND_OPERATION = t.T_KIND "+
+        "               AND TO_NUMBER (opr.t_documentid) = t.T_ID "+
+        "               AND step.T_PLAN_DATE = " + GetSQLDate(CheckDate) +
+        "               AND step.T_ISEXECUTE = 'R') ";
+  cmd = RSDCommand( sql );
+  cmd.NullConversion = true;
+  cmd.execute();
+  rs = TRsbDataSet( cmd );
+  if((rs != null) and(rs.Movenext())) 
+     wrnrecs = rs.resc;
+     if (wrnrecs > 0)
+         result_protocol.AddString("После выполнения обработки остались " + wrnrecs + " клиентские сделки с неисполненными шагами, запланированными на " + string(CheckDate) + ".");
+     end;
+  end;
+
+onError(erru)  
+  errmsg = "onError: " + erru.message + " (модуль " + erru.module + ", строка " + erru.line + ")";
+  return false;  
+END;
+
+/**
+  @brief  Формирование условий запроса для связи сделок с операцией расчётов на срочном рынке
+  @param[in] Oper Структура dvoper.dbt
+  @return         Строка с условиями запроса
+*/
+private macro DealByOperationLink(Oper):string
+  var AddWhere:string = "";
+
+  if( Oper.FLAG1 == ALG_SP_MONEY_SOURCE_TRUST )
+     AddWhere = " DEAL.t_IsTrust = chr(88) ";
+  else
+     AddWhere = " DEAL.t_Client " + IIF(Oper.FLAG1 == ALG_SP_MONEY_SOURCE_OWN, "<= 0 ", "> 0 ");
+  end;
+
+  return " DEAL.t_IsTrust = RSB_Derivatives.DV_Setting_RunFromTrust AND " +
+         " DEAL.t_Department = " + string(Oper.Department) + " AND " +
+         AddWhere + " AND " +
+         " DEAL.t_GenAgrID   = " + string(Oper.GenAgrID) + " AND " +
+         " (( " + string(Oper.PartyKind) + " = " + string(PTK_MARKETPLASE) + " AND " + string(Oper.Party) + " = (SELECT FI.t_Issuer FROM dfininstr_dbt FI WHERE FI.t_FIID = DEAL.t_FIID AND DEAL.t_Broker = -1) ) OR " +
+         "  ( " + string(Oper.PartyKind) + " = " + string(PTK_BROKER) + " AND DEAL.t_Broker = " + string(Oper.Party) + " AND DEAL.t_BrokerContr = " + string(Oper.PartyContr) + " )) AND " +
+         " TURN.t_DealID = DEAL.t_ID AND TURN.t_Date = " + GetSQLDate(Oper.Date);
+END;
+
+
+/**
+  @brief  Формирование запроса для подсчёта количества проводок по сделке срочного рынка
+  @param[in] DealID         ID сделки
+  @param[in] dvoperID       ID операции расчётов
+  @param[in] BalanceAccPay1 Балансовый счёт плательщика 1
+  @param[in] BalanceAccRec1 Балансовый счёт получателя 1
+  @param[in] BalanceAccPay2 Балансовый счёт плательника 2. Если = null, проверяем только один вариант.
+  @param[in] BalanceAccRec2 Балансовый счёт плательщика. Если = null, проверяем только один вариант.
+  @return                   Строка с запросом
+*/
+private macro SelectTrnCountString (DealID:integer, dvoperID:integer, BalanceAccPay1:string, BalanceAccRec1:string, BalanceAccPay2:string, BalanceAccRec2:string):string 
+  var RetValStr = "select count(1) from ddvdealtrn_dbt dvtrn, dacctrn_dbt trn "+
+                  " where dvtrn.t_AccTrnID = trn.t_AccTrnID "+
+                  "    and dvtrn.t_DealID = "+DealID+
+                  "    and dvtrn.t_ID_Step = 5 /*оплата итоговых сумм*/ "+
+                  "    and dvtrn.t_ID_Operation = (select opr.t_ID_Operation from doproper_dbt opr where ltrim(opr.t_DocumentID) = "+dvoperID+" and opr.t_Kind_Operation = 12600 /*расчёты на СР*/)";
+
+  if (BalanceAccPay2 == null)
+    RetValStr = RetValStr + " and (trn.t_Account_Payer LIKE '"+BalanceAccPay1+"%' AND trn.t_Account_Receiver LIKE '"+BalanceAccRec1+"%') ";
+  else
+    RetValStr = RetValStr + " and ((trn.t_Account_Payer LIKE '"+BalanceAccPay1+"%' AND trn.t_Account_Receiver LIKE '"+BalanceAccRec1+"%') or (trn.t_Account_Payer LIKE '"+BalanceAccPay2+"%' AND trn.t_Account_Receiver LIKE '"+BalanceAccRec2+"%')) ";
+  end;
+
+  return RetValStr; 
+END;
+
+/**
+  @brief  Проверка наличия посделочных проводок на шаге 20. "Оплата итоговых сумм"
+  @param[in] dvoper     Структура dvoper.dbt
+  @param[out] DealCount Количество сделок с отсутствующими проводками
+  @param[out] ErrorStr  Строка с ошибками для формирования протокола
+  @return               Статус проверки наличия проводок (true - все проводки сформированы, false - найдены сделки без проводок)
+*/
+private macro CheckDvDealAccTrn(dvoper, DealCount:@integer, ErrorStr:@string):bool
+
+  var QueryTrn, CmdTrn, DataSetTrn;
+  var retVal = true;
+  var firstErr:string = "";
+  var Query = " SELECT count(*) over() cnt, DEAL.t_ID,  DEAL.t_Code, DEAL.t_Date_Clr " +
+              "   FROM ddvdeal_dbt DEAL, ddvdlturn_dbt TURN " +
+              "  WHERE " + DealByOperationLink(dvoper) +
+              "    AND DEAL.t_Type in('B', 'D', 'S', 'G') " +
+              "    AND (select count (1) from ddvdealtrn_dbt TR where TR.t_DealID = DEAL.t_ID AND TR.T_ID_STEP = 5 /*оплата итоговых сумм*/ AND TR.T_ID_OPERATION = (select opr.t_ID_Operation from doproper_dbt opr where ltrim(opr.t_DocumentID) = "+dvoper.id+" AND opr.t_Kind_Operation = 12600 /*расчёты на СР*/)) < ";
+
+  if (dvoper.Flag1 == ALG_SP_MONEY_SOURCE_OWN)
+    Query = Query + " CASE WHEN DEAL.T_Date_Clr = "+GetSQLDate(dvoper.Date)+" THEN 4+(select count (1) from ddvdlcom_dbt com where com.t_DealID = DEAL.t_ID) " +
+                    " ELSE 4 " +
+                    " END;"; 
+  else
+    Query = Query + " CASE WHEN DEAL.T_Date_Clr = "+GetSQLDate(dvoper.Date)+" THEN 1+(select 2*count (1) from ddvdlcom_dbt com where com.t_DealID = DEAL.t_ID) "
+                    " ELSE 0 " +
+                    " END;";
+  end;
+
+  var Cmd = DL_RSDCommand(Query);
+  var DataSet = Cmd.execute(); 
+    
+  while( DataSet.MoveNext() )
+    DealCount = DataSet.cnt;
+    firstErr = "";
+    if (dvoper.Flag1 == ALG_SP_MONEY_SOURCE_OWN)
+      if(DataSet.Date_Clr == dvoper.Date)
+        QueryTrn = " SELECT (" + SelectTrnCountString (DataSet.ID, dvoper.id, "70606", "47404") + ") PayCom, " +
+                           "(" + SelectTrnCountString (DataSet.ID, dvoper.id, "52601", "70613", "70614", "52602") + ") IncExpMarg, " +
+                           "(" + SelectTrnCountString (DataSet.ID, dvoper.id, "526", "61601", "61601", "526") + ") FairVal, " +
+                           "(" + SelectTrnCountString (DataSet.ID, dvoper.id, "61601", "47407", "47408", "61601") + ") ReqComMarg, 1 as EnrVarMarg, " +
+                           "(" + SelectTrnCountString (DataSet.ID, dvoper.id, "47407", "47403", "47404", "47408") + ") MarketMargin, " +
+                           "(select count(1) from ddvdlcom_dbt com, dsfcomiss_dbt sfcom where com.t_DealID = "+DataSet.ID+" AND sfcom.t_ComissID = com.t_ComissID AND sfcom.t_ReceiverID != "+{ourbank}+" ) MarketComissCount, " +
+                           "(select count(1) from ddvdlturn_dbt turn where turn.t_DealID = "+DataSet.ID+" AND turn.t_Date = "+GetSQLDate(dvoper.Date)+" AND turn.t_Margin != 0 ) MarginCount " +   
+                   " FROM dual ";
+      else
+        QueryTrn = " SELECT (" + SelectTrnCountString (DataSet.ID, dvoper.id, "61601", "47407", "47408", "61601") + ") IncExpMarg, " +
+                           "(" + SelectTrnCountString (DataSet.ID, dvoper.id, "526", "61601", "61601", "526") + ") FairVal, " +
+                           "(" + SelectTrnCountString (DataSet.ID, dvoper.id, "47407", "47403", "47404", "47408") + ") EnrVarMarg, 1 as ReqComMarg, " +
+                           "(" + SelectTrnCountString (DataSet.ID, dvoper.id, "30424", "47404", "47403", "47424") + ") MarketMargin, " +
+                           "0 as MarketComissCount, 0 as PayCom, " +
+                           "(select count(1) from ddvdlturn_dbt turn where turn.t_DealID = "+DataSet.ID+" AND turn.t_Date = "+GetSQLDate(dvoper.Date)+" AND turn.t_Margin != 0 ) MarginCount " +   
+                   " FROM dual "; 
+      end;
+      CmdTrn = DL_RSDCommand(QueryTrn);
+      DataSetTrn = CmdTrn.execute();
+      if(DataSetTrn.MoveNext())
+        ErrorStr = ErrorStr + "По сделке " + DataSet.Code +" не сформировались все необходимые проводки по:";
+        if(DataSetTrn.PayCom < DataSetTrn.MarketComissCount)
+          ErrorStr = ErrorStr + " оплате биржевых комиссий";
+          firstErr = ",";
+          retVal = false;
+        end;
+        if(DataSetTrn.MarginCount > 0)
+          if(DataSetTrn.IncExpMarg == 0)
+            ErrorStr = ErrorStr + firstErr + " учету доходов-расходов по вариационной марже";
+            firstErr = ",";
+            retVal = false;
+          end;
+          if(DataSetTrn.FairVal == 0)
+            ErrorStr = ErrorStr + firstErr + " отражению справедливой стоимости";
+            firstErr = ",";
+            retVal = false;
+          end;
+          if(DataSetTrn.EnrVarMarg == 0)
+            ErrorStr = ErrorStr + firstErr + " зачислению/списанию вариационной маржи";
+            firstErr = ",";
+            retVal = false;
+          end;
+          if(DataSetTrn.ReqComMarg == 0)
+            ErrorStr = ErrorStr + firstErr + " учёту требования/обязательства по вариационной марже";
+            firstErr = ",";
+            retVal = false;
+          end;
+          if(DataSetTrn.MarketMargin == 0)
+            ErrorStr = ErrorStr + firstErr + " расчетам с биржей по вариационной марже";
+            firstErr = ",";
+            retVal = false;
+          end;
+        else
+          ErrorStr = ErrorStr + firstErr + " учёту вариацинной маржи (по сделке в биржевом отчете за день вариационная маржа нулевая) ";
+        end;
+        ErrorStr = ErrorStr + ".\n";
+      end;  
+    else // Клиентские сделки
+      QueryTrn = " SELECT (" + SelectTrnCountString (DataSet.ID, dvoper.id, "47423", "47404") + ") AccMarketCom, " +
+                         "(" + SelectTrnCountString (DataSet.ID, dvoper.id, "306", "47423") + ") PayCom, " +
+                         "(" + SelectTrnCountString (DataSet.ID, dvoper.id, "47423", "70601") + ") AccBrokerCom, " +
+                         "(" + SelectTrnCountString (DataSet.ID, dvoper.id, "306", "47404", "47404", "306") + ") VarMarg, " +
+                         "(select count(1) from ddvdlcom_dbt com, dsfcomiss_dbt sfcom where com.t_DealID = "+DataSet.ID+" AND sfcom.t_ComissID = com.t_ComissID AND sfcom.t_ReceiverID = "+{ourbank}+" ) BrokerComissCount, " +
+                         "(select count(1) from ddvdlcom_dbt com, dsfcomiss_dbt sfcom where com.t_DealID = "+DataSet.ID+" AND sfcom.t_ComissID = com.t_ComissID AND sfcom.t_ReceiverID != "+{ourbank}+" ) MarketComissCount, " +
+                         "(select count(1) from ddvdlturn_dbt turn where turn.t_DealID = "+DataSet.ID+" AND turn.t_Date = "+GetSQLDate(dvoper.Date)+" AND turn.t_Margin != 0 ) MarginCount " +   
+                 " FROM dual ";
+
+      CmdTrn = DL_RSDCommand(QueryTrn);
+      DataSetTrn = CmdTrn.execute();
+      if(DataSetTrn.MoveNext())
+        ErrorStr = ErrorStr + "По сделке " + DataSet.Code +" не сформировались все необходимые проводки по:";
+        if(DataSetTrn.AccMarketCom < DataSetTrn.MarketComissCount)
+          ErrorStr = ErrorStr + " начислению биржевых комиссий";
+          firstErr = ",";
+          retVal = false;
+        end;
+        if(DataSetTrn.AccBrokerCom < DataSetTrn.BrokerComissCount)
+          ErrorStr = ErrorStr + firstErr + " начислению брокерских комиссий";
+          firstErr = ",";
+          retVal = false;
+        end;
+        if(DataSetTrn.PayCom < (DataSetTrn.MarketComissCount+DataSetTrn.BrokerComissCount))
+          ErrorStr = ErrorStr + firstErr + " оплате комиссий";
+          firstErr = ",";
+          retVal = false;
+        end;
+        if( (DataSetTrn.VarMarg == 0) and (DataSetTrn.MarginCount > 0) )
+          ErrorStr = ErrorStr + firstErr + " оплате вариационной маржи";
+          firstErr = ",";
+          retVal = false;
+        elif (DataSetTrn.MarginCount == 0)
+          ErrorStr = ErrorStr + firstErr + " учёту вариацинной маржи (в биржевом отчете за день по сделке вариационная маржа нулевая) ";
+        end;
+        ErrorStr = ErrorStr + ".\n";
+      end;
+    end;
+  end;
+  return retVal;
+end;
+ 
+macro DVOPERStep(DateOper:date, step:string, AddWhere:string, recs:@integer, errrecs:@integer, errmsg:@string, result_protocol:@TStrCollector, wrnrecs:@integer);
+  var sql, rs, Result, cmd, _step = StrUpr(step), operId;
+  var oper = TBFile( "dvoper.dbt",  "R", 0 );
+  var dvTrnCkecked = false;
+  var closeDealCount = 0, errorDealCount = 0;
+  var errText:string = "";
+  var QueryDeals, CmdDeals, DataSetDeals;
+
+  var MinCountFuncobj:integer = 0;
+  GetRegistryValue("SECUR\\MIN_COUNT_FOR_FUNCOBJ_CURMARKET", V_INTEGER, MinCountFuncobj);
+  recs=0;
+  errrecs=0;
+  wrnrecs=0;
+
+  sql = 
+    " SELECT t.t_id "
+   +"   FROM ddvoper_dbt t "
+   +"  WHERE     t.t_dockind = 194 "
+   +"        AND (   (t.t_marketschemeid = 14 AND t.t_Partyoffice = 8) "
+   +"             OR (t.t_marketschemeid = 29 AND t.t_Partyoffice = 21) "
+   +"             OR (t.t_marketschemeid = 30 AND t.t_Partyoffice = 22)) "
+   +"        AND t.t_operkind = 12600 "
+   +"        AND t.t_date = "+GetSQLDate(DateOper);
+
+  if (_step == "NEW")
+    sql = sql + " AND t.t_state = " + DVOPER_PREP;
+  elif (   (_step == "CALC")
+        or (_step == "CLOSE"))
+    sql = sql + " AND t.t_state = " + DVOPER_OPEN;
+  else 
+    RunError("Неизвестный вид запуска DVOPERStep: " + _step);
+  end;
+
+  if ((ValType(AddWhere) == V_STRING) and (AddWhere != ""))
+    sql = sql + " AND (" + AddWhere + ") ";
+  end;
+  cmd = DL_RSDCommand(sql);
+  recs = cmd.GetCount();
+  if( recs > 0 )
+    if( (MinCountFuncobj == 0) or (MinCountFuncobj > recs) or ((_step != "CALC")) )
+      //старая обработка по параметру и для шагов NEW и CLOSE 
+      rs = cmd.Execute();
+      while(rs.moveNext())
+        operId = SQL_ConvTypeInteger(rs.value("t_id"));
+        recs=recs+1;
+        if (_step == "NEW")
+          Result = dv_Open_OprCalcExchange(operId,true);
+          if (Result == 0)//выполнили без ошибки толкаем дальше
+            result_protocol.AddString("Операция Расчеты с биржей успешно переведена в статус открыт ( идентификатор ID="+operId+").");
+            Result= dv_Open_OprCalcExchange(operId,true);   
+            if (Result==0)//выполнили хорошо
+              result_protocol.AddString("Выполнены автошаги в операции Расчеты с биржей ( идентификатор ID="+operId+").");
+            else
+              result_protocol.AddString("Не удалось выполнить автошаги в операции Расчеты с биржей ( идентификатор ID="+operId+").");
+              errrecs=errrecs+1;
+            end;
+          else
+            result_protocol.AddString("Не удалось перевести в статус открыт операцию Расчеты с биржей ( идентификатор ID="+operId+").");
+            errrecs=errrecs+1;
+          end;
+
+        elif (_step == "CALC")
+          result= dv_Exec_OprCalcExchange(operId,null,null,60,true);
+          if (Result==0)//выполнили хорошо
+            result_protocol.AddString("Выполнены шаги расчетов в операции Расчеты с биржей ( идентификатор ID="+operId+").");
+          else
+            result_protocol.AddString("Не удалось выполнить автошаги расчетов в операции Расчеты с биржей ( идентификатор ID="+operId+").");
+            errrecs=errrecs+1;
+          end;
+
+        elif (_step == "CLOSE")
+          dvTrnCkecked = false; closeDealCount = 0; errorDealCount = 0; errText = "";
+          oper.Clear();
+          oper.rec.ID = operId;
+
+          if(not oper.GetEQ())
+            errText = "Ошибка получения данных по операции расчётов с биржей на срочном рынке.";  
+          else
+            QueryDeals = " SELECT count(DEAL.t_ID) DealCount " +
+                         "   FROM ddvdeal_dbt DEAL, ddvdlturn_dbt TURN " +
+                         "  WHERE " + DealByOperationLink(oper.rec) +
+                         "    AND DEAL.t_Type in('B', 'D', 'S', 'G') ";
+
+            CmdDeals = DL_RSDCommand(QueryDeals);
+            DataSetDeals = CmdDeals.execute();
+    
+            if ( DataSetDeals.MoveNext() )
+              closeDealCount = int(DataSetDeals.DealCount);
+            else
+              errText = "Ошибка запроса для подсчёта количества обработанных сделок.";
+            end;
+          end;
+
+          if(closeDealCount > 0)
+            dvTrnCkecked = CheckDvDealAccTrn(oper.rec, @errorDealCount, @errText);
+          elif(errText == "")
+            dvTrnCkecked = true;
+          end;
+
+          if(not dvTrnCkecked)
+            errmsg = "Ошибка при проверке проводок по сделкам";
+            result_protocol.AddString("Не удалось закрыть операцию Расчеты с биржей (идентификатор ID="+operId+").\nВсего обработано сделок: "+closeDealCount+" сделок с отсутствующими проводками: "+errorDealCount+"\n"+errText);
+            errrecs=errrecs+1;
+            continue;
+          end;
+
+          Result= dv_Close_OprCalcExchange(operId,false);
+          if (Result==0)//выполнили хорошо
+            if(errText != "")
+              errmsg = "При проверке проводок возникло предупреждение";
+              result_protocol.AddString("Операция Расчеты с биржей успешно закрыта (идентификатор ID="+operId+").\nВсего обработано сделок: "+closeDealCount+" сделок с отсутствующими проводками: "+errorDealCount+"\n"+errText);
+              wrnrecs = wrnrecs + 1;
+            else
+              result_protocol.AddString("Операция Расчеты с биржей успешно закрыта(идентификатор ID="+operId+").");
+            end;
+          else
+            result_protocol.AddString("Не удалось закрыть операцию Расчеты с биржей (идентификатор ID="+operId+").");
+            errrecs=errrecs+1;
+          end;
+        end;
+      end;
+    else //MinCountFuncobj < recs
+
+      //Раздаем задачи
+      var sqlFunkobj = " DECLARE "
+          + "   v_FuncobjID dfuncobj_dbt.t_ID%TYPE; "   
+          + " BEGIN "
+          + "   DELETE FROM ddl_funcobjbuf_tmp; "         
+          + "   FOR c IN(" + sql + ") LOOP "    
+          + "     INSERT INTO dfuncobj_dbt (t_ObjectType, t_ObjectID, t_FuncID, t_Priority, t_Oper) "
+          + "                       VALUES (194, c.t_ID, 5800, 60, ?) " // t_dockind=194, T_FUNCID = 5800, t_Priority=60
+          + "     RETURNING t_ID INTO v_FuncobjID; "
+          + "     INSERT INTO ddl_funcobjbuf_tmp (t_ID, t_ObjectID) VALUES (v_FuncobjID, c.t_ID); "
+          + "   END LOOP; "   
+          + " END; ";
+
+      cmd = RSDCommand(sqlFunkobj);
+      cmd.addParam("", RSDBP_IN, {oper});
+      cmd.execute();
+
+      var isNotFinished:bool = true;
+      var i:integer = 0;
+      var MAX_FUNCOBJ_ITERATION; //Максимальное кол-во итераций по проверке
+      var SLEEP_TIME_MS = 10000; //Время в мс, которое выжидаем, прежде чем снова проверять результаты выполнения задач - 10 секунд    
+      var MIN_EXEC_COUNT = 3; //Минимальное количество повторных выполнений каждой из ошибочных записей, прежде чем выводить по ним отчёт 
+
+      MAX_FUNCOBJ_ITERATION = 10 + 4 * recs; //По минуте на сделку + время на запуск funcobj
+      while( isNotFinished and (i < MAX_FUNCOBJ_ITERATION) )
+        RslWait(SLEEP_TIME_MS); 
+        cmd = DL_RSDCommand("SELECT count(1) cnt " + //Ищем записи, которые еще обрабатываются
+                            "  FROM ddl_funcobjbuf_tmp t, dfuncobj_dbt funcobj " +
+                            " WHERE funcobj.t_ID = t.t_ID " +
+                            "   AND NOT (funcobj.t_State = "+FUNCOBJ_STATE_REPEAT_ERROR+" AND funcobj.t_ExecCount >= "+MIN_EXEC_COUNT+") " +
+                            "   AND funcobj.t_State NOT IN(  "+FUNCOBJ_STATE_FATAL_ERROR+ ", "+FUNCOBJ_STATE_MAX_REPEAT+" ) " /*300809*/ );
+        var ds = cmd.Execute();
+        if( (not ds.MoveNext()) or (int(ds.cnt) == 0) )
+          isNotFinished = false;
+        end;
+        i = i + 1;
+      end;
+
+      if( isNotFinished )
+        //Остановим все задачи, еще не завершившие выполнение
+        cmd = RSDCommand("UPDATE dfuncobj_dbt " + 
+                          "   SET t_State = "+FUNCOBJ_STATE_MAX_REPEAT+", " +
+                          "       t_ErrorText = case when t_ErrorText is null then 'Превышено время ожидания funcobj!' else t_ErrorText end "
+                          " WHERE t_ID IN (SELECT t_ID FROM ddl_funcobjbuf_tmp)" );
+        cmd.Execute();
+      else
+        //Остановим очередные итерации для ошибочных записей, сменив их статус
+        cmd = RSDCommand("UPDATE dfuncobj_dbt " + 
+                          "   SET t_State = "+FUNCOBJ_STATE_MAX_REPEAT +
+                          " WHERE t_State IN ( "+FUNCOBJ_STATE_REPEAT_ERROR+","+FUNCOBJ_STATE_FATAL_ERROR+")"+ /*300809*/
+                          "   AND t_ID IN (SELECT t_ID FROM ddl_funcobjbuf_tmp)" );
+        cmd.Execute();
+      end;
+
+      //Формируем протокол
+      cmd = DL_RSDCommand("SELECT t.t_ObjectID, NVL(funcobj.t_ErrorCode, 0) t_ErrorCode, NVL(funcobj.t_ErrorText, chr(1)) t_ErrorText " + 
+                          "  FROM ddl_funcobjbuf_tmp t, dfuncobj_dbt funcobj " +
+                          " WHERE funcobj.t_ID = t.t_ID " +
+                          "   AND funcobj.t_State IN ("+FUNCOBJ_STATE_FATAL_ERROR +","+FUNCOBJ_STATE_REPEAT_ERROR+","+FUNCOBJ_STATE_MAX_REPEAT+" )" /*300809*/
+                        );
+      ds = cmd.Execute();
+      while( ds.MoveNext() )
+        errrecs = errrecs + 1;
+        result_protocol.AddString("Не удалось выполнить шаги операции (идентификатор ID=" + string(ds.ObjectID) + ". " + iif(ds.ErrorCode > 0, "Код ошибки "+string(ds.ErrorCode)+". ", "") + ds.ErrorText);
+      end;
+
+      cmd = DL_RSDCommand("SELECT t.t_ObjectID " + 
+                          "  FROM ddl_funcobjbuf_tmp t " +
+                          " WHERE NOT EXISTS (SELECT 1 " +
+                          "                     FROM dfuncobj_dbt funcobj " + 
+                          "                    WHERE funcobj.t_ID = t.t_ID) " );
+      ds = cmd.Execute();
+      while( ds.MoveNext() )
+        result_protocol.AddString("Успешно выполнены шаги операции (идентификатор ID=" + string(ds.ObjectID) + ").");
+      end;
+    end;
+  else
+    result_protocol.AddString("Не найдены шаги расчетов в операции Расчеты с биржей");
+    result_protocol.AddString("Процедура выполненения шагов расчетов в операции Расчеты с биржей завершена ( идентификатор ID="+operId+").");
+  end;
+
+  return errrecs == 0;
+onError(erru)  
+  errmsg = "onError: " + erru.message + " (модуль " + erru.module + ", строка " + erru.line + ")";
+  return false;
+
+end;
+
+/*проверяет существование расчетов с биржей в указаном дне в нужном статусе*/
+private macro CheckStockOper(CheckDate:date,CheckStatus:integer,errmsg:@string, result_protocol:@TStrCollector)
+ var sql,cmd,rs;
+ errmsg="";
+ //смотрм только открытые сделки по срочному рынку
+  sql=" select count(*) as t_cnt from ddvoper_dbt t      "
+      +"    where t.t_state="+string(CheckStatus)+"         "
+      +"       and t.t_date= "+GetSQLDate(CheckDate)+" and t.t_dockind=194 "
+      +"       and ((t.t_marketschemeid=14 and t.t_Partyoffice=8) or (t.t_marketschemeid=29 and t.t_Partyoffice=21) or (t.t_marketschemeid=30 and t.t_Partyoffice=22)) and t.t_operkind=12600 ";
+  cmd = RSDCommand( sql );
+  cmd.NullConversion = true;
+  cmd.execute();
+  rs = TRsbDataSet( cmd );
+  if((rs != null) and (rs.moveNext()))
+     if (rs.cnt == 0)//Если нет расчетов с биржей за указаный день 
+         result_protocol.AddString("Не найдены открытые операции Расчеты с биржей за "+string(CheckDate)+" .");
+         return false;
+      end;
+    return true;
+  else
+    return false;
+  end;
+
+onError(erru)  
+  errmsg = "onError: " + erru.message + " (модуль " + erru.module + ", строка " + erru.line + ")";
+  return false;
+ 
+end;
+
+/*обрабатываем все сделки из статуса отложеные (БИРЖЕВЫЕ ФЬЮЧЕРСЫ И ОПЦИОНЫ)*/
+macro Exec_DVDEAL(DealDate:date, isClient:bool, recs:@integer, errrecs:@integer, errmsg:@string, result_protocol:@TStrCollector, wrnrecs:@integer)
+  var sql,cmd,rs,count_ALL, count_FAL,result;
+  var cmdS, rsS;
+  var countSkipDeal:integer = 0;
+  var strSkipDealID:string = "";
+  errmsg="";
+  count_ALL=0;
+  count_FAL=0;
+  
+  if(isClient)
+    /*ZMV BIQ-8258 блокировка без прерывания дальнейшей работы БА исполнения сделок срочного рынка для договоров, 
+    у которых категория "Сведения о наличии или отсутствии ИИС у другого ПУ" = "Да" И категория "Предоставлены подтвержд. документы о расторжении ИИС у другого ПУ" на дату операции равно "Нет" или не заполнено*/ 
+    /*Поскольку на практике такие сделки - редкость, делаю проверку массовой, чтобы в цикле не проверять каждую отдельно*/
+    cmdS = DL_RSDCommand("SELECT d.t_ID, d.t_Code, sfcontr.t_Number " +                           
+                         "  FROM ddvdeal_dbt d, ddlcontrmp_dbt contrmp, ddlcontr_dbt dlcontr, dsfcontr_dbt sfcontr " +                                                                            
+                         " WHERE d.t_State = 0 " +   
+                         "   AND d.t_Date_clr = " + GetSQLDate(DealDate) +  
+                         "   AND contrmp.t_SfContrID = d.t_ClientContr " +                                                                                                                 
+                         "   AND dlcontr.t_DlContrID = contrmp.t_DlContrID " +                                                                                                     
+                         "   AND dlcontr.t_IIS = 'X' " +                                                                                                                            
+                         "   AND rsb_secur.GetMainObjAttr(207, LPAD(dlcontr.t_DlContrID, 34, '0'), 121/*Сведения о наличии или отсутствии ИИС у другого ПУ*/, d.t_Date) = 1 " +          
+                         "   AND rsb_secur.GetMainObjAttr(207, LPAD(dlcontr.t_DlContrID, 34, '0'), 122/*Предоставлены подтвержд. документы о расторжении ИИС у другого ПУ*/, d.t_Date) <> 1 " +
+                         "   AND sfcontr.t_ID = dlcontr.t_SfContrID "
+                        );
+    countSkipDeal = cmdS.GetCount();
+    if(countSkipDeal > 0)
+      rsS = cmdS.Execute();                                                                                                                      
+      while(rsS.MoveNext())
+        result_protocol.AddString(rsS.rec.Code + ": По Договору " + rsS.rec.Number + " клиентом не предоставлены документы о расторжении договора ИИС, заключенного с другим ПУ. Выполнение операции запрещено");
+        strSkipDealID = strSkipDealID + IIF(strSkipDealID == "", rsS.rec.ID, "," + rsS.rec.ID);
+      end;
+      wrnrecs = wrnrecs + countSkipDeal;
+    end;
+  end;
+
+  //смотрим только открытые сделки по срочному рынку
+  sql = " select d.t_id, d.t_code "
+      + "   from ddvdeal_dbt d "
+      + "  where d.t_state = 0 " 
+      + "    and d.t_date_clr = " + GetSQLDate(DealDate)
+      + "    and d.t_client " + IIF(isClient, "> 0", "= -1");
+  if(countSkipDeal > 0)
+    sql = sql + " and d.t_id not in(" + strSkipDealID + ") ";
+  end;
+  cmd = RSDCommand( sql );
+  cmd.NullConversion = true;
+  cmd.execute();
+  rs = TRsbDataSet( cmd );
+  var dealsArr = TArray();
+  if(rs != null)
+    while( rs.MoveNext() )
+      dealsArr[dealsArr.size] = int(rs.rec.id);
+      count_ALL=count_ALL+1;
+    end;
+    result= DV_ExecDeal_Exchange_Mass(dealsArr, count_FAL, false);
+    if (result==0)//выполнили без ошибки
+      result_protocol.AddString("Функция массовой обработки сделок отработала успешно.");
+      count_FAL = 0;
+      var i = 0;
+      while (i < dealsArr.size)        
+        sql = "select t_extcode, t_state from ddvdeal_dbt where t_id = " + dealsArr[i];
+        cmd = RSDCommand( sql );
+        cmd.NullConversion = true;
+        cmd.execute();
+        rs = TRsbDataSet( cmd );
+        if(rs != null)
+          while( rs.MoveNext() )
+            if(rs.rec.state > 0)
+              result_protocol.AddString("Успешно обработана сделка с кодом " + string(rs.rec.ExtCode) + " (ID = " + string(dealsArr[i]) + ").");
+            else
+              result_protocol.AddString("Ошибка обработки сделки с кодом " + string(rs.rec.ExtCode) + " (ID = " + string(dealsArr[i]) + ").");
+              count_FAL = count_FAL + 1;
+            end;
+          end;
+        end;
+        i = i + 1;
+      end; 
+    else
+      result_protocol.AddString("Ошибка функции массовой обработки сделок.");
+    end;
+    recs=count_ALL;
+    errrecs=count_FAL;
+    return true;
+  else
+    result_protocol.AddString("Не найдены не обработанные сделки за "+string(DealDate)+" .");
+    return true;
+  end;
+
+onError(erru)
+  errmsg = "onError: " + erru.message + " (модуль " + erru.module + ", строка " + erru.line + ")";
+  return false;
+
+end;
+
+/*проверяет существование расчетов с биржей в указаном дне по операциям (БИРЖЕВЫЕ ФЬЮЧЕРСЫ И ОПЦИОНЫ)*/
+
+private macro CheckDVStockOper(CheckDate:date, errmsg:@string, nextstep:@bool, result_protocol:@TStrCollector)
+ var sql,cmd,rs;
+ errmsg="";
+ nextstep= true;
+ //смотрм только открытые сделки по срочному рынку
+  sql=" select  decode(d.t_client,-1,1,2) client, "
+      +" (select count(*) from ddvoper_dbt t      "
+      +"    where t.t_state=1                     "
+      +"       and t.t_date= "+GetSQLDate(CheckDate)+" and t.t_dockind=194 "
+      +"       and t.t_marketschemeid=14 and t.t_Partyoffice=8 and t.t_operkind=12600 and t.t_flag1=decode(d.t_client,-1,1,2) "
+      +"   ) vol from ddvdeal_dbt d where d.t_state=0 and d.t_date_clr= "+GetSQLDate(CheckDate)
+      +"  group by decode(d.t_client,-1,1,2) ";
+  cmd = RSDCommand( sql );
+  cmd.NullConversion = true;
+  cmd.execute();
+  rs = TRsbDataSet( cmd );
+  if(rs != null)
+    while( rs.MoveNext() )
+         if (rs.value(1)==0)//Если нет расчетов с биржей за указаный день 
+           result_protocol.AddString("Не найдены открытые расчеты с биржей за "+string(CheckDate)+" по "+IIF(rs.value(0)==1,"собственным","клиентским")+" сделкам. Операция будет создана автоматически.");
+         end;
+    end;
+    return true;
+  //else
+  //  result_protocol.AddString("Не найдены не обработанные сделки за "+string(CheckDate)+" .");
+  //  nextstep=false;//нет сделок дальше не пойдем
+  //  return true;
+  end;
+
+onError(erru)  
+  errmsg = "onError: " + erru.message + " (модуль " + erru.module + ", строка " + erru.line + ")";
+  return false;
+ 
+end;
+
+/*перевод сделок из отложенных в действующие (БИРЖЕВЫЕ ФЬЮЧЕРСЫ И ОПЦИОНЫ)*/
+macro DV_EXEC(dateoper, isClient:bool, result_protocol:@TStrCollector, recs:@integer, errrecs:@integer, errmsg:@string, wrnrecs:@integer)
+  var nextstep;
+  recs = 0;
+  errrecs = 0;
+  wrnrecs = 0;//Пока возвращаем 0
+  errmsg = "";
+  result_protocol.ClearArray;
+  
+  //проверка на существование сделок
+  if (not CheckDVStockOper(dateoper,  @errmsg, @nextstep, @result_protocol))
+     return false;
+  end;
+
+  return Exec_DVDEAL(DateOper, isClient, @recs, @errrecs, @errmsg, @result_protocol, @wrnrecs); 
+
+onError(erru)  
+  errmsg = "onError: " + erru.message + " (модуль " + erru.module + ", строка " + erru.line + ")";
+  return false;
+end;
+
+/*перевод расчетов с биржей из отложенных в действующие и выполнение первых автошагов(БИРЖЕВЫЕ ФЬЮЧЕРСЫ И ОПЦИОНЫ)*/
+macro DVOP_INIT(dateoper, IsClient, result_protocol:@TStrCollector, recs:@integer, errrecs:@integer, errmsg:@string, wrnrecs:@integer)
+  recs = 0;
+  errrecs = 0;
+  wrnrecs = 0; //Пока возвращаем 0
+  errmsg = "";
+  result_protocol.ClearArray;
+
+  if (not CheckStockOper(dateoper,0,@errmsg, @result_protocol ))
+     return false;
+  end;
+  return DVOPERStep(DateOper,"NEW", GetIsClientFilterForDVOper(IsClient), @recs,@errrecs, @errmsg, @result_protocol, @wrnrecs);
+onError(erru)  
+  errmsg = "onError: " + erru.message + " (модуль " + erru.module + ", строка " + erru.line + ")";
+  return false;
+end;
+
+/* выполнение автошагов до закрытия(БИРЖЕВЫЕ ФЬЮЧЕРСЫ И ОПЦИОНЫ)*/
+macro DVOP_CALC(dateoper, IsClient, result_protocol:@TStrCollector, recs:@integer, errrecs:@integer, errmsg:@string, wrnrecs:@integer)
+  var nextstep;
+  recs = 0;
+  errrecs = 0;
+  wrnrecs = 0; //пока возвращаем 0
+  errmsg = "";
+  result_protocol.ClearArray;
+  if (not CheckStockOper(dateoper,1,@errmsg, @result_protocol ))
+     return false;
+  end;
+  return DVOPERStep(DateOper,"CALC", GetIsClientFilterForDVOper(IsClient), @recs,@errrecs, @errmsg, @result_protocol, @wrnrecs);
+onError(erru)  
+  errmsg = "onError: " + erru.message + " (модуль " + erru.module + ", строка " + erru.line + ")";
+  return false;
+end;
+
+
+/*перевод расчетов с биржей в закрытые(БИРЖЕВЫЕ ФЬЮЧЕРСЫ И ОПЦИОНЫ)*/
+macro DVOP_CLOSE(dateoper, IsClient, result_protocol:@TStrCollector, recs:@integer, errrecs:@integer, errmsg:@string, wrnrecs:@integer)
+  var nextstep;
+  recs = 0;
+  errrecs = 0;
+  wrnrecs = 0;//Пока возвращаем 0
+  errmsg = "";
+  result_protocol.ClearArray;
+  if (not CheckStockOper(dateoper,1,@errmsg, @result_protocol ))
+     return false;
+  end;
+  return DVOPERStep(DateOper,"CLOSE",GetIsClientFilterForDVOper(IsClient),@recs,@errrecs, @errmsg, @result_protocol, @wrnrecs);
+onError(erru)  
+  errmsg = "onError: " + erru.message + " (модуль " + erru.module + ", строка " + erru.line + ")";
+  return false;
+end;
+
+private CLASS ClintContr(_id:integer, _cnt:integer, _DocKind:integer)
+  var id:integer, cnt:integer, DocKind:integer;
+  var idList;
+  
+  MACRO Add(AddId:integer, AddCnt:integer)
+    if( (AddId > 0) and (AddCnt > 0))
+      idList = idList + ","+ String(AddId);  
+      cnt = cnt + AddCnt;
+    end;
+  end;
+
+  id = _id;
+  cnt = _cnt;
+  DocKind = _DocKind;
+  idList = String(_id); 
+end;
+
+macro Exec_DVNDEAL(DealDate, result_protocol:@TStrCollector, recs:@integer, errrecs:@integer, errmsg:@string, wrnrecs:@integer):bool
+   var cmd, rs, ds, cmdS, rsS;
+   var countSkipDeal:integer = 0, rest, LastClientContr;
+   var result:integer = 0, MinCountFuncobj:integer = 0, LastClintContr:integer = 0, PackSize:integer = 0;
+   var sql, sqlFromWhere, SkipDealSql, NotSkipDealSql, sqlFunkobj;
+   var ClientContrList = TArray();
+   var retID:integer;
+   recs = 0; errrecs = 0; wrnrecs = 0;    
+   errmsg = "";
+
+   var MAX_FUNCOBJ_ITERATION; //Максимальное кол-во итераций по проверке
+   var SLEEP_TIME_MS = 15000; //Время в мс, которое выжидаем, прежде чем снова проверять результаты выполнения задач - 15 секунд    
+   var MIN_EXEC_COUNT = 3; //Минимальное количество повторных выполнений каждой из ошибочных записей, прежде чем выводить по ним отчёт 
+
+   GetRegistryValue("SECUR\\MIN_COUNT_FOR_FUNCOBJ_CURMARKET", V_INTEGER, MinCountFuncobj);
+   GetRegistryValue("BANK_INI\\ОБЩИЕ ПАРАМЕТРЫ\\ПАРАЛЛЕЛЬНОЕ ВЫПОЛНЕНИЕ\\PSPAYORDER\\РАЗМЕР ПАКЕТА", V_INTEGER, PackSize);
+
+   /*ZMV BIQ-8258 блокировка исполнения сделок валютного рынка для договоров, у которых категория "Сведения о наличии или отсутствии ИИС у другого ПУ" = "Да" И 
+     категория "Предоставлены подтвержд. документы о расторжении ИИС у другого ПУ" на дату операции равно "Нет" или не заполнено*/ 
+   cmdS = DL_RSDCommand("SELECT t.t_ID, t.t_Code, sfcontr.t_Number " +                           
+                        "  FROM ddvndeal_dbt t, ddlcontrmp_dbt contrmp, ddlcontr_dbt dlcontr, dsfcontr_dbt sfcontr " +                                                                            
+                        " WHERE t.t_State = 0 " +   
+                        "   AND t.t_Sector = chr(88) " +
+                        "   AND t.t_MarketKind = "+DV_MARKETKIND_CURRENCY+
+                        "   AND contrmp.t_SfContrID = t.t_ClientContr " +                                                                                                                 
+                        "   AND dlcontr.t_DlContrID = contrmp.t_DlContrID " +                                                                                                     
+                        "   AND dlcontr.t_IIS = 'X' " +                                                                                                                            
+                        "   AND rsb_secur.GetMainObjAttr(207, LPAD(dlcontr.t_DlContrID, 34, '0'), 121/*Сведения о наличии или отсутствии ИИС у другого ПУ*/, t.t_Date) = 1 " +          
+                        "   AND rsb_secur.GetMainObjAttr(207, LPAD(dlcontr.t_DlContrID, 34, '0'), 122/*Предоставлены подтвержд. документы о расторжении ИИС у другого ПУ*/, t.t_Date) <> 1 " +
+                        "   AND sfcontr.t_ID = dlcontr.t_SfContrID "
+                       );
+   countSkipDeal = cmdS.GetCount();
+   if(countSkipDeal > 0)
+     rsS = cmdS.Execute();                                                                                                                      
+     while(rsS.MoveNext())
+       result_protocol.AddString("Не удалось обработать сделку с кодом " + string(rsS.Code) + " (идентификатор ID=" + string(rsS.ID) + "). По Договору " + rsS.Number + " клиентом не предоставлены документы о расторжении договора ИИС, заключенного с другим ПУ. Выполнение операции запрещено");
+     end;
+     errrecs = errrecs + countSkipDeal;
+   end;
+
+   sqlFromWhere = "  FROM ddvndeal_dbt t " +
+                  " WHERE t.t_Client > 0 " +   
+                  "   AND t.t_Sector = chr(88) " +
+                  "   AND t.t_MarketKind = "+DV_MARKETKIND_CURRENCY;
+    // дополнительное условие если нет пропускаемых сделок 
+   NotSkipDealSql = " AND t.t_State IN (0, 1) ";
+    // дополнительное условие для пропускаемых сделок 
+   SkipDealSql =                          
+         "   AND (t.t_State = 1 OR "+
+               " (t.t_State = 0 AND NOT EXISTS (SELECT 1 "+
+                                                " FROM ddlcontrmp_dbt contrmp, ddlcontr_dbt dlcontr "+
+                                               " WHERE contrmp.t_SfContrID = t.t_ClientContr "+
+                                                 " AND dlcontr.t_DlContrID = contrmp.t_DlContrID "+
+                                                 " AND dlcontr.t_IIS = 'X' "+
+                                                 " AND rsb_secur.GetMainObjAttr(207, LPAD(dlcontr.t_DlContrID, 34, '0'), 121/*Сведения о наличии или отсутствии ИИС у другого ПУ*/, t.t_Date) = 1 "+
+                                                 " AND rsb_secur.GetMainObjAttr(207, LPAD(dlcontr.t_DlContrID, 34, '0'), 122/*Предоставлены подтвержд. документы о расторжении ИИС у другого ПУ*/, t.t_Date) <> 1 "+
+                                               ") "+
+                "))";
+   sql = "SELECT t.t_ClientContr, t.t_ID, t.t_Code, t.t_DocKind " + sqlFromWhere;
+   if(countSkipDeal > 0) 
+     sql = sql + SkipDealSql; 
+   else 
+     sql = sql + NotSkipDealSql;
+   end; 
+   cmd = RSDCommand(sql);
+   rs = TRsbDataSet("SELECT count(1) cnt FROM (" +sql+" ) qq");   // алиас qq для конвертера на постгрес
+   if( rs.MoveNext() )
+      recs = rs.cnt;
+   end;
+
+   if( recs > 0 )
+     if( (MinCountFuncobj == 0) or (PackSize == 0) or (PackSize > recs) ) // если funcobj не используется или сделок меньше, чем размер пакета, то выполняем в один поток
+       rs = TRsbDataSet(cmd);
+       while( rs.MoveNext() )
+         result = DV_ExecDeal(int(rs.ID), false, -1, DealDate);
+         if( result == 1336/*Преждевременное выполнение шага*/ )
+           result_protocol.AddString("Успешно обработана сделка с кодом " + string(rs.Code) + " (идентификатор ID=" + string(rs.ID) + ").");
+         elif( result != 0 ) 
+           errrecs = errrecs + 1;
+           result_protocol.AddString("Не удалось обработать сделку с кодом " + string(rs.Code) + " (идентификатор ID=" + string(rs.ID) + "). Код ошибки " + string(result) + ". " + geterrmsg());
+         else
+           result_protocol.AddString("Успешно обработана сделка с кодом " + string(rs.Code) + " (идентификатор ID=" + string(rs.ID) + ").");
+         end;
+       end;
+     else
+        // распараллеливаем через funcobj 
+        // делаем массив клиентов с количеством сделок по каждому клиенту
+       sql = "SELECT t.t_ClientContr, COUNT(t.t_ID) cnt, t.t_DocKind " + sqlFromWhere;
+       if(countSkipDeal > 0) 
+         sql = sql + SkipDealSql; 
+       else 
+         sql = sql + NotSkipDealSql;
+       end; 
+       sql = sql + " GROUP BY t.t_ClientContr, t.t_DocKind " 
+                 + " ORDER BY t.t_ClientContr";
+       rs = TRsbDataSet(sql);
+       LastClientContr = 0;
+       rest = PackSize;
+       while( rs.MoveNext() )
+          if( ClientContrList[LastClientContr] and (rs.cnt <= rest) and (rs.t_ClientContr != ClientContrList[LastClientContr].id) and (rs.t_DocKind == ClientContrList[LastClientContr].DocKind)) // в старой записи есть место и это другой клиент со сделками того же типа -> добавляем
+            rest = rest - rs.cnt;
+            ClientContrList[LastClientContr].Add(rs.t_ClientContr, rs.cnt);
+          elif( ClientContrList[LastClientContr] and ((rs.cnt > rest) or (rs.t_ClientContr != ClientContrList[LastClientContr].id)))  // в старой нет места или тот же клиент -> создаем новую
+            LastClientContr = LastClientContr + 1;
+            ClientContrList[LastClientContr] = ClintContr(rs.t_ClientContr, rs.cnt, rs.t_DocKind); 
+            rest = PackSize - rs.cnt; 
+          elif( not ClientContrList[LastClientContr])  // нет текущей записи, создаем
+            ClientContrList[LastClientContr] = ClintContr(rs.t_ClientContr, rs.cnt, rs.t_DocKind); 
+            rest = PackSize - rs.cnt; 
+          end;
+       end;
+
+       //Раздаем задачи
+       SQL_Execute( "DELETE FROM ddl_funcobjbuf_tmp ");
+       sqlFunkobj = 
+          " DECLARE " + 
+            " v_FuncobjID dfuncobj_dbt.t_ID%TYPE; " +
+          " BEGIN " +
+          " INSERT INTO dfuncobj_dbt (t_ObjectType, t_ObjectID, t_FuncID, t_Param, t_Priority, t_Oper) " +
+            " VALUES (?, ?, 650, to_char(?, 'DD.MM.YYYY')||';'||"+String(countSkipDeal)+"||';'||?, ?, ?)"+
+            " RETURNING t_ID INTO v_FuncobjID; " +
+          " INSERT INTO ddl_funcobjbuf_tmp (t_ID, t_ObjectID) VALUES (v_FuncobjID, ?); " +
+          " END; ";
+       for(var client, ClientContrList)
+          cmd = RsdCommand(sqlFunkobj);
+          cmd.addParam("", RSDBP_IN, client.DocKind);
+          cmd.addParam("", RSDBP_IN, client.id);      // ClientContrID
+          cmd.addParam("", RSDBP_IN, DealDate);
+          cmd.addParam("", RSDBP_IN, client.idList);  // список ClientContrID для обработки в одном потоке funcobj 
+          cmd.addParam("", RSDBP_IN, iif((client.DocKind == DL_DVNDEAL), 60, 65));
+          cmd.addParam("", RSDBP_IN, {oper});
+          cmd.addParam("", RSDBP_IN, client.id);
+          cmd.Execute();
+       end;
+
+       var isNotFinished:bool = true;
+       var i:integer = 0;
+       MAX_FUNCOBJ_ITERATION = 10 + 4 * recs; //По минуте на сделку + время на запуск funcobj
+       while( isNotFinished and (i < MAX_FUNCOBJ_ITERATION) )
+         RslWait(SLEEP_TIME_MS); 
+         cmd = DL_RSDCommand("SELECT count(1) cnt " + //Ищем записи, которые еще обрабатываются
+                             "  FROM ddl_funcobjbuf_tmp t, dfuncobj_dbt funcobj " +
+                             " WHERE funcobj.t_ID = t.t_ID " +
+                             "   AND NOT (funcobj.t_State = "+FUNCOBJ_STATE_REPEAT_ERROR+" AND funcobj.t_ExecCount >= "+MIN_EXEC_COUNT+") " +
+                             "   AND funcobj.t_State NOT IN(  "+FUNCOBJ_STATE_FATAL_ERROR+ ", "+FUNCOBJ_STATE_MAX_REPEAT+" ) " /*300809*/
+                            );
+         ds = cmd.Execute();
+         if( (not ds.MoveNext()) or (int(ds.cnt) == 0) )
+           isNotFinished = false;
+         end;
+         i = i + 1;
+       end;
+
+       if( isNotFinished )
+          //Остановим все задачи, еще не завершившие выполнение
+          cmd = RSDCommand("UPDATE dfuncobj_dbt " + 
+                           "   SET t_State = "+FUNCOBJ_STATE_MAX_REPEAT+", " +
+                           "       t_ErrorText = case when t_ErrorText is null then 'Превышено время ожидания funcobj!' else t_ErrorText end "
+                           " WHERE t_ID IN (SELECT t_ID FROM ddl_funcobjbuf_tmp)"
+                          );
+          cmd.Execute();
+       else
+          //Остановим очередные итерации для ошибочных записей, сменив их статус
+          cmd = RSDCommand("UPDATE dfuncobj_dbt " + 
+                           "   SET t_State = "+FUNCOBJ_STATE_MAX_REPEAT +
+                           " WHERE t_State IN ( "+FUNCOBJ_STATE_REPEAT_ERROR+","+FUNCOBJ_STATE_FATAL_ERROR+")"+ /*300809*/
+                           "   AND t_ID IN (SELECT t_ID FROM ddl_funcobjbuf_tmp)"
+                          );
+          cmd.Execute();
+       end;
+
+       //Формируем протокол
+       cmd = DL_RSDCommand( 
+            "SELECT funcobj.t_ID, NVL(funcobj.t_ErrorCode, 0) t_ErrorCode, NVL(funcobj.t_ErrorText, chr(1)) t_ErrorText, " +
+                  "REPLACE( substr(funcobj.t_Param, instr(funcobj.t_Param, ';', 12)+1), ',', ''',''') as DocList "+
+              "FROM ddl_funcobjbuf_tmp t, dfuncobj_dbt funcobj "+
+                           " WHERE funcobj.t_ID = t.t_ID " +
+               "AND funcobj.t_State IN ("+FUNCOBJ_STATE_FATAL_ERROR +","+FUNCOBJ_STATE_REPEAT_ERROR+","+FUNCOBJ_STATE_MAX_REPEAT+" )" );
+       ds = cmd.Execute();
+       while( ds.MoveNext() )
+         errrecs = errrecs + 1;
+         cmdS = DL_RSDCommand("SELECT NVL(dsf.t_Number, 'Без номера') as NumberList " +
+                                "FROM dsfcontr_dbt dsf " +
+                                "WHERE dsf.t_ID IN ('"+ ds.DocList +"')" );
+         rsS = cmdS.Execute();
+         while( rsS.MoveNext() )
+            result_protocol.AddString("Не удалось обработать сделки клиента по договору " + string(rsS.NumberList) + iif(ds.ErrorCode > 0, ". Код ошибки "+string(ds.ErrorCode)+". ", " ") + ds.ErrorText);
+         end;
+       end;
+
+       cmd = DL_RSDCommand("SELECT REPLACE( substr(histparm.t_Param, instr(histparm.t_Param, ';', 12)+1), ',', ''',''') as DocList " + 
+                           "  FROM ddl_funcobjbuf_tmp t, DFUNCOBJ_HIST_DBT hist, DFUNCOBJ_HISTPARM_DBT histparm " +
+                           " WHERE hist.T_FUNCOBJID = t.t_ID " +
+                           "   AND histparm.t_id = (SELECT max(t_id) FROM DFUNCOBJ_HISTPARM_DBT WHERE t_histid = hist.t_ID) " +
+                           "   AND NOT EXISTS (SELECT 1 " +
+                           "                     FROM dfuncobj_dbt funcobj " + 
+                           "                    WHERE funcobj.t_ID = t.t_ID) " 
+                          );
+       ds = cmd.Execute();
+       while( ds.MoveNext() )
+         cmdS = DL_RSDCommand("SELECT NVL(dsf.t_Number, 'Без номера') as NumberList " +
+                                "FROM dsfcontr_dbt dsf " +
+                                "WHERE dsf.t_ID IN ('"+ ds.DocList +"')" );
+         rsS = cmdS.Execute();
+         while( rsS.MoveNext() )
+            result_protocol.AddString("Успешно обработаны сделки клиента по договору " + string(rsS.NumberList));
+         end;
+       end;
+     end;
+   else
+     result_protocol.AddString("Не найдены не обработанные сделки ");
+   end;
+
+   CheckDealDate(DealDate, @errmsg, @result_protocol, @wrnrecs);
+
+   return true;
+          
+onError(erru)  
+  errmsg = "onError: " + erru.message + " (модуль " + erru.module + ", строка " + erru.line + ")";
+  return false;
+end;
+
+private macro _RunCurItog( DocDate:date, CodeType:integer, MarketKind:integer, ErrMes:@string, WrnMes:@string )
+  var DLQuery, DLComm;
+  var RsdDLQuery = DL_RSdCommand();
+  var Err:string = "", OperName:string = "", OperCode = "";
+  var OperID:integer = 0, MarketID:integer = 0, MarketSchemeID:integer = 0;
+  ErrMes = WrnMes = "";
+
+  OperName = "\"Обработка итогов валютных биржевых торгов\"";
+
+  DLQuery = "SELECT comm.t_DocumentID, comm.t_CommCode, comm.t_CommStatus " + 
+            "  FROM ddl_comm_dbt comm"                                      +   
+            " WHERE comm.t_DocKind = ?  "                                   +                      
+            "   AND (comm.t_CommStatus = ? OR comm.t_CommStatus = ? OR comm.t_CommStatus = ? ) "      +
+            "   AND comm.t_CommDate = ? "                                   +
+            "   AND comm.t_OperSubKind = ? ";
+  RsdDLQuery.AddParam( 4633/*DocKind*/ );  
+  RsdDLQuery.AddParam( DL_COMM_READIED );
+  RsdDLQuery.AddParam( DL_COMM_PREPARING ); 
+  RsdDLQuery.AddParam( DL_COMM_CLOSED ); 
+  RsdDLQuery.AddParam( DocDate );
+  RsdDLQuery.AddParam( CodeType );
+  
+  DLComm = RsdDLQuery.execute( DlQuery );
+  if( DLComm.MoveNext() )
+     OperID = DLComm.DocumentID;
+     OperCode = DLComm.CommCode;
+     if( DLComm.CommStatus == DL_COMM_PREPARING )
+        WrnMes = "Открытая сервисная операция " + OperName + " за дату " + DocDate + " не найдена.\n Будет стартована отложенная сервисная операция с требуемыми параметрами\n";
+        if( DL_Open_MarketOpInDL_Comm(OperID) != 0 ) // Вызов API открытия операции (на случай, если операция отложенная или шаг "Открытие дня" откачен вручную, иначе ничего не должна делать)
+           ErrMes = ErrMes + "Не удалось открыть операцию " + OperName + " №" + OperCode + "! " + GetErrMsg() + "\n";
+        end;
+     end;
+     if (( DLComm.CommStatus == DL_COMM_READIED ) or (DLComm.CommStatus == DL_COMM_PREPARING))
+        if( DV_TotalStep_CurMarketOp(OperID) != 0 ) // Вызов API Расчеты ФИ
+           ErrMes = ErrMes + "Не удалось вставить шаг Расчеты ФИ " + OperName + " №" + OperCode + "! " + GetErrMsg() + "\n";
+        end;
+        if (ErrMes == "")
+           if( DL_Close_MarketOpInDL_Comm(OperID) != 0 ) // Вызов API Закрытие операции
+              ErrMes = ErrMes + "Не удалось закрыть операцию " + OperName + " №" + OperCode + "! " + GetErrMsg() + "\n";
+           end;
+        end;
+     end;
+     if (DLComm.CommStatus == DL_COMM_CLOSED)
+        WrnMes = "Сервисная операция " + OperName + " за дату " + DocDate + " была закрыта ранее";
+     end;
+  else
+     ErrMes = ErrMes + "Не найдена операция " + OperName; 
+  end;
+
+  return OperID;
+end;
+
+macro RunCurItog(dt, result_protocol:@TStrCollector, recs:@integer, errrecs:@integer, errmsg:@string, wrnrecs:@integer)
+  recs = 0;
+  errrecs = 0;
+  wrnrecs = 0; // Пока возвращаем 0
+  errmsg = "";
+  result_protocol.ClearArray;
+
+   var WrnMsg;
+   _RunCurItog( dt, 2/*client*/ , DV_MARKETKIND_CURRENCY, @ErrMsg, @WrnMsg );
+   if ((WrnMsg != "") and (ErrMsg == ""))
+     result_protocol.AddString("Выполнено успешно");
+   end;
+   if (ErrMsg != "")
+     errrecs = errrecs + 1;
+     result_protocol.AddString(errmsg);
+   end;
+   if (WrnMsg != "")
+     wrnrecs = wrnrecs + 1;
+     result_protocol.AddString(wrnmsg);
+   end;
+
+   if (errrecs != 0 )
+      return false;
+   else
+      return true;
+   end;
+onError(erru)  
+  errmsg = "onError: " + erru.message + " (модуль " + erru.module + ", строка " + erru.line + ")";
+  return false;
+end;
+
+PRIVATE MACRO GetFlagAutoSend()
+    var RegistryPath = "РСХБ\\БРОКЕРСКОЕ ОБСЛУЖИВАНИЕ\\ОТЧЕТ БРОКЕРА\\AUTOMATION\\AUTOMATIC_SENT";
+    var Val = -1;
+    var stat = 0;
+
+    GetRegistryValue(RegistryPath, V_INTEGER, Val, stat);
+    if(stat) 
+        msgbox("Не задана настройка в реестре банка:|", RegistryPath);      
+        Val = -1;
+    end;
+
+    return Val;
+END;
+
+
+/*Формирование отчета брокера*/
+macro DV_BrokerRep_Schedul(reportdate, opernum, num, documentid:@integer)
+  var cmdD, rsD;
+  var srvrep = TRecHandler("scsrvrep.dbt"), stat = 0, nextnumb = 0;
+  documentid = 0;
+
+  var AutoSend = GetFlagAutoSend();
+  if (AutoSend == -1)
+     stat = 1;
+  end;
+
+  if (stat == 0 )
+
+     /*Номер операции отправки отчета брокера*/
+     GenerateReference(275, nextnumb);
+
+     srvrep.rec.dockind = SP_SRVBROKERREP/*4622*/;
+     srvrep.rec.date = reportdate;
+     srvrep.rec.code = nextnumb + num;
+     srvrep.rec.repstatus = 0;
+     srvrep.rec.signstatus = 0;
+     srvrep.rec.sendstatus = 0;
+     srvrep.rec.periodkind = 1;
+     srvrep.rec.begdate = reportdate;
+     srvrep.rec.enddate = reportdate;
+     srvrep.rec.clientid = -1;
+     srvrep.rec.clientcontrid = 0;
+     srvrep.rec.byexchange = StrFor(88);
+     srvrep.rec.byoutexchange = StrFor(88);
+     srvrep.rec.bymoving = StrFor(88);
+     srvrep.rec.bynotnullrest = StrFor(0);
+     srvrep.rec.pdfformat = StrFor(88);
+     srvrep.rec.excelformat = StrFor(88);
+     srvrep.rec.bycm          = StrFor(88);
+     srvrep.rec.bystock       = StrFor();
+     srvrep.rec.bydv          = StrFor(0);
+     srvrep.rec.autosign = StrFor(0);
+     srvrep.rec.autosend = IIF(AutoSend, StrFor(88), StrFor(0)) ;
+     srvrep.rec.protocol = StrFor(0);
+     srvrep.rec.oper = opernum;
+     srvrep.rec.department = {operdprt};
+
+     stat = SC_CreateSrvRepOperation(srvrep);
+
+     if(stat == 0)
+        documentid = Int(srvrep.rec.ID);
+        stat = SC_ServOperExecuteSilent( SP_SRVBROKERREP, Int(srvrep.rec.ID) );
+     end;
+
+     if(stat == 0) // Golovkin 18.03.2021 Проверим статус СО на ошибки
+        var srv_cmd = RSDCommand(" SELECT srvrep.t_repstatus                                 " +
+                                 "   FROM dscsrvrep_dbt srvrep                               " +
+                                 "  WHERE srvrep.t_id = :oper_id AND srvrep.t_repstatus = 40 ");
+        srv_cmd.AddParam("oper_id", RSDBP_IN,  Int(srvrep.rec.ID) );
+
+        var srv_rs = TRsbDataSet(srv_cmd);
+        
+        if(srv_rs.movenext)
+          return 1;
+        end;     
+     end;
+
+  end;
+
+  return stat;
+end;
+
+/*Формирование отчета брокера*/
+macro DV_BrokerRep_Schedul_UK(reportdate, opernum, num, documentid:@integer)
+  var cmdD, rsD;
+  var srvrep = TRecHandler("scsrvrep.dbt"), stat = 0, nextnumb = 0;
+  documentid = 0;
+
+  var AutoSend = GetFlagAutoSend();
+  if (AutoSend == -1)
+     stat = 1;
+  end;
+
+  if (stat == 0 )
+
+
+     /*Номер операции отправки отчета брокера*/
+     GenerateReference(275, nextnumb);
+
+     srvrep.rec.dockind = SP_SRVBROKERREP/*4622*/;
+     srvrep.rec.date = reportdate;
+     srvrep.rec.code = nextnumb + num;
+     srvrep.rec.repstatus = 0;
+     srvrep.rec.signstatus = 0;
+     srvrep.rec.sendstatus = 0;
+     srvrep.rec.periodkind = 1;
+     srvrep.rec.begdate = reportdate;
+     srvrep.rec.enddate = reportdate;
+     srvrep.rec.clientid = 114800;
+     srvrep.rec.clientcontrid = 0;
+     srvrep.rec.byexchange = StrFor(88);
+     srvrep.rec.byoutexchange = StrFor(88);
+     srvrep.rec.bymoving = StrFor(88);
+     srvrep.rec.bynotnullrest = StrFor(0);
+     srvrep.rec.pdfformat = StrFor(88);
+     srvrep.rec.excelformat = StrFor(88);
+     srvrep.rec.bycm          = StrFor(88);
+     srvrep.rec.bystock       = StrFor();
+     srvrep.rec.bydv          = StrFor(0);
+     srvrep.rec.autosign = StrFor(0);
+     srvrep.rec.autosend = IIF(AutoSend, StrFor(88), StrFor(0));
+     srvrep.rec.protocol = StrFor(0);
+     srvrep.rec.oper = opernum;
+     srvrep.rec.department = {operdprt};
+
+     stat = SC_CreateSrvRepOperation(srvrep);
+
+     if(stat == 0)
+        documentid = Int(srvrep.rec.ID);
+        stat = SC_ServOperExecuteSilent( SP_SRVBROKERREP, Int(srvrep.rec.ID) );
+     end;
+
+     if(stat == 0) // Golovkin 18.03.2021 Проверим статус СО на ошибки
+        var srv_cmd = RSDCommand(" SELECT srvrep.t_repstatus                                 " +
+                                 "   FROM dscsrvrep_dbt srvrep                               " +
+                                 "  WHERE srvrep.t_id = :oper_id AND srvrep.t_repstatus = 40 ");
+        srv_cmd.AddParam("oper_id", RSDBP_IN,  Int(srvrep.rec.ID) );
+
+        var srv_rs = TRsbDataSet(srv_cmd);
+        
+        if(srv_rs.movenext)
+          return 1;
+        end;     
+     end;
+
+  end;
+
+  return stat;
+end;
+
+
+/*Формирование отчета брокера*/
+macro BrokerRep(dt, opernum, result:@tarray, recs:@integer, errrecs:@integer, errmsg:@string, wrnrecs:@integer)
+  var documentid1=0, documentid2=0;
+  recs = 0;
+  errrecs = 0;
+  wrnrecs = 0;//Пока возвращаем 0
+  errmsg = "";
+
+  if(DV_BrokerRep_Schedul_uk(dt, opernum, "авто", @documentid1) != 0)
+    errmsg = "Ошибка выполнения Операции формирования отчетов брокера по УК";
+    errrecs = errrecs + 1;
+  end;
+
+  if(DV_BrokerRep_Schedul(dt, opernum, "авто", @documentid2) != 0)
+    errmsg = errmsg+"\nОшибка выполнения  Операции формирования отчетов брокера по клиентам";
+    errrecs = errrecs + 1;
+  end;
+
+  if(((documentid1+documentid2) > 0) and (errrecs > 0)) // Golovkin 18.03.2021 Проверим на предмет наличия ошибки отсутствия заявок в протоколе
+     var srv_cmd = RSDCommand(" SELECT d.*                                                              " +
+                              "   FROM ddl_logdata_dbt d, DDL_LOG_DBT LOG, dscsrvrep_dbt srvrep         " +
+                              "  WHERE     d.T_LOGID = LOG.t_ID                                         " +
+                              "        AND LOG.T_DOCKIND = srvrep.T_DOCKIND                             " +
+                              "        AND LOG.T_DOCID = srvrep.t_id                                    " +
+                              "        AND srvrep.t_id in (:oper_id1, :oper_id2)                        " +
+                              "        AND d.T_TYPE != "+LOG_TYPE_HEADER+"                              " +
+                              "        AND d.T_TYPE = "+LOG_TYPE_ERROR+"                                " +
+                              "        AND d.t_logdata LIKE '%отсутствуют заявки-поручения по сделкам%' ");        
+     srv_cmd.AddParam("oper_id1", RSDBP_IN, Int(documentid1) );
+     srv_cmd.AddParam("oper_id2", RSDBP_IN, Int(documentid2) );
+
+     var srv_rs = TRsbDataSet(srv_cmd);
+     
+     if(srv_rs.movenext)
+       errmsg = "Формирование Отчета брокера остановлено - не обработан файл SEM02";
+     end;     
+  end;
+
+
+
+  if(documentid2 > 0)
+    result[result.size] = documentid2;
+  end;
+  recs = recs + 1;
+
+  return true;
+onError(erru)  
+  errmsg = "onError: " + erru.message + " (модуль " + erru.module + ", строка " + erru.line + ")";
+  return false;
+end;
+
+private macro GetCountClients(createDate:date):integer
+  var count:integer = 0;
+
+  var cmd = DL_RSDCommand("SELECT RSI_NPTXOP.GetCountClients( ?, ? ) count from dual ");
+  cmd.AddParam(createDate);
+  cmd.AddParam(UNSET_CHAR);  // пока только не для ИИС, при добавлении параметра ИИС в планировщике- переделать здесь
+
+  var DataSet = cmd.Execute();
+  if(DataSet.moveNext())
+    count = DataSet.count;
+  end;
+
+  return count;
+end;
+
+private macro GetExecPackSize(count:integer):integer
+   var packSize = 0; 
+   if (count < 50)
+       packSize = 5;
+   elif (count < 100 ) 
+       packSize = 10;
+   elif (count < 500 ) 
+       packSize = 50;
+   elif (count < 1000 ) 
+       packSize = 100;
+   elif (count < 5000 ) 
+       packSize = 200;
+   elif (count < 50000 ) 
+       packSize = 500;
+   else
+       packSize = 1000;
+   end;
+   return packSize;
+end;
+
+private macro GetGUID():string
+  var GUIDstr:string = "";
+
+  var cmd = DL_RSDCommand("select CAST(sys_guid() as VARCHAR2(32)) as t_GUID from dual");
+
+  var DataSet = cmd.Execute();
+  if(DataSet.moveNext())
+    GUIDstr = DataSet.GUID;
+  end;
+
+  return GUIDstr;
+END;
+
+private macro ClearTmp()
+  var query, del;
+
+  query = "DELETE FROM DNPTXOPMASSLIST_TMP";
+  del = DL_RSDCommand(query);
+  del.ExecuteCMD();
+
+  query = "DELETE FROM DNPTXTBMES_TMP";
+  del = DL_RSDCommand(query);
+  del.ExecuteCMD();
+end;
+
+private macro isComplitPrecondCalcLucre(dt:date):bool
+    var cmdСheck, rsСheck;
+    
+    StartCaptureOutput();
+    [
+      SELECT 1
+      FROM dprocess_u_dbt 
+      WHERE T_OPERDATE = ?
+      AND T_SUBTYPE IN (506,508) /*СОБУ/СОВУ*/
+      AND T_STATUS NOT IN (3,10) /*Обработан с ошибками/Обработан*/
+    ];
+    cmdСheck = DL_RsdCommand(EndCaptureOutput());
+    cmdСheck.AddParam(dt);
+    rsСheck = cmdСheck.Execute();
+    if(rsСheck.moveNext())
+       return false;
+    end;
+    return true;
+end;
+
+private macro isComplitPrecondHoldLucre(dt:date):bool
+    var cmdСheck, rsСheck;
+    
+    StartCaptureOutput();
+    [
+      SELECT 1
+      FROM dprocess_u_dbt 
+      WHERE T_OPERDATE = ?
+      AND T_SUBTYPE IN (702) /*Расчет Лимитов Фондовый рынок и ЕДП*/ 
+      AND T_STATUS NOT IN (10) /*Обработан*/
+    ];
+    cmdСheck = DL_RsdCommand(EndCaptureOutput());
+    cmdСheck.AddParam(dt);
+    rsСheck = cmdСheck.Execute();
+    if(rsСheck.moveNext())
+       return false;
+    end;
+    return true;
+end;
+
+private macro GetSysTime() : time
+  var sTime: time;
+  var query_time = "select to_date( '01010001' || to_char( sysdate, 'hh24miss' ), 'ddmmyyyyhh24miss' ) from dual";
+  var rs_time:RsdRecordset = execSQLselect( query_time );
+
+  if ( rs_time and rs_time.moveNext() )
+    sTime = rs_time.value(0);
+  end;  
+
+  return sTime;
+end;
+
+/**
+  @brief Расчет НОБ по мат. выгоде
+  @param[in] dt дата операции
+  @param[in] opernum оператор
+  @param[out] result_protocol протокол
+  @param[out] recs счетчик записей
+  @param[out] errrecs счетчик ошибок
+  @param[out] errmsg строка ошибки
+  @param[out] wrnrecs количество обработанных 
+  @return true, если не было exception
+*/
+macro CalcLucre(dt, opernum, result:@tarray, recs:@integer, errrecs:@integer, errmsg:@string, wrnrecs:@integer)
+  var exec, execProtocol;
+  var SubKind_Operation =  DL_TXBASECALC_OPTYPE_LUCRE;
+  var prefix:string;
+  var day, mon, year, periodFrom;
+  var GUID;
+  var countClients, packSize;
+  var ClientGroup = 1;
+  var ClientIdType = -1;
+  var FIID = -1;
+
+  recs = 0;
+  errrecs = 0;
+  wrnrecs = 0; ///Пока возвращаем 0
+  errmsg = "";
+
+  if(not isComplitPrecondCalcLucre(dt))
+      errmsg = "Запуск процесса \"Расчет НОБ по материальной выгоде\" возможен после успешного завершения процессов \"СОБУ по клиентским операциям\" и \"СОВУ по клиентским операциям\"";
+    return false;
+  end;
+
+  DateSplit(dt, day, mon, year);
+  prefix = "БА_" + string(day:2:o) + string(mon:2:o) + substr(string(year),3,4) + "_";
+  periodFrom = date ("01.01."+ year);
+
+  countClients = GetCountClients(dt);
+  packSize = GetExecPackSize(countClients);
+  GUID = GetGUID();
+  if(countClients > 0)
+    ClearGlobalTmp( "DSCTAXMES_TMP" );
+
+    exec = DL_RSDCommand("CALL RSI_NPTXOP.MasCreateNptxOp( ?, ?, null, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ? )");
+    exec.AddParam(dt);
+    exec.AddParam(SubKind_Operation);
+    //exec.AddParam("");                //Номер операции
+    exec.AddParam(UNSET_CHAR);        //ИИС, при добавлении параметра ИИС переделать
+    exec.AddParam(UNSET_CHAR);        //Сообщать о более поздних операциях
+    exec.AddParam(SET_CHAR);          //Не формировать при отсутствии сделок
+    exec.AddParam(GUID);
+    exec.AddParam(packSize);
+    exec.AddParam(UNSET_CHAR);        //pRecalc
+    exec.AddParam(UNSET_CHAR);        //pCalcNDFL
+    exec.AddParam(ClientGroup);
+    exec.AddParam(ClientIdType);
+    exec.AddParam(FIID);
+    exec.AddParam(year);              //pTaxPeriod
+    exec.AddParam(periodFrom);
+    exec.AddParam(dt);                //pPeriodTo
+    exec.AddParam(prefix);
+    exec.AddParam(UNSET_CHAR);        //pIsTechnical
+    exec.ExecuteCMD();
+  end;
+
+  execProtocol = DL_RSDCommand(" SELECT op.t_id "
+                              +" FROM DNPTXOP_DBT op "
+                              +"      INNER JOIN DNPTXMASSPROT_DBT prt ON op.t_Code = prt.t_NptxNumber "
+                              +" WHERE op.T_OPERDATE = ? "
+                              +"   AND op.T_SUBKIND_OPERATION = " + DL_TXBASECALC_OPTYPE_LUCRE);
+  execProtocol.AddParam(dt);
+
+  var DataSet = execProtocol.Execute();
+  while(DataSet.moveNext())
+    result[result.size] = DataSet.id;
+    recs = recs + 1;
+  end;
+  
+  return true;
+onError(erru)  
+  errmsg = "onError: " + erru.message + " (модуль " + erru.module + ", строка " + erru.line + ")";
+  return false;
+end;
+
+/**
+  @brief Удержание НДФЛ по мат. выгоде
+  @param[in] dt дата операции
+  @param[in] opernum оператор
+  @param[out] result_protocol протокол
+  @param[out] recs счетчик записей
+  @param[out] errrecs счетчик ошибок
+  @param[out] errmsg строка ошибки
+  @param[out] wrnrecs количество обработанных 
+  @return true, если не было exception
+*/
+macro HoldLucre(dt, opernum, result:@tarray, recs:@integer, errrecs:@integer, errmsg:@string, wrnrecs:@integer)
+  var query, ins, cmd, DataSet;
+  var day, mon, year;
+  var regVal, stat, stopTime, curTime;
+  var cnt;
+  
+  DateSplit(dt, day, mon, year);
+
+  var TaxPeriod         = year;
+  var SubKind_Operation = DL_TXHOLD_OPTYPE_LUCRE;
+  var ByAllClients      = true;
+  var TypeClient        = 1; //C_SOFR_ID; C_CFT_ID   = 2;
+  var Prefix            = "БА_" + string(day:2:o) + string(mon:2:o) + substr(string(year),3,4) + "_";
+  var SkipCatEnable     = true;
+  
+  GetRegistryValue("COMMON\\НДФЛ\\ВРЕМЯ_ПОСЛЕД_ШАГА_УДЕРЖ_НДФЛ_БА", V_STRING, regVal, stat);
+  if (stat)
+    errmsg = "Ошибка при получении значения настройки COMMON\\НДФЛ\ВРЕМЯ_ПОСЛЕД_ШАГА_УДЕРЖ_НДФЛ_БА";
+    return;
+  end;  
+  stopTime = time(regVal);
+  curTime = GetSysTime();
+
+  if(not isComplitPrecondHoldLucre(dt))
+    errmsg = "\"Удержание НДФЛ по материальной выгоде\" возможен после успешного завершения процессов \"Расчет Лимитов Фондовый рынок и ЕДП\"";
+    return false;
+  end;
+
+  ClearTmp();
+
+  query =   " INSERT INTO DNPTXOPMASSLIST_TMP(T_CLIENTID, T_IN_CLIENTID)"
+            + " SELECT DISTINCT op.t_Client, op.t_Client "
+            + "   FROM dnptxop_dbt op "
+            + "  WHERE op.t_DocKind = " + DL_CALCNDFL
+            + "    AND op.t_OperDate BETWEEN ? AND ? "
+            + "    AND op.t_SubKind_Operation = " + DL_TXBASECALC_OPTYPE_LUCRE
+            + "    AND op.t_Status = 2 "
+            + "    AND op.t_TaxBase > 0 "
+            + "    AND NOT EXISTS(SELECT 1 "
+            + "                     FROM dnptxop_dbt op1 "
+            + "                    WHERE op1.t_DocKind = " + DL_CALCNDFL
+            + "                      AND op1.t_Client = op.t_Client "
+            + "                      AND op1.t_OperDate BETWEEN ? AND ? "
+            + "                      AND op1.t_SubKind_Operation = " + DL_TXBASECALC_OPTYPE_LUCRE
+            + "                      AND op.t_Status <> 2 "           
+            + "                  ) ";
+
+  ins = DL_RSDCommand(query);
+
+  ins.AddParam(date(1,1,TaxPeriod));
+  ins.AddParam(date(31,12,TaxPeriod));
+  ins.AddParam(date(1,1,TaxPeriod));
+  ins.AddParam(date(31,12,TaxPeriod));
+
+  ins.ExecuteCMD();
+
+  //Обрабатываем загруженных клиентов
+  query = " select * from dnptxopmasslist_tmp";
+
+  cmd = DL_RSDCommand(query);
+
+  cnt = cmd.GetCount();
+  if(cnt > 0)
+    DataSet = cmd.Execute();
+    var i = 0;
+    while(DataSet.moveNext())
+      curTime = GetSysTime();
+      if (curTime < stopTime)
+        GenerateOpToClient(TaxPeriod, SubKind_Operation, string(DataSet.ClientID), string(DataSet.In_ClientID), TypeClient, Prefix, SkipCatEnable, ByAllClients);
+            
+        result[result.size] = DataSet.ClientID;
+        recs = recs + 1;
+      end;
+    end;
+  end;
+
+  return true;
+onError(erru)  
+  errmsg = "onError: " + erru.message + " (модуль " + erru.module + ", строка " + erru.line + ")";
+  return false;
+end;
+

@@ -1,0 +1,1191 @@
+/*
+$Name: c_f251.mac
+$Module: Регламентируемая отчетность
+$Description: Расчет формы 251.
+*/
+
+/* ──────────────────────────────────────────────────────────────────────────┐
+   RS-Bank 5.1                                      R-Style Software Lab Ltd
+   Файл подсистемы "Отчеты ЦБ"
+
+   Расчет формы 251
+
+   CREATED : 31.08.00 LA
+
+   MODIFICATIONS:
+             17.10.01 Зорина
+             Удалена настройка ДокументыПереоценки, так как документы переоценки
+             не должны попадать в отчет.
+             03.06.02. Богданова
+             Изменены счета условия Д4.
+   NOTES:
+    25.07.2005  BugZ SCR 69375 Фильтрация по ТС/РС.
+    30.03.2006  ABP  SCR 78752 Доработка для ЦАБС, оптимизация, баги.
+└────────────────────────────────────────────────────────────────────────── */
+
+import BankInter, FIInter, PTInter, lib_path, ReportInter, ReptCBInter, ReptCBCommon, param, rcbconst, CTInter, cb_sql, RsbDataSet, globals;
+import DepartmentFilter;
+import RcbWebCommon;
+import Reporting;
+
+
+/*      Настройка - значения берем из справочника настроек                        */
+
+/* Список буквенных обозначений способов электронной отправки документов.
+   Заполняется через запятую без пробелов: например, "E,O,T".
+ */
+var СпособыЭлектроннойОтправки;
+
+/* Если = TRUE, то в строке 146 дублируются значения 141 без расчета */
+var Дублировать141_В_146;
+
+var ПечатьПротокола,
+    ДиректорияПротоколаРаботы = ReturnDirString( "TEXTDIR", "TXTFILE" ),
+    NameTempFile              = GetWorkFileName( "temp_251." + string( UserNumber:3:l:t ) ),
+    TRs;
+
+/* ------------------------------------------------------------------------- */
+/* ------------------------------------------------------------------------- */
+/* FILES */
+/* ------------------------------------------------------------------------- */
+FILE finin ( fininstr   );
+FILE bnkd  ( bankdprt );
+
+FILE work ( "temp_251.dbt", "rcb_tmp.def" ) WRITE;
+FILE tout () txt;
+
+private var documentFilter = RcbDocumentFilter();
+
+private var ReceiverBankCode = "",
+            PayerBankCode    = "";
+
+/* ------------------------------------------------------------------------- */
+/* CLASSES */
+/* ......................................................................... */
+
+/* Структура для хранения записи по переменной (соответствует 2м атрибутам ТЗ) */
+CLASS CvarRec( p_line, p_column, p_rouble )
+ var v_line   = p_line,   /* номер строки без ведущей 1: 1, 2, 3 и т.п. */
+     v_column = p_column, /* номер колонки: 1/2/3/4/5 */
+     v_rouble = p_rouble, /* ?рубли */
+
+     v_count  = 0, /* количество документов */
+     v_sum    = $0; /* сумма документов */
+
+ /* Добавить сумму документа к сумме переменной и учесть в количестве */
+ MACRO inc( p_sum )
+  v_count = v_count + 1;
+  v_sum   = v_sum + p_sum;
+ END;
+END;
+/* ......................................................................... */
+
+/* 28.03.2006 ABP SCR 78752 */
+/* Класс определения типа платежа по банкам плательщика и получателя.                              */
+/* Типы платежей: внутренний, МФР, внешний через банк-корреспондент, внешний через РНКО            */
+/* Интегрирован кеш. Кешируются параметры субъекта.                                                */
+/* Публичные функции:                                                                              */
+/*   DefinePaymentType(ReceiverPartyID, PayerPartyID) - определение типа платежа                   */
+/*   EnableCache()                                    - включить и инициализировать "сложный" кеш  */
+/*   EnableSimpleCache()                              - включить и инициализировать "простой" кеш  */
+/*   DisableCache()                                   - отключить кеширование                      */
+/* По умолчанию включен "сложный" кеш.                                                             */
+/* PS А можно не извращаться и валить все в один большой массив - "простой" кеш :)                 */
+/*    Но при большом количестве разных субъектов проблемы с массивом гарантированы.                */
+private CLASS TPaymentTypeQualifier
+
+  private class TCasheNode(PartyID, PartyID_SuperiorCABS, PartyID_SuperiorLendingAgency, CorAccBalance, InOurTS)
+    var m_PartyID  = PartyID;
+    var m_RefCount = 1;
+
+    var m_PartyID_SuperiorCABS           = PartyID_SuperiorCABS;
+    var m_PartyID_SuperiorLendingAgency  = PartyID_SuperiorLendingAgency;
+    var m_CorAccBalance                  = CorAccBalance;
+    var m_InOurTS                        = InOurTS;
+
+    macro Check(PartyID)
+      return m_PartyID == PartyID;
+    end;
+
+    macro Inc()
+      m_RefCount = m_RefCount+1;
+    end;
+  end;
+
+  /* Типы узла ТС */
+  private const NODETYPE_FILIAL = 1,
+                NODETYPE_BRANCH = 2;
+
+  /* Типы платежа */
+  const PAYM_UNDEF      = 0, /* неопределен                      */
+        PAYM_INTERNAL   = 1, /* внутренний                       */
+        PAYM_MFR        = 2, /* МФР                              */
+        PAYM_EXTERNAL_B = 3, /* внешний через банк-корреспондент */
+        PAYM_EXTERNAL_R = 4; /* внешний через РНКО               */
+
+  /* Размер определять опытным путем, при внедрении.                                               */
+  /* Слишком сильно увеличивать не рекомендуется - затраты на поиск в кеше могут превысить         */
+  /* время прямого определения по БД. Желающие могут оптимизировать выбор значения: хранить        */
+  /* данные в отсортированном по PartyID виде, это увеличит время вставки нового значения в кеш,   */
+  /* но даст возможность ускорить получение данных путем использования более продвинутого          */
+  /* алгоритма поиска (бинарный поиск, например).                                                  */
+  /* Ну а проще всего - реализовать в сишнике на основе std::map, там сортировка и поиск уже есть. */
+  private const m_CashSize = 50;
+
+  private var m_Cache:TArray;
+  private var m_CacheEnabled;
+  private var m_SimpleCache;
+
+  private macro DefinePartyParameters(PartyID)
+    var rs;
+    var CmdText;
+
+    var InOurTS = false;
+    var PartyID_SuperiorCABS = -1;
+    var PartyID_SuperiorLendingAgency = -1;
+    var CorAccBalance = "";
+
+    /* получить структуру подчинения в нашей ТС */
+    var ParentFld;
+    if (RcbOrganizationStructure == 1)/* TERRITORIAL */
+      ParentFld = "dp.t_ParentCode";
+    else
+      ParentFld = "dp.t_ParentRGNCode";
+    end;
+
+    CmdText = " SELECT dp.t_NodeType NodeType, dp.t_PartyID PartyID"+
+              " FROM ddp_dep_dbt dp"+
+              " WHERE dp.t_Status = 2"+
+              " CONNECT BY PRIOR "+ParentFld+" = dp.t_Code"+
+              " START WITH dp.t_PartyID = "+PartyID+
+              " ORDER BY level";
+
+    rs = TRsbDataSet(CmdText, RSDVAL_CLIENT, RSDVAL_STATIC);
+    rs.SetFieldType("NodeType", V_INTEGER);
+    rs.SetFieldType("PartyID",  V_INTEGER);
+
+    /* если хоть что-то есть - субъект в нашей ТС */
+    InOurTS = rs.Next();
+    if (InOurTS)
+      /* Получить ближайший вышестоящий "филиал" в ТС, это может быть и сам анализируемый субъект */
+      /* не стоит завязываться на неполное вычисление лог. выражений, мало ли что Кубрину захочется... */
+      if (rs.NodeType == NODETYPE_BRANCH)
+        while(rs.Next() == true)
+          if (rs.NodeType == NODETYPE_FILIAL)
+            break;
+          end;
+        end;
+      end;
+      PartyID_SuperiorCABS = rs.PartyID;
+
+      /* ищем самую вышестоящую организацию в структуре кредитных организаций */
+      rs.Last(); /* самый верхний узел в ТС */
+      CmdText = "SELECT rsb_rep_pt.get_top_superior_id("+rs.PartyID+") PartyID FROM dual";
+      rs = TRsbDataSet(CmdText);
+      rs.SetFieldType("PartyID", V_INTEGER);
+      rs.Next();
+      PartyID_SuperiorLendingAgency = rs.PartyID;
+    else
+      /* ищем самую вышестоящую организацию в структуре кредитных организаций */
+      CmdText = "SELECT rsb_rep_pt.get_top_superior_id("+PartyID+") PartyID FROM dual";
+      rs = TRsbDataSet(CmdText);
+      rs.SetFieldType("PartyID", V_INTEGER);
+      rs.Next();
+      PartyID_SuperiorLendingAgency = rs.PartyID;
+    end;
+
+    /* определить корсчет в РКЦ для рассматриваемого субъекта */
+    CmdText = "SELECT substr(t_CorAcc,1,5) CorAccBalance FROM dbankdprt_dbt WHERE t_PartyID = "+PartyID;
+    rs = TRsbDataSet(CmdText);
+    rs.SetFieldType("CorAccBalance", V_STRING);
+    if (rs.Next())
+      CorAccBalance = rs.CorAccBalance;
+    end;
+
+    return TCasheNode(PartyID, PartyID_SuperiorCABS, PartyID_SuperiorLendingAgency, CorAccBalance, InOurTS);
+  end;
+
+  private macro Add(PartyID)
+    var i, MinRefCount = 999999, AddPosition;
+
+    if (m_CacheEnabled)
+      if (m_SimpleCache)
+        AddPosition = m_Cache.Size;
+      else
+        if (m_Cache.Size == m_CashSize)
+          i = 0;
+          while(i < m_Cache.Size)
+            if (m_Cache[i].m_RefCount < MinRefCount)
+              MinRefCount = m_Cache[i].m_RefCount;
+              AddPosition = i;
+            end;
+            i = i+1;
+          end;
+        else
+          AddPosition = m_Cache.Size;
+        end;
+      end;
+    else
+      AddPosition = 0;
+    end;
+
+    m_Cache[AddPosition] = DefinePartyParameters(PartyID);
+
+    return m_Cache[AddPosition];
+  end;
+
+  private macro Get(PartyID)
+    var i = 0;
+
+    if (m_CacheEnabled)
+      while(i < m_Cache.Size)
+        if (m_Cache[i].Check(PartyID))
+          m_Cache[i].Inc();
+          return m_Cache[i];
+        end;
+        i = i+1;
+      end;
+    end;
+
+    return Add(PartyID);
+  end;
+
+  macro EnableCache()
+    m_CacheEnabled = true;
+    m_SimpleCache  = false;
+
+    m_Cache.Size = 0;
+  end;
+
+  macro EnableSimpleCache()
+    m_CacheEnabled = true;
+    m_SimpleCache  = true;
+
+    m_Cache.Size = 0;
+  end;
+
+  macro DisableCache()
+    m_CacheEnabled = false;
+    m_SimpleCache  = false;
+
+    m_Cache.Size = 0;
+  end;
+
+  macro DefinePaymentType(ReceiverPartyID, PayerPartyID)
+    var Receiver, Payer;
+
+    if ((ReceiverPartyID == -1) or (PayerPartyID == -1))
+      return PAYM_UNDEF;
+    end;
+
+    Receiver = Get(ReceiverPartyID);
+    Payer    = Get(PayerPartyID);
+
+    /* Платеж внутренний или МФР в нашей ТС */
+    if (Receiver.m_InOurTS and Payer.m_InOurTS)
+      if (Receiver.m_PartyID_SuperiorCABS == Payer.m_PartyID_SuperiorCABS)
+        return PAYM_INTERNAL;
+      else
+        return PAYM_MFR;
+      end;
+    end;
+
+    /* Платеж внешний или МФР не в нашей ТС */
+    if (Receiver.m_PartyID_SuperiorLendingAgency == Payer.m_PartyID_SuperiorLendingAgency)
+      return PAYM_MFR;
+    else
+      if (Receiver.m_CorAccBalance == "30101")
+        return PAYM_EXTERNAL_B;
+      elif (Receiver.m_CorAccBalance == "30103")
+        return PAYM_EXTERNAL_R;
+      else
+        return PAYM_UNDEF;
+      end;
+    end;
+  end;
+
+  macro PrintCache()
+    var i = 0;
+
+    [+---------------------+---------------------+---------------------+---------------------+---------------------+---------------------+];
+    [|       PartyID       |     SuperiorCABS    |SuperiorLendingAgency|    CorAccBalance    |        InOurTS      |       RefCount      |];
+    while(i < m_Cache.Size)
+    [|#####################|#####################|#####################|#####################|#####################|#####################|]
+      (m_Cache[i].m_PartyID, m_Cache[i].m_PartyID_SuperiorCABS, m_Cache[i].m_PartyID_SuperiorLendingAgency,
+       m_Cache[i].m_CorAccBalance, m_Cache[i].m_InOurTS, m_Cache[i].m_RefCount);
+      i = i+1;
+    end;
+    [+---------------------+---------------------+---------------------+---------------------+---------------------+---------------------+];
+    [ Значений в кеше: ########](m_Cache.Size);
+  end;
+
+  private macro Constructor()
+    m_Cache = TArray(m_CashSize);
+
+    EnableCache();
+  end;
+
+  Constructor();
+END;
+
+/* ------------------------------------------------------------------------- */
+/* GLOBALS */
+/* ......................................................................... */
+var PaymentTypeQualifier = TPaymentTypeQualifier();
+
+var Rub       = 1,
+    Cur       = 2,
+    Multy_Car = 3;
+
+/* Списки балансовых счетов для расчета:
+   C - счета кредита, D - счета дебета,
+   NB - клиенты - не банки, B - клиенты - банки */
+
+var BL_C1 = "30213,30219,30409,30220",
+    BL_C2 = "30109,30110-30115,30122-30123,30220",
+    BL_C3 = "30301,30303,30220",
+    BL_C4 = "30214,30218,30401,30407,40101,40102,40105-40108,40110,40112-40115,402,40301,40302,40306,40307,40309,40312,40314,404-408,423,426",
+
+    BL_D1 = "40101,40102,40105-40108,40110,40112-40115,402,40301,40302,40306,40307,40309,40312,40314,404-408,423,426,30601,30606",
+    BL_D1_NB = "30214,30218,30401,30403,30405", /* не банки */
+
+    BL_D2 = "30109,30112-30113,30122-30123",
+    BL_D2_B = "30601,30606,30214,30218,30401,30403,30405",
+
+    BL_D3 = "30302,30304",
+    BL_D4 = "102-105,107,313-316,31702,31703,31802,31803,32001-32009,32101-32109,32201-32210,32301-32310,40911,47411,47426,47601-47609,50101-50110,50112,50113,50115,50201-50203,50205-50211,50301-50303,50305-50311,50401-50403,50406,50601-50603,50605-50608,50610,50611,50613,50701-50703,50705-50708,50801-50803,50805-50808,50901-50903,50905,51201-51209,51301-51309,51401-51409,51501-51509,51601-51609,51701-51709,51801-51809,51901-51909,520-524,52501,60101-60104,60201-60205,60301-60306,60309-60314,60320,60322,60323,702",
+
+/* Список способов электронной отправки */
+    g_EL_SEND = "",
+
+/* Шифры документов по номерам условий, eq - д.б.равен, neq - д.б. не равен */
+    g_eqSD1 = ",01,",
+    g_eqSD2 = ",02,05,06,",
+    g_eqSD3 = ",07,",
+    g_eqSD4 = ",08,",
+    g_neqSD5 = ",01,02,03,04,05,06,07,08,",
+
+/* Массив для хранения данных по переменным */
+    fAttr = TArray,
+
+/* Префикс переменных формы */
+    F_PREFIX = "Ф51_1";
+
+/* ------------------------------------------------------------------------- */
+/* MACROS */
+/* ......................................................................... */
+
+/* Определить, является ли заданный балансовый счет p_balance счетом из
+   заданного как строка списка. Проверка производится с учетом возможного
+   наличия в списке балансовых счетов 1-го порядка */
+
+MACRO inList( p_bList, p_balance )
+ MACRO notDigit( p_char )
+  return ( ( p_char < "0" ) or
+           ( p_char > "9" ) );
+ END;
+
+ var p_check1 = TRUE; /* ?проверять балансовые 1 порядка */
+
+ p_balance = trim( p_balance );
+
+ var l_balance = substr( p_balance, 1,3 ),
+     l_str, l_p, l_pp, l_balance1, l_balance2;
+
+ if( index( p_bList, p_balance ) > 0 ) /* счет явно присутствует */
+  return TRUE;
+ end;
+
+ /* Проверка на явное наличие в списке счетов 1-го порядка */
+ if( p_check1 )
+  l_str = p_bList;
+  l_p   = index( l_str, l_balance );
+
+  while( l_p != 0 )
+   if( ( notDigit( substr( l_str, l_p - 1, 1 ) ) ) and /* за номером 1-го порядка стоит не цифра */
+       ( notDigit( substr( l_str, l_p + 3, 1 ) ) ) )
+    return TRUE;
+   end;
+
+   l_str = substr( l_str, l_p + 3 );
+   l_p = index( l_str, l_balance );
+  end;
+ end;
+
+ /* Проверим, может быть, счет входит в один из заданных интервалов */
+ p_balance = int( p_balance );
+ l_balance = int( l_balance );
+
+ l_p = strbrk( p_bList, "," );
+ if( l_p == 0 )
+  l_p = strlen( p_bList ) + 1;
+ end;
+
+ while( strlen( p_bList ) > 0 )
+  l_str = substr( p_bList, 1, l_p - 1 );
+  l_pp  = strbrk( l_str, "-" );
+
+  if( l_pp > 0 )
+   l_balance1 = int( substr( l_str, 1, l_pp - 1 ) );
+   l_balance2 = int( substr( l_str, l_pp + 1 ) );
+
+   if( ( ( p_balance >= l_balance1 ) and
+         ( p_balance <= l_balance2 ) ) or
+       ( ( p_check1 ) and
+         ( l_balance >= l_balance1 ) and
+         ( l_balance <= l_balance2 ) ) )
+    return TRUE;
+   end;
+  end;
+
+  p_bList = substr( p_bList, l_p + 1 );
+  l_p = strbrk( p_bList, "," );
+
+  if( l_p == 0 )
+   l_p = strlen( p_bList ) + 1;
+  end;
+ end;
+
+ return FALSE;
+END;
+/* ......................................................................... */
+
+/* Способ отправки документа является электронным */
+MACRO isELECTR_SEND( p_dispatch )
+ return ( index( g_EL_SEND, "," + string( p_dispatch ) + "," ) != 0 );
+END;
+/* ......................................................................... */
+
+/* Получить код региона банка */
+MACRO getBankRegion( p_partyID )
+ bnkd.PartyID = p_partyID;
+ if( not getEQ( bnkd ) )
+  return "";
+ end;
+ return trim( bnkd.Region );
+END;
+/* ......................................................................... */
+
+/* Конвертация суммы в рубли на заданную дату */
+MACRO convToR( p_sum, p_currency, p_date )
+ var l, p_sumR;
+ if( p_currency == 0 )
+  return p_sum;
+ end;
+ l = convSum( p_sumR, p_sum, p_date, p_currency );
+ if (l != 0)
+   p_sumR = $0;
+ end;
+
+ return p_sumR;
+END;
+
+/* ......................................................................... */
+MACRO code_ISO( p_currency )
+ finin.FIID = p_currency;
+ if( getEQ( finin ) )
+  return finin.ISO_Number;
+ else
+  return -1;
+ end;
+END;
+/* ......................................................................... */
+
+/* Получить данные из платежа для текущего документа: способ отправки и
+   ID банка-получателя */
+MACRO getPaymData( p_rouble,  p_dispatch, p_shifr, p_rPartyID, p_pPartyID)
+ var rs, CmdText;
+
+ if  ( p_rouble == Multy_Car )
+
+   setparm( 1, "Э");
+   setparm( 2, TRs.ShifrOper);
+   setparm( 3, -1);
+   setparm( 4, -1);
+   return;
+
+ end;
+
+ /* 30.03.2006 ABP По-хорошему, все это можно в основной запрос засунуть, но нет времени :( */
+ /* 04.10.2007 Malakhova 110424*/
+ /*Заменила rsb_rep_pt.get_ptсode на rsb_rep_pt.get_partyCode*/
+ CmdText = " SELECT rsb_rep_pt.get_partyCode("+PTCK_BIC+", pm.t_ReceiverBankID, pm.t_valueDate) ReceiverBankCode," +
+           "        rsb_rep_pt.get_partyCode("+PTCK_BIC+", pm.t_PayerBankID,    pm.t_valueDate) PayerBankCode,   " +
+           "        pm.t_ReceiverBankID                                                         ReceiverBankID,  " +
+           "        pm.t_PayerBankID                                                            PayerBankID,     " +
+           "        rm.t_PaymentKind                                                            Dispatch,        " +
+           "        rm.t_ShifrOper                                                              ShifrOper        " +
+           " FROM dpmpaym_dbt pm,                                                                                " +
+           "      dpmrmprop_dbt rm,                                                                              " +
+           "      dpmdocs_dbt pmd                                                                                " +
+           " WHERE pmd.t_ApplicationKey = "+GetSQLString(TRs.ApplicationKey)+"                                   " +
+           " AND   pmd.t_ApplicationKind = "+TRs.iApplicationKind+"                                              " +
+           " AND   pmd.t_LinkKindID = 1                                                                          " +
+           " AND   pm.t_PaymentID = pmd.t_PaymentID                                                              " +
+           " AND   rm.t_PaymentID(+) = pm.t_PaymentID                                                            " ;
+
+ rs = TRsbDataSet(CmdText);
+
+ if (rs.Next())
+   p_dispatch       = trim(rs.Dispatch);
+   p_shifr          = "," + trim(rs.ShifrOper) + ",";
+   p_rPartyID       = rs.ReceiverBankID;
+   p_pPartyID       = rs.PayerBankID;
+   ReceiverBankCode = rs.ReceiverBankCode;
+   PayerBankCode    = rs.PayerBankCode;
+ else /* нет платежа */
+   p_dispatch       = "Э";
+   p_shifr          = "," + trim(TRs.Shifr_Oper) + ",";
+   p_rPartyID       = -1;
+   p_pPartyID       = -1;
+   ReceiverBankCode = "";
+   PayerBankCode    = "";
+ end;
+
+ setparm( 1, p_dispatch );
+ setparm( 2, p_shifr    );
+ setparm( 3, p_rPartyID );
+ setparm( 4, p_pPartyID );
+END;
+/* ......................................................................... */
+
+/* Определить номер переменной в массиве fAttr по заданным условиям расчета */
+var N_x = 8, /* число переменных-структур в одной строке */
+    N_y = 7;  /* число строк в одной смысловой секции */
+
+MACRO varIndexByName( p_vlineN, /* номер строки, 11, 12 */
+                      p_vcolN,  /* номер колонки, 1/2/3/4 */
+                      p_rouble  /* ?Рубли */ )
+
+ var S_y, C_y, y, x;
+
+ S_y = substr( p_vlineN, 2 );
+
+ C_y = int( S_y ) -1;
+
+ y = C_y + N_y * ( int( substr( p_vlineN, 1, 1 ) ) - 1 );
+
+ x = 2 * ( int( p_vcolN ) - 1 );
+ if( p_rouble != Rub )
+  x = x + 1;
+ end;
+
+ return ( x + N_x * y );
+END;
+/* ......................................................................... */
+
+MACRO SumFromDoc( iApplicationKind, ApplicationKey )
+
+  var Query = " SELECT NVL(SUM(adocR.t_Sum), 0) DocSum " +
+              " FROM   darhdoc_dbt  adocR,             " +
+              "        daccblnc_dbt acbR_r,            " +
+              "        daccblnc_dbt acbR_p             " +
+              " WHERE      adocR.t_ConnAppKind =       " + iApplicationKind +
+              "        AND adocR.t_ConnAppKey  =       " + ApplicationKey   +
+              "        AND acbR_r.t_Account = adocR.t_Account_Receiver " +
+              "        AND acbR_r.t_Chapter = adocR.t_Chapter          " +
+              "        AND acbR_p.t_Account = adocR.t_Account_Payer    " +
+              "        AND acbR_p.t_Chapter = adocR.t_Chapter          " +
+              "        AND " + ConvertMaskToSqlFormat("!(61306,61406)", "acbR_r.t_Balance" + ЛогическийПланСчетов) +
+              "        AND " + ConvertMaskToSqlFormat("!(61306,61406)", "acbR_p.t_Balance" + ЛогическийПланСчетов);
+
+  var dataSet = TRsbDataSet( Query );
+  dataSet.SetFieldType("DocSum", V_MONEY);
+  dataSet.moveNext();
+
+  return dataSet.value(0);
+END;
+
+/* Рассчитать переменные по текущему документу */
+MACRO WriteDownTheVars( p_rouble )
+ var l_vline   = "", /* строка переменной */
+     l_vcolumn = ""; /* колонка переменной */
+
+  var l_haveBIC, l_dispatch, l_shifr, l_rbankid, l_pbankid, /* иформация о документе из DOC_INF */
+      l_sublines, l_i, l_n, l_col, skip_6, PaymType,
+      Sum_v;
+
+  var CBalance = TRs.bal_Receiver,    /* балансовый счета кредита */
+      DBalance = TRs.bal_Payer,       /* балансовый счета дебета  */
+      CClient  = TRs.cli_Receiver,    /* клиент для счета кредита */
+      DClient  = TRs.cli_Payer,       /* клиент для счета дебета  */
+      DateCar;
+
+  macro check_trans( line, subline, col, p_rouble )
+
+    if( ( line       == "4" ) and
+        ( subline    == "5" ) and
+        ( col        == "1" ) and
+        ( p_rouble   != Rub ) and
+        ( CClient    == Dclient ) )
+
+      if(( index( TRs.tac_Receiver, "X") == 0 ) or ( index( TRs.tac_Payer, "X") == 0 ))
+          return false;
+      end;
+    end;
+
+    return true;
+  end;
+
+  if( p_rouble == Multy_Car )
+    DateCar  = SQL_ConvTypeDate( TRs.Date );
+  else
+    DateCar  = SQL_ConvTypeDate( TRs.Date_Carry );
+  end;
+
+  getPaymData( p_rouble, l_dispatch, l_shifr, l_rBankID, l_pBankID );
+  PaymType = PaymentTypeQualifier.DefinePaymentType(l_rBankID, l_pBankID);
+
+  /* Определить условие на кредитовый счет и тип платежа */
+  if  ( inList( BL_C1, CBalance ) and ((PaymType == PaymentTypeQualifier.PAYM_EXTERNAL_R) or (PaymType == PaymentTypeQualifier.PAYM_UNDEF)) ) l_vline = "1";
+  elif( inList( BL_C2, CBalance ) and ((PaymType == PaymentTypeQualifier.PAYM_EXTERNAL_B) or (PaymType == PaymentTypeQualifier.PAYM_UNDEF)) ) l_vline = "2";
+  elif( inList( BL_C3, CBalance ) and ((PaymType == PaymentTypeQualifier.PAYM_MFR)        or (PaymType == PaymentTypeQualifier.PAYM_UNDEF)) ) l_vline = "3";
+  elif( inList( BL_C4, CBalance ) and ((PaymType == PaymentTypeQualifier.PAYM_INTERNAL)   or (PaymType == PaymentTypeQualifier.PAYM_UNDEF)) ) l_vline = "4";
+  /* счет кредита не удовлетворяет ни одному из условий */
+  else return;
+  end;
+
+  /* Определить условие на дебетовый счет */
+  l_haveBIC = ВидСубъекта( DClient, PTK_BANK ); /* ?Клиент является банком */
+
+  if  ( ( inList( BL_D1, Dbalance )        ) or
+        ( ( not l_haveBIC                  ) and
+          ( inList( BL_D1_NB, Dbalance ) ) ) )
+   l_vcolumn = "1";
+
+  elif( ( inList( BL_D2, Dbalance )        ) or
+        ( ( l_haveBIC                      ) and
+          ( inList( BL_D2_B, Dbalance )  ) ) )
+   l_vcolumn = "2";
+
+  elif( inList( BL_D3, Dbalance ) )
+   l_vcolumn = "3";
+
+  elif( inList( BL_D4, Dbalance ) )
+   l_vcolumn = "4";
+
+  else
+   return;
+  end;
+
+  /* Определить набор подстрок переменной */
+  l_sublines = TArray;
+
+  if  ( index( g_eqSD1, l_shifr ) != 0 )
+   l_sublines( l_sublines.size ) = "1";
+
+   if( ( p_rouble != Rub                ) or /* все валютные считаем электронной отправкой */
+       ( isELECTR_SEND( l_dispatch )    ) or /* электронная отправка */
+
+       ( ( l_vline == "4"               ) and  /* спец.настройка для 146 */
+         ( Дублировать141_В_146       ) ) )
+
+    if( l_vline == "4" )
+     l_sublines( l_sublines.size ) = "6";
+    else
+     l_sublines( l_sublines.size ) = "7";
+    end;
+   end;
+
+  elif( index( g_eqSD2, l_shifr ) != 0 )
+   l_sublines( l_sublines.size ) = "2";
+
+  elif( index( g_eqSD3, l_shifr ) != 0 )
+   l_sublines( l_sublines.size ) = "3";
+
+  elif( index( g_eqSD4, l_shifr ) != 0 )
+   l_sublines( l_sublines.size ) = "4";
+
+  elif( ( p_rouble == Multy_Car ) or ( index( g_neqSD5, l_shifr ) == 0 ) )
+   l_sublines( l_sublines.size ) = "5";
+  end;
+
+  if( p_rouble == Multy_Car )
+    if( l_vline == "4" )
+     l_sublines( l_sublines.size ) = "6";
+    else
+     l_sublines( l_sublines.size ) = "7";
+    end;
+  end;
+
+  if( l_vline != "4" )
+   if( getBankRegion( l_rBankID ) != getBankRegion( l_pBankID ) )
+    l_sublines( l_sublines.size ) = "6";
+   end;
+  end;
+
+  /* Рассчитать переменные */
+  l_i    = 0;
+  l_n    = l_sublines.size;
+  skip_6 = false;
+
+  while( l_i < l_n )
+
+    if( not check_trans( l_vline, l_sublines(l_i), l_vcolumn, p_rouble ) or                 /* условие, специальное для 145 строки */
+        (l_vline == 4) and (l_sublines(l_i) == 6) and (l_vcolumn == 1) and (skip_6 == true) /* если не вошло в 145 строку, то и в 146 не должно отражаться*/
+      )
+
+      skip_6 = true;
+
+    else
+
+      if( p_rouble == Multy_Car )
+         Sum_v = SumFromDoc( TRs.iApplicationKind, TRs.ApplicationKey );
+      else
+         Sum_v = convToR( TRs.Sum, TRs.Code_Currency, DateCar );
+      end;
+
+      fAttr( varIndexByName( l_vline + l_sublines(l_i),
+                             l_vcolumn,
+                             p_rouble ) ).inc( Sum_v );
+      l_col = int( l_vcolumn ) * 4;
+
+      if( p_rouble != Rub )/* Р/В */
+        l_col = l_col + 6;
+      else
+        l_col = l_col + 5;
+      end;
+
+      l_col = string( l_col );
+
+      if( strlen( l_col ) == 1 )
+        l_col = "0" + l_col;
+      end;
+
+      if( ПечатьПротокола )
+        work.Num_Str       = "1" + l_vline + l_sublines(l_i) + "/" + l_col;
+        work.Numb_Document = TRs.Numb_Document;
+        work.Dispatch      = l_dispatch;
+
+        if( p_rouble != Multy_Car )
+          work.Date_Carry    = TRs.Date_Carry;
+          work.Real_Payer    = TRS.Account_Payer;
+          work.Real_Receiver = TRs.Account_Receiver;
+          work.Code_Currency = Code_ISO(TRs.Code_Currency);
+          work.Shift_Oper    = TRs.Shifr_Oper;
+
+          if( TRs.Code_Currency == 0 )
+            work.Sum_Rub      = TRs.Sum;
+            work.Sum_Cur      = $0;
+          else
+            work.Sum_Rub      = Sum_v;
+            work.Sum_Cur      = TRs.Sum;
+          end;
+
+        else
+          work.Date_Carry    = TRs.Date;
+          work.Real_Payer    = TRs.Account_From;
+          work.Real_Receiver = TRs.Account_To;
+
+          if( TRs.FIID_To == 0 )
+            work.Code_Currency = Code_ISO( TRs.FIID_From );
+            work.Sum_Cur       = TRs.Amount_From;
+          elif( TRs.FIID_From == 0 )
+            work.Code_Currency = Code_ISO( TRs.FIID_To );
+            work.Sum_Cur       = TRs.Amount_To;
+          else
+            work.Code_Currency = Code_ISO( TRs.FIID_From );
+            work.Sum_Cur       = TRs.Amount_From;
+          end;
+
+          work.Shift_Oper    = TRs.ShifrOper;
+          work.Sum_Rub       = Sum_v;
+        end;
+
+        if( ( l_vline != 4 ) and ( l_sublines(l_i) == 6 ) )/* Межрегиональные */
+          work.BIC_Payer    = PayerBankCode;
+          work.BIC_Receiver = ReceiverBankCode;
+        else
+          work.BIC_Payer    = "";
+          work.BIC_Receiver = "";
+        end;
+
+        if( not insert( work ) )
+         println( "Ошибка записи в файл ", filename( work ) );
+        end;
+      end;
+
+    end;
+    l_i = l_i+1;
+  end;
+END;
+/* ......................................................................... */
+
+/* Обработать файл документов */
+MACRO processFile( p_rouble )
+  var Query, Str, i;
+
+  if( p_rouble == Rub ) Str  = "рублевых";
+  else                  Str  = "валютных";
+  end;
+
+  Query =           " SELECT acbdeb.t_Balance" + ЛогическийПланСчетов +  " bal_Payer,    " +
+                    "        accdeb.t_Client                               cli_Payer,    " +
+                    "        accdeb.t_Type_Account                         tac_Payer,    " +
+                    "        acbcrd.t_Balance" + ЛогическийПланСчетов +  " bal_Receiver, " +
+                    "        acccrd.t_Client                               cli_Receiver, " +
+                    "        acccrd.t_Type_Account                         tac_Receiver, " +
+                    "        arhdoc.*                                                    " ;
+
+  if  ( p_rouble == Rub )
+    Query = Query + " FROM   darhdoc_dbt  arhdoc, " +
+                    "        daccount_dbt accdeb, " +
+                    "        daccount_dbt acccrd, " +
+                    "        daccblnc_dbt acbdeb, " +
+                    "        daccblnc_dbt acbcrd  " ;
+  elif( p_rouble == Cur )
+    Query = Query + " FROM  darhdoc$_dbt  arhdoc, " +
+                    "       daccount$_dbt accdeb, " +
+                    "       daccount$_dbt acccrd, " +
+                    "       daccblnc$_dbt acbdeb, " +
+                    "       daccblnc$_dbt acbcrd  " ;
+  end;
+
+  Query = Query +   " WHERE      arhdoc.t_Chapter = 1                            " +
+                    "        AND arhdoc.t_Date_Carry   >=                        " + GetSQLDate( ПредДатаОтчета ) +
+                    "        AND arhdoc.t_Date_Carry   <=                        " + GetSQLDate(     ДатаОтчета ) +
+                    "        AND arhdoc.t_Result_Carry <> 18                     " +
+                    "        AND " + documentFilter.GetAsSqlString("arhdoc");
+
+                    /* условия для счета плательщика */
+  if( p_rouble == Cur )
+    Query = Query + "        AND accdeb.t_Code_Currency = arhdoc.t_Code_Currency " ;
+  end;
+  Query = Query +   "        AND accdeb.t_Chapter = arhdoc.t_Chapter             " +
+                    "        AND accdeb.t_Account = arhdoc.t_Account_Payer       " +
+
+                    "        AND acbdeb.t_Chapter = accdeb.t_Chapter             " +
+                    "        AND acbdeb.t_Account = accdeb.t_Account             " ;
+
+                    /* условия для счета получателя */
+  if( p_rouble == Cur )
+    Query = Query + "        AND acccrd.t_Code_Currency = arhdoc.t_Code_Currency " ;
+  end;
+  Query = Query +   "        AND acccrd.t_Chapter = arhdoc.t_Chapter             " +
+                    "        AND acccrd.t_Account = arhdoc.t_Account_Receiver    " +
+
+                    "        AND acbcrd.t_Chapter = acccrd.t_Chapter             " +
+                    "        AND acbcrd.t_Account = acccrd.t_Account             " ;
+
+  if( p_rouble == Rub )
+    /* для рублевых документов: отсекаем документы, проведенные по счетам покрытий */
+    Query = Query + "        AND instr ( accdeb.t_Type_Account, 'П' ) = 0        " +
+                    "        AND instr ( accdeb.t_Type_Account, 'Н' ) = 0        " +
+                    "        AND instr ( accdeb.t_Type_Account, 'М' ) = 0        " +
+                    "        AND instr ( acccrd.t_Type_Account, 'П' ) = 0        " +
+                    "        AND instr ( acccrd.t_Type_Account, 'Н' ) = 0        " +
+                    "        AND instr ( acccrd.t_Type_Account, 'М' ) = 0        " ;
+  end;
+
+  Query = Query +   " ORDER BY arhdoc.t_Date_Carry                               " ;
+
+  BegAction(1000, "Получение "+Str+" документов", false);
+  TRs = TRsbDataSet( Query /*, RSDVAL_CLIENT, RSDVAL_STATIC */);
+  EndAction();
+
+  i = 0;
+  InitProgress(-1, NULL, "Обработка "+Str+" документов");
+  while( TRs.MoveNext() )
+    message( "Обработка ", Str, " документов за дату ", SQL_ConvTypeDate( TRs.Date_Carry ));
+    WriteDownTheVars( p_rouble );
+    i = i+1;
+    UseProgress(i);
+  end;
+  RemProgress();
+END;
+
+MACRO processMult( )
+  var Query, i,
+      CommonStart     = " SELECT multydoc.*,                                               " +
+                        "        acbdeb.t_Balance" + ЛогическийПланСчетов + " bal_Payer,   " +
+                        "        acbcrd.t_Balance" + ЛогическийПланСчетов + " bal_Receiver," +
+                        "        accdeb.t_Client                              cli_Payer,   " +
+                        "        acccrd.t_Client                              cli_Receiver," +
+                        "        accdeb.t_Type_Account                        tac_Payer,   " +
+                        "        acccrd.t_Type_Account                        tac_Receiver " ,
+
+      CommonCondition = " WHERE      multydoc.t_Date >=  " + GetSQLDate( ПредДатаОтчета ) +
+                        "        AND multydoc.t_Date <=  " + GetSQLDate(     ДатаОтчета ) +
+                        "        AND accdeb.t_Code_Currency = multydoc.t_FIID_From      " +
+                        "        AND accdeb.t_Chapter = multydoc.t_Chapter              " +
+                        "        AND accdeb.t_Account = multydoc.t_Account_From         " +
+                        "        AND acccrd.t_Code_Currency = multydoc.t_FIID_To        " +
+                        "        AND acccrd.t_Chapter = multydoc.t_Chapter              " +
+                        "        AND acccrd.t_Account = multydoc.t_Account_To           " +
+                        "        AND acbdeb.t_Chapter = multydoc.t_Chapter              " +
+                        "        AND acbdeb.t_Account = multydoc.t_Account_From         " +
+                        "        AND acbcrd.t_Chapter = multydoc.t_Chapter              " +
+                        "        AND acbcrd.t_Account = multydoc.t_Account_To           " ;
+
+  Query = " SELECT * FROM     ( "        + CommonStart +
+          " FROM   dmultycar_dbt multydoc," +
+          "        daccount$_dbt  acccrd, " +
+          "        daccount$_dbt  accdeb, " +
+          "        daccblnc$_dbt  acbcrd, " +
+          "        daccblnc$_dbt  acbdeb  " +
+          CommonCondition + "    UNION " + CommonStart +
+          " FROM   dmultycar_dbt multydoc," +
+          "        daccount$_dbt  acccrd, " +
+          "        daccount_dbt   accdeb, " +
+          "        daccblnc$_dbt  acbcrd, " +
+          "        daccblnc_dbt   acbdeb  " +
+          CommonCondition + "    UNION " + CommonStart +
+          " FROM   dmultycar_dbt multydoc," +
+          "        daccount_dbt   acccrd, " +
+          "        daccount$_dbt  accdeb, " +
+          "        daccblnc_dbt   acbcrd, " +
+          "        daccblnc$_dbt  acbdeb  " +
+          CommonCondition + " ) ";
+
+  Query = Query +   "        ORDER BY t_Date                        " ;
+
+  BegAction(1000, "Получение мультивалютных документов", false);
+  TRs = TRsbDataSet( Query /*, RSDVAL_CLIENT, RSDVAL_STATIC */);
+  EndAction();
+
+  i = 0;
+  InitProgress(-1, NULL, "Обработка мультивалютных документов");
+  while( TRs.MoveNext() )
+    message( "Обработка мультивалютных документов за дату ", SQL_ConvTypeDate( TRs.Date ));
+    WriteDownTheVars( Multy_Car );
+    i = i+1;
+    UseProgress(i);
+  end;
+  RemProgress();
+END;
+/* ......................................................................... */
+/* ......................................................................... */
+/*                              ENTRY POINT                                  */
+/* ......................................................................... */
+
+var МультивалютныеДокументыСчета702,
+    МультивалютныеДокументыВРубли,
+    l_month, l_year, l_quarter,
+    l_filename,
+    l_lines,
+    l_str,
+    l_s,
+    l_k, l_j, l_i, l_n,
+    counter, counter_rub, counter_cur,
+    sum_rub, sum_cur,
+    sumr_str, sumc_str,
+    sumrt_str, sumct_str,
+    cntr_str, cntc_str,
+    str,
+    count,
+    valt_r, valt_c, valt;
+
+getRegistryValue( "REPTREG\\REP_GROUPS\\ФОРМА 251\\ПЕЧАТЬ ПРОТОКОЛА",
+                  V_BOOL, ПечатьПротокола, NULL );
+getRegistryValue( "REPTREG\\REP_GROUPS\\ФОРМА 251\\СПОСОБЫ ЭЛЕКТРОННОЙ ОТПРАВКИ",
+                  V_STRING, СпособыЭлектроннойОтправки, NULL );
+
+g_EL_SEND = "," + СпособыЭлектроннойОтправки + ",";
+
+getRegistryValue( "REPTREG\\REP_GROUPS\\ФОРМА 251\\ДУБЛИРОВАТЬ 141 В 146",
+                  V_BOOL, Дублировать141_В_146, NULL );
+
+getRegistryValue( "REPTREG\\REP_GROUPS\\ФОРМА 251\\МУЛЬТИВАЛЮТНЫЕ 702",
+                  V_BOOL, МультивалютныеДокументыСчета702, NULL );
+getRegistryValue( "REPTREG\\REP_GROUPS\\ФОРМА 251\\МУЛЬТИВАЛЮТНЫЕ В РУБЛИ",
+                  V_BOOL, МультивалютныеДокументыВРубли, NULL );
+
+/* По необходимости подготовить файл для вывода протокола */
+if( ПечатьПротокола )
+ datesplit( ДатаОтчета, NULL, l_month, l_year );
+ l_quarter = string( ( l_month - 1 ) / 3 + 1 );
+ l_filename = ДиректорияПротоколаРаботы +
+              mkstr( "0", 2 - strlen( l_quarter ) ) + l_quarter +
+              substr( string( l_year ), 3, 2 ) + "251.txt";
+
+ setoutput( l_filename );
+
+[Форма 251. Структура платежей кредитной организации (филиала)
+ ПРОТОКОЛ РАСЧЕТА
+
+   Период отчета с ########## по ##########
+   Исполнитель: #
+   Дата и время выпуска отчета ##########  ########
+
+]( ПредДатаОтчета, ДатаОтчета, Исполнитель, date, time);
+[┌─────┬───────┬──────────┬───────────────────────┬───────────────────────┬───┬──────────────────┬──────────────────┬──────┬──────────┬──────────┬──────────┐];
+[│  №  │   №   │ Дата     │      Счет             │       Счет            │Код│    Сумма         │     Сумма        │ Шифр │   Вид    │   БИК    │   БИК    │];
+[│ п/п │ докум │документа │    по дебету          │    по кредиту         │вал│   в рублях       │    в валюте      │операц│ отправки │плательщик│получателя│];
+[└─────┴───────┴──────────┴───────────────────────┴───────────────────────┴───┴──────────────────┴──────────────────┴──────┴──────────┴──────────┴──────────┘];
+
+ SQL_Truncate(work);
+ clearRecord( work ) ;
+
+end;
+
+/* Инициализация массива с данными по переменным */
+l_lines = TArray; /* обозначения строк без ведущей 1 */
+l_lines(0) = "1";
+l_lines(1) = "2";
+l_lines(2) = "3";
+l_lines(3) = "4";
+l_lines(4) = "5";
+l_lines(5) = "6";
+l_lines(6) = "7";
+
+l_k = 1; /* секции по вертикали */
+while( l_k <= 4 )
+ l_j = 0; /* номер в l_lines */
+
+ while( l_j <= 6 )
+  l_i = 1;
+  while( l_i <= 4 ) /* колонки по горизонтали */
+   fAttr(fAttr.size) = CvarRec( string( l_k ) + l_lines(l_j),
+                                string( l_i ),
+                                TRUE  ); /* рубли */
+
+   fAttr(fAttr.size) = CvarRec( string( l_k ) + l_lines(l_j),
+                                string( l_i ),
+                                FALSE ); /* валюта */
+
+   l_i = l_i+1;
+  end;
+
+  l_j = l_j+1;
+ end;
+
+ l_k = l_k+1;
+end;
+
+/* Обработать файлы документов */
+processFile( Rub  );
+processFile( Cur );
+processMult( );
+
+if( ПечатьПротокола )
+ counter = 0;
+ counter_rub = 0;
+ counter_cur = 0;
+ sum_rub = $0;
+ sum_cur = $0;
+ SumR_str = $0; SumC_str = $0;
+ SumRT_str = 0; SumCT_str = 0;
+  CntR_str = 0;  CntC_str = 0;
+ rewind( work );
+ str = "";
+ while( next( work ) )
+   if( str != work.Num_Str )
+    if( str != "" )
+ [Итого по строке ######                                                        #################  #################]
+(str, SumR_str, SumC_str);
+     SumRT_str = ОкруглитьВТысячи( SumR_str );
+     if( ( SumRT_str == 0 ) and ( CntR_str >= 1 ) )
+      SumRT_str = 1;
+     end;
+     SumCT_str = ОкруглитьВТысячи( SumCT_str );
+     if( ( SumCT_str == 0 ) and ( CntC_str >= 1 ) )
+      SumCT_str = 1;
+     end;
+ [Количество документов руб: ###### вал:  ######      округленные значения             ##########         ##########]
+(CntR_str, CntC_str, SumRT_str:0:0, SumCT_str:0:0);
+     SumR_str = $0; SumC_str = $0;
+     SumRT_str = 0; SumCT_str = 0;
+      CntR_str = 0;  CntC_str = 0;
+ [────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────];
+    end;
+    str = work.Num_Str;
+
+ [Строка ###########]( work.Num_Str );
+   end;
+
+   if( ( substr( str, 3, 1 ) != "6" ) and
+       ( substr( str, 3, 1 ) != "7" ) )
+    counter = counter + 1;
+    count = counter;
+    if( work.Code_Currency == {ISONatCur} )
+     counter_rub = counter_rub + 1;
+     sum_rub     = sum_rub + work.Sum_Rub;
+    else
+     counter_cur = counter_cur + 1;
+     sum_cur     = sum_cur + work.Sum_Cur;
+    end;
+   else
+    count = "";
+   end;
+   if( work.Code_Currency == {ISONatCur} )
+    SumR_str    =  SumR_str  + work.Sum_Rub;
+    CntR_str    =  CntR_str + 1;
+   else
+    SumC_str    =  SumC_str  + work.Sum_Cur;
+    CntC_str    =  CntC_str + 1;
+   end;
+[ ####  ####### ########## ####################### ####################### ### #################  #################    ##   ##########  #########  #########]
+ ( count, work.Numb_Document, work.Date_Carry, work.Real_Payer:f, work.Real_Receiver:f, work.Code_Currency:o, work.Sum_Rub:a, work.Sum_Cur:a, work.Shift_Oper, work.Dispatch, work.BIC_Payer, work.BIC_Receiver );
+
+ end;
+
+    if( str != "" )
+ [Итого по строке ######                                                        #################  #################]
+(str, SumR_str, SumC_str);
+     SumRT_str = ОкруглитьВТысячи( SumR_str );
+     if( ( SumRT_str == 0 ) and ( CntR_str >= 1 ) )
+      SumRT_str = 1;
+     end;
+     SumCT_str = ОкруглитьВТысячи( SumCT_str );
+     if( ( SumCT_str == 0 ) and ( CntC_str >= 1 ) )
+      SumCT_str = 1;
+     end;
+ [Количество документов руб: ###### вал:  ######      округленные значения             ##########         ##########]
+(CntR_str, CntC_str, SumRT_str:0:0, SumCT_str:0:0);
+ [────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────];
+    end;
+ valT_r = ОкруглитьВТысячи( sum_rub );
+ if( ( valT_r == 0 ) and ( counter_rub >= 1 ) )
+  valT_r = 1;
+ end;
+ valT_c = ОкруглитьВТысячи( sum_cur );
+ if( ( valT_c == 0 ) and ( counter_cur >= 1 ) )
+  valT_c = 1;
+ end;
+ [Итого                                                                         #################  #################]
+ (sum_rub, sum_cur);
+ [Количество документов руб: ###### вал:  ######      округленные значения             ##########         ##########]
+ (counter_rub, counter_cur, valT_r:0:0, valT_c:0:0);
+ [────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────];
+
+    open( tout, setoutput( ДиректорияПротоколаРаботы + "tmp.txt" ) );
+    RepTxtFilesQueue().add(ДиректорияПротоколаРаботы + "tmp.txt");
+    viewFile( tout );
+    close( tout );
+end;
+
+/* Округлить в тысячи и сохранить */
+l_i = 0;
+l_n = fAttr.size;
+
+while( l_i < l_n )
+ valT = ОкруглитьВТысячи( fAttr(l_i).v_sum );
+ if( ( valT == 0 ) and ( fAttr(l_i).v_count >= 1 ) )
+  valT = 1;
+ end;
+
+ if( fAttr(l_i).v_rouble == Rub )
+  l_str = "_Ру";
+ else
+  l_str = "_Ва";
+ end;
+
+ l_s = "___";
+ l_s = substr( fAttr(l_i).v_line, 1, 2 ) + l_s;
+
+ СохранитьПеременную2( fAttr(l_i).v_count, fAttr(l_i).v_count, ДатаОтчета, ПредДатаОтчета,
+                      {Название Отчета},
+                      F_PREFIX + l_s + fAttr(l_i).v_column + "_К" + l_str );
+
+ СохранитьПеременную2( fAttr(l_i).v_sum, valT, ДатаОтчета, ПредДатаОтчета,
+                      {Название Отчета},
+                      F_PREFIX + l_s + fAttr(l_i).v_column + "_С" + l_str );
+
+ l_i = l_i+1;
+end;
+
+УстановитьФлагВозврата( OK_MACRO_FLAG ); /* Успешное завершение макроса */
+
+ exit(1);
+
+/* EoF */

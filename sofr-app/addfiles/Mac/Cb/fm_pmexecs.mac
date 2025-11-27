@@ -1,0 +1,146 @@
+/* Получение списка исполненных платежей для фин. мониторинга */
+
+import oralib, likepy;
+
+private const ExecutedPaymentsQueryTempl:string = 
+ "insert into dfmpaym_tmp (t_PaymentID, t_PmAddPIID, t_Department, t_ValueDate)"
+" select payms.t_PaymentID,"
+       " payms.t_PmAddPIID,"
+       " payms.t_Department,"
+       " min( payms.t_Date )"
+" from ( select /*+LEADING(c) index(c)*/"
+               " lnk.t_PaymentID as t_PaymentID,"
+               " c.t_Date_Carry  as t_Date,"
+               " c.t_Department  as t_Department,"
+               " decode( pm.t_DocKind, 74, lnk.t_PmAddPIID, 0 ) as t_PmAddPIID,"
+               " pm.t_PayerAccount    as t_PaymPayerAccount,"
+               " pm.t_ReceiverAccount as t_PaymReceiverAccount"
+        " from dacctrn_dbt c,"
+             " dpmdocs_dbt lnk,"
+             " dpmpaym_dbt pm,"
+             " dpmprop_dbt outp"
+        " where c.t_Chapter = 1"
+          " and c.t_State = 1"
+          "$(DatesCond)"
+          "$(DepartmentsCond)"
+          " and lnk.t_AccTrnID = c.t_AccTrnID"
+          " and lnk.t_Reason = 1"
+          " and pm.t_PaymentID = lnk.t_PaymentID"
+          " and outp.t_PaymentID = lnk.t_PaymentID"
+          " and outp.t_IsSender = CHR(0)"
+          "$(DirectionsCond)"
+     " ) payms,"
+     " dpmaddpi_dbt pi"
+" where pi.t_PmAddPIID(+) = payms.t_PmAddPIID"
+  "$(AccountMasksCond)"
+" group by payms.t_PaymentID, payms.t_Department, payms.t_PmAddPIID";
+
+
+/* -----------------------------------------------------------------------------
+   Заполнить dfmpaym_tmp списком платежей, исполненных в некотором множестве филиалов на период.
+   Возвращает true, если успешно отработала
+   ----------------------------------------------------------------------------- */
+MACRO FillExecutedPaymentsList( Departments:TArray,   /* Список кодов филиалов */
+                                DateFrom:date,        /* Начало периода */
+                                DateTo:date,          /* Конец периода */
+                                PayerMask:string,     /* Маска счёта плательщика */
+                                ReceiverMask:string,  /* Маска счёта получателя */
+                                IncludeInternal:bool, /* Включая внутренние */
+                                IncludeIncoming:bool, /* Включая входящие */
+                                IncludeOutgoing:bool, /* Включая исходящие */
+                                IncludeTransit:bool   /* Включая транзитные */
+                              ):bool
+
+  /* Создать часть условия where по датам */
+  macro makeDatesCondition( DateFrom:date, DateTo:date, params:TArray ):string
+    if( DateFrom == DateTo )
+      params[params.size] = SQLParam( "DateCarry", DateFrom );
+      return " and c.t_Date_Carry = :DateCarry";
+    else
+      params[params.size] = SQLParam( "DateFrom", DateFrom );
+      params[params.size] = SQLParam( "DateTo",   DateTo   );
+      return " and c.t_Date_Carry between :DateFrom and :DateTo";
+    end;
+  end;
+
+  /* Создать часть условия where по филиалам */
+  macro makeDepartmentsCondition( Departments:TArray, params:TArray ):string
+    if( Departments.size > 1 )
+      return " and c.t_Department in (" + join( Departments, "," ) + ")";
+    elif( Departments.size == 1 )
+      params[params.size] = SQLParam( "Department", Departments[0] );
+      return " and c.t_Department = :Department";
+    else
+      return " and 1=2";
+    end;
+  end;
+
+  /* Создать часть условия where по допустимым направлениям платежей */
+  macro makeDirectionCondition( IncludeInternal:bool, IncludeIncoming:bool, IncludeOutgoing:bool, IncludeTransit:bool ):string
+
+    if( not (IncludeInternal or IncludeIncoming or IncludeOutgoing or IncludeTransit ) )
+      return " and 1=2";
+    end;
+
+    var result:string = "";
+    /* Исключить внутренние */
+    if( not IncludeInternal ) 
+      result = result + " and ( pm.t_StartDepartment <> pm.t_EndDepartment or pm.t_DocKind in (320, 322) or outp.t_Group = 1 )";
+    end;
+  
+    /* Исключить входящие */
+    if( not IncludeIncoming ) 
+      result = result + " and ( c.t_Department <> pm.t_EndDepartment or outp.t_Group = 1 or ( pm.t_StartDepartment = pm.t_EndDepartment and pm.t_DocKind not in (320, 322) ) )";
+    end;
+
+    /* Исключить исходящие */
+    if( not IncludeOutgoing ) 
+      result = result + " and ( c.t_Department <> pm.t_StartDepartment or pm.t_DocKind in (320, 322) or ( pm.t_StartDepartment = pm.t_EndDepartment and outp.t_Group = 2 ) )";
+    end;
+
+    /* Исключить транзитные */
+    if( not IncludeTransit ) 
+      result = result + " and ( ( c.t_Department = pm.t_StartDepartment and pm.t_DocKind not in (320, 322) ) or ( c.t_Department = pm.t_EndDepartment and outp.t_Group = 2 ) )";
+    end;
+
+    return result;
+
+  end;
+
+  /* Создать часть условия where по маскам счетов */
+  macro makeMaskCondition( PayerMask:string, ReceiverMask:string, params:TArray ):string
+
+    var result:string = "";
+
+    if( PayerMask and ( PayerMask != "*" ) )
+      params[params.size] = SQLParam( "PayerMask", PayerMask );
+      result = result + " and rsb_mask.CompareStringWithMask( :PayerMask, decode( nvl( pi.t_PmAddPIID, 0 ), 0, payms.t_PaymPayerAccount, decode( pi.t_DebetCredit, 0, pi.t_Account, payms.t_PaymPayerAccount ) ) ) = 1";
+    end;
+
+    if( ReceiverMask and ( ReceiverMask != "*" ) )
+      params[params.size] = SQLParam( "ReceiverMask", ReceiverMask );
+      result = result + " and rsb_mask.CompareStringWithMask( :ReceiverMask, decode( nvl( pi.t_PmAddPIID, 0 ), 0, payms.t_PaymReceiverAccount, decode( pi.t_DebetCredit, 1, pi.t_Account, payms.t_PaymReceiverAccount ) ) ) = 1";
+    end;
+
+    return result;
+
+  end;
+
+  var params:TArray = TArray();
+
+  var query:string = ExecutedPaymentsQueryTempl;
+      query = StrSubst( query, "$(DatesCond)"       , makeDatesCondition( DateFrom, DateTo, params ) );
+      query = StrSubst( query, "$(DepartmentsCond)" , makeDepartmentsCondition( Departments, params ) );
+      query = StrSubst( query, "$(DirectionsCond)"  , makeDirectionCondition( IncludeInternal, IncludeIncoming, IncludeOutgoing, IncludeTransit ) );
+      query = StrSubst( query, "$(AccountMasksCond)", makeMaskCondition( PayerMask, ReceiverMask, params ) );
+      
+  execSQL( query, params );
+  return true;
+
+onerror(x)
+
+  return false;
+
+END;
+
+

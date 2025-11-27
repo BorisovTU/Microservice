@@ -1,0 +1,1889 @@
+/**
+ @file 		vsrpord.mac
+ @brief 	Печать вексельных договоров
+
+ # changelog
+ |date       |autor          |tasks                                           |note
+ |-----------|---------------|------------------------------------------------|-------------------------------------------------------------
+ |28.12.2023 |Велигжанин А.В.|DEF-56486                                       |Оптимизация. Выражение GetGE() неэффективно без addFilter()
+ |08.05.2018 |Симанов        |                                                |редактирование макроса под шаблоны РСХБ
+*/
+Import dlwreps, vsrplib, OprInter, vslib, vsbnrfd, dlvsacnum,
+       vs4each, PaymInter, DealsInter, vsclsrpo,dlprxytg, "adress.mac";
+//import or_exl_h;       
+import oralib, likepy, captureoutput, "StringUtils.mac";
+
+/*const  Path = "../mac/dlng/veksel/";*/
+
+CONST 
+            Д_Эмиссии      = 1,
+            Д_Проц         = 2,
+            Д_Диск         = 3,
+            Д_Мены         = 4,
+            Д_ДосрПогаш    = 5,
+            Д_Хран         = 6,
+            Д_Зачет        = 7, 
+            Д_Продажа      = 8,
+            Д_СписаниеВык  = 9,
+            Д_ДискПроц     = 10,
+            Д_Погаш        = 11,
+            Д_Залог        = 12,
+            Д_Выкуп        = 13,
+            Д_Бездох       = 14
+            ;
+
+CONST DL_ORDER_VSBAYOUT = 4918;
+CONST PTADDR_REGISTRATION = 5;
+
+CONST COUNTSHEET = "2 (двух)"; //количество листов договора
+
+PRIVATE var
+            Вексель,                    /* текщий вексель */
+            СвязьВД,                    /* файл связи векселя с дог. */
+            ЦУ,                         /* ценовые условия векселя */
+            ВексПД,
+            ВалютаСтарых = -1, ВалютаНовых = -1,
+
+            ВалВекселей = -1,
+            ВалПлатежа = -1;
+
+var
+            ВидДоговора = Д_Эмиссии;
+
+var         IssuePlace = "",
+            PaymentPlace = "",
+            ProcessingDepartment = RsbParty({OurBank});
+var         PayBank = 0;
+
+PRIVATE var GB = null,          /* экземпляр класса ГруппыВекс */
+            AB = null;          /* экземпляр класса МассивыВекс */
+
+array months;
+
+months( 1)="января";  months( 2)="февраля";  months( 3)="марта";
+months( 4)="апреля";  months( 5)="мая";      months( 6)="июня";
+months( 7)="июля";    months( 8)="августа";  months( 9)="сентября";
+months(10)="октября"; months(11)="ноября";   months(12)="декабря";
+
+MACRO VS_InitRepBanners()
+    GB = ГруппыВекс();
+    AB = МассивыВекс ();
+END;
+
+private macro IIF(expr,var1,var2)
+  if (expr)
+    return var1;
+  else
+    return var2;
+  end;
+end;
+
+
+PRIVATE MACRO IsOurFilial( ReceiverID )   /*490815 CHVA копия из dv_car для опеределения филиала*/
+  var rs;  
+  rs = RSDCommand( "SELECT T_PARTYID FROM DDP_DEP_DBT WHERE T_PARTYID = ?");
+  rs.addParam( "", RSDBP_IN, ReceiverID );
+  rs.execute();
+  var DataSet = TRsbDataSet(rs);
+  if( DataSet.movenext )    
+    return true;   
+  end;
+
+  return false;
+end;
+
+//Проверяет уникальность кода
+private macro UniqueAccCode (bcid, AccCode)
+  var sql;
+  sql = "select 1 from dvsbanner_dbt where t_bcid <> :bcid and t_acccode = :code";
+  sql = ExecSqlSelect(sql, MakeArray(SqlParam("bcid", BCID),
+                                     SqlParam("code", AccCode)), false);
+  if (sql.MoveNext() )
+    return false;
+  end;
+  return true;
+End;
+
+// Извлечь адрес из адресной строки
+private macro ExtractCity(address)
+  var idxStart = Index(StrLwr(address), "г.");
+  if (idxStart == 0)
+    return "Москва";
+  end;
+
+  var idxEnd = Index(address, ",", idxStart);
+
+  if (idxEnd == 0)
+    return Trim(SubStr(address, idxStart + 2));
+  end;
+    
+  return Trim(SubStr(address, idxStart + 2, idxEnd - idxStart - 2));
+end;
+
+// Извлечь регион из наименования филиала
+private macro ExtractDepartmentRegion(departmentName)
+  var idx = Index(StrUpr(departmentName), "РФ АО");
+  
+  if (idx == 0)
+    return "";
+  end;
+
+  var region = StrCapitalize(Trim(SubStr(departmentName, 1, idx - 1)));
+  idx = Index(region, "-");
+
+  if (idx > 0)
+    region = SubStr(region, 1, idx - 1) + "-" + StrCapitalize(SubStr(region, idx + 1));
+  end;
+
+  return region;
+end;
+
+/**
+@brief Функция преобразования наименования ЮЛ
+@param[in] name Текст для преобразования
+@return Отформатированный текст
+
+Преобразование в виде - все символы в нижнем регистре кроме первого символа до кавычки и первого символа после кавычки
+Напр. ОБЩЕСТВО С ОГРАНИЧЕННОЙ ОТВЕТСТВЕННОСТЬЮ "РОМАШКА" -> Общество с ограниченной ответственностью "Ромашка"
+*/
+private macro NormalizeLegalPersonName(name: String): String
+  var quoteIndex = Index(name, "\"");
+
+  if (quoteIndex > 0)
+    return StrCapitalize(SubStr(name, 1, quoteIndex)) + StrCapitalize(SubStr(name, quoteIndex + 1));
+  end;
+
+  return StrCapitalize(name);
+end;
+
+/**
+@brief Функция преобразования наименования ИП (P.S. для ФЛ тоже подойдет)
+@param[in] name Текст для преобразования
+@return Отформатированный текст
+*/
+private macro NormalizeEmployerName(name: String): String
+  name = StrLwr(name);
+  
+  var words = StringSplit(name, " ", false);
+  if (words.size > 0)
+    words(0) = IIF(words(0) == "ип", "ИП", StrCapitalize(words(0)));
+    var idx = words.size - 1;
+    var limitIdx = idx - 3;
+    
+    while ((idx > 0) and (idx > limitIdx)) // ФИО
+      words(idx) = StrCapitalize(words(idx));
+      
+      idx = idx - 1;
+    end;
+  end;
+  
+  return StringArrayConcat(words, " ");
+end;
+
+/**
+@brief Функция преобразования наименования эмитента
+@param[in] name Текст для преобразования
+@return Отформатированный текст
+*/
+private macro NormalizeIssuerName(issuerName)
+  if (ValType(issuerName) != V_STRING)
+    return "";
+  end;
+  
+  issuerName = NormalizeLegalPersonName(issuerName);
+  
+  issuerName = StrSubst(issuerName, "Ао ", "АО ");
+  issuerName = StrSubst(issuerName, " рф ", " Рф ");
+  issuerName = StrSubst(issuerName, "Рф ао ", "РФ АО ");
+  issuerName = StrSubst(issuerName, "црмб", "ЦРМБ");
+  
+  var dashIndex = Index(issuerName, "-");
+  
+  if (dashIndex > 1)
+    return SubStr(issuerName, 1, dashIndex) + StrUpr(SubStr(issuerName, dashIndex + 1, 1)) + SubStr(issuerName, dashIndex + 2);
+  else
+    return issuerName;
+  end;
+end;
+
+private macro SetAccCode (bcid, AccCode) /*CHVA*/
+  var sql;
+  sql = "update dvsbanner_dbt set t_acccode = :code where t_bcid = :bcid";
+  sql = ExecSql(sql, MakeArray(SqlParam("code", AccCode), SqlParam("bcid", bcid)), false);
+  if (sql == null) 
+    return false;
+  end;
+  return true;
+onerror
+  return false;
+End;
+
+/* Возвращает число прописью
+*/
+PRIVATE MACRO Прописью(число, type)
+var s = "";
+
+    if((ValType(type) == V_STRING) AND (type == "%"))
+       s = NumToStr(число, "процент", "процента", "процентов", true, 4);
+    else
+       if(ValType(число) == V_STRING)
+         число = Int(число);
+       end;
+       rubtostralt(число, s, null, null);
+    end;
+
+    return s;
+END;
+
+// Найти ISO код валюты
+private macro GetCurrencyISOCode(fiid: Integer)
+  var cmd = RsdCommand("select * from dfininstr_dbt where t_fiid = ?");
+  cmd.addParam("fiid", RSDBP_IN, fiid);
+  cmd.execute();
+  var rs = RsdRecordset(cmd);
+
+  if (not rs.movenext())
+     return "";
+  end;
+
+  return rs.value("t_iso_number");
+
+OnError(err)
+  return "";
+end;
+
+// Сумма в необходимом(?) формате
+macro Get_NumToStr(num:money, fiid:integer)
+   var rub :string = "",
+       kop :string = "",
+       s1  :string;
+   var ISOCode = GetCurrencyISOCode(fiid);
+
+   if (ISOCode == "")
+     return "";
+   end;
+
+   s1 = CurToStrAlt(num, rub, kop, int(ISOCode));
+   s1 = trim(StrSubSt(s1, rub, ""));
+   s1 = trim(StrSubSt(s1, SubStr(s1, index(s1, kop)), ""));
+
+   return StrSubst(StrSubSt(string(num:a),"'"," "), ".", ",")+" ("+rub+" и "+kop+"/100) "+s1;
+end;
+
+// Извлечь наименование валюты ("рублей", "американских долларов" и т.п.)
+private macro GetCurrencyStr(num: money, fiid: Integer)
+  var ISOCode = GetCurrencyISOCode(fiid);
+  var rub, sum, kop;
+
+  if (ISOCode == "")
+    return "";
+  end;
+
+  sum = CurToStrAlt(num, rub, kop, Int(ISOCode));
+  var rubLen = StrLen(rub);
+  return SubStr(sum, rubLen + 2, Index(sum, kop, rubLen) - rubLen - 3);
+end;
+
+
+/*
+GetThing (43) возвращает: 43(сорок три) штуки
+*/
+macro GetThing (id:integer)
+  var LastNum = Mod(id, 10);
+  var nm = "";
+  /*
+  var str = string(int(id));
+  var len = strlen(str);
+  str = substr (str, len);
+  */
+  if   ((LastNum == 0) or (LastNum >= 5)) nm= "штук";
+  elif (LastNum == 1) nm= "штука";
+  else nm= "штуки";
+  end;
+  return (int(id) + " ("+NumToStr(id)+") "+nm);
+end;
+
+macro Get_DaysToStr (days)
+  var rez = "";
+  var s = 0, d = 0, e = 0;
+  var s_str = "", d_str = "", e_str = "";
+  var tail;
+
+  if (days == 0)
+   days = 1;
+  end;
+
+  s = int(days/100);
+  d = mod(int(days/10), 10);
+  e = mod(days, 10);
+
+  if ((e == 1) and (d != 1))
+    tail = "рабочего дня";
+  else
+    tail = "рабочих дней";
+  end;
+
+  if (s == 0)
+    s_str = "";
+  elif (s == 1)
+    s_str = "ста ";
+  elif (s == 2)
+    s_str = "двухсот ";
+  elif (s == 3)
+    s_str = "трёхсот ";
+  elif (s == 4)
+    s_str = "четырёхсот ";
+  elif (s == 5)
+    s_str = "пятисот ";
+  elif (s == 6)
+    s_str = "шестисот ";
+  elif (s == 7)
+    s_str = "семисот ";
+  elif (s == 8)
+    s_str = "восьмисот ";
+  elif (s == 9)
+    s_str = "девятисот ";
+  end;
+
+  if (d == 0)
+    d_str = "";
+  elif (d == 1)
+    d_str = ""
+  elif (d == 2)
+    d_str = "двадцати ";
+  elif (d == 3)
+    d_str = "тридцати ";
+  elif (d == 4)
+    d_str = "сорока ";
+  elif (d == 5)
+    d_str = "пятидесяти ";
+  elif (d == 6)
+    d_str = "шестидесяти ";
+  elif (d == 7)
+    d_str = "семидесяти ";
+  elif (d == 8)
+    d_str = "восьмидесяти ";
+  elif (d == 9)
+    if (e == 0) 
+      d_str = "девяноста ";   
+    else
+      d_str = "девяносто ";
+    end;
+  end;
+
+  if (d != 1) 
+    if (e == 0)
+      e_str = "";
+    elif (e == 1)
+      e_str = "одного";
+    elif (e == 2)
+      e_str = "двух";
+    elif (e == 3)
+      e_str = "трёх";
+    elif (e == 4)
+      e_str = "четырёх";
+    elif (e == 5)
+      e_str = "пяти";
+    elif (e == 6)
+      e_str = "шести";
+    elif (e == 7)
+      e_str = "семи";
+    elif (e == 8)
+      e_str = "восьми";
+    elif (e == 9)
+      e_str = "девяти";
+    end;
+  end;
+
+  if (d == 1) 
+    if (e == 0)
+      e_str = "десяти";
+    elif (e == 1)
+      e_str = "одиннадцати";
+    elif (e == 2)
+      e_str = "двенадцати";
+    elif (e == 3)
+      e_str = "тринадцати";
+    elif (e == 4)
+      e_str = "четырнадцати";
+    elif (e == 5)
+      e_str = "пятнадцати";
+    elif (e == 6)
+      e_str = "шестнадцати";
+    elif (e == 7)
+      e_str = "семнадцати";
+    elif (e == 8)
+      e_str = "восемнадцати";
+    elif (e == 9)
+      e_str = "девятнадцати";
+    end;
+  end;
+
+  rez = string(days) + " (" + s_str + d_str + e_str + ") " + tail;
+
+  return rez;
+End;
+
+private macro GetOGRN (partyid)
+  var Ogrn = "";
+  var sql = ExecSqlSelect("select cod.t_code from dobjcode_dbt cod where cod.t_codekind = 27 and cod.t_state = 0 and cod.t_objectid = :1", MakeArray(SqlParam("1", partyid)), false);
+  if (sql.MoveNext() )
+      Ogrn = sql.value("t_code");
+  end;
+  return Ogrn;
+End;
+
+
+/*
+Возвращает короткий код валюты
+*/
+private macro GetCCY (fiid)
+  var ccy_name = "";
+  var sql = ExecSqlSelect("select t_name from dfininstr_dbt where t_fi_kind = 1 and t_fiid = :fiid", MakeArray(SqlParam("fiid", fiid)), false);
+  if (sql.MoveNext() )
+    ccy_name = sql.value("t_name");    
+  end;
+  return ccy_name;
+End;
+
+/*
+1 = юр.лицо
+2 = физ.лицо
+3 = ИП
+*/
+macro GetLegalForm (partyid)
+  var Party = RsbParty(PartyID);
+  var lform = 0;
+  if (Party.LegalForm == PTLEGF_INST) //юр. лицо
+    lform = 1;
+  elif (Party.LegalForm == PTLEGF_PERSN) //физ. лицо
+    if (Party.IsEmployer) //ип
+      lform = 3;
+    else
+      lform = 2;
+    end;
+  end;
+  return lform;
+End;
+
+// Является ли ЮЛ на самом деле ИП
+private macro DetectIPByPartyName(name)
+  if (Index(StrLwr(name), "глава крестьянского фермерского хозяйства") > 0)
+    return true;
+  end;
+
+  return false;
+end;
+
+/*
+Возвращает название города по номеру филиала
+*/
+macro GetCity (NumDprt)
+   var partyid = 0;
+   var Party, PartyAddress;
+   var sql = ExecSqlSelect("select t_partyid from ddp_dep_dbt where t_code = :num", MakeArray(SqlParam("num", NumDprt)), false);
+   if (sql.MoveNext() )
+      partyid = int(sql.value("t_partyid"));
+   end;
+   if (partyid == 0)
+      return "";
+   end;
+
+   Party = RsbParty(partyid);
+   PartyAddress = Party.Address(PTADDR_LEGAL);
+   return PartyAddress.District;
+End;
+
+/*
+Взять тип документа, удостоверяющего личность для физ. лица
+*/
+macro GetPaperKind (partyid)
+
+  var sql = " select t_paperkind kind from dpersnidc_dbt "
+          + "where t_isnotvalid <> 'X' and t_personid = :partyid and rownum = 1 "
+          + "order by t_paperkind ";
+         
+  sql = ExecSqlSelect(sql, MakeArray(SqlParam("partyid", partyid)), false);
+  if (sql.MoveNext() ) 
+    return int(sql.value("kind"));
+  end;
+  return -1;
+End;
+
+/*
+название документа, удостоверяющего личность физ. лица
+*/
+macro GetDocName (doctype)
+  var sql = ExecSqlSelect("select t_name from dpaprkind_dbt where t_paperkind = :t", MakeArray(SqlParam("t", doctype)), false);
+  if (sql.MoveNext() ) 
+    return sql.value("t_name");
+  end;
+  return "";
+End;
+
+
+private macro GetShortName (partyid)
+  var sql = ExecSqlSelect("select t_shortname shname from dparty_dbt where t_partyid = :partyid ", MakeArray(SqlParam("partyid", partyid)), false);
+  if (sql.MoveNext() )
+    return sql.value("shname");
+  end;
+  return "";
+End;
+
+
+/*
+документ, удостоверяющий личность или регистрационный документ
+*/
+macro ClientInfo (PartyID)
+
+  var Party = RsbParty(PartyID);
+  var day = "", mm = "", year = "", RegDoc, doctype;
+  var bday, bmm, byear;
+  var docname:string = "";
+  var docseries:string = "";
+  var docnumber:string = "";
+  var docissuer:string = "";
+  var dociscode:string = "";
+  var regaddr:string = "";
+  var realaddr:string = "";
+  var isIP = false;
+  
+  if (Party.LegalForm == PTLEGF_INST) //юр. лицо
+    isIP = DetectIPByPartyName(Party.FullName);
+  end;
+  
+  if (Party.LegalForm == PTLEGF_PERSN) //физ. лицо, ИП
+    if (Party.BirthDate == Date(0, 0, 0))
+      Party.BirthDate = Date(01, 01, 1901);
+    end;
+
+    /*документ, удостоверяющий личность*/
+    doctype = GetPaperKind (PartyID);
+    if (doctype >= 0) 
+      RegDoc = Party.PersonPaper(doctype);
+      DateSplit(RegDoc.IssuedDate, day, mm, year);
+      docname   = GetDocName(doctype);
+      docseries = RegDoc.Series;
+      docnumber = RegDoc.Number;
+      docissuer = RegDoc.Issuer;
+      dociscode = RegDoc.IssuerCode;
+      mm = months(mm);
+    end;
+
+    docname   = IIF(docname   != "", docname, "паспорт");
+    docseries = IIF(docseries != "", docseries, "_______");
+    docnumber = IIF(docnumber != "", docnumber, "_______");
+    dociscode = IIF(dociscode != "", dociscode, "_______");
+    day       = IIF(day       != "", day, "__");
+    mm        = IIF(mm        != "", mm, "_______");
+    year      = IIF(year      != "", year, "____");
+
+    [~GkfhDesc];
+    println("");
+
+    [~docname];
+    println(docname);
+
+    [~docseries];
+    println(docseries);
+
+    [~docnumber];
+    println(docnumber);
+
+    [~docissuer];
+    println(docissuer);
+
+    [~docdt];      
+    if (StrLen(string(day)) == 1)
+        println("0",(day));
+    else 
+        println(day);
+    end;
+    
+    [~docmonth];
+    println(mm);
+
+    [~docyear];
+    println(year);
+
+    [~doccode];
+    println(dociscode);
+
+    /*Дата рождения*/
+    DateSplit(Party.BirthDate, bday, bmm, byear);
+    
+    [~bdate];      
+    if (StrLen(string(bday)) == 1)
+        println("0",(bday));
+    else 
+        println(bday);
+    end;
+
+    [~bmonth];
+    println(months(bmm));
+
+    [~byear];
+    println(byear);
+  end;
+  
+  if ((Party.LegalForm == PTLEGF_PERSN) or isIP) //физ. лицо, ИП + ГКФХ
+    regaddr  = Party.Address(PTADDR_REGISTRATION).Address;
+    realaddr = Party.Address(PTADDR_REAL).Address;
+    
+    /*адрес*/
+    [~legaladdress];
+    println(IIF(regaddr != "", regaddr, "____________________"));
+
+    [~factaddress];
+    println(IIF(realaddr != "", realaddr, "____________________"));
+  end;
+End;
+
+
+
+/*  Общий тэг для всех видов вексельного договора
+*/
+PRIVATE MACRO CommonOrderTag (order, spg, PaymsOrd )
+  var paym = PaymsOrd.ПлатежПоУмолчанию();
+  var day, mm, year; 
+  
+  [~Xld];
+  println(spg.rec.Xld);
+
+  [~City];
+  println(ExtractCity(ProcessingDepartment.Address(PTADDR_LEGAL).Address));
+
+  /*Дата поручения*/
+  DateSplit(spg.rec.SignedDate, day, mm, year);
+
+  [~Date];
+  if (StrLen(string(day)) == 1)
+      println("0",(day));
+  else 
+      println(day);
+  end;
+
+  [~Month];
+  println(months(mm));
+
+  
+  [~Year];
+  println(substr(string(year:4),3));
+
+  var isIP = DetectIPByPartyName(order.rec.ContractorName);
+  var legalForm = GetLegalForm(order.rec.Contractor);
+  var contractorName = order.rec.ContractorName;
+  
+  if ((legalForm == 1) and (not isIP))
+    contractorName = NormalizeLegalPersonName(contractorName);
+  else
+    contractorName = NormalizeEmployerName(contractorName);
+  end;
+  [~CounterpartyCaption];
+  println(contractorName);
+
+  [~IpType];
+  println("");
+
+  [~ShortCounterpartyCaption];
+  println(GetShortName(order.rec.Contractor));
+
+  ClientInfo(order.rec.Contractor);
+
+  [~TaxId_IdPurpose];
+  println(order.rec.ContractorTaxCode);
+
+  [~CounterpartyAccount];
+  println(order.rec.ContractorAccount);
+
+  [~CounterpartyBankCaption];
+  println(order.rec.ContractorBankName);
+
+  [~CounterpartyBankAccount];
+  println(order.rec.ContractorBankCorrAcc);
+  
+  [~CounterpartyBankAlias];
+  println(order.rec.ContractorBankCode);
+
+  [~CountSheet];
+  println(COUNTSHEET);
+
+  [~HandingTerm];
+  //println(Get_DaysToStr(paym.ValueDate - order.rec.SignDate));
+  println("2-х рабочих дней");
+
+  [~Ogrn];
+  println(GetOGRN(order.rec.Contractor));
+
+  [~OurOgrn];
+  println(GetOGRN({HeadBankID}));
+
+  [~HandOver];
+  println(order.rec.HandOver:m:f);
+
+  [~CounterpartyAddress];
+  println(order.rec.ContractorAddress);
+  
+  if (ProcessingDepartment.PartyID != 1)
+    [~CourtAddress];
+    println("____________________");
+  end;
+
+ return true;
+
+END;
+
+/*  Возвращает цену векселя по договору.
+    Для дисконтного = номинал - размер дисконта
+    для остальных = номинал
+  Изменено. Цена всегда берётся из анкеты
+*/
+PRIVATE MACRO ЦенаВекс()
+  if(ВексельДисконтный(ЦУ))
+    return ЦУ.rec.ReceiptAmount;
+  else
+    return ЦУ.rec.ReceiptAmount;
+  end;
+END;
+
+
+/*  Возвращает ставку дохода по векселю.
+    Для процентных векселей, для остальных - 0;`
+*/
+PRIVATE MACRO СтавкаДох()
+var проценты_число;
+  if(ВексельПроцентный(ЦУ))
+   if (ПолучитьСтрокуЗначенияКурса(ЦУ.rec.Price,ЦУ.rec.Point,проценты_число)==0)
+    return проценты_число;
+   end;
+  else
+    return 0;
+  end;
+END;
+
+
+/*  Возвращает ставку дохода по векселю.
+    Для процентных векселей, для остальных - 0;
+*/
+PRIVATE MACRO ОпределитьВалВекс()
+/*
+  if(ВалВекселей != -1)
+    // уже определена 
+  elif(ВидДоговора == Д_ДосрПогаш)
+    // определяем из платежа 
+  elif(ВидДоговора == Д_Хран) 
+    // валюта баланса
+    ВалВекселей = 0; 
+  elif(ВидДоговора == Д_Мены)
+    if(СвязьВД.rec.LinkKind == VSORDLNK_K_EMISSION)
+       ВалВекселей = ЦУ.rec.PFI; 
+    end;
+  else
+  end;*/
+  ВалВекселей = ЦУ.rec.PFI; 
+END;
+
+/*  Анализ информации по векселю.
+*/
+PRIVATE MACRO АнализВекселя (bnr, leg, emi, order, numOrd, lnk)
+var stat = 0;
+var code_update = false;
+
+   /*CHVA пользователи не заполнив анкету векселя печатают договора, поскольку анкета не заполнена , то открываются счета с 0000 на хвосте, */
+   /*далее добавил принудительное формирование кода в номере счета для векселя, у которого не заполнено значение этого поля */
+   if (bnr.rec.acccode == "")
+     DL_VS_GetAccCodeNumber( bnr );
+     code_update = true;
+     //SetAccCode (bnr.rec.bcid, bnr.rec.AccCode);
+   end;
+
+   //Simanov
+   while (not UniqueAccCode(bnr.rec.bcid, bnr.rec.AccCode) )
+     code_update = true;
+     DL_VS_GetAccCodeNumber( bnr );
+   end;
+
+   if (code_update)
+     SetAccCode (bnr.rec.bcid, bnr.rec.AccCode);
+   end;
+
+  /*CHVA*/
+  СвязьВД = lnk;  Вексель = bnr;  ЦУ = leg;  ВексПД = VSBannerFD(bnr, leg);
+
+  ОпределитьВалВекс();              /* определение валюты векселей */
+
+  ВалПлатежа = ЦУ.rec.CFI;
+
+  [~currency];
+  println(GetCurrencyStr(5, ВалВекселей)); //5 просто случайное число, для получения валюты в нужном склонении
+
+  /*
+  мб добавить тег на валюту цены
+  */
+  var BCAccount = "";
+  ПолучитьСчетВекселя("Наш вексель", ВексПД, BCAccount, NULL, NULL, NULL, date());
+  
+  //if(lnk.rec.LinkKind == VSORDLNK_K_SALE)
+    GB.Группировать(     /* векселя группируются */
+       Вексель.rec.IssuerName,             /* векселедатель */
+       ЦУ.rec.Principal,                   /* номинал */
+       Вексель.rec.BCTermFormula,          /* форм. векс.срока */
+       ЦУ.rec.Maturity,                    /* дата погашения "не ранее" */
+       ЦУ.rec.Expiry,                      /* дата погашения "не позднее" */
+       ЦенаВекс(),                         /* цена векселя */
+       СтавкаДох(),                        /* ставка дохода */
+       ЦУ,
+       Вексель.rec.BCSeries,               /* серия векселя */
+       Вексель.rec.BCNumber,               /* номер векселя */              
+       Вексель.rec.HolderName,             /* первый векселедержатель */
+       BCAccount                           /* номер счета */ 
+    ); 
+  //end;
+
+  /* векселя покупки */
+  //if((ВидДоговора != Д_Мены) OR (lnk.rec.LinkKind == VSORDLNK_K_DRAW) )
+    AB.ДобавьВМассив(Вексель, СвязьВД, ЦУ );
+  //end;
+
+  if(ВидДоговора == Д_Мены)
+    if(lnk.rec.LinkKind == VSORDLNK_K_SALE)
+       AB.ДобавьВМассив(Вексель, СвязьВД, ЦУ, true );
+       if(ВалютаНовых == -1)
+          ВалютаНовых = leg.rec.PFI;
+       end;
+    elif(lnk.rec.LinkKind == VSORDLNK_K_DRAW)
+       if(ВалютаСтарых == -1)
+          ВалютаСтарых = leg.rec.PFI;
+       end;
+    end;
+  end;
+
+  return stat;
+END;
+
+
+/* Анализ векселей по договорам.
+   Формируются массивы групп и векселей.
+*/
+PRIVATE MACRO АнализВекселей(order)
+var stat = 0;
+   stat = ДляКаждогоВекселя(order, @АнализВекселя, VSORDLNK_K_ALL, null, "BL");
+   return (stat==0);
+END;
+
+
+/* Создает тэг для копирования строк таблицы
+*/
+PRIVATE MACRO MultipleRow(ТабНо, КолСтрок)
+  if(КолСтрок > 1)
+    [~MultipleRow];
+    println(ТабНо);                 /* идентификатор таблицы */
+    println(КолСтрок - 1);          /* кол-во недостающих строк */
+    println();                      /* Закладка, по которой определять таблицу для добавления строк */
+    println(2);                     /* номер строки, которую надо размножить */
+  end;
+END;
+
+/* Формирует тэг для размножения строк таблицы для векселей
+*/
+PRIVATE MACRO РазмножитьСтроки(order)
+var stat = 0;
+var LegalForm = GetLegalForm(order.rec.Contractor);
+var isIP = false;
+
+   if (LegalForm == 1)
+     isIP = DetectIPByPartyName(order.rec.ContractorName);
+   end;
+
+   if(ВидДоговора == Д_Мены)
+      MultipleRow(1, AB.ArrBnr.size);      
+      MultipleRow(2, AB.ArrBnr_ms.size);  
+      MultipleRow(4, AB.ArrBnr.size);
+      MultipleRow(6, AB.ArrBnr_ms.size);
+
+   elif ((ВидДоговора == Д_Диск) or (ВидДоговора == Д_Бездох) or (ВидДоговора == Д_Проц))
+      MultipleRow(1, GB.ArrGrp.size);
+      //MultipleRow(3, GB.ArrGrp.size); Если размножить 2 таблицы сразу, то первая не заполняется
+
+   elif(ВидДоговора == Д_Выкуп)
+      MultipleRow(1, GB.ArrGrp.size);
+      MultipleRow(3, GB.ArrGrp.size);
+
+   elif(ВидДоговора == Д_Хран) 
+      MultipleRow(1, AB.ArrBnr.size);
+      MultipleRow(3, AB.ArrBnr.size);
+      MultipleRow(4, AB.ArrBnr.size);
+   elif(ВидДоговора == Д_ДосрПогаш)
+      MultipleRow(1, AB.ArrBnr.size);
+      MultipleRow(3, AB.ArrBnr.size);
+   elif(ВидДоговора == Д_Зачет)
+      MultipleRow(1, AB.ArrBnr.size);
+   elif(ВидДоговора == Д_Продажа)
+      MultipleRow(1, GB.ArrGrp.size);
+      MultipleRow(3, GB.ArrGrp.size);
+   elif(ВидДоговора == Д_СписаниеВык)
+      MultipleRow(1, AB.ArrBnr.size);
+   end;
+
+   return (stat==0);
+END;
+
+
+/*  Тэг по группе векселей.
+*/
+PRIVATE MACRO ВексГруппТэг (prefix, i, postfix)
+var номер = string(i + 1);
+
+   if(ValType(postfix) != V_STRING)
+     postfix = "";
+   elif(postfix == "")
+     return 0;
+   end;
+   println(String("~", prefix, "BCIssuerCaption", номер, postfix));
+   println(GB.ArrGrp[i].векселедатель);
+
+   println(String("~", prefix, "FaceValue", номер, postfix));
+   println(StrSubSt(string(GB.ArrGrp[i].номинал:a),"'"," ") );
+
+   println(String("~", prefix, "FaceValueWr", номер, postfix));
+   println(ValueWr(GB.ArrGrp[i].номинал, GB.ArrGrp[i].PFI));
+
+   println(String("~", prefix, "Rate", номер, postfix));
+   println(money(GB.ArrGrp[i].ставка):*:2);
+
+   println(String("~", prefix, "RateWr", номер, postfix));
+   println(Прописью(GB.ArrGrp[i].ставка, "%"));
+
+   println(String("~", prefix, "MaturityFormula", номер, postfix));
+   println(VS_TermFormula(GB.ArrGrp[i].СРОК, GB.ArrGrp[i].датаП, GB.ArrGrp[i].Expiry, true));
+
+   
+   println(String("~", prefix, "BCPresentTerm", номер, postfix));
+   println(PresentTerm(GB.ArrGrp[i].датаП, GB.ArrGrp[i].Expiry, GB.ArrGrp[i].срок));
+
+   println(String("~", prefix, "BCCost", номер, postfix));
+   println(StrSubSt(string(GB.ArrGrp[i].цена:a),"'"," "));
+
+   println(String("~", prefix, "BCCostWr", номер, postfix));
+   println(Прописью(GB.ArrGrp[i].цена));
+
+   println(String("~", prefix, "BCQuantity", номер, postfix));
+   println(GB.ArrGrp[i].колич );
+
+   println(String("~", prefix, "BCQuantityWr", номер, postfix));
+   println(Прописью(GB.ArrGrp[i].колич));
+
+   println(String("~", prefix, "BCNumber", номер, postfix));
+   println(GB.ArrGrp[i].номер);
+
+   println(String("~", prefix, "BCSeries", номер, postfix));
+   println(GB.ArrGrp[i].серия);
+
+   println(String("~", prefix, "BCHolderCaption", номер, postfix));
+   println(GB.ArrGrp[i].всДержатель);
+
+   println(String("~", prefix, "BCIssueDate", номер, postfix));
+   println(GB.ArrGrp[i].Start:f);
+
+
+   println(String("~", prefix, "BCAccount", номер, postfix));
+   println(GB.ArrGrp[i].счет);
+/*
+   println(String("~", prefix, "BCQuantityTotal", номер, postfix));
+   println(quantity);
+*/
+
+  return 0;
+
+END;
+
+/*  Тэг по группе векселей.
+*/
+PRIVATE MACRO ВексГруппТэг2 (prefix, postfix, i)
+var номер = string(i + 1);
+
+   if(ValType(postfix) != V_STRING)
+     postfix = "";
+   elif(postfix == "")
+     return 0;
+   end;
+   println(String("~", prefix, "BCIssuerCaption", postfix, номер));
+   println(GB.ArrGrp[i].векселедатель);
+
+   println(String("~", prefix, "FaceValue", postfix, номер));
+   println(StrSubst(StrSubSt(string(GB.ArrGrp[i].номинал:a),"'"," "), ".", ","));
+
+   println(String("~", prefix, "FaceValueWr", postfix, номер));
+   println(ValueWr(GB.ArrGrp[i].номинал, GB.ArrGrp[i].PFI));
+
+   println(String("~", prefix, "Rate", postfix, номер));
+   println(StrSubst(FloatToStringNoZeroes(GB.ArrGrp[i].ставка), ".", ",") + "%");
+
+   println(String("~", prefix, "RateWr", postfix, номер));
+   println(Прописью(GB.ArrGrp[i].ставка, "%"));
+
+   println(String("~", prefix, "MaturityFormula", postfix, номер));
+   println(VS_TermFormula(GB.ArrGrp[i].СРОК, GB.ArrGrp[i].датаП, GB.ArrGrp[i].Expiry, true));
+
+   println(String("~", prefix, "BCPresentTerm", postfix, номер));
+   println(PresentTerm(GB.ArrGrp[i].датаП, GB.ArrGrp[i].Expiry, GB.ArrGrp[i].срок));
+
+   println(String("~", prefix, "BCCost", postfix, номер));
+   println(StrSubst(StrSubSt(string(GB.ArrGrp[i].цена:a),"'"," "), ".", ","));
+
+   println(String("~", prefix, "BCCostWr", postfix, номер));
+   println(Прописью(GB.ArrGrp[i].цена));
+
+   println(String("~", prefix, "BCQuantity", postfix, номер));
+   println(GB.ArrGrp[i].колич );
+
+   println(String("~", prefix, "BCQuantityWr", postfix, номер));
+   println(Прописью(GB.ArrGrp[i].колич));
+
+   println(String("~", prefix, "BCNumber", postfix, номер));
+   println(GB.ArrGrp[i].номер);
+
+   println(String("~", prefix, "BCSeries", postfix, номер));
+   println(GB.ArrGrp[i].серия);
+
+   println(String("~", prefix, "BCHolderCaption", postfix, номер));
+   println(GB.ArrGrp[i].всДержатель);
+
+   println(String("~", prefix, "BCIssueDate", postfix, номер));
+   println(GB.ArrGrp[i].Start:f);
+
+
+   println(String("~", prefix, "BCAccount", postfix, номер));
+   println(GB.ArrGrp[i].счет);
+
+  return 0;
+END;
+
+/*  Шаблон для каждого векселя.
+*/
+PRIVATE MACRO ВексТэг (prefix, i, ArrBnr, postfix)
+var 
+   номер = i + 1,
+   rStr = RateStr(ArrBnr[i].leg.rec.Price, ArrBnr[i].leg.rec.Point /*масВекс(i+12), масВекс(i+13)*/);
+
+   if(ValType(postfix) != V_STRING)
+     postfix = "";
+   elif(postfix == "")
+     return 0;
+   end;
+
+
+   println(String("~", prefix, "BCCost", номер, postfix));
+   println(StrSubSt(string(ArrBnr[i].lnk.rec.BCCost:a),"'"," "));
+
+   println(String("~", prefix, "BCCostWr", номер, postfix));
+   println(ValueWr(ArrBnr[i].lnk.rec.BCCost, ArrBnr[i].leg.rec.PFI));
+
+   println(String("~", prefix, "BCIssuerCaption", номер, postfix));
+   println(ArrBnr[i].bnr.rec.IssuerName);
+
+   println(String("~", prefix, "BCSeries", номер, postfix));
+   println(ArrBnr[i].bnr.rec.BCSeries);
+
+   println(String("~", prefix, "BCNumber", номер, postfix));
+   println(trim(ArrBnr[i].bnr.rec.BCNumber));
+
+   println(String("~", prefix, "BCHolderCaption", номер, postfix));
+   println(ArrBnr[i].bnr.rec.HolderName);
+
+   println(String("~", prefix, "BCIssuePlace", номер, postfix));
+   println(ArrBnr[i].bnr.rec.IssuePlace);
+
+   println(String("~", prefix, "FaceValue", номер, postfix));
+   println(StrSubSt(string(ArrBnr[i].leg.rec.Principal:a),"'"," ") );
+
+   println(String("~", prefix, "FaceValueWr", номер, postfix));
+   println(ValueWr(ArrBnr[i].leg.rec.Principal, ArrBnr[i].leg.rec.PFI));
+
+   println(String("~", prefix, "ProfitLoss", номер, postfix));
+   println(ArrBnr[i].leg.rec.Principal - ArrBnr[i].leg.rec.ReceiptAmount);
+
+   println(String("~", prefix, "ProfitLossStr", номер, postfix));
+   println(ValueWr(ArrBnr[i].leg.rec.Principal - ArrBnr[i].leg.rec.ReceiptAmount, ArrBnr[i].leg.rec.PFI));
+
+   println(String("~", prefix, "Rate", номер, postfix));
+   println(rStr:*:2);
+
+   println(String("~", prefix, "RateWr", номер, postfix));
+   println(Прописью(rStr, "%"));
+
+   println(String("~", prefix, "BCIssueDate", номер, postfix));
+   println(ArrBnr[i].leg.rec.Start:f);
+
+
+   println(String("~", prefix, "Maturity", номер, postfix));
+   println(ArrBnr[i].leg.rec.Maturity:f);
+
+   println(String("~", prefix, "Expiry", номер, postfix));
+   println(ArrBnr[i].leg.rec.Expiry:f);
+
+   println(String("~", prefix, "RepaymentDelay", номер, postfix));
+   println(ArrBnr[i].leg.rec.Diff);
+
+   println(String("~", prefix, "MaturityFormula", номер, postfix));
+   println(VS_TermFormula(ArrBnr[i].bnr.rec.BCTermFormula, ArrBnr[i].leg.rec.Maturity, ArrBnr[i].leg.rec.Expiry, true));
+
+   println(String("~", prefix, "BCPresentTerm", номер, postfix));
+   println(PresentTerm(ArrBnr[i].leg.rec.Maturity, 
+                       ArrBnr[i].leg.rec.Expiry,
+                       ArrBnr[i].bnr.rec.BCTermFormula));
+
+   println(String("~", prefix, "ProfitLossFormula", номер, postfix));
+   println(NameAlg(ALG_VS_IN, ArrBnr[i].leg.rec.Formula));
+
+   println(String("~", prefix, "OnCallRate", номер, postfix));
+   println(RateStr(ArrBnr[i].bnr.rec.OnCallRate, ArrBnr[i].bnr.rec.OnCallRatePoint));
+
+   println(String("~", prefix, "Count", номер, postfix));
+   println(String(номер));
+
+   println(String("~", prefix, "BCQuantity", номер, postfix));
+   println(1);
+
+   println(String("~", prefix, "PaymentPlace", номер, postfix));
+   println(ArrBnr[i].bnr.rec.PaymentPlace);
+
+   println(String("~", prefix, "CounterpartyAccount", номер, postfix));
+   println(ArrBnr[i].СчетНоминала);
+
+  return 0;
+
+END;
+
+
+
+/*  Итоговые суммы по векселям.
+*/
+PRIVATE MACRO ИтогТэг (prefix, face, cost, quantity, FIID, postfix)
+   if(ValType(postfix) != V_STRING)
+     postfix = "";
+   elif(postfix == "")
+     return 0;
+   end;
+
+  println(String("~", prefix, "FaceValueTotal", postfix));
+  println(StrSubSt(string(face:a),"'"," ") );
+
+  println(String("~", prefix, "FaceValueTotalWr", postfix));
+  println(ValueWr(face, FIID));
+
+  println(String("~", prefix, "BCCostTotal", postfix));
+  println(StrSubSt(string(cost:a),"'"," "));
+
+
+  println(String("~", prefix, "BCCostTotalWr", postfix));
+  println(ValueWr(cost, FIID));
+
+  println(String("~", prefix, "BCQuantityTotal", postfix));
+  println(quantity);
+
+  println(String("~", prefix, "BCQuantityTotalWr", postfix));
+  println(Прописью(quantity));
+
+  println(String("~", prefix, "FaceValueTotalStr", postfix));
+  println(Get_NumToStr(face, FIID));
+
+
+/*********************************************************************/
+
+  println(String("~", prefix, "TotalQuanityAndWr", postfix));
+  println(GetThing(quantity));
+
+  println(String("~", prefix, "TotalSumAndWr", postfix));
+  //println(StrLwr(string(Get_NumToStr(cost, FIID))));
+  println(string(Get_NumToStr(cost, FIID)));
+
+  println(String("~", prefix, "TotalFaceValueAndWr", postfix));
+  //println(StrLwr(string(Get_NumToStr(face, FIID))));
+  println(string(Get_NumToStr(face, FIID)));
+
+  return 0;
+
+END;
+
+/* Формирует вексельные тэги, на основе информации в массивах
+     групп и векселей
+*/
+PRIVATE MACRO ФормВексТэги()
+var i,                             /* индексы массива */
+    prefix = "Grp", 
+    postfix = "",
+    face, cost, quantity,          /* итоги */
+    bnr, leg, lnk, 
+    issuerName,
+    stat = 0;                      /* состояние */
+
+   if(ВидДоговора == Д_Мены)
+     prefix = "NewGrp";
+   elif(ВидДоговора == Д_Зачет)
+     postfix = "_dup_1";
+   end;
+   /* Группы векселей. Выводится информация, подсчитываются итоги.*/
+   i = quantity = face = cost = 0;
+   while( i < GB.ArrGrp.size )
+     if ((ВидДоговора == Д_Диск) or (ВидДоговора == Д_Бездох) or (ВидДоговора == Д_Проц))
+       ВексГруппТэг2(prefix, "1_", i);
+     else
+       ВексГруппТэг(prefix, i);
+       ВексГруппТэг(prefix, i, postfix);
+     end;
+     face = face + GB.ArrGrp[i].номинал * GB.ArrGrp[i].колич;
+     cost = cost + GB.ArrGrp[i].цена * GB.ArrGrp[i].колич;
+     quantity = quantity + GB.ArrGrp[i].колич;
+     i = i + 1;
+   end;
+   
+   // Допечатать вторую таблицу (сразу две не печатаются)
+   if ((ВидДоговора == Д_Диск) or (ВидДоговора == Д_Бездох) or (ВидДоговора == Д_Проц))
+     MultipleRow(3, GB.ArrGrp.size);
+     i = 0;
+     while( i < GB.ArrGrp.size )
+       ВексГруппТэг2(prefix, "2_", i);
+       i = i + 1;
+     end;
+   end;
+
+   /* Итог по группе */
+   if( i > 0 )
+     ИтогТэг(prefix, face, cost, quantity, GB.ArrGrp[0].PFI);
+     ИтогТэг(prefix, face, cost, quantity, GB.ArrGrp[0].PFI, postfix);
+   end;
+
+   /* По каждому векселю. Выводится информация, подсчитываются итоги. */
+   i = face = cost = 0; 
+   while( i < AB.ArrBnr.size )
+     prefix = "";
+     ВексТэг(prefix, i, AB.ArrBnr);
+     ВексТэг(prefix, i, AB.ArrBnr, postfix);
+     face = face + AB.ArrBnr[i].leg.rec.Principal;
+     cost = cost + AB.ArrBnr[i].lnk.rec.BCCost;
+     issuerName = NormalizeIssuerName(AB.ArrBnr[i].bnr.rec.IssuerName);
+     IssuePlace = issuerName + " " + AB.ArrBnr[i].bnr.rec.IssuePlace;
+     PaymentPlace = issuerName + " " + AB.ArrBnr[i].bnr.rec.PaymentPlace;
+     i = i + 1;
+   end;
+
+   /* Итог по векселям */
+   if( i > 0 )
+     ИтогТэг("", face, cost, AB.ArrBnr.size, AB.ArrBnr[0].leg.rec.PFI );
+     ИтогТэг("", face, cost, AB.ArrBnr.size, AB.ArrBnr[0].leg.rec.PFI, postfix );
+   end;
+
+   i = face = cost = 0; 
+   while( i < AB.ArrBnr_ms.size )
+     prefix = "New";     
+     ВексТэг(prefix, i, AB.ArrBnr_ms);
+     ВексТэг(prefix, i, AB.ArrBnr_ms, postfix);
+     face = face + AB.ArrBnr_ms[i].leg.rec.Principal;
+     cost = cost + AB.ArrBnr_ms[i].lnk.rec.BCCost;
+     i = i + 1;
+   end;
+
+   /* Итог по векселям */
+   if( (i > 0) AND (AB.ArrBnr_ms.size!=0))
+     ИтогТэг("New", face, cost, AB.ArrBnr_ms.size,AB.ArrBnr_ms[0].leg.rec.PFI);
+     ИтогТэг("New", face, cost, AB.ArrBnr_ms.size,AB.ArrBnr_ms[0].leg.rec.PFI, postfix);
+   end;
+
+   return (stat==0);
+END;
+
+PRIVATE MACRO OrderTag(order, paym)
+var 
+   stat = 0, 
+   RateStr = "",
+   zero_date = date(0,0,0);
+/*
+   if (order.rec.HandingDate != zero_date )
+     println(String("~", "HandingDateToCounterparty"));
+     println(order.rec.HandingDate:f);
+   end;
+
+   if (order.rec.DateReceived != zero_date )
+     println(String("~", "HandingDateToBank"));
+     println(order.rec.DateReceived:f);  
+   end;
+
+   // Если нет платежа, курсы брать неоткуда
+   if (paym == NULL) return (stat == 0); end;
+
+   if(ПолучитьСтрокуЗначенияКурса(paym.FactRate.Rate, paym.FactRate.Point, RateStr) == 0)
+      [~PaymentRate];
+      if(paym.FactRate.IsInverse == "X")
+         println(RateStr, " ", 
+                 ПолучитьКодФинИН(paym.PayerFIID), 
+                 " за ", paym.FactRate.Scale, " ",
+                 ПолучитьКодФинИН(paym.ReceiverFIID));
+      else
+         println(RateStr, " ", 
+                 ПолучитьКодФинИН(paym.ReceiverFIID), 
+                 " за ", paym.FactRate.Scale, " ",
+                 ПолучитьКодФинИН(paym.PayerFIID));
+      end;
+   end;
+*/
+   return (stat == 0);
+END;
+
+/*  Тэг для векселей.
+    Векселя печатаются в договоре в виде таблицы. Поэтому:
+      1. сначала информация по векселям анализируется,
+      2. формируются тэги для размножения строк таблицы,
+      3. собственно заполняются тэги для векселей.
+*/
+MACRO VS_VekselTag(order)
+var stat = 0;
+
+   if(not АнализВекселей(order))
+     stat = 1;
+   elif(not РазмножитьСтроки(order))
+     stat = 1;
+   elif(not ФормВексТэги())
+     stat = 1;
+   end;
+
+   return (stat==0);
+END;
+
+
+
+PRIVATE MACRO НайтиСвойствоПлатежа (prop, PaymentID, ДебетКредит )
+  prop.KeyNum = 0;
+  prop.rec.PaymentID = PaymentID;
+  prop.rec.DebetCredit = ДебетКредит; 
+
+  if(prop.GetEQ)
+    return true;
+  else
+    return false;
+  end;
+
+END;
+
+PRIVATE MACRO ОпредКорСхему (order, PaymsOrd, corschem,ВидДог)
+var Ok, stat = 0,
+   дк = -1,
+   prop   = TBfile("pmprop.dbt"), 
+   paym_O,
+   Corschem_num=-1;
+   
+  /* Выясним платежи */
+  if (ВидДог == Д_Зачет) 
+    /* сначала ищем платеж клиента банку */
+    paym_O = PaymsOrd.НайтиПлатеж(PM_PURP_VSDIFF2B);
+    /* не найден. Это не ошибка, тогда ищем платеж банка клиенту */
+    if (not paym_O)
+      paym_O = PaymsOrd.НайтиПлатеж(PM_PURP_VSDIFF2C);
+    end;
+  elif(ВидДог == Д_ДосрПогаш)
+    paym_O = PaymsOrd.НайтиПлатеж(PM_PURP_VEKSELDRAW); 
+    if ((not paym_O) or (paym_O.ReceiverAmount == 0))
+       /* тогда найдем платеж по оплате задолженности */
+       paym_O = PaymsOrd.НайтиПлатеж(PM_PURP_PAY_DEBT); 
+    end;
+  elif(ВидДог == Д_Мены)
+       /* сумма платежа равна 0 */
+       paym_O = PaymsOrd.НайтиПлатеж(PM_PURP_VSBARTERDIFF); 
+       if((paym_O == false) or (paym_O.ReceiverAmount == 0))
+         return true; /* Не ошибка */
+       end;
+  else /* для всех остальных видов договоров */
+   paym_O = PaymsOrd.ПлатежПоУмолчанию();
+   if (not paym_O) /* вообще нет платежа */
+     return true; /* Не ошибка */
+   end;
+  end;
+
+  if(not paym_O)
+    return true;
+  end;
+  /* Если счет плательщика не в нашем банке */
+  if( (paym_O.PayerBankID != {OurBank}) and (not IsOurFilial({OurBank}))) /*chva 490815 если оставить, то при печати договора в филиале выдает ошибку */
+  /* Если счет получателя не в нашем банке */
+  elif( (paym_O.ReceiverBankID != {OurBank}) and (not IsOurFilial({OurBank})) )
+    дк = 1;  /* значит должно быть свойство по Кредиту */
+  else
+    return true; /* т.е. искать корсхему не нужно */
+  end;
+
+  /* если у платежа должно быть свойства*/
+  if (дк != -1)
+    if ( not НайтиСвойствоПлатежа (prop, paym_O.PaymentID, дк))
+      stat = Ошибка ("Не найдено свойство платежа ", paym_O.PaymentID);
+    else
+      /* Ищем Корсхему по номеру взятому из свойства */
+      corschem.KeyNum = 1;
+      corschem.rec.Number  = prop.rec.Corschem;
+      corschem.rec.FI_Kind = FIKIND_CURRENCY;
+      corschem.rec.FIID    = paym_O.ReceiverFIID;
+      Ok = corschem.GetEQ;
+
+      if(not Ok)
+        stat = Ошибка ("Не найдена корсхема с номером ", corschem.rec.Number);
+      end;
+    end;
+  end;
+ return stat;
+END;
+
+
+/*  Тэг для реквизитов нашего банка.
+*/
+PRIVATE MACRO OurBankTag (order, PaymsOrd, ВидДог)
+var 
+   party = TBfile("party.dbt"), 
+   partcode = TBfile("partcode.dbt"),
+   settacc =  TBfile("settacc.dbt"),
+   corschem = TBfile("corschem.dbt"),
+   Валюта,
+   found, Ok;
+record PtAdress ( adress );
+
+   party.KeyNum = 0;
+   party.rec.PartyID = 1;
+   Ok = party.GetEQ;
+   if(Ok)
+      ClearRecord(PtAdress);
+      НайтиЮридическийАдресСубъекта(party.rec.PartyID,PtAdress);
+      [~SelfCaption];
+      println(party.rec.Name);
+      [~SelfCaptionShort];
+      println(party.rec.ShortName);
+      [~SelfAddress];
+      println(PtAdress.Adress);
+   end;
+
+   partcode.KeyNum = 0;
+   partcode.rec.PartyID = 1;
+   partcode.rec.CodeKind = PTCK_INN;
+   Ok = partcode.GetEQ;
+   if(Ok)
+      [~SelfTaxId_IdPurpose];
+      println(partcode.rec.Code);
+   end;
+
+   partcode.rec.CodeKind = PTCK_BIC;
+   Ok = partcode.GetEQ;
+   if(Ok)
+      [~SelfBankAlias];
+      println(partcode.rec.Code);
+   end;
+
+   if (ProcessingDepartment.PartyID == 1)
+     [~DprtRegion];
+     println(" ");
+     [~DprtRegionStr];
+     println(" ");
+     [~DprtAddressStr];
+     println(" ");
+     [~DprtAddress];
+     println(" ");
+   else
+     [~DprtRegion];
+     println(ExtractDepartmentRegion(ProcessingDepartment.FullName));
+     [~DprtAddress];
+     println(ProcessingDepartment.Address(PTADDR_LEGAL).Address);
+   end;
+
+   // Нет платежей (напр. залог), больше заполнять нечего
+   if(PaymsOrd.КоличествоПлатежей() == 0) return true; end;
+
+   if (not ОпредКорСхему (order, PaymsOrd, corschem, ВидДог)) /* определили корсхему*/
+     [~SelfBankAccount];
+     println(corschem.rec.CorAccount);
+     partcode.KeyNum = 0;
+     partcode.rec.PartyID = corschem.rec.CorrID;
+     partcode.rec.CodeKind = PTCK_BIC;
+     Ok = partcode.GetEQ;
+     if(Ok)
+       [~SelfBankAccountDmcAlias];
+       println(partcode.rec.Code);
+       party.KeyNum = 0;
+       party.rec.PartyID = corschem.rec.CorrID;
+       Ok = party.GetEQ;
+       if(Ok)
+         [~SelfBankAccountDmcCaption];
+         println(party.rec.Name);
+       end;
+     end;
+   else   
+       Валюта = PaymsOrd.ВалютаПлатежаПоУмолчанию();
+       if (Валюта == -1) /* валюта не определена */
+        Валюта = NATCUR;
+       end;
+      
+       settacc.KeyNum = 3;
+       /*CHVA 490815 по другому в филиале ругается на кор схему, потому что  {OurBank} = id филиала , пока как-то так*/
+       var BankOrFilial = 0;
+       if (IsOurFilial(party.rec.PartyID))
+         settacc.rec.PartyID = 1;
+         settacc.addFilter("t_PartyID = " + string(1)); // DEF-56486, без добавления фильтра SELECT неэффективен
+         BankOrFilial = 1;
+       else
+         settacc.rec.PartyID = {OurBank};
+         settacc.addFilter("t_PartyID = " + string({OurBank})); // DEF-56486, без добавления фильтра SELECT неэффективен
+         BankOrFilial =  {OurBank};
+       end;
+       /*CHVA*/
+
+
+       Ok = settacc.GetGE;
+       found = false;
+       while(Ok and (not found))
+          Ok = settacc.rec.PartyID == BankOrFilial/*{OurBank}*/;
+          found = Ok and 
+                  (settacc.rec.FIID == Валюта) and
+                  (settacc.rec.BankID == BankOrFilial/*{OurBank}*/);
+          if(Ok and (not found))
+            Ok = settacc.Next;
+          end;
+       end;
+       settacc.dropFilter(); // DEF-56486
+
+       if(found)
+          [~SelfBankAccount];
+          println(settacc.rec.CorrAcc);
+          [~SelfBankAccountDmcAlias];
+          println(settacc.rec.BankCorrCode);
+          [~SelfBankAccountDmcCaption];
+          println(settacc.rec.BankCorrName);
+       else
+         msgbox("Не найден кор.счет банка ");
+       end;
+
+   end;
+
+
+   return true;
+END;
+
+/*  Тэг-заглушка. Заполняется в последнюю очередь
+*/
+PRIVATE MACRO EndTag ()
+     return true;
+END;
+
+
+/*  Поиск и сохранение платежей по договору.
+*/
+PRIVATE MACRO FindPayms(paym:@variant, order, PaymsOrd, ВидДог)
+var
+   stat = 0;
+
+   /* Если это договор "Зачет требований" */
+   if(ВидДог == Д_Зачет)
+          /* ищем платеж клиента банку */
+          if(НайтиПлатежПоДоговору(@paym, order, PM_PURP_VSDIFF2B))
+            PaymsOrd.ДобавьПлатеж(paym, true);
+          end;
+          /* ищем платеж банка клиенту */
+          if(НайтиПлатежПоДоговору(@paym, order, PM_PURP_VSDIFF2C))
+            PaymsOrd.ДобавьПлатеж(paym);
+          end;
+   /* Если это досрочное погашение */
+   elif(ВидДог == Д_ДосрПогаш)
+          /* ищем платеж по оплате векселя */
+          if(НайтиПлатежПоДоговору(@paym, order, PM_PURP_VEKSELDRAW))
+             PaymsOrd.ДобавьПлатеж(paym, true);
+          end;
+          /* ищем платеж по оплате задолженности */
+          if(НайтиПлатежПоДоговору(@paym, order, PM_PURP_PAY_DEBT))
+             PaymsOrd.ДобавьПлатеж(paym);
+          end;
+   else /*для остальных видов дог. */
+          if(НайтиПлатежПоДоговору(@paym, order, -1))
+             PaymsOrd.ДобавьПлатеж(paym, true);
+          end;
+   end;
+
+   return (stat == 0);
+END;
+
+
+/*  Формирование тэгов, характерных для зачета требований. */
+PRIVATE MACRO ЗачетТребований(order)
+var Дог = NULL,  /* Объект договора "Зачет Требований" */
+    stat = 0;
+
+    Дог = ДогЗачетТреб ( order);   /* конструируем объект */
+    if(Дог.Init())                 /* доп.инициализация объекта */
+        stat = 1;
+    else
+        MultipleRow(2, Дог.InfLinkOrd.size); /* размножаем строки таблицы N2 */
+        MultipleRow(3, Дог.InfLinkOrd.size); /* размножаем строки таблицы N3 */
+        Дог.ФормВсеТеги();             /* формирует все теги дог. "Зачет Требований */
+    end;
+
+    return stat;
+END;
+
+
+/*  Формирование тэгов, характерных для договора мены. */
+PRIVATE MACRO ДогМены(order, paym)
+var stat = 0, RateStr;
+
+    if(ПолучитьСтрокуЗначенияКурса(order.rec.Rate, order.rec.Point, RateStr) == 0)
+       [~ContractRate];
+       if(order.rec.IsInverse == "X")
+          println(RateStr, " ", 
+                  ПолучитьКодФинИН(ВалютаСтарых), 
+                  " за ", order.rec.Scale, " ",
+                  ПолучитьКодФинИН(ВалютаНовых));
+       else
+          println(RateStr, " ", 
+                  ПолучитьКодФинИН(ВалютаНовых), 
+                  " за ", order.rec.Scale, " ",
+                  ПолучитьКодФинИН(ВалютаСтарых));
+       end;
+    end;
+
+    return stat;
+END;
+
+
+/*  Формирование тэгов, характерных для зачета требований. */
+PRIVATE MACRO AccountsTag(paym)
+var stat = 0;
+
+   // Если нет платежа, то нет и счетов в нем
+   if (paym == NULL) return (stat == 0); end;
+
+    [~PayerAccount];
+    println(paym.PayerAccount);
+    [~ReceiverAccount];
+    println(paym.ReceiverAccount);
+
+    return (stat == 0);
+END;
+
+
+/*  Формирование специфичных тэгов.
+*/
+PRIVATE MACRO SpecificTag(order, spg, paym)
+var Дог = NULL,  /* Объект договора "Зачет Требований" */
+    stat = 0;
+    var transferDate = null;
+
+    if (paym != NULL)
+      [~ValueDateAgreed];
+      println(paym.ValueDate:m:f);
+      transferDate = paym.ValueDate + 1;
+    else
+      transferDate = spg.rec.SignedDate + 2;
+    end;
+     
+    [~TransferDate];
+    println(transferDate:m:f);
+
+/*
+    if (ВидДоговора == Д_Диск) 
+       [~ValueDateAgreed];
+       println(paym.ValueDate:m:f);
+    elif (ВидДоговора = Д_Проц)
+       [~ValueDateAgreed];
+       println(Get_DaysToStr(order.rec.HandOver - paym.ValueDate));
+    end;
+*/
+    //if ((ВидДоговора == Д_Эмиссии) or (ВидДоговора == Д_Проц) or (ВидДоговора == Д_Диск))
+       [~issueplace];
+       println(IssuePlace);
+
+       [~paymentplace];
+       println(PaymentPlace);
+
+       if (ВалПлатежа != 0)
+
+          [~blooper];
+          println("\nВекселя содержат оговорку эффективного платежа в " + GetCCY(ВалПлатежа) + ".");       
+       end;
+    //end;
+
+    return (stat == 0);
+END;
+
+//Определяет вид договора по первому попавшемуся векселю в договоре
+macro GetDocTypeIssue (order):integer
+  var sql, DocType = 0;
+  sql = " select t_principal-t_receiptamount diff, \n"
+      + "       t_formula formula \n"
+      + "from ddl_leg_dbt leg, dvsordlnk_dbt lnk \n"
+      + "where leg.t_legid = 0 and leg.t_legkind = 1 \n"
+      + "      and lnk.t_bcid = leg.t_dealid \n"
+      + "      and lnk.t_contractid = :contractid \n"
+      + "      and lnk.t_dockind = :dockind \n";
+  sql = ExecSqlSelect(sql, MakeArray(SqlParam("contractid", order.rec.ContractID),
+                                     SqlParam("dockind", order.rec.DocKind)), false);
+  if (sql.MoveNext() )
+    if (int(sql.value("formula")) == 1)
+      DocType = Д_Проц;
+    else
+      if (int(sql.value("diff")) == 0) 
+        DocType = Д_Бездох;
+      else
+        DocType = Д_Диск;
+      end;
+    end;     
+  end;
+
+  return DocType;
+End;
+
+/*  Выбор шаблона выбор шаблона и определение вида договора 
+*/
+PRIVATE MACRO ChoiceTmpl(order, tmpl, paym)
+var
+    printed = false,
+    stat = 0,
+    LegalForm = GetLegalForm(order.rec.Contractor),
+    pril,
+    DocName = "",
+    OurBank = {HeadBankID},
+    isIP = false;
+    
+    if (LegalForm == 1)
+      isIP = DetectIPByPartyName(order.rec.ContractorName);
+    end;
+
+    if((order.rec.DocKind == DL_VSBARTERORDER) and (order.rec.ContractKind == DL_ORDER_VSBARTER)) /* договор мены */
+      ВидДоговора = Д_Мены;
+    elif((order.rec.DocKind == DL_VEKSELDRAWORDER) and (order.rec.ContractKind == DL_ORDER_VSDRAW_EARLY)) /* договор досрочного погашения */
+      ВидДоговора = Д_ДосрПогаш;
+    elif((order.rec.DocKind == DL_VEKSELDRAWORDER) and (order.rec.ContractKind == DL_ORDER_VSDRAW)) /* договор погашения */
+      if (order.rec.kind_operation == DL_ORDER_VSBAYOUT )
+        ВидДоговора = Д_Выкуп;
+      else
+        ВидДоговора = Д_Погаш;
+      end;
+    elif((order.rec.DocKind == DL_VSSTORAGEORDER) and (order.rec.ContractKind == DL_ORDER_VSSTORE)) /* договор хранения */
+      ВидДоговора = Д_Хран;
+    elif(order.rec.DocKind == DL_VEKSELPAWNORDER) /* Залог */
+      ВидДоговора = Д_Залог;
+    elif(order.rec.DocKind == DL_VSINTERCHANGE) /* договор Зачет требований */
+      ВидДоговора = Д_Зачет;
+    elif(order.rec.DocKind == DL_VSSALE)
+      ВидДоговора = Д_Продажа;
+    else
+      ВидДоговора = Д_Эмиссии;
+    end;
+
+    if (order.rec.DocKind == DL_VEKSELORDER) //договор эмиссии
+      ВидДоговора = GetDocTypeIssue(order);
+    end;
+
+      if ((paym != NULL) and IsOurFilial(paym.PayerBankID)) 
+        pril = ".1"; 
+        PayBank = 1;
+      else
+        pril = ""; 
+        PayBank = 0;
+      end;
+
+    if ((ВидДоговора == Д_Диск) or (ВидДоговора == Д_Бездох) or (ВидДоговора == Д_Проц))
+
+      if ((LegalForm == 1) and (not isIP))
+        DocName = "VD_30l.dotx";
+      elif (LegalForm == 2)
+        DocName = "VD_30p.dotx";       
+      elif ((LegalForm == 3) or isIP)
+        DocName = "VD_30ip.dotx";
+      end; 
+
+    elif (ВидДоговора == Д_Выкуп) 
+      if (LegalForm == 1) 
+        DocName = "VD_5l.dotx";
+      elif (LegalForm == 2)
+        DocName = "VD_5p.dotx";
+      elif (LegalForm == 3)
+        DocName = "VD_5ip.dotx";
+      end; 
+
+    elif (ВидДоговора == Д_Продажа) 
+      if (LegalForm == 1)  
+        DocName = "VD_6l.dotx";
+      elif (LegalForm == 2)
+        DocName = "VD_6p.dotx";
+      elif (LegalForm == 3)
+        DocName = "VD_6ip.dotx";
+      end; 
+    
+    elif (ВидДоговора = Д_Мены)
+      if (LegalForm == 1) 
+        DocName = "VD_36l.dotx";
+      elif (LegalForm == 2)
+        DocName = "VD_36p.dotx";
+      elif (LegalForm == 3)
+        DocName = "VD_36ip.dotx";
+      end
+    end;
+
+    println(DocName);
+    //MsgBox(DocName);
+    return (stat == 0);
+END;
+
+
+/*  Печать договора мены векселей.
+    ContractID - индентификатор договора
+      Сначала осуществляется поиск договора, затем печать.
+*/
+MACRO PrintReport (ContractID, tmpl)
+var
+    PaymsOrd,
+    order = TBfile ("dl_order"),
+    paym,
+    spg = TBfile("spground.dbt"),
+    stat = 0;
+
+    PaymsOrd = ПлатежиДоговора ();
+    VS_InitRepBanners();
+    
+    if(not ПоискДоговора(order, ContractID))
+      stat = Ошибка("Не найден договор ", ContractID);
+    elif(not ПоискРегистратора(spg, order))
+      stat = Ошибка("Не найден входящий/исходящий|документ для договора ", ContractID);
+    elif(not FindPayms(@paym, order, PaymsOrd, ВидДоговора)) /*ищет инфо по платежам*/
+      stat = 1;
+    elif(not ChoiceTmpl(order, tmpl, paym)) /* выбор шаблона и определение вида договора */
+      stat = 1;
+    elif(not CommonOrderTag(order, spg, PaymsOrd)) /*стороны в шапке + реквизиты клиента + стороны в акте*/
+      stat = 1;
+    elif(not VS_VekselTag(order)) /*информация по векселям*/
+      stat = 1;
+    elif(not OrderTag(order, paym)) 
+      stat = 1;
+    elif(not ProxyTag(order.rec.DocKind, order.rec.ContractID, order.rec.Contractor, IIF((order.rec.DocKind == DL_VEKSELORDER), true, false))) /*представители сторон*/
+      stat = 1;
+    elif(not OurBankTag(order, PaymsOrd, ВидДоговора)) /*реквизиты нашего банка*/
+      stat = 1;
+    elif(not SpecificTag(order, spg, paym)) /*??? хз*/
+      stat = 1;
+    elif(not EndTag())
+      stat = 1;
+    else
+      DLWREPS_PrintReportFromTagFile (SetOutput (CreateFileName));
+      SetOutput(NULL, false);
+    end;
+/*
+    var ob;
+    ob = CDAOMSWord(WordFileName, false);
+    ob.Show(false);
+    if(ob.ExportAsFixedFormat(WordFileName+".pdf"))
+      ob.Close;
+      ob.Destructor;
+      MsgBox("Создан файл: " + WordFileName+".pdf");
+    else
+      ob.Show(true);
+    end;
+
+    if (not RemoveFile (WordFileName))
+      MsgBox("Ошибка удаления файла " + WordFileName);
+    end;
+*/
+    return stat;
+
+END;

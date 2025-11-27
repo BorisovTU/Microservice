@@ -1,0 +1,466 @@
+/*
+$Name:             pmclirin.mac
+$Module:           
+$Description:      
+*/
+//------------------------------------------------------------------------------
+//         Автоматизированная банковская система RS-Bank v6
+//                 Copyright (c) R-Style Software Lab
+//
+//  Имя файла        : pmclirin.mac
+//
+//  Описание         : Макрофункция определения кода клиринга в системе
+//                     межфилиальных расчетов СБ РФ("Клиринг")
+//  Программист      : Дудин В.А.
+//
+//  Создан           : 19.08.99
+//
+//  15.03.2005 - Макрос модифицирован для ЦАБС
+//               Теперь макрос выполняет только сделующие функции:
+//                 - Доформирование названия клиента
+//                 - Определение типа сообщения по умолчанию
+//                 - Определение очередности по умолчанию
+//                 - Определение участника получателя (*MesBankID) только для внешнего платежа
+//------------------------------------------------------------------------------
+
+import globals, PTInter, PaymInter, OprInter, FIInter, CTInter, oralib, likepy, pmprops, pm_tools;
+
+private file PartCode      ( partcode ) key 1; /*  Код контрагента (по коду)       */
+private file PartCode_Kind ( partcode ) key 0; /*  Код контрагента (по виду кода)  */
+
+//------------------------------------------------------------------------------
+//Счет является коррсчетом по некоторой схеме корр.расчетов?
+//------------------------------------------------------------------------------
+PRIVATE MACRO IsAccountInCorrSchem( account:string, FIID:integer ):integer
+  var select:string = "select t_CorrID "
+                    + "from dcorschem_dbt cs "        
+                    + "where cs.t_Account = :account "   
+                    + "and cs.t_FIID = :fiid";
+  var params:TArray = TArray();
+  params[params.size] = SQLParam( "account" , account );
+  params[params.size] = SQLParam( "fiid" , FIID );
+  var rset:RsdRecordset = execSQLselect( select, params, false );
+  if( rset AND rset.moveNext() )
+    return rset.Value(0);
+  end;
+  return 0;
+END;
+
+//------------------------------------------------------------------------------
+// Получить название банка-держателя счета
+// для добавления в поле названия клиента
+//------------------------------------------------------------------------------
+PRIVATE MACRO GetAccountOwnerName( prop:TPaymentProps ):string
+  var OwnerID:integer = prop.AccountOwnerID();
+  if( (prop.Group()==PAYMENTS_GROUP_EXTERNAL) AND (OwnerID==prop.BankID()) )
+    return "";
+  end;
+  return Bnk_GetPartyName( OwnerID );
+END;
+                                   
+//------------------------------------------------------------------------------
+// Банк существует и закрыт?
+//------------------------------------------------------------------------------
+PRIVATE MACRO IsBankExistAndClosed( BankID:integer ):bool
+  
+  var select:string = "select bd.t_Lock " +
+                      "from dbankdprt_dbt bd " +
+                      "where bd.t_PartyID=:PartyID";
+  var params:TArray = TArray();
+  params[params.size] = SQLParam( "PartyID" , BankID );
+  var rset:object = execSQLselect( select, params, false );
+  if( rset AND rset.moveNext() )
+    return ( rset.Value(0) == "X" );
+  end;
+  return false;
+END;
+
+//------------------------------------------------------------------------------
+// Получить код субъекта и его активность
+//------------------------------------------------------------------------------
+PRIVATE MACRO GetPartyCode( PartyID:integer, CodeKind:integer,
+                            Code:string, Active:bool ):bool
+  var select:string = "select pc.t_Code, pc.t_State " +
+                      "from dpartcode_dbt pc " +
+                      "where pc.t_PartyID=:PartyID " + 
+                      "  and pc.t_CodeKind=:CodeKind";
+  var params:TArray = TArray();
+  params[params.size] = SQLParam( "PartyID" , PartyID );
+  params[params.size] = SQLParam( "CodeKind" , CodeKind );
+  var rset:object = execSQLselect( select, params, false );
+  if( rset AND rset.moveNext() )
+    Code = rset.Value(0);
+    Active = ( rset.Value(1) == 0 );
+    SetParm( 2, Code );
+    SetParm( 3, Active );
+    return true;
+  end;
+  return false;
+END;
+
+//------------------------------------------------------------------------------
+// Получить правопреемника (рекурсивно)
+//  ID         - PartyID закрытого банка
+//  AssigneeID - PartyID правопреемника (возвращаемый параметр)
+//               Если правопреемник не задан, вернет сам себя
+// Вернет true, если запрос выполнился успешно
+// Вернет false, если запрос ничего не вернет или отвалится (например зациклится)
+//------------------------------------------------------------------------------
+MACRO GetPartyAssignee( ID:integer, AssigneeID:@integer ):bool
+  var select:string = "select asg.t_PartyID " +
+                      "from ( select bd.T_PARTYID T_PARTYID " +
+                             "from dbankdprt_dbt bd " +
+                             "connect by bd.T_PARTYID = prior (select to_number(ol.T_ATTRID) " +
+                                                              "from dobjlink_dbt ol " +
+                                                              "where ol.T_OBJECTTYPE = 3 " + 
+                                                                "and ol.T_OBJECTID   = lpad( bd.T_PARTYID, 10, '0' ) " +
+                                                                "and ol.T_GROUPID    = 1 " +
+                                                                "and ol.T_ATTRTYPE   = 3) " +
+                                    "and prior bd.T_LOCK = 'X' " +
+                             "start with bd.T_PARTYID = :PartyID " +
+                             "order by level desc ) asg " +
+                       "where rownum = 1";
+
+  var params:TArray = makeArray( SQLParam( "PartyID", ID ) );
+  var rset:object = execSQLselect( select, params, true );
+  if( rset.moveNext() )
+    AssigneeID = rset.Value(0);
+    return true;
+  else
+    return false;
+  end;
+onerror( x )
+  MsgBox( x.message );
+  return false;
+END;
+
+
+//------------------------------------------------------------------------------
+// Получить ID участника расчетов для расчетов СБРФ
+//------------------------------------------------------------------------------
+PRIVATE MACRO SB_SetMesBankID( Prop:TPaymentProps, ErrorText:string, CheckCodeCliring:bool ):bool
+  var SMFR_Code:string;
+  var Clir_Code:string;
+  var CorrBankBIC:string;
+  var BICMask:string;
+  var BIC_Active:bool;
+  var REC_BANK_BIC:string;
+  var REC_BIC_ACTIVE:bool;
+  var Clir_Active:bool;
+  var CorrBankID:integer = 0;
+  var MesBankID:integer = -1;
+  var result   :bool = true;
+  var select   :string;
+  var params   :TArray = TArray();
+  var rset     :object;
+  var AccBal:string;
+
+  CorrBankID = IsAccountInCorrSchem( Prop.Account(), Prop.FIID() );
+  // 1. если счет открыт в "нашем банке" и не является корр.счетом по некоторой корр. схеме
+  //  if( (Prop.Group() != PAYMENTS_GROUP_EXTERNAL) and (CorrBankID == 0)  )
+  //    MesBankID = {OurBank};
+  // 2. если счет открыт в "нашем" и является корр.счетом по некоторой корр. схеме
+  if( (Prop.Group() != PAYMENTS_GROUP_EXTERNAL) and (CorrBankID != 0) )
+      //если банк-корреспондент является СБ РФ
+      if( CorrBankID and BankIsSB(CorrBankID) )
+        SMFR_Code = SubStr( Prop.Account(), 17, 4 );
+        MesBankID = GetCodeOwnerID( PTCK_SMFR, SMFR_Code );
+      //если банк-корреспондент имеет БИК
+      elif( GetPartyCode( CorrBankID, PTCK_BIC, CorrBankBIC, BIC_Active ) )
+        //найдем БИК банка-получателя для региона по первым четырем цифрам БИКа
+        GetPartyCode( Prop.BankID(), PTCK_BIC, REC_BANK_BIC, REC_BIC_ACTIVE );
+        BICMask = SubStr( REC_BANK_BIC, 1, 4 );
+        select = "select pcc.t_Code "
+               + "from dpartcode_dbt pcb, dbankdprt_dbt kb, dpartcode_dbt pcc "
+               + "where pcb.t_CodeKind = :CodeKindBIC "
+               + "and kb.t_PartyID = pcb.t_PartyID "
+               + "and kb.t_UERType = :Type "
+               + "and pcb.t_Code like :Mask "
+               + "and pcc.t_PartyID = pcb.t_PartyID "
+               + "and pcc.t_PartyID = kb.t_PartyID "
+               + "and pcc.t_CodeKind = :CodeKindClir";
+        params[params.size] = SQLParam( "CodeKindBIC" , PTCK_BIC );
+        params[params.size] = SQLParam( "Type"        , PT_KIND_SAVINGS_BANK );
+        params[params.size] = SQLParam( "Mask"        , BICMask + "%" );
+        params[params.size] = SQLParam( "CodeKindClir", PTCK_CLIRING );
+        rset = execSQLselect( select, params, false );
+        if( rset AND rset.moveNext() )
+          Clir_Code = rset.Value(0);
+        else
+          Clir_Code = "";
+          MsgBox("Ошибка при определении кода клиринга банка-получателя для региона");   
+        end;
+        //найдем территориальный банк
+        if( Clir_Code != "" )
+          MesBankID = GetCodeOwnerID( PTCK_CLIRING, string( SubStr(Clir_Code,1,2), "00000000" ) );
+        end;
+      else
+        //поиск субъекта по нулевому коду клиринга
+        MesBankID = GetCodeOwnerID( PTCK_CLIRING, "0000000000" );
+        if( MesBankID == -1 )
+          MsgBox("Невозможно определить получателя сообщения");
+          result = false;
+        end;
+      end;
+  else
+      //если банк-владелец счета является СБ РФ
+      if( BankIsSB( Prop.BankID() ) )
+        AccBal = SubStr( Prop.Account(), 1, 5 );
+        if( not Prop.Account() )
+          MesBankID = Prop.BankID();
+        else
+          if( (AccBal == "30301") or (AccBal == "30302") or (AccBal == "30109") or (AccBal == "30111") )
+            SMFR_Code = SubStr( Prop.Account(), 17, 4 );
+          else
+            SMFR_Code = SubStr( Prop.Account(), 10, 4 );
+          end;
+          MesBankID = GetCodeOwnerID( PTCK_SMFR, SMFR_Code );
+        end;
+      else
+        if( Prop.Group() == PAYMENTS_GROUP_EXTERNAL )
+          //если банк-владелец счета имеет БИК
+          if( GetPartyCode( Prop.BankID(), PTCK_BIC, REC_BANK_BIC, REC_BIC_ACTIVE ) )
+            BICMask = SubStr( REC_BANK_BIC, 1, 4 );
+            select = "select pcc.t_Code "
+                   + "from dpartcode_dbt pcb, dbankdprt_dbt kb, dpartcode_dbt pcc "
+                   + "where pcb.t_CodeKind = :CodeKindBIC "
+                   + "and kb.t_PartyID = pcb.t_PartyID "
+                   + "and kb.t_UERType = :Type "
+                   + "and pcb.t_Code like :Mask "
+                   + "and pcc.t_PartyID = pcb.t_PartyID "
+                   + "and pcc.t_PartyID = kb.t_PartyID "
+                   + "and pcc.t_CodeKind = :CodeKindClir";
+            params[params.size] = SQLParam( "CodeKindBIC" , PTCK_BIC );
+            params[params.size] = SQLParam( "Type"        , PT_KIND_SAVINGS_BANK );
+            params[params.size] = SQLParam( "Mask"        , BICMask + "%" );
+            params[params.size] = SQLParam( "CodeKindClir", PTCK_CLIRING );
+            rset = execSQLselect( select, params, false );
+            if( rset AND rset.moveNext() )
+              Clir_Code = rset.Value(0);
+            else
+              Clir_Code = "";
+              MsgBox("Ошибка при определении кода клиринга банка-получателя для региона");   
+            end;
+            //найдем территориальный банк
+            if( Clir_Code != "" )
+              MesBankID = GetCodeOwnerID( PTCK_CLIRING, string( SubStr(Clir_Code,1,2), "00000000" ) );
+            end;
+          else
+            //поиск субъекта по нулевому коду клиринга
+            MesBankID = GetCodeOwnerID( PTCK_CLIRING, "0000000000" );
+            if( MesBankID == -1 )
+              MsgBox("Невозможно определить получателя сообщения");
+              result = false;
+            end;                           
+          end;
+        else
+          MesBankID = Prop.BankID();
+        end;
+      end;
+  end;
+
+  if(MesBankID == -1)
+     MesBankID = 0;
+     if(CheckCodeCliring)
+     result = false;
+  end;
+  end;
+  
+  // Проверка активности кода клиринга
+  if( result AND CheckCodeCliring )
+    if( GetPartyCode( MesBankID, PTCK_CLIRING, Clir_Code, Clir_Active ) )
+      if( not Clir_Active )
+        MsgBox( "Код клиринга " + Clir_Code + " является неактивным" );
+        result = false;
+      end;
+    end;
+  elif( not result )
+    MsgBox( "Ошибка при определении участника " + ErrorText );
+  end;
+  
+  if( result )
+    Prop.MesBankID( MesBankID );
+  else
+    Prop.MesBankID( 0 );
+  end;
+
+  return result;
+END;
+
+/* Параметр Generation принимает следующие значения:
+PM_CLIRING_MODE_PANEL = 0 - Вход в панель позиционирования
+PM_CLIRING_MODE_REGEN = 1 - Принудительная перегенерация
+PM_CLIRING_MODE_MODIF = 2 - Изменение ключевых реквизитов
+PM_CLIRING_MODE_EXIT  = 3 - Выход из панели позиционирования
+PM_CLIRING_MODE_SAVE  = 4 - Сохранение платежа
+PM_CLIRING_MODE_ROUTE = 7 - Изменился маршрут платежа
+
+   Если макрос возвращает TRUE - изменения, произведенные в макросе, сохраняются.
+   Иначе (если возвращается false), изменения не учитываются */
+MACRO Cliring( Generation, PaymPtr:MEMADDR, RmPtr:MEMADDR, DebetPtr:MEMADDR, CreditPtr:MEMADDR,
+                           Old_PaymPtr:MEMADDR, Old_RmPtr:MEMADDR, Old_DebetPtr:MEMADDR, Old_CreditPtr:MEMADDR )
+
+  var SaveGeneration:integer = Generation;
+  var result:bool            = True;
+
+  record fininstr_paym( fininstr );
+
+  record Pm_paym ( pmpaym   ); /* Структуры после текущего изменения */
+  record Rm_prop ( pmrmprop );
+  record Debet   ( pmprop   );      
+  record Credit  ( pmprop   );
+
+  record Old_Pm_paym ( pmpaym   ); /* Структуры до текущего изменения */
+  record Old_Rm_prop ( pmrmprop );
+  record Old_Debet   ( pmprop   );
+  record Old_Credit  ( pmprop   );
+
+  SetBuff( Pm_paym, PaymPtr );
+  SetBuff( Rm_prop, RmPtr );
+  SetBuff( Debet, DebetPtr );
+  SetBuff( Credit, CreditPtr );
+
+  SetBuff( Old_Pm_paym, Old_PaymPtr );
+  SetBuff( Old_Rm_prop, Old_RmPtr );
+  SetBuff( Old_Debet, Old_DebetPtr );
+  SetBuff( Old_Credit, Old_CreditPtr );  
+
+  //------------------------------------------------------------
+  // Проверки на тип платежа (надо ли запускать перерасчет?)
+  //------------------------------------------------------------
+  /* Для валютных (или сводных платежей) платежей никаких проверок не выполняем */
+  if( (Pm_paym.PayFIID != 0) OR (Pm_paym.Purpose == PM_PURP_MULTI) )
+    return result;
+  end;
+
+  /* Если макрос клиринга запускается для вставки ответных платежей МБР 
+     (генерация платежей по сообщениям), то пока ничего не делаем, т.к. макрос 
+     генерации должен все определить сам, иначе макрос клиринга начинает 
+     изменять ответный платеж (добавляет текстовки, меняет тип сообщения) */
+  if( Pm_paym.DocKind == WL_INDOC )
+    return result;
+  end;
+
+  /* Для платежей по ценным бумагам ничего не делаем */
+  if( (ПолучитьФинИн( Pm_paym.FIID, fininstr_paym) == 0) AND (fininstr_paym.FI_Kind == FIKIND_AVOIRISS) )
+    return result;
+  end;
+
+  /* Расчет запускаем также при входе, сохранении платежа, вводе в отложенные */
+  if( (Generation == PM_CLIRING_MODE_PANEL) OR
+      (Generation == PM_CLIRING_MODE_REGEN) OR
+      (Generation == PM_CLIRING_MODE_SAVE) )
+    Generation = PM_CLIRING_MODE_REGEN;
+  else
+    /* Если изменения важные, то запускаем перерасчет */
+    if ( (Generation!=PM_CLIRING_MODE_MODIF) OR
+         ( (Pm_paym.Payer==Old_Pm_paym.Payer) AND (Pm_paym.PayerBankID==Old_Pm_paym.PayerBankID) AND
+           (Pm_paym.PayerMesBankID==Old_Pm_paym.PayerMesBankID) AND (Pm_paym.PayerAccount==Old_Pm_paym.PayerAccount) AND
+           (Pm_paym.Receiver==Old_Pm_paym.Receiver) AND (Pm_paym.ReceiverBankID==Old_Pm_paym.ReceiverBankID) AND
+           (Pm_paym.ReceiverMesBankID==Old_Pm_paym.ReceiverMesBankID) AND (Pm_paym.ReceiverAccount==Old_Pm_paym.ReceiverAccount)
+         )
+       )
+       return TRUE;
+    end;
+    if( (Generation==PM_CLIRING_MODE_MODIF) AND (Pm_paym.PayerAccount=="") AND (Pm_paym.ReceiverAccount=="") )
+      /* Еще не все заполнили, перерасчет не запускаем */
+      return TRUE;
+    end;
+  end;
+
+  var payProp    :TPaymentProps = TPaymentProps( Pm_paym, Rm_prop, Debet, Credit, PRT_Debet  );
+  var recProp    :TPaymentProps = TPaymentProps( Pm_paym, Rm_prop, Debet, Credit, PRT_Credit );
+  var payProp_old:TPaymentProps = TPaymentProps( Old_Pm_paym, Old_Rm_prop, Old_Debet, Old_Credit, PRT_Debet  );
+  var recProp_old:TPaymentProps = TPaymentProps( Old_Pm_paym, Old_Rm_prop, Old_Debet, Old_Credit, PRT_Credit );
+
+  //---------------------------------------------------------
+  // Обработка кода банка получателя
+  //---------------------------------------------------------
+  var CheckCodeCliring:bool = false;
+  var outProp    :TPaymentProps = NULL;
+  var outProp_old:TPaymentProps = NULL;
+  var inProp     :TPaymentProps = NULL;
+  var inProp_old :TPaymentProps = NULL; 
+  var MesID:integer = payProp.MesBankID();
+    
+  if( (payProp.Group() == PAYMENTS_GROUP_EXTERNAL) AND (not payProp.IsSender()) )
+    outProp     = payProp;
+    outProp_old = payProp_old;
+    inProp      = recProp;
+    inProp_old  = recProp_old;
+  elif( (recProp.Group() == PAYMENTS_GROUP_EXTERNAL) AND (not recProp.IsSender()) )
+    outProp     = recProp;
+    outProp_old = recProp_old;
+    inProp      = payProp;
+    inProp_old  = payProp_old;    
+  end;
+  
+  //Имеет смысл, только если мы - Сбербанк РФ или транспорт - SBRF3
+  if( outProp and ( ( outProp.TpID() == 4 ) or ( outProp.TpID() == 0 ) and ( BankIsSB( {OurBank} ) ) ) )
+    
+    if( ( outProp.BankID()  != outProp_old.BankID()  ) OR
+        ( outProp.Account() != outProp_old.Account() ) OR
+        ( Generation == PM_CLIRING_MODE_MODIF ) OR
+        ( Generation == PM_CLIRING_MODE_REGEN ) )
+
+      if( ( SaveGeneration==PM_CLIRING_MODE_MODIF ) OR ( SaveGeneration==PM_CLIRING_MODE_SAVE ) )
+        if( (outProp.TpID() == 4) OR (outProp.TpID() == 0) )
+          CheckCodeCliring = true;
+        end;
+      end;
+      //найдем новые коды клиринга
+      if( inProp )
+        result = SB_SetMesBankID( inProp, "отправителя", CheckCodeCliring );
+      end;
+      if( outProp )
+        result = SB_SetMesBankID( outProp, "получателя", CheckCodeCliring );
+      end;
+      if( not result )
+        return false;
+      end;
+    end;
+  
+  else
+    
+    //если корсхема уже определена и банк-корреспондент не является учреждением СБ РФ
+    //(для исходящих внешних платежей)
+    if( outProp and (outProp.CorschemNum() != -1) and (outProp.Group() == PAYMENTS_GROUP_EXTERNAL) )
+      if( not BankIsSB( outProp.CorrBankID() ) )
+        return true;
+      end;
+    end;
+
+  end;               
+
+  //---------------------------------------------------------
+  // Установка типа сообщения
+  //---------------------------------------------------------
+  if( ( ( Pm_paym.DocKind == DLDOC_BANKPAYMENT ) or ( Pm_paym.DocKind == BBANK_CPORDER ) )
+      and ( Rm_prop.MessageType == "192" ) )
+    ; // Если документ является возвратом - то не трогаем MessageType (временная мера)
+  else
+    Rm_prop.MessageType = Found_Type_Clir(Pm_paym, Rm_prop, Debet, Credit, outProp );
+  end;
+
+  //---------------------------------------------------------
+  // Обработка правопреемника получателя при закрытом банке
+  //---------------------------------------------------------
+  var ID:integer = 0;
+  if( outProp )
+    ID = outProp.MesBankID();
+  end;
+
+  if( ID and IsBankExistAndClosed( ID ) )
+
+    result = GetPartyAssignee( ID, @ID );
+    if( result )
+      outProp.MesBankID( ID );
+    else
+      MsgBox( "Ошибка поиска правопреемника для закрытого субъекта PartyID=", ID );
+      return result;
+    end;
+
+  end;
+
+  return result;
+end;

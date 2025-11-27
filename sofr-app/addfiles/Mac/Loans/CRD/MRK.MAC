@@ -1,0 +1,1222 @@
+/*
+$Name:             Mrk.mac                                              
+$Module:           Кредитование
+$Description:      МРК
+*/
+
+/*------------------------------------------------------------------------------
+                     Библиотека интерпретируемых модулей
+
+ Filename    : mrk.mac
+ Description : Расчёт максимального размера кредита
+
+ Programmer  : SAE
+ 10.04.01    : Создан
+ Изменения   :
+------------------------------------------------------------------------------*/
+import CTInter, ActiveX, VBAconst, "total.mac", Календарь, LoansFind, replib, scoring;
+
+private file ClaimF  ("claim.dbt",    "loans.def");
+private file crtype  ("type_crd.dbt", "loans.def");
+private file CiCode  ("ci_code.dbt",  "loans.def");
+private file CreditC ("credit_c.dbt", "loans.def") key 6;
+private file PlanPay ("planpay.dbt",  "loans.def");
+private file mrkGraph("planpay.dbt",  "loans.def");
+private file DutyCrd ("duty_crd.dbt", "loans.def") key 1;
+private file mrkEns  ("enscontr.dbt", "loans.def") key 3;  /* Ключ по заявке   */
+private file crd_op  ("crd_op.dbt",   "loans.def") key 1;
+private file lufvalue("lufvalue.dbt", "loans.def");
+private file lufotype("lufotype.dbt", "loans.def") key 1;
+private file person  ("person.dbt",   "bank.def");
+private file lothdeb ("lothdeb.dbt",  "loans.def");
+private file party   ("party.dbt",    "bank.def");
+
+private record othdeb_party ("party.dbt",    "bank.def");
+
+private var ecn_eob = TBFile ("ecn_eob.dbt", "r", 0);
+private var ensobj  = TBFile ("ensobj.dbt", "r", 0);
+
+CONST BM_REPEAT         = "Repeat", /* Закладка в документе: начало повторяющегося интервала */
+      BM_STOP           = "Stop",   /* Закладка в документе: конец повторяющегося интервала */
+      MAX_DURATION      = 120, /* Максимальный срок кредита для 139-Р-2 (в месяцах)*/
+      INSTR_229           = 0, /* Инструкция 229-2-р  */
+      INSTR_1040_HYPOTHEC = 2, /* Инструкция 1040 для ипотечных кредитов  */
+      INSTR_1040_REALTY   = 3, /* Инструкция 1040 для кредитов на недвижимость  */
+      INSTR_1207_HYPOTHEC = 4, /* Инструкция 1207 для ипотечных кредитов Молодая семья  */
+      INSTR_1207_REALTY   = 5, /* Инструкция 1207 для кредитов на недвижимость Молодая семья */
+      PARENT              = 1, /* Контрагент является родителем */
+      SPOUSE              = 2; /* Контрагент является супругом */
+
+private var INSTR_139     = false; /* льготный порядок кредитования сотрудников банка */
+private var IsChild       = false,
+            IsSpouse      = false,
+            IsParent      = false,
+            Parents       = 0,
+            Spouses       = 0;
+private var Дд2_  :moneyL = $0,
+            Ддч2_ :moneyL = $0,
+            Дд_   :moneyL = $0,
+            Уд2_  :moneyL = $0;
+
+/* Переменные для расчета МРК, определяются из группы "Условия, предлагаемые кредитным отделом"
+   Если параметр не определен, то он берется из группы "Условия, предлагаемые заемщиком"*/
+var СрокДоговораМес  : integer,
+    ТипСрока         : integer,
+    ПериодПогашения  : integer,
+    ТипПериода       : integer, /* в днях или месяцах */
+    Ставка           : doublel, /* процентная ставка  */
+    ДатаВозврата     : date,    /* Дата окончания действия договора: Дата начала действия заявки + срок*/
+    СуммаКредита     : moneyl,
+    ВалютаКредита    : integer,
+    КурсВалюты       : doubleL, /* Курс валюты заявки на дату заявки */
+    КурсДоллара      : doubleL, /* Курс доллара США на дату заявки */
+    СуммаКредитаРубли: moneyL,
+    СуммаКредитаUSD  : moneyL,  /* Используется для расчета коэфициента k(i)*/
+    Ипотека          : bool,    /* Признак ипотеки из вида кредита, установленного по заявке */
+    ЦелевойКредит    : bool,
+
+    СуммаКредитаСПроцентами : moneyL = $0, // Сумма кредита с процентами за год (или за срок кредитования)
+
+    GuaranteeCount   : integer = 0,
+    OnlyGuarantee    : bool,
+
+    СовокупноеОбеспечение         : moneyl = $0,
+    ЕстьЗалог                     :bool = false,
+    СуммаЗалоговРубли             : MoneyL = $0,
+    ТребуемаяПлатежеспособностьЗ  : moneyl = $0, // платежеспособность заемщика, требуемая для получения исспрашиваемой суммы кредита
+    ПлатежеспособностьПоручителей : moneyl = $0;
+
+var Контрагент = Tarray;  /* 0-й контрагент - заемщик, остальные контрагенты - поручители*/
+
+/* Столбцы массива Контрагент (массив двумерный)*/
+CONST CLIENT_ID    = 0,  /* Ссылка на ID контрагента                                */
+      BORNDATE     = 1,  /* Дата рождения контрагента                               */
+      ALG          = 2,  /* Алгоритм расчета платежеспособности (139/229)           */
+      FIO          = 3,  /* Фамилия И. О. контрагента                               */
+      FULL_FIO     = 4,  /* Фамилия Имя Отчество контрагента                        */
+      PENSION_DATE = 5,  /* Дата выхода на пенсию                                   */
+      ENS_SUM      = 6,  /* Сумма проучительства (для поручителей)                  */
+      ENS_SUM_CUR  = 7,  /* Валюта суммы поручительства                             */
+      SOLVENCY     = 8,  /* Платежеспособность контрагента                          */
+      PROFIT       = 9,  /* Чистый доход контрагента                                */
+      KOEFF        = 10, /* Коэффициент для расчета платежеспособности              */
+      MRK_RUR      = 11, /* МРК контрагента в рублевом эквиваленте                  */
+      MRK          = 12, /* МРК контрагента в запрашиваемой валюте                  */
+      PRIVILEGE    = 13, /* Льготный порядок расчета платежеспособности по 139      */
+      ISOTHDEB     = 14, /* Является созаемщиком                                    */
+      DEBSTATUS    = 15; /* Статус контрагента (родитель - PARENT, супруг - SPOUSE) */
+
+
+private CONST SX_MALE   = "муж.",
+              SX_FEMALE = "жен.";
+
+private var {oper};
+
+/* Функция возвращает имя пользователя с номером operNum
+Функция аналогична одноименной функции из ExchangeInter*/
+MACRO GetFIOEmployee(operNum)
+
+    ClearRecord(person);
+    person.Oper = operNum;
+    if (GetEQ(person))
+       return trim(person.Name);
+    end;
+
+    return "";
+END;
+
+/* Функция возвращает true, если договор обеспечения является ипотечным договором,
+   т.е. по этому договору есть хотя бы один объект, являющийся предметом ипотеки */
+MACRO isHypothecContract(EnsContractID_Ref):bool
+   var stat = false;
+
+   ecn_eob.Clear;
+   ecn_eob.AddFilter("t_EnsContractID_Ref = " + EnsContractID_Ref);
+   ecn_eob.rec.EnsContractID_Ref = EnsContractID_Ref;
+   ecn_eob.rec.EnsObjectID_Ref   = 0;
+   stat = ecn_eob.GetGE;
+   while (stat and (ecn_eob.rec.EnsContractID_Ref == EnsContractID_Ref))
+      ensobj.Clear;
+      ensobj.rec.EnsObjectID  = ecn_eob.rec.EnsObjectID_Ref;
+      if (ensobj.GetEQ)
+         if (trim(ensobj.rec.Mortgage) != "")
+             return true;
+         end;
+      end;
+      stat = ecn_eob.Next;
+   end;
+   ecn_eob.DropFilter;
+
+   return false;
+END;
+
+
+/* Функция возвращает стоимость предметов ипотеки по договору обеспечения,
+рассчитанную в рублях по курсу ЦБ на Дату */
+MACRO EnsContrHypothecVal(EnsContractID_Ref, Дата):MoneyL
+
+   var HypothecVal:moneyL = $0, EnsObjSum = $0;
+   var stat = false;
+
+   ecn_eob.Clear;
+   ecn_eob.AddFilter("t_EnsContractID_Ref = " + EnsContractID_Ref);
+   ecn_eob.rec.EnsContractID_Ref = EnsContractID_Ref;
+   ecn_eob.rec.EnsObjectID_Ref   = 0;
+   stat = ecn_eob.GetGE;
+   while (stat and (ecn_eob.rec.EnsContractID_Ref == EnsContractID_Ref))
+      ensobj.Clear;
+      ensobj.rec.EnsObjectID  = ecn_eob.rec.EnsObjectID_Ref;
+      if (ensobj.GetEQ)
+          if (trim(ensobj.rec.Mortgage) != "")
+             ConvSum(EnsObjSum, ensobj.rec.EnsObjectSum, Дата, ensobj.rec.EnsObjectCur, NATCUR);
+             HypothecVal = HypothecVal + EnsObjSum;
+          end;
+      end;
+      stat = ecn_eob.Next;
+   end;
+   ecn_eob.DropFilter;
+
+   return HypothecVal;
+
+END;
+
+
+/*Функция возвращает стоимость совокупную стоимость всех предметов ипотеки уменьшенную на дисконт
+  для всех договоров обеспечения, привязанных к заявке, рассчитанную в рублях по курсу ЦБ на Дату */
+MACRO СтоимостьПредметовИпотеки(ClaimID_Ref, Дата):MoneyL
+
+   var HypothecVal:moneyL = $0;
+
+   ClearRecord(MrkEns);
+   MrkEns.ClaimID_Ref = ClaimID_Ref;
+   MrkEns.EnsSysType  = ЗалогИмущества;
+   MrkEns.EnsContractID = 0;
+   if (not GetGE(MrkEns))
+      return $0;
+   end;
+   prev(MrkEns);
+   while (next(MrkEns) and (MrkEns.ClaimID_Ref == ClaimID_Ref)
+                         and (MrkEns.EnsSysType  == ЗалогИмущества))
+
+       HypothecVal = HypothecVal + EnsContrHypothecVal(MrkEns.EnsContractID, Дата) * (1 - MrkEns.Discount);
+   end;
+
+   return money(round(HypothecVal));
+END;
+
+/* Функция возвращает возраст клиента на дату (количество полных лет),
+   либо 0, если Дата меньше даты рождения */
+macro Возраст(CodClient, Дата)
+
+   var  d1:integer = 0, d2:integer = 0,
+        m1:integer = 0, m2:integer = 0,
+        y1:integer = 0, y2:integer = 0;
+   var  age : integer = 0;
+
+   if (not depclnt.GetRecord(CodClient))
+       return 0;
+   end;
+
+   DateSplit(depclnt.Born, d1, m1, y1);
+   DateSplit(Дата, d2, m2, y2);
+
+   age = y2 - y1;
+   if (m2 < m1)
+      age = age - 1;
+   elif ((m2 == m1) and (d2 < d1))
+      age = age - 1;
+   end;
+
+   if (age < 0)
+      return 0;
+   end;
+
+   return age;
+
+end;
+
+MACRO ИнициализироватьПараметрыЗаявки(Claim):bool
+   var dd1 = 0, mm1 = 0, yyyy1 = 0, mm2 = 0, yyyy2 = 0, КодДоллараСША:integer = -1;
+
+  /* Определим срок кредита и дату возврата */
+  if (Claim.BCreditDuration > 0)
+     ТипСрока        = Claim.BCTypeDuration;
+     if (ТипСрока == CF_DAY) /* Срок кредита указан в днях, пересчитаем его в месяцах*/
+        ДатаВозврата    = {curdate} + Claim.BCreditDuration;
+        СрокДоговораМес = КоличествоМесяцев({curdate}, ДатаВозврата);
+
+     elif (ТипСрока == CF_MONTH)
+        СрокДоговораМес = Claim.BCreditDuration;
+        /* Определим дату возврата */
+        DateSplit({curdate}, dd1, mm1, yyyy1);
+        yyyy2 = yyyy1 + int(СрокДоговораМес) / int(12); /* Год возврата */
+        mm2   = mm1 + СрокДоговораМес - 12*(int(СрокДоговораМес) / int(12)); /* Месяц возврата*/
+        if (mm2 > 12)
+           mm2 = mm2 - 12;
+           yyyy2 = yyyy2 + 1;
+        end;
+
+        ДатаВозврата = date(dd1, mm2, yyyy2);
+
+     elif (Claim.BCTypeDuration != 0) /* Неизвестный тип срока */
+        MsgBox("По заявке указан неизвестный тип срока!");
+        return false;
+     end;
+  else
+    /* Срок кредита неопределен в разделе "Условия, предлагаемые банком"
+       возьмем его из раздела "Условия, предлагаемые заемщиком" */
+     ТипСрока        = Claim.LCTypeDuration;
+     if (ТипСрока == CF_DAY) /* Срок кредита указан в днях, пересчитаем его в месяцах */
+        ДатаВозврата    = {curdate} + Claim.LCreditDuration;
+        СрокДоговораМес = КоличествоМесяцев({curdate}, ДатаВозврата);
+     elif (ТипСрока == CF_MONTH)
+        СрокДоговораМес = Claim.LCreditDuration;
+
+        /* Определим дату возврата */
+        DateSplit({curdate}, dd1, mm1, yyyy1);
+        yyyy2 = yyyy1 + int(СрокДоговораМес) / int(12); /* Год возврата */
+        mm2   = mm1 + СрокДоговораМес - 12*(int(СрокДоговораМес) / int(12)); /* Месяц возврата*/
+        if (mm2 > 12)
+           mm2 = mm2 - 12;
+           yyyy2 = yyyy2 + 1;
+        end;
+
+        ДатаВозврата = date(dd1, mm2, yyyy2);
+
+     elif (Claim.LCTypeDuration != 0) /* Неизвестный тип срока */
+        MsgBox("По заявке указан неизвестный тип срока!");
+        return false;
+     end;
+  end;
+
+  /* Опеределить сумму кредита и валюту суммы */
+  if (Claim.BCreditSum == $0)
+     СуммаКредита  = Claim.LCreditSum;
+     ВалютаКредита = Claim.LCreditCurCode;
+  else
+     СуммаКредита  = Claim.BCreditSum;
+     ВалютаКредита = Claim.BCreditCurCode;
+  end;
+
+  if (ВалютаКредита != 0)
+     КурсВалюты  = GetRate(Claim.GivingDate, ВалютаКредита);
+     if (КурсВалюты == 0.0)
+        MsgBox("Не задан курс валюты кредитного договора.");
+        return $0;
+     end;
+  else
+     КурсВалюты = 1.0;
+  end;
+
+  КодДоллараСША = ПолучитьКодФинИн("840");
+  КурсДоллара = GetRate(Claim.GivingDate, КодДоллараСША);
+  if (КурсДоллара == 0)
+     MsgBox("Не задан курс доллара США на ", string(Claim.GivingDate:m));
+     exit(1);
+  end;
+
+
+  /* Сумма кредита, пересчитанная в рубли */
+  СуммаКредитаРубли = FloorL(double(СуммаКредита) * КурсВалюты);
+
+  /* Сумма кредита, пересчитанная в доллары США */
+  СуммаКредитаUSD = FloorL(double(СуммаКредитаРубли) / КурсДоллара);
+
+  Ставка = 0.0;
+  if(Claim.TuneType == CF_GROUP)
+     if(Claim.CreditTypeID_ref != 0)
+        Ставка = Loans_FindRateVal(LO_TYPECREDIT, Claim.CreditTypeID_ref, TRU_CRD, {curdate});
+     end;
+  else
+     /* Определить процентную ставку */
+     if (Claim.BPercRate > 0)
+        Ставка = Claim.BPercRate;
+     else
+       /* Процентная ставка не определена в разделе "Условия, предлагаемые банком",
+          возьмем ее из раздела "Условия, предлагаемые заемщиком" */
+        Ставка = Claim.LPercRate;
+     end;
+  end;
+  
+  if (Ставка == 0.0)
+      MsgBox("Не определена процентная ставка! |Введите процентную ставку по заявке и повторите расчет.");
+      return false;
+  end;
+
+  return true;
+
+END;
+
+
+MACRO ОценкаОбеспечения(ens, Дата)
+
+   var stat = false, СуммаОценокРуб = $0, EnsSumRUR = $0;
+   ecn_eob.Clear;
+   ecn_eob.AddFilter("t_EnsContractID_Ref = " + ens.EnsContractID);
+   ecn_eob.rec.EnsContractID_Ref = ens.EnsContractID;
+   ecn_eob.rec.EnsObjectID_Ref   = 0;
+   stat = ecn_eob.GetGE;
+   while (stat and (ecn_eob.rec.EnsContractID_Ref == ens.EnsContractID))
+       ConvSum(EnsSumRUR, ecn_eob.rec.RatingSum, ClaimF.GivingDate, ecn_eob.rec.RatingCurCode, NATCUR);
+       СуммаОценокРуб = СуммаОценокРуб + EnsSumRUR;
+       stat = ecn_eob.Next;
+   end;
+   ecn_eob.DropFilter;
+   return money(round(СуммаОценокРуб * (1 - ens.Discount)));
+
+END;
+
+
+MACRO ПроверитьОбеспечение(claimID_Ref, Дата, Инструкция, Обеспечение:@moneyl, Залог:@bool):bool
+
+   var ЕстьЗалог :bool = false, ДругоеОбеспечение : bool = false;
+
+   /* Проверка обеспеченности неипотечных кредитов */
+   ClearRecord(mrkEns);
+   mrkEns.ClaimID_Ref = ClaimID_Ref;
+   mrkEns.EnsSysType  = 0;
+   mrkEns.EnsContractID = 0;
+
+   GuaranteeCount       = 0;
+   СуммаЗалоговРубли    = $0;
+   OnlyGuarantee        = true;
+
+   if (GetGE(mrkEns) and (mrkEns.ClaimID_Ref == ClaimID_Ref))
+      prev(mrkEns);
+      while (next(mrkEns) and (mrkEns.ClaimID_Ref == ClaimID_Ref))
+         if (mrkEns.EnsSysType != Поручительство)
+            Залог = true;
+            if (isHypothecContract(mrkEns.EnsContractID))
+                ЕстьЗалог = true;
+            else
+                ДругоеОбеспечение = true;
+            end;
+            OnlyGuarantee = false;
+            СуммаЗалоговРубли = СуммаЗалоговРубли + ОценкаОбеспечения(MrkEns, Дата);
+         else
+            ДругоеОбеспечение = true;
+            GuaranteeCount = GuaranteeCount + 1;
+         end;
+      end;
+   end;
+   Обеспечение = Обеспечение + СуммаЗалоговРубли;
+   // Проверки на наличие обеспечений
+   if (Инструкция == INSTR_1040_REALTY)
+        if (ЕстьЗалог and not ДругоеОбеспечение)
+           if (not GetTrue(false, "Не допускается заключение кредитного договора с использованием | залога приобретаемого или строящегося объекта недвижимости в качестве | единственного вида обеспечения. Продолжить?"))
+               return false;
+           end;
+        elif ((not ЕстьЗалог) and (СуммаКредитаUSD > $25000.00))/* Залога нет вообще */
+          if (not GetTrue(false, "По кредиту свыше $25000 необходимо предоставить в залог приобретаемый |или строящийся объект недвижимости. Продолжить?"))
+              return false;
+          end;
+       end;
+   elif ((Инструкция == INSTR_1040_HYPOTHEC) or Ипотека)
+       if (not ЕстьЗалог)/* Залога нет вообще */
+           if (not GetTrue(false, "По ипотечному кредиту необходимо предоставить в залог приобретаемый |или строящийся объект недвижимости. Продолжить?"))
+               return false;
+           end;
+        end;
+     else
+        if (OnlyGuarantee) /* В качестве обеспечений предоставлены только поручительства */
+           if (СуммаКредитаUSD <= $25000.00)
+              if (GuaranteeCount < 2)
+                 if (not (GetTrue(false, "Необходимо предоставить не менее 2-х поручительств или залог!| Продолжить?")))
+                    return false;
+                 end;
+              end;
+           else
+              if (not GetTrue(false, "Сумма кредита превышает $25000. Необходимо предоставить залог!| Продолжить?"))
+                 return false;
+              end;
+           end;
+        end;
+     end;
+
+   return true;
+END;
+
+
+/* Функция расчета платежеспособности клиента Контрагент[ClntIndx][CLIENT_ID]
+   по Инструкции на Дату
+   4-м и 5-м параметром функция возвращает обобщенный чистый доход и
+   обобщенный коэффициент для расчета платежеспобности */
+MACRO РассчитатьПлатежеспособность(ClntIndx, Инструкция, Дата, Дч:@moneyl, K:@doubleL):moneyL
+
+   var Д1             :moneyL = $0,
+       Дч1            :moneyL = $0,
+       Д2             :moneyL = $0,
+       Д3             :moneyL = $0,
+       Дч2            :moneyL = $0,
+       Дч3            :moneyL = $0,
+       Дд1            :moneyL = $0,
+       Дд2            :moneyL = $0,
+       Ддч1           :moneyL = $0,
+       Ддч2           :moneyL = $0,
+       Дд             :moneyL = $0,
+       Дчп            :moneyL = $0,
+       Уд1            :moneyL = $0,
+       Уд2            :moneyL = $0,
+       У1             :moneyL = $0,
+       У2             :moneyL = $0,
+       У3             :moneyL = $0,
+       P              :moneyL = $0,
+       Ск             :moneyL = $0,
+       Об             :moneyL = $0,
+       MaxDutyLastDate:date   = date(0,0,0),
+       MaxDate        :date   = date(0,0,0),
+       FullDuration   :integer = 0,
+       ПенсионныйПериод : integer = 0,
+       ClientID_Ref   :integer = Контрагент[ClntIndx][CLIENT_ID],
+       oldKey         :integer = 0,
+       stat           :bool    = false,
+       PlanPaySum     :money   = $0,
+       EnsContrSum    :money   = $0,
+       LastOpID       :integer = 0;
+
+   /* Функция рассчитывает коэффициент дохода для расчета платежеспособности */
+   MACRO GetK(Sum, KFType, USDCurrRate)
+     var sc;
+
+     if (USDCurrRate == $0)
+       MsgBox("Не задан курс доллара США.");
+       exit(1);
+     end;
+
+     sc = Floorl(round(Sum / USDCurrRate));
+     if ((KFType == INSTR_1040_HYPOTHEC) or
+         (KFType == INSTR_1207_HYPOTHEC))
+        if (sc <= $700.)
+            return 0.8;
+        else
+            return 0.9;
+        end;
+     elif ((KFType == INSTR_1040_REALTY) or
+           (KFType == INSTR_1207_REALTY))
+        if (sc <= $1000.)
+            return 0.7;
+        else
+            return 0.8;
+        end;
+     elif (KFType == INSTR_229)
+        if (sc <= $1500.)
+            return 0.5;
+        else
+            return 0.7;
+        end;
+     end;
+   END;
+
+   Дч = $0;
+   K  = 0.0;
+
+   /* Вычислим среднемесячный платеж Ск по обязательствам контрагента по кредитным договорам */
+   Ск = $0;
+   MaxDutyLastDate = Дата;
+
+   ClearRecord(creditC);
+   CreditC.ClientID_Ref = ClientID_Ref;
+   CreditC.CreditState  = CF_OPEN;
+   stat = GetEQ(creditC);
+   MaxDutyLastDate = date(0,0,0);
+
+   /* Просмотрим все кредитные договора контрагента */
+   while (stat and (CreditC.ClientID_Ref == ClientID_Ref)
+                and (CreditC.CreditState  == CF_OPEN))
+        /* Просмотрим все срочные обязательства договора*/
+        ClearRecord(DutyCrd);
+        DutyCrd.CreditNumber_Ref = CreditC.CreditNumber;
+        DutyCrd.DutyType         = 0;
+        DutyCrd.DutyState        = CF_OPEN;
+        if (GetEQ(DutyCrd))
+           prev(DutyCrd);
+           while (next(DutyCrd) and (DutyCrd.CreditNumber_Ref == CreditC.CreditNumber)
+                  and (DutyCrd.DutyType == 0)
+                  and (DutyCrd.DutyState == CF_OPEN))
+               /* Просуммируем все будущие (относительно даты расчета платежеспособности) платежи по обязательству*/
+               if (MaxDutyLastDate < DutyCrd.DutyLastDate)
+               /* Найдем максимальную дату окончания срочного обязательства */
+                  MaxDutyLastDate = DutyCrd.DutyLastDate;
+               end;
+               /* Чтобы найти нужный график, нужно сначала найти последнюю операцию расчета графика */
+               ClearRecord(crd_op);
+               crd_op.IsDeleted = 0;
+               crd_op.ObjectID_Ref       = DutyCrd.DutyID;
+               crd_op.ObjectTypeID_Ref   = LO_DUTY;
+               crd_op.OperTypeNumber_Ref = CF_RECALCGPAY;
+               if (GetEQ(crd_op))
+                  MaxDate = crd_op.CredOperDate;
+                  LastOpID = crd_op.CredOperID;
+                  while (next(crd_op) and (crd_op.IsDeleted == 0)
+                                      and (crd_op.ObjectID_Ref       == DutyCrd.DutyID)
+                                      and (crd_op.ObjectTypeID_Ref   == LO_DUTY)
+                                      and (crd_op.OperTypeNumber_Ref == CF_RECALCGPAY))
+                     /* Ищем операцию перерасчета графика с максимальной датой */
+                     if (MaxDate < crd_op.CredOperDate)
+                         MaxDate = crd_op.CredOperDate;
+                         LastOpID = crd_op.CredOperID;
+                     end;
+                  end; /* цикл по операциям */
+                  /* Операцию нашли (lastOpID), теперь найдем график */
+                  ClearRecord(mrkGraph);
+                  mrkGraph.ObjectTypeID_Ref = LO_DUTY;
+                  mrkGraph.ObjectID_Ref     = DutyCrd.DutyID;
+                  mrkGraph.CredOperID_Ref   = LastOpID;
+                  mrkGraph.Type             = 0;
+                  mrkGraph.PlannedPayDate   = Дата;
+                  mrkGraph.PlannedExpDate   = Дата;
+                  if (getGE(mrkGraph) and (mrkGraph.ObjectTypeID_Ref == LO_DUTY)
+                                      and (mrkGraph.ObjectID_Ref == DutyCrd.DutyID)
+                                      and (mrkGraph.Type == 0)
+                                      and (mrkGraph.CredOperID_Ref == LastOpID))
+                      prev(mrkGraph);
+                      while (next(mrkGraph) and (mrkGraph.ObjectTypeID_Ref == LO_DUTY)
+                                            and (mrkGraph.ObjectID_Ref == DutyCrd.DutyID)
+                                            and (mrkGraph.Type == 0)
+                                            and (mrkGraph.CredOperID_Ref == LastOpID))
+                          ConvSum(PlanPaySum, mrkGraph.PlannedPaySum + mrkGraph.PlannedPercentSum, mrkGraph.PlannedPayDate, CreditC.CurCode, NATCUR);
+                          Ск = Ск + PlanPaySum;
+                      end;
+                  end;
+               end; /*end if (GetEQ(crd_op))*/
+           end; /* цикл по обязательствам */
+        end; /* end if (GetEQ(DutyCrd))*/
+        stat = next(creditC);
+   end; /* цикл по договорам */
+   /*В Ск - общая сумма платежей по всем кредитам контрагента.
+     Найдем среднемесячный платеж, как Ск / Количество месяцев до окончания последнего обязательства */
+   if (MaxDutyLastDate > Дата)
+      /* Рассчитаем общее количество месяцев, оставшихся до погашения всех кредитов
+         контрагента */
+      FullDuration = КоличествоМесяцев(Дата, MaxDutyLastDate);
+      if (FullDuration != 0)
+         /* Найдем среднемесячный платеж */
+         Ск = Floorl(double(Ск) / double(FullDuration));
+      end;
+   end;
+   Ск = Ск + moneyl(GetClientUsFieldValue(ClientID_Ref, ОбязательстваПоПолученнымРанееКредитам, Дата));
+
+   /* Найдем среднемесячный платеж Об по обязательствам контрагента по всем его поручительствам */
+   Об = $0;
+   FullDuration = 0;
+   oldKey = keyNum(mrkEns, 4);
+
+   ClearRecord(mrkEns);
+   mrkEns.EnsContractPersonID_Ref = ClientID_Ref;
+   if (GetEQ(mrkEns))
+      prev(mrkEns);
+      while (next(mrkEns) and (mrkEns.EnsContractPersonID_Ref == ClientID_Ref))
+         if ((mrkEns.EnsContractStatus == EC_IN /*принят на внебаланс*/)
+             and (mrkEns.EnsSysType == Поручительство)
+             and (mrkEns.EnsContractLastDate > Дата))
+
+             FullDuration = КоличествоМесяцев(mrkEns.EnsContractFirstDate, mrkEns.EnsContractLastDate);
+             if (FullDuration <= 0)
+                 FullDuration = 1;
+             end;
+             if (FullDuration > 0)
+                ConvSum(EnsContrSum, mrkEns.EnsContractSum, Дата, mrkEns.EnsContractCur, NATCUR);
+                Об = Об + Floorl(round(EnsContrSum / doublel(FullDuration)));
+             end;
+         end;
+      end;
+   end;
+   KeyNum(mrkEns, oldKey);
+
+   Об = Об + moneyl(GetClientUsFieldValue(ClientID_Ref, ОбязательстваПоПредоставленнымПоручительствам, Дата));
+   if (Контрагент[ClntIndx][PRIVILEGE])
+      if (СтажРаботы(ClientID_Ref, Дата) < 12/*Месяцев*/)
+        // сотрудник работает меньше года - учтем в расчете доходы/расходы за фактически отработанное время
+         Д3 = moneyl(GetClientUsFieldValue(ClientID_Ref, ВаловыйСреднемесячныйДоходЗаФОВ, Дата)); /*№31*/
+         У3 = moneyl(GetClientUsFieldValue(ClientID_Ref, УдержанияЗаФОВ_Прочие, Дата));   /*№35*/
+         Дч3 = max(0,Д3 - У3 - Ск - Об*0.5);
+      end;
+         /* Доходы */
+      Д1 = moneyl(GetClientUsFieldValue(ClientID_Ref, ВаловыйДоходПоОМР, Дата));     /*№9*/
+      Д2 = moneyl(GetClientUsFieldValue(ClientID_Ref, Доход12месПоОМР, Дата));     /*№71*/
+         /* Удержания */
+      У1 = moneyl(GetClientUsFieldValue(ClientID_Ref, УдержаниеИзOД_Прочие, Дата));     /*№13*/
+      У2 = moneyl(GetClientUsFieldValue(ClientID_Ref, Удержания12месИзОД, Дата));  /*№72*/
+         /* Чистые доходы = Доходы - Все расходы */
+      Дч1 = max(0,Д1 - У1 - Ск - Об*0.5);
+      Дч2 = max(0,Д2 - У2 - Ск - Об*0.5);
+
+      if   ((Дч1 == 0) and (Дч2 == 0)) Дч = Дч3;
+      elif ((Дч1 == 0) and (Дч3 == 0)) Дч = Дч2;
+      elif ((Дч2 == 0) and (Дч3 == 0)) Дч = Дч1;
+      elif (Дч1 == 0)                  Дч = min (Дч2, Дч3);
+      elif (Дч2 == 0)                  Дч = min (Дч1, Дч3);
+      elif (Дч3 == 0)                  Дч = min (Дч1, Дч2);
+      else
+        Дч = min(Дч1, min(Дч2, Дч3));
+      end;
+  else
+      Д1  = moneyl(GetClientUsFieldValue(ClientID_Ref, ВаловыйДоходПоОМР, Дата));      /*№9*/
+      У1  = moneyl(GetClientUsFieldValue(ClientID_Ref, УдержаниеИзOД_Прочие, Дата));   /*№13*/
+      Дч  = Д1 - У1 - Ск - Об*0.5;
+  end;
+
+  if ((ЦелевойКредит) and
+      (Инструкция != INSTR_1207_HYPOTHEC) and
+      (Инструкция != INSTR_1207_REALTY)) // Учитываем доп.доходы
+     /*Доходы и удержания по основному месту работы созаемщика */
+     Дд1 = moneyl(GetClientUsFieldValue(ClientID_Ref, ВаловыйДоходСозаемщика, Дата)); /*№19*/
+     Уд1 = moneyl(GetClientUsFieldValue(ClientID_Ref, УдержаниеИзДС_Прочие, Дата));   /*№23*/
+
+     /*Доходы и удержания по дополнительному месту работы */
+     Дд2 = moneyl(GetClientUsFieldValue(ClientID_Ref, ВаловыйДоходПоДМР, Дата));      /*№14*/
+     Уд2 = moneyl(GetClientUsFieldValue(ClientID_Ref, УдержаниеИзДД_Прочие, Дата));   /*№18*/
+
+     /* Дополнительный чистый доход */
+     Ддч1 = Дд1 - Уд1;
+     Ддч2 = Дд2 - Уд2;
+     Дд = max(Ддч1, Ддч2);
+  end;
+
+
+  if((Инструкция == INSTR_1207_HYPOTHEC) or
+     (Инструкция == INSTR_1207_REALTY))
+      /*Созаемщики - только супруги*/
+      /*учитываем доп. доходы*/
+      if(NOT IsChild and NOT IsParent)
+          /*Доходы и удержания по основному месту работы созаемщика */
+          Дд1 = moneyl(GetClientUsFieldValue(ClientID_Ref, ВаловыйДоходСозаемщика, Дата)); /*№19*/
+          Уд1 = moneyl(GetClientUsFieldValue(ClientID_Ref, УдержаниеИзДС_Прочие, Дата));   /*№23*/
+
+              /*Доходы и удержания по дополнительному месту работы */
+          Дд2 = moneyl(GetClientUsFieldValue(ClientID_Ref, ВаловыйДоходПоДМР, Дата));      /*№14*/
+          Уд2 = moneyl(GetClientUsFieldValue(ClientID_Ref, УдержаниеИзДД_Прочие, Дата));   /*№18*/
+
+              /* Дополнительный чистый доход */
+          Ддч1 = Дд1 - Уд1;
+          Ддч2 = Дд2 - Уд2;
+          Дд = max(Ддч1, Ддч2);
+      end;
+
+      /*Созаемщиками являются супруг и родитель (родители)*/
+      if(((Parents == 1) or (Parents == 2)) and (Spouses == 1))
+          Дд = Дд_;
+      end;
+
+  end;
+
+  Дчп = moneyl(GetClientUsFieldValue(ClientID_Ref, Пенсия, Дата));   /*№63*/
+  Дд = max(Дд, Дчп);
+  Дч = FloorL(Дч + Дд);
+  K = GetK(Дч, Инструкция, КурсДоллара);
+
+  if (Контрагент[ClntIndx][PENSION_DATE] > Дата) // Пенсионный возраст наступает в течение срока действия кредита
+     ПенсионныйПериод = КоличествоМесяцев(Контрагент[ClntIndx][PENSION_DATE], ДатаВозврата);
+     if (ПенсионныйПериод < 0)
+        ПенсионныйПериод = 0;
+     end;
+     P = Дч*K*(КоличествоМесяцев(Дата, ДатаВозврата) - ПенсионныйПериод) + МинимальнаяПенсия*GetK(МинимальнаяПенсия, Инструкция, КурсДоллара)*ПенсионныйПериод;
+  else  // На момент подачи заявки уже является пенсионером - весь период является пенсионным и рабочим одновременно
+     P = Дч*K*КоличествоМесяцев(Дата, ДатаВозврата);
+  end;
+
+  /* Платежеспособность */
+  return moneyL(round(P));
+END;
+
+
+
+MACRO ПроверитьЗаявку(claim, Инструкция)
+
+  var i = 0, МаксимальныйСрок = 0;
+
+/* Проверка общих условий кредитования по инструкции 139*/
+  if (Контрагент[0][PRIVILEGE])
+     //Срок договорора, применяемый при расчете платежеспособности не первышает Максимального установленного
+     if (СрокДоговораМес > MAX_DURATION)
+        if (not GetTrue(false, "Срок договора превышает максимальный. Продолжить?"))
+           return false;
+        end;
+        /* При расчете платежеспособности максимальный срок кредитования 120 мес.*/
+        СрокДоговораМес = MAX_DURATION;
+     end;
+  else
+     if ((Ипотека) or (Инструкция == INSTR_1040_REALTY)   or
+                      (Инструкция == INSTR_1040_HYPOTHEC) or
+                      (Инструкция == INSTR_1207_REALTY)   or
+                      (Инструкция == INSTR_1207_HYPOTHEC))
+         МаксимальныйСрок = 180/*месяцев*/;
+     else
+         МаксимальныйСрок = 60/*месяцев*/;
+     end;
+     if (СрокДоговораМес > МаксимальныйСрок)
+        if (not (GetTrue(false, "Срок договора (" + СрокДоговораМес + " мес.) превышает максимальный (" + МаксимальныйСрок + " мес.)!|Продолжить?")))
+           return false;
+        end;
+     end;
+  end;
+
+
+  /* Проверим возрастные характеристики всех контрагентов */
+  while(i < Контрагент.size())
+
+      if ( (ValType(Контрагент[i][BORNDATE])== V_UNDEF) or  (Контрагент[i][BORNDATE] == date(0,0,0)) )
+         MsgBox("Дата рождения контрагента №" + Контрагент[i][CLIENT_ID] + " (" +Контрагент[i][FIO]+ ") не определена!");
+         return false;
+      end;
+
+      if (Контрагент[i][PRIVILEGE])
+
+        if (Контрагент[i][PENSION_DATE] < ДатаВозврата)
+           if (not GetTrue(false, "Пенсионный возраст сотрудника наступает |до даты погашения кредита! Продолжить?"))
+               return false;
+           end;
+        end;
+
+      else
+
+        if (Возраст(Контрагент[i][CLIENT_ID], {curdate}) < 18/*лет*/)
+           if (not GetTrue(false, "Контрагент №"+ Контрагент[i][CLIENT_ID]+ "("+ Контрагент[i][FIO]+") моложе 18 лет.| Продолжить?"))
+               return false;
+           end;
+        end;
+
+        /*Если кредит на сумму до $100 и на срок до 6 месяцев, то максимальный возрастной
+          ценз не устанавливается */
+        if ((СуммаКредитаUSD > $100) or (СрокДоговораМес > 6/*мес*/))
+           if (Возраст(Контрагент[i][CLIENT_ID], {curdate}) > 70/*лет*/)
+              if (not GetTrue(false, "Контрагент №"+ Контрагент[i][CLIENT_ID]+ "("+ Контрагент[i][FIO]+") старше 70 лет.| Продолжить?"))
+                  return false;
+              end;
+           end;
+
+           if (Возраст(Контрагент[i][CLIENT_ID], ДатаВозврата) >= 75/*лет*/)
+              if (not GetTrue(false, "При наступлении срока возврата кредита контрагенту №"+ Контрагент[i][CLIENT_ID]+ "("+ Контрагент[i][FIO]+")| будет больше 75 лет|. Продолжить?"))
+                  return false;
+              end;
+           end;
+        end;
+
+      end;
+      i = i + 1;
+   end;
+
+   return true;
+
+END;
+
+// Функция возвращает true, если контрагент ClientID входит в массив "Контрагент", false в противном случае
+private macro ДублированиеКонтрагента(ClientID)
+   var i = 0;
+   while (i < Контрагент.size)
+       if (Контрагент[i][CLIENT_ID] == ClientID)
+          return true;
+       end;
+       i = i + 1;
+   end;
+
+   return false;
+end;
+
+/*
+   Вызывается по F6 из панели кредитной заявки
+   ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+   Входные параметры:
+      ClaimID - ID кредитной заявки
+*/
+macro CalcMRK (ClaimID)
+
+  var i                     : integer = 0,
+      DefaultMenuItem       : integer = 0,
+      MessageString         : string  = "",
+      SelectedItem          : integer = -2,
+      Инструкция            : string  = "",
+      СтоимостьИпотеки      : moneyL = $0;
+
+  var Пол, ПенсионныйВозраст, BornDay, BornMonth, BornYear;
+
+  array  menuItems;
+
+  asize(menuItems, 0);
+  menuItems(0) = " Рассчитать МРК по инструкции ~229-3-р~ ";
+  menuItems(1) = " Рассчитать МРК по инструкции ~1040-2-р~ (Ипотека) ";
+  menuItems(2) = " Рассчитать МРК по инструкции ~1040-2-р~ (Недвижимость)";
+  menuItems(3) = " Расчет размера ~потребительского кредита~ ";
+  menuItems(4) = " Рассчитать МРК по инструкции ~1207-р~ (Молодая семья/Ипотека) ";
+  menuItems(5) = " Рассчитать МРК по инструкции ~1207-р~ (Молодая семья/Недвижимость)";
+
+  ClaimF.ClaimID = ClaimID;
+  if( not GetEQ(ClaimF) )
+    MsgBox("Не найдена кредитная заявка");
+     Exit(1);
+  end;
+
+  if (not depclnt.GetRecord(ClaimF.LoanerID_Ref))
+     MsgBox("Заемщик в справочнике клиентов не найден!");
+     Exit(1);
+  end;
+
+  // Проверка вида кредита
+  if (ClaimF.CreditTypeID_Ref == 0)
+     MsgBox("Не установлен вид кредита! |Установите вид кредита и запустите процедуру еще раз.");
+     return Exit(1);
+  end;
+
+  /* Определим вид кредита */
+  ClearRecord(crtype);
+  crtype.CreditTypeID = ClaimF.CreditTypeID_Ref;
+  if (not GetEQ(crtype) )
+      MsgBox("Установленный вид кредита не найден в справочнике видов кредита.");
+      return Exit(1);
+  end;
+
+  /*Определим признак ипотечности кредита */
+  if (Index(trim(crtype.Specific), S_HYPOTEC) != 0) /* Ипотечный кредит */
+      Ипотека = true;
+  else
+      Ипотека = false;
+  end;
+
+  /*Определим, является ли кредит целевым */
+  if (Index(trim(crtype.Specific), S_TARGET) != 0) /* Целевой кредит */
+      ЦелевойКредит = true;
+  else
+      ЦелевойКредит = false;
+  end;
+
+  if (Ипотека) // Расчет МРК по инструкции 1040
+     DefaultMenuItem = 1;
+  else
+     DefaultMenuItem = 0;
+  end;
+
+  SelectedItem = Menu(menuItems,  "~ESC~ Отмена", " Расчет МРК ", null, null, DefaultMenuItem);
+
+  if (SelectedItem == -2)
+      return -1;
+  elif (SelectedItem == 0)
+      Инструкция = INSTR_229;
+  elif (SelectedItem == 1)
+      Инструкция = INSTR_1040_HYPOTHEC;
+  elif (SelectedItem == 2)
+      Инструкция = INSTR_1040_REALTY;
+  elif (SelectedItem == 3)
+      return Скоринг (ClaimID, {curdate});
+      Exit(1);
+  elif (SelectedItem == 4)
+      Инструкция = INSTR_1207_HYPOTHEC;
+  elif (SelectedItem == 5)
+      Инструкция = INSTR_1207_REALTY;
+  else
+      MsgBox("Расчет МРК по этой инструкции не реализован.");
+      Exit(1);
+  end;
+
+  if (depclnt.СотрудникБанка())
+     INSTR_139 = GetTrue(true, "Заемщик является сотрудником банка! Применить порядок| расчета МРК по инструкции 139-3-р?");
+  end;
+
+  if (not ИнициализироватьПараметрыЗаявки(ClaimF))
+      Exit(1);
+  end;
+
+/* Сформируем массив контрагентов */
+  /* Заемщик - отдельно */
+  Контрагент[0] = Tarray;
+  Контрагент[0][CLIENT_ID ] = ClaimF.LoanerID_Ref; /* Ссылка на контрагента (здесь - заемщик) */
+  /* Найдем дату рождения заемщика */
+  Контрагент[0][BORNDATE] = depclnt.Born;
+  if (depclnt.Born == date(0,0,0))
+     MsgBox("Не указана дата рождения заемщика.");
+     Exit(1);
+  end;
+  Контрагент[0][ALG]      = Инструкция;
+  Контрагент[0][PRIVILEGE]= INSTR_139;
+  Контрагент[0][FIO]      = FindClient(ClaimF.LoanerID_Ref);
+  Контрагент[0][FULL_FIO] = FindFullClient(ClaimF.LoanerID_Ref);
+
+  if (trim(depclnt.IsMale) != "") // Пенсионный возраст для мужчин
+     ПенсионныйВозраст = ПенсионныйВозрастМ;
+  else  // Пенсионный возраст для женщин
+     ПенсионныйВозраст = ПенсионныйВозрастЖ;
+  end;
+  DateSplit(Контрагент[0][BORNDATE], BornDay, BornMonth, BornYear);
+  Контрагент[0][PENSION_DATE] = date(BornDay, BornMonth, BornYear + ПенсионныйВозраст);
+  Контрагент[0][ENS_SUM]      = $0;
+  Контрагент[0][ENS_SUM_CUR]  = 0;
+  Контрагент[0][ISOTHDEB]     = 0;
+  /*Доходы и удержания по дополнительному месту работы */
+  Дд2_ = moneyl(GetClientUsFieldValue(Контрагент[0][CLIENT_ID], ВаловыйДоходПоДМР,    {curdate})); /*№14*/
+  Уд2_ = moneyl(GetClientUsFieldValue(Контрагент[0][CLIENT_ID], УдержаниеИзДД_Прочие, {curdate}));   /*№18*/
+
+  /* Дополнительный чистый доход */
+  Ддч2_ = Дд2_ - Уд2_;
+
+  Дд_ = max(Дд_, Ддч2_);
+
+  /*-----Созаемщики-----*/
+  if(((Инструкция == INSTR_1207_HYPOTHEC) or
+     (Инструкция == INSTR_1207_REALTY)) and
+     (Контрагент[i][ISOTHDEB]))
+      /*Поищем в созаемщиках детей, родителей, супругов*/
+      i = 1;
+      ClearRecord(lothdeb);
+      lothdeb.ObjectTypeID_Ref = LO_CLAIM;
+      lothdeb.ObjectNumber_Ref = ClaimF.ClaimID;
+      lothdeb.PartyID_Ref      = 0;
+      if((GetGE(lothdeb)) and
+         (lothdeb.ObjectNumber_Ref == ClaimF.ClaimID) and
+         (lothdeb.ObjectTypeID_Ref == LO_CLAIM))
+          prev(lothdeb);
+          while((next(lothdeb)) and
+                (lothdeb.ObjectNumber_Ref == ClaimF.ClaimID) and
+                (lothdeb.ObjectTypeID_Ref == LO_CLAIM))
+              ClearRecord(party);
+              party.PartyID = lothdeb.PartyID_Ref;
+              if(GetEQ(party))
+
+                  /*Будем искать среди созаемщиков "Сын" или "Дочь"*/
+                  if(GetLinkedObject(OBJROLE_PARTY_SON,      OBJTYPE_PARTY, party, OBJTYPE_PARTY, othdeb_party) or
+                     GetLinkedObject(OBJROLE_PARTY_DAUGHTER, OBJTYPE_PARTY, party, OBJTYPE_PARTY, othdeb_party))
+                      /*Нашлись дети, значит, присвоим для целей расчета МРК основному заемщику
+                        статус "Родитель"*/
+                      Контрагент[0][DEBSTATUS] = PARENT;
+                      IsChild = true;
+                  end;
+                  if(GetLinkedObject(OBJROLE_PARTY_SPOUSE, OBJTYPE_PARTY, party, OBJTYPE_PARTY, othdeb_party))
+                      IsSpouse = true;
+                      Spouses = Spouses + 1;
+                  end;
+                  if(GetLinkedObject(OBJROLE_PARTY_MOTHER, OBJTYPE_PARTY, party, OBJTYPE_PARTY, othdeb_party) or
+                     GetLinkedObject(OBJROLE_PARTY_FATHER, OBJTYPE_PARTY, party, OBJTYPE_PARTY, othdeb_party))
+                      IsParent = true;
+                      Parents = Parents + 1;
+                  end;
+              else
+                  MsgBox("Созаемщик №", lothdeb.PartyID_Ref, " в справочнике клиентов не найден!");
+                  Exit(1);
+              end;
+          end;
+          if(NOT IsChild)
+              /*Детей не нашлось, значит, для целей расчета МРК основному заемщику
+                присвоим статус "Супруг"*/
+              Контрагент[0][DEBSTATUS] = PARENT;
+          end;
+          if(Parents > 2)
+              MsgBox("Созаемщиков-родителей не должно быть больше двух!");
+              Exit(1);
+          end;
+          if(Spouses > 1)
+              MsgBox("Созаемщиков-супругов не должно быть больше двух!");
+              Exit(1);
+          end;
+
+          rewind(lothdeb);
+          while((next(lothdeb)) and
+                (lothdeb.ObjectNumber_Ref == ClaimF.ClaimID) and
+                (lothdeb.ObjectTypeID_Ref == LO_CLAIM))
+              ClearRecord(party);
+              party.PartyID = lothdeb.PartyID_Ref;
+              if(GetEQ(party))
+                  if (not ДублированиеКонтрагента(lothdeb.PartyID_Ref))
+                      Контрагент[i] = TArray;
+                      Контрагент[i][CLIENT_ID] = lothdeb.PartyID_Ref;
+                      Контрагент[i][ISOTHDEB] = 1;
+                      /*Разберемся со статусами контрагентов*/
+                      if(GetLinkedObject(OBJROLE_PARTY_SON,      OBJTYPE_PARTY, party, OBJTYPE_PARTY, othdeb_party) or
+                         GetLinkedObject(OBJROLE_PARTY_DAUGHTER, OBJTYPE_PARTY, party, OBJTYPE_PARTY, othdeb_party))
+                          /*Это дети, значит, присвоим для целей расчета МРК контрагенту
+                            статус "Супруг"*/
+                          Контрагент[i][DEBSTATUS] = SPOUSE;
+                      elif(GetLinkedObject(OBJROLE_PARTY_SPOUSE, OBJTYPE_PARTY, party, OBJTYPE_PARTY, othdeb_party))
+                          if(IsChild)
+                          /*Это супруг, и дети есть, значит, присвоим для целей расчета МРК контрагенту
+                            статус "Родитель"*/
+                              Контрагент[i][DEBSTATUS] = PARENT;
+                           else
+                               /*детей нет, значит, это просто "Супруг"*/
+                              Контрагент[i][DEBSTATUS] = SPOUSE;
+                           end;
+                      elif((GetLinkedObject(2/*OBJROLE_PARTY_FATHER*/, OBJTYPE_PARTY, party, OBJTYPE_PARTY, othdeb_party) or
+                            GetLinkedObject(3/*OBJROLE_PARTY_MOTHER*/, OBJTYPE_PARTY, party, OBJTYPE_PARTY, othdeb_party)) and
+                           (NOT IsChild))
+                          /*Это родители, значит, присвоим для целей расчета МРК контрагенту
+                            статус "Родитель"*/
+                          Контрагент[i][DEBSTATUS] = PARENT;
+                      end;
+
+                      if(((Parents == 1) or (Parents == 2)) and (Spouses == 1))
+                          /*Доходы и удержания по дополнительному месту работы */
+                          Дд2_ = moneyl(GetClientUsFieldValue(Контрагент[i][CLIENT_ID], ВаловыйДоходПоДМР,    {curdate})); /*№14*/
+                          Уд2_ = moneyl(GetClientUsFieldValue(Контрагент[i][CLIENT_ID], УдержаниеИзДД_Прочие, {curdate}));   /*№18*/
+
+                          /* Дополнительный чистый доход */
+                          Ддч2_ = Дд2_ - Уд2_;
+
+                          Дд_ = max(Дд_, Ддч2_);
+                      end;
+
+                      /* Найдем дату рождения созаемщика */
+                      if (not depclnt.GetRecord(Контрагент[i][CLIENT_ID]))
+                          MsgBox("Созаемщик №", Контрагент[i][CLIENT_ID], " в справочнике клиентов не найден!");
+                          Exit(1);
+                      end;
+                      Контрагент[i][BORNDATE] = depclnt.Born; /* Дата рождения созаемщика */
+                      if (depclnt.Born == date(0,0,0))
+                          MsgBox("Не указана дата рождения созаемщика: " + depclnt.ConvertFIO());
+                          Exit(1);
+                      end;
+                      Контрагент[i][ALG]      = Инструкция;
+                      Контрагент[i][FIO]      = depclnt.ConvertFIO();
+                      Контрагент[i][FULL_FIO] = depclnt.ConvertFIOFull();
+                      if (depclnt.СотрудникБанка())
+                          Контрагент[i][PRIVILEGE] = GetTrue(true, "Созаемщик " + Контрагент[i][FIO] +" является сотрудником банка! Применить порядок| расчета платежеспособности по инструкции 139-3-р?");;
+                      end;
+
+                      if (trim(depclnt.IsMale) != "") // Пенсионный возраст для мужчин
+                          ПенсионныйВозраст = ПенсионныйВозрастМ;
+                      else  // Пенсионный возраст для женщин
+                          ПенсионныйВозраст = ПенсионныйВозрастЖ;
+                      end;
+                      DateSplit(Контрагент[i][BORNDATE], BornDay, BornMonth, BornYear);
+                      Контрагент[i][PENSION_DATE] = date(BornDay, BornMonth, BornYear + ПенсионныйВозраст);
+                      i = i + 1;
+                  end;
+              else
+                  MsgBox("Созаемщик №", lothdeb.PartyID_Ref, " в справочнике клиентов не найден!");
+                  Exit(1);
+              end;
+          end;
+      end;
+  end;
+
+  /* Поручители */
+  i = i+1;
+  ClearRecord(mrkEns);
+  mrkEns.ClaimID_Ref   = ClaimF.ClaimID;
+  mrkEns.EnsSysType    = Поручительство;
+  mrkEns.EnsContractID = 0;
+  if (GetGE(mrkEns) and (mrkEns.ClaimID_Ref == ClaimF.ClaimID) and (mrkEns.EnsSysType == Поручительство))
+      prev(mrkEns);
+      while(next(mrkEns) and (mrkEns.ClaimID_Ref == ClaimF.ClaimID) and (mrkEns.EnsSysType == Поручительство))
+          if (not ДублированиеКонтрагента(mrkEns.EnsContractPersonID_Ref))
+              Контрагент[i] = TArray;
+              Контрагент[i][ISOTHDEB]  = 0;
+              Контрагент[i][CLIENT_ID] = mrkEns.EnsContractPersonID_Ref;
+              /* Найдем дату рождения поручителя */
+              if (not depclnt.GetRecord(Контрагент[i][CLIENT_ID]))
+                  MsgBox("Поручитель №", Контрагент[i][CLIENT_ID], " в справочнике клиентов не найден!");
+                  Exit(1);
+              end;
+              Контрагент[i][BORNDATE] = depclnt.Born; /* Дата рождения поручителя */
+              if (depclnt.Born == date(0,0,0))
+                  MsgBox("Не указана дата рождения поручителя: " + depclnt.ConvertFIO());
+                  Exit(1);
+              end;
+              if ((Инструкция == INSTR_1040_HYPOTHEC) or
+                  (Инструкция == INSTR_1040_REALTY))
+                  Контрагент[i][ALG]      = INSTR_229; //Поручители при расчете по 1040 - всегда по 229
+              else
+                  Контрагент[i][ALG]      = Инструкция;
+              end;
+              Контрагент[i][FIO]      = depclnt.ConvertFIO();
+              Контрагент[i][FULL_FIO] = depclnt.ConvertFIOFull();
+              if (depclnt.СотрудникБанка())
+                  Контрагент[i][PRIVILEGE] = GetTrue(true, "Поручитель " + Контрагент[i][FIO] +" является сотрудником банка! Применить порядок| расчета платежеспособности по инструкции 139-3-р?");;
+              end;
+
+              if (trim(depclnt.IsMale) != "") // Пенсионный возраст для мужчин
+                  ПенсионныйВозраст = ПенсионныйВозрастМ;
+              else  // Пенсионный возраст для женщин
+                  ПенсионныйВозраст = ПенсионныйВозрастЖ;
+              end;
+              DateSplit(Контрагент[i][BORNDATE], BornDay, BornMonth, BornYear);
+              Контрагент[i][PENSION_DATE] = date(BornDay, BornMonth, BornYear + ПенсионныйВозраст);
+              Контрагент[i][ENS_SUM]     = mrkEns.EnsContractSum;
+              Контрагент[i][ENS_SUM_CUR] = mrkEns.EnsContractCur;
+              i = i + 1;
+          end;
+      end;
+  end;
+
+  /* Проверим заявку*/
+  if (not ПроверитьЗаявку(ClaimF, Инструкция))
+      Exit(1);
+  end;
+
+  i = 0;
+  ПлатежеспособностьПоручителей = $0;
+  while(i < Контрагент.size())
+      Контрагент[i][PROFIT] = Контрагент[i][KOEFF] = 0;
+      Контрагент[i][SOLVENCY] = РассчитатьПлатежеспособность(i, Контрагент[i][ALG], {curdate}, @Контрагент[i][PROFIT], @Контрагент[i][KOEFF]);
+
+      if((Инструкция == INSTR_1207_HYPOTHEC) or
+         (Инструкция == INSTR_1207_REALTY))
+          if((Контрагент[i][ISOTHDEB]) and
+             ((Контрагент[i][DEBSTATUS] == PARENT) or
+              (Контрагент[i][DEBSTATUS] == SPOUSE)))
+              ПлатежеспособностьПоручителей = ПлатежеспособностьПоручителей + Контрагент[i][SOLVENCY];
+          end;
+      else
+          if (i != 0)
+              ПлатежеспособностьПоручителей = ПлатежеспособностьПоручителей + Контрагент[i][SOLVENCY];
+          end;
+      end;
+      i = i + 1;
+  end;
+
+  /* Проверим обеспеченность кредита и рассчитаем совкупное обеспечение кредита */
+  СовокупноеОбеспечение = ПлатежеспособностьПоручителей;
+  if(not ПроверитьОбеспечение(ClaimF.ClaimID, ClaimF.GivingDate, Инструкция, @СовокупноеОбеспечение, @ЕстьЗалог))
+     return 0;
+  end;
+
+/* Рассчитаем МРК для каждого контрагента */
+  /* Для заемщика МРК рассчитаем отдельно: */
+  if (СовокупноеОбеспечение < Контрагент[0][SOLVENCY])
+      if (ЕстьЗалог)
+         Контрагент[0][MRK_RUR] = FloorL(doubleL(СовокупноеОбеспечение  ) / ( 1.0 + 13.0*Ставка / 2400.0 ));
+      else
+         Контрагент[0][MRK_RUR] = FloorL(doubleL(СовокупноеОбеспечение  ) / ( 1.0 + (СрокДоговораМес + 1.0)*Ставка / 2400.0 ));
+      end;
+  else
+      Контрагент[0][MRK_RUR] = FloorL(doubleL(Контрагент[0][SOLVENCY]) / ( 1.0 + (СрокДоговораМес + 1.0)*Ставка / 2400.0 ));
+  end;
+  if (Ипотека)
+     СтоимостьИпотеки = СтоимостьПредметовИпотеки(ClaimF.ClaimID, ClaimF.GivingDate);
+     if (Контрагент[0][MRK_RUR] > СтоимостьИпотеки)
+        Контрагент[0][MRK_RUR] = СтоимостьИпотеки;
+     end;
+  end;
+
+  СуммаКредитаСПроцентами  = min(СуммаКредитаРубли, Контрагент[0][MRK_RUR]) * (1.0 + Ставка*min(СрокДоговораМес, 12.0)/1200.0);
+  if (OnlyGuarantee) // В обеспечение предоставлены только поручительства
+  // ТребуемаяПлатежеспособностьЗ - платежеспособнось заемщика, необходимая для получения требуемого им кредита
+     if (СуммаКредитаРубли < Контрагент[0][MRK_RUR])
+        ТребуемаяПлатежеспособностьЗ = doubleL(СуммаКредитаРубли) * ( 1.0 + (СрокДоговораМес + 1.0)*Ставка / 2400.0 );
+        if (max(0, СовокупноеОбеспечение) <= max(0, ТребуемаяПлатежеспособностьЗ))
+            if (not GetTrue(false, "Сумма платежеспособностей поручителей (" + max(0, СовокупноеОбеспечение) + ") не превышает| платежеспособность (" + max(0, ТребуемаяПлатежеспособностьЗ) + "), позволяющую заемщику | получить кредит в исспрашиваемой сумме. Продолжить?"))
+              return 0;
+            end;
+        end;
+     end;
+     if  (СовокупноеОбеспечение <= СуммаКредитаСПроцентами)
+         if (not GetTrue(false, "Обеспечение поручительствами не обеспечивает покрытие обязательств| заемщика по кредиту (с процентами). Продолжить?"))
+           return 0;
+         end;
+     end;
+  else // В обеспечение предоставлен залог
+     if (СовокупноеОбеспечение < СуммаКредитаСПроцентами)
+        if (not GetTrue(false, "Обеспечение залогами и поручительствами не обеспечивает покрытие| обязательств заемщика по кредиту  (с процентами). Продолжить?"))
+           return 0;
+        end;
+     end;
+  end;
+
+  /* МРК заемщика: */
+  Контрагент[0][MRK] = FloorL(doubleL(Контрагент[0][MRK_RUR]) / КурсВалюты);
+  /* Рассчитаем МРК для всех поручителей */
+  i = 1;
+  while(i < Контрагент.size())
+     Контрагент[i][MRK_RUR] = FloorL(doubleL(Контрагент[i][SOLVENCY]) / ( 1.0 + (СрокДоговораМес + 1.0)*Ставка / 2400.0 ));
+     Контрагент[i][MRK] = Контрагент[i][MRK_RUR] / КурсВалюты;
+     i = i + 1;
+  end;
+
+  return max(0, Контрагент[0][MRK]); // Отрицательные суммы не возвращаем
+END;

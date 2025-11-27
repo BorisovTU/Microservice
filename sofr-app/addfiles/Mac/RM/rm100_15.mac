@@ -1,0 +1,1290 @@
+/*
+  $Name:         rm100_15.mac
+  $Module:       Арм позиционера
+  $Description:  Макрос шага "Предобработка входящего платежа"
+*/
+
+//-----------------------------------------------------------------------------
+// Блок      : 29025 - "Предобработка входящего платежа"
+// Шаг       : 30    - "Предобработка входящего платежа"
+// Назначение: Макрос шага
+// Описание  : Макрос шага
+//-----------------------------------------------------------------------------
+import RMInter, PaymInter, BankInter, OprInter, PTInter, CTInter, CurrInter, WldInter, 
+       "rmtools.mac", "rmcmptl.mac", "akkrtls.mac", "cbsttls.mac", "cbdefbo.mac", 
+       "wlglobal.mac", "pmpurp.mac", "pm_const.mac", "pmprops.mac", "pm_reserve_prcres.mac",
+       "globals.mac", "oralib.mac", "likepy.mac", pm_tools, pmfm, "pmprepromass.mac", "pm_answerret.mac"; 
+
+var PaymentObj:RsbPayment;
+
+record ReceiverBank(pmroute);
+record IntermediaryBank(pmroute);
+
+private const ПутьКНастройкеСчетаНерезидентов:string = "173-ФЗ СЧЕТА НЕРЕЗИД ДО 116-И";
+
+private macro PaymBankCodeIsAccountBankCode(Account :string, FIID :integer, PaymBankCode :string, PaymBankCodeKind :integer ):bool
+  VAR select:string =" select dep.t_PartyID " +
+                      " from daccount_dbt acc, " +
+                      "      ddp_dep_dbt dep "+
+                      " where acc.t_department=dep.t_Code "+
+                      "   and acc.T_ACCOUNT = :account" +
+                      "   and acc.T_CODE_CURRENCY = :fiid " +
+                      "   and acc.t_Chapter=1";
+
+  VAR params:TArray = makeArray( SQLParam( "account", Account),  
+                                   SQLParam( "fiid", FIID ));
+
+  VAR rset:RsdRecordset = execSQLselect( select, params, TRUE );
+  var Code :string;
+  if( rset and rset.moveNext() )
+       GetPartyCodeEx(rset.value(0),PaymBankCodeKind, @Code); 
+       if(Code==PaymBankCode)
+            return true;
+       end;
+  end;
+  return false;
+end;
+
+
+private const CHECKNAMETYPE_CLIENT = 0;
+private const CHECKNAMETYPE_ALL = 1;
+
+private macro GetCheckNameType()
+  var RegVal = CHECKNAMETYPE_CLIENT;
+  var err = 0;
+  GetRegistryValue( "АРМ ПОЗИЦИОНЕРА\\ЗАЧИСЛЕНИЕ\\ПРОВЕРЯТЬ_НАИМЕНОВАН_ПОЛУЧАТЕЛЯ", V_INTEGER, RegVal, err);
+  if(err)
+    RegVal = CHECKNAMETYPE_CLIENT;
+  end;
+  return RegVal;
+end;
+
+// Счет имеется в БД и принадлежит филиалу pmpaym.StartDepartment или любому подчиненному ему
+private macro CheckStartDepartment( AccountDepartment, StartDepartment )
+  var rs = execSQLSelect( " Select t_Code "
+                          " From ddp_dep_dbt "
+                          " Connect by prior t_Code = t_ParentCode "
+                          " Start with t_Code = :DepCode ",
+                          MakeArray( SQLParam( "DepCode", StartDepartment )));
+  while( rs and rs.MoveNext())
+    if( AccountDepartment == rs.value(0) )
+      return true;
+    end;
+  end;
+  
+  return false;
+end;
+
+// Среди подчиненных филиалов есть филиалы вне ЦАБС
+private macro CheckDepartmentCABS( PartyID )
+  var rs = execSQLSelect( " Select t_Code "
+                          " From ddp_dep_dbt "
+                          " Where t_AccessMode != :AccessMode "
+                          " Connect by prior t_Code = t_ParentCode "
+                          " Start with t_PartyID = :PartyID ",
+                          MakeArray( SQLParam( "AccessMode", 1), //DEPARTMENT_ACCESS_ONLINE
+                                     SQLParam( "PartyID", PartyID )));
+                                     
+  if( rs and rs.MoveNext())
+    return true;
+  end;
+  
+  return false;
+end;
+
+//-----------------------------------------------------------------------------
+// Получить название филиала
+//-----------------------------------------------------------------------------
+PRIVATE MACRO GetDepartmentName( Department:integer ):string
+  var rset:object;
+  var select:string;
+  var params:TArray = TArray();
+
+  select = " SELECT T_NAME FROM DDP_DEP_DBT WHERE T_CODE = :Department ";
+
+  params[params.size] = SQLParam( "Department", Department );
+  rset = execSQLselect( select, params, TRUE );
+
+  if( rset and rset.moveNext() )
+    return rset.value(0);
+  end;
+
+  return "";
+END;
+
+PRIVATE MACRO GetDepartmentNameByBankID( BankID:integer ):string
+  var rset:object;
+  var select:string;
+  var params:TArray = TArray();
+
+  select = " SELECT T_NAME FROM DDP_DEP_DBT WHERE T_PARTYID = :BankID ";
+
+  params[params.size] = SQLParam( "BankID", BankID );
+  rset = execSQLselect( select, params, TRUE );
+
+  if( rset and rset.moveNext() )
+    return rset.value(0);
+  end;
+
+  return "";
+END;
+
+
+// ----------------------------------------------------------------------------
+// Поместить в невыясненные
+// ----------------------------------------------------------------------------
+private macro PM_ToUnknown( note_text:string ):integer
+
+  if( УстановитьСтатусыПлатежа( OPR_PAYM_INDEX, OPR_PAYM_ST_INDEX_UNKNOWN, OPR_PAYM_MANUAL, OPR_PAYM_ST_MANUAL_NOTNEED ) )
+    msgbox("Ошибка при установке сегментов статуса экземпляра операции");
+    return 1;
+  end;
+  if( (ValType(note_text) != V_UNDEF) and (note_text != "") ) // Заполнить примечание
+    if( PaymentObj.Notes.AddNote( PM_NOTEKIND_DENIALGROUND, note_text ) != 0 )
+      msgbox( "Ошибка при вставке примечания платежа" );
+      return 1;
+    end;
+  end;
+
+  return 0;
+end;
+
+// ----------------------------------------------------------------------------
+// Субъект является юридическим лицом
+// ----------------------------------------------------------------------------
+private macro PartyIsInst( PartyID ):bool
+
+  var SelectStr:string;
+  var params   :TArray;
+  var rs       :object;
+
+  SelectStr = "select pt.t_LegalForm " +
+              "  from dparty_dbt pt " +
+              "where  pt.t_PartyID = :PartyID ";
+
+  params = makeArray( SQLParam( "PartyID", PartyID ));
+
+  rs = execSQLselect( SelectStr, params, FALSE );
+
+  if( rs and rs.moveNext() )
+    if( rs.value(0) == 1 )
+      return true;
+    end;
+  end;
+
+  return false;
+end;
+
+private macro CheckRestAndMakeReserve( Account : string, Chapter : integer, FIID : integer,
+                                       Payment : RsbPayment, SkipArest : bool 
+                                     ) : integer
+
+  var IsI2 : bool = false, IsWaiting : bool = false, IsWP : bool = false, 
+      ReasonID : integer = 0;
+
+  var CheckReserveResult : integer = Payment.CheckRestAndMakeReserve
+                                         ( Account, Chapter, FIID, 
+                                           Payment.FuturePayerAmount, 
+                                           Payment.InTransferDate, CR_CHECKREST, 
+                                           true, true, true, true, SkipArest,
+                                           null, null, @ReasonID, true, true, null,
+                                           IsI2, IsWaiting, IsWP, true );
+
+  var stat : integer = ProcessCheckReserveResult
+             ( CheckReserveResult, ReasonID, IsWP, IsI2, IsWaiting,
+               Payment, Account, Chapter, FIID, false
+             );
+
+  return stat;
+end;
+
+private macro ПроверитьКодБанка( Account :string, FIID :integer, 
+                                 PaymBankCode :string, PaymBankCodeKind :integer,
+                                 DKFlag : string, SkipArest : bool
+                               ):integer
+
+  if( PaymBankCodeIsAccountBankCode(Account, FIID, PaymBankCode, PaymBankCodeKind) )
+
+    if(DKFlag == FL_DEBET)
+      var stat : integer = CheckRestAndMakeReserve( Account, PaymentObj.Chapter, FIID,
+                                                    PaymentObj, SkipArest );
+
+      // если резерв не был создан, завершить выполнение шага
+      if(stat)
+        return ConvertPrcChkRsrvStatForStep(stat);
+      end;
+    end;
+
+    if(УстановитьСтатусыПлатежа( OPR_PAYM_DO, OPR_PM_ST_ENTER ))
+      msgbox( "Ошибка при установке значения сегмента статуса");
+      return 1;
+    end;
+  else
+    return PM_ToManual( PaymentObj, "Нет открытого счёта "+Account+" в филиале "+PaymBankCode);
+  end;
+
+  return 0;
+end;
+
+private macro ПроверитьСчетПлательщикаЭСИД( PaymentObj:object ):integer
+
+  var select:string = " select acc.t_department, acc.t_open_date, acc.t_close_date, acc.t_client " +
+                      " from daccount_dbt acc "+ 
+                      " where acc.t_chapter         = :chapter " +
+                      "   and acc.t_code_currency   = :fiid    " +
+                      "   and acc.t_account         = :account ";
+  var params:TArray = makeArray(SQLParam( "chapter", PaymentObj.Chapter       ),     
+                                SQLParam( "fiid"   , PaymentObj.PayerFIID     ),     
+                                SQLParam( "account", PaymentObj.PayerAccount  ) );
+  
+  var rset:RsdRecordset = execSQLselect( select, params, TRUE );
+  var RejectGround = "";
+  if( rset and rset.moveNext() )
+ 
+    if( not ПолучитьСообщение( PaymentObj.PaymentID, OBJTYPE_PAYMENT, 1/*WLD_MES_IN*/, wlmes, NULL ) )
+      ClearRecord( wlmes );
+    end;
+    var ErrorNumber = "";
+    if( not CheckStartDepartment( rset.Value(0), PaymentObj.StartDepartment ) )
+      if( GetMesFormatType(wlmes.MesID) == WLD_FORMAT_XML )
+        ErrorNumber = "22";
+      else
+        ErrorNumber = "32";
+      end;
+      RejectGround = ErrorNumber + ";В банке (филиале банка) и подчиненных ему филиалах отсутствует номер счета, указанный в электронном документе, сформированном налоговым органом";
+    elif( ( rset.Value(1) > PaymentObj.ValueDate ) or                                         /*счет на дату валютирования еще не открыт*/
+          ( ( rset.Value(2) != date(0,0,0) ) and ( rset.Value(2) <= PaymentObj.ValueDate ) ) ) /*или уже закрыт*/
+      if( GetMesFormatType(wlmes.MesID) == WLD_FORMAT_XML )
+        ErrorNumber = "31";
+      else
+        ErrorNumber = "35";
+      end;
+      RejectGround = ErrorNumber + ";На дату получения банком (филиалом банка) БИК " + PaymentObj.PayerBankCode + " " + PaymentObj.PayerBankName + 
+                     " поручении налогового органа на списание денежных средств № " + PaymentObj.Number + 
+                     " от "               + PaymentObj.Date + 
+                     " на сумму "         + PaymentObj.BaseAmount + 
+                     " счёт плательщика " + PaymentObj.PayerAccount + 
+                     " закрыт";
+      MsgBox( RejectGround );
+    end;
+  else
+    RejectGround = "32;В банке (филиале банка) и подчиненных ему филиалах отсутствует номер счета, указанный в электронном документе, сформированном налоговым органом";
+  end;
+
+  var query = 
+  " SELECT 1 " +
+    " FROM dobjcode_dbt " +
+  " WHERE     t_State = :State " +
+      "  AND t_ObjectID = :ObjectID " +
+      "  AND t_CodeKind = :PTCK_INN " +
+      "  AND REGEXP_SUBSTR (t_Code, '[^/]+') = :Code ";
+  
+  var rsOpenINN = execSQLselect( query, makeArray(SQLParam("State", 0),
+                                                  SQLParam("PartyID", rset.Value(3) ),                                                   
+                                                  SQLParam("PTCK_INN", PTCK_INN),                                                    
+                                                  SQLParam("Code", RemoveKPP(PaymentObj.PayerINN) ) ) );   
+                                               
+  if((not rsOpenINN) or (not rsOpenINN.MoveNext()))
+  
+    var closed = Bnk_GetRegistryValue("PS\\REQOPENACC\\OPERATION\\365-П\\Данные по закрытому ИНН\\ЗАКРИНН_ПОРУЧЕНИЕ", V_INTEGER, 0);
+    
+    var rsCloseINN = execSQLselect( query, makeArray(SQLParam("State", 1),
+                                                SQLParam("PartyID", rset.Value(3) ),                                                   
+                                                SQLParam("PTCK_INN", PTCK_INN),                                                    
+                                                SQLParam("Code", RemoveKPP(PaymentObj.PayerINN) ) ) );
+    
+    if(rsCloseINN and rsCloseINN.MoveNext())
+      if(closed == 0)
+        RejectGround = "31;В поручении налогового органа на списание денежных средств № " + PaymentObj.Number + 
+                 " от " + PaymentObj.Date + 
+                 " на сумму " + PaymentObj.BaseAmount +
+                 " указан недействующий ИНН " + RemoveKPP(PaymentObj.PayerINN) +
+                 " клиента " + PaymentObj.PayerName;
+      end;
+    else  
+      RejectGround = "31;ИНН " + RemoveKPP(PaymentObj.PayerINN) + 
+               " клиента " + PaymentObj.PayerName + 
+               " не соответствует номеру счета клиента " + PaymentObj.PayerAccount + 
+               ", указанному в поручении налогового органа на списание денежных средств № " + PaymentObj.Number + 
+               " от " + PaymentObj.Date + 
+               " на сумму " + PaymentObj.BaseAmount;
+    end;
+  end;
+
+  if( (PaymentObj.PayerGroup == PAYMENTS_GROUP_EXTERNAL) or CheckDepartmentCABS(PaymentObj.PayerBankID))
+    PaymentObj.DemandIsESID = ESID_EXTERN_SYSTEM; //Обрабатывается внесистемно
+  end;
+
+  if( RejectGround != "" )
+    RejectPayment( PaymentObj, RejectGround );
+    return 1;
+  end;
+  return 0;
+ONERROR(x)
+  MsgBox( x.Message );
+  return false;
+end;
+
+macro ПроверитьБанкротство()
+  var RegVal : String = "";
+  var BankruptStatus = 0;
+  GetPartyBankruptStatus( PaymentObj.Payer, date(), BankruptStatus );
+  GetRegistryValue( "CB\\PAYMENTS\\SKIPBANKRUPTSTATUS", V_STRING, RegVal);
+  var BStatus : String = BankruptStatus;
+  if( CompareStrWithMasks( RegVal, BStatus) and (BankruptStatus != 10) )
+    return BankruptStatus;
+  end;
+  return 0;
+end;
+
+private macro CutTextInBrackets(s : string) : string
+  var i1 : integer = index(s, "(");
+  if(i1)
+    var i2 : integer = index(s, ")", i1);
+    if(i2)
+      s = substr(s, 1, i1 - 1) + substr(s, i2 + 1);
+    end;
+  end;
+
+  return s;
+end;
+
+private macro CheckPayerNameByUNKGN(checkError : @integer)
+  var PayerUNKGN : string = ПолучитьКодСубъекта(PaymentObj.Payer, PTCK_UNKGN),
+      PayerINN : string = RemoveKPP(PaymentObj.PayerINN);
+  if(PayerUNKGN)
+    var query : string =
+      "select 1 from dual where exists "
+      "( select 1 "
+      "    from dpartcode_dbt ptINN, dpartcode_dbt ptUNKGN "
+      "   where ptUNKGN.t_CodeKind = :PTCK_UNKGN "
+      "     and ptUNKGN.t_Code = :PayerUNKGN "
+      "     and ptUNKGN.t_PartyID <> :PayerID "
+      "     and ptINN.t_PartyID = ptUNKGN.t_PartyID "
+      "     and ptINN.t_CodeKind = :PTCK_INN "
+      "     and ( ptINN.t_Code = :PayerINN or ptINN.t_Code like (:PayerINN_1 || '/%') ) "
+      ") ";
+
+    var params : TArray = makeArray
+    ( SQLParam("PTCK_UNKGN", PTCK_UNKGN),
+      SQLParam("PayerUNKGN", PayerUNKGN),
+      SQLParam("PayerID",    PaymentObj.Payer),
+      SQLParam("PTCK_INN",   PTCK_INN),
+      SQLParam("PayerINN",   PayerINN),
+      SQLParam("PayerINN_1", PayerINN)
+    );
+
+    var rs = execSQLselect(query, params);
+    if(rs and rs.moveNext())
+      var PayerName : string = CutTextInBrackets(PaymentObj.PayerName);
+      checkError = CompareNamesByClientID(PaymentObj.Payer, PayerName, 0, "", 0);
+    end;
+  end;
+end;
+
+private macro checkBankIsOurDep( BankID:integer ) : bool
+  
+  if( BankID == {OurBank} )
+    return true;
+  end; 
+  
+  var query = 
+              "SELECT dp_dep.t_PartyID " +
+              "FROM ddp_dep_dbt dp_dep " +
+              "WHERE dp_dep.t_AccessMode = :AccessMode AND dp_dep.t_PartyID = :PartyID";
+              
+  var rs = execSQLselect( query, makeArray( SQLParam("AccessMode", 1), SQLParam("PartyID", BankID) ) );
+  
+  if( (not rs) or ( not rs.movenext() ) )
+    return false;
+  end;
+  
+  return true;
+end;
+
+// ----------------------------------------------------------------------------
+// Выполнение шага
+// ----------------------------------------------------------------------------
+macro ExecuteStep( Kind_Operation, first, KindDoc, ID_Operation )
+
+  var FlagTrans  :bool    = false,
+      IsAkkr     :bool    = false,
+      PaymWithSPI:bool    = false,
+      err_bool   :bool    = false,
+      Остаток    :money   = $0,
+      err        :integer = 0,
+      Покрытие   :integer = 0,
+      DO_Segment :integer = 0,
+      stat       :integer = 0,
+      AccType    :string  = "",
+      DKFlag     :string,
+      symbol     :string;
+  var Department:integer,
+      settaccDep:integer,
+      RegVal    :bool = false;
+  var err_mes:string;
+  var checkName:integer = 0;
+  var VOReject = "";
+  var VORejectGround = "";
+  
+  var МаскиСчетовКлиентов:string = "";
+  var field_value        :string = "";
+
+  // Для установки значений сегментов статусов
+  var CABS_Segment:integer = OPR_PM_ST_MFR_YES;
+  var BO_Segment  :integer = OPR_PAYM_ST_BO_NO;
+  var SkipArest;
+
+  if( GetOprStatus(OPR_PAYM_PERMISSION) == OPR_PAYM_ST_PERMISSION_YES )
+    SkipArest = true;
+  else
+    SkipArest = false;
+  end;
+
+  RECORD settacc ( settacc  );
+  RECORD corschem( corschem );
+  RECORD cors    ( corschem );
+
+  if( PaymentObj.DemandIsESID == "E" )
+    RejectPayment( PaymentObj, "");
+    return 0;
+  end;
+
+  // актуализируем платеж
+  if( PaymentObj.Actuate() )
+    RejectPayment(PaymentObj, "Не определен курс конверсии");
+    MsgBox("Ошибка при актуализации платежа ");
+    return 1;
+  end;
+
+  if( PaymentObj.Purpose == PM_PURP_MULTI )
+    if( УстановитьСтатусыПлатежа( OPR_PAYM_DO, OPR_PM_ST_UNDEF ) )
+      msgbox("Ошибка при установке сегментов статуса экземпляра операции");
+      return 1;
+    end;
+    return 0;
+  end;
+
+  if( (PaymentObj.PrimDocKind == WL_INDOC) and (PaymentObj.Purpose == PM_PURP_BANKPAYORDER) )   
+
+    ClearRecord( IntermediaryBank );
+    ClearRecord( ReceiverBank );
+
+    if( PaymentObj.GetOperationParticipantsFromRoute( null, null, null, IntermediaryBank, null, ReceiverBank  ) )
+
+      if( ReceiverBank.PartyID and (not checkBankIsOurDep( ReceiverBank.PartyID ) ) )
+        return PM_ToManual( PaymentObj, "Обработка транзитного поручения банка (ED107) в RS-Bank V.6 не поддерживается");
+      end;
+    
+      if( IntermediaryBank.PartyID and ( not checkBankIsOurDep( IntermediaryBank.PartyID ) ) )
+        return PM_ToManual( PaymentObj, "Обработка поручения банка (ED107) в, котором указан посредник для передачи средств между филиалами \"нашего\" банка, RS-Bank V.6 не поддерживается" );
+      end;
+    end;
+  end;
+
+  // Для Акцептных требований
+  if( (PaymentObj.DemandAcceptTerm == PM_DEMAND_TERM_ACCEPT) and (PaymentObj.DemandAccept == PM_DEMAND_ACCEPT_WAIT))
+    if( УстановитьСтатусыПлатежа( OPR_PAYM_ACCEPT, OPR_PAYM_ST_ACPT_NEED ) )
+      msgbox("Ошибка при установке сегментов статуса экземпляра операции");
+      return 1;
+    end;
+
+    // Платеж Транзитный
+    if( ( PaymentObj.PayerGroup    == PAYMENTS_GROUP_EXTERNAL ) and
+        ( PaymentObj.ReceiverGroup == PAYMENTS_GROUP_EXTERNAL ) )
+      msgbox( "Транзитные акцептные требования системой не обрабатываются" );
+      return 1;
+    
+    // Платеж входящий
+    elif( ( not ( ( PaymentObj.PayerGroup  == PAYMENTS_GROUP_EXTERNAL ) and
+                ( PaymentObj.ReceiverGroup == PAYMENTS_GROUP_EXTERNAL ) ) ) and 
+          PaymentObj.IsExternalIncoming )
+
+      if( УстановитьСтатусыПлатежа( OPR_PAYM_INDEX, OPR_PAYM_ST_INDEX_TP ) )
+        msgbox("Ошибка при установке сегментов статуса экземпляра операции");
+        return 1;
+      end;
+      return 0;
+
+    end;
+  else
+    if( УстановитьСтатусыПлатежа( OPR_PAYM_ACCEPT, OPR_PAYM_ST_ACPT_NONE ) )
+      msgbox("Ошибка при установке сегментов статуса экземпляра операции");
+      return 1;
+    end;
+  end;
+
+  // Дебетовый или кредитовый?
+  if( PaymentObj.IsCredit() )
+    DKFlag = FL_KREDIT;
+  else
+    DKFlag = FL_DEBET;
+  end;
+     
+  // Транзитный?
+  FlagTrans = PaymentObj.IsTransit();
+
+  // Установить сегменты "ЦАБС" и "Контроль"
+  if( PaymentObj.StartDepartment != PaymentObj.EndDepartment )
+    if( not FlagTrans)
+       CABS_Segment = OPR_PM_ST_MFR_NO;
+    end;
+  end;
+
+  // Проверить, не является ли платеж целевым финансированием
+  if( ( PaymentObj.IsPurpose == "" ) and ( IsPurposefulPayment( PaymentObj ) ) )
+    PaymentObj.IsPurpose = "X";
+  end;
+  
+  if( УстановитьСтатусыПлатежа( OPR_PAYM_CABS, CABS_Segment, OPR_PAYM_CONTROL, OPR_PAYM_ST_CTRL_CONTROL ) )
+    msgbox("Ошибка при установке сегментов статуса экземпляра операции");
+    return 1;
+  end;
+
+  // Принудительно помещать в невыясненные - а если действительно надо?
+  if( IsForcePlaceInUnknown() )
+    return PM_ToUnknown();
+  end;
+
+  // Платеж с признаком "В невыясненные"
+  if( PaymentObj.IsUnknown == "X" )
+    if( IsOprMultiExec() == FALSE ) 
+      return PM_ToUnknown();
+    else // Оставляем платеж в списке принятых (27285)
+      return PM_ToManual( PaymentObj,  "" );
+    end;
+  end;  
+
+  // Найти входящую корсхему
+  if( НайтиКорсхему( PaymentObj.InCorschem, PaymentObj.BaseFIID, cors ) )
+    msgBox("Не найдена входящая корсхема");
+    return 1;
+  end;
+
+  // Проверить ДПП
+  array Text, Buttons;
+  if( not InList(PaymentObj.DemandIsESID, IS_ESID_PAYMENT, ESID_KGN) )
+    var IsDPPOperday = false, IsDPPBalance = "";
+    IsDPPOperday = existsOperDay(PaymentObj.InTransferDate, cors.Department, @IsDPPBalance);
+
+    if( PaymentObj.InTransferDate != {curdate} ) 
+
+      if( (PaymentObj.InTransferDate < {curdate}) and IsDPPOperday and IsDPPBalance )
+        if( GetDialogFlag() )
+          Text(0) = "Входящая ДПП платежа меньше текущего операционного дня.";
+          Text(1) = "Провести платеж указанной датой?";
+          Buttons( 0 ) = "Провести ДПП";
+          Buttons( 1 ) = "Текущим ОД";
+          Buttons( 2 ) = "Отложить";
+          var UserChoice : integer = ConfWin( Text, Buttons );
+
+          if( UserChoice == 1 )
+            PaymentObj.InTransferDate = {curdate};
+          elif( UserChoice == 2 )
+            return 1;
+          end;
+        
+        else
+          err_mes = "Входящая ДПП платежа меньше текущего операционного дня. " +
+                    "Измените ДПП или выберите правильный вариант исполнения платежа в индивидуальном режиме";
+          msgbox(err_mes);
+          return 1;
+        end;
+      end;
+    end;
+
+    if( not IsDPPOperday or not IsDPPBalance )
+      err_mes = "Операционный день, соответствующий входящей ДПП платежа, не существует или не имеет признака баланса. " +
+                "Исполнение платежа указанной ДПП невозможно";
+      msgbox(err_mes);
+      return 1;
+    end;  
+  end;
+
+  // Если корсчет вида ЛОРО
+  if( not stat and (cors.IsNostro != SET_CHAR) and not InList(PaymentObj.DemandIsESID, IS_ESID_PAYMENT, ESID_KGN) )
+
+    if( DKFlag == FL_KREDIT )
+      stat = CheckRestAndMakeReserve(cors.Account, CHAPT1, cors.FIID, PaymentObj, SkipArest);
+
+      // если резерв не был создан, завершить выполнение шага
+      if(stat)
+        return ConvertPrcChkRsrvStatForStep(stat);
+      end;
+    end;
+
+  end;
+
+  // Если для платежа значение категории $(Подлежит возврату) равно $(Да)
+  if( PaymentObj.Categories.IsAttrPresense(OBJ_PAYMENT_GROUP_NEED_RETURN, 1, NULL, NULL, false, date(0,0,0)/*???{curdate}*/) )
+    
+    if( УстановитьСтатусыПлатежа( OPR_PAYM_DO, OPR_PM_ST_ENTER ) )
+      msgbox("Ошибка при установке сегментов статуса экземпляра операции");
+      return 1;
+    end;
+
+    if( УстановитьСтатусыПлатежа( OPR_PAYM_INDEX, OPR_PAYM_ST_INDEX_INRETURN ) )
+      msgbox("Ошибка при установке сегментов статуса экземпляра операции");
+      return 1;
+    end;
+
+    return 0;
+  end;
+
+  // Если платеж не является транзитным - установить символ бэк-офиса
+  if( not FlagTrans and not InList( PaymentObj.DemandIsESID, IS_ESID_PAYMENT, ESID_KGN ) )
+    symbol = DefineToBackOffice( PaymentObj, true );
+    
+    if( symbol )
+      PaymentObj.ToBackOffice = symbol;
+    end;
+
+    if( PaymentObj.ToBackOffice )
+      BO_Segment = OPR_PAYM_ST_BO_YES;
+    end;
+
+    if( УстановитьСтатусыПлатежа( OPR_PAYM_BO_PROCESS, BO_Segment ) )
+      msgbox("Ошибка при установке сегментов статуса экземпляра операции");
+      return 1;
+    end;
+
+    // Если БО выполняет бухгалтерские проводки по платежу
+    if( not( IsNeedInAccounting( 0, PaymentObj.ToBackOffice ) ) )
+
+      if( УстановитьСтатусыПлатежа( OPR_PAYM_DO, OPR_PM_ST_ENTER ) )
+        msgbox("Ошибка при установке сегментов статуса экземпляра операции");
+        return 1;
+      end;
+
+      return 0;
+    end;
+  end;
+
+  // Проверка на причастность к терроризму
+  stat = ПроверкаПричастностиТерроризму( PaymentObj, true );
+  if( stat < 0 )
+    return 1;
+  elif( stat > 0 )
+    return 0;
+  end;
+
+  if( not InList(PaymentObj.DemandIsESID, IS_ESID_PAYMENT, ESID_KGN) and not ПлатежЗачисленНаСНР(PaymentObj, true) )
+    if( PaymentObj.ValueDate > PaymentObj.InTransferDate )
+      if( УстановитьСтатусыПлатежа( OPR_PAYM_DO, OPR_PM_ST_UNFIN ) )
+        msgbox("Ошибка при установке сегментов статуса экземпляра операции");
+        return 1;
+      end;
+
+      return 0;
+    end;
+
+    if( PaymentObj.ValueDate < PaymentObj.InTransferDate )
+      if( GetDialogFlag() )
+        Text(0) = "Дата валютирования в документе меньше даты отражения по корсчету.";
+        Text(1) = "Исполнить датой отражения по корсчету?";
+        Buttons( 0 ) = "Исполнить";
+        Buttons( 1 ) = "На ручную обработку";
+        if( ConfWin( Text, Buttons ) == 1 )
+          PM_ToManual( PaymentObj, "Дата валютирования в документе меньше даты отражения по корсчету");
+          return 0;
+        else
+          PaymentObj.ValueDate = PaymentObj.InTransferDate;
+        end;
+      else
+        msgbox("Дата валютирования в документе меньше даты отражения по корсчету");
+        return 1;
+      end;
+    end;
+  end;
+
+  if( (GetOprStatus(OPR_PAYM_MANUAL) == OPR_PAYM_ST_MANUAL_PROCESSED) or 
+      (GetOprStatus(OPR_PAYM_INDEX) == OPR_PAYM_ST_INDEX_UNKNOWN) )
+    if( УстановитьСтатусыПлатежа( OPR_PAYM_DO, OPR_PM_ST_ENTER ) )
+      msgbox("Ошибка при установке сегментов статуса экземпляра операции");
+      return 1;
+    end;
+
+    return 0;
+  end;
+
+  if( PaymentObj.Date > {curdate})
+    return PM_ToManual( PaymentObj,  "Дата документа больше даты операционного дня" );
+  end;
+
+  // Проверки требований ЭСИД
+  if( InList(PaymentObj.DemandIsESID, IS_ESID_PAYMENT, ESID_KGN) )
+    var BankruptStatus = 0;
+    if( not ПолучитьСообщение( PaymentObj.PaymentID, OBJTYPE_PAYMENT, 1/*WLD_MES_IN*/, wlmes, NULL ) )
+      ClearRecord( wlmes );
+    end;
+    var FormatType = GetMesFormatType(wlmes.MesID);
+    var ErrorNumber = "";
+
+    if( strlen(PaymentObj.PayerAccount) == 0)
+      RejectPayment( PaymentObj, "35;В электронном документе, сформированном налоговым органом, не указан счет плательщика, с которого должна быть списана сумма взыскания");
+      return 0;
+    elif( strlen(PaymentObj.ReceiverAccount) == 0)
+      RejectPayment( PaymentObj, "35;В электронном документе, сформированном налоговым органом, не указан счет получателя, на который должна быть зачислена сумма взыскания");
+      return 0;
+    elif( PaymentObj.PayerBankID <= 0 )
+      if( FormatType == WLD_FORMAT_XML )
+        ErrorNumber = "21";
+      else
+        ErrorNumber = "31";
+      end;
+      RejectPayment( PaymentObj, ErrorNumber + ";Электронный документ ошибочно направлен налоговым органом не в тот банк (филиал банка)");
+      return 0;
+    elif( PaymentObj.PayerGroup != PAYMENTS_GROUP_INTERNAL )
+      if( FormatType == WLD_FORMAT_XML )
+        ErrorNumber = "31";
+      else
+        ErrorNumber = "100";
+      end;
+      RejectPayment( PaymentObj, ErrorNumber + ";Поручение на списание направлено в филиал " + GetDepartmentNameByBankID( PaymentObj.PayerBankID ) + ", не включенный в ЦАБС. Автоматическая передача инкассового поручения в этот филиал невозможна");
+      return 0;
+    elif( int( PaymentObj.Number ) == 0 )
+      if( FormatType == WLD_FORMAT_XML )
+        ErrorNumber = "31";
+      else
+        ErrorNumber = "35";
+      end;
+      RejectPayment( PaymentObj, ErrorNumber + ";Номер поручения не соответсвует требованиям Положения Банка России от 19.06.2012 №383-П");
+      return 0;
+    elif( PaymentObj.BaseAmount <= 0 )
+      RejectPayment( PaymentObj, "35;Не задана сумма взыскания");
+      return 0;
+    elif( PaymentObj.PayerAccount == "" )
+      RejectPayment( PaymentObj, "35;В электронном документе, сформированном налоговым органом, не указан счет плательщика, с которого должна быть списана сумма взыскания");
+      return 0;
+    elif( ПроверитьСчетПлательщикаЭСИД( PaymentObj ) != 0 )
+      return 0;
+    elif( PaymentObj.ReceiverAccount == "" )
+      RejectPayment( PaymentObj, "35;В электронном документе, сформированном налоговым органом, не указан счет получателя, с которого должна быть списана сумма взыскания");
+      return 0;
+    elif( BankruptStatus = ПроверитьБанкротство() )
+      var Status = "";
+      var SelectStatus = " select t_Name "
+                         " from   dllvalues_dbt "
+                         " where  t_List = 3564 "
+                         " and t_Element = :Element ";
+      var rs = execSQLSelect( SelectStatus, makeArray( SQLParam( "Element", BankruptStatus ) ));
+      if( rs.MoveNext() )
+        Status = rs.value(0);
+      end;
+      rs = execSQLSelect( " select pmprop.t_BankCode, pmrmprop.t_PayerBankName, pmrmprop.t_Number, "
+                              " TO_CHAR(pmrmprop.t_Date, 'dd.mm.yyyy'), pmrmprop.t_PayerName "
+                              " from dpmprop_dbt pmprop, dpmrmprop_dbt pmrmprop "
+                              " where pmprop.t_DebetCredit = 0 "
+                              " and pmprop.t_PaymentID = :PaymentID1 "
+                              " and pmrmprop.t_PaymentID = :PaymentID2 ",
+                              makeArray( SQLParam( "PaymentID1", PaymentObj.PaymentID ),
+                                         SQLParam( "PaymentID2", PaymentObj.PaymentID )));
+      if( rs and rs.MoveNext() )
+        var Note = "На дату получания банком (филиалом банка)БИК " + rs.value(0) + " " +
+        rs.value(1) + "поручения налогового органа на списание денежных средств № " + rs.value(2) + " от "
+        + rs.value(3) + " на сумму " + PaymentObj.BaseAmount + " по плательщику " + rs.value(4) 
+        + " инициирована процедура банкротства в стадии " + "\"" + Status + "\"";  
+        RejectPayment( PaymentObj, "31;" + Note );
+        MsgBox(Note);
+        return 0;
+      end;
+    else
+      checkName = CheckPaymPayerName( PaymentObj.PaymentID );
+      if( (checkName == PAYMERR_CHECKNAMNEWRONGINN) and (PaymentObj.DemandIsESID == ESID_KGN) )
+        CheckPayerNameByUNKGN(@checkName);
+      end;
+
+      if( (checkName == PAYMERR_CHECKNAMNEWRONGINN) or (checkName == PAYMERR_CHECKNAMENOINN) )                       
+        if( FormatType == WLD_FORMAT_XML )
+          ErrorNumber = "31";
+        else
+          ErrorNumber = "35";
+        end;                     
+        RejectPayment( PaymentObj, ErrorNumber + "; ИНН " + PaymentObj.PayerINN + " клиента " + PaymentObj.PayerName + " не соответствует номеру счета клиента "+
+                      PaymentObj.PayerAccount + ", указанному в поручении налогового органа на списание денежных средств № " + PaymentObj.Number + 
+                      " от " + PaymentObj.Date + " на сумму " + PaymentObj.BaseAmount + ", направленном в банк (филиал банка) БИК " +
+                      PaymentObj.PayerBankCode + " " + PaymentObj.PayerBankName );
+      elif( (checkName == PAYMERR_CHECKNAMNEWRONGNAME) or (checkName == PAYMERR_CHECKNAMENONAME) )
+        if( FormatType == WLD_FORMAT_XML )
+          ErrorNumber = "23";
+        else
+          ErrorNumber = "33";
+        end;
+        RejectPayment( PaymentObj, ErrorNumber + ";Наименование клиента не соответствует номеру счета клиента, указанному в электронном документе, сформированном налоговым органом");
+      else
+        if( УстановитьСтатусыПлатежа( OPR_PAYM_DO, OPR_PM_ST_EXEC_ORDER ) )
+          msgbox("Ошибка при установке сегментов статуса экземпляра операции");
+          return 1;
+        end;
+        return 0;
+      end;
+    end;
+  end;
+  
+
+  if( not FlagTrans )
+    if( DKFlag == FL_KREDIT )
+      if( ( strlen( PaymentObj.ReceiverAccount ) == 0 )) 
+        return PM_ToManual( PaymentObj,  "Не указан счет получателя" );
+      end;
+    else
+      if( ( strlen( PaymentObj.PayerAccount ) == 0 ) ) 
+        return PM_ToManual( PaymentObj,  "Не указан счет плательщика" );
+      end;
+    end;
+  end;
+
+  //#144442 
+  if( DKFlag == FL_KREDIT )
+    if( PM_AccountIsMFR(PaymentObj.ReceiverAccount, CHAPT1, PaymentObj.ReceiverFIID) ) 
+      return PM_ToManual( PaymentObj,  "Конечный счет получателя не задан" );
+    end;
+  else
+    if( PM_AccountIsMFR(PaymentObj.PayerAccount, CHAPT1, PaymentObj.PayerFIID) ) 
+      return PM_ToManual( PaymentObj,  "Конечный счет плательщика не задан" );
+    end;
+  end;
+
+
+  // Проверка по настройке "Счета клиентов"
+  if( not FlagTrans )
+    if( DKFlag == FL_KREDIT )
+      if( (GetCheckNameType() == CHECKNAMETYPE_CLIENT) and PM_IsBankAccount( PaymentObj.ReceiverAccount, PaymentObj.ReceiverFIID )  ) 
+        return ПроверитьКодБанка(PaymentObj.ReceiverAccount, PaymentObj.ReceiverFIID, PaymentObj.ReceiverBankCode, PaymentObj.ReceiverBankCodeKind);
+      end;
+    else
+      if( (GetCheckNameType() == CHECKNAMETYPE_CLIENT) and  PM_IsBankAccount( PaymentObj.PayerAccount, PaymentObj.PayerFIID ) ) 
+        return ПроверитьКодБанка(PaymentObj.PayerAccount, PaymentObj.PayerFIID, PaymentObj.PayerBankCode, PaymentObj.PayerBankCodeKind, DKFlag, SkipArest);
+      end;
+    end;
+  end;
+
+  // Если платеж является непокрытым аккредитивом
+  if( ( not PaymentObj.ReceiverFIID ) and ( PaymentObj.ShifrOper == "08" ) )
+
+    field_value = PaymentObj.AkkrType;
+
+    if( field_value )
+      if ( (field_value == "О") OR (field_value == "Б") )
+        Покрытие = КодПокрытия;
+      else
+        Покрытие = КодНепокрытия;
+        IsAkkr   = true;
+      end;
+    end;
+  end;
+
+  // Произвести проверку по настройке "Счета нерезидентов до 116-И"
+  // Для входящих кредитовых документов, кроме непокрытых аккредитивов
+  if( ( not FlagTrans ) and ( DKFlag == FL_KREDIT ) and ( not IsAkkr ) )
+
+    // Если счет найден и открыт
+    if( СчетОткрыт( PaymentObj.ReceiverFIID, PaymentObj.ReceiverAccount, 1, AccType, @Department ) )
+      // Если запрет на кредит или счет в 116-И
+      if( ( Index( AccType, "У" ) ) or ( PM_FindBalanceInReg_117( ПутьКНастройкеСчетаНерезидентов, PaymentObj.ReceiverAccount, 0 ) ) )
+        return PM_ToManual( PaymentObj, "Запрещено зачисление на счет "+PaymentObj.ReceiverAccount+" в филиале " + Department);
+      end;
+      /* Проверка спецбанковского */
+      if( Index( AccType, "Я" ) )
+        if( not PM_ExternalAccountIsSpecial( PaymentObj.PayerAccount ) )
+          return PM_ToManual( PaymentObj,  "Не допускается зачисление средств на специальный банковский счет со счета, не являющегося специальным банковским" );
+        end;
+      end;
+    // Если счет найден и закрыт
+    elif( СчетЗакрыт( PaymentObj.ReceiverFIID, PaymentObj.ReceiverAccount, 1, @Department ) )
+      // Если для счета есть СПИ перенаправления
+      if( not FoundSPI( 0, PaymentObj.ReceiverAccount, settacc ) )
+        GetRegistryValue( "АРМ ПОЗИЦИОНЕРА\\ПЕРЕМЕННЫЕ\\CLOSEDACCOUNTREDIRECTTOEXTERNAL", V_BOOL, RegVal, err ); 
+        if( СчетОткрыт( settacc.FIID, settacc.Account, 1, "", @settaccDep ) )
+          if( not НайтиКорсхему( PaymentObj.InCorschem, PaymentObj.BaseFIID, corschem ) )
+            PaymWithSPI = IfThenElse( settaccDep != corschem.Department, RegVal, true ); 
+          end;
+        elif( not СчетЗакрыт( settacc.FIID, settacc.Account, 1, @settaccDep ) )
+          PaymWithSPI = RegVal; 
+        end;
+      end;
+      if( PaymWithSPI == false )
+        return PM_ToManual( PaymentObj,  "Счет № " + PaymentObj.ReceiverAccount + " в филиале № " + GetDepartmentName( Department ) + " закрыт" );
+      end;
+    else // Если счет не найден
+      return PM_ToManual( PaymentObj,  "Не найден счет получателя № " + PaymentObj.ReceiverAccount );
+    end;
+
+  end;
+
+  // Произвести проверку номера счета плательщика
+  // Для входящих дебетовых документов
+  if( ( not FlagTrans ) and ( DKFlag == FL_DEBET ) )
+
+    if( СчетОткрыт( PaymentObj.PayerFIID, PaymentObj.PayerAccount, 1, AccType ) )
+      // Если запрет на дебет
+      if( Index( AccType, "Т" ) ) 
+        return PM_ToManual( PaymentObj,  "Нельзя списать требуемую сумму со счета плательщика № " + PaymentObj.PayerAccount );
+      end;
+    else
+      return PM_ToManual( PaymentObj,  "Нельзя списать требуемую сумму со счета плательщика № " + PaymentObj.PayerAccount );
+    end;
+
+    // Проверить статус банкротства плательщика
+    BankruptStatus = 0;
+    var BStatus = "";
+    if( BankruptStatus = ПроверитьБанкротство() )
+      var ret = 0;
+      var select = " select t_Name "
+                   " from   dllvalues_dbt "
+                   " where  t_List = 3564 "
+                   " and t_Element = :Element ";
+      rs = execSQLSelect( select, makeArray( SQLParam( "Element", BankruptStatus ) ));
+      if( rs.MoveNext() )
+        BStatus = rs.value(0);
+      end;
+      var Mes = TArray();
+      Mes(Mes.size) = "ВНИМАНИЕ! Физическое лицо " + PaymentObj.Payer + " " + PaymentObj.PayerName 
+      + " имеет по состоянию на " + date() + " статус банкротства \"" + BStatus + "\"";
+      Mes(Mes.size) = "Убедитесь в правомерности приостановления операции по счетам";
+      Buttons(0) = "Продолжить";
+      Buttons(1) = "На ручную обработку";
+      if( GetDialogFlag() )
+        ret = ConfWin( Mes, Buttons, 1 );
+      else 
+        ret = 1;
+      end;
+      
+      if( ret == 1 )
+        // На ручную обработку
+        return PM_ToManual( PaymentObj, Mes(0) );
+      end;
+      
+    end;
+
+  end;
+
+  // Если платеж является аккредитивом
+  if( ( not PaymentObj.ReceiverFIID ) and ( PaymentObj.ShifrOper == "08" ) )
+    // В групповом режиме аккредитивы не обрабатываются
+    if( IsOprMultiExec())
+      msgbox("В групповом режиме аккредитивы не обрабатываются");
+      return 1;
+    end;
+
+    // транзитный аккредитив
+    if( FlagTrans )
+      return PM_ToUnknown();
+    end;
+
+    // Если аккредитив - непокрытый
+    if( Покрытие == КодНепокрытия )
+      if( УстановитьСтатусыПлатежа( OPR_PAYM_STATE, OPR_PM_ST_CLOSE ) )
+        msgbox("Ошибка при установке сегментов статуса экземпляра операции");
+        return 1;
+      end;
+      return 0;
+    end;
+
+    if( Покрытие == 0 )
+       msgBox("Невозможно определить вид покрытия аккредитива");
+       return 1;
+    end;
+  end;
+
+  // Если платеж неполноформатный
+  if( PaymentObj.IsShortFormat )
+    return PM_ToUnknown();
+  end;
+
+  // Проверить наименования
+  if( not FlagTrans )
+    // Только юридические или предприниматели !!!
+    var errFirst: integer = 0,
+        errSecond: integer = 0;
+
+    if( DKFlag == FL_KREDIT )
+       if( (GetCheckNameType() == CHECKNAMETYPE_ALL) or CчетПолучателяКлиентский( PaymentObj ) )
+         errFirst = CheckPaymReceiverName( PaymentObj.PaymentID, @errSecond, true );
+       end;
+    end;
+    if( errFirst == 0 )
+      if( PaymWithSPI )
+        DO_Segment = OPR_PM_ST_REDIRECT;
+      else
+        DO_Segment = OPR_PM_ST_ENTER;
+      end;
+      if( УстановитьСтатусыПлатежа( OPR_PAYM_DO, DO_Segment ) )
+        msgbox("Ошибка при установке сегментов статуса экземпляра операции");
+        return 1;
+      end;
+    else
+      err_mes = "";
+      if( (errSecond == PAYMERR_CHECKNAMENOINN) or (errFirst == PAYMERR_CHECKNAMENOINN) )
+        err_mes = "В платежном документе № " + PaymentObj.Number + " от " + PaymentObj.Date + " отсутствует ИНН получателя";
+      end;
+      if( (errSecond == PAYMERR_CHECKNAMENONAME) or (errFirst == PAYMERR_CHECKNAMENONAME) )
+        if (err_mes != "") err_mes = err_mes + "\n"; end;
+        err_mes = err_mes + "В платежном документе № " + PaymentObj.Number + " от " + PaymentObj.Date + " отсутствует наименование получателя";
+      end;
+      if( (errSecond == PAYMERR_CHECKNAMNEWRONGINN) or (errFirst == PAYMERR_CHECKNAMNEWRONGINN) )
+        if (err_mes != "") err_mes = err_mes + "\n"; end;
+        err_mes = err_mes + "В платежном документе № " + PaymentObj.Number + " от " + PaymentObj.Date + " ИНН получателя не совпадает с имеющимся в справочнике клиентов";
+      end;
+      if( (errSecond == PAYMERR_CHECKNAMNEWRONGNAME) or (errFirst == PAYMERR_CHECKNAMNEWRONGNAME) )
+        if (err_mes != "") err_mes = err_mes + "\n"; end;
+        err_mes = err_mes + "В платежном документе № " + PaymentObj.Number + " от " + PaymentObj.Date + " наименование получателя не совпадает с имеющимся в справочнике клиентов";
+      end;
+      if( PaymentObj.Notes.AddNote( PM_NOTEKIND_PAYM_ERRORSCHECK, err_mes ) != 0 )
+        msgbox( "Ошибка при вставке примечания платежа" );
+        return 1;
+      end;
+      if( (errFirst == PAYMERR_CHECKNAMENOINN) or 
+          (errFirst == PAYMERR_CHECKNAMENONAME) )
+        GetRegistryValue( "АРМ ПОЗИЦИОНЕРА\\ЗАЧИСЛЕНИЕ\\ОТСУТСТВИЕ ДАННЫХ", V_INTEGER, errSecond, err );
+        if (err)
+          errSecond = 0;
+        end;
+        err_mes = "Не указаны необходимые для зачисления реквизиты клиента по счету № " + PaymentObj.ReceiverAccount;
+      elif( (errFirst == PAYMERR_CHECKNAMNEWRONGINN) or 
+            (errFirst == PAYMERR_CHECKNAMNEWRONGNAME) )
+        GetRegistryValue( "АРМ ПОЗИЦИОНЕРА\\ЗАЧИСЛЕНИЕ\\НЕВЕРНЫЕ ДАННЫЕ", V_INTEGER, errSecond, err );
+        if (err)
+          errSecond = 0;
+        end;
+        err_mes = "Указаны неверные реквизиты клиента по счету № " + PaymentObj.ReceiverAccount;
+      end;
+      
+      if( InList(errSecond, 1, 0) )
+        var denialGroundNote = PaymentObj.Notes.ReadNote( PM_NOTEKIND_DENIALGROUND, {curdate} );
+        if( strlen(denialGroundNote) > 0 ) 
+          err_mes = denialGroundNote + "\n" + err_mes;
+        end;
+
+        if ( errSecond == 1 )
+          PM_ToUnknown(err_mes);
+        elif( errSecond == 0)
+          PM_ToManual( PaymentObj, err_mes);
+        else
+          msgbox("Ошибка в макросе! Не все исправили.");
+          return 1;
+        end;
+      end;
+    end;
+    
+  end;
+
+  // Проверки по валютной опреации
+  if( PaymentObj.PM_Check117( VOReject, VORejectGround ) != 0 )
+    msgbox("Ошибка при проверке реквизитов валютной операции");
+    return 1;
+  end;
+  
+  
+  if( ( not FlagTrans ) and ( DKFlag == FL_KREDIT ) )
+    
+    var cmd = RsdCommand
+    (
+      " DECLARE " +
+      "   V_RESULT NUMBER := 1; "
+      " BEGIN " +
+      " EXECUTE IMMEDIATE ( 'BEGIN SELECT " + Bnk_GetRegistryValue("АРМ ПОЗИЦИОНЕРА\\ЗАЧИСЛЕНИЕ\\БЮДЖ_ВЫПЛАТЫ_ХП_ПРОВЕРКИ", V_STRING, "") + "( " + string( PaymentObj.PaymentID ) +
+      " ) INTO :V_RESULT FROM DUAL; END; ') " +
+      " USING OUT V_RESULT;"
+      " ? := V_RESULT;"
+      " EXCEPTION " +
+      "    WHEN OTHERS " +
+      "    THEN" +
+      "       ? := 1;" +
+      " END;"
+    );
+    
+    cmd.addParam("", RSDBP_OUT, V_INTEGER);
+    cmd.addParam("", RSDBP_OUT, V_INTEGER);
+    
+    cmd.execute();
+
+    if( (cmd.value(0) == 1) or (cmd.value(1) == 1) )
+      return PM_ToManual( PaymentObj, "Требуется проверка счета получателя на допустимость зачисления бюджетных средств" );
+    end;
+  end;
+
+  // Если платеж транзитный
+  if( FlagTrans )
+
+    if( (PaymentObj.OutCorschem == PaymentObj.InCorschem) and (PaymentObj.OutCorschemFIID == PaymentObj.InCorschemFIID) )
+      
+      if(PaymentObj.IsCredit())            
+        PaymentObj.SetReceiverPI( PAYMENTS_GROUP_UNDEF, 
+                                  PaymentObj.ReceiverBankID, 
+                                  PaymentObj.ReceiverBankCodeKind, 
+                                  PaymentObj.ReceiverBankCode, 
+                                  PaymentObj.ReceiverBankName,
+                                  PaymentObj.ReceiverBankCorrAcc,
+                                  PaymentObj.ReceiverFIID, 
+                                  1/*CHAPT1*/, 
+                                  PaymentObj.ReceiverAccount, 
+                                  PaymentObj.Receiver, 
+                                  PaymentObj.ReceiverName, 
+                                  PaymentObj.ReceiverINN,
+                                  NULL,
+                                  NULL,
+                                  -1,
+                                  PM_CORRPOS_TYPE_USER );
+      else
+        PaymentObj.SetPayerPI(  PAYMENTS_GROUP_UNDEF, 
+                                PaymentObj.PayerBankID, 
+                                PaymentObj.PayerBankCodeKind, 
+                                PaymentObj.PayerBankCode, 
+                                PaymentObj.PayerBankName,
+                                PaymentObj.PayerBankCorrAcc,
+                                PaymentObj.PayerFIID, 
+                                1/*CHAPT1*/, 
+                                PaymentObj.PayerAccount, 
+                                PaymentObj.Payer, 
+                                PaymentObj.PayerName, 
+                                PaymentObj.PayerINN,
+                                NULL,
+                                NULL,
+                                -1,
+                                PM_CORRPOS_TYPE_USER );
+
+      end;
+      PaymentObj.OutTransport= 0;
+      PaymentObj.OutRlsForm  = 0;
+      PaymentObj.OutTpSchem  = 0;
+      PaymentObj.OutSubKindMessage = 0;
+      if( УстановитьСтатусыПлатежа( OPR_PAYM_DIRECT, OPR_PM_ST_DIR_IN ) )
+        msgbox("Ошибка при установке сегментов статуса экземпляра операции");
+        return 1;
+      end;
+      return PM_ToManual( PaymentObj, "Совпадают входящий и исходящий корсчета"); 
+    end;
+ 
+    if( УстановитьСтатусыПлатежа( OPR_PAYM_DO, OPR_PM_ST_ENTER ) )
+      msgbox("Ошибка при установке сегментов статуса экземпляра операции");
+      return 1;
+    end;
+  end;
+
+
+  if( stat < 0 )
+    return 1;
+  end;
+
+  return 0;
+end;
+
+
+/* -----------------------------------------------------------------------------
+   Массовое выполнение шага "Предобработка входящего платежа"
+   ----------------------------------------------------------------------------- */
+
+/* -----------------------------------------------------------------------------
+   Предтранзакционные действия 
+   Все проверки отражаются только на временной таблице dwlpmprep_tmp,
+   никакие изменения в БД не делаются
+   ----------------------------------------------------------------------------- */
+macro PrepMassExecuteStep() 
+
+  // Проверки, предшествующие проверке на терроризм
+  var stat:integer = execStoredFunc( "WLD_PREPRO.MassPreprocessPrepare1", V_INTEGER );
+
+  if( not stat )
+    stat = MassCheckTerrorPrepare(true /*IsWlIncoming*/); // Проверки на терроризм
+  end;
+  
+  // Проверки, следующие за проверкой на терроризм
+  if( not stat )
+    stat = execStoredFunc( "WLD_PREPRO.MassPreprocessPrepare2", V_INTEGER );
+  end;
+
+  if( stat )
+    MemoryError( stat );
+  end;
+
+  return stat;
+
+OnError(er)
+  ExeptionMessage( er );
+  return 1;
+end;
+
+/* -----------------------------------------------------------------------------
+   Транзакционные действия 
+   Всё, что напроверяли, отражается на статусах документа, платежа, операции 
+   ----------------------------------------------------------------------------- */
+
+// По таблице dpmchnm_tmp вставить примечания "Ошибки проверки реквизитов клиента"
+private macro PM_MassSetNotesCheckNames()
+  
+  var query:string = "select t.t_OrderID "
+                           ",pre.t_ManualGround "
+                           ",t.t_ID_Operation "
+                           ",t.t_ID_Step "
+                       "from dpmchnm_tmp ch, "
+                            "V_PMMASSOP t, "
+                            "dwlpmprep_tmp pre "
+                      "where ch.t_Error1 > 0 "
+                        "and t.t_OrderID = ch.t_PaymentID "
+                        "and t.t_SkipDocument = 0 "
+                        "and t.t_ErrorStatus  = 0 "
+                        "and pre.t_PaymentID  = t.t_OrderID ";
+
+  var rs:RsdRecordset = execSQLselect( query );
+
+  while( rs.moveNext() )
+    
+    if( AddNoteForObject( OBJTYPE_PAYMENT, 
+                          string( rs.Value(0):o:10 ),
+                          PM_NOTEKIND_DENIALGROUND, 
+                          rs.Value(1),
+                          date(),/*{curdate} - не инициализировано*/
+                          rs.Value(2),
+                          rs.Value(3) ) )
+      PM_SetErrorStatus( rs.Value(0), 1, "Ошибка при вставке примечания \"Ошибки проверки реквизитов клиента\"" );
+    end;
+
+  end;
+
+  return 0;
+end;
+
+macro MassExecuteStep()
+
+  var stat:integer = execStoredFunc( "WLD_PREPRO.MassPreprocessExecute", V_INTEGER );
+
+  if( not stat )
+    stat = PM_MassPreproExecute( true /*IsWlIncoming*/ );
+  end;
+
+  if( not stat )
+    // По таблице dpmchnm_tmp вставить примечания "Ошибки проверки реквизитов клиента"
+    stat = PM_MassSetNotesCheckNames();
+  end;
+
+  if( stat )
+    MemoryError( stat );
+  end;
+
+  return stat;
+
+OnError(er)
+  ExeptionMessage( er );
+  return 1;
+end;
+
+
+/* -----------------------------------------------------------------------------
+   Действия после транзакции
+   Заполняем лог обработки платежей для отчета 
+   ----------------------------------------------------------------------------- */
+macro PostMassExecuteStep()
+
+  var stat:integer = execStoredFunc( "WLD_PREPRO.MassFillLog", V_INTEGER );
+
+  if( stat )
+    MemoryError( stat );
+  end;
+
+  return stat;
+
+OnError(er)
+  ExeptionMessage( er );
+  return 1;
+end;

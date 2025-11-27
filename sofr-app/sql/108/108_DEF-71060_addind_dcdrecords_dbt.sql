@@ -1,0 +1,16 @@
+-- Добавить индекс в таблицу "DCDRECORDS_DBT"
+DECLARE
+  e_idx_does_not_exist EXCEPTION;
+  PRAGMA EXCEPTION_INIT(e_idx_does_not_exist , -1418);
+BEGIN
+
+  EXECUTE IMMEDIATE 'DROP INDEX DCDRECORDS_DBT_IDXRD';
+
+  EXCEPTION WHEN e_idx_does_not_exist THEN NULL;
+END;
+/
+
+CREATE   INDEX DCDRECORDS_DBT_IDXRD ON DCDRECORDS_DBT (
+   T_REQUESTDATE ASC
+)
+/

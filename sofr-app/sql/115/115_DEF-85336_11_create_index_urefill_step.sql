@@ -1,0 +1,7 @@
+--Изменение urefill_step_dbt
+begin
+  execute immediate 'CREATE UNIQUE INDEX UREFILL_STEP_IDX0 ON UREFILL_STEP_DBT (T_STEPID)';
+  execute immediate 'CREATE INDEX UREFILL_STEP_IDX1 ON UREFILL_STEP_DBT (T_REFILLID)';
+  execute immediate 'CREATE INDEX UREFILL_STEP_IDX2 ON UREFILL_STEP_DBT (T_DATE_OPERATION)';
+end;
+/

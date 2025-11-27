@@ -1,0 +1,1356 @@
+/*
+$Name:        dlcontrmsg_mmvb.mac
+$Module:      Ядро Securities
+$Description: Формирование сообщений ДБО для ММВБ
+*/
+import "spRepFun.mac", "dlcontrfunc.mac", "moex_client.mac", "Rs_json.mac";
+
+// Настраиваемые константы //////////
+private const LoadToTE      = 1;   // Импорт сведений в торговую систему в режиме онлайн (1 - да, 0 - нет)
+private const LKU           = 4;   // 4 Собственный клиент Участника
+private const SENDER_NAME   = "";  // Краткое наименование нашего банка
+// Обязательные параметры при значении настройки: "SECUR\ОНЛАЙН РЕГИСТРАЦИЯ КЛ НА БИРЖЕ" = TRUE
+// (Важно! Обязательно должны быть настроены необходимые war-файлы, RabbitMQ и прочее ПО (#287404))
+// для подключение к очереди bank_to_moex:
+private const host     = "localhost";
+private const vhost    = "/";
+private const user     = "admin";
+private const password = "admin";
+private const port     = 5672;
+private const queue    = "bank_to_moex";
+/////////////////////////////////////
+
+private const UnknownParty          = -1;
+
+// Результат отправки сообщения онлайн (JSON объект)
+private class CSendMesResult
+   var clientCode: string;         // код клиента, переданный при регистрации (сюда записывается PartyID)
+   var conractNumber: string;      // номер договора, переданный при регистрации заявки (DlContrID ДБО)
+   var subContractNumber: string;  // номер субдоговора, переданный при регистрации заявки (ID сообщения)
+   var status: integer;            // статус выполнения заявки
+end;
+
+private macro PathNoticeSvodMMVB()
+  var RegistryPath = "SECUR\\PATH_NOTICE_SVOD";
+  var Path = "", stat = 0;
+ 
+  GetRegistryValue(RegistryPath, V_STRING, Path, stat);
+  if(stat) 
+     msgbox("Не задана настройка в реестре банка:|", RegistryPath);      
+  end;
+
+  return Path;
+end;
+
+// массив для протокола сводных сообщений (заполняется в функции "СформироватьСводноеСообщенияДБО()")
+private var arrProtocolSvod = TDlMsgProtocol();
+
+private macro GetFormatDate(_date)
+   var y, mon, d;
+   DateSplit (_date,d,mon,y);
+   return string(L_Z(y, 4)) + "-" + string(L_Z(mon,2)) + "-" + string(L_Z(d,2));
+end;
+
+private macro GetFormatTime(_time)
+   var h, m, s;
+   TimeSplit(Time(),h,m,s);
+   return string(L_Z(h,2)) + ":" + string(L_Z(m,2)) + ":" + string(L_Z(s, 2));
+end;
+
+private class (DL_XML) TDlFileClientsXML(IndividualFile:Bool)
+   private var m_MainNode,
+               m_UniOurBankCode, m_UniClientCode,
+               m_IndividualFile;
+
+   private macro GetFileName()
+      var h, m, s;
+
+      if(m_FileName == NULL)
+         m_FileName = "ECLIENTS_" + IIF(m_IndividualFile, this.GetUniClientCode(), this.GetUniOurBankCode()) + "_";
+         TimeSplit(Time(),h,m,s);
+         m_FileName = m_FileName + GetFormatDate({curdate}) + "_" + string(L_Z(h,2)) + string(L_Z(m,2)) + string(L_Z(s, 2));
+      end;
+
+      return m_FileName;
+   end;
+
+   macro GetDataXML()
+      return m_MainNode.xml;
+   end;
+
+   macro SaveXml()
+      var NamePath = "", NameFile = "", NamePathFile = "";
+
+      if(m_MainNode != null)
+         AddMainNode(m_MainNode);
+
+         NamePath = DL_GetFullPath(PathNoticeSvodMMVB());
+
+         if(not DL_CreateDirIfNotExists(NamePath))
+            NameFile = GetFileName(); 
+            NamePathFile = NamePath + NameFile + ".xml";
+            m_xml.save(NamePathFile);
+         end;
+      end;
+
+      return NamePathFile;
+   end;
+
+   macro GetUniOurBankCode()
+      if(m_UniOurBankCode == null)
+         m_UniOurBankCode = ПолучитьКодСубъекта({OurBank}, PTCK_MICEX);
+         if(substr(m_UniOurBankCode,1,2) == "MC")
+           m_UniOurBankCode = substr(m_UniOurBankCode,3);
+         end;
+      end;
+      return m_UniOurBankCode;
+   end;
+
+   macro GetUniClientCode()
+      if(m_UniClientCode == null)
+         m_UniClientCode = "";
+      end;
+      return m_UniClientCode;
+   end;
+
+   private macro SetUniClientCode(xmlClient)
+      if(xmlClient != null)
+         var CLIENT_CODE = xmlClient.getElementsByTagName( "CLIENT_CODE" );
+         if((CLIENT_CODE != null) and (CLIENT_CODE.Length > 0))
+            if(CLIENT_CODE.item(0).attributes.Length > 0)
+               var UniClientCode = CLIENT_CODE.item(0).getAttribute("UniClientCode");
+               if((UniClientCode != null) and (ValType(UniClientCode) != V_SPECVAL))
+                  m_UniClientCode = UniClientCode;
+               end;
+            end;
+         end;
+      end;
+   end;
+
+   private macro GetSfContrRH(xmlClient, RecFromSelect)
+      if(xmlClient != null)
+         var CLIENT = xmlClient.getElementsByTagName( "CLIENT" );
+         if((CLIENT != null) and (CLIENT.Length > 0))
+            if(CLIENT.Item(0).attributes.Length > 0)
+               var OperationId = CLIENT.Item(0).getAttribute("OperationId");
+               if(SQL_ConvTypeInteger(int(OperationId)) > 0)
+                  var Query = "SELECT sf.* " +
+                              "  FROM ddlcontrmsg_dbt msg, ddlcontr_dbt contr, dsfcontr_dbt sf " +
+                              " WHERE sf.t_ID = contr.t_SfContrID " +
+                              "   AND contr.t_DlContrID = msg.t_DlContrID " +
+                              "   AND msg.t_ID = " + int(OperationId);
+   
+                  RecFromSelect.Clear();
+                  if(DL_GetRecHandler(RecFromSelect, Query))
+                     return true;
+                  end;
+               end;
+            end;
+         end;
+      end;
+
+      return false;
+   end;
+
+   private macro GetClientOperation(xmlClient)
+      var ClientOperationName = "";
+
+      if(xmlClient != null)
+         var CLIENT = xmlClient.getElementsByTagName( "CLIENT" );
+         if((CLIENT != null) and (CLIENT.Length > 0))
+            if(CLIENT.Item(0).attributes.Length > 0)
+               var ClientOperation = CLIENT.Item(0).getAttribute("ClientOperation");
+               ClientOperation = SQL_ConvTypeStr(ClientOperation);
+               if(ClientOperation == "A")
+                  ClientOperationName = "\"A\" - добавление информации о новом клиенте";
+               elif(ClientOperation == "L")
+                  ClientOperationName = "\"L\" - добавление клиенту новых кратких кодов";
+               elif(ClientOperation == "R")
+                  ClientOperationName = "\"R\" - удаление кратких кодов клиента на рынках";
+               elif(ClientOperation == "D")
+                  ClientOperationName = "\"D\" - полное удаление информации о клиенте";
+               elif(ClientOperation == "U")
+                  ClientOperationName = "\"U\" - изменение информации о личных данных клиента";
+               end;
+            end;
+         end;
+      end;
+
+      return ClientOperationName;
+   end;
+
+   private macro AddMessToProtocolSvod(xmlClient)
+      var SfContr = TRecHandler("sfcontr.dbt");
+
+      GetSfContrRH(xmlClient, SfContr);
+      if(SfContr.rec.ID > 0)
+         arrProtocolSvod.Add(SfContr.rec.Number,
+                             ПолучитьКороткоеИмяСубъекта(SfContr.rec.PartyID),
+                             GetClientOperation(xmlClient));
+      end;
+   end;
+
+   private macro Create_CLIENTS()
+      var query, cmd, ds, xmlClient;
+      var CLIENTS = CreateNode("CLIENTS");
+
+      CLIENTS.setAttribute("LoadToTE", LoadToTE);
+      CLIENTS.setAttribute("DocDate", GetFormatDate({curdate}));
+
+      query = " SELECT CM.T_ID FROM DDLCONTRMSG_DBT CM, DDLCONTRMSG_TMP CMT WHERE CM.T_ID = CMT.T_MSGID ORDER BY CM.T_CREATEDATE, CM.T_CREATETIME, CM.T_ID ";
+      cmd = DL_RSDCommand(query);
+      ds = cmd.Execute();
+      while(ds.moveNext())
+         xmlClient = Dl_XmlReader();
+         if(xmlClient.Load_xml(DL_GetClobData("t_xml", "from DDLCONTRMSG_DBT where t_ID = "+Int(ds.ID))))
+            if(xmlClient.GetXml().ChildNodes.Length > 0)
+               if(m_IndividualFile)
+                  SetUniClientCode(xmlClient.GetXml());
+               else
+                  // для сводного сообщения добавляем информацию в протокол
+                  AddMessToProtocolSvod(xmlClient.GetXml());
+               end;
+
+               CLIENTS.appendChild(xmlClient.GetXml().DocumentElement);
+            end;
+         end;
+      end;
+
+      CLIENTS.setAttribute("UniFirmId", GetUniOurBankCode());
+
+      return CLIENTS;
+   end;
+
+   private macro Create_DOC_REQUISITES()
+      var DOC_REQUISITES = CreateNode("DOC_REQUISITES");
+
+      DOC_REQUISITES.setAttribute("DOC_DATE", GetFormatDate({curdate}));
+      DOC_REQUISITES.setAttribute("DOC_TIME", GetFormatTime(Time()));
+
+      var RefID, RefNum;
+      if(GenerateNumberByReference( 207, 5, @RefID, @RefNum ))
+         DOC_REQUISITES.setAttribute("DOC_NO", RefNum);
+      end;
+
+      DOC_REQUISITES.setAttribute("DOC_TYPE_ID", "ECLIENTS");
+      DOC_REQUISITES.setAttribute("SENDER_ID", GetUniOurBankCode());
+      var sn = SENDER_NAME;
+      if(sn == "")
+        sn = GetPartyShortNameByID({OurBank});
+      end;
+      DOC_REQUISITES.setAttribute("SENDER_NAME", sn);
+      DOC_REQUISITES.setAttribute("RECEIVER_ID", "MM0000100000");
+      DOC_REQUISITES.setAttribute("REMARKS", "Клиенты");
+
+      return DOC_REQUISITES;
+   end;
+
+   private macro Create_FileCLIENT()
+      m_MainNode = CreateNode("MICEX_DOC");
+
+      m_MainNode.setAttribute("xsi:noNamespaceSchemaLocation", "MoexClients.xsd");
+      m_MainNode.setAttribute("xmlns:xsi", "http://www.w3.org/2001/XMLSchema-instance");
+
+      m_MainNode.appendChild(Create_DOC_REQUISITES());
+      m_MainNode.appendChild(Create_CLIENTS());
+   end;
+
+   macro Construct(IndividualFile);
+      m_MainNode = null;
+      m_IndividualFile = IndividualFile;
+      CreateXML("utf-8");
+
+      Create_FileCLIENT();
+   end;
+
+   initDL_XML();
+   this.Construct(IndividualFile);
+end;
+
+private macro GetSfContrRH( RecFromSelect:TRecHandler, SfContrID ) :BOOL
+   var Query = "SELECT * FROM DSFCONTR_DBT WHERE T_ID = " + SfContrID;
+   RecFromSelect.Clear();
+   if(DL_GetRecHandler(RecFromSelect, Query))
+      return true;
+   end;
+   return false;
+end;
+
+private class (DL_XML) TDlClientXML(DlContr, SfContr, DlContrMsg)
+   private var m_MainNode,
+               m_DlContr, m_SfContr, m_DlContrMsg, m_Kind,
+               m_Client = TRecHandler("party.dbt"),
+               m_UniClientCode, m_UniOurBankCode,
+               m_stat = 0;
+
+   macro GetClientXML()
+      return m_MainNode.xml;
+   end;
+
+   macro GetStat()
+      return m_stat;
+   end;
+
+   private macro GetUniClientCode()
+      var CodeKind;
+      if(m_UniClientCode == null)
+         CodeKind = ПолучитьВидКодаДБОДляБиржи(m_DlContrMsg.rec.MarketID);
+         if(CodeKind > 0)
+           m_UniClientCode = DL_GetDlObjCodeOnDate(OBJTYPE_BROKERCONTR_DL, CodeKind, m_DlContr.rec.DlContrID/*, m_SfContr.rec.DateBegin*/);
+         end;
+      end;
+      return m_UniClientCode;
+   end;
+
+   private macro GetUniOurBankCode()
+      if(m_UniOurBankCode == null)
+         m_UniOurBankCode = ПолучитьКодСубъекта({OurBank}, PTCK_MICEX);
+         if(substr(m_UniOurBankCode,1,2) == "MC")
+           m_UniOurBankCode = substr(m_UniOurBankCode,3);
+         end;
+      end;
+      return m_UniOurBankCode;
+   end;
+
+   private macro GetClientOperation()
+      var ClientOperation = "";
+      if(m_Kind == OBJTYPE_DLCONTRMSG_MARKETREG)
+         ClientOperation = "A";
+      elif(m_Kind == OBJTYPE_DLCONTRMSG_MPREG)
+         ClientOperation = "L";
+      elif(m_Kind == OBJTYPE_DLCONTRMSG_MPCLOSE)
+         ClientOperation = "R";
+      elif(m_Kind == OBJTYPE_DLCONTRMSG_MARKETCLOSE)
+         ClientOperation = "D";
+      elif(m_Kind == OBJTYPE_DLCONTRMSG_CHNGPERSDATA)
+         ClientOperation = "U";
+      end;
+
+      return ClientOperation;
+   end;
+
+   private macro GetMarketID(SfContr)
+      var MarketID = "";
+
+      if(SfContr.rec.ServKind == PTSK_STOCKDL)
+         MarketID = "SE"; // Фондовый рынок
+      elif(SfContr.rec.ServKind == PTSK_DV)
+         MarketID = "FO"; // Срочный рынок
+      elif(SfContr.rec.ServKind == PTSK_CM)
+         MarketID = "CU"; // Валютный рынок
+      end;
+
+      return MarketID;
+   end;
+
+   private macro GetClient()
+      if(m_Client.rec.PartyID == 0)
+         m_Client.clear();
+         ПолучитьСубъекта(m_SfContr.rec.PartyID, m_Client);
+      end;
+
+      return m_Client;
+   end;
+
+   private macro GetClientIDC( RecFromSelect:TRecHandler, PartyID, PaperKind ) :BOOL
+      var Query = "SELECT * FROM DPERSNIDC_DBT WHERE T_PERSONID = " + PartyID + IIF(PaperKind != null, " AND T_PAPERKIND = " + PaperKind, "");
+      RecFromSelect.Clear();
+      if(DL_GetRecHandler(RecFromSelect, Query))
+         return true;
+      end;
+      return false;
+   end;
+
+   private macro GetIsIISContract()
+      if(m_DlContr.rec.IIS == SET_CHAR)
+         return "Y";
+      else
+         return "N";
+      end;
+   end;
+
+   private macro GetClientCodeDescr() :STRING
+      var ret = "", query, cmd, ds;
+      if(GetClient().rec.PartyID > 0)
+         query = " SELECT RSB_SECUR.Translit(trim(t_Name1 || substr(t_Name2, 1, 1) || substr(t_Name3, 1, 1))) as FIO " +
+                   " FROM DPERSN_DBT " +
+                  " WHERE t_PersonID = ? ";
+
+         cmd = DL_RSDCommand(query);
+         cmd.AddParam(GetClient().rec.PartyID);
+
+         ds = cmd.Execute();
+         if(ds.moveNext())
+            ret = SQL_ConvTypeStr(ds.FIO);
+         end;
+      end;
+      return ret;
+   end;
+
+   private macro Create_CLIENT_MARKETS(DlContrMp)
+      var SfContr = TRecHandler("sfcontr.dbt");
+      var CLIENT_MARKETS = CreateNode("CLIENT_MARKETS");
+
+      if(GetSfContrRH(SfContr, DlContrMp.rec.SfContrID))
+         CLIENT_MARKETS.setAttribute("ClientCode", DlContrMp.rec.MpCode);
+         CLIENT_MARKETS.setAttribute("MarketId", GetMarketID(SfContr));
+   
+         if(((GetMarketID(SfContr) == "SE") or (GetMarketID(SfContr) == "FO")) and (GetClient().rec.LegalForm == PTLEGF_PERSN))
+            CLIENT_MARKETS.setAttribute("isIISContract", GetIsIISContract());
+         end;
+      end;
+
+      CLIENT_MARKETS.setAttribute("isCrossTrades", "N");
+
+      if((GetMarketID(SfContr) == "FO") and (GetClient().rec.LegalForm == PTLEGF_PERSN))
+         CLIENT_MARKETS.setAttribute("ClientCodeDescr", GetClientCodeDescr());
+      end;
+
+      return CLIENT_MARKETS;
+   end;
+
+   private macro Create_CLIENT_CODE()
+      var query, cmd, ds, DlContrMp = TRecHandler("dlcontrmp.dbt"),
+          select  = " SELECT MP.* ",
+          from    = " FROM DDLCONTRGENMSG_TMP GENMSG, DDLCONTRMP_DBT MP ",
+          where   = " WHERE MP.T_ID = GENMSG.T_MpID ",
+          orderBy = " ORDER BY GENMSG.T_ID ";
+      var CLIENT_CODE = CreateNode("CLIENT_CODE");
+
+      CLIENT_CODE.setAttribute("UniClientCode", GetUniClientCode());
+
+      if((m_Kind == OBJTYPE_DLCONTRMSG_MARKETREG)
+      or (m_Kind == OBJTYPE_DLCONTRMSG_MPREG)
+      or (m_Kind == OBJTYPE_DLCONTRMSG_MPCLOSE)
+      or (m_Kind == OBJTYPE_DLCONTRMSG_MARKETCLOSE))
+         if(m_Kind == OBJTYPE_DLCONTRMSG_MARKETREG)
+            where = where + " AND GENMSG.T_KIND IN (" + OBJTYPE_DLCONTRMSG_MARKETREG + "," + OBJTYPE_DLCONTRMSG_MPREG + ")";
+         elif(m_Kind == OBJTYPE_DLCONTRMSG_MPREG)
+            where = where + " AND GENMSG.T_KIND IN (" + OBJTYPE_DLCONTRMSG_MPREG + ")";
+         elif(m_Kind == OBJTYPE_DLCONTRMSG_MPCLOSE)
+            where = where + " AND GENMSG.T_KIND IN (" + OBJTYPE_DLCONTRMSG_MPCLOSE + ")";
+         else
+            where = where + " AND GENMSG.T_KIND IN (" + OBJTYPE_DLCONTRMSG_MPCLOSE + "," + OBJTYPE_DLCONTRMSG_MARKETCLOSE + ")";
+         end;
+
+         query = select + from + where + orderBy;
+         cmd = DL_RSDCommand(query);
+         ds = cmd.Execute();
+         while((not m_stat) and ds.moveNext() and (ds.ID > 0))
+            DlContrMp.clear();
+            ds.GetRecord().CopyTo( DlContrMp.rec );
+            CLIENT_CODE.appendChild(Create_CLIENT_MARKETS(DlContrMp));
+         end;
+      end;
+
+      return CLIENT_CODE;
+   end;
+
+   private macro GetObjLink_cmd(ObjectType, ObjectID, AttrType/*, GroupID*/)
+      var query, vGroupID = "", GroupID, i = 4;
+
+      while (GetParm(i, GroupID))
+         if(vGroupID != "")
+            vGroupID = vGroupID + ",";
+         end;
+         vGroupID = vGroupID + GroupID;
+         i = i + 1;
+      end;
+
+      query = " SELECT T_ATTRID FROM DOBJLINK_DBT WHERE T_OBJECTTYPE = " + ObjectType +
+              "                                     AND T_OBJECTID = " + ObjectID +
+              "                                     AND T_ATTRTYPE = " + AttrType +
+              "                                     AND T_GROUPID IN (" + vGroupID +")";
+
+      return DL_RSDCommand(query);
+   end;
+
+   // получить представителя субъекта
+   private macro GetRepresentativePers(PartyID)
+      var PersPartyID = UnknownParty, query, cmd, ds, pBuf = TRecHandler("party.dbt"), existsDefault = false, existsInDate = false;
+
+      // Если субъект несовершеннолетний, то ищем его законных представителей:
+      // 1. Мать/отца, через связанные объекты на субъекте 
+      cmd = GetObjLink_cmd(OBJTYPE_PARTY, UniID(GetClient(), OBJTYPE_PARTY), OBJTYPE_PARTY, OBJROLE_PARTY_FATHER, OBJROLE_PARTY_MOTHER);
+      ds = cmd.Execute();
+      if(ds.moveNext())
+         pBuf.Clear();
+         if(RestoreFromUniID(ds.AttrID, pBuf, OBJTYPE_PARTY) and (pBuf.rec.PartyID > 0))
+            PersPartyID = pBuf.rec.PartyID;
+         end;
+      // 2. иначе ищем представителя, который вызывается на субъекте по Alt+Y
+      else
+         query = " SELECT T_PROXYID, T_DOCDATE, T_VALIDITYDATE, T_ISDEFAULT FROM DPTPROXY_DBT WHERE T_PARTYID = " + PartyID;
+         cmd = DL_RSDCommand(query);
+         ds = cmd.Execute();
+         while(ds.moveNext())
+            if(PersPartyID == UnknownParty)
+               PersPartyID = ds.ProxyID;
+            end;
+            
+            if(({curdate} >= SQL_ConvTypeDate(ds.DocDate)) and ({curdate} <= SQL_ConvTypeDate(ds.ValidityDate)))
+               if(not existsInDate)
+                  PersPartyID = ds.ProxyID;
+                  existsInDate = true;
+               end;
+               
+               if(ds.IsDefault == SET_CHAR)
+                  PersPartyID = ds.ProxyID;
+                  break;
+               end;
+            elif((ds.IsDefault == SET_CHAR) and (not existsDefault))
+               PersPartyID = ds.ProxyID;
+               existsDefault = true;
+            end;
+         end;
+      end;
+
+      return PersPartyID;
+   end;
+
+   private macro SetNodesIn_CLIENT_INDIVIDUAL(PartyID, IsRepresentative, ParentNode)
+      var stat = false;
+      var ClientIDC = TRecHandler("persnidc.dbt"), node, DocNo, PersPartyID,
+          existsDoc = false;
+
+      if(GetClientIDC(ClientIDC, PartyID, DOC_PASSPORT))
+         if((strlen(ClientIDC.rec.PaperSeries) > 0) and (strlen(ClientIDC.rec.PaperNumber) > 0))
+            if(strlen(ClientIDC.rec.PaperSeries) > 3)
+               DocNo = SubStr(ClientIDC.rec.PaperSeries, 1, 2) + " " + SubStr(ClientIDC.rec.PaperSeries, 3, 2) + " " + ClientIDC.rec.PaperNumber;
+               node = CreateNode("PASSPORT_RF");
+               node.setAttribute("DocNo", DocNo);
+               ParentNode.appendChild(node);
+               existsDoc = true;
+               stat = true;
+            end;
+         else
+            m_stat = 1;
+            MsgBox("Для субъекта \"" + ПолучитьКороткоеИмяСубъекта(PartyID) + "\" не заданы параметры документа");
+         end;
+      elif(GetClientIDC(ClientIDC, PartyID, DOC_USSRPASS))
+         if((strlen(ClientIDC.rec.PaperSeries) > 0) and (strlen(ClientIDC.rec.PaperNumber) > 0))
+            DocNo = ClientIDC.rec.PaperSeries + " " + ClientIDC.rec.PaperNumber;
+            node = CreateNode("PASSPORT_USSR");
+            node.setAttribute("DocNo", DocNo);
+            ParentNode.appendChild(node);
+            existsDoc = true;
+            stat = true;
+         else
+            m_stat = 1;
+            MsgBox("Для субъекта \"" + ПолучитьКороткоеИмяСубъекта(PartyID) + "\" не заданы параметры документа");
+         end;
+      elif(GetClientIDC(ClientIDC, PartyID, DOC_BIRTH_CERTIFICATE) and (not IsRepresentative))
+         if((strlen(ClientIDC.rec.PaperSeries) > 0) and (strlen(ClientIDC.rec.PaperNumber) > 0))
+            DocNo = ClientIDC.rec.PaperSeries + " " + ClientIDC.rec.PaperNumber;
+            node = CreateNode("BIRTH_CERTIFICATE");
+            node.setAttribute("DocNo", DocNo);
+            ParentNode.appendChild(node);
+            stat = true;
+
+            var REPRESENTATIVE_PERS = CreateNode("REPRESENTATIVE_PERS");
+            PersPartyID = GetRepresentativePers(PartyID);
+            if(PersPartyID != UnknownParty)
+               if(SetNodesIn_CLIENT_INDIVIDUAL(PersPartyID, true, REPRESENTATIVE_PERS))
+                  ParentNode.appendChild(REPRESENTATIVE_PERS);
+               end;
+            end;
+         else
+            m_stat = 1;
+            MsgBox("Для субъекта \"" + ПолучитьКороткоеИмяСубъекта(PartyID) + "\" не заданы параметры документа");
+         end;
+      elif(GetClientIDC(ClientIDC, PartyID))
+         if(strlen(ClientIDC.rec.PaperNumber) > 0)
+            DocNo = IIF(strlen(ClientIDC.rec.PaperSeries) > 0, (ClientIDC.rec.PaperSeries + " "), "") + ClientIDC.rec.PaperNumber;
+            node = CreateNode("OTHER_DOC");
+            node.setAttribute("DocNo", DocNo);
+            ParentNode.appendChild(node);
+            existsDoc = true;
+            stat = true;
+         else
+            m_stat = 1;
+            MsgBox("Для субъекта \"" + ПолучитьКороткоеИмяСубъекта(PartyID) + "\" не заданы параметры документа");
+         end;
+      end;
+
+      if( (not m_stat) and (not existsDoc) )
+         m_stat = 1;
+         MsgBox("Для субъекта \"" + ПолучитьКороткоеИмяСубъекта(PartyID) + "\" не задан документ, удостоверяющий личность");
+      end;
+
+      return stat;
+   end;
+
+   private macro Create_CLIENT_INDIVIDUAL(PartyID, IsClient)
+      var ClientIDC = TRecHandler("persnidc.dbt"), node;
+      var CLIENT_INDIVIDUAL = CreateNode("CLIENT_INDIVIDUAL");
+
+      if(IsClient)
+         CLIENT_INDIVIDUAL.setAttribute("isIISContract", GetIsIISContract());
+      end;
+
+      SetNodesIn_CLIENT_INDIVIDUAL(PartyID, false, CLIENT_INDIVIDUAL);
+
+      return CLIENT_INDIVIDUAL;
+   end;
+
+   private macro GetIsSelfFirm()
+      if( (GetClient().rec.PartyID == {OurBank} ) AND
+          (DL_GetMainObjAttr( GetClient(), PARTY_ATTR_GROUP_PTTYPE, OBJTYPE_PARTY ) == PARTY_ATTR_PTTYPE_TRUSTMANAGER))
+         return true;
+      end;
+      return false;
+   end;
+
+   private macro GetIsMainSingleDU()
+      if((GetClient().rec.NotResident == UNSET_CHAR) AND
+         (DL_GetMainObjAttr( GetClient(), PARTY_ATTR_GROUP_PTTYPE, OBJTYPE_PARTY ) == PARTY_ATTR_PTTYPE_TRUSTMANAGER))
+         var cmd, ds, cnt = 0;
+         cmd = GetObjLink_cmd(OBJTYPE_PARTY, UniID(GetClient(), OBJTYPE_PARTY), OBJTYPE_PARTY, 8/*Учредитель ДУ*/);
+         ds = cmd.Execute();
+         while(ds.moveNext())
+            cnt = cnt + 1;
+         end;
+
+         if(cnt > 1)
+            return true;
+         end;
+      end;
+
+      return false;
+   end;
+
+   private macro GetIsMainPF()
+      if((GetClient().rec.NotResident == UNSET_CHAR) AND
+         (DL_GetMainObjAttr( GetClient(), PARTY_ATTR_GROUP_PTTYPE, OBJTYPE_PARTY ) == PARTY_ATTR_PTTYPE_TRUSTMANAGER))
+         var cmd, ds;
+         cmd = GetObjLink_cmd(OBJTYPE_PARTY, UniID(GetClient(), OBJTYPE_PARTY), OBJTYPE_PARTY, 9/*Фонд ДУ*/);
+         ds = cmd.Execute();
+         if(ds.moveNext())
+            return true;
+         end;
+      end;
+
+      return false;
+   end;
+
+   private macro Create_INN(val)
+      var INN = CreateNode("INN");
+      INN.setAttribute("DocNo", val);
+      return INN;
+   end;
+
+   private macro Create_KIO(val)
+      var KIO = CreateNode("KIO");
+      KIO.setAttribute("DocNo", val);
+      return KIO;
+   end;
+
+   private macro GetINN(PartyID, PTCK_Kind)
+      var inn, slashInd, innNotKPP;
+
+      inn = ПолучитьКодСубъекта(PartyID, PTCK_Kind);
+      slashInd = Index(inn, "/");
+      innNotKPP = IIF(slashInd > 0, SubStr(inn, 1, slashInd - 1), inn);
+
+      return innNotKPP;
+   end;
+
+   private macro Create_CLIENT_LEGAL_PERS(PartyID, IsClient)
+      var innNotKPP, KIO, party = TRecHandler("party.dbt");
+      var CLIENT_LEGAL_PERS = CreateNode("CLIENT_LEGAL_PERS");
+
+      if(ПолучитьСубъекта(PartyID, party) == 0)
+         if(IsClient)
+            if(GetIsSelfFirm())
+               CLIENT_LEGAL_PERS.setAttribute("isSelfFirm", "Y");
+            end;
+      
+            if(GetIsMainSingleDU())
+               CLIENT_LEGAL_PERS.setAttribute("isMainSingleDU", "Y");
+               CLIENT_LEGAL_PERS.setAttribute("isMainGroupDU", "Y");
+            end;
+      
+            if(GetIsMainPF())
+               CLIENT_LEGAL_PERS.setAttribute("isMainPF", "Y");         
+            end;
+         end;
+   
+         innNotKPP = GetINN(PartyID, IIF(party.rec.NotResident == UNSET_CHAR, PTCK_INN, PTCK_FOREIGN_INN));
+   
+         if((innNotKPP != null) and (innNotKPP != ""))
+            innNotKPP = L_Z(innNotKPP, 10);
+            CLIENT_LEGAL_PERS.appendChild(Create_INN(innNotKPP));
+         else
+            if(party.rec.NotResident == UNSET_CHAR)
+               m_stat = 1;
+               MsgBox("Для субъекта \"" + Party.rec.ShortName + "\" не задан ИНН");
+            else
+               KIO = ПолучитьКодСубъекта(party.rec.PartyID, PTCK_INN /*если ИНН = 5 символов, то это КИО*/);
+               if((KIO != null) and (strlen(KIO) == 5))
+                  CLIENT_LEGAL_PERS.appendChild(Create_KIO(KIO));
+               else
+                  m_stat = 1;
+                  MsgBox("Для субъекта \"" + Party.rec.ShortName + "\" не задан ИНН/КИО");
+               end;
+            end;
+         end;
+      end;
+
+      return CLIENT_LEGAL_PERS;
+   end;
+
+   private macro Create_CLIENT_SIMPLE()
+      var CLIENT_SIMPLE = CreateNode("CLIENT_SIMPLE");
+
+      CLIENT_SIMPLE.setAttribute("CountryCode", DL_GetCountryByCodeLat3(GetClient().rec.NrCountry).CodeNum3);
+      CLIENT_SIMPLE.setAttribute("isQualInvestor", IIF(IsQI(GetClient().rec.PartyID, m_DlContr.rec.SfContrID), "Y", "N" ));
+
+      if(GetClient().rec.LegalForm == PTLEGF_INST)
+         CLIENT_SIMPLE.appendChild(Create_CLIENT_LEGAL_PERS(GetClient().rec.PartyID, true));
+      else
+         CLIENT_SIMPLE.appendChild(Create_CLIENT_INDIVIDUAL(GetClient().rec.PartyID, true));
+      end;
+
+      return CLIENT_SIMPLE;
+   end;
+
+   private macro Create_CLIENT_DU(Party)
+      var CLIENT_DU = CreateNode("CLIENT_DU");      
+      
+      if(ПолучитьСубъекта(Party.rec.PartyID, Party) == 0)
+         CLIENT_DU.setAttribute("CountryCode", DL_GetCountryByCodeLat3(Party.rec.NrCountry).CodeNum3);
+
+         if(IsQI(Party.rec.PartyID, m_DlContr.rec.SfContrID))
+            CLIENT_DU.setAttribute("isQualInvestor", "Y");
+         end;
+
+         if(Party.rec.LegalForm == PTLEGF_PERSN)
+            CLIENT_DU.appendChild(Create_CLIENT_INDIVIDUAL(Party.rec.PartyID, false));
+         else
+            CLIENT_DU.appendChild(Create_CLIENT_LEGAL_PERS(Party.rec.PartyID, false));
+         end;
+      end;
+
+      return CLIENT_DU;
+   end;
+
+   private macro Create_PIF(val)
+      var PIF = CreateNode("PIF");
+      PIF.setAttribute("RegNum", val);
+      return PIF;
+   end;
+
+   private macro Create_NPF_Reserv(val)
+      var NPF_Reserv = CreateNode("NPF_Reserv");
+      NPF_Reserv.setAttribute("INN", val);
+      return NPF_Reserv;
+   end;
+
+   private macro Create_NPF_Save(val)
+      var NPF_Save = CreateNode("NPF_Save");
+      NPF_Save.setAttribute("INN", val);
+      return NPF_Save;
+   end;
+
+   private macro Create_NPF_Ustav(val)
+      var NPF_Ustav = CreateNode("NPF_Ustav");
+      NPF_Ustav.setAttribute("INN", val);
+      return NPF_Ustav;
+   end;
+
+   private macro Create_PF(inn, PartyID)
+      var party = TRecHandler("party.dbt"), InfoIP;
+      var PF = CreateNode("PF");
+      PF.setAttribute("INN", inn);
+
+      party.rec.PartyID = PartyID;
+      InfoIP = ReadNoteForObject(OBJTYPE_PARTY, UniID(party, OBJTYPE_PARTY), 72/*Код инвестиционного портфеля*/);
+      if(InfoIP != null)
+         PF.setAttribute("InfoIP", InfoIP);
+      end;
+
+      return PF;
+   end;
+
+   private macro Create_HomeMilitary(inn, PartyID)
+      var party = TRecHandler("party.dbt"), InfoIP;
+      var HomeMilitary = CreateNode("HomeMilitary");
+      HomeMilitary.setAttribute("INN", inn);
+
+      party.rec.PartyID = PartyID;
+      InfoIP = ReadNoteForObject(OBJTYPE_PARTY, UniID(party, OBJTYPE_PARTY), 72/*Код инвестиционного портфеля*/);
+      if(InfoIP != null)
+         HomeMilitary.setAttribute("InfoIP", InfoIP);
+      end;
+
+      return HomeMilitary;
+   end;
+
+   private macro Create_CLIENT_PF(Party)
+      var FSFR, innNotKPP;
+      var CLIENT_PF = CreateNode("CLIENT_PF");      
+
+      if(IsQI(Party.rec.PartyID, m_DlContr.rec.SfContrID))
+         CLIENT_PF.setAttribute("isQualInvestor", "Y");
+      end;
+
+      if( ВидСубъекта( Party.rec.PartyID, PTK_UNIT_INVESTMENT_FUND ) )
+         FSFR = ПолучитьКодСубъекта(Party.rec.PartyID, PTCK_FSFR);
+         if(FSFR != "")
+            CLIENT_PF.appendChild(Create_PIF(FSFR));
+         end;
+      else
+         innNotKPP = GetINN(Party.rec.PartyID, IIF(party.rec.NotResident == UNSET_CHAR, PTCK_INN, PTCK_FOREIGN_INN));
+
+         if((innNotKPP != null) and (innNotKPP != ""))
+            if( ВидСубъекта( Party.rec.PartyID, PTK_NPF ) )
+               CLIENT_PF.appendChild(Create_NPF_Save(innNotKPP));
+            elif( ВидСубъекта( Party.rec.PartyID, PTK_FUNDRESERVENPF ) )
+               CLIENT_PF.appendChild(Create_NPF_Reserv(innNotKPP));
+            elif( ВидСубъекта( Party.rec.PartyID, PTK_PROPERTYFUNDNPF ) )
+               CLIENT_PF.appendChild(Create_NPF_Ustav(innNotKPP));
+            elif( ВидСубъекта( Party.rec.PartyID, PTK_PENSFOND ) )
+               CLIENT_PF.appendChild(Create_PF(innNotKPP, Party.rec.PartyID));
+            elif( ВидСубъекта( Party.rec.PartyID, PTK_ACCUMULATIONFUND ) )
+               CLIENT_PF.appendChild(Create_HomeMilitary(innNotKPP, Party.rec.PartyID));
+            end;
+         else
+            m_stat = 1;
+            MsgBox("Для субъекта \"" + Party.rec.ShortName + "\" фонда ДУ не задан ИНН");
+         end;
+      end;
+
+      return CLIENT_PF;
+   end;
+
+   private macro Create_CLIENT_INFO()
+      var cmd, ds, pBuf = TRecHandler("party.dbt"), existsDU = false;
+      var CLIENT_INFO = CreateNode("CLIENT_INFO");
+
+      if( ВидСубъекта( GetClient().rec.PartyID, PTK_CLIENT ) )
+         if(DL_GetMainObjAttr( GetClient(), PARTY_ATTR_GROUP_PTTYPE, OBJTYPE_PARTY ) == PARTY_ATTR_PTTYPE_TRUSTMANAGER)
+            cmd = GetObjLink_cmd(OBJTYPE_PARTY, UniID(GetClient(), OBJTYPE_PARTY), OBJTYPE_PARTY, 8/*Учредитель ДУ*/);
+            ds = cmd.Execute();
+            while((not m_stat) and (ds.moveNext()))
+               pBuf.Clear();
+               if(RestoreFromUniID(ds.AttrID, pBuf, OBJTYPE_PARTY) and (pBuf.rec.PartyID > 0))
+                  CLIENT_INFO.appendChild(Create_CLIENT_DU(pBuf));
+                  existsDU = true;
+               end;
+            end;
+
+            cmd = GetObjLink_cmd(OBJTYPE_PARTY, UniID(GetClient(), OBJTYPE_PARTY), OBJTYPE_PARTY, 9/*Фонд ДУ*/);
+            ds = cmd.Execute();
+            while((not m_stat) and (ds.moveNext()))
+               pBuf.Clear();
+               if(RestoreFromUniID(ds.AttrID, pBuf, OBJTYPE_PARTY) and (pBuf.rec.PartyID > 0))
+                  CLIENT_INFO.appendChild(Create_CLIENT_PF(pBuf));
+                  existsDU = true;
+               end;
+            end;
+
+            if(not existsDU)
+               m_stat = 1;
+               MsgBox("Для доверительного управляющего \"" + GetClient().rec.ShortName + "\" не заполнены учредители и фонды ДУ.");
+            end;
+         else
+            CLIENT_INFO.appendChild(Create_CLIENT_SIMPLE());
+         end;
+      end;
+
+      return CLIENT_INFO;
+   end;
+
+   private macro Create_CLIENT()
+      var CLIENT = CreateNode("CLIENT");
+
+      CLIENT.setAttribute("ClientOperation", GetClientOperation());
+      CLIENT.setAttribute("OperationId", m_DlContrMsg.rec.ID);
+      CLIENT.setAttribute("LKU", LKU);
+      
+      if(((m_Kind == OBJTYPE_DLCONTRMSG_MARKETREG) OR (m_Kind == OBJTYPE_DLCONTRMSG_MPREG)) AND
+         (GetUniClientCode() == ""))
+         m_stat = 1;
+         MsgBox("Для клиента \"" + GetClient().rec.ShortName + "\" на ДБО не задано значение единого краткого кода");
+      end;
+
+      if(not m_stat)
+         CLIENT.appendChild(Create_CLIENT_CODE());
+         if( (not m_stat) and ((m_Kind == OBJTYPE_DLCONTRMSG_MARKETREG) or (m_Kind == OBJTYPE_DLCONTRMSG_CHNGPERSDATA)) )
+            CLIENT.appendChild(Create_CLIENT_INFO());
+         end;
+      end;
+
+      m_MainNode = CLIENT;
+
+   OnError(er)
+      if(er.Code != 0)
+         m_stat = er.Code;
+      else
+         m_stat = 1;
+      end;
+   end;
+
+   macro Construct( DlContr, SfContr, DlContrMsg );
+      m_DlContr = DlContr;
+      m_SfContr = SfContr;
+      m_DlContrMsg = DlContrMsg;
+      m_Kind = m_DlContrMsg.rec.Kind;
+      m_MainNode = null;
+      CreateXML("utf-8");
+
+      Create_CLIENT();
+   end;
+
+   initDL_XML();
+   this.Construct( DlContr, SfContr, DlContrMsg );
+END;
+
+private macro ФормФайлБиржСообщДБО(IndividualFile:Bool)
+   var XMLFileName = "", DataXML = "", fileClients;
+
+   fileClients = TDlFileClientsXML(IndividualFile);
+   DataXML = fileClients.GetDataXML();
+
+   if(strlen(DataXML) > 0)
+      XMLFileName = fileClients.SaveXml();
+   end;
+
+   return XMLFileName;
+   
+OnError(er)
+   return "";
+end;
+
+private macro GetDlContrMsgXml(DlContrMsgID)
+  var filePathName = "", xmlData = "";
+  var queryImg = " SELECT t_imageid, t_filename " +
+                   " FROM dimgdata_dbt " +
+                  " WHERE t_imagetype = 1 " +
+                    " AND t_objecttype = " + OBJTYPE_BSCMSG_DL +
+                    " AND t_objectid = LPAD("+DlContrMsgID+", 34, '0') " +
+                    " AND t_closedate = TO_DATE('01.01.0001', 'DD.MM.YYYY') " +
+                  " ORDER BY t_IsMain desc ";
+
+  var ds = TRsbDataSet(queryImg);
+  if(ds.MoveNext())
+     var ax, fd = DlGetTxtFileDir();
+     var h, m, s, fileName, ext;
+     TimeSplit(Time(),h,m,s);
+     SplitFile(ds.filename, fileName, ext);
+     filePathName = fd + "\\" + fileName + "__" + string(DlContrMsgID) + "_" + GetFormatDate({curdate}) + "_" + string(L_Z(h,2)) + string(L_Z(m,2)) + string(L_Z(s, 2)) + ext;
+
+     if(WEB_ShowImageByID(Int(ds.ImageID), filePathName))
+       var xmlReader = Dl_XmlReader();
+       if(xmlReader.Load_file(filePathName))
+         xmlData = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>" +
+                   xmlReader.GetXml().DocumentElement.xml;
+       end;
+       RemoveFile(filePathName);
+     end;
+  end;
+  return xmlData;
+end;
+
+private macro AddExMesToQueue(partyID, dlContrID, dlContrMsgID, dataXML:@string)
+   var client = AMQPMOEXClient(host, vhost, user, password, port, queue);
+   client.publish(string(partyID), string(dlContrID), string(dlContrMsgID), dataXML);
+   return 0;
+onError(er)
+   return 1;
+end;
+
+private macro ДобавитьСообщВОчередьОтправки(PartyID, dlContrMsg, dataXML:@string, repeat:bool, showErr:bool)
+   var stat = 0;
+   stat=AddExMesToQueue(PartyID, dlContrMsg.rec.DlContrID, dlContrMsg.rec.ID, @dataXML);
+
+   if(stat and showErr)
+      MsgBox("Не удалось добавить xml сообщение в очередь для отправки на биржу");
+   else
+      var query = " UPDATE ddlcontrmsg_dbt " +
+                     " SET t_SendDate = ?, " +
+                         " t_SendTime = ?, " +
+                         " t_SendMesState = ?, " +
+                         " t_RespDate = TO_DATE('01.01.0001', 'DD.MM.YYYY'), " +
+                         " t_RespTime = TO_DATE('01.01.0001:00:00:00', 'DD.MM.YYYY:HH24:MI:SS') " +
+                   " WHERE t_ID = ? " +
+                     " AND t_SendMesState != ? " +
+                     " AND t_Version = ? ";
+
+      var cmd = RsdCommand(query);
+      cmd.NullConversion = true;
+      cmd.AddParam("", RSDBP_IN, {curdate});
+      cmd.AddParam("", RSDBP_IN, Time());
+      cmd.AddParam("", RSDBP_IN, IIF(repeat, DLSENDMESSTATE_REPEATINQUEUE, DLSENDMESSTATE_INQUEUE));
+      cmd.AddParam("", RSDBP_IN, dlContrMsg.rec.ID);
+      cmd.AddParam("", RSDBP_IN, DLSENDMESSTATE_SUCCESS);
+      cmd.AddParam("", RSDBP_IN, dlContrMsg.rec.Version);
+      cmd.Execute();
+   end;
+
+   return stat;
+end;
+
+MACRO AddDlContrMsgToAMQP(DlContrID:Integer, ShowErr:Bool)
+  var stat = 0;
+  var cmdParty = RSDCommand("SELECT sfcontr.t_PartyID "+
+                             " FROM DDLCONTR_DBT dlcontr, DSFCONTR_DBT sfcontr "+
+                            " WHERE dlcontr.t_DlContrID = ? "+
+                              " AND sfcontr.t_ID = dlcontr.t_SfContrID");
+  cmdParty.AddParam("", RSDBP_IN, DlContrID);
+  cmdParty.Execute();
+
+  var dsParty = TRsbDataSet(cmdParty), PartyID = UnknownParty;
+  if(dsParty.moveNext())
+    PartyID = SQL_ConvTypeInteger(dsParty.PartyID);
+  else
+    stat = 1;
+    if(ShowErr)
+      msgbox("Не найден клиент ДБО по DlContrID = " + DlContrID);
+    end;
+  end;
+
+  if(stat == 0)
+    var cmd = RSDCommand("SELECT msg.* "+
+                          " FROM DDLCONTRMSG_DBT msg "+
+                         " WHERE msg.t_DlContrID = ? "+
+                           " AND msg.t_MarketID = "+ MMVB_ID()+
+                           " AND msg.t_Kind IN (?,?,?,?,?) "+
+                           " AND msg.t_IsOnlineSendMes = 'X' "+
+                           " AND msg.t_SendMesState = 0 ");
+    cmd.AddParam("", RSDBP_IN, DlContrID);
+    cmd.AddParam("", RSDBP_IN, OBJTYPE_DLCONTRMSG_MARKETREG);
+    cmd.AddParam("", RSDBP_IN, OBJTYPE_DLCONTRMSG_MPREG);
+    cmd.AddParam("", RSDBP_IN, OBJTYPE_DLCONTRMSG_MPCLOSE);
+    cmd.AddParam("", RSDBP_IN, OBJTYPE_DLCONTRMSG_MARKETCLOSE);
+    cmd.AddParam("", RSDBP_IN, OBJTYPE_DLCONTRMSG_CHNGPERSDATA);
+    cmd.Execute();
+
+    var ds = TRsbDataSet(cmd);
+    while(ds.moveNext() and (stat == 0))
+      var DlContrMsg = TRecHandler("dlcontrmsg.dbt");
+      ds.GetRecord().CopyTo(DlContrMsg.rec);
+
+      var dataXML = GetDlContrMsgXml(DlContrMsg.rec.ID);
+      if(strlen(dataXML) <= 0)
+        stat = 1;
+      end;
+
+      if(stat == 0)
+        stat = ДобавитьСообщВОчередьОтправки(PartyID, DlContrMsg, @dataXML, false, ShowErr);
+      end;
+    end;
+  end;
+
+  return stat;
+onError(er)
+  return 1;
+END;
+
+macro СоздатьСообщениеДБО_ММВБ(Kind, MarketID, DlContr, SfContr)
+  var stat = 0;
+  var query, cmd, ds, xml_client = "", params, fullPathName = "";
+  var dlcontrmsg = Tbfile("dlcontrmsg.dbt", "W", 0);
+
+  if(not ПолучитьКодСубъекта({OurBank}, PTCK_MICEX))
+    stat = 1;
+    MsgBox("Для субъекта \"" + ПолучитьКороткоеИмяСубъекта({OurBank}) + "\" не задано значение кода на ММВБ");
+  end;
+
+  if((stat == 0) and (Kind == OBJTYPE_DLCONTRMSG_CHNGPERSDATA))
+    stat = DL_ОчиститьНеотправленныеСообщения(Kind, DlContr.rec.DlContrID, MarketID);
+  end;
+
+  // Создать запись о сообщении ДБО
+  if(stat == 0)
+    dlcontrmsg.clear();
+    dlcontrmsg.rec.DlContrID = DlContr.rec.DlContrID;
+    dlcontrmsg.rec.Kind = Kind;
+    dlcontrmsg.rec.CreateDate = {curdate};
+    dlcontrmsg.rec.CreateTime = Time();
+    dlcontrmsg.rec.IsOnlineSendMes = IIF(ОнлайнРегистрацияКлиентовНаБирже(), SET_CHAR, UNSET_CHAR);
+    dlcontrmsg.rec.MarketID = MarketID;
+    if(not dlcontrmsg.insert())
+      stat = 1;
+    end;
+  end;
+
+  if(stat == 0)
+    // сформировать, в зависимости от вида сообщения, xml-узел CLIENT
+    xml_client = TDlClientXML(DlContr, SfContr, dlcontrmsg);
+    stat = xml_client.GetStat();
+  end;
+
+  if((stat == 0) and (strlen(xml_client.GetClientXML()) > 0))
+    query = " UPDATE DDLCONTRMSG_DBT SET T_XML = ? WHERE T_ID = ? ";
+    params = makeArray(SQLParam("T_XML", xml_client.GetClientXML()),
+                       SQLParam("T_ID", dlcontrmsg.rec.ID));
+    execSQL(query, params, true);
+
+    SQL_Execute("DELETE FROM DDLCONTRMSG_TMP");
+
+    query = " INSERT INTO DDLCONTRMSG_TMP (T_MSGID) VALUES (?) ";
+    params = makeArray(SQLParam("T_MSGID", dlcontrmsg.rec.ID));
+    execSQL(query, params, true);
+
+    fullPathName = ФормФайлБиржСообщДБО(true);
+  end;
+
+  if((stat == 0) and (fullPathName == ""))
+    stat = 1;
+    MsgBox("Для клиента \"" + ПолучитьКороткоеИмяСубъекта(SfContr.rec.PartyID) + "\" не удалось сформировать файл сообщения");
+  end;
+
+  if(stat == 0)
+    if(not LoadImageObj(fullPathName, OBJTYPE_BSCMSG_DL, UniID(dlcontrmsg, OBJTYPE_BSCMSG_DL), 1));
+      stat = 1;
+      MsgBox("К записи о сообщении не удалось прикрепить файл сообщения");
+    end;
+  end;
+
+  if(stat == 0)
+    if(not RemoveFile(fullPathName))
+      stat = 1;
+      MsgBox("Не удалось удалить файл \"" + fullPathName + "\"");
+    end;
+  end;
+
+  return stat;
+end;
+
+
+private macro PrintProtocolSvod()
+   var i = 0, j = 0, exists = false;
+
+[
+                                           Протокол формирования сводного уведомления на биржу ММВБ
+                                                          за ########## г.
+ ┌─────────────────────────────┬───────────────────────────────────────────────────────────────┬───────────────────────────────┐
+ │           Код ДБО           │                     Наименование субъекта                     │         Тип сообщения         │
+]
+   ({CurDate});
+
+   while( i < arrProtocolSvod.size )
+      j = 0;
+      while( j < arrProtocolSvod(i).arrMessType.size )
+[├─────────────────────────────┼───────────────────────────────────────────────────────────────┼───────────────────────────────┤
+ │#############################│###############################################################│###############################│]
+         ( arrProtocolSvod(i).Code:w, arrProtocolSvod(i).Name:w, arrProtocolSvod(i).arrMessType[j].MessType:w);
+
+         exists = true;
+         j = j + 1;
+      end;
+      i = i + 1;
+   end;
+
+[└─────────────────────────────┴───────────────────────────────────────────────────────────────┴───────────────────────────────┘];
+
+   if(not exists)
+[Нет сообщений для формирования сводного уведомления на биржу ММВБ.];
+   end;
+end;
+
+MACRO СформироватьСводноеСообщениеДБО_ММВБ()
+   var stat = 0, transactionStarted:bool = false;
+   var query, query2, cmd, ds, params, XMLFileName, ids = TArray(), i = 0, needCreate = false;
+   var OldDialogFlag = SetDialogFlag(0);
+
+   InitError();
+
+   RslDefCon.BeginTrans();
+   transactionStarted = true;
+
+   arrProtocolSvod.ClearArray();
+
+   SQL_Execute("DELETE FROM DDLCONTRMSG_TMP");
+
+   query = " SELECT T_ID, T_DLCONTRID FROM DDLCONTRMSG_DBT " +
+           " WHERE T_SENDDATE = TO_DATE('01.01.0001', 'DD.MM.YYYY') " +
+           "   AND T_KIND IN ("+OBJTYPE_DLCONTRMSG_MARKETREG
+                          +", "+OBJTYPE_DLCONTRMSG_MPREG
+                          +", "+OBJTYPE_DLCONTRMSG_MPCLOSE
+                          +", "+OBJTYPE_DLCONTRMSG_MARKETCLOSE
+                          +", "+OBJTYPE_DLCONTRMSG_CHNGPERSDATA+") " +
+           "   AND T_MARKETID = "+MMVB_ID()+
+           "   AND T_ISONLINESENDMES != 'X' "+
+           " ORDER BY T_DLCONTRID, T_ID";
+
+   cmd = DL_RSDCommand(query);
+   ds = cmd.Execute();
+   while(ds.moveNext())
+      if((ids.size == 0) or ((ids.size > 0) and (ids[ids.size-1] != ds.DlContrID)))
+        ids[ids.size] = ds.DlContrID;
+      end;
+      needCreate = true;
+
+      query = " INSERT INTO DDLCONTRMSG_TMP (T_MSGID) VALUES (?) ";
+      params = makeArray(SQLParam("T_MSGID", ds.ID));
+      execSQL(query, params, true);
+   end;
+
+   if(needCreate)
+      XMLFileName = ФормФайлБиржСообщДБО(false);
+      if( XMLFileName == "" )
+         stat = 1;
+      end;
+   
+      if(not stat)
+         query = " UPDATE DDLCONTRMSG_DBT SET T_SENDDATE = ?, T_SENDTIME = ? WHERE T_ID IN (SELECT T_MSGID FROM DDLCONTRMSG_TMP) ";
+         params = makeArray(SQLParam("T_SENDDATE", {curdate}),
+                            SQLParam("T_SENDTIME", Time()));
+         execSQL(query, params, true);
+      end;
+   
+      while((i < ids.size) and (not stat))
+         var dlcontr = TRecHandler("dlcontr.dbt");
+
+         dlcontr.Clear();
+         dlcontr.rec.DlContrID = ids[i];
+         
+         if( not LoadImageObj(XMLFileName, OBJTYPE_BROKERCONTR_DL, UniID(dlcontr, OBJTYPE_BROKERCONTR_DL), 1));
+            stat = 1;
+         end;
+         i = i + 1;
+      end;
+   end;
+
+   if(not stat)
+      SQL_Execute("DELETE FROM DDLCONTRMSG_TMP");
+      RslDefCon.CommitTrans();
+   else
+      RslDefCon.RollbackTrans();
+   end;
+   transactionStarted = false;
+   SetDialogFlag(OldDialogFlag);
+
+   // Показать протокол
+   PrintProtocolSvod();
+
+   return stat;
+
+OnError(er)
+   if( transactionStarted )
+      RslDefCon.RollbackTrans();
+   end;
+
+   if(er.Code != 0)
+      stat = er.Code;
+   else
+      stat = 1;
+   end;
+   return stat;
+END;
+
+
+private macro ОбновитьСтатусОтправлСообщ(dlContrMsgID:integer, state:integer, respData:string)
+   var sql = " UPDATE DDLCONTRMSG_DBT " +
+                " SET t_SendMesState = ?, " +
+                    " t_RespDate = ?, " +
+                    " t_RespTime = ? ";
+   if(respData != "")
+      sql = sql + " ,t_RespData = ? ";
+   end;
+   sql = sql +" WHERE t_ID = ? " +
+                " AND t_IsOnlineSendMes = CHR(88) " +
+                " AND t_RespDate = TO_DATE('01.01.0001', 'DD.MM.YYYY') " +
+                " AND t_SendMesState != ? ";
+
+   var cmd = RSDCommand(sql);
+   cmd.addParam("", RSDBP_IN, state);
+   cmd.addParam("", RSDBP_IN, {curdate});
+   cmd.addParam("", RSDBP_IN, Time());
+   if(respData != "")
+      cmd.addParam("", RSDBP_IN, respData);
+   end;
+   cmd.addParam("", RSDBP_IN, dlContrMsgID);
+   cmd.addParam("", RSDBP_IN, DLSENDMESSTATE_SUCCESS);
+   cmd.execute();
+end;
+
+private macro GetResultByPrm(prm)
+   var result: CSendMesResult;
+
+   if ((prm != null) and (ValType(prm) == V_STRING) and (strlen(prm) > 0))
+      var json:object = jsn.JsonDoc(prm);
+      if( json != null )
+         result.clientCode = jsn.GetProperty(json, "clientCode");
+         result.conractNumber = jsn.GetProperty(json, "conractNumber");
+         result.subContractNumber = jsn.GetProperty(json, "subContractNumber");
+         result.status = jsn.GetProperty(json, "status");
+      end;
+   end;
+   return result;
+end;
+
+// проверить существование записи сообщения ДБО
+private macro FindDlContrMsg(DlContrMsgID)
+  var cmd = RSDCommand(" select count(1) cnt from ddlcontrmsg_dbt where t_ID = ? ");
+  cmd.AddParam("", RSDBP_IN, DlContrMsgID);
+  cmd.Execute();
+
+  var ds = TRsbDataSet(cmd);
+  if((ds.moveNext()) and (Int(ds.Cnt) > 0))
+    return true;
+  end;
+
+  return false;
+end;
+
+// Обработка результата отправки сообщения
+macro DLOnlineMesResponseProc(objectType, objectId, param, guid, taskId)
+   var stat = 1;
+   var result = GetResultByPrm(param);
+
+   if(result != null)
+      if(not FindDlContrMsg(Int(result.subContractNumber)))
+        return 1; 
+      end;
+
+      ОбновитьСтатусОтправлСообщ(Int(result.subContractNumber),
+                                 result.status,
+                                 DL_GetClobData("t_Data", " from DFUNCOBJ_DBT where t_ID = "+Int(taskId)));
+      stat = 0;
+   end;
+
+   return stat;
+onError(er)
+   return 1;
+end;
+
+
+private macro GetDlContrRH( RecFromSelect:TRecHandler, DlContrID ) :BOOL
+   var Query = "SELECT * FROM DDLCONTR_DBT WHERE T_DLCONTRID = " + DlContrID;
+   RecFromSelect.Clear();
+   if(DL_GetRecHandler(RecFromSelect, Query))
+      return true;
+   end;
+   return false;
+end;
+
+// Повторно добавить сообщение в очередь для отправки
+macro DlRepeatSendMes_MMVB(dlContrMsg)
+  var stat = 0, dataXML = "";
+  var dlContr = TRecHandler("dlcontr.dbt"), 
+      sfContr = TRecHandler("sfcontr.dbt");
+
+  // повторно отправляем только новые/ошибочные сообщения
+  if(dlContrMsg.rec.SendMesState != 0)
+    if(not((dlContrMsg.rec.SendMesState > DLSENDMESSTATE_REPEATINQUEUE) and
+           (dlContrMsg.rec.SendMesState < DLSENDMESSTATE_SUCCESS)))
+      MsgBox("Отправлять повторно можно только новые/ошибочные сообщения");
+      return stat;
+    end;
+  end;
+
+  GetDlContrRH(dlContr, dlContrMsg.rec.DlContrID);
+  GetSfContrRH(sfContr, dlContr.rec.SfContrID);
+
+  dataXML = GetDlContrMsgXml(dlContrMsg.rec.ID);
+  if(strlen(dataXML) > 0)
+    stat = ДобавитьСообщВОчередьОтправки(sfContr.rec.PartyID, dlContrMsg, @dataXML, true, true);
+  else
+    stat = 1;
+  end;
+
+  return stat;
+end;

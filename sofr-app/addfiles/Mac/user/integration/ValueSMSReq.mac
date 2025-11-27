@@ -1,0 +1,471 @@
+/*--------------------------------------*/
+/* Сервис Валидации СМС-кода            */
+/* Поток "A6"                           */
+/*--------------------------------------*/
+/* РСХБ                                 */
+/* |- БРОКЕРСКОЕ ОБСЛУЖИВАНИЕ           */
+/*    |- ПОДТВЕРЖДЕНИЕ ПО СМС           */
+/*       |- ОДНОРАЗОВЫЙ ПАРОЛЬ          */
+/*          |- ВРЕМЯ ДЕЙСТВИЯ В МИНУТАХ */
+/*          |- КОЛИЧЕСТВО ПОПЫТОК       */
+/*--------------------------------------*/
+
+import "ValueSMSReq_lib.mac";
+import "global_classes_adp.mac";
+//import "global_utils_intgr.mac"; /* Функции общего назначения */
+import BankInter; /* GetRegistryValue() */
+
+
+private const CV_ERROR_TECH = -10001;
+private const CV_ERR_TECH = "Техническая проблема при выполнении запроса";
+
+
+/**/
+private class (c_ValueSMSResp) c_adp_ValueSMSResp(p_MessageId, p_ErrorCode, p_ErrorDesc)
+   /*----------------------------------*/
+   /* Метод добавления ошибки к списку */
+   /*----------------------------------*/
+   macro m_add_error_to_list(p_ErrorCode, p_ErrorDesc)
+      var v_aux_buf;
+
+      /* Код ошибки считаем первичным параметром */
+      if(ValType(p_ErrorCode) != V_UNDEF)
+         v_aux_buf = ErrorList.size;
+         ErrorList.value(v_aux_buf) = c_Error;
+
+         ErrorList.value(v_aux_buf).ErrorCode = p_ErrorCode;
+
+         if(ValType(p_ErrorDesc) != V_UNDEF)
+            ErrorList.value(v_aux_buf).ErrorDesc = p_ErrorDesc;
+         else
+            ErrorList.value(v_aux_buf).ErrorDesc = "";
+         end;
+      end;
+   end; /* macro m_add_error_to_list() */
+
+
+   /*-------------*/
+   /* Конструктор */
+   /*-------------*/
+   private macro m_init_adp_ValueSMSResp(i_MessageId, i_ErrorCode, i_ErrorDesc)
+      ErrorList = TArray;
+      MassageId = c_IntegrSymId();
+
+      if(ValType(i_MessageId) != V_UNDEF)
+         MassageDate = dttm(date(), time());
+         MassageId.ObjectId = i_MessageId;
+      end;
+
+      m_add_error_to_list(i_ErrorCode, i_ErrorDesc);
+   end; /* macro m_init_adp_ValueSMSResp() */
+
+   Initc_ValueSMSResp();
+
+   m_init_adp_ValueSMSResp(p_MessageId, p_ErrorCode, p_ErrorDesc);
+end; /* class c_adp_ValueSMSResp() */
+
+
+/* Исходящий объект */
+private class c_out_obj()
+   var ValueSMSResp : object; /* c_adp_ValueSMSResp */
+end;
+
+
+/**/
+private class (c_ValueSMSReq) c_adp_ValueSMSReq(p_income_data)
+   /* Код ошибки */
+   private const CV_ERROR_SIGN = 1; /* Значение для ErrorCode, говорящее о наличии ошибки */
+   private const CV_ERROR_CLEAR = 0; /* Значение для ErrorCode, говорящее об отсутствии ошибки */
+
+   /* Описание ошибки */
+   private const CV_ERR_CLEAR = ""; /* Текст ошибки по умолчанию */
+   private const CV_ERR_DEFAULT = ""; /* Если ничего конкретного нет, то будем возвращать этот текст */
+
+   private var v_code_expire_time; /* Время действия кода (в минутах) */
+   private var v_code_accept_try; /* Допустимое количество попыток ввода кода */
+
+   private var v_error_code;
+   private var v_error_desc;
+
+   private var v_code_id;
+   private var v_code_type;
+   private var v_code_status;
+   private var v_code_over_try;
+
+
+   macro m_get_error_code()
+      return v_error_code;
+   end;
+
+   macro m_get_error_desc()
+      return v_error_desc;
+   end;
+
+   macro m_get_code_id()
+      return v_code_id;
+   end;
+
+   macro m_get_code_type()
+      return v_code_type;
+   end;
+
+
+   /*-------------------------------------------------------------------------------*/
+   /* Создать задачу генерации и отправки временного пароля для входа в торг. терм. */
+   /*-------------------------------------------------------------------------------*/
+   macro m_make_temp_pwd_task()
+      const CV_OBJ_TYPE_TEMP_PWD = 5024;
+
+      var v_ret = true;
+
+      /* Функция определена в global_utils_intgr.mac */
+      /* Тип процесса и статус в функции заполняются по умолчанию значениями 1 */
+      v_ret = m_make_event_to_process(CV_OBJ_TYPE_TEMP_PWD, ClientLogin.ObjectId);
+
+      if(not v_ret)
+         /* Чтобы не стереть предыдущие ошибки (по ТЗ не понятно можно ли отправить список ошибок) */
+         if(v_error_code == CV_ERROR_CLEAR)
+            v_error_code = CV_ERROR_SIGN;
+            v_error_desc = CV_ERR_DEFAULT;
+         end;
+      end;
+
+      return v_ret;
+
+   onError(err)
+      /* Чтобы не стереть предыдущие ошибки (по ТЗ не понятно можно ли отправить список ошибок) */
+      if(v_error_code == CV_ERROR_CLEAR)
+         v_error_code = CV_ERROR_SIGN;
+         v_error_desc = CV_ERR_DEFAULT;
+      end;
+      v_ret = false;
+      return v_ret;
+   end; /* macro m_make_temp_pwd_task() */
+
+
+   /*-----------------------------------*/
+   /* Обновление статуса кодового слова */
+   /*-----------------------------------*/
+   macro m_update_code_word()
+      const CV_CODE_WORD_TYPE = 2;
+//      const CV_TYPE_CW_PRIME = 1;
+//      const CV_TYPE_CW_CHNG = 2;
+      const CV_STAT_CW_ACCEPTED = 4;
+      const CV_STAT_CW_CHNG_TO_NEW = 5;
+
+      var v_ret = true;
+      var v_sql, v_cmd;
+
+      if(v_code_type == CV_CODE_WORD_TYPE)
+         /* Код подтвержден */
+         /* Обновляем старые записи в таблице с историей */
+         /* Переносим запись из буферной таблицы в таблицу с историей */
+         /* Удаляем запись из буферной таблицы */
+         if(v_error_code == CV_ERROR_CLEAR)
+            v_sql =         "BEGIN ";
+            v_sql = v_sql + "    :p_result := USR_PKG_IMPORT_SOFR.f_save_accepted_code_word(:p_cw_type, ";
+            v_sql = v_sql + "                                                               :p_client, ";
+            v_sql = v_sql + "                                                               :p_stat_cw_chng, ";
+            v_sql = v_sql + "                                                               :p_stat_cw_accepted, ";
+            v_sql = v_sql + "                                                               :p_ret_txt); ";
+            v_sql = v_sql + "END; ";
+            v_cmd = RSDCommand(v_sql);
+            v_cmd.addParam("p_result", RSDBP_RETVAL, V_INTEGER);
+            v_cmd.addParam("p_cw_type", RSDBP_IN, v_code_type);
+            v_cmd.addParam("p_client", RSDBP_IN, ClientLogin.ObjectId);
+            v_cmd.addParam("p_stat_cw_chng", RSDBP_IN, CV_STAT_CW_CHNG_TO_NEW);
+            v_cmd.addParam("p_stat_cw_accepted", RSDBP_IN, CV_STAT_CW_ACCEPTED);
+            v_cmd.addParam("p_ret_txt", RSDBP_OUT, V_STRING, 2000);
+            v_cmd.execute();
+
+            if(v_cmd.value("p_result") != 0)
+               v_error_code = CV_ERROR_SIGN;
+               v_error_desc = CV_ERR_DEFAULT;
+               v_ret = false;
+            end;
+         else
+            /* Код не подтвержден */
+            v_sql =         "UPDATE usr_clnt_cdwrd_buf_dbt ";
+            v_sql = v_sql + "   SET t_cw_accept_ts = SYSTIMESTAMP, ";
+            v_sql = v_sql + "       t_cw_accept_try = (t_cw_accept_try + 1) ";
+            v_sql = v_sql + " WHERE t_cw_type = :p_cw_type ";
+            v_sql = v_sql + "   AND t_cw_client = :p_cw_client ";
+
+            v_cmd = RSDCommand(v_sql);
+            v_cmd.addParam("p_cw_type", RSDBP_IN, v_code_type);
+            v_cmd.addParam("p_cw_client", RSDBP_IN, ClientLogin.ObjectId);
+            v_cmd.execute();
+         end;
+
+         v_cmd.close(); v_cmd = NULL; v_sql = NULL;
+      end;
+
+      return v_ret;
+
+   onError(err)
+      /* Чтобы не стереть предыдущие ошибки (по ТЗ не понятно можно ли отправить список ошибок) */
+      if(v_error_code == CV_ERROR_CLEAR)
+         v_error_code = CV_ERROR_SIGN;
+         v_error_desc = CV_ERR_DEFAULT;
+      end;
+      v_ret = false;
+      return v_ret;
+   end;
+
+
+   /*------------------------------*/
+   /* Метод обновления записи кода */
+   /*------------------------------*/
+   /* Метод должен вызываться только если код был найден в таблице (v_code_id != 0) */
+   macro m_update_code()
+      const CV_STAT_WAS_ACCEPTED = 2;
+      const CV_STAT_OVER_TRY = 4;
+
+      var v_ret = true;
+      var v_sql, v_cmd;
+
+      v_sql =         "UPDATE usr_clnt_sms_code_dbt ";
+      v_sql = v_sql + "   SET t_status = :p_status, ";
+      v_sql = v_sql + "       t_accept_try = (t_accept_try + 1), ";
+      v_sql = v_sql + "       t_accept_ts = SYSTIMESTAMP ";
+      v_sql = v_sql + " WHERE t_id = :p_id ";
+      v_cmd = RSDCommand(v_sql);
+      if(v_error_code == CV_ERROR_CLEAR)
+         /* Код правильный, количество повторных вводов не превышено */
+         v_cmd.addParam("p_status", RSDBP_IN, CV_STAT_WAS_ACCEPTED);
+      else
+         /* Код не правильный */
+         if(v_code_over_try)
+            /* Количество повторов превышено */
+            v_cmd.addParam("p_status", RSDBP_IN, CV_STAT_OVER_TRY);
+         else
+            /* Количество повторов не превышено */
+            v_cmd.addParam("p_status", RSDBP_IN, v_code_status);
+         end;
+      end;
+      v_cmd.addParam("p_id", RSDBP_IN, v_code_id);
+      v_cmd.execute();
+
+      v_cmd.close(); v_cmd = NULL; v_sql = NULL;
+
+      return v_ret;
+
+   onError(err)
+      /* Чтобы не стереть предыдущие ошибки (по ТЗ не понятно можно ли отправить список ошибок) */
+      if(v_error_code == CV_ERROR_CLEAR)
+         v_error_code = CV_ERROR_SIGN;
+         v_error_desc = CV_ERR_DEFAULT;
+      end;
+      v_ret = false;
+      return v_ret;
+   end; /* macro m_update_code() */
+
+
+   /*------------------------------*/
+   /* Метод проверки значения кода */
+   /*------------------------------*/
+   /* Для Клиента должен быть только один активный код */
+   macro m_check_code_val()
+      const CV_STAT_IS_ACTIVE = 1;
+      const CV_STAT_WAS_SENT = 6;
+
+      const CV_ERR_WRONG_CODE = "Код введен неверно, повторите попытку";
+      const CV_ERR_OVER_TRY = "Код введен неверно. Превышено количество попыток ввода кода.";
+
+      var v_ret = true;
+      var v_sql, v_cmd, v_rs;
+
+      v_sql =         "SELECT t_id, t_type, t_client, t_sms_code, ";
+      v_sql = v_sql + "       t_status, t_create_ts, t_accept_try ";
+      v_sql = v_sql + "  FROM usr_clnt_sms_code_dbt ";
+      v_sql = v_sql + " WHERE t_client = :p_client ";
+      v_sql = v_sql + "   AND t_status IN (:p_stat_is_active, :p_stat_was_sent) ";
+      v_sql = v_sql + "   AND t_create_ts > (SYSDATE - NUMTODSINTERVAL(:p_expire_time, 'MINUTE')) ";
+      v_cmd = RSDCommand(v_sql);
+      v_cmd.addParam("p_client", RSDBP_IN, ClientLogin.ObjectId);
+      v_cmd.addParam("p_stat_is_active", RSDBP_IN, CV_STAT_IS_ACTIVE);
+      v_cmd.addParam("p_stat_was_sent", RSDBP_IN, CV_STAT_WAS_SENT);
+      v_cmd.addParam("p_expire_time", RSDBP_IN, v_code_expire_time);
+      v_rs = RSDRecordSet(v_cmd);
+
+      v_code_id = 0;
+      if(v_rs.movenext())
+         v_code_id = v_rs.value("t_id");
+         v_code_type = v_rs.value("t_type");
+         v_code_status = v_rs.value("t_status");
+         if(v_rs.value("t_sms_code") == PassSMS)
+            if(v_rs.value("t_accept_try") >= v_code_accept_try)
+               v_ret = false;
+               v_code_over_try = true;
+               v_error_code = CV_ERROR_SIGN;
+               v_error_desc = CV_ERR_OVER_TRY;
+            end;
+         else
+            v_ret = false;
+            v_error_code = CV_ERROR_SIGN;
+            /* Странно, что отслеживание количества попыток выполняется на этой стороне */
+            if(v_rs.value("t_accept_try") >= v_code_accept_try)
+               v_code_over_try = true;
+               v_error_desc = CV_ERR_OVER_TRY;
+            else
+               v_error_desc = CV_ERR_WRONG_CODE;
+            end;
+         end;
+      end;
+
+      v_rs.close(); v_cmd.close(); v_rs = NULL; v_cmd = NULL; v_sql = NULL;
+
+      /* Действующего кода по заданному клиенту не найдено */
+      if(v_code_id == 0)
+         v_error_code = CV_ERROR_SIGN;
+         v_error_desc = CV_ERR_DEFAULT;
+         v_ret = false;
+      end;
+
+      return v_ret;
+
+   onError(err)
+      v_error_code = CV_ERROR_SIGN;
+      v_error_desc = CV_ERR_DEFAULT;
+      v_ret = false;
+      return v_ret;
+   end; /* macro m_check_code_val() */
+
+
+   /*-------------*/
+   /* Конструктор */
+   /*-------------*/
+   private macro m_init_adp_ValueSMSReq(i_income_data)
+      const CV_CODE_EXP_TIME_PATH = "РСХБ\\БРОКЕРСКОЕ ОБСЛУЖИВАНИЕ\\ПОДТВЕРЖДЕНИЕ ПО СМС\\ОДНОРАЗОВЫЙ ПАРОЛЬ\\ВРЕМЯ ДЕЙСТВИЯ В МИНУТАХ";
+      const CV_CODE_ACCEPT_TRY_PATH = "РСХБ\\БРОКЕРСКОЕ ОБСЛУЖИВАНИЕ\\ПОДТВЕРЖДЕНИЕ ПО СМС\\ОДНОРАЗОВЫЙ ПАРОЛЬ\\КОЛИЧЕСТВО ПОПЫТОК";
+
+      const CV_CODE_EXP_TIME_DEF = 15; /* Время действия кода (в минутах) - значение по умолчанию */
+      const CV_CODE_ACCEPT_TRY_DEF = 3; /* Количество попыток ввода кода - значение по умолчанию */
+
+      var v_aux_buf;
+      var v_stat;
+
+      v_error_code = CV_ERROR_CLEAR;
+      v_error_desc = CV_ERR_CLEAR;
+      v_code_id = 0;
+      v_code_over_try = false;
+
+      /* Время действия пароля */
+      GetRegistryValue(CV_CODE_EXP_TIME_PATH, V_INTEGER, v_code_expire_time, v_stat);
+      if(v_stat > 0)
+         /* Значение по умолчанию */
+         v_code_expire_time = CV_CODE_EXP_TIME_DEF;
+      end;
+
+      /* Количество попыток ввода */
+      GetRegistryValue(CV_CODE_ACCEPT_TRY_PATH, V_INTEGER, v_code_accept_try, v_stat);
+      if(v_stat > 0)
+         /* Значение по умолчанию */
+         v_code_accept_try = CV_CODE_ACCEPT_TRY_DEF;
+      end;
+
+      if(ValType(i_income_data) != V_UNDEF)
+         MassageDate = uTryToGetPropS(i_income_data, "MassageDate");
+         if(ValType(MassageDate) == V_UNDEF)
+            RunError(CV_ERR_TECH, CV_ERROR_TECH);
+         end;
+
+         PassSMS = uTryToGetPropS(i_income_data, "PassSMS");
+         if(ValType(PassSMS) == V_UNDEF)
+            RunError(CV_ERR_TECH, CV_ERROR_TECH);
+         end;
+
+         v_aux_buf = ValType(uTryToGetPropS(i_income_data, "MassageId"));
+         if(v_aux_buf == V_GENOBJ)
+            MassageId = c_adp_IntegrSymId(i_income_data.MassageId);
+         else
+            RunError(CV_ERR_TECH, CV_ERROR_TECH);
+         end;
+
+         v_aux_buf = ValType(uTryToGetPropS(i_income_data, "ClientLogin"));
+         if(v_aux_buf == V_GENOBJ)
+            ClientLogin = c_adp_IntegrSymId(i_income_data.ClientLogin);
+         else
+            RunError(CV_ERR_TECH, CV_ERROR_TECH);
+         end;
+      end;
+
+   onError(err)
+      v_error_code = CV_ERROR_SIGN;
+      v_error_desc = CV_ERR_DEFAULT;
+   end; /* macro m_init_adp_ValueSMSReq() */
+
+   Initc_ValueSMSReq();
+
+   m_init_adp_ValueSMSReq(p_income_data);
+end; /* class c_adp_ValueSMSReq() */
+
+
+/*-----------------------------------------*/
+/* Точка входа в Сервис валидации СМС-кода */
+/*-----------------------------------------*/
+macro ValueSMSReq(p_income_data)
+   const CV_ERROR_SIGN = 0; /* Значение для ErrorCode, говорящее о наличии ошибки */
+   const CV_ERR_DEFAULT = ""; /* Если ничего конкретного нет, то будем возвращать этот текст */
+
+   const CV_TRADE_TERM_ENTRY = 1; /* Тип "запрос на вход в торговые терминалы" */
+
+   var gv_message_id;
+   var v_in_data_proc;
+   var v_result_obj = c_out_obj();
+   var v_check_stat = true; /* Флаг состояния процесса */
+
+   /* На всякий случай сохраняем для формирования ответа */
+   if(ValType(uTryToGetPropS(p_income_data, "MassageId")) == V_GENOBJ)
+      gv_message_id = uTryToGetPropS(p_income_data.MassageId, "ObjectId");
+   else
+      RunError(CV_ERR_TECH, CV_ERROR_TECH);
+   end;
+
+   /* Проверка входящего объекта */
+   v_in_data_proc = c_adp_ValueSMSReq(p_income_data);
+   if(v_in_data_proc.m_get_error_code() != 0)
+      v_check_stat = false;
+   end;
+
+   /* Проверка значения кода */
+   if(v_check_stat)
+      v_check_stat = v_in_data_proc.m_check_code_val();
+   end;
+
+   if(v_check_stat)
+      /* Код подтвержден */
+      v_check_stat = v_in_data_proc.m_update_code();
+      if(v_check_stat)
+         v_check_stat = v_in_data_proc.m_update_code_word();
+      end;
+      if(v_check_stat)
+         if(v_in_data_proc.m_get_code_type() == CV_TRADE_TERM_ENTRY)
+            v_check_stat = v_in_data_proc.m_make_temp_pwd_task();
+         end;
+      end;
+   else
+      /* Код не подтвержден */
+      if(v_in_data_proc.m_get_code_id != 0)
+         v_check_stat = v_in_data_proc.m_update_code();
+      end;
+      if(v_check_stat)
+         v_check_stat = v_in_data_proc.m_update_code_word();
+      end;
+   end;
+
+   /* Формируем исходящий объект */
+   v_result_obj.ValueSMSResp = c_adp_ValueSMSResp(gv_message_id,
+                                                  v_in_data_proc.m_get_error_code(),
+                                                  v_in_data_proc.m_get_error_desc());
+
+   return v_result_obj;
+
+onError(err)
+   v_result_obj.ValueSMSResp = NULL;
+//   v_result_obj.ValueSMSResp = c_adp_ValueSMSResp(gv_message_id, 1, c_usr_err_obj.obtain_err_msg(err));
+   /* Есть подозрение, что текст будет транслироваться Клиенту как есть */
+   v_result_obj.ValueSMSResp = c_adp_ValueSMSResp(gv_message_id, CV_ERROR_SIGN, CV_ERR_DEFAULT);
+
+   return v_result_obj;
+end; /* macro ValueSMSReq() */

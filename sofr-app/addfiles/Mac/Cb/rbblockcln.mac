@@ -1,0 +1,155 @@
+// алгоритм замораживания и размораживания активов клиента, относящихся 
+// к Расчетному Банку
+
+import oralib, likepy, CTInter, FMInter, FIInter, BankInter, CurrInter, globals;
+
+private macro GetTypeAccForBlock : string
+  var TypeStr = "";
+
+  var RegPath = "ФИНМОНИТОРИНГ\\ЗАМОРАЖИВАНИЕ\\BANKING\\TYPEACCFORBLOCKING",
+      err : integer = 0;
+  GetRegistryValue(RegPath, V_STRING, TypeStr, err);
+  if( err )
+    TypeStr = "ЧXЯQYJG";
+  end;
+
+  return TypeStr;
+end;
+
+private macro GetAccRs(PartyID : integer, MandatoryType : string) : RsdRecordset
+  var q = "SELECT ac.* "
+          "  FROM daccount_dbt ac "
+          " WHERE ( ac.t_Close_Date = to_date('01010001', 'ddmmyyyy') OR "
+          "         ac.t_Close_Date > :Curdate "
+          "       ) "
+          "   AND ac.t_Client = :PartyID "
+          "   AND regexp_like( ac.t_Type_Account, '[' || :TYPEACCFORBLOCKING || ']' ) "
+          "   AND ac.t_Branch IN "
+          "       ( SELECT dep.t_Code "
+          "           FROM ddp_dep_dbt dep "
+          "          START WITH dep.t_Code = :Department "
+          "          CONNECT BY dep.t_ParentCode = PRIOR dep.t_Code "
+          "                 AND dep.t_FMRegim <> 1 /* DEPARTMENT_FM_FULL_MODE */ ) ";
+  if(MandatoryType)
+    q = q + " AND instr(ac.t_Type_Account, :MandatoryType) <> 0 ";
+  end;
+
+  var params : TArray = makeArray( SQLParam("Curdate", {curdate}),
+                                   SQLParam("PartyID", PartyID),
+                                   SQLParam("TYPEACCFORBLOCKING", GetTypeAccForBlock()),
+                                   SQLParam("Department", {OperDprt}) );
+
+  if(MandatoryType)
+    params[ params.size ] = SQLParam("MandatoryType", MandatoryType);
+  end;
+
+  return execSQLselect(q, params);
+end;
+
+private macro GetAccStrID(Account : string, FIID : integer, Chapter : integer) : string
+  record acc(account);
+  ClearRecord(acc);
+  acc.Account = Account;
+  acc.Code_Currency = FIID;
+  acc.Chapter = Chapter;
+  return UniID(acc, OBJTYPE_ACCOUNT, 0);
+end;
+
+private const FrzSymb : string = "R";
+
+macro Bnk_FreezeClient(PartyID : integer) : integer
+
+  var TypeAc : string = "", stat : integer = 0, FrzAction : FMFreezeAction = null, 
+      AccStrID : string = "";
+
+  var rs : RsdRecordset = GetAccRs(PartyID);
+  while(rs and rs.moveNext())
+    // Установить на счет тип $(Заморожен) 
+    TypeAc = rs.value("t_Type_Account");
+    if(not index(TypeAc, FrzSymb))
+
+      execSQL( "update daccount_dbt " +
+               "   set t_Type_Account = t_Type_Account || :FrzSymb " +
+               " where t_Account       = :Account " +
+               "   and t_Code_Currency = :Code_Currency " +
+               "   and t_Chapter       = :Chapter ",
+
+               makeArray( SQLParam("FrzSymb",       FrzSymb),
+                          SQLParam("Account",       rs.value("t_Account")),
+                          SQLParam("Code_Currency", rs.value("t_Code_Currency")),
+                          SQLParam("Chapter",       rs.value("t_Chapter")) )
+             );
+
+    end;
+
+    // Записать примечание 
+    AccStrID = GetAccStrID(rs.value("t_Account"), rs.value("t_Code_Currency"), rs.value("t_Chapter"));
+    stat = AddNoteForObject( OBJTYPE_ACCOUNT, AccStrID, ACC_NOTE_KIND_FREEZE_GROUND, 
+                             "Счет заморожен операционистом " + {oper} + " " +
+                             string({curdate}:f) + " в " + time() );
+    if(stat)
+      return stat;
+    end;
+
+    // Создать объект системы "Действие по замораживанию" 
+    FrzAction = FMFreezeAction();
+    FrzAction.PartyID = rs.value("t_Client");
+    FrzAction.FreezeDprt = rs.value("t_Department");
+    FrzAction.FrozenObjKind = FM_VIDIM_CASHLESS; // безналичные денежные средства
+    FrzAction.FrozenObjNumber = AccStrID;
+    FrzAction.CurrencyISO = ПолучитьКодФинИн(rs.value("t_Code_Currency"), stat, FICK_ISONUMBER);
+    if(stat)
+      return stat;
+    end;
+    FrzAction.SumInFIID = RestA(rs.value("t_Account"), {curdate}, null, rs.value("t_Chapter"), rs.value("t_Code_Currency"));
+    if(rs.value("t_Code_Currency") == NATCUR)
+      FrzAction.SumInNatCur = FrzAction.SumInFIID;
+    else
+      FrzAction.SumInNatCur = RestA(rs.value("t_Account"), {curdate}, null, rs.value("t_Chapter"), rs.value("t_Code_Currency"), NATCUR);
+    end;
+
+    stat = FrzAction.Save();
+    if(stat)
+      return stat;
+    end;
+  end;
+
+  return stat;
+
+OnError(er)
+  return 1;
+end;
+
+macro Bnk_UnFreezeClient(PartyID : integer) : integer
+  var TypeAc : string = "", stat : integer = 0,
+      AccStrID : string = "";
+
+  var rs : RsdRecordset = GetAccRs(PartyID, FrzSymb);
+  while(not stat and rs and rs.moveNext())
+    // Удалить из типа счета account.TypeAcc тип "Заморожен"
+    TypeAc = StrSubst( rs.value("t_Type_Account"), FrzSymb, "" );
+
+    execSQL (  "update daccount_dbt " +
+               "   set t_Type_Account =  :TypeAc " +
+               " where t_Account       = :Account " +
+               "   and t_Code_Currency = :Code_Currency " +
+               "   and t_Chapter       = :Chapter ",
+
+               makeArray( SQLParam("TypeAc",        TypeAc),
+                          SQLParam("Account",       rs.value("t_Account")),
+                          SQLParam("Code_Currency", rs.value("t_Code_Currency")),
+                          SQLParam("Chapter",       rs.value("t_Chapter")) )
+            );
+
+    // Очистить примечание счета "Основание замораживания счета"
+    AccStrID = GetAccStrID(rs.value("t_Account"), rs.value("t_Code_Currency"), rs.value("t_Chapter"));
+    if(not RemoveNoteForObject(OBJTYPE_ACCOUNT, AccStrID, ACC_NOTE_KIND_FREEZE_GROUND))
+      stat = 1;
+    end;
+  end;
+
+  return stat;
+
+OnError(er)
+  return 1;
+end;

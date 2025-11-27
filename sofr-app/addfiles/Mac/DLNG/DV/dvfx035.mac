@@ -1,0 +1,505 @@
+/*
+$Name:        dvfx035.mac
+$Module:      Производные инструменты
+$Description: Конверсионная операция. Шаг: Изменение условий сделки
+*/
+import InsCarryDoc, "dv_categ.mac", "dv_car.mac", "dv_period.mac";
+
+PRIVATE VAR Dold = TRecHandler( "dvndeal.dbt" ); /**/
+PRIVATE VAR Dnew = TRecHandler( "dvndeal.dbt" ); /**/
+PRIVATE VAR Fold = TRecHandler( "dvnfi.dbt" );   /* Заполняется программой при выполнении шага */
+PRIVATE VAR Fnew = TRecHandler( "dvnfi.dbt" );   /**/
+
+private macro ПроверитьНеобходимостьРепортингаВРепозитарии( DealID:integer )
+  
+  var    result=false;
+  var cmd = DL_RSDCommand();
+  var query = " SELECT t_docid"
+             +" FROM ddl_repozdeal_dbt"
+             +" WHERE t_docid = ?"
+             +" AND (t_dockind = 4813)";
+  
+  cmd.AddParam(DealID);
+  
+  var DataSet = cmd.Execute(query);
+  if(DataSet.moveNext())
+      result=true;
+  end;
+  return result;
+end;
+
+/* Поиск первичных сообщений для сделки, имеющих статус "Подготовлено" либо "Ошибка выгрузки" */
+private macro FindUnloadedMessages(DealID:integer)
+  var cmd = DL_RSDCommand();
+  var query = "select 1 from dir_generalinf_dbt "
+            + "  where t_internalmessageid "
+            + "  in ( select t_docid from ddlgrdoc_dbt "
+            + "       where t_grdealid in ( select t_id from ddlgrdeal_dbt "
+            + "                             where t_docid = ? and t_dockind = 4813 )"
+            + "       and t_dockind = ? )" 
+            + "  and T_RSTATUS in (1, 4)"; // 1 - подготовлено, 4 - ошибка выгрузки
+
+  cmd.AddParam(DealID);
+  cmd.AddParam(4853/*REPOS_GENERALINF*/);
+  var DataSet = cmd.Execute(query);
+  return DataSet.moveNext()
+end;
+
+/* Поиск сводных (cm083) сообщений для сделки, имеющих статус "Подготовлено" либо "Ошибка выгрузки" */
+private macro FindUnloadedBulkMessages(DealID:integer)
+  var cmd = DL_RSDCommand();
+  var query = "select 1 from dir_generalinf_dbt "
+            + "  where t_internalmessageid "
+            + "  in ( select t_internalmessageid from dir_cm083_dbt "
+            + "       where t_id in ( select t_docid from ddlgrdoc_dbt "
+            + "                       where t_grdealid in ( select t_id from ddlgrdeal_dbt "
+            + "                                             where t_docid = ? and t_dockind = 4813 ) "
+            + "                       and t_dockind = ? ) )"
+            + "  and T_RSTATUS in (1, 4)"; // 1 - подготовлено, 4 - ошибка выгрузки
+
+  cmd.AddParam(DealID);
+  cmd.AddParam(4857/*REPOS_CM083*/);
+  var DataSet = cmd.Execute(query);
+  return DataSet.moveNext();
+end;
+
+private macro ПроверитьИзменениеПараметровДляРепозУчета()
+  var haveChange = false;
+  haveChange = haveChange or (Fnew.rec.Cost != Fold.rec.Cost); //стоимость
+  haveChange = haveChange or (Fnew.rec.Price != Fold.rec.Price); //цена
+  haveChange = haveChange or (Fnew.rec.PayDate != Fold.rec.PayDate); //дата поставки
+  haveChange = haveChange or (Fnew.rec.SuplDate != Fold.rec.SuplDate); //дата оплаты
+  haveChange = haveChange or (Fnew.rec.ExecDate != Fold.rec.ExecDate); //дата исполнения
+  return haveChange;
+end;
+
+/* Проверка, является ли слелка с ожиданием запроса: параметры "Способ подтверждения" = "Комбинированный/Последовательный" и  */
+/* "Инициирующая сторона" = "Контрагент"                                                                                      */
+private macro isPendingRequestDeal(DealID:integer)
+  var cmd = DL_RSDCommand();
+  var query = " SELECT T_INITIATOR, T_METHOD_WAYTWOWAY FROM DDL_REPOZDEAL_DBT "
+            + "   WHERE T_DOCID = ? and T_DOCKIND = 4813";
+  cmd.AddParam(DealID);
+  var DataSet = cmd.Execute(query);
+  var stat = false;
+  if (DataSet.moveNext())
+    stat = ( DataSet.rec.Initiator == 2 ) and ( DataSet.rec.Method_Waytwoway == 1 )
+  end;
+  return stat;
+end;
+
+private macro DV_ПроверитьСуществованиеШага(ID_Operation, Symb, IsExecute)
+  var dOperStep = TBFile("oprstep.dbt", "R", 8);
+  dOperStep.rec.ID_Operation = ID_Operation;
+  dOperStep.rec.IsExecute = IsExecute;
+  dOperStep.rec.Symbol = Symb;
+  return dOperStep.GetEQ();
+end;
+
+macro ExecuteStep( doc, FDoc, DocKind, ID_Operation, ID_Step )
+
+  var ndeal = TRecHandler("dvndeal.dbt");
+  var ДатаИсполненияШага = {curdate};
+  var ПостНаВнебал = false, ПостНаБал = false;
+  var deltaReq = $0, deltaObl = $0;
+  var форвПол = "+Форвард, прочие", форвОтр = "-Форвард, прочие", корТреб = TRecHandler("account.dbt"), корОбяз = TRecHandler("account.dbt");
+  var форвПолДопОст = $0, форвОтрДопОст = $0;
+  var дебСчет, кредСчет, дебВал, кредВал, дебРоль, кредРоль, СчетОбяз = TRecHandler("account.dbt"), СчетТреб = TRecHandler("account.dbt");
+  var newReqDate = NULL, newOblDate = NULL;
+  var AccPlus = TRecHandler("account.dbt"), AccMinus = TRecHandler("account.dbt"), plusRest =$0, minusRest = $0;
+  var hasCurChange = false;
+  var prevReqSum = $0, prevOblSum = $0, prevReqFiid = 0, prevOblFiid = 0;
+  var УчетРазноВалютныхБанкнотныхСделок = RegVal_УчетРазноВалютныхБанкнотныхСделок();
+  var ПроводкиНужны = true;
+  var дебСумма = $0, кредСумма = $0;
+
+  SetBuff( ndeal, FDoc );
+
+  if( Dold.rec.ID <= 0 )
+     MsgBox("Вставка шага \"Изменение условий\" должна выполняться из скроллинга сделок");
+     return 1;
+  end;
+
+  var newFD = DVFirstDocFXDeal(DocKind, ndeal, null, Fnew);
+  var oldFD = DVFirstDocFXDeal(DocKind, ndeal, null, Fold);
+
+  ПостНаВнебал = DV_ПроверитьСуществованиеШага(ID_Operation, "В", "X"); //Была ли постановка на внебаланс
+  ПостНаБал = DV_ПроверитьСуществованиеШага(ID_Operation, "б", "X"); //Была ли постановка на баланс
+
+  if ( (newFD.IsClient() == false) )
+  
+    hasCurChange = newFD.ВалютаКонтрАктива() != oldFD.ВалютаКонтрАктива();  // Смотрим только КА
+    
+    deltaReq = newFD.СуммаТребования() - oldFD.СуммаТребования();
+    deltaObl = newFD.СуммаОбязательства() - oldFD.СуммаОбязательства();
+    newReqDate = IIF((newFD.ДатаТребования()  != oldFD.ДатаТребования()), newFD.ДатаТребования() , NULL);
+    newOblDate = IIF((newFD.ДатаОбязательства()  != oldFD.ДатаОбязательства()), newFD.ДатаОбязательства(), NULL);
+
+    if (newFD.IsBNote() and УчетРазноВалютныхБанкнотныхСделок and (oldFD.ВалютаБазовогоАктива() == oldFD.ВалютаКонтрАктива()) and hasCurChange)
+      ПроводкиНужны = false;
+      if( not InsertOprStatus(DV_FX_OPERSTATUS_KIND_OFFBAL_CHDEAL, DV_FX_OPERSTATUS_DL_RUN) )
+        MsgBox("Ошибка при установке статуса <Внебаланс> по операции.");
+        return 1;
+      end;
+      DL_CalendDefineOprDate(newFD,DV_FXDEAL_OPRDATE_CHANGEDEAL, ДатаИсполненияШага);
+    else
+      if( not InsertOprStatus(DV_FX_OPERSTATUS_KIND_OFFBAL_CHDEAL, DV_FX_OPERSTATUS_DL_COMPLETE) )
+        MsgBox("Ошибка при установке статуса <Внебаланс> по операции.");
+        return 1;
+      end;
+    end;
+
+    if ( newFD.IsBNote() and УчетРазноВалютныхБанкнотныхСделок and hasCurChange and 
+        (oldFD.ВалютаБазовогоАктива() != oldFD.ВалютаКонтрАктива()) and (newFD.ВалютаБазовогоАктива() == newFD.ВалютаКонтрАктива()))
+      ПроводкиНужны = false;
+      if (newFD.nFI.rec.OperState == DL_LEG_OUTBAL)
+        if( (not oldFD.IsExistAccount("-Форвард, прочие", null, false, FIROLE_FICOM, СчетОбяз, null, ДатаИсполненияШага, oldFD.ВалютаОбязательства())) or
+            (not oldFD.IsExistAccount("+Форвард, прочие", null, false, FIROLE_FIREQ, СчетТреб, null, ДатаИсполненияШага, oldFD.ВалютаТребования()))
+          )
+            return 1;
+        end;
+
+        oldFD.SetFIIDForCorAccNum(oldFD.ВалютаТребования());
+        if( not ПроводкаПоКатегориямУчета( oldFD,
+                                            "СчКорреспГлаваГ", СчетТреб,
+                                            ДатаИсполненияШага,
+                                            4,
+                                            oldFD.ВалютаТребования(),
+                                            oldFD.СуммаТребования(),
+                                            doc,
+                                            INPCARRY, "", "",
+                                            "Снятие требований с внебалансового учета по сделке " + oldFD.DealCode(),
+                                            null,
+                                            oldFD.РольСчКорреспГлаваГВнб(FIROLE_CORACC_ACTIVE), null
+                                          )
+          )
+            return 1;
+        end;
+
+        oldFD.SetFIIDForCorAccNum(oldFD.ВалютаОбязательства());
+        if( not ПроводкаПоКатегориямУчета( oldFD,
+                                            СчетОбяз, "СчКорреспГлаваГ",
+                                            ДатаИсполненияШага,
+                                            4,
+                                            oldFD.ВалютаОбязательства(),
+                                            oldFD.СуммаОбязательства(),
+                                            doc,
+                                            INPCARRY, "", "",
+                                            "Снятие обязательств с внебалансового учета по сделке " + oldFD.DealCode(),
+                                            null,
+                                            null, oldFD.РольСчКорреспГлаваГВнб(FIROLE_CORACC_PASSIVE)
+                                          )
+          )
+            return 1;
+        end;
+
+        //Списание переоценки
+
+        if( oldFD.IsExistAccount("+Переоц.,поставка ИВ и ДМ", null, true, FIROLE_FIRST_OVERVAL, AccPlus, MC_PAIRACCMODE_MANUAL, ДатаИсполненияШага, NATCUR) )
+          plusRest = Abs(RestAC( AccPlus.rec.Account, AccPlus.rec.Code_Currency, ДатаИсполненияШага, NULL, AccPlus.rec.Chapter ));
+        end;
+
+        if( oldFD.IsExistAccount("-Переоц.,поставка ИВ и ДМ", null, true, FIROLE_FIRST_OVERVAL, AccMinus, MC_PAIRACCMODE_MANUAL, ДатаИсполненияШага, NATCUR) )
+          minusRest = Abs(RestAC( AccMinus.rec.Account, AccMinus.rec.Code_Currency, ДатаИсполненияШага, NULL, AccMinus.rec.Chapter ));
+        end;
+
+        if (plusRest != $0)
+          if( not ПроводкаПоКатегориямУчета(  newFD,
+                                              "+Маржа, ИВ и ДМ", AccPlus,
+                                              ДатаИсполненияШага,
+                                              1,
+                                              NATCUR, plusRest,
+                                              doc,
+                                              INPCARRY, "", "",
+                                              "Списание курсовой разницы",
+                                              null,
+                                              FIROLE_BA  
+                                            )
+            )
+              return 1;
+          end;
+        elif (minusRest != $0)
+          if( not ПроводкаПоКатегориямУчета( newFD,
+                                              AccMinus, "-Маржа, ИВ и ДМ",
+                                              ДатаИсполненияШага,
+                                              1,
+                                              NATCUR, minusRest,
+                                              doc,
+                                              INPCARRY, "", "",
+                                              "Списание курсовой разницы",
+                                              null,
+                                              null, FIROLE_BA
+                                            )
+            )
+              return 1;
+          end;
+        end;
+      end;
+
+      if( not InsertOprStatus(DV_FX_OPERSTATUS_KIND_OFFBAL_CHDEAL, DV_FX_OPERSTATUS_DL_COMPLETE) )
+        MsgBox("Ошибка при установке статуса <Внебаланс> по операции.");
+        return 1;
+      end;
+      if( not DV_ОбновитьСтатусЧастиСделки(newFD.nFI, DL_LEG_PREPARING) )
+        MsgBox("Ошибка при изменении статуса сделки");
+        return 1;
+      end;
+    end;
+
+    if ((not newFD.IsDealMet()) and hasCurChange and (ПостНаВнебал) and (newFD.nFI.rec.OperState == DL_LEG_OUTBAL) and (not ПостНаБал))
+
+      if (((newFD.IsBNote() and УчетРазноВалютныхБанкнотныхСделок) or IsDVFXDEAL(newFD.Group)) and ПроводкиНужны)
+        if( (not oldFD.IsExistAccount(форвОтр, null, false, FIROLE_FICOM, СчетОбяз, null, ДатаИсполненияШага, oldFD.ВалютаОбязательства())) or
+            (not oldFD.IsExistAccount(форвПол, null, false, FIROLE_FIREQ, СчетТреб, null, ДатаИсполненияШага, oldFD.ВалютаТребования()))
+          )
+            return 1;
+        end;
+
+        if (oldFD.IsSale())//если сделка - продажа, значит неправильный внебаланс только по требованию
+          oldFD.SetFIIDForCorAccNum(oldFD.ВалютаТребования());
+          if( not ПроводкаПоКатегориямУчета( oldFD,
+                                              "СчКорреспГлаваГ", СчетТреб,
+                                              ДатаИсполненияШага,
+                                              4,
+                                              oldFD.ВалютаТребования(),
+                                              oldFD.СуммаТребования(),
+                                              doc,
+                                              INPCARRY, "", "",
+                                              "Снятие требований с внебалансового учета по сделке " + oldFD.DealCode(),
+                                              null,
+                                              oldFD.РольСчКорреспГлаваГВнб(FIROLE_CORACC_ACTIVE), null
+                                            )
+            )
+              return 1;
+          end;
+
+          newFD.SetFIIDForCorAccNum(newFD.ВалютаТребования());
+          if( not newFD.IsExistAccount("СчКорреспГлаваГ", null, false, newFD.РольСчКорреспГлаваГВнб(FIROLE_CORACC_ACTIVE), корТреб, null, ДатаИсполненияШага) )
+            if( not newFD.OpenAccount("СчКорреспГлаваГ", null, false, newFD.РольСчКорреспГлаваГВнб(FIROLE_CORACC_ACTIVE), корТреб, ДатаИсполненияШага) )
+              return 1;
+            end;
+          end;
+          if( not ПроводкаПоКатегориямУчета(  newFD,
+                                              форвПол, корТреб,
+                                              ДатаИсполненияШага,
+                                              4,
+                                              newFD.ВалютаТребования(),
+                                              newFD.СуммаТребования(),
+                                              doc,
+                                              INPCARRY, "", "",
+                                              "Постановка требований на внебалансовый учет по сделке " + newFD.DealCode(),
+                                              null,
+                                              FIROLE_FIREQ, null
+                                            )
+            )
+              return 1;
+          end;
+          форвПолДопОст = форвПолДопОст-newFD.СуммаТребования();
+        end;
+
+        if (oldFD.IsBuy()) //если сделка - покупка, значит неправильный внебаланс только по обязательству
+          oldFD.SetFIIDForCorAccNum(oldFD.ВалютаОбязательства());
+          if( not ПроводкаПоКатегориямУчета( oldFD,
+                                              СчетОбяз, "СчКорреспГлаваГ",
+                                              ДатаИсполненияШага,
+                                              4,
+                                              oldFD.ВалютаОбязательства(),
+                                              oldFD.СуммаОбязательства(),
+                                              doc,
+                                              INPCARRY, "", "",
+                                              "Снятие обязательств с внебалансового учета по сделке " + oldFD.DealCode(),
+                                              null,
+                                              null, oldFD.РольСчКорреспГлаваГВнб(FIROLE_CORACC_PASSIVE)
+                                            )
+            )
+              return 1;
+          end;
+
+          newFD.SetFIIDForCorAccNum(newFD.ВалютаОбязательства());
+          if( not newFD.IsExistAccount("СчКорреспГлаваГ", null, false, newFD.РольСчКорреспГлаваГВнб(FIROLE_CORACC_PASSIVE), корОбяз, null, ДатаИсполненияШага) )
+              if( not newFD.OpenAccount("СчКорреспГлаваГ", null, false, newFD.РольСчКорреспГлаваГВнб(FIROLE_CORACC_PASSIVE), корОбяз, ДатаИсполненияШага) )
+                return 1;
+              end;
+          end;
+          if( not ПроводкаПоКатегориямУчета(  newFD,
+                                              корОбяз, форвОтр,
+                                              ДатаИсполненияШага,
+                                              4,
+                                              newFD.ВалютаОбязательства(),
+                                              newFD.СуммаОбязательства(),
+                                              doc,
+                                              INPCARRY, "", "",
+                                              "Постановка обязательств на внебалансовый учет по сделке " + newFD.DealCode(),
+                                              null,
+                                              null, FIROLE_FICOM
+                                            )
+            )
+              return 1;
+          end;
+          форвОтрДопОст = форвОтрДопОст+newFD.СуммаОбязательства();
+        end;
+
+
+        //Списание переоценки
+
+        if( oldFD.IsExistAccount("+Переоц.,поставка ИВ и ДМ", null, true, FIROLE_FIRST_OVERVAL, AccPlus, MC_PAIRACCMODE_MANUAL, ДатаИсполненияШага, NATCUR) )
+          plusRest = Abs(RestAC( AccPlus.rec.Account, AccPlus.rec.Code_Currency, ДатаИсполненияШага, NULL, AccPlus.rec.Chapter ));
+        end;
+
+        if( oldFD.IsExistAccount("-Переоц.,поставка ИВ и ДМ", null, true, FIROLE_FIRST_OVERVAL, AccMinus, MC_PAIRACCMODE_MANUAL, ДатаИсполненияШага, NATCUR) )
+          minusRest = Abs(RestAC( AccMinus.rec.Account, AccMinus.rec.Code_Currency, ДатаИсполненияШага, NULL, AccMinus.rec.Chapter ));
+        end;
+
+        if (plusRest != $0)
+          if( not ПроводкаПоКатегориямУчета(  newFD,
+                                              IIF(CheckDealAndDateFor793P(newFD,ДатаИсполненияШага), "+Маржа, ДМ", "+Маржа, ИВ и ДМ"), AccPlus,
+                                              ДатаИсполненияШага,
+                                              1,
+                                              NATCUR, plusRest,
+                                              doc,
+                                              INPCARRY, "", "",
+                                              "Списание курсовой разницы",
+                                              null,
+                                              FIROLE_BA  
+                                            )
+            )
+              return 1;
+          end;
+        elif (minusRest != $0)
+          if( not ПроводкаПоКатегориямУчета( newFD,
+                                              AccMinus, IIF(CheckDealAndDateFor793P(newFD,ДатаИсполненияШага), "-Маржа, ДМ", "-Маржа, ИВ и ДМ"),
+                                              ДатаИсполненияШага,
+                                              1,
+                                              NATCUR, minusRest,
+                                              doc,
+                                              INPCARRY, "", "",
+                                              "Списание курсовой разницы",
+                                              null,
+                                              null, FIROLE_BA
+                                            )
+            )
+              return 1;
+          end;
+        end;
+
+        if (DV_ПроверитьСуществованиеШага(ID_Operation, "П", "X"))
+          if ( ПИКО_ПровестиПереоценкуЧастиСделки(newFD, doc, ДатаИсполненияШага, форвПолДопОст, форвОтрДопОст) != 0 )
+            return 1;
+          end;
+        end;
+      end;
+    end;
+
+    if ((not newFD.IsDealMet()) and (not hasCurChange) and (ПостНаВнебал) and (newFD.nFI.rec.OperState == DL_LEG_OUTBAL) and (not ПостНаБал))
+      if (deltaReq != $0)
+        newFD.SetFIIDForCorAccNum(newFD.ВалютаТребования());
+        if( not newFD.IsExistAccount("СчКорреспГлаваГ", null, false, newFD.РольСчКорреспГлаваГВнб(FIROLE_CORACC_ACTIVE), корТреб, null, ДатаИсполненияШага) )
+          MsgBox("Не найден счет требования СчКорреспГлаваГ");
+          return 1;
+        end;
+        дебСчет   = IIF((deltaReq > $0), форвПол, корТреб);
+        кредСчет  = IIF((deltaReq > $0), корТреб, форвПол);
+        дебВал    = IIF((deltaReq > $0), newFD.ВалютаТребования(), NATCUR);
+        кредВал   = IIF((deltaReq > $0), NATCUR, newFD.ВалютаТребования());
+        дебРоль   = IIF((deltaReq > $0), FIROLE_FIREQ, null);
+        кредРоль  = IIF((deltaReq > $0), null, FIROLE_FIREQ);
+        дебСумма  = IIF((deltaReq > $0), deltaReq, NULL);
+        кредСумма = IIF((deltaReq > $0), NULL, ABS(deltaReq));
+
+        if( not ПроводкаПоКатегориямУчета( newFD,
+                                          дебСчет, кредСчет,
+                                          ДатаИсполненияШага,
+                                          4,
+                                          дебВал,
+                                          дебСумма,
+                                          doc,
+                                          INPCARRY, "", "",
+                                          "Корректировка требования по внебалансовому учету по сделке " + newFD.DealCode(),
+                                          null,
+                                          дебРоль, кредРоль, NULL, NULL, кредВал, кредСумма
+                                        )
+        )
+          return 1;
+        end;
+      end;
+
+      if (deltaObl != $0)
+        newFD.SetFIIDForCorAccNum(newFD.ВалютаОбязательства());
+        if( not newFD.IsExistAccount("СчКорреспГлаваГ", null, false, newFD.РольСчКорреспГлаваГВнб(FIROLE_CORACC_PASSIVE), корОбяз, null, ДатаИсполненияШага) )
+          MsgBox("Не найден счет обязательства СчКорреспГлаваГ");
+          return 1;
+        end;
+        дебСчет   = IIF((deltaObl > $0), корОбяз, форвОтр);
+        кредСчет  = IIF((deltaObl > $0), форвОтр, корОбяз);
+        дебВал    = IIF((deltaObl > $0), NATCUR, newFD.ВалютаОбязательства());
+        кредВал   = IIF((deltaObl > $0), newFD.ВалютаОбязательства(), NATCUR);
+        дебРоль   = IIF((deltaObl > $0), NULL, FIROLE_FICOM);
+        кредРоль  = IIF((deltaObl > $0), FIROLE_FICOM, NULL);
+        дебСумма  = IIF((deltaObl > $0), NULL, ABS(deltaObl));
+        кредСумма = IIF((deltaObl > $0), deltaObl, NULL);
+
+        if( not ПроводкаПоКатегориямУчета( newFD,
+                                          дебСчет, кредСчет,
+                                          ДатаИсполненияШага,
+                                          4,
+                                          дебВал,
+                                          дебСумма,
+                                          doc,
+                                          INPCARRY, "", "",
+                                          "Корректировка обязательства по внебалансовому учету по сделке " + newFD.DealCode(),
+                                          null,
+                                          дебРоль, кредРоль, NULL, NULL, кредВал, кредСумма
+                                        )
+        )
+          return 1;
+        end;
+      end;
+    end;
+
+    if (hasCurChange or (deltaObl != $0) or (newOblDate != NULL) or (deltaReq != $0) or (newReqDate != NULL))
+      DV_NDealUpdatePayment();
+    end;
+
+  end;
+
+  if( DV_ChangeDVNDEAL(Dold, Dnew, Fold, Fnew, NULL, NULL, ALG_DV_CHANGEKIND_CHANGE, ДатаИсполненияШага) != 0 )
+     MsgBox("Ошибка при изменении условий сделки");
+     return 1;
+  end;
+
+  DL_CalendDefineOprDate(newFD,DV_FXDEAL_OPRDATE_EXEC,     newFD.ДатаИсполнения());
+  DL_CalendDefineOprDate(newFD,DV_FXDEAL_OPRDATE_REQ,      newFD.ДатаТребования());
+  DL_CalendDefineOprDate(newFD,DV_FXDEAL_OPRDATE_OBL,      newFD.ДатаОбязательства());
+  DL_CalendDefineOprDate(newFD,DV_FXDEAL_OPRDATE_CLOSE,    newFD.ДатаЗавершения());
+
+  if( ПроверитьНеобходимостьРепортингаВРепозитарии( newFD.ID ) and ПроверитьИзменениеПараметровДляРепозУчета() )
+    if ((FindUnloadedMessages(newFD.ID)) or (FindUnloadedBulkMessages(newFD.ID)))
+      MsgBox("По сделке есть подготовленные, но не сгенерированные сообщения. Необходимо либо выполнить откат подготовки сообщения, либо выполнить для него генерацию");
+      return 1;
+    else
+      var requestTimeout = 0;
+      GetRegistryValue("РЕПОЗИТАРИЙ\\СРОК ОЖИД.ЗАПР. ПРИ КОМБ.ПОДТВ.", V_INTEGER, requestTimeout, null);
+      var planDate = ДатаИсполненияШага;
+      if( isPendingRequestDeal(newFD.ID) and ( requestTimeout > 0 ) )
+        planDate = GetDateAfterWorkDays(planDate, requestTimeout);
+        if( DL_InsertGrDeal( DocKind, newFD.ID, DLGR_TEMPL_CHANGEMSGWTHREQUEST, planDate, time(0,0,0), -1) )
+          return 1;
+        end;
+        if( DL_SetDateGrDeal(newFD.Deal.rec.DocKind, newFD.Deal.rec.ID, DLGR_DATEKIND_CLOSEDEAL, GetDateAfterWorkDays(newFD.ДатаИсполнения(true), requestTimeout)) != 0 )
+          return 1;
+        end;
+      else
+        if( DL_InsertGrDeal( DocKind, newFD.ID, DLGR_TEMPL_CHANGEMSG, planDate, time(0,0,0), -1) )
+          return 1;
+        end;  
+        if(newFD.Deal.rec.AutoClose == UNSET_CHAR)
+          if( DL_SetDateGrDeal(newFD.Deal.rec.DocKind, newFD.Deal.rec.ID, DLGR_DATEKIND_CLOSEDEAL, newFD.ДатаИсполнения(true)) != 0 )
+            return 1;
+          end;
+        end;
+      end;
+    end;
+  end;
+
+  return 0;
+end;

@@ -1,0 +1,268 @@
+/**                                                                                                             
+ @file  WrtOffDebtSumFromCFT.mac                                                                                           
+ @brief Списание брокерской задолженности с текущих счетов в ЦФТ. Вызывается из FuncObj                                                                         
+                                                                                                                
+ #tag                                                                                                          
+ - functional_block:СО                                                                             
+ - code_type:Event_handler 
+ - code_type:API                                                                                                                                                                                               
+                                                                                                                
+ # changeLog                                                                                                    
+ |date       |author         |tasks               |note                                                         
+ |-----------|---------------|--------------------|-------------------------------------------------------------
+ |2025.10.09 |Жиц М.В.       |AVT_BOSS-714        |Создание макроса обработки задания FuncObj                                                                                                                                                 
+*/ 
+
+import "DebtSumOp_Common.mac", "dv_compay_payreq.mac", "FuncObj.mac";
+
+/**
+ @brief Установка признака учета списания задолженности в СОФР
+ @param[in] CarryCftId идентификатор проводки в ЦФТ 
+*/                    
+PRIVATE MACRO UpdateUserDebtFromCFT(CarryCftId:string)
+  var cmd;
+  cmd = RSDCommand(" UPDATE duserdebtfromcft_dbt " +
+                   "    SET t_IsTakenInSofr = 'X' " +
+                   "  WHERE t_CarryCftId = ? "
+                  );
+  cmd.addParam("", RSDBP_IN, CarryCftId);  
+  cmd.execute();
+END;
+
+/**
+ @brief Обновление предоставляемой задолженности для ЦФТ
+ @param[in] DebtID     идентификатор списанной задолженности 
+ @param[in] DebtSum    сумма задолженности 
+ @param[in] CarrySum   сумма проводки в ЦФТ
+ @param[in] IsDebtPart признак возможности частичного списания
+*/                    
+PRIVATE MACRO UpdateUserDebtToCFT(DebtID:integer, DebtSum:money, CarrySum:money, IsDebtPart:string);
+  var cmd;
+  if((CarrySum < DebtSum) and (IsDebtPart == SET_CHAR))
+    cmd = RSDCommand(" UPDATE duserdebttocft_dbt " +
+                     "    SET t_DebtSum = ? " +
+                     "  WHERE t_ID = ? "
+                    );
+    cmd.addParam("", RSDBP_IN, DebtSum - CarrySum);  
+    cmd.addParam("", RSDBP_IN, DebtID);  
+    cmd.execute();
+  else
+    cmd = RSDCommand(" UPDATE duserdebttocft_dbt " +
+                     "    SET t_IsFactDebt = 'X' " +
+                     "  WHERE t_ID = ? "
+                    );
+    cmd.addParam("", RSDBP_IN, DebtID);  
+    cmd.execute();
+  end;
+END;
+
+/**
+ @brief Регистрация ошибки как события мониторинга для информирования сопровождения СОФР
+ @param[in] ServName название сервиса
+ @param[in] ErrCode  код ошибки 
+ @param[in] ErrText  текст ошибки 
+*/                    
+PRIVATE MACRO AddEventError_it(ServName:string, ErrCode:integer, ErrText:string)
+  var cmd;
+  cmd = RSDCommand("BEGIN " +
+                   "  it_event.RegisterError(p_SystemId => 'SOFR', " +
+                   "                         p_ServiceName => :p_ServiceName, " +
+                   "                         p_ErrorCode => :p_ErrorCode, " +
+                   "                         p_ErrorDesc => :p_ErrorText, " +
+                   "                         p_LevelInfo => 8); " + 
+                   "END; "
+                  );
+  cmd.AddParam("", RSDBP_IN, ServName);
+  cmd.AddParam("", RSDBP_IN, ErrCode);
+  cmd.AddParam("", RSDBP_IN, ErrText);
+  cmd.execute();
+END;
+
+/**
+ @brief Проверка наличия ошибок в логе
+ @param[out] ErrText  текст ошибки 
+ @return номер ошибки
+*/                    
+PRIVATE MACRO CheckErrorsInLog(ErrText:@string):integer
+  var cmd, DataSet;
+  cmd = DL_RSDCommand("SELECT t_Text " +
+                      "  FROM ddl_debtsumlog_tmp " +
+                      " WHERE t_Type = "+ISSUE_ERROR);  
+  DataSet = cmd.Execute(); 
+  if(DataSet.moveNext())
+    ErrText = DataSet.Text;
+    return 1;
+  end;
+  return 0;
+END;
+
+/**
+ @brief Оплата задолженности по прочим требованиям (овердрафту) по счетам ЦФТ
+ @param[in]  ProcDate      дата процедуры 
+ @param[in]  CarryCftId    идентификатор проводки в ЦФТ 
+ @param[in]  DebtSourceID  идентификатор источника задолженности (ID записи в реестре)
+ @param[in]  DebtSfContrID идентификатор субдоговора
+ @param[in]  DebtDate      дата возникновения задолженности
+ @param[in]  DebtSum       сумма задолженности
+ @param[in]  CarryAccount  номер счет дебета по проводке в ЦФТ 
+ @param[in]  CarrySum      сумма проводки в ЦФТ
+ @param[in]  DebtCurr      валюта задолженности
+ @param[out] ErrText       текст ошибки 
+ @return номер ошибки
+*/                    
+PRIVATE MACRO WrtOffDebtSumFromCFTByExpired(ProcDate:date, CarryCftId:string, DebtSourceID:integer, DebtSfContrID:integer, DebtDate:date, DebtSum:money, CarryAccount:string, CarrySum:money, DebtCurr:integer, ErrText:@string):integer
+  var FD = NULL;
+  record ClientAcc(account);
+  record DebtAcc(account);
+  var Ground:string = "", CarryNum:string = "";
+
+  ErrText = "";
+
+  RslDefCon.BeginTrans();
+
+  FD = DL_SubContrFD(DebtSfContrID);
+
+  if(not OpenDebtAccount(FD, ProcDate, DebtCurr, DebtAcc))
+    ErrText = "Ошибка при открытии счета по категории \"Треб. с н.с. брок\" в валюте FIID = " + GetFinInstrCcy(DebtCurr);
+    RslDefCon.RollbackTrans();
+    return 1;
+  end;
+
+  if(not GetAccount(1, DebtCurr, CarryAccount, ClientAcc, true))
+    ErrText = "Ошибка: счет " + CarryAccount + " не найден в СОФР";
+    RslDefCon.RollbackTrans();
+    return 1;
+  end;
+
+  Ground = "Безакцептное списание задолженности брокера"+IIF(DebtSum > CarrySum, " (частичное)", "")+", согласно п. 5.8 Регламента 15-Р., по Соглашению № "+
+           FD.GetMainContr().rec.Number+" от "+string(FD.GetMainContr().rec.DateBegin:f)+". НДС не облагается.";
+
+  CarryNum = IIF(strlen(CarryCftId) > 8, substr(CarryCftId, strlen(CarryCftId)-7), CarryCftId);
+   
+  CreateCarryByExpired(FD, ClientAcc, DebtAcc,
+                       ProcDate, 1, DebtCurr, CarrySum,
+                       Ground, {oper}, CarryNum, 
+                       false, null, true);
+
+  if(not UpdateDebtIntoReestr(DebtSourceID, -2, DebtDate, DebtSum - CarrySum, DebtCurr, {oper}, ProcDate, @ErrText)) //Изменим существующую запись в реестре
+    RslDefCon.RollbackTrans();
+    return 1;
+  end;
+
+  RslDefCon.CommitTrans();
+
+  return 0;
+
+onError(erru) 
+  if(RslDefCon.IsInTrans)
+    RslDefCon.RollbackTrans();
+  end;
+
+  if(IsEqClass("TrslError", erru))
+    ErrText = erru.Message;
+    if(IsEqClass("TDbError", erru.err))
+      ErrText = ErrText+":|"+erru.err.Stat+"-"+erru.err.Oper+"-"+erru.err.Table+"-"+erru.err.Message;
+    end;
+  elif(not ErrText)
+    ErrText = "Неизвестная ошибка выполнения при оплате задолженности по прочим требованиям (овердрафту) по счетам ЦФТ";
+  end;
+
+  return 1;
+END;
+
+/**
+ @brief Cписание брокерской задолженности с текущих счетов ЦФТ в СОФР 
+ @param[in]  CarryCftId идентификатор проводки в ЦФТ 
+ @param[out] errmsg     сообщение об ошибке
+*/
+PRIVATE MACRO WrtOffDebtSumFromCFT(CarryCftId:string, errmsg:@string):integer
+  var cmd, DataSet;
+  var stat:integer = 0;
+
+  cmd = DL_RSDCommand("SELECT t.t_PartyID, t.t_DlContrID, t.t_SfContrID, t.t_DebtType, t.t_IsDebtPart, " +
+                      "       t.t_DebtSourceID, t.t_DebtDate, t.t_DebtSum, t.t_DebtSumCur, " +
+                      "       f.t_DebtID, f.t_CarryDate, f.t_CarryAccount, f.t_CarrySum, " +
+                      "       NVL(dl.t_SfContrID, 0) as t_RootSfContrID " +
+                      "  FROM duserdebtfromcft_dbt f " +
+                      " INNER JOIN duserdebttocft_dbt t ON t.t_ID = f.t_DebtID " +
+                      "  LEFT JOIN ddlcontr_dbt dl ON dl.t_DlContrID = t.t_DlContrID " +
+                      " WHERE f.t_CarryCftId = ? " +
+                      "   AND f.t_IsTakenInSofr <> 'X' "
+                     );
+  cmd.addParam(CarryCftId);
+  DataSet = cmd.Execute(); 
+
+  if(DataSet.moveNext())
+    if((DataSet.DebtType == DEBT_FIX_COM) or (DataSet.DebtType == DEBT_INVEST_COM))
+      stat = WrtOffDebtSumByFixOrInvestCom(DataSet.CarryDate, DataSet.DebtType, DataSet.DebtSourceID, DataSet.DebtDate, DataSet.SfContrID, {oper}, @errmsg);
+    elif(DataSet.DebtType == DEBT_EXPIRED)
+      stat = WrtOffDebtSumFromCFTByExpired(DataSet.CarryDate, CarryCftId, DataSet.DebtSourceID, DataSet.SfContrID, DataSet.DebtDate, DataSet.DebtSum, DataSet.CarryAccount, DataSet.CarrySum, DataSet.DebtSumCur, @errmsg);
+    elif(DataSet.DebtType == DEBT_DEAL_COM_2023)
+      if(DVComPayScrollPayList(DataSet.DebtSourceID, SQL_ConvTypeInteger(DataSet.RootSfContrID), DataSet.CarrySum, DataSet.CarryAccount, SQL_ConvTypeDate(DataSet.CarryDate)).ConstructAndShowScroll())
+        //Пересчитаем данные по клиенту в представлении
+        var tmpCalcIdAndDate = DVComPayFindAndInsert(null, DataSet.PartyID, DataSet.DebtSourceID);
+        DVComPayUpdateCalcIdByNewCalc(tmpCalcIdAndDate.Key, DataSet.DebtSourceID, DataSet.PartyID); 
+        DVComPayDeleteCalcId(tmpCalcIdAndDate.Key);
+      else
+        errmsg = GetErrMsg();
+        stat = 1; 
+      end;
+    end;
+
+    if(not stat)
+      UpdateUserDebtFromCFT(CarryCftId);
+      UpdateUserDebtToCFT(DataSet.DebtID, DataSet.DebtSum, DataSet.CarrySum, DataSet.IsDebtPart);
+      SendDebtListToCFT(DataSet.DlContrID, DataSet.DebtSumCur);
+    end;
+  else
+    errmsg = "Не удалось получить информацию о списанной задолженности с CarryCftId = " + CarryCftId;
+    stat = 1; 
+  end;
+  
+  return stat;
+ 
+onError(erru)  
+  errmsg = "Ошибка в процессе списания задолженности: " + erru.message + " (модуль " + erru.module + ", строка " + erru.line + ")";
+  return 1;
+END;
+
+/**
+ @brief Обработчик задания FuncObj, реализующий списание брокерской задолженности с текущих счетов ЦФТ в СОФР с инициацией списания следующей задолженности в ЦФТ
+ @param[in] ObjectType вид объекта
+ @param[in] ObjectID   идетификатор объекта (идентификатор списанной задолженности DebtId)
+ @param[in] ParamStr   строка параметров задания FuncObj (идентификатор проводки в ЦФТ CarryCftId)
+ @return объект задания FuncObj 
+*/
+MACRO WrtOffDebtSumFromCFT_Funcobj(ObjectType, ObjectID, ParamStr):FuncObjResult
+  var err:integer = 0; //Идентификатор ошибки
+  var errMsg:string = ""; //Описание ошибки
+  var ReturnObj = FuncObjResult(FUNCOBJ_RESULT_OK, "", 0); //Объект задания FuncObj
+  var ServName:string = "NotifyBrokerDebtClient";
+
+  SQL_Execute("TRUNCATE TABLE DDL_DEBTSUMLOG_TMP"); //Очистим лог
+
+  if((Valtype(ParamStr) == V_UNDEF) and (Valtype(ParamStr) == 26) and (ParamStr == ""))
+    ReturnObj.state = FUNCOBJ_RESULT_ERROR;
+    ReturnObj.errorText = "Переданы неверные параметры";
+    ReturnObj.errorCode = 0;
+  else
+    err = WrtOffDebtSumFromCFT(ParamStr, @errMsg);
+ 
+    if(err == 0)
+      ServName = "SendBrokerDebtAccountClient";
+      err = CheckErrorsInLog(@errMsg);
+    end;
+    
+    if(err != 0)
+      ReturnObj.state = FUNCOBJ_RESULT_ERROR;
+      ReturnObj.errorText = errMsg;
+      ReturnObj.errorCode = err;
+    end;
+  end;
+
+  if(ReturnObj.state == FUNCOBJ_RESULT_ERROR)
+    AddEventError_it(ServName, ReturnObj.errorCode, ReturnObj.errorText)
+  end;
+  
+  return ReturnObj;
+END;

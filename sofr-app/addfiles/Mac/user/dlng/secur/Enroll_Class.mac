@@ -1,0 +1,2569 @@
+/**
+ @file 		mac\user\dlng\secur\Enroll_Class.mac
+ @brief 	Классы по работе с входящими клиентскими зачислениями, формирование платежей возврата
+
+ # tag
+ - functional_block: Клиенты_Зачисление
+ - code_type: API
+
+ # changelog
+ |date       |autor          |tasks                                           |note
+ |-----------|---------------|------------------------------------------------|-------------------------------------------------------------
+ |24.11.2025 |Велигжанин А.В.|DEF-108968                                      |Доработка возврата ДС, добавление поля БИК на форму
+ |25.07.2025 |Топорков Д.В.  |BOSS-8439                                       |Добавление зачислений по ЮЛ
+ |16.01.2024 |Шишкин Е.В.    |BOSS-1935                                       |Подмена счета 47422 при загрузке в СОФР доходов по ценным бумагам от Депозитария (Дт 47422 Кт306)
+ |17.10.2023 |Гераськина Т.В.|BIQ-15498                                       |Добавлены проверки перед создание и процедура запуска операции
+ |00.00.2021 |Белохонов П.В. |BIQ-6998                                        |Классы по работе с входящими клиентскими зачислениями, формирование платежей возврата
+ |           |               |                                                |Первичный документ для записи промежуточного клиентского зачисления 5002
+*/
+
+import cb_sql, oralib, likepy, dealsinter, globals, bankinter, payminter, sp_class, rsbformsinter, ptinter, commonutil, "nptxwrt_func.mac", "FuncObjController.mac", "RegvalReader.mac";
+import "Enroll_RefundForm.mac", "Enroll_PartyForm.mac";
+import "func_lib.mac", "dlutils.mac";
+
+CONST
+   C_ENROLL_ACTION_MANUAL        = -1, /*на ручном разборе*/
+   C_ENROLL_ACTION_CREATED       =  0, /*просто создана*/
+   C_ENROLL_ACTION_TRANSFERRED   =  1, /*выполнен перенос на 306Т*/
+   C_ENROLL_ACTION_CREATEDNPTXOP =  2, /*создана операция зачисления*/
+   C_ENROLL_ACTION_REFUNDED      =  3, /*выполнен возврат*/
+   C_ENROLL_ACTION_DELETED       =  4; /*удалена*/
+  // C_ENROLL_ACTION_ERROR         = 5; /*error*/
+
+CONST
+   C_REFUND_REASON_UNDEF                = -1, /* */
+   C_REFUND_REASON_CONTRNOTEXISTS       = 1, /* Отсутствует договор*/
+   C_REFUND_REASON_MISMATCHFIO          = 2, /* Несоовтетствие ФИО плательщика и владельца договора*/
+   C_REFUND_REASON_EXCEEDLIMITS         = 3, /* Превышение лимита по ИИС*/
+   C_REFUND_REASON_INVALIDCURR          = 4, /* Некорректная валюта (по ИИС только в рублях) */
+   C_REFUND_REASON_UNALLOWEDCURR        = 5; /* Не разрешённая валюта для процедения операции */
+
+// BIQ-15498
+CONST 
+   C_CATEGORY_ALLOWED_INCOME   = 103,  /*Категория на операции зачисления "Разрешено зачисление"*/
+   C_NOTEKIND_ALLOWED_INCOME   = 104,  /*Примечание "Разрешено зачисление" */
+   C_NOTEKIND_QUIK_INSTR_PROC_RESULT   = 105,  /*Примечание "Результат обработки неторгового поручения в QUIK" */
+   C_OBJTYPE_WRTMONEY = 131,
+   C_NOTEKIND_REASON_OF_STOP_RUN_OPER = 1;
+
+const PTLEGF_UNKNOWN = -1,
+      PTLEGF_IP      =  3;
+
+const PTK_INCOMEPAYER = 89;
+
+const EXCLUDE_MASK_SFSI_FROMBEGIN = "40817";
+const EXCLUDE_MASK_SFSI_FROMEND   = "99999";
+
+private const REGVAL_ACCOUNTS = RegValReader.GetString("РСХБ\\БРОКЕРСКОЕ ОБСЛУЖИВАНИЕ\\СЧЕТА ДЛЯ ВОЗВРАТА ДС", "810,47422810399000000033,156,47422156299000000033,840,47422840699000000033,978,47422978299000000033");
+
+private const TOO_MUCH_RECORDS = -2;
+
+/**
+@brief Список пар валюта/счет
+@param[in] str строка пар валюта1,счет1,валюта2,счет2,...
+*/
+private class CurrencyAndAccountSet(str)
+
+  var lst = TArray();
+
+  /**
+  @brief вернуть значение v или пустую сроку
+  @param[in] значение v
+  */
+  private macro valOrEmptyString(v)
+    if(v)
+      return v;
+    end;
+    return "";
+  end;
+
+  /**
+  @brief значение заданного счета для валюты
+  @param[in] curr код валюты
+  */
+  macro get(curr)
+    var i = 0;
+    while(i < lst.size)
+      if(lst[i] == trim(curr))
+        return valOrEmptyString(lst[i+1]);
+      end;
+      i = i + 2;
+    end;
+    return valOrEmptyString(null);;
+  end;
+
+  /**
+  @brief конструктор
+  @param[in] str строка пар валюта1,счет1,валюта2,счет2,...
+  */
+  private macro construct(str)
+    //пары значений валюта1,счет1,валюта2,счет2...
+    lst = TArray();
+    var delim = ",";
+    var pos = Index(str,delim);
+    while(pos != 0)
+      lst[lst.size] = trim(SubStr(str, 1, pos-1));
+      str = SubStr(str, pos+1);
+      pos = Index(str, delim);
+    end;
+    if(str != "")
+      lst[lst.size] = trim(str);
+    end;
+
+    if (mod(lst.size,2) == 1)
+      //?!Последняя пара без счета
+      lst[lst.size] = "";
+    end;
+  end;
+
+  construct(str);
+end;
+
+
+/**
+@brief Функция поиска технического счета 55555* для подмены счетов 47422* при загрузке в СОФР доходов по ценным бумагам от Депозитария (Дт 47422 Кт306)
+@param[in] IsoCurrencyCode Код валюты ISO
+@param[in] defaultAccount	Счет по умолчанию, если не найден технический
+@return Подмененный счет
+*/
+private macro GetTechAccount(IsoCurrencyCode, defaultAccount)
+  var cmd = RsdCommand("select doc.* " +
+                         "from dmcaccdoc_dbt doc, dmccateg_dbt cat " +
+                        "where cat.t_name = 'ТехническийСчетПасс' " +
+                          "and doc.t_catid = cat.t_id " +
+                          "and t_iscommon = 'X' " +
+                          "and doc.t_currency = (select t_fiid " +
+                                                  "from dfininstr_dbt " +
+                                                 "where t_iso_number = decode(:1,'810','643',:1))");
+  cmd.addParam("", RSDBP_IN, IsoCurrencyCode);
+  var rs = RsdRecordSet(cmd);
+
+  if (rs.MoveNext())
+    return rs.Value("t_account");
+  else
+    return defaultAccount;
+  end;
+end;
+
+/**
+@brief Найти id контрагента по ИНН
+*/
+private macro FindPartyByINN(INN): Integer
+  if ((ValType(INN) == V_STRING) and (StrLen(INN) > 0))
+    var cmd = RsdCommand("SELECT DISTINCT(t_objectID) " + 
+                           "FROM dObjCode_dbt " +
+                          "WHERE t_objectType = " + OBJTYPE_PARTY +
+                           " AND t_codeKind = " + PTCK_INN + 
+                           " AND t_BankCloseDate = TO_DATE('01010001', 'DDMMYYYY') " +
+                           " AND (t_code LIKE '" + INN + "/%' OR t_code = '" + INN +"') " +
+                          "ORDER BY t_objectID");
+    var rs = RsdRecordSet(cmd);
+    if (rs.MoveNext())
+      var partyID = rs.Value("t_objectID");
+      if ((partyID != 1) and rs.MoveNext())
+        return TOO_MUCH_RECORDS;
+      end;
+
+      return partyID;
+    end;
+  end;
+
+  return -1;
+end;
+
+/**** Классы enroll_rec NaturalPersonEnroll_rec LegalPersonEnroll_rec *****************************/
+class enroll_rec(enrollRS)
+  /*Свойства соответствующие полям таблицы*/
+  var m_ENROLLID      : integer; 
+  var m_JMSMESSAGEID  : string; 
+  var m_CONTRNUMBER   : string; 
+  var m_ENTRYNUMBER   : string;
+  var m_PAYEENAME     : string;
+  var m_CLIENTCODE    : string;
+  var m_DOCNUMBER     : string;
+  var m_DOCISSUED     : date;
+  var m_DATE          : date; 
+  var m_TIME          : time;
+  var m_DEBETACCOUNT  : string; 
+  var m_CREDITACCOUNT : string;
+  var m_SUM           : money;
+  var m_CURRCODE      : string; 
+  var m_ACCTSEND      : string;
+  var m_BIC           : string;
+  var m_GROUND        : string;
+  var m_STATE         : integer;
+  var m_SYSTEMDATE    : datetime; 
+  var m_COMMENT       : string; 
+  var m_NPTXOPID      : integer;
+  var m_LastName      : string;
+  var m_FirstName     : string;
+  var m_MiddleName    : string;
+  var m_IsReliable    : string;
+  var m_PayerINN      : string;
+  var m_PayerKPP      : string;
+  var m_ResidenceAddress    : string;
+  var m_PayerName     : string;
+  var m_DocType       : string;
+  var m_LegalForm     : integer;
+  var m_DepoPaymentDocId : string;
+
+  /*Свойства Получаемые*/
+  var m_PartyId       : integer;
+  var m_ContrId       : integer;
+  var m_SfContrAcc    : string;
+  var m_ContrAccountId: integer;
+  var m_ServKind      : integer;
+  var m_PartyName     : string;/*из существующего субъекта*/
+  var m_DocNum        : string;
+  var m_DocSeries     : string;
+  var m_SpGroundKind  : integer;
+  var m_SpGroundParty : integer;
+  var m_PayerID       : integer;
+
+  /*Свойства Вспомогательные*/
+  var m_DebetAccountCommon : string;
+  var m_DebetAccountSPI : string;
+  var m_PartyIdBankSPI  : integer;
+  var m_CurAction       : integer;
+  var m_CurrID          : integer;
+  var m_CurrCCY         : string;
+  var m_LastAccTrnID    : integer;
+  var m_CurStepID       : integer;
+
+  m_PartyId=m_ContrId=m_SfContrAcc=m_ContrAccountId=m_ServKind=m_DebetAccountCommon=m_DebetAccountSPI=m_PartyIdBankSPI=m_CurAction=
+  m_CurrID=m_LastAccTrnID=m_CurStepID=m_PartyName=m_LastName=m_FirstName=m_MiddleName=m_DocNum=m_DocSeries=m_CurrCCY=m_SpGroundKind=
+  m_PayerID=m_SpGroundParty=null;
+
+  macro НайтиКлиентаИСчета()
+    // Для переопределения в дочерних классах
+  end;
+
+  macro State()
+    return m_State;
+  end;
+
+  macro PartyID()
+    if (m_partyID == null)
+       НайтиКлиентаИСчета();
+    end;
+    return m_PartyID;
+  end;
+
+  macro PartyName()
+    // Для переопределения в дочерних классах
+    return m_PartyName;
+  end;
+
+  macro LastName() /*из входящего сообщения*/
+    return m_LastName;
+  end;
+
+  macro FirstName()/*из входящего сообщения*/
+    return m_FirstName;
+  end;
+
+  macro Patronymic()/*из входящего сообщения*/
+    return m_MiddleName;
+  end;
+
+  macro IsMale()
+    return iif (SubStr(this.Patronymic(),StrLen(this.Patronymic())-1,StrLen(this.Patronymic())) == "ич",true,false); 
+  end;
+
+  macro DocSeries()
+    if (m_DocSeries == null)
+      m_DocSeries = StrSubst(SubStr(m_DocNumber,index(m_DocNumber," "))," ","");
+    end;
+    return m_DocSeries;
+  end;
+
+  macro DocNum()
+    if (m_DocNum == null)
+      m_DocNum = StrSubst(SubStr(m_DocNumber,1,index(m_DocNumber," "))," ","");
+    end;
+    return m_DocNum;
+  end;
+
+  macro DocIssued()
+    if (m_DocIssued == null)
+       m_DocIssued = date(0,0,0);
+    end;
+    return m_DocIssued;
+  end;
+
+  macro ContrId()
+    if (m_ContrId == null)
+      НайтиКлиентаИСчета();
+    end;
+    return m_ContrId;
+  end;
+
+  macro SfContrAcc()
+    if (m_SfContrAcc == null)
+      НайтиКлиентаИСчета();
+    end;
+    return m_SfContrAcc;
+  end;
+
+  macro ContrAccountId()
+    if (m_ContrAccountId == null)
+      НайтиКлиентаИСчета();
+    end;
+    return m_ContrAccountId;
+  end;
+
+  macro ServKind()
+    if (m_ServKind == null)
+      НайтиКлиентаИСчета();
+    end;
+    return m_ServKind;
+  end;
+
+  macro ЕстьВсеДанные()
+    if (     (PartyId()        !=null) 
+         and (ContrId()        !=null)
+         and (SfContrAcc()     !=null)
+         and (ContrAccountId() !=null)
+         and (ServKind()       !=null))
+      return true;
+    end;
+    
+    return false;      
+  end;
+
+  macro CurrID()
+    if (m_CurrID == null)
+      var cmd = RsdCommand("select t_fiid from dfininstr_dbt where t_iso_number = decode(:1,'810','643',:1)");
+      cmd.addParam("", RSDBP_IN, m_CurrCode);
+      var rs = RsdRecordSet(cmd);
+      if (rs.MoveNext())
+        m_CurrID = rs.value("t_fiid");
+      end;
+    end;
+    return m_CurrID;
+  end;
+   
+  macro CCY()
+    if (m_CurrCCY == null)
+      var cmd = RsdCommand("select t_ccy from dfininstr_dbt where t_iso_number = decode(:1,'810','643',:1)");
+      cmd.addParam("", RSDBP_IN, m_CurrCode);
+      var rs = RsdRecordSet(cmd);
+      if (rs.movenext())
+        m_CurrCCY = rs.value("t_ccy");
+      end;
+    end;
+    return m_CurrCCY;
+  end;
+
+  macro DebetAccountCommon()
+    if (m_DebetAccountCommon == null)
+      if (SubStr(m_DebetAccount, 1,3) == "408")
+        var cmd = RsdCommand("select t_account from daccount_dbt where t_chapter = 1 and t_client = :1 and t_balance = :2 and t_account like '%99999999999' and t_code_currency = :3");
+        cmd.addParam("", RSDBP_IN, {OurBank});
+        cmd.addParam("", RSDBP_IN, SubStr(m_DebetAccount, 1,5));
+        cmd.addParam("", RSDBP_IN, CurrID);
+        var rs = RsdRecordSet(cmd);
+        if (rs.movenext())
+          m_DebetAccountCommon = rs.value("t_account");
+        end;
+      else
+        m_DebetAccountCommon = m_DebetAccount;
+      end;
+    end;
+    return m_DebetAccountCommon;
+  end;
+
+  macro EntryNumber()
+    if ((ValType(m_EntryNumber) == V_UNDEF) or (m_EntryNumber == StrFor(1)))
+      return "б/н";
+    end;
+    return m_EntryNumber;
+  end;
+  
+  macro PayerID()
+    if (m_PayerID == null)
+      m_PayerID = FindPartyByINN(m_PayerINN);
+    end;
+    
+    return m_PayerID;
+  end;
+
+  private macro FindPartyAndContrData(): Integer
+    var legalForm = m_LegalForm;
+    
+    if (legalForm == PTLEGF_IP)
+      legalForm = PTLEGF_INST;
+    end;
+    
+    var Params = makeArray(SQLParam("p_LegalForm"     , legalForm       ),
+                           SQLParam("p_ContrNumber"   , m_ContrNumber   ),
+                           SQLParam("p_ObjectType"    , 0               ),
+                           SQLParam("p_Account"       , m_CreditAccount ),
+                           SQLParam("p_ObjType"       , 659             ),
+                           SQLParam("p_FiKind"        , 1               ),
+                           SQLParam("p_FiCode"        , m_CurrCode      ),
+                           SQLParam("p_PartyId"       , V_INTEGER, RSDBP_OUT ),
+                           SQLParam("p_ContrId"       , V_INTEGER, RSDBP_OUT ),
+                           SQLParam("p_AccountContr"  , V_STRING , RSDBP_OUT ),
+                           SQLParam("p_ContrAccountId", V_INTEGER, RSDBP_OUT ),
+                           SQLParam("p_ServKind"      , V_INTEGER, RSDBP_OUT )  );
+    var state = execStoredFunc( "USR_PKG_IMPORT_SOFR.GetPropFromContrNum", V_INTEGER, Params );
+    if (state == 0)
+      m_PartyId = Params.Value(7).Value;
+      m_ContrId = Params.Value(8).Value;
+      m_ContrAccountId = Params.Value(10).Value;
+      m_ServKind = Params.Value(11).Value;
+    end;
+    
+    return state;
+  end;
+  
+  //получим счет из СПИ субъекта и PartyId банка
+  private macro GetSfSiAccountParty(PartyIdBank :@integer ) :string
+    var Params :TArray,
+        state :integer = 0,
+        Acc :string = "";
+
+    Params = makeArray( SQLParam("p_PartyId", m_PartyID),
+                        SQLParam("p_ServiceKind", 1 ),
+                        SQLParam("p_KindOper", 2037 ),
+                        SQLParam("p_FiKind", 1 ),
+                        SQLParam("p_FiCode", m_CurrCode ),
+                        SQLParam("p_Account", m_DebetAccount ),
+                        SQLParam("p_AccountResult", V_STRING , RSDBP_OUT ),
+                        SQLParam("p_BankId", V_INTEGER , RSDBP_OUT ) );
+    state = execStoredFunc( "USR_PKG_IMPORT_SOFR.GetSfSiAccountAndBankPartyId", V_INTEGER, Params );
+    if( state == 0 )
+      Acc = Params.Value(6).Value;
+      PartyIdBank = Params.Value(7).Value;
+    else
+      PartyIdBank = -1;
+    end;
+
+    return Acc;
+  end;
+  
+  // Создать СПИ субъекта
+  private macro SetSfSiAccountParty() :integer
+    var Params :TArray,
+        state :integer = 0;
+    var currencyCode = SubStr(m_DebetAccount, 6, 3);
+
+    Params = makeArray(SQLParam("p_PartyId", m_PartyID),
+                       SQLParam("p_ServiceKind", 1 ),
+                       SQLParam("p_KindOper", 2037 ),
+                       SQLParam("p_FiKind", 1 ),
+                       SQLParam("p_FiCode", currencyCode ),
+                       SQLParam("p_Account", m_DebetAccount ),
+                       SQLParam("p_BankId", {OurBank} ),
+                       SQLParam("p_BankDate", {CurDate} ));
+    state = execStoredFunc( "USR_PKG_IMPORT_SOFR.AddSfSiForParty", V_INTEGER, Params );
+
+    //shev 110820 В СПИ глава должна быть 0, если счет не из нашего банка
+    var sql :string = "",
+        cmd, rs, isAccountExist = false;
+
+    sql = "select * from daccount_dbt where t_account = :acc";
+    cmd = RSDCommand(sql);
+    cmd.AddParam("Acc", RSDBP_IN, m_DebetAccount);
+    rs = RSDRecordSet(cmd);
+
+    if (rs.MoveNext())
+      isAccountExist = true;
+    end;
+
+    if (not isAccountExist)
+      sql = " DECLARE " +
+            "  v_Account   dsettacc_dbt.t_account%TYPE := :p_Account; " +
+            " BEGIN " +
+            "  update dsettacc_dbt " +
+            "     set t_chapter = 0 " +
+            "   where t_account = v_Account; " +
+            " END; ";
+      cmd = RSDCommand(sql);
+      cmd.AddParam("p_Account", RSDBP_IN, m_DebetAccount);
+      cmd.execute();
+    end;
+
+    return state;
+  
+  OnError()
+    return state;
+  end;
+
+  //Получение вида входящего документа
+  macro SpGroundKind()
+    if (m_SpGroundKind == null)
+      if (m_DocType == "01")
+        m_SpGroundKind = 313; // Платежное поручение
+      elif (m_DocType == "06")
+        m_SpGroundKind = 336; // Мемориальный ордер
+      elif (m_DocType == "06о")
+        m_SpGroundKind = 337; // Банковский ордер
+      elif (m_DocType == "0106")
+        m_SpGroundKind = 338; // Инкассовое поручение
+      elif (m_DocType == "03rv")
+        m_SpGroundKind = 339; // Расходный вал. ордер
+      elif (m_DocType == "03pv")
+        m_SpGroundKind = 340; // Приходный вал. ордер
+      end;
+    end;
+    return m_SpGroundKind;
+  end;
+
+  //Получение контрагента входящего документа
+  macro SpGroundParty()
+    if (m_SpGroundParty == null)
+      if (SubStr(m_DebetAccount, 1, 4) == "4742")
+        m_SpGroundParty = {OurBank};
+      else
+        m_SpGroundParty = PartyID();
+      end;
+    end;
+    return m_SpGroundParty;
+  end;
+  
+  private macro Construct(rs)
+    if (ValType(rs) == V_UNDEF)
+      m_ENROLLID      = 0; 
+      m_JMSMESSAGEID  = "";
+      m_CONTRNUMBER   = ""; 
+      m_ENTRYNUMBER   = StrFor(1);
+      m_PAYEENAME     = "";
+      m_CLIENTCODE    = ""; 
+      m_DOCNUMBER     = "";
+      m_DOCISSUED     = date(0,0,0);
+      m_DATE          = date(0,0,0); 
+      m_TIME          = time(0,0,0); 
+      m_DEBETACCOUNT  = ""; 
+      m_CREDITACCOUNT = ""; 
+      m_SUM           = 0;
+      m_ACCTSEND      = "";
+      m_BIC           = "";
+      m_GROUND        = "";
+      m_CURRCODE      = -1; 
+      m_STATE         = -1; 
+      m_COMMENT       = ""; 
+      m_NPTXOPID      = -1;
+      m_LastName      = "";
+      m_FirstName     = "";
+      m_MiddleName    = "";
+      m_IsReliable    = StrFor(0);
+      m_PayerName     = "";
+      m_ResidenceAddress = "";
+      m_PayerINN      = "";
+      m_PayerKPP      = "";
+      m_DocType       = "";
+      m_LegalForm     = PTLEGF_UNKNOWN;
+      m_DepoPaymentDocId = "-1";
+    else
+      m_ENROLLID    = rs.Value("t_ENROLLID");
+      m_JMSMESSAGEID= rs.Value("t_JMSMESSAGEID");
+      m_CONTRNUMBER = rs.Value("t_CONTRNUMBER");
+      m_ENTRYNUMBER = rs.Value("t_ENTRYNUMBER");
+      m_PAYEENAME   = rs.Value("t_PayeeName");
+      m_CLIENTCODE  = rs.Value("t_CLIENTCODE");
+      m_DOCNUMBER   = rs.Value("t_DOCNUMBER");
+      m_DOCISSUED   = rs.Value("t_DOCISSUED");
+      m_DATE        = rs.Value("t_DATE");
+      m_TIME        = rs.Value("t_TIME");
+ 
+      if (Substr(rs.Value("t_DEBETACCOUNT"),1,5) == "47422") //Подмена счета 47422 при загрузке в СОФР доходов по ценным бумагам от Депозитария (Дт 47422 Кт306)
+        m_DEBETACCOUNT = GetTechAccount(rs.Value("t_CURRCODE"), rs.Value("t_DEBETACCOUNT"));
+      else
+        m_DEBETACCOUNT = rs.Value("t_DEBETACCOUNT");
+      end;
+
+      m_CREDITACCOUNT = rs.Value("t_CREDITACCOUNT");
+      m_SUM         = rs.Value("t_SUM");
+
+      if (valtype(rs.Value("t_ACCTSEND")) == 26)
+        m_ACCTSEND  =  "";
+      else
+        m_ACCTSEND  =  rs.Value("t_ACCTSEND");
+      end;
+
+      if (valtype(rs.Value("t_BIC")) == 26)
+        m_BIC       = "";
+      else
+        m_BIC       = rs.Value("t_BIC");
+      end;
+
+      m_GROUND      = rs.Value("t_GROUND");
+      m_CURRCODE    = rs.Value("t_CURRCODE");
+      m_STATE       = rs.Value("t_STATE");
+      m_SYSTEMDATE  = rs.Value("t_SYSTEMDATE");
+      m_COMMENT     = rs.Value("t_COMMENT");
+      m_NPTXOPID    = rs.Value("t_NPTXOPID");
+      m_LastName    = rs.Value("t_LastName");
+      m_FirstName   = rs.Value("t_FirstName");
+      m_MiddleName  = rs.Value("t_MiddleName");
+      m_IsReliable  = rs.Value("t_IsReliable");
+      m_PayerName   = rs.Value("t_PayerName");
+      m_ResidenceAddress = rs.Value("t_ResidenceAddress");
+      m_PayerINN    = rs.Value("t_PayerINN");
+      m_PayerKPP    = rs.Value("t_PayerKPP");
+      m_DocType     = rs.Value("t_DocType");
+      m_LegalForm   = rs.Value("t_LegalForm");
+      m_DepoPaymentDocId = rs.Value("t_DepoPaymentDocId");
+    end;
+  end;
+
+  Construct(enrollRS);
+end;
+
+private class (enroll_rec) LegalPersonEnroll_rec(enrollRS) // ЮЛ
+  macro НайтиКлиентаИСчета()
+    var state = FindPartyAndContrData();
+    
+    if (state == 0)
+      m_SfContrAcc = m_CreditAccount;
+      m_PartyIdBankSPI = -1;
+      
+      var debitAccountCode = SubStr(m_DebetAccount, 1, 5);
+      var debitAccountSuffix = SubStr(m_DebetAccount, Strlen(m_DebetAccount) - 4, 5);
+      
+      if (debitAccountCode == "47422")
+        m_DebetAccountSPI = GetTechAccount(SubStr(m_DebetAccount, 6, 3), "");
+        m_PartyIdBankSPI = {OurBank};
+      elif (debitAccountCode == "55555")
+        m_DebetAccountSPI = m_DebetAccount;
+        m_PartyIdBankSPI = {OurBank};
+      else
+        m_DebetAccountSPI = GetSfSiAccountParty(@m_PartyIdBankSPI);
+
+        if (((m_DebetAccountSPI == "") or (m_DebetAccountSPI != m_DebetAccount)) and
+            (Index(EXCLUDE_MASK_SFSI_FROMBEGIN, debitAccountCode) == 0) and
+            (Index(EXCLUDE_MASK_SFSI_FROMEND, debitAccountSuffix) == 0)) //создать СПИ субъекта по счету из объекта в Нашем банке кроме 40817..99999
+          state = SetSfSiAccountParty();
+          m_PartyIdBankSPI = {OurBank};
+          
+          if (state == 0) 
+            m_DebetAccountSPI = m_DebetAccount;
+            m_PartyIdBankSPI = {OurBank};
+          else
+            // ошибка СПИ субъекта не нашли и не добавили
+          end;
+        end;
+
+        if ((state == 0 ) and
+            (Index(EXCLUDE_MASK_SFSI_FROMBEGIN, debitAccountCode) == 1 ) and
+            (Index(EXCLUDE_MASK_SFSI_FROMEND, debitAccountSuffix) == 1 ) ) //СПИ субъекта не нужен для 40817..99999
+          m_DebetAccountSPI = m_DebetAccount;
+          m_PartyIdBankSPI = {OurBank};
+        end;
+      end;
+    end;
+  end;
+  
+  macro PartyName()
+    if (m_PartyName == null)
+      var cmd = RsdCommand("select t_shortName from dparty_dbt where t_partyID = :1");
+      cmd.AddParam("", RSDBP_IN, PartyId());
+      var rs = RsdRecordSet(cmd);
+      
+      if (rs.MoveNext())
+         m_PartyName = rs.Value("t_shortName");
+      end;
+    end;
+    
+    return m_PartyName;
+  end;
+  
+  private macro Construct(rs)
+    Construct(rs); // Конструктор родительского класса
+     
+    if (ValType(rs) != V_UNDEF)
+      // Дополнить при необходимости
+    end;
+  end;
+  
+  Construct(enrollRS);
+end;
+
+private class (enroll_rec) NaturalPersonEnroll_rec(enrollRS) // ФЛ
+  macro НайтиКлиентаИСчета()
+    var Params : TArray;
+    var state = 0, Dt;
+
+    if ((m_ContrNumber == "") or (m_ContrNUmber == StrFor(1)) or (ValType(m_ContrNumber) == V_UNDEF))
+      /* пытаемся получить номер договора из назначения платежа */
+      /* сначала удаляем все даты формата ДД.ММ.ГГГГ и ДД.ММ.ГГ, т.к. они потенциально могут повлиять на результат поиска*/
+      /* затем удялем все пробелы и ищем последовательность, состоящую */
+      /*  из цифр, латинских букв и символов "\/-" длинной не менее трех символов и которая может оканчиваться символами "ИИС" */
+      Dt = TRsbDataSet(
+            " select " + 
+            " regexp_substr(replace(regexp_replace(upper('"+m_Ground+"'),'(\d{2}(\.|/)\d{2}(\.|/)\d{4})|(\d{2}(\.|/)\d{2}(\.|/)\d{2})'),' '),'[a-z0-9/\\-]{3,}(ИИС)?') contrnumber " + 
+            " from dual ");
+      if (Dt.movenext())
+        m_ContrNumber = Dt.contrnumber;
+      end;
+    end;
+
+    state = FindPartyAndContrData();
+    
+    if( state == 0 )
+      Dt = TRsbDataSet(" select t_account from daccount_dbt t where T.T_ACCOUNTID = " + m_ContrAccountId);
+      if (Dt.Movenext())
+        m_SfContrAcc = Dt.account;
+      end;
+
+      m_DebetAccountSPI = GetSfSiAccountParty(@m_PartyIdBankSPI);
+    else
+      var errcode;
+      m_PartyID = ПолучитьКодСубъекта(m_ClientCode, 101, errcode);
+      if (errcode != 0)
+        m_PartyID = null;
+      end;
+    end;
+
+    Params = Null;
+  end;
+   
+  macro PartyName()
+    if(m_PartyName == null)
+      var cmd = RsdCommand("select t_name1||' '||t_name2||' '||t_name3 nam from dpersn_dbt where t_personid = :1");
+      cmd.addParam("", RSDBP_IN, PartyId());
+      var rs = RsdRecordSet(cmd);
+      if (rs.movenext())
+        m_PartyName = rs.value("nam");
+      end;
+    end;
+    return m_PartyName;
+  end;
+   
+  /**
+  @brief Get_Contract_By_FIO_INN_ADDRESS_PASPORT 
+  Дополнительную идентификацию требуется проводить по полю Плательщик. 
+  Для этого в поле Плательщик должен присутствовать хотя бы один из реквизитов:
+    - ИНН;
+    - адрес;
+    - паспортные данные.
+  @return вернет true, если будет найден хотя бы один клиент у котоорого есть контракт 
+  */
+  macro Get_Contract_By_FIO_INN_ADDRESS_PASPORT()
+    // последовательные попытки найти данные контракта по фио, документу, инн и адресу 
+    CaptureOutput;
+    [
+    select sf.t_number, sf.t_partyid, count(*) over() cnt from dsfcontr_dbt sf where sf.t_servkind = 0 and sf.t_partyid in ( 
+     select p.t_personid t_partyid from dpersn_dbt p 
+        where p.t_name1 = :lastname and p.t_name2 = :firstname and p.t_name3 = :middlename 
+      union all
+      select l.t_personid t_partyid
+        from dpersnidc_dbt l
+        where l.t_paperseries = (select trim(substr(:docnum,
+                                                    instr(:docnum, ' '),
+                                                    length(:docnum) -
+                                                    instr(:docnum, ' ')))
+                                   from dual)
+          and l.t_papernumber =  (select trim(substr(:docnum,
+                                    1,
+                                    instr(:docnum, ' ')))
+                                    from dual)
+      union all
+      select do.t_objectid t_partyid
+                 from dobjcode_dbt do
+                where do.t_objecttype = 3
+                  and do.t_code = :INN
+                  and do.t_codekind = 16
+      union all
+      select da.t_partyid
+                 from dadress_dbt da
+                where da.t_adress =
+                      :residenceAddress
+                  and da.t_postindex = substr(:residenceAddress,1,6)
+     )
+    ]; 
+    var sql = StopCaptureOutput;
+    var contractDataRS = execSQLselectPrmDyn(sql, 
+                         m_lastName, m_firstName, m_middleName,
+                         m_DocNumber,m_DocNumber,m_DocNumber,m_DocNumber,m_DocNumber,m_DocNumber,
+                         m_payerinn,
+                         m_residenceAddress,m_residenceAddress
+                       );
+    if (contractDataRS.movenext() and (contractDataRS.value("cnt")==1) ) 
+      // если найден хоть один договор, но он должен быть единственным
+      m_ContrNumber = contractDataRS.value("t_number");
+      return true; 
+    end;
+    return false;
+  end;
+  
+  private macro Construct(rs)
+    Construct(rs); // Конструктор родительского класса
+     
+    if (ValType(rs) != V_UNDEF)
+      // Дополнить при необходимости
+    end;
+  end;
+  
+  Construct(enrollRS);
+end;
+
+class ClientEnrollLocker(enrollId:integer)
+  private var locker:UniConcurrentLocker = null;
+  private var lockName = string("client-enroll-lock-", enrollId);
+
+  //получается, что для enrollId == 0 тоже вешается уникальная блокировка
+  //это неявно ознаает, то сохраняться зачисления в буфер могут только строго по одному
+  //если эта блокировка применена, конечно
+  //
+  //timeout = null - автоматически конвертируется в 0
+  macro SetLock(timeout:integer):bool
+    locker = UniConcurrentLocker(lockName, timeout);
+    return locker.Lock();
+  end;
+
+  macro ReleaseLock()
+    if (locker != null)
+      locker.Unlock();
+      locker = null;
+    end;
+  end;
+end;
+
+/**** Классы ClientEnroll NaturalPersonClientEnroll LegalPersonClientEnroll ***********************/
+class ClientEnroll(enrollRS)
+   var Rec;
+
+   private macro ВставитьШагВИсторию(Action)
+      var sql = "";
+      sql = " declare"
+            "   sd date;"
+            " begin"
+            "   select t_systemdate into sd from USR_ACC306ENROLL_DBT where t_enrollid = :1; "
+            "   Insert into USR_ACC306ENROLL_STEP_DBT "
+            "     (T_STEPID, T_ENROLLID, T_DATE, T_SYSTEMDATE, T_ACTION, T_COMMENT, T_OPER)"
+            "   VALUES (0, :2, :3, sd, :4, "
+            "      :5, :6 )"
+            "   returning t_stepid into :v_ret;"
+            " end;";
+      var cmd = RsdCommand(sql);
+      cmd.addParam("", RSDBP_IN, Rec.m_ENROLLID);
+      cmd.addParam("", RSDBP_IN, Rec.m_ENROLLID);
+      cmd.addParam("", RSDBP_IN, {curdate});
+      cmd.addParam("", RSDBP_IN, Rec.m_STATE);
+      cmd.addParam("", RSDBP_IN, Rec.m_COMMENT);
+      cmd.addParam("", RSDBP_IN, {oper});
+      cmd.addParam("v_ret", RSDBP_OUT, V_INTEGER);
+      cmd.execute();
+
+      rec.m_CURSTEPID = cmd.Value("v_ret");
+
+      return 0;
+
+   OnError(e)
+      return 1;
+   end;
+ 
+   private macro СохранитьЗапись()
+      var cmd, sql = "";
+
+      if (rec.m_ENROLLID == 0)
+         sql = " Insert into USR_ACC306ENROLL_DBT "
+               "   (T_ENROLLID, T_JMSMESSAGEID, T_CONTRNUMBER, T_ENTRYNUMBER, T_PAYEENAME, " +
+               "    T_CLIENTCODE, T_DOCNUMBER, T_DOCISSUED, T_DATE, T_TIME, T_DEBETACCOUNT, T_CREDITACCOUNT, " +
+               "    T_SUM, T_CURRCODE, T_ACCTSEND, T_BIC, T_GROUND, T_STATE, T_SYSTEMDATE, " +
+               "    T_COMMENT, T_NPTXOPID, t_LastName, t_FirstName, t_MiddleName, t_IsReliable, " +
+               "    t_PayerInn, t_PayerKPP, t_residenceaddress, t_PayerName, t_DocType, t_LegalForm, t_DepoPaymentDocId)"
+               " Values                "
+               "   (0, :1, :2, :3, :4, "
+               "    :5, :6, :7, :8, :9, :10, :11," 
+               "    :12, :13, :14, :15, :16, :17, SYSDATE,"
+               "    :18, :19, :20, :21, :22, :23, "
+               "    :24, :25, :26, :27, :28, :29, :30) returning t_enrollid into :v_enrollid;";
+         cmd = RsdCommand(sql);
+         cmd.addParam("", RSDBP_IN, Rec.m_JMSMESSAGEID);
+         cmd.addParam("", RSDBP_IN, Rec.m_contrnumber);
+         cmd.addParam("", RSDBP_IN, Rec.m_entrynumber);
+         cmd.addParam("", RSDBP_IN, Rec.m_PAYEENAME);
+         cmd.addParam("", RSDBP_IN, Rec.m_CLIENTCODE);
+         cmd.addParam("", RSDBP_IN, Rec.m_DOCNUMBER);
+         cmd.addParam("", RSDBP_IN, Rec.m_DOCISSUED);
+         cmd.addParam("", RSDBP_IN, Rec.m_DATE);
+         cmd.addParam("", RSDBP_IN, Rec.m_TIME);
+         cmd.addParam("", RSDBP_IN, Rec.m_DEBETACCOUNT);
+         cmd.addParam("", RSDBP_IN, Rec.m_CREDITACCOUNT);
+         cmd.addParam("", RSDBP_IN, Rec.m_SUM);
+         cmd.addParam("", RSDBP_IN, Rec.m_CURRCODE);
+         cmd.addParam("", RSDBP_IN, Rec.m_ACCTSEND);
+         cmd.addParam("", RSDBP_IN, Rec.m_BIC);
+         cmd.addParam("", RSDBP_IN, Rec.m_GROUND);
+         cmd.addParam("", RSDBP_IN, C_ENROLL_ACTION_CREATED);
+         cmd.addParam("", RSDBP_IN, Rec.m_COMMENT);
+         cmd.addParam("", RSDBP_IN, Rec.m_NPTXOPID);
+         cmd.addParam("", RSDBP_IN, Rec.m_LastName);
+         cmd.addParam("", RSDBP_IN, Rec.m_FirstName);
+         cmd.addParam("", RSDBP_IN, Rec.m_MiddleName);
+         cmd.addParam("", RSDBP_IN, Rec.m_IsReliable);
+         cmd.addParam("", RSDBP_IN, Rec.m_PayerINN);
+         cmd.addParam("", RSDBP_IN, Rec.m_PayerKPP);
+         cmd.addParam("", RSDBP_IN, Rec.m_ResidenceAddress);
+         cmd.addParam("", RSDBP_IN, Rec.m_PayerName);
+         cmd.addParam("", RSDBP_IN, Rec.m_DocType);
+         cmd.addParam("", RSDBP_IN, Rec.m_LegalForm);
+         cmd.addParam("", RSDBP_IN, Rec.m_DepoPaymentDocId);    
+         
+         cmd.addParam("v_enrollid", RSDBP_OUT, V_INTEGER);
+         cmd.execute();
+
+         rec.m_EnrollID =  cmd.Value("v_enrollid");
+         rec.m_State = C_ENROLL_ACTION_CREATED;
+      else
+         sql = " UPDATE USR_ACC306ENROLL_DBT "
+               "   SET T_STATE = :1, T_SYSTEMDATE = SYSDATE, T_COMMENT = :2, T_NPTXOPID = :3, T_CONTRNUMBER = :4 "
+               " WHERE  t_enrollid = :v_enrollid ";
+         cmd = RsdCommand(sql);
+         cmd.addParam("", RSDBP_IN, Rec.m_STATE);
+         cmd.addParam("", RSDBP_IN, Rec.m_COMMENT);
+         cmd.addParam("", RSDBP_IN, Rec.m_NPTXOPID);
+         cmd.addParam("", RSDBP_IN, Rec.m_ContrNumber);
+         cmd.addParam("v_enrollid", RSDBP_IN, Rec.m_ENROLLID);
+         cmd.execute();
+      end;
+
+      if (ВставитьШагВИсторию() != 0)
+         return 1;
+      end;
+
+      return 0;
+
+   OnError(e);
+      return 1;
+   end;
+
+   private macro СохранитьЗаписьTrn()
+      var cmd, sql = "";
+
+      if ( not rslDefCon.isInTrans() )
+         rslDefCon.beginTrans();
+      end;
+
+      СохранитьЗапись();
+
+      if ( rslDefCon.isInTrans() )
+        rslDefCon.commitTrans();
+      end;
+      return 0;
+
+   OnError(e);
+      if ( rslDefCon.isInTrans() )
+        rslDefCon.rollbackTrans();
+      end;
+      return 1;
+   end;
+
+   private macro ClearError()
+      rec.m_Comment = StrFor(1);
+   end;
+
+   private macro SetError(Err)
+      rec.m_Comment = Err;
+      СохранитьЗапись();
+   end;
+
+   private macro ДобавитьСвязкуСПроводкой(TrnID, PaymentID)
+      var cmd, sql = "";
+
+      if (ValType(PaymentID) == V_UNDEF)
+         Paymentid = 0;
+      end;
+      sql = " Insert into USR_ACC306ENROLL_TRN_DBT "
+            "   (T_STEPID, T_ENROLLID, T_ACCTRNID, T_PAYMENTID)"
+            " Values                "
+            "   (:1, :2, :3, :4);";
+      cmd = RsdCommand(sql);
+      cmd.addParam("", RSDBP_IN, Rec.m_curstepid);
+      cmd.addParam("", RSDBP_IN, Rec.m_enrollid);
+      cmd.addParam("", RSDBP_IN, TrnID);
+      cmd.addParam("", RSDBP_IN, PaymentID);
+      cmd.execute();
+      return 0;
+   OnError(e);
+      return 1;
+   end;
+
+   private macro ВыполнитьПроводку(AccDeb, AccCred, Sum, TrnDate, CurrID, Ground, TrnID:@integer)
+      var tr = RsbAccTransaction();
+      tr.Shifr_Oper = "09"; // стираем, потом заполним правильно
+      tr.Chapter         = 1;
+      tr.Date_Carry      = TrnDate;
+      tr.Numb_Document   = rec.m_EntryNumber;
+      tr.ResultCarry     = 1;
+      tr.Kind_Oper       = " 1";
+      tr.Ground          = Ground;
+      tr.Department      = {OperDprt};
+      tr.Oper            = {oper};
+      tr.FIIDPayer       = CurrID;
+      tr.FIIDReceiver    = CurrID;
+      tr.AccountPayer    = AccDeb;
+      tr.AccountReceiver = AccCred;
+      tr.SumPayer        = ABS(Sum);
+      tr.SumReceiver     = ABS(Sum); 
+      tr.Userfield2      = "1";/*Не выгружать*/
+      
+      if (not tr.Carry())
+        return 1;
+      else
+        TrnID = tr.AccTrnID;
+        return 0;
+      end;
+   end;
+
+   private macro СоздатьКлиента()
+      // Переопределение в дочерних классах
+   end;
+
+   private macro MakeAdditionalTransaction(refundParams, paymentid)
+     var stat = 0;
+     return stat;
+   end;
+
+   private macro CreatePayment(refundParams, acctrnid:@integer, paymentid:@integer)
+      var pmobj = RSBPayment();
+      var stat = 0;
+
+      pmobj.DocKind      = 5002;
+      pmobj.DocumentID   = string(rec.m_EnrollID:o:34);
+      pmobj.Purpose      = 100;         // Возврат ДС
+      pmobj.BaseAmount   = rec.m_Sum;
+      pmobj.PayerAmount  = rec.m_Sum;
+      pmobj.BaseFIID     = rec.CurrID();
+      pmobj.ReceiverFIID = rec.CurrID();
+      pmobj.PayerFIID    = rec.CurrID();
+      pmobj.ValueDate    = {curdate};   // Дата валютирования
+      pmobj.PaymStatus   = 3000;        //- на отправку. 
+      pmobj.Ground       = refundParams.GetGround();
+      pmobj.Number       = rec.m_EnrollID;
+      pmobj.PrimDocKind  = DOC_BO_PAYMENT;
+      pmobj.NumberPack   = 11;
+      pmobj.Priority     = 5;
+      pmobj.ShifrOper   = "09";
+
+      //Проверить опера
+      pmobj.Oper = GetMainOperInGroup(pmobj.DocKind);
+      if (pmobj.Oper <= 0)
+        pmobj.Oper = {oper};
+      end;
+
+      Pmobj.SetPayerPI(
+                  PAYMENTS_GROUP_UNDEF,                  // Group
+                  {OurBank},                             // BankID  // Банк плательщика
+                  3,                                     // BankCodeKind
+                  "044525111",                           // BankCode
+                  "",                                    // BankName
+                  "",                                    // CorrAcc
+                  pmobj.BaseFIID,                        // AccountFI
+                  1,                                     // AccountChapter
+                  refundParams.debitAccount,             // Account   // Счет плательщика
+                  {OurBank},                             // ClientID  // Плательщик
+                  "",                                    // ClientName,
+                  {INN_Bank},                            // ClientINN,
+                  3,                                     // ClientCodeKind,
+                  "044525111"                            // ClientCode
+                 );
+
+      if (ValType(rec.Partyid()) != V_UNDEF) // такого быть не может и не должно, но если вдруг ..
+
+         Pmobj.SetReceiverPI(
+                     PAYMENTS_GROUP_UNDEF,               // Group
+                     ПолучитьКодСубъекта(refundParams.BIC, 3),  // BanlID DEF-108968 забирается из параметров возврата
+                     3,                                  // BankCodeKind
+                     refundParams.BIC,                   // BankCode DEF-108968 забирается из параметров возврата
+                     "",                                 // BankName
+                     "",                                 // CorrAcc
+                     pmobj.BaseFIID,                     // AccountFI
+                     1,                                  // AccountChapter
+                     refundParams.receiverAccount,       // Account
+                     FindPartyByINN(rec.m_ClientCode),   // ClientID
+                     refundParams.receivername,           // ClientName,
+                     rec.m_PayerINN,                     // ClientINN,
+                     1,                                  // ClientCodeKind,
+                     ПолучитьКодСубъекта(FindPartyByINN(rec.m_ClientCode), 1)   // ClientCode
+                  );
+
+    
+         Pmobj.IsFactPaym   = "X"; //Этот флаг должен бысть установлен уже после добавления схем расчётов. Иначе по платежу не создаётся операция 4001 (или 14001)
+
+         pmobj.BaseRate.Actuate(pmobj.ValueDate, false);
+         pmobj.FactRate.Actuate(pmobj.ValueDate, false);
+         pmobj.Actuate();
+         pmobj.Update();
+
+         if(substr(pmobj.futurereceiveraccount,1,3) == "301")  // DEF-108968 условие изменено, было "30102"
+            Connect_attr_to_paym (pmobj.paymentid, ATTR_GROUP_DOCUMENT_BIS, IIF(pmobj.basefiid == NATCUR,"01","01"));
+         else
+            Connect_attr_to_paym (pmobj.paymentid, ATTR_GROUP_DOCUMENT_BIS, IIF(pmobj.basefiid == NATCUR,"06o","06"));
+         end;
+
+         if(PM_BOOperation(pmObj) == false)
+           //errmsg = "Ошибка PM_BOOperation";
+           stat = 1;
+         end;
+         if ( not stat )
+            var tr = pmobj.MakeTransaction();
+            if( tr == NULL )
+               msgbox("Ошибка при создании проводки по платежу");
+               stat = 1;
+            else
+               tr.AccountReceiver = rec.DebetAccountCommon();
+               tr.Number_Pack = pmobj.NumberPack;
+               if( not tr.Carry() )
+                  msgbox("Ошибка при выполнении проводки " + GetErrMsg());
+                  stat = 1;
+               end;
+            end;
+         end;
+         acctrnid = tr.acctrnid;
+         paymentid = pmobj.PaymentID;
+      else
+         stat = 1;
+      end;
+      return stat;
+   //OnError(e);
+   //   return 1;
+   end;
+
+   private macro Construct(rs)
+     Rec = enroll_rec(rs);
+   end;
+
+
+   /****** Public methods ********/
+
+   macro GetRefundParamsUI()
+     // Для переопределения в дочерних классах
+     return null;
+   end;
+   
+   macro GetRefundParamsDefault()
+     // Для переопределения в дочерних классах
+     return null;
+   end;
+
+   macro GetRefundGround(CodeReason)
+      var RetVal = "ВОЗВРАТ СРЕДСТВ ПО ПРИЧИНЕ-";
+      if   (CodeReason == C_REFUND_REASON_CONTRNOTEXISTS )
+         RetVal = RetVal + "ОТСУТСТВУЕТ СОГЛАШЕНИЕ.";
+      elif (CodeReason == C_REFUND_REASON_MISMATCHFIO    )
+         RetVal = RetVal + "НАИМЕНОВАНИЕ ВЛАДЕЛЬЦА НЕ СОВПАДАЕТ С НАИМЕНОВАНИЕМ ПОЛУЧАТЕЛЯ.";
+      elif (CodeReason == C_REFUND_REASON_EXCEEDLIMITS)
+         RetVal = RetVal + "ПРЕВЫШЕНИЕ ПРЕДЕЛЬНОЙ СУММЫ ПО ИИС.";
+      elif (CodeReason == C_REFUND_REASON_INVALIDCURR )
+         RetVal = RetVal + "ВАЛЮТА ЗАЧИСЛЕНИЯ ПО ИИС ОТЛИЧНА ОТ РУБЛЕЙ.";
+      elif (CodeReason == C_REFUND_REASON_UNALLOWEDCURR )
+         RetVal = RetVal + "ПОПОЛНЕНИЕ БРОКЕРСКОГО СЧЕТА В ВАЛЮТЕ " + rec.CCY() + " НЕ ПРОИЗВОДИТСЯ.";
+      else
+         RetVal = "ВОЗВРАТ СРЕДСТВ ";
+      end;
+      RetVal = RetVal + "ПО ПЛАТ.ПОР.N "+rec.EntryNumber()+" ОТ "+string(date(rec.m_DATE):f)+" (ПОЛУЧАТЕЛЬ "+rec.m_PayeeName+", "+rec.m_AcctSend+")";
+
+      return RetVal;
+   end;
+
+   macro ВыполнитьВозврат(refundParams)
+      var stat = 0, acctrnid, paymentid;
+      if ((rec.m_State == C_ENROLL_ACTION_TRANSFERRED) or (rec.m_State == C_ENROLL_ACTION_MANUAL))
+         if ( not rslDefCon.isInTrans() )
+            rslDefCon.beginTrans();
+         end;
+         
+         stat = IIF(ValType(refundParams) == V_UNDEF, 1, 0);
+         
+         if (not stat)
+           if (ValType(rec.Partyid()) == V_UNDEF) /*Если возврат при отсутствии клиента, то клиента такого создаём*/
+             СоздатьКлиента();
+             stat = IIF(ValType(rec.Partyid()) == V_UNDEF, 1, 0);
+           end;
+         end;
+
+         if (not stat)
+            stat = MakeAdditionalTransaction(refundParams, paymentid);
+         end;
+
+         if (not stat)
+           stat = CreatePayment(refundParams, @acctrnid, @paymentid);
+         end;
+
+         if (not stat)
+            rec.m_State = C_ENROLL_ACTION_REFUNDED;
+            ClearError();
+            rec.m_Comment = refundParams.GetGround();
+            stat = СохранитьЗапись();
+         end;
+
+         if (not stat)
+            stat = ДобавитьСвязкуСПроводкой(acctrnid, paymentid);
+         end;
+
+         if (not stat)
+            if ( rslDefCon.isInTrans() )
+               rslDefCon.commitTrans();
+            end;
+         else
+            if (  rslDefCon.isInTrans() )
+               rslDefCon.rollbackTrans();
+            end;
+         end;
+      end;
+
+      if (stat)
+         SetError("Не удалось выполнить возврат " + GetErrMsg());
+      end;
+      return stat;
+
+   OnError(e)
+      if ( rslDefCon.isInTrans() )
+        rslDefCon.rollbackTrans();
+      end;
+      rec.m_State = C_ENROLL_ACTION_TRANSFERRED;
+      SetError(e.Message +"\n"+ e.Module +"\nLine:"+ e.Line);
+
+      return 1;
+   end;
+
+   // Получить код операции по ID
+   private macro GetNptxopCode(id)
+     var sql = "select t_code from dnptxop_dbt where t_id = ? ";
+     var cmd = RsdCommand(sql);
+     cmd.addParam("",RSDBP_IN,id);
+     var rs = RSDRecordSet(cmd);
+     if (rs.MoveNext())
+       return rs.Value("t_code");
+     else
+       return "";
+     end;
+   end;
+   
+   //Создание входящего документа по операции на основании данных об исходном документе из ЦФТ
+   private macro CreateSpGround()
+     var SystDate:date, SystTime:time; 
+     DtTmSplit(rec.m_SystemDate, SystDate, SystTime);
+
+     var params = MakeArray(SqlParam("p_nptxop_id",  rec.m_NptxOpID),
+                            SqlParam("p_groundkind", rec.SpGroundKind()),
+                            SqlParam("p_code",       GetNptxopCode(rec.m_NptxopID)),
+                            SqlParam("p_extcode",    rec.m_EntryNumber),
+                            SqlParam("p_partyid",    rec.SpGroundParty()),
+                            SqlParam("p_date",       SystDate),
+                            SqlParam("p_time",       SystTime),
+                            SqlParam("p_signdate",   rec.m_Date),
+                            SqlParam("p_src",        "ЦФТ"));
+
+     ExecStoredFunc("nontrading_orders_utils.create_spground", V_UNDEF, params);
+   end;
+
+   macro СоздатьОперациюЗачисления()
+     // Для переопределения в подклассах
+     SetError("Вызов функции СоздатьОперациюЗачисления не реализован в родительском классе");
+     СохранитьЗапись();
+     return 1;
+   end;
+
+   macro PushToFuncObj()
+      if (rec.m_NptxOpid > 0)
+         if (RegValReader.GetBool("РСХБ\\ИНТЕГРАЦИЯ\\НЕТОРГОВЫЕ ПОРУЧЕНИЯ\\ИСПОЛНЕНИЕ ОПЕРАЦИЙ\\ЗАЧИСЛЕНИЯ НА FUNCOBJ", false)) 
+            var categories = c_categ(rec.m_NptxOpid);
+            if (categories.Allowed())
+               FuncObjController().SaveByCode(rec.m_NptxOpid, "run_nptx_money");
+            end;
+         end;
+      end;
+   end;
+
+   macro Create() // метод для интеграции. Здесь не должно быть вложенных транзакций. Дальнейшую обработку должен проводить планировщик или вручную.
+      if (this.rec.m_EnrollID == 0)
+         if (СохранитьЗапись() != 0) // внутри транзакция
+            SetError("Не удалось сохранить запись");
+            return 1;
+         end;
+      end;
+      
+      return 0;
+   end;
+
+   macro Run() // нельзя использовать в интеграции
+      // Переопределение в дочерних классах
+      return 0;
+   end;
+
+   //BIQ-15498 запуск на выполнение
+   macro ExecuteOp()
+      var err, ErrStr;
+      var stat = 0;
+
+      if ( not rslDefCon.isInTrans() )
+         rslDefCon.beginTrans();
+      end;
+
+      stat = DL_ExecuteNptxOp(rec.m_NptxOpid, false, ErrStr);
+
+      
+      if(stat != 0 )
+         rec.m_Comment = "Зачисление № " + GetNptxopCode(rec.m_NptxOpid);
+         rec.m_Comment = Substr(rec.m_Comment + " Ошибка выполнения: "+ErrStr,1,200);
+         stat = СохранитьЗапись();
+      end;
+
+      if (not stat)
+         if ( rslDefCon.isInTrans() )
+            rslDefCon.commitTrans();
+         end;
+      else
+         if (  rslDefCon.isInTrans() )
+            rslDefCon.rollbackTrans();
+         end;
+         SetError("Не удалось создать операцию. "+ErrStr);
+      end;
+      return stat;
+
+   OnError(e)
+      if ( rslDefCon.isInTrans() )
+        rslDefCon.rollbackTrans();
+      end;
+      SetError(e.Message +"\n"+ e.Module +"\nLine:"+ e.Line);
+      СохранитьЗапись();
+      
+      return 1;
+   end;
+
+   Construct(enrollRS);
+end;
+
+class (ClientEnroll) LegalPersonClientEnroll(enrollRS) // ЮЛ
+  /**
+  @brief Дополнительная проводка для ЮЛ
+  */
+  private macro MakeAdditionalTransaction(refundParams, paymentID)
+    var transactionID = 0;
+    var stat = ВыполнитьПроводку(refundParams.creditAccount, refundParams.debitAccount, rec.m_Sum, {curdate}, rec.CurrID(), refundParams.GetGround(), @transactionID);
+    
+    if (not stat)
+      stat = ДобавитьСвязкуСПроводкой(transactionID, paymentID);
+    end;
+    
+    return stat;
+  end;
+  
+  /**
+  @brief Получить параметры возврата через UI
+  */
+  macro GetRefundParamsUI()
+    var refundParams = CEnrollRefundParams();
+    
+    var accountsSet = CurrencyAndAccountSet(REGVAL_ACCOUNTS);
+    var currencyCode = SubStr(rec.m_DebetAccount, 6, 3);
+    /*
+    if(currencyCode == "643")
+       currencyCode == "810";
+    end;
+    */
+    var account = accountsSet.get(currencyCode);
+
+    refundParams.debitAccount = account;
+    refundParams.creditAccount = rec.m_DebetAccount;
+    refundParams.currency = rec.CurrID();
+    refundParams.reason = "ОТСУТСТВУЕТ СОГЛАШЕНИЕ";
+    refundParams.reasonDoc = "ПО ПЛАТ.ПОР.N "+rec.EntryNumber()+" ОТ "+String(Date(rec.m_Date):f);
+    refundParams.receiverName = IIF(StrLen(rec.m_PayerName) <= 1, "Не определен", rec.m_PayerName);
+    refundParams.BIC = rec.m_Bic;   // DEF-108968 в параметрах возврата нужен BIC 
+    refundParams.receiverAccount = rec.m_AcctSend;
+    
+    return refundParams;
+  end;
+  
+  /**
+  @brief Получить параметры возврата по умолчанию для выполнения возврата в автоматическом режиме
+  */
+  macro GetRefundParamsDefault()
+    return null; // Возвраты в автоматическом режиме не поддерживаются
+  end;
+  
+  /**
+  @brief Создать клиента
+  */
+  private macro СоздатьКлиента()
+    var pt = rsbparty();
+
+    pt.LegalForm   = PTLEGF_INST; // 1
+    pt.ShortName   = rec.m_PayerName;
+    pt.FullName    = rec.m_PayerName;
+    pt.Code.SetCode(PTCK_INN, rec.m_PayerINN + IIF(StrLen(rec.m_PayerKPP) > 0, "/" + rec.m_PayerKPP), "");
+    pt.Update();
+    
+    if (pt.PartyId > 0)
+      rec.m_PartyId = pt.PartyId;
+      PutInProcess(SERV_CDI_FIND_ORG, rec.m_PartyId, 1, "4,5,6", "-1"); // создать событие FindOrg
+    end;
+  end;
+
+  /**
+  @brief Является ли плательщик внутренним депозитарием
+  */
+  private macro IsPayerInternalDepository()
+    return (SubStr(rec.m_DebetAccount, 1, 5) == "47422") or (SubStr(rec.m_DebetAccount, 1, 5) == "55555");
+  end;
+
+  /**
+  @brief Предварительные проверки перед созданием зачисления
+  @param[out] error Текст ошибки
+  */
+  private macro OperationPreCreationChecks(error: @String)
+    error = "";
+
+    if (not rec.ЕстьВсеДанные())
+      error = "Не найден договор БО";
+    elif (IsPayerInternalDepository())
+      // Дальше не проверяем
+    elif (rec.PayerID() == -1)
+      error = "Плательщик не определен";
+    elif (rec.PayerID() == -2)
+      error = "Найдено несколько субъектов с ИНН " + rec.m_PayerINN;
+    elif ((rec.PartyID() != rec.PayerID()) and (not ВидСубъекта(rec.PayerID(), PTK_INCOMEPAYER)))
+      error = "Плательщик третье лицо, не совпадает с получателем и не проставлен признак Плательщик доходов";
+    end;
+    
+    return (StrLen(error) == 0);
+  end;
+
+  /**
+  @brief Создать операцию зачисления
+  */
+  macro СоздатьОперациюЗачисления()
+    var stat = 0, error = "";
+        
+    if ( not rslDefCon.IsInTrans() )
+      rslDefCon.BeginTrans();
+    end;
+    
+    stat = IIF(OperationPreCreationChecks(@error), 0, 1);
+    
+    if (not stat)
+      stat = CreateNPTXOP(  rec.ServKind(),        // вид обслуживания субдоговора 1-фондовый, 21 - валютныйб 15-срочный
+                            10,                    //TYPE пока всегда 10-зачисление
+                            rec.PartyId(),         //Клиент
+                            rec.ContrId(),         //договор
+                            rec.ContrAccountId(),  //ID счета клиента
+                            rec.m_Sum,  
+                            rec.m_DebetAccountSPI, //номер счет откуда зачисляем  
+                            rec.m_PartyIdBankSPI,  //банк откуда зачисляем
+                            rec.m_Date,            //DATE
+                            rec.m_Time,            //TIME
+                            Null,                  //RUN
+                            Null,                  //SPGROUND_ID
+                            Null,                  //SPGROUND_KIND
+                            Null,                  //SPGROUND_XLD
+                            Null,                  //SPGROUND_DATE
+                            Null,                  //KIND OPERATION
+
+                            Null,                  //PLACE
+                            Null,                  //MARKET_PLACE
+                            Null,                  //MARKET_SECTOR
+                            Null,                  //PLACE2
+                            Null,                  //MARKET_PLACE2
+                            Null,                  //MARKET_SECTOR2
+
+                            rec.m_NptxOpid         //RETURN ID
+                           );
+      if (not stat)
+        rec.m_State = C_ENROLL_ACTION_CREATEDNPTXOP;
+
+        if (rec.m_IsReliable != "X")
+          stat = 1;
+          error = "Параметры операции не определены надёжно. Требуется ручное разрешение исполнения";
+        end;
+
+        var categories = c_categ(rec.m_NptxOpid);
+        categories.SetAllowed(stat == 0);
+
+        var notes = c_notes(rec.m_NptxOpid);
+        if (StrLen(error) > 1)
+          notes.SaveReject(error);
+        end;
+        notes.SaveIsAllowedEnroll(IIF(stat == 0, "Разрешено зачисление", "Запрещено зачисление"));
+
+        if (rec.SpGroundKind() != null) 
+          CreateSpGround();
+        end;
+      else
+        error = GetErrMsg();
+        if (StrLen(error) == 0)
+          error = "Ошибка создания операции зачисления (код " + stat + ")";
+        end;
+      end;
+    end;
+    
+    if ((error != rec.m_Comment) or (rec.m_State == C_ENROLL_ACTION_CREATEDNPTXOP))
+      rec.m_Comment = error;
+      if (rec.m_State == C_ENROLL_ACTION_CREATEDNPTXOP)
+        rec.m_Comment = "Зачисление № " + GetNptxopCode(rec.m_NptxopID);
+        //BIQ-15498, добавим текст ошибки
+        if (StrLen(error) > 1)
+          rec.m_Comment = rec.m_Comment + " " + error;
+        end;
+      else
+        rec.m_State = C_ENROLL_ACTION_MANUAL;
+      end;
+      stat = СохранитьЗапись();
+    end;
+    
+    if (not stat)
+      if ( rslDefCon.IsInTrans() )
+        rslDefCon.CommitTrans();
+      end;
+    else
+      if (  rslDefCon.IsInTrans() )
+        rslDefCon.RollbackTrans();
+      end;
+      SetError("Не удалось создать операцию. " + GetErrMsg());
+    end;
+    
+    return stat;
+
+  OnError(e)
+    if (rslDefCon.IsInTrans())
+      rslDefCon.RollbackTrans();
+    end;
+    rec.m_State = C_ENROLL_ACTION_MANUAL;
+    SetError(e.Message +"\n"+ e.Module +"\nLine:"+ e.Line);
+    СохранитьЗапись();
+    return 1;
+  end;
+
+  /**
+  @brief Запуск создания операции зачисления
+  @return Код ошибки (0 в случае успеха)
+  */
+  macro Run()
+    if (this.rec.m_EnrollID == 0)
+      if (СохранитьЗаписьTrn() != 0) // внутри транзакция
+        SetError("Не удалось сохранить запись");
+        return 1;
+      end;
+    end;
+
+    if ((this.rec.State() == C_ENROLL_ACTION_CREATED) or (this.rec.State() == C_ENROLL_ACTION_MANUAL))
+      if (СоздатьОперациюЗачисления() != 0) // внутри транзакция
+        // это не ошибка, если внутри что-то случилось, то ошибка сохранится на записи, но в интеграцию вернем ок
+      end;
+      PushToFuncObj();
+    end;
+    
+    return 0;
+  end;
+
+  private macro Construct(rs)
+    Rec = LegalPersonEnroll_rec(rs);
+  end;
+  
+  Construct(enrollRS);
+end;
+
+class (ClientEnroll) NaturalPersonClientEnroll(enrollRS) // ФЛ
+  /**
+  @brief Получить параметры возврата через UI
+  */
+  macro GetRefundParamsUI()
+    return GetRefundParamsDefault();
+  end;
+  
+  /**
+  @brief Получить параметры возврата по умолчанию для выполнения возврата в автоматическом режиме
+  */
+  macro GetRefundParamsDefault()
+    var refundParams = CEnrollRefundParams();
+    
+    refundParams.debitAccount = rec.m_CreditAccount;
+    refundParams.creditAccount = rec.m_DebetAccount;
+    refundParams.currency = rec.CurrID();
+    refundParams.reason = "ОТСУТСТВУЕТ СОГЛАШЕНИЕ";
+    refundParams.reasonDoc = "ПО ПЛАТ.ПОР.N "+rec.EntryNumber()+" ОТ "+String(Date(rec.m_Date):f);
+    refundParams.receiverName = IIF(StrLen(rec.m_PayerName) <= 1, "Не определен", rec.m_PayerName);
+    refundParams.BIC = rec.m_Bic;   // DEF-108968 в параметрах возврата нужен BIC 
+    refundParams.receiverAccount = rec.m_AcctSend;
+    
+    return refundParams;
+  end;
+
+  /**
+  @brief Создать клиента
+  */
+  private macro СоздатьКлиента()
+    var pt = rsbparty();
+
+    pt.LegalForm   = PTLEGF_PERSN; // 2
+    pt.FirstName   = rec.FirstName();
+    pt.Patronymic  = rec.Patronymic();
+    pt.LastName    = rec.LastName();
+    pt.IsMale      = rec.IsMale();
+    pt.paperkind   = 0;/*паспорт*/
+    pt.paperseries = rec.DocSeries();
+    pt.papernumber = rec.DocNum();
+    pt.paperissueddate = rec.DocIssued();
+    pt.shortname   = pt.LastName+" "+ substr(pt.FirstName,1,1)+". "+SubStr(pt.Patronymic,1,1)+".";
+    pt.fullname    = pt.LastName+" "+ pt.FirstName+" "+pt.Patronymic;
+    pt.Code.SetCode(1, rec.m_ClientCode);
+    Pt.Code.SetCode(101, rec.m_ClientCode);
+    pt.Update();
+    
+    if (pt.PartyId > 0)
+      rec.m_PartyId = pt.PartyId;
+    end;
+  end;
+
+  /**
+  @brief Создать операцию зачисления
+  */
+  macro СоздатьОперациюЗачисления()
+    var stat = 0, err="";
+    private var IsError = false;
+    private var DtBalance;
+    private var clear_buf, clear_name = "", prsn;
+
+    private macro CheckContrIIS(ContrID)
+      var query = "select RSI_NPTO.CheckContrIIS(?) as t_IIS from dual";
+      var queryCmd = DL_RSDCommand(query);
+      queryCmd.AddParam(ContrID);
+      var queryDS = queryCmd.Execute();
+
+      return queryDS.MoveNext() and (queryDS.IIS == 1);
+    end;
+
+    private macro CheckPartyAndAccounts()
+      /* Считается, что отправитель имеет статус "ИП" - если отправитель физическое лицо и счет начинается с 40802, 40804, 40805; 
+         получатель имеет статус "ИП", если - клиент физическое лицо, но по договору открыт в ЦФТ отдельный 306 счет, без использования сводного 
+         (наличие сводного счета устанавливается по таблице Dbrokacc_Dbt) */
+      var res = true;
+      var payer_IP = 0, payee_IP = 0;
+
+      // статус ЮЛ отправителя не проверяем, потому что для ЮЛ буферные зачисления не используются (отправитель PersonPayerDetails / LegalEntityPayerDetails анализируется в AddAccountingEntriesRequestMsg)
+      if (     (substr(rec.m_AcctSend,1,5) == "40802")
+           or  (substr(rec.m_AcctSend,1,5) == "40804")
+           or  (substr(rec.m_AcctSend,1,5) == "40805") )
+        payer_IP = 1;
+      end;
+
+      var lf = TRsbDataSet(" select t_legalform from dparty_dbt where t_partyid = " + rec.PartyId);
+      if (lf.movenext())
+        if (lf.legalform == PTLEGF_PERSN)
+          var acc = TRsbDataSet(" select count(*) cnt from Dbrokacc_Dbt where t_account = '" + rec.m_CreditAccount + "'");
+          if (acc.movenext())
+            if (acc.cnt == 0) // не сводный
+              payee_IP = 1;
+            end;
+          end;
+        end;
+      end;
+
+      if (payer_IP != payee_IP)
+        res = false;
+      end;
+
+      return res;
+    end;
+
+    if ( not rslDefCon.isInTrans() )
+      rslDefCon.beginTrans();
+    end;
+    var bosskey_1226 = false, stat1226;
+    GetRegistryValue("РСХБ\\ИНТЕГРАЦИЯ\\РУБИЛЬНИК.BOSS-1226", V_BOOL, bosskey_1226, stat1226);
+    var ContractWasFind = true;
+    // turn off definition of contract number via BOSS-1226
+    if ( bosskey_1226 )  
+      if (rec.ЕстьВсеДанные() == false)
+        // if ArgumentNumber xml-tag is empty
+        if ( (rec.m_ContrNumber == "") or (rec.m_ContrNUmber == StrFor(1)) or (ValType(rec.m_ContrNumber) == V_UNDEF) )  //DEF-76225 by technical specification 
+          // try to find contract number by another attributes
+          ContractWasFind = rec.Get_Contract_By_FIO_INN_ADDRESS_PASPORT();
+        end; 
+      end;
+    end;
+
+    if (ContractWasFind and rec.ЕстьВсеДанные()) // redefine all data again
+      stat = CreateNPTXOP(  rec.ServKind(),        // вид обслуживания субдоговора 1-фондовый, 21 - валютныйб 15-срочный
+                            10,                    //TYPE     //пока всегда 10-зачисление
+                            rec.PartyId(),         //Клиент
+                            rec.ContrId(),         //договор
+                            rec.ContrAccountId(),  //айди счета клиента
+                            rec.m_Sum,  
+                            rec.m_AcctSend,        //номер счет откуда зачисляем  
+                            ПолучитьКодСубъекта(rec.m_BIC, 3),      //бакн откуда зачисляем
+                            rec.m_Date,            //DATE
+                            rec.m_Time,            //TIME
+                            Null,                  //RUN
+                            Null,                  //SPGROUND_ID
+                            Null,                  //SPGROUND_KIND
+                            Null,                  //SPGROUND_XLD
+                            Null,                  //SPGROUND_DATE
+                            Null,                  //KIND OPERATION
+
+                            Null,                  //PLACE
+                            Null,                  //MARKET_PLACE
+                            Null,                  //MARKET_SECTOR
+                            Null,                  //PLACE2
+                            Null,                  //MARKET_PLACE2
+                            Null,                  //MARKET_SECTOR2
+
+                            rec.m_NptxOpid      //RETURN ID
+                           ); 
+      if (not stat)
+        rec.m_State = C_ENROLL_ACTION_CREATEDNPTXOP;
+
+        IsError = false;
+        // проверки BIQ-15498
+        DtBalance = substr(rec.m_DEBETACCOUNT, 1, 5);
+
+        // зачисление на ИИС в нац.валюте, кроме счетов доходов
+        // вид операции nptxop.SubKind_Operation не сверяем, так как всегда 10 (зачисление)
+        if (CheckContrIIS(rec.ContrId))
+          if (rec.CurrID() != NATCUR )
+            if ((DtBalance != "47422") and (DtBalance != "55555")) 
+              err = "Пополнение договора ИИС в валюте, отличной от рублей";
+              IsError = true;
+            end;
+          end;
+        end;
+
+        if (not IsError) // проверяем дальше
+          // совпадение ФИО плательщика и владельца договора
+          if ((DtBalance != "47422") and (DtBalance != "55555")) // BIQ-7910 зачисление дохода не проверяется
+            clear_buf = ""; clear_name = "";
+            prsn = TRsbDataSet(" select t_name1||t_name2||t_name3 clientname, t_name1||t_name2||substr(t_name3,1,instr(t_name3,' ')) clientname2 from dpersn_dbt where t_personid = " + rec.PartyId);
+            if (prsn.movenext())
+              // DEF-25095 SD8084419||543558||300931||Некорректная обработка зачислений на брокерские счета
+              clear_buf = StrSubst(StrSubst(StrUpr(rec.LastName()+rec.FirstName()+rec.Patronymic()),"Ё","Е")," ","");
+              clear_name = StrSubst(StrSubst(StrUpr(prsn.ClientName),"Ё","Е")," ","");
+              //if (valtype(clear_buf) != 6) //def-25598 для зачислений, сделанных из других банков
+              //def-42707
+              if (strlen(clear_buf) > 1)
+                if (clear_buf != clear_name)
+                  IsError = true;
+                end;
+                if (IsError)
+                  // не совпало, очистим от chr(1)
+                  clear_buf = StrSubst(clear_buf,strFor(1),"");
+                  clear_name = StrSubst(clear_name,strFor(1),"");
+                  if (clear_buf == clear_name)
+                    IsError = false;
+                  end;
+                end;
+                if (IsError)
+                  // не совпало, очистим от второго слова в отчестве
+                  clear_name = StrSubst(StrSubst(StrUpr(prsn.ClientName2),"Ё","Е")," ","");
+                  if (clear_buf == clear_name)
+                    IsError = false;
+                  end;
+                end;
+              else  // DEF-46664 пустое имя = ошибка
+                IsError = true;
+              end;
+
+              if (IsError) // не совпало совсем
+                err = "ФИО владельца договора не совпадает с ФИО плательщика";
+              end;
+            end;
+          end;
+        end;
+            
+        if (not IsError) // проверяем дальше
+          // соответствие резидентности 
+          if ( (substr(rec.m_AcctSend,1,5) == "40817") and (substr(rec.m_SfContrAcc,1,5) == "30606") )
+            IsError = true;
+            err = "Несовпадение резидентности: дебет 40817, кредит 30606";
+          elif ( (substr(rec.m_AcctSend,1,5) == "40820") and (substr(rec.m_SfContrAcc,1,5) == "30601") )
+            IsError = true;
+            err = "Несовпадение резидентности: дебет 40820, кредит 30601";
+          end;
+        end;
+
+        if ( (not IsError) and (rec.m_IsReliable != "X") )
+          IsError = true;
+          err = "Параметры операции не определены надёжно. Требуется ручное разрешение исполнения";
+        end;
+
+        var categories = c_categ(rec.m_NptxOpid);
+        categories.SetAllowed(IsError == false);
+
+        var notes = c_notes(rec.m_NptxOpid);
+        if (StrLen(err) > 1)
+          notes.SaveReject(err);
+        end;
+        notes.SaveIsAllowedEnroll(iif(IsError, "Запрещено зачисление", "Разрешено зачисление"));
+
+        if (rec.SpGroundKind() != null) 
+          CreateSpGround();
+        end;
+      else
+        err = geterrmsg();
+      end;
+         
+    else
+      if (rec.ContrId() == null)
+        err = "Не найден договор";
+      end;
+    end;
+
+    if ((err != rec.m_Comment) or (rec.m_State == C_ENROLL_ACTION_CREATEDNPTXOP))
+      rec.m_Comment = err;
+      if (rec.m_State == C_ENROLL_ACTION_CREATEDNPTXOP)
+        rec.m_Comment = "Зачисление № " + GetNptxopCode(rec.m_NptxopID);
+        //BIQ-15498, добавим текст ошибки
+        if (StrLen(err) > 1)
+          rec.m_Comment = rec.m_Comment + " " + err;
+        end;
+      end;
+      stat = СохранитьЗапись();
+    end;
+
+    if (not stat)
+      if ( rslDefCon.isInTrans() )
+        rslDefCon.commitTrans();
+      end;
+    else
+      if (  rslDefCon.isInTrans() )
+        rslDefCon.rollbackTrans();
+      end;
+      SetError("Не удалось создать операцию. "+geterrmsg());
+    end;
+    return stat;
+
+  OnError(e)
+    if ( rslDefCon.isInTrans() )
+      rslDefCon.rollbackTrans();
+    end;
+    rec.m_State = C_ENROLL_ACTION_TRANSFERRED;
+    SetError(e.Message +"\n"+ e.Module +"\nLine:"+ e.Line);
+    СохранитьЗапись();
+    return 1;
+  end;
+  
+  /**
+  @brief Выполнить проводку на 306 счет
+  */
+  private macro ВыполнитьПроводку306Т()
+      var stat = 0;
+      var TrnID = 0;
+
+      if ( not rslDefCon.isInTrans() )
+         rslDefCon.beginTrans();
+      end;
+
+      if (not stat)
+         stat = ВыполнитьПроводку(rec.DebetAccountCommon(), rec.m_CREDITACCOUNT, rec.m_Sum, rec.m_Date, rec.CurrID(), rec.m_Ground, @TrnID);
+      end;
+
+      if (not stat)
+         rec.m_State = C_ENROLL_ACTION_TRANSFERRED;
+         ClearError();
+         stat = СохранитьЗапись();
+      end;
+
+      if (not stat)
+         stat = ДобавитьСвязкуСПроводкой(TrnID);
+      end;
+
+      if (not stat)
+         if ( rslDefCon.isInTrans() )
+            rslDefCon.commitTrans();
+         end;
+      else
+         if (  rslDefCon.isInTrans() )
+            rslDefCon.rollbackTrans();
+         end;
+         rec.m_State = C_ENROLL_ACTION_CREATED;
+         SetError("Не удалось выполнить проводку на 306Т. " + geterrmsg());
+      end;
+
+      return stat;
+   OnError(e);
+      if (rslDefCon.isInTrans())
+        rslDefCon.rollbackTrans();
+      end;
+      
+      rec.m_State = C_ENROLL_ACTION_CREATED;
+      SetError("Не удалось выполнить проводку на 306Т. " + geterrmsg());
+
+      return 1;
+  end;
+
+  /**
+  @brief Запуск создания операции зачисления
+  @return Код ошибки (0 в случае успеха)
+  */
+  macro Run() // нельзя использовать в интеграции
+    if (this.rec.m_EnrollID == 0)
+      if (СохранитьЗаписьTrn() != 0) // внутри транзакция
+        SetError("Не удалось сохранить запись");
+        return 1;
+      end;
+    end;
+
+    if (this.rec.State() == C_ENROLL_ACTION_CREATED)
+      if (ВыполнитьПроводку306Т() != 0) // внутри транзакция
+            //return 1; 
+      end;
+    end;
+
+    if (this.rec.State() == C_ENROLL_ACTION_TRANSFERRED)
+      if (СоздатьОперациюЗачисления() != 0) // внутри транзакция
+        // это не ошибка, если внутри что-то случилось, то ошибка сохранится на записи, но в интеграцию вернем ок
+      end;
+      PushToFuncObj();
+    end;
+    
+    return 0;
+  end;
+
+  private macro Construct(rs)
+    Rec = NaturalPersonEnroll_rec(rs);
+  end;
+  
+  Construct(enrollRS);
+end;
+
+/*************************************************************************************/
+macro GetClientEnroll(EnrollID, NptxopID)
+  if (ValType(EnrollID) == V_UNDEF) 
+    EnrollID = 0;
+  end;
+
+  if (ValType(NptxopID) == V_UNDEF) 
+    NptxopID = 0;
+  end;
+
+  if ((EnrollID > 0) or (NptxopID > 0))
+    var sql = "select t_enrollid, t_date, t_time, nvl(t_contrnumber,chr(1)) t_contrnumber, nvl(t_entrynumber,chr(1)) t_entrynumber,nvl(t_PayeeName,chr(1)) t_PayeeName, nvl(t_clientcode,chr(1)) t_clientcode, " + 
+          "  trim(nvl(t_docnumber,chr(1))) t_docnumber, nvl(t_docissued, to_date('01010001','ddmmyyyy')) t_docissued, t_debetaccount, t_creditaccount, " +
+          "  t_sum, t_acctsend, t_bic, t_Ground, t_currcode, t_state, nvl(t_comment,chr(1)) t_comment, t_nptxopid, nvl(t_JMSMESSAGEID,chr(1)) t_JMSMESSAGEID, t_SYSTEMDATE, " +
+          "  nvl(t_LastName,chr(1)) t_LastName, nvl(t_FirstName,chr(1)) t_FirstName, nvl(t_MiddleName,chr(1)) t_MiddleName, "+
+          "  nvl(t_IsReliable,chr(0)) t_IsReliable, nvl(t_PayerName,chr(1)) t_PayerName, nvl(t_ResidenceAddress,chr(1)) t_ResidenceAddress, nvl(t_PayerINN,chr(1)) t_PayerINN, " +
+          "  nvl(t_PayerKPP, CHR(1)) t_PayerKPP, nvl(t_DocType,chr(1)) t_DocType, t_LegalForm, t_DepoPaymentDocId " +
+          "  from USR_ACC306ENROLL_DBT ";
+    if (EnrollID > 0)
+      sql = sql + " where t_EnrollID = :1 ";
+    elif (NptxopID > 0)
+      sql = sql + " where t_NptxopID = :1 ";
+    end;
+         
+    var cmd = RsdCommand(sql);
+    cmd.NullConversion = true;
+         
+    if (EnrollID > 0)
+      cmd.addParam("", RSDBP_IN, Enrollid);
+    elif (NptxopID > 0)
+      cmd.addParam("", RSDBP_IN, Nptxopid);
+    end;
+    
+    var rs = RsdRecordSet(cmd);
+    if (rs.MoveNext())
+      if ((rs.Value("t_LegalForm") == PTLEGF_INST) or (rs.Value("t_LegalForm") == PTLEGF_IP)) // ЮЛ или ИП
+        return LegalPersonClientEnroll(rs);
+      elif (rs.Value("t_LegalForm") == PTLEGF_PERSN) // ФЛ
+        return NaturalPersonClientEnroll(rs);
+      else
+        return ClientEnroll(rs);
+      end;
+    end;
+  end;
+  
+  return ClientEnroll(); // Объект базового класса, если не найдено
+end;
+
+class EnrollStarter
+   private var logger:c_logger = LoggerFactory().NewItLog("EnrollStarter").GetLogger();
+
+   macro RunEnrollById(enrollId:integer):bool
+      var locker = ClientEnrollLocker(enrollId);
+      if (locker.SetLock() == false)
+         RunError("Не установлена блокировка по зачислению");
+      end;
+
+      var enroll = GetClientEnroll(enrollId);
+
+      var err = enroll.Run();
+      locker.ReleaseLock();
+
+      return err == 0;
+   OnError(err)
+      locker.ReleaseLock();
+      logger.ErrorClob("RunEnrollById. Error. enrollId = " + enrollId, GetFullErrMsg(err));
+      return false;
+   end;
+
+   macro ExecuteOperationByEnrollId(enrollId:integer):bool
+      var locker = ClientEnrollLocker(enrollId);
+      if (locker.SetLock() == false)
+         RunError("Не установлена блокировка по зачислению");
+      end;
+
+      var enroll = GetClientEnroll(enrollId);
+
+      logger.Debug("Выполнен запуск буферного зачисления EnrollID=" + string(enrollId.EnrollID) + "; nptxopid = " + string(enroll.rec.m_NptxOpid));
+      var err = enroll.ExecuteOp();
+      locker.ReleaseLock();
+
+      return err == 0;
+   OnError(err)
+      locker.ReleaseLock();
+      logger.ErrorClob("ExecuteOperationByEnrollId. Error. enrollId = " + enrollId, GetFullErrMsg(err));
+      return false;
+   end;
+
+   macro ExecuteOperationByNptxopId(nptxopId:integer)
+      var lockName:string = string("start-enroll-operation-", nptxopId);
+      var locker = UniConcurrentLocker(lockName);
+      if (locker.Lock() == false)
+         RunError("Не установлена блокировка по зачислению");
+      end;
+
+      logger.Debug("Выполнен запуск буферного зачисления nptxopid = " + string(nptxopId));
+
+      var ErrStr:string;
+      var err = DL_ExecuteNptxOp(nptxopId, false, ErrStr);
+      if (err != 0)
+         RunError("Ошибка при исполнении буферного зачисления: " + ErrStr);
+      end;
+      locker.Unlock();
+
+      return err == 0;
+   OnError(err)
+      locker.Unlock();
+      logger.ErrorClob("ExecuteOperationByNptxopId. Error. nptxopId = " + nptxopId, GetFullErrMsg(err));
+      return false;
+   end;
+
+   macro ExecuteRefund(enrollId:integer, refundParams)
+      var locker = ClientEnrollLocker(enrollId);
+      if (locker.SetLock() == false)
+         RunError("Не установлена блокировка по зачислению");
+      end;
+
+      var enroll = GetClientEnroll(enrollId);
+
+      var expectedStateList = TArray();
+      expectedStateList(expectedStateList.size) = C_ENROLL_ACTION_TRANSFERRED;
+      enroll.validateState(expectedStateList);
+
+      var err = enroll.ВыполнитьВозврат(refundParams);
+      locker.ReleaseLock();
+
+      return err == 0;
+   OnError(err)
+      locker.ReleaseLock();
+      logger.ExecuteRefund("ExecuteRefund. Error. enrollId = " + enrollId, GetFullErrMsg(err));
+      return false;
+   end;
+
+end;
+
+/******Скроллинг******************************************************************/
+private class TFiltrCond
+   var BegDate          : date;
+   var EndDate          : date;
+   var St_Created       : bool;
+   var St_Transferred   : bool;
+   var St_CreatedNptxop : bool;
+   var St_Refunded      : bool;
+   macro Init
+      BegDate           = GetDateAfterWorkDays(date(),-100);
+      EndDate           = date();
+      St_Created        = true;
+      St_Transferred    = true;
+      St_CreatedNptxop  = false;
+      St_Refunded       = true;
+   end;
+end;
+
+private var FiltrCond = TFiltrCond();
+FiltrCond.Init();
+
+class ClientEnrollScroll
+   const K_ENTER   = 13;
+   const K_ESC     = 27;
+   const K_F3      = 317;
+   const K_F2      = 316;
+   const K_F5      = 319;
+   const K_F6      = 320;
+   const K_F7      = 321;
+   const K_F8      = 322;
+   const K_F9      = 323;
+   const K_F10     = 324;
+   const K_CTRL_R  = 18;
+   const K_ALT_P   = 281;
+   const K_ALT_F2  = 361;
+   const K_ALT_F6  = 365;
+   const K_ALT_F8  = 367;
+
+   macro m_add_column(p_ar, p_ind, p_fld, p_head, p_width, p_edit, p_dec_point)
+      p_ar.value(p_ind * 6 + 0) = p_fld;       // fieldName
+      p_ar.value(p_ind * 6 + 1) = p_head;      // header
+      p_ar.value(p_ind * 6 + 2) = p_width;     // width
+      p_ar.value(p_ind * 6 + 3) = p_edit;      // fldType (2 = FBT)
+      p_ar.value(p_ind * 6 + 4) = p_dec_point; // decPoint
+      p_ar.value(p_ind * 6 + 5) = 0;           // reserv
+   end; /* macro m_add_column() */
+
+private class(TRsbPanel) TFiltrPanel()
+      const FT_DATE =  9;
+      const FT_CHR  = 12;
+
+     var LBegDate:TRsbLabel, ,
+         FieldDate:TRsbEditField;
+/*
+          1         2         3
+ 123456789012345678901234567890123
+╔═══════════Фильтр════════════════╗
+║ За период с[00.00.0000]         ║1 
+║          по[00.00.0000]         ║2 
+║ Статусы:                        ║3 
+║ [X] Создан                      ║4 
+║ [X] Выполнен  перевод на 306Т   ║5 
+║ [X] Создана операция зачисления ║6 
+║ [X] Выполнен возврат            ║7 
+║                                 ║8 
+║                                 ║9 
+╚═════════════════════════════════╝ 
+*/                                  
+     var rows=0, control;
+     InitTRsbPanel();
+
+     SetCaption("Фильтр");
+     SetStatus("~Esc~ Выход ~F2~ Применить");
+     SetSize(28, 10);
+     SetPosition(45,10);
+
+     rows = rows + 1;                               //║ За период с[00.00.0000]         ║1 
+     LBegDate = TRsbLabel(2, rows, "За период с");
+     addLabel(LBegDate);                 	
+    
+     FieldDate = TRsbEditField(FT_DATE);
+     FieldDate.setPosition(14,rows);
+     FieldDate.setSize(10,1);
+     FieldDate.Name = "BegDate";
+     FieldDate.value = FiltrCond.BegDate;
+     addControl(FieldDate);
+
+     rows = rows + 1;                               //║          по[00.00.0000]         ║2 
+     FieldDate = TRsbEditField(FT_DATE);
+     FieldDate.setPosition(14,rows);
+     FieldDate.setSize(10,1);
+     FieldDate.Name = "EndDate";
+     FieldDate.value = FiltrCond.EndDate;
+     addControl(FieldDate);
+
+     rows = rows + 1;                               //║ Статусы:                        ║3 
+     addLabel(TRsbLabel(1, rows, "Статусы:"));
+
+     rows = rows + 1;                               //║ [X] Создан                      ║4 
+     control = TRsbCheckBox(1);                    
+     control.name = "St_Created";
+     control.dataType = FT_CHR;
+     control.setPosition(3, rows);
+     control.checked = FiltrCond.St_Created;
+     addControl(control);
+     addLabel(TRsbLabel(5, rows, "Создан"));
+
+     rows = rows + 1;                               //║ [X] Выполнен  перевод на 306Т   ║5 
+     control = TRsbCheckBox(1);
+     control.name = "St_Transferred";
+     control.dataType = 12; /*FT_CHR*/
+     control.setPosition(3, rows);
+     control.checked = FiltrCond.St_Transferred;
+     addControl(control);
+     addLabel(TRsbLabel(5, rows, "Выполнен перевод на 306Т"));
+
+     rows = rows + 1;                               //║ [X] Создана операция зачисления ║6 
+     control = TRsbCheckBox(1);
+     control.name = "St_CreatedNptxop";
+     control.dataType = 12; /*FT_CHR*/
+     control.setPosition(3, rows);
+     control.checked = FiltrCond.St_CreatedNptxop;
+     addControl(control);
+     addLabel(TRsbLabel(5, rows, "Создана операция зачисления"));
+
+     rows = rows + 1;                               //║ [X] Выполнен возврат            ║7 
+     control = TRsbCheckBox(1);
+     control.name = "St_Refunded";
+     control.dataType = 12; /*FT_CHR*/
+     control.setPosition(3, rows);
+     control.checked = FiltrCond.St_Refunded;
+     addControl(control);
+     addLabel(TRsbLabel(5, rows, "Выполнен возврат"));
+     rows = rows + 1;
+     
+     addEventHandler(RSB_EV_KEY_PRESSED, R2M(this, "KeyEvent"));//KeyEvent
+     
+     macro KeyEvent(RsbEvent:Object)
+        var focusedControl;
+       
+        if (rsbEvent.KeyCode == 27)//ESC
+           this.Close(rsbEvent.KeyCode);
+        elif ((rsbEvent.KeyCode == 316) or (rsbEvent.KeyCode == 323))//F2 or F9
+           FiltrCond.BegDate          = getControl("BegDate"         ).value;
+           FiltrCond.EndDate          = getControl("EndDate"         ).value;
+           FiltrCond.St_Created       = getControl("St_Created"      ).checked;
+           FiltrCond.St_Transferred   = getControl("St_Transferred"  ).checked;
+           FiltrCond.St_CreatedNptxop = getControl("St_CreatedNptxop").checked;
+           FiltrCond.St_Refunded      = getControl("St_Refunded"     ).checked;
+           Close(rsbEvent.KeyCode);
+        elif (rsbEvent.KeyCode == 317)//F3
+           focusedControl = this.focusedControl();
+           if(focusedControl.Name == "BegDate")
+              FiltrCond.BegDate = GetDateByCalendar(FiltrCond.BegDate);
+              getControl("BegDate").Value = FiltrCond.BegDate;
+           elif(focusedControl.Name == "EndDate")
+              FiltrCond.EndDate = GetDateByCalendar(FiltrCond.EndDate);
+              getControl("EndDate").Value = FiltrCond.EndDate;
+           end;
+         end;
+      end;
+   end;
+
+   private macro MassEnrollExecution(whereCondition)
+      var query = "select t_enrollid from USR_ACC306ENROLL_DBT where " + whereCondition;
+      var nrecs = SQL_GetNRecs(query);
+      var enroll;
+     
+      if (nrecs == 0)
+        msgbox("Нет подходящих записей");
+      else
+         InitProgress(nrecs, "Создание зачислений");
+         var cmd = RSDCommand(query);
+         var rs1 = RsdRecordSet(cmd);
+         var i = 0;
+        
+         var starter = EnrollStarter();
+         while (rs1.movenext())
+            starter.RunEnrollById(rs1.Value("t_enrollid"));
+            UseProgress(i = i + 1);
+         end;
+         
+         RemProgress();        
+      end;
+   end;
+
+   macro Run
+      private var SaveNum=0;
+      private var sql_scr, cmd_scr, rs_scr, nrecs=0,i=0;
+      private var sql_main  = "";
+      private var sql_filtr = "";
+      private var sql_order = "";
+
+      private macro getSQlFiltr()
+         return " and t_date between "+GetSQLDate(FiltrCond.BegDate)+ " and " + GetSQLDate(FiltrCond.EndDate) 
+                + " and t_state in (" +
+                                    iif (FiltrCond.St_Created      , string(C_ENROLL_ACTION_CREATED)      ,"-1") + ", " +
+                                    iif (FiltrCond.St_Transferred  , string(C_ENROLL_ACTION_TRANSFERRED)  ,"-1") + ", " +
+                                    iif (FiltrCond.St_CreatedNptxop, string(C_ENROLL_ACTION_CREATEDNPTXOP),"-1") + ", " +
+                                    iif (FiltrCond.St_Refunded     , string(C_ENROLL_ACTION_REFUNDED)     ,"-1") + 
+                                   ") " ;
+      end;
+
+      macro EvProcMain(rs,cmd,id,key)
+         var  CM_DEFAULT = null;
+         var cmd1, rs1, col_ar = TArray(), col_num = -1,Enroll;
+         var starter = EnrollStarter();
+
+         if (cmd == DLG_INIT)
+            /*Позиционируемся*/
+            if(SaveNum > 0)
+               while(rs.movenext)
+                  if(SaveNum == rs.value("t_enrollid"))
+                     GoToScroll(rs);
+                     break;
+                  end;
+               end;
+            end;
+         elif ((cmd == DLG_KEY)and(key == K_ENTER))/*показать текст комментария/ошибки*/
+            msgbox(rs.value("t_comment"));
+         elif ((cmd == DLG_KEY)and(key == K_F2))
+            SaveNum = rs.value("t_enrollid");
+            if (starter.RunEnrollById(rs.Value("t_enrollid")) == false)
+               MsgBox("Не удалось испольовать зачисление. Повторите попытку позже");
+            end;
+
+            return CM_SELECT;
+         elif ((cmd == DLG_KEY)and(key == K_F3))
+
+         elif ((cmd == DLG_KEY)and(key == K_F5))/*фильтр*/
+            var FiltrPanel = TFiltrPanel();
+            FiltrPanel.Run();
+            sql_filtr =  getSQLFiltr();
+            return CM_SELECT;
+         elif ((cmd == DLG_KEY)and(key == K_F8)) /*Выполнить возврат*/
+            if ((rs.value("t_State") == C_ENROLL_ACTION_TRANSFERRED) or (rs.Value("t_State") == C_ENROLL_ACTION_MANUAL))
+               if (GetTrue(false, "Выполнить возврат средств клиенту?"))
+                  Enroll = GetClientEnroll(rs.Value("t_enrollid"));
+                  var refundParams = Enroll.GetRefundParamsUI();
+                  var refundParamsForm = CEnroll_RefundForm();
+                  refundParamsForm.refundParams = refundParams;
+                  
+                  if (refundParamsForm.Run() and (starter.ExecuteRefund(rs.Value("t_enrollid"), refundParamsForm.refundParams)))
+                     MsgBox("Возврат выполнен");
+                  else
+                     MsgBox("Не удалось выполнить возврат");
+                  end;
+                  
+                  SaveNum = rs.value("t_enrollid");
+                  return CM_SELECT;
+               end;
+            else
+               msgbox("Возврат можно выполнить только по зачислениям в статусах\n \"Выполнен перевод на 306Т\" и \"Ожидает ручного разбора\"");
+            end;
+         elif ((cmd == DLG_KEY) and (key == K_F9) and (rs.Value("t_State") == C_ENROLL_ACTION_MANUAL))
+            var INNValue = rs.Value("t_PayerINN");
+            
+            if (StrLen(INNValue) == 12)
+              MsgBox("Операция невозможна. Принадлежность плательщик доходов возможно проставить только на юридическом лице");
+              return CM_DEFAULT;
+            elif (GetTrue(false, "Добавить данному субъекту принадлежность \"Плательщик доходов\"?"))
+              var payerID = FindPartyByINN(INNValue);
+              var payer = null;
+              
+              if (payerID > 0)
+                payer = RsbParty(payerID);
+              elif (payerID == TOO_MUCH_RECORDS)
+                // Записать ошибку (ниже)
+              elif (GetTrue(false, "Субъект не найден. Добавить из реквизитов зачисления?"))
+                var form = CEnroll_NewPartyForm();
+                form.params.PartyName = rs.Value("t_PayerName");
+                form.params.PartyINN = INNValue;
+                form.params.partyKPP = rs.Value("t_PayerKPP");
+
+                if (form.Run())
+                  payer = RsbParty(form.params.partyID);
+                  INNValue = form.params.PartyINN;
+                  PutInProcess(SERV_CDI_FIND_ORG, form.params.partyID, 1, "4,5,6", "-1"); // создать событие FindOrg
+                else
+                  return CM_DEFAULT;
+                end;
+              else
+                return CM_DEFAULT;
+              end;
+              
+              var error = "";
+              if (payerID == TOO_MUCH_RECORDS)
+                error = "Найдено несколько субъектов с ИНН " + INNValue + ". Продолжение невозможно";
+              elif (ValType(payer) == V_UNDEF)
+                error = "Плательщик не найден и не создан";
+              elif ((not payer.IsOwned(PTK_INCOMEPAYER)) and ((not payer.AddOwn(PTK_INCOMEPAYER)) or (not payer.Update())))
+                error = "Ошибка установки принадлежности \"Плательщик доходов\"";
+              end;
+              
+              payer = null;
+              if (StrLen(error) > 0)
+                MsgBox(error);
+              elif (GetTrue(false, "Провести массовое зачисление по данному плательщику?"))
+                MassEnrollExecution("t_State in (" + String(C_ENROLL_ACTION_CREATED) + ", " + String(C_ENROLL_ACTION_MANUAL)+") and t_PayerINN = '" + INNValue + "'");
+                return CM_SELECT;
+              end;
+            end;
+            
+            return CM_DEFAULT;
+         elif ((cmd == DLG_KEY)and(key == K_F10))
+            SaveNum = rs.value("t_enrollid");
+            MassEnrollExecution("t_State = " + String(C_ENROLL_ACTION_MANUAL) + " ");
+            return CM_SELECT;
+         elif ((cmd == DLG_KEY)and(key == K_CTRL_R))/*обновить*/
+            SaveNum = rs.value("t_enrollid");
+            if ((ValType(SaveNum) == V_UNDEF) or (ValType(SaveNum) == 26))
+               SaveNum = 0;
+            end;
+            return CM_SELECT;
+         elif ((cmd == DLG_KEY)and(key == K_ALT_P))
+            //cmd1 = " select t_paymentid from dpmdocs_dbt where t_acctrnid in (select t_acctrnid from usr_acc306enroll_trn_dbt where t_enrollid = ?)";
+            cmd1 = " select t_paymentid from usr_acc306enroll_trn_dbt where t_enrollid = ? and t_paymentid <> 0";
+            cmd1 = RSDCommand(cmd1);
+            cmd1.addParam("",RSDBP_IN, rs.Value("t_enrollid"));
+            rs1 = RsdRecordSet(cmd1);
+            if (rs1.movenext())
+               var PaymentObj = RsbPayment(rs1.value("t_paymentid"));
+               PM_ProcessPanel(PaymentObj, 0, null, null, null, null, null, null, null, null, null, null, null, 4);
+            end;
+         elif ((cmd == DLG_KEY)and(key == K_ALT_F2))
+            SaveNum = rs.value("t_enrollid");
+            MassEnrollExecution("t_State in (" + String(C_ENROLL_ACTION_CREATED) + ", " + String(C_ENROLL_ACTION_TRANSFERRED)+") ");
+            return CM_SELECT;
+         elif ((cmd == DLG_KEY)and(key == K_ALT_F8))
+            cmd1 = " select t_enrollid from USR_ACC306ENROLL_DBT where t_State in ("+string(C_ENROLL_ACTION_TRANSFERRED)+")";
+            nrecs = SQL_GetNRecs(cmd1);
+            if (nrecs == 0)
+               msgbox("Нет подходящих записей");
+            else
+               InitProgress(nrecs, "Выполнение возвратов");
+               cmd1 = RSDCommand(cmd1);
+               rs1 = RsdRecordSet(cmd1);
+               i = 0;
+               while (rs1.movenext())
+                  Enroll = null;
+                  Enroll = GetClientEnroll(rs1.Value("t_enrollid"));
+                  Enroll.ВыполнитьВозврат(Enroll.GetRefundParamsDefault());
+                  UseProgress(i=i+1);
+               end;
+               RemProgress;
+               SaveNum = rs.value("t_enrollid");
+               return CM_SELECT;
+            end;
+         elif ((cmd == DLG_KEY)and(key == K_ALT_F6))
+            cmd1 = " select row_number() over (order by t_stepid) num, T_DATE_CARRY, trn.t_account_payer, trn.t_account_receiver, trn.t_sum_payer, t_ground," + 
+                       " /*(select t_paymentid from dpmdocs_dbt where t_acctrnid = trn.t_acctrnid)*/ t.t_paymentid "
+                       " from USR_ACC306ENROLL_TRN_DBT t, dacctrn_dbt trn WHERE T_ENROLLID = :1 and trn.t_acctrnid = t.t_acctrnid ORDER BY T_STEPID ";
+            cmd1 = RSDCommand(cmd1);
+            cmd1.addParam("",RSDBP_IN, rs.Value("t_enrollid"));
+            rs1 = RSDRecordset(cmd1 , null, RSDVAL_STATIC );
+
+            m_add_column(col_ar, col_num=col_num+1, "num",       "№", 3,false,0); 
+            m_add_column(col_ar, col_num=col_num+1, "T_DATE_CARRY",       "Дата",         10); 
+            m_add_column(col_ar, col_num=col_num+1, "t_account_payer", "Дебет",22); 
+            m_add_column(col_ar, col_num=col_num+1, "t_account_receiver", "Кредит",22); 
+            m_add_column(col_ar, col_num=col_num+1, "t_sum_payer", "Сумма",12); 
+            m_add_column(col_ar, col_num=col_num+1, "t_ground", "Назначение",25); 
+            m_add_column(col_ar, col_num=col_num+1, "t_paymentid", "ID платежа",12,0,0); 
+
+            if (RunScroll (rs1,col_num+1,col_ar,"","EvProc2", "", "ESC - выход"/*, true, 7, 5, 100, 30*/))
+            end;
+
+         elif ((cmd == DLG_KEY)and(key == K_F6))
+            cmd1 = "  select row_number() over (order by t_stepid) num, T_DATE, to_char(T_SYSTEMDATE,'dd.mm.yyyy hh24:mi:ss') t_systemdate, " + 
+                       " decode(T_ACTION,0,'Создана',1,'На 306Т',2,'Создано зачисление',3,'Возврат',4,'Удалена',5, 'Ошибка') T_ACTION, T_COMMENT, T_OPER, T_STEPID  " + 
+                       " from USR_ACC306ENROLL_STEP_DBT WHERE T_ENROLLID = :1 ORDER BY T_STEPID";
+            cmd1 = RSDCommand(cmd1);
+            cmd1.addParam("",RSDBP_IN, rs.Value("t_enrollid"));
+            rs1 = RSDRecordset(cmd1 , null, RSDVAL_STATIC );
+            
+            m_add_column(col_ar, col_num=col_num+1, "num",       "№", 3,false,0); 
+            m_add_column(col_ar, col_num=col_num+1, "T_DATE",       "Дата",         10); 
+            m_add_column(col_ar, col_num=col_num+1, "T_SYSTEMDATE", "Системная дата",18); 
+            m_add_column(col_ar, col_num=col_num+1, "T_ACTION",     "Действие",     13); 
+            m_add_column(col_ar, col_num=col_num+1, "T_COMMENT",    "Комментарий",  25); 
+            m_add_column(col_ar, col_num=col_num+1, "T_OPER",       "Операционист", 5); 
+            m_add_column(col_ar, col_num=col_num+1, "T_STEPID",     "ID",           5); 
+
+            if (RunScroll (rs1,col_num+1,col_ar,"","EvProc2", "", "ESC - выход", true, 7, 5, 95, 30))
+            end;
+
+         elif ((cmd == DLG_KEY)and(key == K_ESC))
+            return 2;
+         end;
+
+         return CM_DEFAULT;
+      end;
+
+      /* точка входа скроллинг */
+
+      var col_ar = TArray();
+      col_ar.size = 0;
+      var col_num = -1;
+
+      sql_main =  "SELECT t_enrollid, t_date, to_char(t_time,'hh24:mi:ss') t_time, nvl(t_contrnumber, chr(1)) t_contrnumber, t_PayeeName, t_PayerName, t_debetaccount, t_creditaccount, t_acctsend, t_State, t_sum, t_currcode, " +
+                  "       nvl(t_comment,' ') t_comment, t_nptxopid, t_JMSMESSAGEID, t_ground, t_IsReliable, t_PayerINN, nvl(t_PayerKPP, chr(1)) t_PayerKPP, nvl(t_residenceAddress, chr(1)) t_residenceAddress, t_DocType, " +
+                  "       decode(t_state,-1,'Ожидает ручного разбора'," +
+                                         "0,'Создана'," +
+                                         "1,'Выполнен перевод на 306Т'," +
+                                         "2,'Создана операция зачисления'," +
+                                         "3,'Выполнен возврат'," +
+                                         "4,'Удалена'," +
+                                         "5,'Ошибка') t_statename, " +
+                  "       decode(t_legalForm, 1, 'ЮЛ', " +
+                                             "2, 'ФЛ', " +
+                                             "3, 'ИП', " +
+                                             "'Не определена') t_legalFormName" +
+                  "  FROM USR_ACC306ENROLL_DBT WHERE 1=1 ";
+      sql_order = " ORDER BY t_enrollid desc";
+      sql_filtr = getSQlFiltr();
+      sql_scr = sql_main + sql_filtr + sql_order;
+
+      cmd_scr = RSDCommand(sql_scr);
+      cmd_scr.NullConversion = true;
+
+      rs_scr = RSDRecordSet(cmd_scr, RSDVAL_CLIENT, RSDVAl_STATIC);
+      rs_scr.NullConversion = true;
+
+      m_add_column(col_ar, col_num=col_num+1, "T_ENROLLID",         "ID",              4); 
+      m_add_column(col_ar, col_num=col_num+1, "T_DATE",             "Дата",           10); 
+      m_add_column(col_ar, col_num=col_num+1, "T_TIME",             "Время",          10); 
+      m_add_column(col_ar, col_num=col_num+1, "T_CONTRNUMBER",      "Номер договора", 12);
+      m_add_column(col_ar, col_num=col_num+1, "t_PayerName",        "Плательщик",     25);
+      m_add_column(col_ar, col_num=col_num+1, "t_PayeeName",        "Получатель",     25);
+      m_add_column(col_ar, col_num=col_num+1, "T_DEBETACCOUNT",     "Дебет",          20);
+      m_add_column(col_ar, col_num=col_num+1, "T_CREDITACCOUNT",    "Кредит",         20);
+      m_add_column(col_ar, col_num=col_num+1, "T_SUM",              "Сумма",          10);
+      m_add_column(col_ar, col_num=col_num+1, "T_CURRCODE",         "Валюта",          5);
+      m_add_column(col_ar, col_num=col_num+1, "T_STATENAME",        "Статус",         18);
+      m_add_column(col_ar, col_num=col_num+1, "T_ACCTSEND",         "Счет плательщика", 20);
+      m_add_column(col_ar, col_num=col_num+1, "T_COMMENT",          "Комментарий",    20);
+      m_add_column(col_ar, col_num=col_num+1, "T_GROUND",           "Назначение",      5);
+      m_add_column(col_ar, col_num=col_num+1, "t_PayerINN",         "ИНН",	          10);
+      m_add_column(col_ar, col_num=col_num+1, "t_PayerKPP",         "КПП",	          10);
+      m_add_column(col_ar, col_num=col_num+1, "t_ResidenceAddress", "Адрес",          10);
+      m_add_column(col_ar, col_num=col_num+1, "t_legalFormName",    "Форма субъекта", 10);
+      m_add_column(col_ar, col_num=col_num+1, "t_IsReliable",       "Надежно опр.",   10);
+      m_add_column(col_ar, col_num=col_num+1, "T_JMSMESSAGEID",     "JMSMESSAGEID",   10);
+      m_add_column(col_ar, col_num=col_num+1, "T_NPTXOPID",         "NPTXOPID",       10);
+
+         while(RunScroll(rs_scr, col_num+1, col_ar, "cw_hist_list", "EvProcMain", "", "ESC - выход  F2 - выполнить F5 - фильтр F6 - история действий F8 - возврат F9 - уст.призн.плат.дохода F10 - массовое зачисление Alt+F6 - проводки  Alt+P - платеж по возврату Alt-F2 - массово выполнить Alt+F8 - массовый возврат")) //, true/*, 7, 5, NULL, 40*/))
+         /* Обновляем скроллинг */
+            cmd_scr.close(); cmd_scr = NULL;
+            rs_scr.close(); rs_scr = NULL;
+
+            sql_scr = sql_main + sql_filtr + sql_order;
+
+            cmd_scr = RSDCommand(sql_scr);
+            cmd_scr.NullConversion = true;
+
+            rs_scr = RSDRecordSet(cmd_scr, RSDVAL_CLIENT, RSDVAl_STATIC);
+         end;
+
+      rs_scr.close();
+   end;  
+end;
+
+Macro usr_CreateNPTXOP(enrollRec,
+                       PaymentId:@integer,
+                       Error:@string)
+  var Enroll;
+  
+  if (enrollRec.m_LegalForm == PTLEGF_PERSN)
+    Enroll = NaturalPersonClientEnroll();
+  elif ((enrollRec.m_LegalForm == PTLEGF_INST) or (enrollRec.m_LegalForm == PTLEGF_IP))
+    Enroll = LegalPersonClientEnroll();
+  else
+    Enroll = ClientEnroll();
+  end;
+
+  Enroll.rec.m_JMSMessageID = enrollRec.m_JMSMessageID;
+  Enroll.rec.m_ContrNumber  = enrollRec.m_ContrNumber;
+  Enroll.rec.m_EntryNumber  = enrollRec.m_EntryNumber;
+  Enroll.rec.m_PayeeName    = enrollRec.m_PayeeName;
+  Enroll.rec.m_ClientCode   = enrollRec.m_ClientCode;
+  Enroll.rec.m_DocNumber    = enrollRec.m_DocNumber;
+  Enroll.rec.m_DocIssued    = enrollRec.m_DocIssued;
+  Enroll.rec.m_Date         = enrollRec.m_Date;
+  Enroll.rec.m_Time         = enrollRec.m_Time;
+  Enroll.rec.m_DebetAccount = enrollRec.m_DebetAccount;
+  Enroll.rec.m_CreditAccount= enrollRec.m_CreditAccount;
+  Enroll.rec.m_Sum          = enrollRec.m_Sum;
+  Enroll.rec.m_CurrCode     = enrollRec.m_CurrCode;
+  Enroll.rec.m_AcctSend     = enrollRec.m_AcctSend;
+  Enroll.rec.m_BIC          = enrollRec.m_BIC;
+  Enroll.rec.m_Ground       = enrollRec.m_Ground;
+  Enroll.rec.m_LastName     = enrollRec.m_LastName;
+  Enroll.rec.m_FirstName    = enrollRec.m_FirstName;
+  Enroll.rec.m_MiddleName   = enrollRec.m_MiddleName;
+  Enroll.rec.m_IsReliable   = enrollRec.m_IsReliable;
+  Enroll.rec.m_PayerINN     = enrollRec.m_PayerINN;
+  Enroll.rec.m_PayerKPP     = enrollRec.m_PayerKPP;
+  Enroll.rec.m_ResidenceAddress= enrollRec.m_ResidenceAddress;
+  Enroll.rec.m_PayerName    = enrollRec.m_PayerName;
+  Enroll.rec.m_DocType      = enrollRec.m_DocType;
+  Enroll.rec.m_LegalForm    = enrollRec.m_LegalForm;
+  Enroll.rec.m_DepoPaymentDocId = enrollRec.m_DepoPaymentDocId;
+
+  if (Enroll.Create() == 0)
+    PaymentId = Enroll.rec.m_EnrollID;
+    return 0;
+  else
+    Error = Enroll.rec.m_Comment;
+    return 1;
+  end;             
+end;

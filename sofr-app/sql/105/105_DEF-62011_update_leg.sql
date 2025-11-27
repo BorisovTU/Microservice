@@ -1,0 +1,2 @@
+--Исправление количества цб в сделке, введённой при переносе данных из сторонней системы
+update ddl_leg_dbt leg set leg.t_principal = 120002 where leg.t_dealid = (select t_dealid from ddl_tick_dbt where t_dealcode = 'LSEB/BO17/01')/

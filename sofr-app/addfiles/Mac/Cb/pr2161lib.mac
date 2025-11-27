@@ -1,0 +1,870 @@
+ /*
+ $Name: pr2161lib.mac
+ $Module: Ядро Banking
+ $Description: Библиотека для печати МО по ф. 2161-У
+ */
+
+import FIInter, globals, likepy, oralib, CTInter, prpm, PaymInter, "pmsummo.mac", "or_srt_h.mac", SPInter;
+
+/*Главы счетов*/
+private const CHAPT1 = 1,    // Глава А - баланс
+              CHAPT5 = 5;    // Глава Д - счета депо
+
+private const SET_CHAR = "X",
+              SP_DEPOPER_UNIVOPERATION = 800;
+
+//======================================================================================================
+// Вспомогательные функции
+//======================================================================================================
+private macro РублевыйЭквивалентПроводки( S1:money, FI1:integer, S2:money, FI2:integer, MinTurn:string, Dt:date )
+
+  var SR1 = S1, SR2 = S2;
+
+  if( FI1 != 0/*NATCUR*/ )
+    ConvSumCross( SR1, S1, Dt, FI1, 0/*NATCUR*/ );
+  end;
+  if( FI2 != 0/*NATCUR*/ )
+    ConvSumCross( SR2, S2, Dt, FI2, 0/*NATCUR*/ );
+  end;
+
+  if( ( ( FI1 != 0/*NATCUR*/) and ( FI2 != 0/*NATCUR*/) ) or ( MinTurn != "" ) )
+    return min( SR1, SR2 );
+  end;
+  return IfThenElse( FI1 == 0/*NATCUR*/, SR1, SR2 );
+end;
+
+/* Группировка простых проводок по мультивалютной */
+// сформировать строку из проводки по формату "Дт Кт IDпроводки"
+private macro MakeCarryString( Дт:string, Кт:string, ID:integer )
+  return string( string(Дт), " ", string(Кт), " ", string(ID) );
+end;
+// реквизиты проводки по строке "Дт Кт IDпроводки"
+private macro СчетСтороныПроводки( carrystr:string, side:integer ):string
+  var arr:TArray = split( carrystr, " " );
+  return string(arr[side]);
+end;
+private macro IDПроводки( carrystr:string ):integer
+  var arr:TArray = split( carrystr, " " );
+  return int(arr[2]);
+end;
+private macro find_account( arr:TArray, acc:string ):bool
+  var i:integer = 0;
+  while( i < arr.size )
+    if( arr[i].Счет() == acc )
+      return true;
+    end;
+    i = i + 1;
+  end;
+  return false;
+end;
+
+private macro СортировкаПоДебетуГруппы( Group1:TArray, Group2:TArray ):integer
+  if  ( Group1[0] < Group2[0] ) return -1;
+  elif( Group1[0] > Group2[0] ) return  1;
+  end;
+  return 0;
+end;
+
+//======================================================================================================
+// Классы 
+//======================================================================================================
+
+PRIVATE CLASS СторонаПроводки( _Account:string, _FIID:integer, _Chapter:integer, _Amount:money, _Side:integer, _AmountRub:money, 
+                               _IsDepo:bool, _AccTrnID:integer )
+
+  private var m_Name         : string ,// Наименование счета
+              m_Account      : string ,// Номер счета
+              m_AmountCur    : money  ,// Сумма в валюте счета
+              m_AmountRub    : money  ,// Сумма в рублях по основному курсу
+              m_Sum          : money  ,// acctrn.Sum_Payer или acctrn.Sum_Receiver
+              m_Side         : integer,// Сторона (PRT_Debet/PRT_Credit)
+              m_FIID         : integer,// Валюта счета
+              m_err          : integer,// ошибка
+              m_IsDepo       : bool   ,// проводка по счетам депо
+              m_AccTrnID     : integer;
+
+  MACRO СторонаСчета()
+    return m_Side;
+  END;
+
+  MACRO Счет()
+    return m_Account;
+  END;
+
+  MACRO ВалютаСчета()
+    record fi( "fininstr.dbt", "bank.def" );
+    private var RegCur = true, stat = 0;
+    GetRegistryValue( "COMMON\\ПЕЧАТЬ\\ОРДЕР\\КОД_ВАЛЮТЫ", V_BOOL, RegCur, stat );
+    if( ( stat == 0 ) and ( RegCur == false ) )
+      return "";
+    elif( m_FIID >= 0 )
+      if( ПолучитьФинИн( m_FIID, fi ) == 0 )
+        return fi.Ccy;
+      else
+        MsgBox( "Не найдена валюта" );
+        return -1;
+      end;
+    end;
+    return 0;
+  END;
+
+  MACRO FIID()
+    return m_FIID;
+  END;
+
+  MACRO СуммаРуб( onDate:date )
+
+    if( ( m_AmountRub == $0 ) and ( m_FIID != 0 ) and ( m_AmountCur != $0 ) and not m_err )
+      m_err = IfThenElse( ConvSumCross( m_AmountRub, m_AmountCur, onDate, m_FIID, 0/*NATCUR*/ ), 0, 1 );
+      if( m_err )
+        m_AmountRub = $0;
+        DisplayError();
+      end;
+    end;
+    return m_AmountRub;
+  END;
+
+  MACRO Sum() : money
+    return m_Sum;
+  END;
+
+  PRIVATE MACRO СуммаЦифрами( Sum:money )
+    private var str = string( Sum:f ), isDigit = TRUE, stat = 0;
+    GetRegistryValue( "COMMON\\ПЕЧАТЬ\\ОРДЕР\\ДРОБНАЯ_ЧАСТЬ_ЦИФРАМИ", V_BOOL, isDigit, stat );
+    if( stat != 0 )
+      isDigit = TRUE;
+    end;                                    
+    if( ( isDigit == FALSE ) AND ( SubStr( str, strlen( str ) - 2 ) == "-00" ) )
+      str = SubStr( str, 1, strlen( str ) - 3 ) + "=  ";
+    end;
+    return str;
+  END;
+
+  PRIVATE MACRO AmountRubStr(onDate:date, WhithAmountRub:bool):string
+    return IfThenElse( WhithAmountRub                          , СуммаЦифрами( СуммаРуб( onDate ) ), "" ); 
+  END;
+
+  PRIVATE MACRO AmountCurStr( WhithAmountCur:bool ):string
+    return IfThenElse( WhithAmountCur and ( m_AmountCur != $0 ), СуммаЦифрами( m_AmountCur )       , "" );
+  END;
+
+  PRIVATE MACRO CurrencyStr( WhithAmountCur:bool ):string
+    return IfThenElse( WhithAmountCur and ( m_AmountCur != $0 ), ВалютаСчета()                     , "" );
+  END;
+
+  PRIVATE MACRO GetNominalAndCurrStrings(FI_Kind : integer, AvoirKind : integer, nominal_str : @string, curr_str : @string)
+    nominal_str = ""; 
+    curr_str = "";
+    FILE avrkinds ("avrkinds") key 0;
+    FILE certif("certif") key 0;
+    record fi("fininstr");
+    ClearRecord(fi);
+    avrkinds.FI_Kind = FI_Kind;
+    avrkinds.AvoirKind = AvoirKind;
+    if( GetEQ(avrkinds) and (avrkinds.IsIndividual == SET_CHAR) and (m_Sum == $1) )
+      var nominal : money = $0, nom_fiid : integer = 0;
+      var query = "select certif.t_autokey " +
+                  "  from dcertif_dbt certif, dcertmove_dbt certmove, dpmpaym_dbt pmpaym, dpmdocs_dbt pmdocs " +
+                  " where certif.t_Department = pmpaym.t_Department " +
+                  "   and pmpaym.t_PaymentID = pmdocs.t_PaymentID " +
+                  "   and pmdocs.t_AccTrnID = " + m_AccTrnID +
+                  "   and certif.t_XID = certmove.t_XID " +
+                  "   and certmove.t_PaymTo = pmpaym.t_PaymentID ";
+      var rs = execSQLselect(query);
+      if( rs and rs.moveNext() )
+        certif.AutoKey = rs.value("t_AutoKey");
+        if( GetEQ(certif) and (GetNominalValueCertOneFI(certif, nominal, nom_fiid) == 0) )
+          nominal_str = СуммаЦифрами( nominal );
+          if( ПолучитьФинИн (nom_fiid, fi) == 0 )
+            curr_str = fi.Ccy;
+          else
+            msgbox("Не найден финансовый инструмент: ", nom_fiid);
+          end;
+        end;
+      end;
+    end;
+
+  END;
+
+  PRIVATE MACRO MakeSumDepoStrings(sum_str : @string, nominal_str : @string, curr_str : @string)
+    
+    sum_str = nominal_str = curr_str = "";
+
+    record fi("fininstr");
+    ClearRecord(fi);
+    if(m_Side != PRT_Credit)
+      if( ПолучитьФинИн (m_FIID, fi) == 0 )
+        if( fi.AvoirKind == AVOIRISSKIND_INVESTMENT_SHARE ) // вид ценной бумаги равен "инвестиционный пай" 
+          sum_str = string(m_Sum:f:0:*, fi.SumPrecision);
+        elif( floor(m_Sum) == m_Sum ) // сумма в проводке выражена целым числом
+          sum_str = string(m_Sum:f:0:0);
+        else
+          sum_str = string(m_Sum:f);
+        end;
+        GetNominalAndCurrStrings(fi.FI_Kind, fi.AvoirKind, @nominal_str, @curr_str);
+      else
+        sum_str = string(m_Sum:f);
+        msgbox("Не найден финансовый инструмент: ", m_FIID);
+      end;
+      sum_str = sum_str + " шт.";
+    end;
+    
+  END;
+
+  PRIVATE MACRO GetBalanceName(iNumPlan : integer, Balance : string, Chapter : integer) : string
+    var BalanceName : string = "";
+    FILE blnc ("balance") key 0;
+    blnc.iNumPlan = iNumPlan;
+    blnc.Balance = Balance;
+    blnc.Chapter = Chapter;
+    if( GetEQ(blnc) )
+      BalanceName = blnc.Name_Part;
+    elif( not pr_PrintEA )
+      msgbox("Не найден счет: ", Balance);
+    end;
+    return BalanceName;
+  END;
+
+  // Конструктор
+  PRIVATE MACRO Init( _Account:string, _FIID:integer, _Chapter:integer, _Amount:money, _Side:integer, _AmountRub:money, 
+                      _IsDepo:bool, _AccTrnID:integer )
+
+    m_Account   = _Account;
+    m_FIID      = _FIID;
+    m_AmountCur = IfThenElse( m_FIID == 0 /*NATCUR*/, $0     , _Amount );
+    m_AmountRub = IfThenElse( m_FIID == 0 /*NATCUR*/, _Amount, $0      );
+    m_Sum       = _Amount;
+    m_Side      = _Side;  
+    m_err       = 0;
+    var sumrub = $0;
+
+    // рублевую сумму можно передать отдельным параметром
+    if( ( ValType(_AmountRub) == V_MONEY ) and ( _AmountRub > $0 ) )
+      m_AmountRub = _AmountRub;
+    end;
+    
+    if( _IsDepo )
+      m_IsDepo = true;
+    else // _IsDepo не задан или false
+      m_IsDepo = false;
+    end;
+
+    if( ValType(_AccTrnID) == V_INTEGER )
+      m_AccTrnID = _AccTrnID;
+    else
+      m_AccTrnID = 0;
+    end;
+
+    FILE acc ("account" );
+    ClearRecord(acc);     
+    acc.Chapter       = _Chapter;
+    acc.Account       = _Account;         
+    acc.Code_Currency = _FIID;
+    if ( getEQ(acc) )            
+      m_Name = IfThenElse( m_IsDepo,
+                           GetBalanceName(0, acc.Balance, acc.Chapter),
+                           acc.NameAccount);
+      if( m_IsDepo )
+        m_Account = acc.Balance;
+      end;
+    elif( not pr_PrintEA )
+      MsgBox("Не найден счет: ", _Account );
+    end;
+
+  END;
+
+  MACRO СтрокаПроводки( onDate:date, WhithAmountRub:bool, WhithAmountCur:bool )
+
+   array NameArray;
+   StrSplit( m_Name, NameArray, 33  );
+   var sum_str, nominal_str, curr_str;
+   if(m_IsDepo)
+     MakeSumDepoStrings(@sum_str, @nominal_str, @curr_str);
+   end;
+   private var col = asize( NameArray ), i = 1;
+   [  #################################│########################│#########################│##################### ### ]
+   ( NameArray(0), 
+     m_Account, 
+     IfThenElse( m_IsDepo, sum_str, AmountRubStr(onDate, WhithAmountRub) ):r, 
+     IfThenElse( m_IsDepo, nominal_str, AmountCurStr(WhithAmountCur) ):r, 
+     IfThenElse( m_IsDepo, curr_str, CurrencyStr(WhithAmountCur) ):r );
+   while( i < col )
+     [  #################################│                        │                         │                          ]
+     ( NameArray(i) );
+     i = i + 1;
+   end;
+  END;
+
+  Init( _Account, _FIID, _Chapter, _Amount, _Side, _AmountRub, _IsDepo, _AccTrnID );
+
+END;
+
+PRIVATE CLASS Проводка( p_Chapter:integer )
+
+  var m_Debet :TArray = TArray(), // Дебетовые  реквизиты проводок, массив из СторонаПроводки
+      m_Credit:TArray = TArray(), // Кредитовые реквизиты проводок, массив из СторонаПроводки
+      m_Chapter = p_Chapter;      // Глава счетов
+
+  MACRO Сторона( side:integer )
+    return IfThenElse( side == PRT_Debet, m_Debet, m_Credit );
+  END;
+
+  MACRO ДобавитьСторону( val:СторонаПроводки )
+
+    if( val.СторонаСчета() == PRT_Debet )
+      m_Debet[m_Debet.Size] = val;
+    else
+      m_Credit[m_Credit.Size] = val;
+    end;
+    
+  END;
+  
+  MACRO СформироватьПроводкуПоПлатежу()
+
+    private var PaymentObj = RsbPayment( pr_pmpaym.rec.PaymentID );
+    private var pi :TRecHandler = TRecHandler( "pmaddpi.dbt" ), DC = PRT_Debet;
+    private var CoverAmount = РублевыйЭквивалентПроводки( pr_pmpaym.rec.Amount   , pr_pmpaym.rec.FIID, 
+                                                          pr_pmpaym.rec.PayAmount, pr_pmpaym.rec.PayFIID, 
+                                                          pr_pmpaym.rec.MinimizationTurn, pr_pmrmprop.rec.Date ) ;
+    if( IsSummaryPayment( PaymentObj ) ) /* для сводного платежа заполняем данные из уточняющих записей */
+      while( DC <= PRT_Credit )
+        if( PaymentObj.PIList( DC ).Size > 0 ) 
+         if( ( PaymentObj.PIList( DC ).First() == 0 ) and ( PaymentObj.PIList( DC ).Current( pi ) == 0 ) )
+           ДобавитьСторону( СторонаПроводки( pi.rec.Account  , 
+                                             pi.rec.FIID     , 
+                                             pi.rec.Chapter  , 
+                                             pi.rec.Amount   , 
+                                             DC              ,
+                                             РублевыйЭквивалентПроводки( IfThenElse( DC == PRT_Debet, pi.rec.Amount, pi.rec.PmAmount ),
+                                                                         IfThenElse( DC == PRT_Debet, pi.rec.FIID  , pi.rec.PmFIID   ),
+                                                                         IfThenElse( DC == PRT_Debet, pi.rec.PmAmount, pi.rec.Amount ),
+                                                                         IfThenElse( DC == PRT_Debet, pi.rec.PmFIID  , pi.rec.FIID   ),
+                                                                         pr_pmpaym.rec.MinimizationTurn, pr_pmrmprop.rec.Date ) ) );
+
+           while( ( PaymentObj.PIList( DC ).Next() == 0 ) and ( PaymentObj.PIList( DC ).Current( pi ) == 0 ) )
+             ДобавитьСторону( СторонаПроводки( pi.rec.Account  , 
+                                               pi.rec.FIID     , 
+                                               pi.rec.Chapter  , 
+                                               pi.rec.Amount   , 
+                                               DC              ,
+                                               РублевыйЭквивалентПроводки( IfThenElse( DC == PRT_Debet, pi.rec.Amount, pi.rec.PmAmount ),
+                                                                           IfThenElse( DC == PRT_Debet, pi.rec.FIID  , pi.rec.PmFIID   ),
+                                                                           IfThenElse( DC == PRT_Debet, pi.rec.PmAmount, pi.rec.Amount ),
+                                                                           IfThenElse( DC == PRT_Debet, pi.rec.PmFIID  , pi.rec.FIID   ),
+                                                                           pr_pmpaym.rec.MinimizationTurn, pr_pmrmprop.rec.Date ) ) );
+           end;
+         end;
+        end;
+        DC = DC + 1;
+      end;
+    end;
+    if( m_Debet.Size == 0 )                                 /* для несводного - из таблиц платежа */
+      ДобавитьСторону( СторонаПроводки( pr_pmpaym.rec.PayerAccount , 
+                                        pr_pmpaym.rec.FIID         , 
+                                        pr_pmpaym.rec.Chapter      , 
+                                        pr_pmpaym.rec.Amount       , 
+                                        PRT_Debet                  ,
+                                        CoverAmount                ) );
+    end;
+    if( m_Credit.Size == 0 )
+      ДобавитьСторону( СторонаПроводки( pr_pmpaym.rec.ReceiverAccount, 
+                                        pr_pmpaym.rec.PayFIID        , 
+                                        pr_pmpaym.rec.Chapter        , 
+                                        pr_pmpaym.rec.PayAmount      , 
+                                        PRT_Credit                   ,
+                                        CoverAmount                  ) );
+    end;
+  
+  END;
+  
+  PRIVATE MACRO ЗаголовокСтороныПроводки( Side )
+    
+    if( Side == PRT_Debet )
+      [ ──────────────────────────────────┬────────────────────────┬────────────────────────────────────────────────────
+        Наименование счета                │       Дебет счета      │               Сумма цифрами      
+        ──────────────────────────────────┼────────────────────────┼─────────────────────────┬──────────────────────────];                                                                   
+    else                                                                                                        
+      [ Наименование счета                │      Кредит счета      │                         │                          ];
+    end;
+
+  END;
+
+  PRIVATE MACRO РазделительСтрокПроводки( isLast )
+   if( isLast )
+     [ ──────────────────────────────────┴────────────────────────┴───────────────┬─────────┴┬─────────────────────────];
+   else
+     [ ──────────────────────────────────┼────────────────────────┤                         │                          ];
+   end;
+  END;                                  
+
+  MACRO ОтчетПоПроводке( onDate )
+
+    private var i = 0;
+
+    ЗаголовокСтороныПроводки( PRT_Debet );
+    while( i < m_Debet.Size )   
+      m_Debet(i).СтрокаПроводки( onDate, true, true );
+      РазделительСтрокПроводки( false );
+      i = i + 1;
+    end;
+    i = 0;
+    ЗаголовокСтороныПроводки( PRT_Credit );
+    while( i < m_Credit.Size )  
+      m_Credit(i).СтрокаПроводки( onDate, IfThenElse( ( m_Credit.Size == 1  ) and ( m_Debet.Size == 1  ), 
+                                            false, true ), /*рублевая сумма по кредиту выводится только если есть разноска*/
+                                            IfThenElse( ( m_Credit.Size == 1  ) and ( m_Debet.Size == 1  ) and 
+                                                        ( m_Debet(0).FIID() == m_Credit(0).FIID() ) and
+                                                        ( m_Debet(0).FIID() != 0/*NATCUR*/ ),
+                                            false, true ) );/*валютная сумма - только для разноски или разновалютных счетов*/
+      РазделительСтрокПроводки( i == m_Credit.Size - 1 );
+      i = i + 1;
+    end;
+  
+  END;
+
+  MACRO СуммаПоСтороне( Side:integer, onDate:date )
+    private var Sum = $0, i = 0;
+    private var arr:TArray = IfThenElse( Side == PRT_Debet, m_Debet, m_Credit );
+    while( i < arr.Size )
+      Sum = Sum + arr(i).СуммаРуб( onDate );
+      i = i + 1;
+    end;
+    return Sum;
+  END;
+               
+END;
+
+CLASS  МемориальныйОрдер2161У( RecordID    :string,
+                               Number      :string, 
+                               DateDoc     :date, 
+                               TypeDoc     :string, 
+                               Carry       :Проводка,
+                               Ground      :string,
+                               IsDepo      :bool )
+
+   private var  m_RecordID      : string              ,// Идентификатор записи с указанием, какое поле какой таблицы
+                m_Number        : string              ,// Номер документа
+                m_BankName      : string              ,// Наименование "нашего" банка
+                m_Date          : date                ,// Дата документа
+                m_SubKind1      : string              ,// Тип документа (Исправительный)
+                m_SubKind2      : string              ,// Тип документа (СПОД)
+                m_Carry         : Проводка            ,// Проводка по документу 
+                m_AmountStr     : string              ,// Сумма прописью
+                m_Ground        : string              ;// Основание документа
+
+   // Конструктор
+   PRIVATE MACRO Init( RecordID    :string, 
+                       Number      :string, 
+                       DateDoc     :date, 
+                       TypeDoc     :string, 
+                       Carry       :Проводка,
+                       Ground      :string,
+                       IsDepo      :bool  )
+
+       m_RecordID     = RecordID;
+       m_Number       = Number;
+       m_BankName     = {Name_Bank};
+       m_Date         = DateDoc;
+       m_Carry        = Carry;
+       if( IsDepo )
+         m_AmountStr  = StrUpr( NumToStr ( Carry.Сторона(PRT_Debet).value(0).Sum(), "штука", "штуки", "штук", false, 0 ), 1 );
+       else
+         m_AmountStr  = IfThenElse( Carry.m_Chapter != CHAPT5, 
+                        RubToStrAlt( max( Carry.СуммаПоСтороне( PRT_Debet, DateDoc ), Carry.СуммаПоСтороне( PRT_Credit, DateDoc ) ) ),
+                        NumToStr   ( max( Carry.СуммаПоСтороне( PRT_Debet, DateDoc ), Carry.СуммаПоСтороне( PRT_Credit, DateDoc ) ), "штука", "штуки", "штук", false, 0 ) );
+       end;
+       m_Ground       = Ground;
+       m_SubKind1     = IfThenElse( StrBrk("ИКSN", TypeDoc ) > 0, "", "               " ) + 
+                       "МЕМОРИАЛЬНЫЙ " + 
+                        IfThenElse( StrBrk("ИКSN", TypeDoc ) > 0, "ИСПРАВИТЕЛЬНЫЙ ", "" );
+       m_SubKind2     = IfThenElse( StrBrk("З"   , TypeDoc ) > 0, "СПОД"           , "" );
+   END;
+
+   PRIVATE MACRO ЗаголовокОтчета()
+
+    if( pr_PrintEA )
+      PrintEAHeader();
+    end;
+
+    array BankNameArray;
+    StrSplit( m_BankName, BankNameArray, 52, 52, 3 );
+    [
+      
+                                                                           
+      ####################################################                                     ┌─────────────────┐
+      ####################################################                                     │    Код формы    │
+      ####################################################                                     │документа по ОКУД│
+      ────────────────────────────────────────────────────                                     ├─────────────────┤
+      Составитель                                                                              │     0401108     │
+                                                                                               └─────────────────┘
+      ############################ОРДЕР № #########        ##################  
+                                          ─────────     ────────────────────────
+                                                                  Дата
+      #####
+    ]( BankNameArray(0),
+       BankNameArray(1), 
+       BankNameArray(2),
+       m_SubKind1,
+       m_Number,
+       m_Date:c:f,
+       m_SubKind2 );
+
+   END;
+
+   PRIVATE MACRO ПодвалОтчета()
+
+   array GroundArray, AmountArray;
+   StrSplit(  m_Ground    , GroundArray  , 105, 105, 3  );
+   StrSplit(  m_AmountStr , AmountArray  , 67 , 67 , 5  );
+    
+   [  Сумма прописью                                                            │Шифр      │ 09
+      ######################################################################### │документа │
+      ######################################################################### ├──────────┼─────────────────────────
+      ######################################################################### │          │
+      ######################################################################### ├──────────┼─────────────────────────
+      ######################################################################### │          │
+     ───────────────────────────────────────────────────────────────────────────┴──────────┴─────────────────────────
+      Содержание операции, наименование, номер и дата документа,
+      на основании которого составлен мемориальный ордер
+      ###########################################################################################################
+      ###########################################################################################################
+      ###########################################################################################################
+     ────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+      Подписи
+     ────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+     Приложение:                             документов на              листах.
+                ────────────────────────────               ────────────
+     #################################################
+     ]( AmountArray(0),
+        AmountArray(1),
+        AmountArray(2),
+        AmountArray(3),
+        AmountArray(4),
+        GroundArray(0),
+        GroundArray(1),
+        GroundArray(2),
+        m_RecordID:l );
+   END;
+
+   MACRO PrintReport()
+     
+     ЗаголовокОтчета();
+     m_Carry.ОтчетПоПроводке( m_Date );
+     ПодвалОтчета();
+
+   END;
+
+   Init( RecordID, Number, DateDoc, TypeDoc, Carry, Ground, IsDepo );
+
+END;
+
+/* Создать массив из ( Проводка() + данные проводки ) из массива строк "Дт Кт IDпроводки" */
+private macro СоздатьПроводкуГруппы( Arr:TArray ):TArray
+  var retval:TArray = TArray();
+  var Carry:object  = NULL;
+  var side = IfThenElse( Arr.size > 1, -1, PRT_Debet ),
+      i = 0, summaRub = $0, summaCur = $0;
+  var params:TArray;
+  var rs:object;
+  var query:string;
+  var pr1 = TArray() ;
+  var pr2 = TArray() ;
+  
+  private macro ЗаполнитьМассивРеквизитовПроводки(pr:Tarray,pFIID_Payer:integer, pFIID_Receiver:integer,pSum_NatCur:numeric,pSum_Payer:numeric,Sum_Receiver:numeric):TArray;
+    pr[0] = pFIID_Payer;
+    pr[1] = pFIID_Receiver;
+    pr[2] = pSum_NatCur;
+    pr[3] = pSum_Payer;
+    pr[4] = Sum_Receiver;
+  end;  
+ 
+  while( i < Arr.size )
+
+    query = " select t_FIID_Payer, t_FIID_Receiver, t_Chapter, t_Sum_Payer, t_Sum_Receiver, t_Sum_NatCur, "+
+            "        t_Numb_Document, t_Date_Carry, t_TypeDocument, t_Ground, t_Chapter "+
+            "   from dacctrn_dbt            "+
+            "  where t_AccTrnID = :AccTrnID ";
+
+    params = makeArray( SQLParam("AccTrnID", IDПроводки( Arr[i] ) ) );
+    rs = execSQLselect( query, params, false );
+    if( rs and rs.moveNext() )
+      if( ( Arr.size > 1 ) and ( side == -1 ) )
+        side = IfThenElse( СчетСтороныПроводки( Arr[0], PRT_Debet ) == СчетСтороныПроводки( Arr[1], PRT_Debet ), PRT_Debet, PRT_Credit ) //Сторона объединения
+      end;
+      if( side > -1 )
+        summaRub = summaRub + rs.value(5);
+        summaCur = summaCur + rs.value(side+3);
+      end;
+    end;
+    
+    if (i == 0)
+      ЗаполнитьМассивРеквизитовПроводки(pr1,rs.value(0),rs.value(1),rs.value(5),rs.value(3),rs.value(4));
+    else
+      ЗаполнитьМассивРеквизитовПроводки(pr2,rs.value(0),rs.value(1),rs.value(5),rs.value(3),rs.value(4));		
+    end;	
+   
+    i = i + 1;
+  end;
+ 
+  if(rs)
+    Carry = Проводка( int( rs.value(10) ) );
+
+    /*Если проводок несколько и они сгруппированы по дебету или кредиту*/
+    if (Arr.size>1)
+      if (side == PRT_Debet)
+        Carry.ДобавитьСторону( СторонаПроводки( СчетСтороныПроводки( Arr[0], PRT_Debet  ), pr1[0], rs.value(2), IfThenElse( side == PRT_Debet , summaCur, pr1[3] ), PRT_Debet , summaRub ) );
+        Carry.ДобавитьСторону( СторонаПроводки( СчетСтороныПроводки( Arr[0], PRT_Credit ), pr1[1], rs.value(2), pr1[4], PRT_Credit, pr1[2] ) );
+        Carry.ДобавитьСторону( СторонаПроводки( СчетСтороныПроводки( Arr[1], PRT_Credit ), pr2[1], rs.value(2), pr2[4], PRT_Credit, pr2[2] ) );
+      else
+        Carry.ДобавитьСторону( СторонаПроводки( СчетСтороныПроводки( Arr[0], PRT_Credit ), pr1(1), rs.value(2), IfThenElse( side == PRT_Credit, summaCur, rs.value(4) ), PRT_Credit, summaRub ) );
+        Carry.ДобавитьСторону( СторонаПроводки( СчетСтороныПроводки( Arr[0], PRT_Debet  ), pr1[0], rs.value(2),  pr1[3],  PRT_Debet , pr1[2] ) );    
+        Carry.ДобавитьСторону( СторонаПроводки( СчетСтороныПроводки( Arr[1], PRT_Debet  ), pr2[0], rs.value(2),  pr2[3] , PRT_Debet , pr2[2] ) );
+      end;
+
+    /*Если единственная проводка*/
+    else
+      Carry.ДобавитьСторону( СторонаПроводки( СчетСтороныПроводки( Arr[0], PRT_Debet  ), rs.value(0), rs.value(2), IfThenElse( side == PRT_Debet , summaCur, rs.value(3) ), PRT_Debet , summaRub ) );
+      Carry.ДобавитьСторону( СторонаПроводки( СчетСтороныПроводки( Arr[0], PRT_Credit ), rs.value(1), rs.value(2), IfThenElse( side == PRT_Credit, summaCur, rs.value(4) ), PRT_Credit, summaRub ) );
+    end;    
+ 
+    retval(0) = string( rs.value(6) );
+    retval(1) = date(   rs.value(7) );
+    retval(2) = string( rs.value(8) );
+    retval(3) = Carry;
+    retval(4) = string( rs.value(9) );  
+  end;
+  return retval;
+end;
+
+PRIVATE MACRO ПроводкаПоМультивалютномуОрдеру( onlyPrimary:integer ):TArray
+
+  private var Arr1:TArray     = TArray(),// массив строк простых проводок в формате "Дт Кт ID проводки" 
+              Arr2:TArray     = TArray(),// массив сгуппированных по Дт/Кт строк простых проводок
+              Проводки:TArray = TArray();// массив из Проводка() + еще некоторые данные - возвращаемый
+  var i = 0, j = 0, k = 0, side = PRT_Debet;
+  var isEquival = true, isAdded = false;
+
+  // запрос
+  var params:TArray;
+  var rs:object;
+  var query = " select t_AccTrnID, t_PayerAccount, t_ReceiverAccount "+
+              "   from table( PM_CARFUN.GetPaymentCarries( :PaymentID, :OnlyPrimary ) ) "+
+              "order by t_Numb_Document, t_PayerAccount, t_ReceiverAccount       ";
+
+  params = makeArray( SQLParam("PaymentID"   , pr_pmpaym.rec.PaymentID  ),
+                      SQLParam("OnlyPrimary" , onlyPrimary              ) );
+  rs = execSQLselect( query, params, FALSE );
+  if( rs )      
+    // Выбираем все простые проводки
+    while( rs.moveNext() )
+      Arr1[Arr1.size] = MakeCarryString( rs.value(1), rs.value(2), rs.value(0) );
+    end;
+    // Группируем их по Дт/Кт
+    i = 0;
+    while( i < Arr1.size )   
+      j = 0;
+      isAdded = false;
+      while( ( j < Arr2.size ) and not isAdded )
+        while( ( side <= PRT_Credit ) and not isAdded )
+          k = 0;            // индекс внутри j-той группы
+          isEquival = true; // совпадает с каждым счетом в группе
+          // для i-той проводки ищем группу(j), где Дт будет совпадать с каждым счетом Дт или Кт будет совпадать с каждым счетом Кт
+          while( ( k < Arr2[j].size ) and ( not isAdded or isEquival ) )
+            isEquival = isEquival and ( СчетСтороныПроводки( Arr2[j][k], side ) == СчетСтороныПроводки( Arr1[i], side ) );
+            k = k + 1;
+          end;
+          if( isEquival ) // если совпадает, добавим в эту группу          
+            Arr2[j][Arr2[j].size] = Arr1[i];         
+            isAdded = true;
+          end;
+          side = side + 1;
+        end;
+        j = j + 1;
+      end;
+      if( not isAdded ) // если так и не добавили никуда - создаем новую группу
+        Arr2[Arr2.size] = makeArray( Arr1[i] );
+        isAdded = true;
+      end;
+      i = i + 1;
+    end;      
+    // теперь сортируем
+    i = 0;
+    while( i < Arr2.size )
+      Arr2[i] = SortArray( Arr2[i], true );// элементы каждой группы по Дт по возрастанию 
+      i = i + 1;
+    end; 
+    Qsort( Arr2, @СортировкаПоДебетуГруппы ); // все группы по первому счету Дт группы по возрастанию
+    // вот теперь из каждой группы создаем объект Проводка() и заполняем необходимые данные
+    i = 0;
+    while( i < Arr2.size )
+      Проводки[i] = СоздатьПроводкуГруппы( Arr2[i] );
+      i = i + 1;
+    end;
+  end;
+  return Проводки;
+END;
+
+//======================================================================================================
+// Функции создания структуры данных для отчета по ф 2161-У
+//======================================================================================================
+
+MACRO СформироватьОтчетДляСводногоМО():МемориальныйОрдер2161У
+
+  var Carry = Проводка( pr_pmpaym.rec.Chapter );
+  Carry.СформироватьПроводкуПоПлатежу();
+  
+  return МемориальныйОрдер2161У( string( "ID платежа: ", pr_pmpaym.rec.PaymentID ),
+                                 pr_pmrmprop.rec.Number       ,
+                                 pr_pmrmprop.rec.Date         ,
+                                 ""                           ,
+                                 Carry                        ,
+                                 pr_pmrmprop.rec.Ground        );
+END;
+
+MACRO  СформироватьОтчетДляОдновалютногоМО( pr_cb_doc ):МемориальныйОрдер2161У
+
+  var Carry = Проводка( pr_cb_doc.rec.Chapter );
+  Carry.СформироватьПроводкуПоПлатежу();
+  
+  return МемориальныйОрдер2161У( string( "ID платежа: ", pr_pmpaym.rec.PaymentID ),
+                                 pr_pmrmprop.rec.Number       ,
+                                 pr_pmrmprop.rec.Date         ,
+                                 pr_cb_doc.rec.TypeDocument   ,
+                                 Carry                        ,
+                                 pr_pmrmprop.rec.Ground        );
+END;
+
+PRIVATE MACRO GetRecIDForCarryDepo(pr_document): string
+  var RecID : string = "Вх.№ поручения: ";
+  
+  // Определим операцию проводки oproper
+  var select = "SELECT oproper.t_DocKind, oproper.t_DocumentID " +
+               "  FROM doproper_dbt oproper, doprdocs_dbt oprdocs " +
+               " WHERE oproper.t_ID_Operation = oprdocs.t_ID_Operation " +
+               "   AND oprdocs.t_AccTrnID = " + pr_document.rec.AccTrnID;
+  var rs = execSQLselect(select);
+  if(rs and rs.moveNext())
+    var DocKind : integer = rs.value("t_DocKind");
+    var DocumentID : string = rs.value("t_DocumentID");
+    if ( (DocKind == DP_DEPOPER_CONVERT) or
+         (DocKind == DP_DEPOPER_REPAY)   or
+         (DocKind == DP_DEPOPER_BONEMISS)
+       )
+      select = "SELECT t_XlD FROM dspground_dbt " +
+               " WHERE t_SourceDocKind = " + DocKind +
+               "   AND t_SourceDocID = " + DocumentID;
+      rs = execSQLselect(select);
+      if(rs and rs.moveNext())
+        RecID = RecID + rs.value("t_XlD");
+      end;
+    elif( (DocKind == SP_DEPOPER_UNIVOPERATION) or
+          (DocKind == SP_DEPOPER_TRANSFERORDER) or
+          (DocKind == SP_DEPOPER_ENROLMENT) or
+          (DocKind == SP_DEPOPER_RECORDER) or
+          (DocKind == SP_DEPOPER_WITHDRORDER)
+        )
+      select = "SELECT spground.t_XlD " +
+               "  FROM dspground_dbt spground, dspdraft_dbt spdraft " +
+               " WHERE spground.t_SPGroundID = spdraft.t_SPGroundID " +
+               "   AND spdraft.t_AutoKey = " + DocumentID;
+      rs = execSQLselect(select);
+      if(rs and rs.moveNext())
+        RecID = RecID + rs.value("t_XlD");
+      end;
+    end;
+  end;
+
+  return RecID;
+END;
+
+MACRO СформироватьОтчетДляПроводки( pr_document, onlyPrimary )
+
+  var IsDepo : bool = (pr_document.rec.Chapter == CHAPT5);
+  var RecID : string = IfThenElse( IsDepo,
+                       GetRecIDForCarryDepo(pr_document),
+                       "ID (dacctrn_dbt.AccTrnID): " + string( pr_document.rec.AccTrnID ) );
+
+  var Carry       = Проводка( pr_document.rec.Chapter );
+  var ExRateCarry = Проводка( pr_document.rec.Chapter );
+  var factr:TBFile = TBFile( "acctrn", "R", 0 );
+  Carry.ДобавитьСторону( СторонаПроводки( pr_document.rec.Account_Payer, 
+                                          pr_document.rec.FIID_Payer   , 
+                                          pr_document.rec.Chapter      , 
+                                          pr_document.rec.Sum_Payer    , 
+                                          PRT_Debet                    ,
+                                          pr_document.rec.Sum_NatCur   ,
+                                          IsDepo                       ,
+                                          pr_document.rec.AccTrnID     ) );
+  Carry.ДобавитьСторону( СторонаПроводки( pr_document.rec.Account_Receiver, 
+                                          pr_document.rec.FIID_Receiver   , 
+                                          pr_document.rec.Chapter         , 
+                                          pr_document.rec.Sum_Receiver    , 
+                                          PRT_Credit                      ,
+                                          pr_document.rec.Sum_NatCur      ,
+                                          IsDepo                          ,
+                                          pr_document.rec.AccTrnID        ) );
+  
+  МемориальныйОрдер2161У(  RecID,
+                           pr_document.rec.Numb_Document ,
+                           pr_document.rec.Date_Carry    ,
+                           pr_document.rec.TypeDocument  ,
+                           Carry                         ,
+                           pr_document.rec.Ground        ,
+                           IsDepo                        ).PrintReport();
+                       
+  if( not onlyPrimary and ( pr_document.rec.ExRateAccTrnID > 0 ) )
+    factr.rec.AccTrnID = pr_document.rec.ExRateAccTrnID;    
+    if( factr.GetEQ() )
+      ExRateCarry.ДобавитьСторону( СторонаПроводки( factr.rec.Account_Payer, 
+                                                    factr.rec.FIID_Payer   , 
+                                                    factr.rec.Chapter      , 
+                                                    factr.rec.Sum_Payer    , 
+                                                    PRT_Debet              ,
+                                                    factr.rec.Sum_NatCur   ) );
+      ExRateCarry.ДобавитьСторону( СторонаПроводки( factr.rec.Account_Receiver, 
+                                                    factr.rec.FIID_Receiver   , 
+                                                    factr.rec.Chapter         , 
+                                                    factr.rec.Sum_Receiver    , 
+                                                    PRT_Credit                ,
+                                                    factr.rec.Sum_NatCur      ) );
+      return МемориальныйОрдер2161У( "ID (dacctrn_dbt.AccTrnID): " + string( pr_document.rec.AccTrnID ),
+                                      factr.rec.Numb_Document ,
+                                      factr.rec.Date_Carry    ,
+                                      factr.rec.TypeDocument  ,
+                                      ExRateCarry             ,
+                                      factr.rec.Ground        ).PrintReport();
+    end;
+  end;
+  return 0;
+END;
+
+MACRO СформироватьОтчетДляМультивалютногоМО( pr_multydoc, onlyPrimary )
+  var Carry   = Проводка( pr_multydoc.rec.Chapter );                 
+  var Carries = TArray();// возможно, у нас будет целый массив проводок
+  var i = 0;
+  if( ( not IsSummaryPayment( RsbPayment( pr_pmpaym.rec.PaymentID ) ) ) )               
+    Carries = ПроводкаПоМультивалютномуОрдеру( onlyPrimary );
+    if( Carries. size > 0  )
+       while( i < Carries.size  )
+         МемориальныйОрдер2161У( string( "ID платежа: ", pr_pmpaym.rec.PaymentID ),
+                                      Carries[i][0] + IfThenElse( Carries. size > 1, "/" + string(i), "") ,
+                                      Carries[i][1]   ,
+                                      Carries[i][2]   ,
+                                      Carries[i][3]   ,
+                                      Carries[i][4]   ).PrintReport();
+         i = i + 1;
+       end;
+       return true;
+    end;
+  end;
+
+  /*а если документ не был проведен - формируем данные по первичке*/
+  Carry.СформироватьПроводкуПоПлатежу();
+  return МемориальныйОрдер2161У( string( "ID платежа: ", pr_pmpaym.rec.PaymentID ),
+                                 pr_pmrmprop.rec.Number        ,
+                                 pr_pmrmprop.rec.Date          ,
+                                 pr_multydoc.rec.Type_Document ,
+                                 Carry                         ,
+                                 pr_pmrmprop.rec.Ground         ).PrintReport();
+END;

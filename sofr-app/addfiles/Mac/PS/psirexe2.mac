@@ -1,0 +1,432 @@
+/*
+ $Name: psirexe2.mac
+ $Module: PS
+ $Description: Макрос шага. Исполнение ИПВС. Формирование документа оплаты 
+*/
+
+//-----------------------------------------------------------------------------
+// Блок     : "Исполнение ИПВС"
+// Шаг      : "Формирование документа оплаты"
+// Описание : Макрос шага
+//-----------------------------------------------------------------------------
+
+import PaymInter, PSInter, PTInter, FIInter, pm_opr, cbsttls, ir_categ, likepy, prpm,
+       pm_common;
+
+var PaymentObj:RsbPayment;
+
+// Возможные исходы событий
+PRIVATE CONST IR_ACTION_OK    :integer = 0, //Ok
+              IR_ACTION_STOP  :integer = 1, //Прервать выполенение шага
+              IR_ACTION_ERROR :integer = 2; //Возникла ошибка
+
+//-----------------------------------------------------------------------------
+// Найти расчетный счет клиента
+//-----------------------------------------------------------------------------
+PRIVATE MACRO FindClientAccount( FIID:integer, Client:integer, Chapter:integer ):RsdRecordset
+
+  VAR select:string = " SELECT T_ACCOUNT, T_DEPARTMENT " +
+                        " FROM DACCOUNT_DBT " +
+                       " WHERE T_CHAPTER = :CHAPTER " +
+                         " AND T_CODE_CURRENCY = :FIID " +
+                         " AND T_CLIENT = :CLIENT " +
+                         " AND T_OPEN_CLOSE = CHR(0) " +
+                         " AND T_TYPE_ACCOUNT LIKE '%Ч%' "
+                         " ORDER BY DECODE(T_DEPARTMENT, :OPERDPRT, 0, 1 )";
+  VAR params:TArray = makeArray( SQLParam( "CHAPTER" , Chapter ),     
+                                 SQLParam( "FIID"    , FIID    ),     
+                                 SQLParam( "CLIENT"  , Client  ),
+                                 SQLParam( "OPERDPRT", {OperDprt}  ) );
+  
+  return execSQLselect( select, params, TRUE );
+
+ONERROR(x)
+  MsgBox( x.Message );
+  return NULL;
+END;
+
+//-----------------------------------------------------------------------------
+// Получить имя клиента
+//-----------------------------------------------------------------------------
+PRIVATE MACRO GetClientName( PartyID:integer ):string
+  file Субъекты (party) key 0;
+  if( ПолучитьСубъекта( PartyID, Субъекты ) == 0 )
+    return Субъекты.Name;
+  end;
+  return "";
+END;
+
+//-----------------------------------------------------------------------------
+// Получить ID филиала
+//-----------------------------------------------------------------------------
+PRIVATE MACRO GetDepartmentIDbyCode( Code:integer )
+  var dp_dep = TBfile("dp_dep.dbt", "r");
+  dp_dep.rec.Code = Code;
+  if( getEQ(dp_dep) )
+    return dp_dep.rec.PartyID;
+  end;
+  return {OurBank};
+END;
+
+//-----------------------------------------------------------------------------
+// Создать платеж банка
+//-----------------------------------------------------------------------------
+PRIVATE MACRO CreateBankPaym( PayerAccount:string, ReceiverAccount:string, Amount:money, EndDepartment:integer )
+
+  var BankPaym:object              = GenObject( "RsbBankPayment", 0 );
+  var Payment:object               = BankPaym.Payment();
+
+  BankPaym.Origin                  = MEMORDER_FDOC_AUTO;
+  BankPaym.Oper                    = {oper}; 
+  BankPaym.Status                  = 1/*MEMORDER_STATUS_POST*/;
+
+  Payment.DocKind                  = DLDOC_BANKPAYMENT;
+  Payment.Purpose                  = PM_PURP_BANKPAYMENT;
+
+  Payment.Number                   = PaymentObj.Number;
+  Payment.PaymentKind              = "Э";
+  Payment.ShifrOper                = "01";
+
+  Payment.PayerFIID                = 0;
+  Payment.ReceiverFIID             = 0;
+
+  Payment.PayerAmount              = Amount;
+  Payment.EndDepartment            = EndDepartment;
+
+  Payment.SetPayerPI( PAYMENTS_GROUP_UNDEF, 
+                      {OurBank}, 
+                      0, 
+                      "", 
+                      "",
+                      "",
+                      0/*NATCUR*/, 
+                      1/*CHAPT1*/, 
+                      PayerAccount, 
+                      PaymentObj.Payer, 
+                      PaymentObj.PayerName, 
+                      PaymentObj.PayerINN );
+
+  Payment.SetReceiverPI( PAYMENTS_GROUP_UNDEF, 
+                         GetDepartmentIDbyCode( EndDepartment ), 
+                         0, 
+                         "", 
+                         "",
+                         "",
+                         0/*NATCUR*/, 
+                         1/*CHAPT1*/,
+                         ReceiverAccount, 
+                         PaymentObj.Payer, 
+                         PaymentObj.PayerName, 
+                         PaymentObj.PayerINN );
+
+  Payment.ClientDate               = 
+  Payment.Date                     =
+  Payment.ValueDate                = {curdate};
+  PM_CorrectOutTransferDate(Payment);
+
+  // Установить очередность родительского документа
+  Payment.Priority = PaymentObj.Priority;
+
+  Payment.Ground                   = " № " + PaymentObj.Number + " от " + PaymentObj.Date + ". Перевод нереализованной суммы рублей.";
+
+  // Установить признак автозапуска операции.
+  BankPaym.LaunchOper              = true;
+
+  Payment.CryptoAction( string("Автоматическое_формирование_платежей") );
+
+END;
+
+//-----------------------------------------------------------------------------
+// Номер пачки для оплаты К2
+//-----------------------------------------------------------------------------
+PRIVATE MACRO MeetNumberPack():integer
+  var NumberPack:integer = 0, err;
+  GetRegistryValue( "PS\\PAYORDER\\MEETI2_NUMBERPACK", V_INTEGER, NumberPack, err );
+  return NumberPack;
+END;
+
+//-----------------------------------------------------------------------------
+// Создать рублевый клиентский платеж
+//-----------------------------------------------------------------------------
+PRIVATE MACRO CreatePayOrder( RequestOrder:object, PayerAccount:string, Amount )
+  
+  var PayOrder:object = GenObject( "RsbPSPayOrder", 0 );
+  var Payment:RsbPayment = PayOrder.Payment();
+
+  var isEdit; GetEditFlag( RequestOrder.Payment.PaymentID, RequestOrder.Payment.DocKind, 0, NULL, NULL, NULL, NULL, @IsEdit ); 
+  if( ( RequestOrder.State == PSINRQ_ST_I2 ) and ( ( Amount < RequestOrder.Payment.BaseAmount ) or ( ( Amount == RequestOrder.Payment.BaseAmount ) and ( IsEdit ) ) ) )
+    PayOrder.DocKind               = PSPOKIND_ORDER;
+  else
+    PayOrder.DocKind               = PSPOKIND_REQUEST;
+  end;
+
+  PayOrder.CurrentState            = PSPO_ST_DEFERRED;
+  Payment.Origin                   = RequestOrder.Payment.Origin;
+  PayOrder.Oper                    = {oper};
+
+  if( PayOrder.DocKind == PSPOKIND_REQUEST ) 
+    Payment.PayerBankEnterDate     = {curdate};
+    PayOrder.AcceptTerm            = 1;//PSPAYDEM_TERM_WITHOUTACCEPT;
+    PayOrder.ReqSum                = Amount;
+    Payment.ShifrOper              = "06";
+  else
+    Payment.NumberPack             = MeetNumberPack();
+    Payment.PartPaymShifrMain      = PaymentObj.ShifrOper;
+    Payment.PartPaymNumMain        = PaymentObj.Number;
+    Payment.PartPaymDateMain       = PaymentObj.Date;
+    Payment.ShifrOper              = "16";
+  end;
+
+  if(RequestOrder.Payment.PrimdocOrigin == PD_OR_FNS)
+    PayOrder.Origin = PSPO_OR_FNS;
+  else
+    PayOrder.Origin = PSPO_OR_AUTO;    
+  end;
+
+  Payment.DocKind                  = PS_PAYORDER;
+  Payment.Purpose                  = PM_PURP_POPRIMARY;
+  Payment.PaymStatus               = PM_PREPARING;
+  Payment.PaymentKind              = "Э";
+
+  Payment.PayerFIID                = 0;
+  Payment.PayerAmount              = Amount;
+
+  Payment.Number                   = PaymentObj.Number;
+
+  Payment.SetPayerPI( PAYMENTS_GROUP_UNDEF, 
+                      {OurBank}, 
+                      0, 
+                      "", 
+                      "",
+                      "",
+                      0/*NATCUR*/, 
+                      1/*CHAPT1*/, 
+                      PayerAccount, 
+                      PaymentObj.Payer, 
+                      PaymentObj.PayerName, 
+                      PaymentObj.PayerINN );
+
+  Payment.SetReceiverPI( PAYMENTS_GROUP_UNDEF, 
+                         PaymentObj.ReceiverBankID, 
+                         PaymentObj.ReceiverBankCodeKind, 
+                         PaymentObj.ReceiverBankCode, 
+                         PaymentObj.ReceiverBankName,
+                         PaymentObj.ReceiverBankCorrAcc,
+                         0/*NATCUR*/, 
+                         1/*CHAPT1*/, 
+                         PaymentObj.ReceiverAccount, 
+                         PaymentObj.Receiver, 
+                         PaymentObj.ReceiverName, 
+                         PaymentObj.ReceiverINN );
+
+  Payment.PayDate                  =
+  Payment.ClientDate               = 
+  Payment.Date                     =
+  Payment.ValueDate                = {curdate};
+  PM_CorrectOutTransferDate(Payment);
+
+    // Установить очередность родительского документа
+  Payment.Priority = PaymentObj.Priority;
+
+  Payment.Ground                   = " № " + Payment.Number + " от " + PaymentObj.Date + ". Документ оплаты.";
+
+  if( PaymentObj.BaseAmount != Amount )
+    Payment.PartPaymNumber         = RequestOrder.LastPartPaymNumber() + 1;
+  else
+    Payment.PartPaymNumber         = 0;
+  end;
+
+  // Установить признак автозапуска операции.
+  PayOrder.LaunchOper              = true;
+
+  Payment.CryptoAction( string("Автоматическое_формирование_платежей") );
+
+  // заполняются налоговые данные
+  Payment.TaxAuthorState = PaymentObj.TaxAuthorState;
+  Payment.BttTICode      = PaymentObj.BttTICode;
+  Payment.OKATOCode      = PaymentObj.OKATOCode;
+  Payment.TaxPmGround    = PaymentObj.TaxPmGround;
+  Payment.TaxPmPeriod    = PaymentObj.TaxPmPeriod;
+  Payment.TaxPmNumber    = PaymentObj.TaxPmNumber;
+  Payment.TaxPmDate      = PaymentObj.TaxPmDate;
+  Payment.TaxPmType      = PaymentObj.TaxPmType;
+
+  CopyPmserv(PaymentObj, Payment);
+
+  if( PayOrder.DocKind == PSPOKIND_REQUEST )
+    Payment.Legality       = PaymentObj.Legality;      
+    Payment.LegalityEdit   = PaymentObj.LegalityEdit;
+    Payment.LegalityReason = PaymentObj.LegalityReason;
+  end;
+END;
+
+//------------------------------------------------------------------------------
+// Проверка дочернего документа, сформированного на предыдущем шаге
+//------------------------------------------------------------------------------
+PRIVATE MACRO CheckChildDoc( action:integer, oprdocs:TRecHandler /*oprchilddoc.rec*/ ):integer
+
+  var RequestOrder:object = GenObject( "RsbRequestOrder", PaymentObj.DocumentID );
+ 
+  record pmpaym(pmpaym);
+  ClearRecord(pmpaym);
+  pmpaym.PaymentID = PaymentObj.PaymentID;
+
+  if( action != IR_ACTION_OK )
+    return action;
+  end;
+
+  var Status:integer = -1;
+
+  if( not PM_GetOprStatus( oprdocs.rec.DocKind, oprdocs.rec.DocumentID, OPR_BC_CONTROL, @Status ) )
+    return IR_ACTION_ERROR;
+  end;
+
+  if( Status == OPR_BC_ST_CTRL_REJECTED )
+
+    if( RequestOrder.State == PSINRQ_ST_I2 )
+      msgbox( "Невозможно выполнить документ оплаты картотеки|" + ReadNoteForObject( OBJTYPE_PAYMENT, makeObjectID(OBJTYPE_PAYMENT, NULL, pmpaym), PM_NOTEKIND_DENIALGROUND ));
+      return IR_ACTION_ERROR; //Прервать выполнение шага
+    else
+      PaymentObj.PaymStatus = PM_REJECTED;
+      RequestOrder.State    = PSINRQ_ST_REJECTED;
+      // Установить статусы
+      if( УстановитьСтатусыПлатежа( OPR_PAYM_STATE, OPR_PM_ST_REJECT ) )
+        msgbox("Ошибка при установке сегментов статуса экземпляра операции");
+        return IR_ACTION_ERROR;
+      end;
+      // Заполнить примечание
+      if( PaymentObj.Notes.AddNote( PM_NOTEKIND_DENIALGROUND, ReadNoteForObject( OBJTYPE_PAYMENT, makeObjectID(OBJTYPE_PAYMENT, NULL, pmpaym), PM_NOTEKIND_DENIALGROUND ) ) != 0 )
+        msgbox( "Ошибка при вставке примечания платежа" );
+        return IR_ACTION_ERROR;
+      end;
+      return IR_ACTION_STOP; // Завершить выполнение шага и блока
+    end;
+  
+  else
+    
+    if( not PM_GetOprStatus( oprdocs.rec.DocKind, oprdocs.rec.DocumentID, OPR_BC_STATE, @Status ) )
+      return IR_ACTION_ERROR;
+    end;
+
+    if( Status != OPR_BC_ST_CLOSE )
+      msgbox("Невозможно выполнить документ оплаты картотеки|Еще не выполнена продажа валюты");
+      return IR_ACTION_ERROR; // Прервать исполнение шага
+    else
+      return IR_ACTION_OK; // Прервать исполнение шага
+    end;
+
+  end;
+
+END;
+
+//-----------------------------------------------------------------------------
+// RecFilter
+//-----------------------------------------------------------------------------
+PRIVATE MACRO CheckDocKind( oprdocs:TRecHandler /*oprchilddoc.rec*/ )
+  return (oprdocs.rec.DocKind == PS_BUYCURORDER);
+END;
+
+
+//------------------------------------------------------------------------------
+// Макрос шага
+//------------------------------------------------------------------------------
+MACRO ExecuteCaseStep( Kind_Operation, Number_Step, pspayorder, KindDoc )
+
+  var RequestOrder:object = GenObject( "RsbRequestOrder", PaymentObj.DocumentID );
+
+  var FD:IR_FirstDoc  = IR_FirstDoc( PaymentObj.DocumentID );
+  var СчетКонвКл : string = FD.FindAndOpenAccount( "+СчетКонвКл", 0, {curdate} );
+  var PayAmount;
+  
+  var ID_Operation:integer = 0, ID_Step:integer = 0;
+  var Prev_Step:integer = 0;
+
+  var ChildDocList:TArray;
+
+  // находим текущий шаг                
+  var stat:bool = Opr_GetCurrStep( PaymentObj.DocumentID, PaymentObj.DocKind, @ID_Operation, @ID_Step );
+  if( stat )
+    // находим предыдущий шаг
+    stat = Opr_GetPrevStep( ID_Operation, ID_Step, @Prev_Step );
+  
+    // находим документы, порожденные на предыдущем шаге
+    if( stat )
+      ChildDocList = filter( OprGetChildDocs( ID_Operation, Prev_Step, true ), @CheckDocKind);
+      if( ChildDocList.Size == 0 )
+        msgbox("Не найдена заявка на продажу валюты");
+        stat = false;
+      end;
+    end;
+  end;
+
+  //проверяем состояние документов, порожденных на предыдущем шаге
+  var Action:integer;
+  if( stat )
+    Action = reduce( ChildDocList, @CheckChildDoc, IR_ACTION_OK );
+    if( Action == IR_ACTION_STOP  ) 
+      return ""; // Завершить выполнение блока
+    elif( Action == IR_ACTION_ERROR )
+      return 1;  // Прервать выполенение шага
+    end;
+  else
+    return 1;  // Прервать выполенение шага
+  end;
+ 
+  // Перевод нереализованной суммы рублей на расчетный счет клиента
+  var oprdocs:TRecHandler = ChildDocList.Value( 0 );
+  var BcPaym:object = GenObject( "RsbPayment", int(oprdocs.rec.DocumentID) );
+  var rset:RsdRecordset;
+  var accTrn:object     = RsbAccTransaction();
+
+  if( BcPaym.ReceiverAmount > PaymentObj.FutureBaseAmount )
+
+    rset = FindClientAccount( 0, PaymentObj.Payer, 1 );
+    if( rset and rset.moveNext() )
+      if( rset.value(1) == {OperDprt} )
+
+        // Выполнить фактическую проводку
+        accTrn.Chapter         = 1;                                            
+        accTrn.Date_Carry      = {curdate};
+        accTrn.Number_Pack     = PaymentObj.NumberPack;
+        accTrn.Numb_Document   = PaymentObj.Number;
+        accTrn.ResultCarry     = 1;
+        accTrn.Kind_Oper       = " 1";
+        accTrn.Shifr_Oper      = "09";
+        accTrn.Ground          = " № " + PaymentObj.Number + " от " + PaymentObj.Date + ". Перевод нереализованной суммы рублей.";
+        accTrn.Department      = PaymentObj.Department;
+        accTrn.AccountPayer    = FD.FindAndOpenAccount( "+СчетКонвКл", 0, {curdate}, FIROLE_FIREQ );
+        accTrn.AccountReceiver = rset.value(0);
+        accTrn.FIID            = 0;
+        accTrn.Sum             = (BcPaym.ReceiverAmount - PaymentObj.FutureBaseAmount);
+        if( not accTrn.Carry )
+          msgbox("Ошибка при актуализации платежа");
+          return 1;
+        end;  
+
+      else
+        
+        // Выбрать счет в ближайшем к "нашему" филиале
+        // Сформировать рублевый платеж банка
+        CreateBankPaym( FD.FindAndOpenAccount( "+СчетКонвКл", 0, {curdate}, FIROLE_FIREQ ), rset.value(0), (BcPaym.ReceiverAmount - PaymentObj.FutureBaseAmount), rset.value(1) );
+
+      end;
+    else
+      msgbox("У " + GetClientName(PaymentObj.Payer) + " после продажи валюты осталась нереализованная|сумма рублей " + (BcPaym.ReceiverAmount - PaymentObj.FutureBaseAmount) + "|ввиду отсутствия расчетного счета");
+    end;
+
+  end;
+
+  // Формирование документа оплаты
+  var Sопл = 0;
+   
+  if( BcPaym.ReceiverAmount > PaymentObj.FutureBaseAmount )
+    Sопл = PaymentObj.FutureBaseAmount;
+  else
+    Sопл = BcPaym.ReceiverAmount;
+  end;
+
+  CreatePayOrder( RequestOrder, FD.FindAndOpenAccount( "+СчетКонвКл", 0, {curdate}, FIROLE_FIREQ ), Sопл );
+
+  return "30";
+
+END;

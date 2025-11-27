@@ -1,0 +1,865 @@
+/******************************************************************************
+ FILE         :   fxservop.mac (по мотивам mmservop.mac)
+
+ DESCRIPTION  :   Сервисные операции (операции сопровождения)
+ ******************************************************************************/
+IMPORT RsbDataSet, BankInter, CTInter, OprInter, globals, DealsInter, PaymInter,
+ 	   FIInter, fxlb, dlreport, fxcateg, fxcarry, mccatacf;
+	  
+const RSRV_QCATEGORY_TICK    = 1, /* кат. качества: по сделке           */
+      RSRV_QCATEGORY_CONTR   = 2, /* кат. качества: по контрагенту      */
+      RSRV_QCATEGORY_PERCENT = 3; /* кат. качества: по проценту резерва */ 
+
+const RSRV_RESPERCENT_TICK   = 1, /* процент резервирования: по сделке      */
+      RSRV_RESPERCENT_CONTR  = 2, /* процент резервирования: по контрагенту */
+      RSRV_RESPERCENT_MIN    = 3, /* процент резервирования: минимальный    */
+      RSRV_RESPERCENT_MAX    = 4, /* процент резервирования: максимальный*/
+      RSRV_RESPERCENT_DIFF   = 5; /* процент резервирования: */
+
+//const RSRV_ACCBASE_CRDP      = 1; /* База начисления: кредиты и депозиты */
+
+const RSRV_PARMS_CONTROL_NONE       = 1, /* контроль параметров кредитного риска: без контроля */
+      RSRV_PARMS_CONTROL_EDIT_KKS   = 2, /* контроль параметров кредитного риска: контроль и корректировка   ККС */
+      RSRV_PARMS_CONTROL_NOEDIT_KKS = 3; /* контроль параметров кредитного риска: контроль без корректировки ККС */
+
+// Значения категории "Создание резервов"
+const RSRV_CATEG_NONE        = 1, /* не создавать резерв */
+      RSRV_CATEG_YES         = 2; /* создавать резерв */
+
+
+/* -- используем в fxrsrv_j.mac -- */
+var  
+      R_Id = 0,  // 
+      IsVK = "", // Вал. корректировка?
+      Rnew1 = $0, // Новая сумма обеспечения обычной сделки/прямой части СВОП
+      Rnew2 = $0, // Новая сумма обеспечения обратной части СВОП
+      Rold1 = $0, // ранее созданный резерв обычной сделки/прямой части СВОП
+      Rold2 = $0, // ранее созданный резерв обратной части СВОП
+      isSwapDeal = false;
+
+/* ------------------------------- */
+
+/* типы связи оп. резервирования */
+CONST RSRV_TYPE_MMDEAL = 3;  /* сделка МБК */
+
+private var НАСТРОЙКА = "КОНВЕРСИОННЫЕ ОПЕРАЦИИ\\КОНТРОЛЬ ПАРАМ. КРЕД-НОГО РИСКА";
+private var ЗначениеНастройки;
+
+
+/* Документ сервисной операции */
+record OprServDoc( dl_comm );
+/* Структура с данными о 1 строке отчета. Заполняется в макросе выполнения шага*/
+var SvOpReportLineData = TArray; 
+/*Признак, что выполняется сервисная операция*/
+var SvOpIsServiceOper = false;
+/*Число вставленных в отчет записей */
+var SvOpNumInsRecord = 0; 
+
+
+/* Имя файла для отчетов сервисных операций */
+private var  SvOpReportName = "fxservop";
+private file SvOpReportFile() txt write;
+
+private var SvOpErrorArray = TArray();
+
+/* Данные об ошибке*/
+private class SvOpError( _OpCode, _ObjCode, _ObjCode2, _NumErr, _StrErr )
+  var OpCode  = _OpCode, 
+      ObjCode = _ObjCode, 
+      ObjCode2 = _ObjCode2, 
+      NumErr  = _NumErr, 
+      StrErr  = _StrErr; 
+end;
+
+/*Печать строки отчета сервисной операции*/
+private macro SvOpPrintLine( str, SayMsgBox )
+  FX_ByDefault(SayMsgBox, false);
+  if( SvOpIsServiceOper == true )
+    return insert( SvOpReportFile, str );
+  elif( SayMsgBox == true )/*отчет по операции*/
+    msgbox( str );
+  else
+    [#](str);
+  end;
+  return true;
+end;
+
+private macro SvOpDealsReserveHead()
+  SvOpPrintLine( "                    РАСЧЕТ/КОРРЕКТИРОВКА РЕЗЕРВА ПО СДЕЛКАМ");
+  SvOpPrintLine( "┌──────────────────────────────┬───────┬──────────────────────────────────────────────────────────────────────────────────┐");
+  SvOpPrintLine( "│         Номер сделки         │№Ошибки│                               Сообщение                                          │");
+  SvOpPrintLine( "├──────────────────────────────┼───────┼──────────────────────────────────────────────────────────────────────────────────┤");
+end;
+
+//Заголовок отчета о сервисной операции
+private macro SvOpPrintHead( ServDocKind )
+  if( ServDocKind == DL_FXRESERV )
+     SvOpDealsReserveHead();
+  end;
+end;
+
+
+private macro ConnectBuff( b1, b2 )
+  var type = ValType(b2);
+
+  if( (type == V_DBFFILE) or (type == V_STRUC) or (type == V_GENOBJ) ) 
+    copy( b1, b2 );
+  else SetBuff( b1, b2); /*Для передачи из С*/
+  end;
+end;
+
+/*Запомнить ошибку
+  OprDocKind - вид первичного документа
+  SvOpServDoc - Документ сервисной операции 
+  SvOpDoc - Первичный документ
+  Num, StrErr - номер и строка ошибки*/
+macro SvOpInsertError( OprDocKind, SvOpServDoc, SvOpDoc, Num, StrErr )
+
+  record comm( dl_comm);
+  record tick( dl_tick );
+
+  var ObjCode = "", ObjCode2 = "";
+
+  if( (SvOpIsServiceOper == true) AND (isOprMultiExec() == true) )
+
+     ConnectBuff( comm, SvOpServDoc ); 
+
+     if( OprDocKind == DL_FOREXDOC ) 
+       ConnectBuff( tick, SvOpDoc ); 
+       ObjCode  = tick.DealCode; 
+     end;
+
+     if( (StrErr == null) or (StrErr == "") ) 
+       StrErr = "Ошибка при выполнении шага."
+     end;
+     SvOpErrorArray( SvOpErrorArray.Size ) = SvOpError( comm.CommCode, ObjCode, ObjCode2, Num, StrErr );
+  end;
+  
+  return 0;
+end;
+
+MACRO SayReserveError( tick, stat, Err )
+  SvOpInsertError(DL_FXRESERV, OprServDoc, tick, stat, err );
+  return stat;
+end;
+
+// проверка соответствия категории качества и процента резерва
+MACRO CheckQualityCateg(QualityCateg, ReservePercent)
+
+   if(QualityCateg == 1)
+      if(ReservePercent == 0.0)
+         return true;
+      end;
+   elif(QualityCateg == 2)
+      if((ReservePercent >= 1.0) AND (ReservePercent <= 20.0))
+         return true;
+      end;
+   elif(QualityCateg == 3)
+      if((ReservePercent >= 21.0) AND (ReservePercent <= 50.0))
+         return true;
+      end;
+   elif(QualityCateg == 4)
+      if((ReservePercent >= 51.0) AND (ReservePercent <= 100.0))
+         return true;
+      end;
+   elif(QualityCateg == 5)
+      if(ReservePercent == 100.0)
+         return true;
+      end;
+   end;
+   
+   return false;
+
+END;
+
+// получить минимальный процент резерва для категории качества
+PRIVATE MACRO GetMinPercent(QualityCateg) : double
+
+   if(QualityCateg == 1)
+      return 0;
+   elif(QualityCateg == 2)
+      return 1;
+   elif(QualityCateg == 3)
+      return 21;
+   elif(QualityCateg == 4)
+      return 51;
+   elif(QualityCateg == 5)
+      return 100;
+   end;
+   
+   return -1;
+END;
+
+// получить максимальный процент резерва для категории качества
+PRIVATE MACRO GetMaxPercent(QualityCateg) : double
+
+   if(QualityCateg == 1)
+      return 0;
+   elif(QualityCateg == 2)
+      return 20;
+   elif(QualityCateg == 3)
+      return 50;
+   elif(QualityCateg == 4)
+      return 100;
+   elif(QualityCateg == 5)
+      return 100;
+   end;
+   
+   return -1;
+END;
+
+// поиск категории качества для заданного процента резерва
+PRIVATE MACRO FoundQualityCateg(ReservePercent)
+
+   if(ReservePercent == 0.0)
+      return 1;
+   elif((ReservePercent >= 1.0) AND (ReservePercent <= 20.0))
+      return 2;
+   elif((ReservePercent >= 21.0) AND (ReservePercent <= 50.0))
+      return 3;
+   elif((ReservePercent >= 51.0) AND (ReservePercent < 100.0))
+      return 4;
+   elif(ReservePercent == 100.0)
+      return 5;
+   end;
+
+   return 0;
+
+END;
+
+private macro ОпределитьRold(tick, leg, OprDate, Rold1:@money, Rold2:@money)
+var  AccountPc,AccountPc_CHC, Счет, fd = FXFirstDoc(DL_FXLEG, leg.rec.ID, true);
+
+//  Определяем ранее сформированный резерв для данной сделки.
+      var DataSet = TRsbDataSet("SELECT t_ReserveAmount,  t_ReserveAmountSwap " +
+         " FROM ddlreslnk_dbt " +
+         " WHERE t_Type = 3 AND t_ParentID = " + tick.DealID + " AND t_ChildID <> -1 "+
+           " AND t_LnkDate <= "+ FX_ToDate(OprDate) +
+         " ORDER BY t_LnkDate DESC, t_Id DESC ");
+
+      var ok = DataSet.MoveNext();
+		if(ok)
+         Rold1  = DataSet.ReserveAmount; 	 // прямая часть СВОП / Обычная сделка
+         Rold2  = DataSet.ReserveAmountSwap;     // обратная часть СВОП
+      else
+		   Rold1  = $0;
+         Rold2  = $0;
+      end;
+     
+	/* Счет = MC_FindAndOpenAccountEx("Резерв, договор", fd, OprDate, isOprMultiExec, MC_OPENACC_CHECKEXIST, null, NATCUR);
+     if(Счет != "")
+        Rold = RestA (Счет, OprDate);
+     end;
+
+	  if (Rold == Rold1 + Rold2)
+        return 0;
+	  else 
+	     return 1;
+	  end;*/
+	  return 0;
+end;
+
+private macro GetPercentValDiff(tick, leg, OprDate)
+var 
+fi_from = TRecHandler("fininstr.dbt"),
+      BaseVal = $0,
+      NomVal = $0,
+      ValPFI = leg.rec.Principal,
+      ValCFI = leg.rec.Cost,
+      DiffPerc = 0;
+
+if(leg.rec.PFI != NATCUR)
+         // конвертация
+         if(ConvSum( ValPFI, ValPFI, OprDate, leg.rec.PFI, NATCUR )  != 0 )
+            return 0;
+         end;
+end;
+	  
+if(leg.rec.CFI != NATCUR)
+         // конвертация
+         if(ConvSum( ValCFI, ValCFI, OprDate, leg.rec.CFI, NATCUR )  != 0 )
+            return 0;
+         end;
+end;
+
+if ((leg.rec.PFI != NATCUR) and (leg.rec.CFI == NATCUR))
+		DiffPerc = (ValPFI - ValCFI)*100/ValPFI;
+elif ((leg.rec.PFI == NATCUR) and (leg.rec.CFI != NATCUR))
+   		DiffPerc = (ValCFI - ValPFI)*100/ValCFI;
+elif ((leg.rec.PFI != NATCUR) and (leg.rec.CFI != NATCUR))
+	if (tick.TypeDoc == "B")
+	 	DiffPerc = (ValPFI - ValCFI)*100/ValPFI;
+	elif (tick.TypeDoc == "S")
+		DiffPerc = (ValCFI - ValPFI)*100/ValCFI;
+	end;
+end;
+
+if (DiffPerc >=10) DiffPerc = 100;
+else DiffPerc = 0;
+end;
+
+return DiffPerc;
+
+END; // End GetPercentValDiff
+
+private macro GetKurs(FIID, OtherFIID, KursDate)
+    var retVal = 0;
+
+    record ratedef ("ratedef");
+
+    ПолучитьКурс(ratedef, FIID, OtherFIID);
+    ПолучитьЗначениеКурса(ratedef, Date(KursDate));
+
+    if (FIID == OtherFIID)
+        retVal = 1;
+    elif ((ratedef.fiid == FIID)and(ratedef.otherfi == OtherFIID))
+        retVal = (1 / (ratedef.rate / (pow(10, ratedef.point)*ratedef.Scale)));
+    elif ((ratedef.fiid == OtherFIID)and(ratedef.otherfi == FIID))
+        retVal = (1 * (ratedef.rate / (pow(10, ratedef.point)*ratedef.Scale)));
+    end;
+
+    return retVal;
+end;
+
+private macro РасчетНовойСуммыРезерва(tick, leg, ПР, OprDate,rev_part, Rnew:@money )
+var    
+      AccountPc,   
+      fi_from = TRecHandler("fininstr.dbt"),
+      BaseVal = $0,
+      NomVal = $0,
+      KursPFI = $1,
+      KursCFI = $1,
+	  MarketVal = $0;
+
+
+if (FX_Balance(tick.dealid,rev_part) == 1)
+	Rnew = 0;
+    return 0; 
+end;
+
+if(leg.rec.PFI != NATCUR)
+         // конвертация
+//         if(ConvSum( KursPFI, KursPFI, OprDate, leg.rec.PFI, NATCUR )  != 0 )
+         KursPFI = GetKurs(leg.rec.PFI, NATCUR, OprDate);
+         if(KursPFI  == 0 )
+            ПолучитьФинИн(leg.rec.PFI, fi_from);
+            return SayReserveError( tick, 55, string("Не найден курс валюты ", fi_from.rec.ISO_Number,
+                                                     " к нац. валюте за ", OprDate) );
+         end;
+end;
+	  
+if(leg.rec.CFI != NATCUR)
+         // конвертация
+//         if(ConvSum( KursCFI, KursCFI, OprDate, leg.rec.CFI, NATCUR )  != 0 )
+         KursCFI = GetKurs(leg.rec.CFI, NATCUR, OprDate);
+         if(KursCFI  == 0 )
+            ПолучитьФинИн(leg.rec.CFI, fi_from);
+            return SayReserveError( tick, 55, string("Не найден курс валюты ", fi_from.rec.ISO_Number,
+                                                     " к нац. валюте за ", OprDate) );
+         end;
+end;	  
+
+
+if (tick.TypeDoc == "S")
+  if ((leg.rec.PFI != NATCUR) and (leg.rec.CFI == NATCUR))
+    NomVal = leg.rec.Cost;
+    MarketVal = leg.rec.Principal * KursPFI;
+	BaseVal = MarketVal - NomVal;
+  end;
+  if ((leg.rec.PFI == NATCUR) and (leg.rec.CFI != NATCUR))
+    NomVal = leg.rec.Cost * KursCFI;
+    MarketVal = leg.rec.Principal;
+	BaseVal = MarketVal -NomVal;
+  end;
+  if ((leg.rec.PFI != NATCUR) and (leg.rec.CFI != NATCUR))
+    NomVal = leg.rec.Cost * KursCFI;
+    MarketVal = leg.rec.Principal * KursPFI;
+	BaseVal = MarketVal -NomVal;
+  end;
+end;
+
+if (tick.TypeDoc == "B")
+  if ((leg.rec.PFI != NATCUR) and (leg.rec.CFI == NATCUR))
+    NomVal = leg.rec.Cost;
+    MarketVal = leg.rec.Principal * KursPFI;
+	BaseVal = NomVal -MarketVal;
+  end;
+  if ((leg.rec.PFI == NATCUR) and (leg.rec.CFI != NATCUR))
+    NomVal = leg.rec.Cost* KursCFI;
+    MarketVal = leg.rec.Principal;
+	BaseVal = NomVal - MarketVal;
+  end;
+  if ((leg.rec.PFI != NATCUR) and (leg.rec.CFI != NATCUR))
+    NomVal = leg.rec.Cost * KursCFI;
+    MarketVal = leg.rec.Principal * KursPFI;
+	BaseVal = NomVal-MarketVal;
+  end;
+end;
+
+if (rev_part) 
+  BaseVal= -BaseVal;
+end;
+Rnew = money(BaseVal *  ПР / 100 );
+if (Rnew < 0) 
+  Rnew = 0;
+end;
+
+return 0;
+END;
+
+// Получить наихудшие (т.е. наибольшие) КК и % резерва для контрагента
+private macro НККС_ПР_дляКонтрагента(НККС:@variant, НПР:@variant, Контрагент)
+var   
+      RsbReslnk = TRsbDataSet("select max(lnk.t_ReservePercent) maxRP, t_QualityCategory maxQC "
+                              "from ddlreslnk_dbt lnk, ddl_tick_dbt tick "
+                              "where lnk.t_Type = 3 and lnk.t_ParentID = tick.t_DealID and "
+                              " tick.t_BofficeKind = 100 and"
+                              " lnk.t_ChildID = -1 and tick.t_PartyID = " + Контрагент + 
+                              " group by t_QualityCategory order by t_QualityCategory DESC");
+
+      if (not RsbReslnk.MoveNext()) 
+        НККС = 1;
+        НПР = GetMinPercent(НККС);
+        return;
+      end;
+
+      НПР  = RsbReslnk.maxRP;
+      НККС = RsbReslnk.maxQC;
+end;
+
+
+PRIVATE MACRO FX_SvOpDealCheck(comm, tick, AttrID:@variant )
+var attr_id;
+
+    // Значение категории "Создание резервов"
+    if (GetMainObjAttr(null, OBJTYPE_CONVDEAL, UniID(tick, OBJTYPE_CONVDEAL), 1, attr_id, null, null, comm.CommDate))
+
+        if (valtype(AttrID) != V_UNDEF)
+            AttrID = attr_id;
+        end;
+
+        if (attr_id == RSRV_CATEG_NONE) // "не создавать"
+            return false;
+        end;
+    end;
+
+    return true;
+END;
+
+
+
+macro FX_CalcReserve(comm, tick, _ККС:@variant, _ПР:@variant, _ККС2:@variant, _ПР2:@variant)
+var 
+      НастрКатКач = 1,      // тип кат. качества
+      НастрПроцРезерва = 1, // тип процент резерва
+      ККС = -1,       // категория качества сделки 
+      ПР = -1,        // процент резерва
+      ККС2 = -1,       // категория качества сделки 
+      ПР2 = -1,        // процент резерва
+      НККС,      // наихудшая категория качества сделки
+      НПР,       // наихудший процент резерва      
+      BlankDate = date(0,0,0),
+      check_date = BlankDate,
+      OprDate = comm.CommDate,
+      ErrMsg = "", AttrID = 0,
+      leg    = TBfile("dl_leg.dbt",   "R", 0),
+      leg2    = TBfile("dl_leg.dbt",   "R", 0),
+      reslnk = TBfile("dlreslnk.dbt", "R", 2),
+      party  = TBfile("party.dbt",    "R", 0),
+      resset = TRsbDataSet("SELECT t_QualityCategory, t_ReservePercent FROM ddlresset_dbt"+
+                          " WHERE t_Module='V' AND t_AccountBase=1 AND t_SetDate <= " + FX_ToDate(OprDate)+
+                          " ORDER BY t_SetDate DESC");
+      leg.rec.DealID = tick.DealID;
+      leg.rec.LegKind = 0;
+      leg.rec.LegID = 0;
+      leg.getEQ;
+
+      leg2.rec.DealID = tick.DealID;
+      leg2.rec.LegKind = 0;
+      leg2.rec.LegID = 1;
+      if (leg2.getEQ) isSwapDeal = true;
+		end;
+
+      party.rec.PartyID = tick.PartyID;
+      party.getEQ;
+      
+      // Сохраним размер массива ошибок на случай,
+      // если придется очистить все ошибки для конкретной сделки
+      var NumErrors = SvOpErrorArray.size;
+
+      if(resset.MoveNext)
+         НастрКатКач = resset.QualityCategory;
+         НастрПроцРезерва = resset.ReservePercent;
+      else
+         return SayReserveError( tick, 10, string("Не заданы настройки расчета резерва") );
+      end;
+
+      if( not FX_SvOpDealCheck(comm, tick, @AttrID ) )
+         return 0;
+      end;
+
+      // 1. Определяем новые параметры риска данной сделки.
+      var DataSet = TRsbDataSet("SELECT t_QualityCategory, t_ReservePercent, t_QualityCategorySwap, t_ReservePercentSwap " +
+         " FROM ddlreslnk_dbt " +
+         " WHERE t_Type = 3 AND t_ParentID = " + tick.DealID + " AND t_ChildID = -1 "+
+           " AND t_LnkDate <= "+ FX_ToDate(OprDate) +
+         " ORDER BY t_LnkDate DESC, t_Id DESC ");
+
+      var ok = DataSet.MoveNext();
+
+      // Определение ККС и ПР
+      // 1.
+      if((НастрКатКач == RSRV_QCATEGORY_TICK) and (НастрПроцРезерва == RSRV_RESPERCENT_TICK))
+         if(ok)
+            ККС = DataSet.QualityCategory;
+            ПР  = DataSet.ReservePercent;
+            ККС2 = DataSet.QualityCategorySwap;
+            ПР2  = DataSet.ReservePercentSwap;
+         else
+            return SayReserveError( tick, 11, string("Не заданы параметры резервирования в сделке ", tick.DealCode) );
+         end;
+
+//         if((ПР == 0)and(ПР2 == 0))
+//            return SayReserveError( tick, 13, string("Нулевой процент резерва в сделке ", tick.DealCode) );
+//         end;
+
+      // 2.
+      else
+           // 2.1.
+           if((НастрКатКач == RSRV_QCATEGORY_TICK))  /* кат. качества: по сделке           */
+              if(ok)
+                 ККС = DataSet.QualityCategory;
+                 ККС2 = DataSet.QualityCategorySwap;
+              else
+                 return SayReserveError( tick, 11, string("Не заданы параметры резервирования в сделке ", tick.DealCode) );
+              end;
+           elif((НастрКатКач == RSRV_QCATEGORY_CONTR))  /* кат. качества: по контрагенту      */
+              party.rec.PartyID = tick.PartyID;
+              party.getEQ;
+              ККС = -1;
+              ККС2 = -1;
+              if(not GetMainObjAttr(null, OBJTYPE_PARTY, UniID(party, OBJTYPE_PARTY), 13, ККС, null, null, OprDate))
+                 return SayReserveError( tick, 15, string("Для контрагента ", party.rec.ShortName, " не задана категории качества") );
+				  else ККС2 = ККС;
+              end;
+           end;
+
+           if(НастрПроцРезерва == RSRV_RESPERCENT_TICK)    /* процент резервирования: по сделке      */
+              if(ok)
+                 ПР = DataSet.ReservePercent;
+                 ПР2 = DataSet.ReservePercentSwap;
+              else
+                 return SayReserveError( tick, 11, string("Не заданы параметры резервирования в сделке ", tick.DealCode) );
+              end;
+           elif(НастрПроцРезерва == RSRV_RESPERCENT_CONTR) /* процент резервирования: по контрагенту */
+              ПР = double(readNoteForObject(OBJTYPE_PARTY, UniID(party, OBJTYPE_PARTY), 3, OprDate, check_date));
+              if(check_date == date(0,0,0))
+                 return SayReserveError( tick, 16, string("Для контрагента ", party.rec.ShortName, " не задан процент резерва") );
+              else ПР2 = ПР;
+              end;
+           elif(НастрПроцРезерва == RSRV_RESPERCENT_MIN)   /* процент резервирования: минимальный    */
+              ПР = GetMinPercent(ККС);
+              ПР2 = ПР;
+           elif(НастрПроцРезерва == RSRV_RESPERCENT_MAX)   /* процент резервирования: максимальный   */
+              ПР = GetMaxPercent(ККС);
+              ПР2 = ПР;
+           elif (НастрПроцРезерва == RSRV_RESPERCENT_DIFF)  
+              ПР = GetPercentValDiff(tick, leg, OprDate);
+              ПР2 = ПР;
+           end;
+
+           if((НастрКатКач == RSRV_QCATEGORY_PERCENT))  /* кат. качества: по проценту резерва */ 
+              ККС = FoundQualityCateg(ПР);
+              ККС2 = FoundQualityCateg(ПР2);
+           end;
+
+           if(not CheckQualityCateg(ККС, ПР))
+              return SayReserveError( tick, 14, string("Процент резерва "+ПР+" не соответствует категории качества "+ККС) );
+           end;
+
+      end;
+		
+           if (not isSwapDeal) 
+              ПР2 = -1;
+              ККС2 = -1;
+           end;
+
+      // 3.
+      if((НастрКатКач != RSRV_RESPERCENT_MIN) and (НастрПроцРезерва != RSRV_RESPERCENT_MAX) and (НастрКатКач != RSRV_QCATEGORY_PERCENT))
+
+          // 3.1.
+          if(not CheckQualityCateg(ККС, ПР))
+
+             return SayReserveError( tick, 14, string("Процент резерва ", ПР, " не соответ категории качества ", ККС) ); 
+          end;
+
+          if((not CheckQualityCateg(ККС2, ПР2)) and (isSwapDeal))
+             return SayReserveError( tick, 14, string("Процент резерва ", ПР2, " не соответ категории качества ", ККС2) ); 
+          end;
+
+          // 3.2.
+          if(ЗначениеНастройки != RSRV_PARMS_CONTROL_NONE)
+
+               НККС_ПР_дляКонтрагента(@НККС, @НПР, tick.PartyID);
+
+               if(ККС < НККС)
+                  if(ЗначениеНастройки == RSRV_PARMS_CONTROL_NOEDIT_KKS)
+
+                     return SayReserveError( tick, 12, string("Категория качества ", ККС, " сделки ", tick.DealCode, "|меньше наихудшей ", НККС, " для контрагента ", party.rec.ShortName) ); 
+                  else
+                     ККС = НККС;
+                     SayReserveError( tick, 21, string("Контроль наихудшей категории качества ", НККС, " для контрагента ", party.rec.ShortName) ); 
+                  end;
+               end;
+
+                  if((ККС2 < НККС) and (isSwapDeal))
+                  if(ЗначениеНастройки == RSRV_PARMS_CONTROL_NOEDIT_KKS)
+
+                     return SayReserveError( tick, 12, string("Категория качества ", ККС2, " сделки ", tick.DealCode, "|меньше наихудшей ", НККС, " для контрагента ", party.rec.ShortName) ); 
+                  else
+                     ККС2 = НККС;
+                     SayReserveError( tick, 21, string("Контроль наихудшей категории качества ", НККС, " для контрагента ", party.rec.ShortName) ); 
+                  end;
+               end;
+
+               // 3.3.
+               if(ПР < НПР)
+
+                  if(ЗначениеНастройки == RSRV_PARMS_CONTROL_NOEDIT_KKS)
+                     return SayReserveError( tick, 17, string("Процент резерва ", ПР, " меньше наихудшего ", НПР, "|для контрагента ", party.rec.ShortName) );
+                  else
+                     ПР = НПР;
+                     SayReserveError( tick, 22, string("Контроль наихудшего процента резерва ", НПР, " для контрагента ", party.rec.ShortName) ); 
+                  end;
+
+               end;
+
+                  if((ПР2 < НПР) and (isSwapDeal))
+
+                  if(ЗначениеНастройки == RSRV_PARMS_CONTROL_NOEDIT_KKS)
+                     return SayReserveError( tick, 17, string("Процент резерва ", ПР2, " меньше наихудшего ", НПР, "|для контрагента ", party.rec.ShortName) );
+                  else
+                     ПР2 = НПР;
+                     SayReserveError( tick, 22, string("Контроль наихудшего процента резерва ", НПР, " для контрагента ", party.rec.ShortName) ); 
+                  end;
+
+               end;
+
+          end;
+      end;
+
+      if((ПР == 0)and(ПР2 == 0))
+          return SayReserveError( tick, 13, string("Нулевой процент резерва в сделке ", tick.DealCode) );
+      end;
+	
+      // 5.- 6.
+      if(РасчетНовойСуммыРезерва(tick, leg, ПР, OprDate,false, @Rnew1) != 0)
+         return 1;
+      end;
+		
+      if (isSwapDeal)
+         if(РасчетНовойСуммыРезерва(tick, leg2, ПР2, OprDate,true, @Rnew2) != 0)
+            return 1;
+         end;
+      end;
+
+		
+      ОпределитьRold(tick, leg, OprDate, @Rold1, @Rold2);
+
+	  if ((Rnew1 == Rold1) and (Rnew2 == Rold2))
+         SvOpErrorArray.size = NumErrors; // Очищаем буфер ошибок для этой сделки
+         return 1; // Корректировка резерва не требуется
+      end;
+
+
+      _ККС = ККС;
+      _ПР  = ПР;
+      _ККС2 = ККС2;
+      _ПР2  = ПР2;
+
+      return 0;
+end;
+
+/* Фильтр на сервисные операции. 
+   Если вернет false, то по объекту сервисная опер. выполняться не будет
+   OprDocKind - вид первичного документа
+   SvOpServDoc - Документ сервисной операции 
+   SvOpDoc - Первичный документ*/
+
+MACRO FX_SvOpFilter( OprDocKind, SvOpServDoc, SvOpDoc )       
+var
+    Ok = false, PrincPaym, sqltext = "";
+//    ОтборВсехСделок;
+
+  record comm( dl_comm );
+  record tick( dl_tick );
+
+  SetBuff( tick, SvOpDoc );
+  SetBuff( comm, SvOpServDoc );
+
+//  if(comm.Flag1 == "X") ОтборВсехСделок = false;
+//  else                  ОтборВсехСделок = true;
+//  end;
+
+  if( (comm.DocKind == DL_FXRESERV))// and MM_IsDSF(tick.DealType) )  /* Формирование резерва для МБК */
+
+     if (not FX_SvOpDealCheck(comm, tick))
+        return false;
+     end;
+
+//      if(ОтборВсехСделок == true)
+
+         sqltext = "select doprstep_dbt.t_Number_Step from doprstep_dbt, doproper_dbt" +
+                    " where (doprstep_dbt.t_ID_Operation = doproper_dbt.t_ID_Operation)" +
+                    " and  (doproper_dbt.t_DocumentID = " + tick.DealID + ")" +
+                    " and ((doprstep_dbt.t_Number_Step = 30) and (doprstep_dbt.t_IsExecute = 'X')" +
+                    " or   (doprstep_dbt.t_Number_Step = 210) and (doprstep_dbt.t_IsExecute = 'X'))";
+
+         PrincPaym = TRsbDataSet(sqltext);
+         Ok = PrincPaym.MoveNext;
+
+//         if(Ok)
+//             PrincPaym = TRsbDataSet(sqltext +
+//                            " and (doprstep_dbt.t_Number_Step = 70) and (doprstep_dbt.t_IsExecute = 'X')");
+//
+//            Ok = PrincPaym.MoveNext;
+//			   if(Ok) Ok=false;
+//			   else Ok = true;
+//			   end;
+//         end;
+//
+//         if(not Ok)
+//            PrincPaym = TRsbDataSet(sqltext +
+//                            " and (doprstep_dbt.t_Number_Step = 210) and (doprstep_dbt.t_IsExecute = 'X')");
+//            Ok = PrincPaym.MoveNext;
+//
+//            if (Ok)
+//               PrincPaym = TRsbDataSet(sqltext +
+//                            " and (doprstep_dbt.t_Number_Step = 250) and (doprstep_dbt.t_IsExecute = 'X')");
+//
+//               Ok = PrincPaym.MoveNext;
+//               if(Ok) Ok=false;
+//               else Ok = true;
+//               end;
+//           end;	
+//        end;	
+  end;
+
+  return Ok;
+end;
+
+private macro DealsErrorHead()
+  SvOpPrintLine( "┌────────────┬────────────────────┬──────┬─────────────────────────────────────────────────────────────────────────────────────────┐");
+  SvOpPrintLine( "│    Код     │    Номер сделки    │  №   │               Сообщение                                                                 │");
+  SvOpPrintLine( "│  операции  │                    │ошибки│                                                                                         │");
+  SvOpPrintLine( "├────────────┼────────────────────┼──────┼─────────────────────────────────────────────────────────────────────────────────────────┤");
+end;
+
+/*Заголовок отчета об ошибках сервисной операции*/
+private macro PrintErrorHead( ServDocKind )
+  if( ServDocKind == DL_FXRESERV )
+     DealsErrorHead();
+  end;
+end;
+
+/*Распечатать ошибки*/
+private macro SvOpPrintError( ServDocKind, ObjectName )
+  var i = 0;
+  if( SvOpErrorArray.Size == 0 ) return; end;
+
+  PrintErrorHead( ServDocKind );
+
+  while( i != SvOpErrorArray.Size )
+     SvOpPrintLine( "│" +
+                    string(SvOpErrorArray(i).OpCode:12) + "│" + 
+                    string(SvOpErrorArray(i).ObjCode:20) + "│" +  
+                    string(SvOpErrorArray(i).NumErr:6) + "│" +  
+                    string(SvOpErrorArray(i).StrErr:89) + "│"  );
+     if(SvOpErrorArray(i).ObjCode2 != "")
+        SvOpPrintLine( "│" +
+                    string("":12) + "│" + 
+                    string(SvOpErrorArray(i).ObjCode2:20) + "│" +  
+                    string("":6) + "│" +  
+                    string("":89) + "│"  );
+     end;
+     i = i + 1;
+  end;
+
+  SvOpPrintLine( "└────────────┴────────────────────┴──────┴─────────────────────────────────────────────────────────────────────────────────────────┘");
+end;
+
+
+/*****************************************************************************
+                    Общие ф-и для печати отчета серв. операции 
+******************************************************************************/
+private macro ИнитЗначенияНастройки()
+var 
+    stat = 0;
+
+     GetRegistryValue(НАСТРОЙКА, V_INTEGER, @ЗначениеНастройки, stat);
+     if(stat)
+        msgbox("Не задана настройка в реестре банка:|", Настройка);
+     end;
+
+     return stat;
+end;
+
+/*Вызывается при инициализации сервисной операции*/
+macro FX_SvOpInit(parm1:@integer)
+var
+  stat = ИнитЗначенияНастройки();
+
+  if(stat == 0)
+
+     close( SvOpReportFile ); /*На всякий случай*/
+     open( SvOpReportFile, GetTxtFileName(SvOpReportName) );
+     SvOpErrorArray.Size = 0;
+     SvOpNumInsRecord = 0;
+     SvOpReportLineData.Size = 0;
+     SvOpIsServiceOper  = true;
+  end;
+
+  setparm(0, stat);
+end;
+
+/* Печать отчета о сервисной операции
+   OprDocKind - вид первичного документа
+   SvOpServDoc- документ сервисной операции
+   ReportFlag - Признак, что нужно печатать отчет 
+   ShowReport - показывать отчет*/
+macro SvOpPrintReport( OprDocKind, SvOpServDoc, ReportFlag, ShowReport )
+  record comm( dl_comm );
+
+  var ObjectName = "";
+
+  ConnectBuff( comm, SvOpServDoc ); 
+
+//  if( (ReportFlag == true) and (SvOpNumInsRecord > 0) )    
+//    SvOpPrintFoot( comm.DocKind, comm.CommDate );
+//  end;
+
+  if( OprDocKind == DL_FOREXDOC ) ObjectName = "Сделка";
+  end;
+
+  SvOpPrintError( comm.DocKind, ObjectName ); /* Ошибки будем печатать всегда */
+
+// раскомментировать, когда будет печататься нормальный отчет о выполнении и SvOpNumInsRecord будет > 0
+/*  
+  if( (SvOpNumInsRecord == 0) and (ReportFlag == true) and (SvOpErrorArray.Size == 0) )
+    if( OprDocKind == DL_FOREXDOC )
+       SvOpPrintLine( "Нет подходящих для операции сделок." );
+//       SvOpPrintLine( "Операция завершена успешно." );
+    end;
+  end;*/
+
+  SvOpIsServiceOper  = false;
+  close( SvOpReportFile );
+  if( (ShowReport == true) AND 
+      (
+        (SvOpErrorArray.Size > 0) or (ReportFlag == true) 
+      )
+    )
+    ViewFile( SvOpReportFile );
+  end;
+end;
+

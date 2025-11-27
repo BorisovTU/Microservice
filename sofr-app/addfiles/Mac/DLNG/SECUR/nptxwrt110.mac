@@ -1,0 +1,268 @@
+/**
+ @file 	nptxwrt110.mac
+ @brief Операция списания и зачисления денежных средств. Шаг закрытия
+
+ # changelog
+ |date       |autor          |tasks                                           |note
+ |-----------|---------------|------------------------------------------------|-------------------------------------------------------------
+ |26.11.2025 |Велигжанин А.В.|DEF-108968                                      |Исправление payPurpose
+ |24.11.2025 |Мустафаев Э.Р  |DEF-109975                                      |Доработка по доступности корреспонденции для счетов 3060-30601; 3060-30606; 3060-30301 для ФЛ,
+ |           |               |                                                |и также 3060-30301 для ЮЛ, с дополнительной проверкой типа операции для новых комбинаций счетов.
+ |01.11.2024 |Велигжанин А.В.|DEF-75377                                       |Доработка по правильности корреспонденции 3060 - 40802 для 
+ |           |               |                                                |вывода ДС на лечение (по receiver не определить форму собственности)
+*/
+
+import InsCarryDoc, "sp_categ.mac", "sp_car.mac", RsbDataSet, oralib, likepy, commonutil;
+import "Enroll_Control.mac", "nptxwrt_func.mac", "FuncObjController.mac", DealsInter, "RegvalReader.mac", "nptxstbfun.mac";
+
+private macro Error( ErrStr:STRING ):INTEGER
+  DL_NPTX_PutMsg( ErrStr );
+  MsgBox( ErrStr );
+  return 1;
+end;
+
+/**
+  @brief checkAutoControl - проверка на соблюдение условий для автоотправки (при проверке кода валюты и соответствия балансовых счетов)
+  @param[in] paymid - id платежа
+  @param[in] payPurpose - тип операции
+  @param[our] error_message - сообщение об ошибке
+  @return true - проверка прошла, false - проверка не прошла
+*/
+private macro checkAutoControl(paymid, payPurpose, error_message:@string)
+  error_message = "";
+  CaptureOutput();
+  [
+    select
+      case 
+          when legalform=2 and payeraccount30601 = 1 and  receiveraccount40817 = 1 then 1
+          when legalform=2 and payeraccount30606 = 1 and  receiveraccount40820 = 1 then 1
+          when legalform=2 and payeraccount3060 = 1 and receiveraccount30601 = 1 and operpaypurpose in (2, 5) then 1 
+          when legalform=2 and payeraccount3060 = 1 and receiveraccount30606 = 1 and operpaypurpose in (2, 5) then 1 
+          when legalform=2 and payeraccount3060 = 1 and receiveraccount30301 = 1 and operpaypurpose in (2, 5)  then 1  
+          when payeraccount3060 = 1 and  receiveraccount40802 = 1 then 1             
+          when legalform=1 and payeraccount30601 = 1 and  receiveraccount40701 = 1 then 1
+          when legalform=1 and payeraccount30601 = 1 and  receiveraccount40702 = 1 then 1
+          when legalform=1 and payeraccount3060 = 1 and receiveraccount30301 = 1 and operpaypurpose in (2, 5) then 1 
+          else 0
+        end may_upload_payment1,
+      fiids_equal may_upload_payment2
+      from 
+    ( select 
+      (select d.t_legalform from dparty_dbt d where d.t_partyid = p.t_receiver ) legalform,
+      case when substr(p.t_payeraccount,1,5) = '30601' then 1 else 0 end payeraccount30601, 
+      case when substr(p.t_receiveraccount,1,5) = '40817' then 1 else 0 end receiveraccount40817, 
+      case when substr(p.t_payeraccount,1,5) = '30606' then 1 else 0 end payeraccount30606, 
+      case when substr(p.t_payeraccount,1,4) = '3060' then 1 else 0 end payeraccount3060, 
+      case when substr(p.t_receiveraccount,1,5) = '40820' then 1 else 0 end receiveraccount40820, 
+      case when substr(p.t_receiveraccount,1,5) = '40701' then 1 else 0 end receiveraccount40701, 
+      case when substr(p.t_receiveraccount,1,5) = '40702' then 1 else 0 end receiveraccount40702, 
+      case when substr(p.t_receiveraccount,1,5) = '40802' then 1 else 0 end receiveraccount40802,
+      case when substr(p.t_receiveraccount,1,5) = '30601' then 1 else 0 end receiveraccount30601, 
+      case when substr(p.t_receiveraccount,1,5) = '30606' then 1 else 0 end receiveraccount30606, 
+      case when substr(p.t_receiveraccount,1,5) = '30301' then 1 else 0 end receiveraccount30301,  
+      case when substr(p.t_payeraccount,6,3) = substr(p.t_receiveraccount,6,3) then 1 else 0 end fiids_equal,
+      p.* , :paypurpose as operpaypurpose
+    from dpmpaym_dbt p 
+    where p.t_paymentid = :id )
+  ];
+  var rs = execSQLselectPrmDyn(StopCaptureOutput(), payPurpose, paymid);
+
+  if (rs.movenext)
+    if ( (rs.value("may_upload_payment1")==1) 
+          and 
+         (rs.value("may_upload_payment2")==1)
+       )
+      return true;
+    else
+      if (rs.value("may_upload_payment1")==0)
+        error_message = "Счета плательщика и получателя не соответствуют друг другу."; 
+      end; 
+      if (rs.value("may_upload_payment2")==0)
+        error_message = error_message + " Не совпадает код валюты в счете плательщика и получателя"; 
+      end; 
+      return false;
+    end;  
+  else
+    return false;
+  end;
+end;
+
+private macro GetNextClientOperationID(baseOperationID:integer, clientID:integer)
+  CaptureOutput();
+  [
+  select /*+ index (o DNPTXOP_DBT_IDX3) */
+         o.t_id
+    from dnptxop_dbt o
+    join nontrading_orders_buffer b on b.operation_id = o.t_id
+   where o.t_status in (0, 1)
+     and o.t_dockind = 4607
+     and o.t_client = :clientid
+     and nontrading_orders_read.is_allowed_autorun(p_system_name          => b.src,
+                                                   p_exchange_type        => b.marketplace_withdrawal,
+                                                   p_exchange_type_target => b.marketplace_enroll,
+                                                   p_is_full_rest         => b.is_full_rest,
+                                                   p_currency             => b.currency,
+                                                   p_iis                  => 0) = 1
+     and nontrading_orders_read.is_client_operation_in_funcobj(p_client_id => o.t_client) = 1
+     and o.t_id != :opid
+   order by b.req_date, b.req_time
+   fetch first 1 rows only
+  ];
+  var sql = ExecSQLselectPrmDyn(StopCaptureOutput(), clientID, baseOperationID);
+  if (sql.MoveNext() ) 
+    return sql.value("t_id");
+  end;
+
+  return 0;
+end;
+
+private macro GetOperationCode(operationID:integer):string
+  var query = "select t_code from dnptxop_dbt where t_id = :id";
+  var sql = ExecSQLselectPrmDyn(query, operationID);
+  if (sql.MoveNext() )
+    return sql.value("t_code");
+  end;
+
+  return "";
+end;
+
+private macro RunActionNettOp(Oper)
+  var nptxop_new = TRecHandler( "nptxop" );
+  var RefID, TaxPeriod;
+  var err = 0;
+
+  datesplit(Oper.rec.OperDate, null, null, TaxPeriod);
+
+  if((Oper.rec.SubKind_Operation == DL_NPTXOP_WRTKIND_WRTOFF) and (NeedNptxNettOp(Oper.rec.Client, TaxPeriod, Oper.rec.OperDate)))
+
+    nptxop_new.Clear();
+
+    GenerateNumberByReference( OBJTYPE_NPTXNETTOP, 1 /*REFOBJ_NPTXNETTOP*/, @RefID, @nptxop_new.rec.Code );
+        
+    nptxop_new.rec.DocKind           = DL_NPTXNETTOP;
+    nptxop_new.rec.OperDate          = Oper.rec.OperDate;
+    nptxop_new.rec.Time              = time();
+    nptxop_new.rec.Department        = {OperDprt};
+    nptxop_new.rec.Oper              = Oper.rec.Oper;
+    nptxop_new.rec.Status            = 0/*DL_TXOP_Prep*/;
+    nptxop_new.rec.Recalc            = UNSET_CHAR;
+    nptxop_new.rec.FIID              = ALLFININSTR;
+    nptxop_new.rec.Client            = Oper.rec.Client;
+
+    nptxop_new.rec.PrevDate          = date(1,1,TaxPeriod);
+
+    nptxop_new.rec.Kind_Operation    = 2046;//Зачет удержанного НДФЛ
+
+    if ( not CreateNptxOpStep(nptxop_new, true))
+      err = 1;
+    end;
+  end;
+
+  return err;
+end;
+
+
+macro ExecuteStep( Doc, FDoc, DocKind, OperationID )
+  record nptxop("nptxop");
+  var Oper = TRecHandler("nptxop.dbt");
+
+  SetBuff( nptxop, FDoc );
+  
+  copy(Oper, nptxop);
+
+  if(RunActionNettOp(Oper) != 0)
+    return Error( "Ошибка при создании операции зачета НДФЛ" );
+  end;
+
+  var funcobj = FuncObjController();
+
+  ExecStoredFunc("nontrading_orders_utils.set_status_done", V_UNDEF, MakeArray(SqlParam("p_nptxop_id", nptxop.id)));
+
+  if(nptxop.FlagTax == SET_CHAR)
+    if( not InsertOprStatus(46072, 2)) //Установить УН = Закрыт
+        return Error( "Ошибка при установке статуса вида \"Установить УН\" операции" );        
+    end;
+  end;
+  if( not InsertOprStatus(46073, 2)) //Установить ВН = Закрыт
+      return Error( "Ошибка при установке статуса вида \"Установить ВН\" операции" );        
+  end;
+  if( not InsertOprStatus(46075, 2)) //Установить ВД = Завершить
+        return Error( "Ошибка при установке статуса вида \"Установить ВД\" операции" );        
+  end;
+
+  if ((nptxop.subkind_operation == DL_NPTXOP_WRTKIND_WRTOFF) and RegValReader.GetBool("РСХБ\\ИНТЕГРАЦИЯ\\РУБИЛЬНИК.BOSS-2576", false))
+    // BIQ-13408 определим id платежки
+    var rs = execSQLselectPrmDyn("select pmpaym.t_paymentid from dpmpaym_dbt pmpaym where pmpaym.t_documentid = :1 and pmpaym.t_dockind=4607",nptxop.id);
+    // только для операций списания запустим задание funcobj, которое проведет контроль платежки, и тем самым запустит цепь из планировшика 10002 и задачу funcobj 5007
+    if (rs.movenext)
+      var error_message = "";
+      if ( not checkAutoControl(rs.value("t_paymentid"), nptxop.paypurpose, @error_message ) )  //проверка условий для автовыгрузки платежа BOSS-5664
+        var notes = c_notes(nptxop.ID);
+        if (not notes.SaveReject(error_message))
+          return Error("Не удалось сохранить Примечание");
+        end;
+        MsgBox(error_message);
+      else
+        funcobj.SaveByCode(rs.value("t_paymentid"), "run_nptx_control");
+      end; 
+
+      /* 
+        если данный вариант будет медленным, для ускорения процесса придется исключать из цепи звено планировщика 10002:
+        - в триггере делаем исключение для операций списания ДС (то есть после контроля для операций списания ДС не должно быть вставки в uTableProcessEvent_dbt)
+        - создаем задание funcobj, которое запустит контроль 
+        - в этом же макросе запустить переработанный ws_SOFR_addAccountingEntries, который примет параметр - id платежки
+            из макроса вырезать все что связано с uTableProcessEvent_dbt
+            все что связано с удалением проводки
+            оставить блокировку записи проводки - хотя какой смысл в этом? идет же отправка платежа
+            осуществить вызовы uws_exchng_logger и SubmitRequestToWS
+            транзакция одна
+            обработка ошибки
+      */
+    end;
+  end;
+
+  var nextClientOperationID:integer = 0;
+  if ( (nptxop.subkind_operation == DL_NPTXOP_WRTKIND_WRTOFF)  or (nptxop.subkind_operation == DL_NPTXOP_WRTKIND_TBSABC))
+    nextClientOperationID = GetNextClientOperationID(nptxop.ID, nptxop.Client);
+    if (nextClientOperationID != 0)
+      funcobj.SaveByCode(nextClientOperationID, "run_nptx_money");
+      MsgBoxEx("Инициировано исполнение следующего поручения клиента - " + GetOperationCode(nextClientOperationID));
+    end;
+  end;
+  return 0;
+end;
+
+MACRO PostStep (    
+                CommitOrRollback, /*1-выполнение шага,2 -отакат шага*/
+                errTrn,        /* Статус выполнения шага-!0-произошла ошибка */
+                FDoc,      /* Указатель на первичный документ */
+                ID_Operation,  /* Номер экземпляра операции */
+                Num_Step,      /* Номер шага операции(из настроек) */
+                Kind_Operation,/* Вид операции */
+                KindDoc,       /* Вид первичного документа */
+                KindStep,      /* Вид шага операции */
+                ID_Step)       /* Номер шага операции */
+
+    
+  record nptxop("nptxop");
+  SetBuff( nptxop, FDoc );
+
+  if (CommitOrRollback == 2) // При откате шага
+    ExecStoredFunc("nontrading_orders_utils.set_status_wait", V_UNDEF, MakeArray(SqlParam("p_nptxop_id", nptxop.id)));
+  end;
+  
+  // DEF-82482 только для операций перевода
+  if ((CommitOrRollback == 1) and (errTrn == 0) and (nptxop.SubKind_Operation == DL_NPTXOP_WRTKIND_TBSABC) ) // При успешном выполнении шага
+    var sql = String("begin \n"+
+                     "  nontrading_orders_utils.send_order_status(p_operid  => :p_nptxop_id, \n"+
+                     "                                            p_status => nontrading_orders_read.buf_status_done ); \n"+
+                     "end; ");
+    var cmd = RSDCommand(sql);
+    cmd.Addparam("p_nptxop_id", RSDBP_IN, nptxop.id);
+    cmd.execute();
+    cmd.close();
+  end;
+
+  return 0;
+
+END;

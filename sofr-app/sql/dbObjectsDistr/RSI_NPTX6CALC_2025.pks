@@ -1,0 +1,11 @@
+CREATE OR REPLACE PACKAGE RSI_NPTX6CALC_2025
+IS
+
+  --Типы записей в расшифровка (T_RECTYPE)
+  RECTYPE_NORMAL           CONSTANT NUMBER := 0; --Обычная запись
+  RECTYPE_NDR_CHANGECODES  CONSTANT NUMBER := 1; --НДР. Замена кодов
+
+  PROCEDURE CalcNptx6Decoding(p_BegDate IN DATE, p_EndDate IN DATE, p_ByCB IN CHAR, p_ByDepo IN CHAR, p_ByVS IN CHAR, p_BySOFR IN CHAR, p_ByDIASOFT IN CHAR);
+
+END RSI_NPTX6CALC_2025;
+/

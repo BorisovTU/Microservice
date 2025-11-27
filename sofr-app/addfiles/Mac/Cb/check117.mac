@@ -1,0 +1,257 @@
+//-----------------------------------------------------------------------------
+//
+// Проверка допустимости реквизитов сохраняемого документа
+//
+// Проверки по 117-И при сохранении документа
+// MACRO CheckOnSave_117( paym, debet, credit, docum, rm ):integer
+//
+//-----------------------------------------------------------------------------
+
+import globals, PaymInter;
+import oralib, likepy, "bnk_ptlib.mac";
+
+PRIVATE CONST RegPath_117_Rest:string = "173-ФЗ счета нерезид с огранич";
+PRIVATE CONST RegPath_117   :string = "173-ФЗ счета нерезидентов";
+PRIVATE CONST RegPath_117_All :string = "PS\\REQOPENACC\\173-ФЗ счета нерезидентов\\Все счета";
+PRIVATE CONST RegPath_Client:string = "PS\\REQOPENACC\\Счета клиентов";
+
+//-----------------------------------------------------------------------------
+// Подходит ли счет по маске? 
+// true - подходит
+// false - не подходит
+//-----------------------------------------------------------------------------
+PRIVATE MACRO IsAccountEqMask( Mask, Account ):bool
+  return ( CompareStrWithMasks( Mask, Account ) == 0 );
+END;
+
+
+//-----------------------------------------------------------------------------
+// Является ли субъект резидентом
+//-----------------------------------------------------------------------------
+PRIVATE MACRO IsResident( PartyID:integer, Account:string, PrimDocKind:integer ):bool
+  
+  VAR select:string = " select party.T_NotResident " +
+                        " from dparty_dbt party "+
+                       " where party.T_PARTYID = :PartyID";
+  VAR params:TArray = makeArray( SQLParam( "PartyID", PartyID ) );
+  VAR rset:RsdRecordset = execSQLselect( select, params, TRUE );
+
+  if( rset and rset.moveNext() )
+    return IfThenElse( (rset.value(0) == "X"), false, true );
+  end;
+
+  if( Account != null )
+  // Если клиент неизвестен - то смотрим на счет
+    if( (PrimDocKind != 300) and (PrimDocKind != 320) and 
+      (PrimDocKind != 381) and (PrimDocKind != 382))
+      if( PM_FindBalanceInReg_117( RegPath_117, Account, 0 ) )
+        return false;
+      end;
+    else
+      if( PM_FindBalanceInReg_117( RegPath_117_All, Account, 1 ) )
+        return false;
+      end;
+    end;
+  end;
+
+  return true;
+
+END;
+
+//---------------------------------------------------------------------------
+// Является ли субъект нашим банком
+//---------------------------------------------------------------------------
+PRIVATE MACRO IsOurBank( PartyID ):bool
+
+  if(PartyID == {OurBank})
+    return true;
+  end;
+
+  var select:string = "SELECT count(1) "
+                       " FROM ddp_dep_dbt dep " +
+                      " WHERE dep.t_PartyID  = :PartyID "   +  
+                        " AND dep.t_NodeType = 1 " + 
+                        " AND dep.t_status <> 3 ";
+          
+  var params:TArray = makeArray( SQLParam( "PartyID", PartyID ) );
+  VAR rset:RsdRecordset = execSQLselect( select, params, FALSE );
+
+  if( ( NOT rset ) OR ( NOT rset.moveNext() ) OR (rset.value(0) == 0))
+    return false;
+  end;
+
+  return true;
+
+END;
+
+//---------------------------------------------------------------------------
+// Определим реального плательщика / получателя
+//---------------------------------------------------------------------------
+PRIVATE MACRO SetRealPayerReceiver( PartyID, BankID, Account ):integer
+
+  if( IsOurBank( BankID ) )
+    if( IsOurBank( PartyID ) )
+      return PartyID;
+    end;
+  end;
+
+  if( PM_FindBalanceInReg_117( RegPath_Client, Account, 1 ) )
+    return PartyID;
+  end;
+
+  return BankID;
+
+END;
+
+//---------------------------------------------------------------------------
+// Получить главу
+//---------------------------------------------------------------------------
+PRIVATE MACRO GetChapter( paym, docum ):integer
+  
+  if( (paym.DocKind == 201 /*PS_PAYORDER*/ ) OR
+      (paym.DocKind == 202 /*PS_CPORDER*/ ) OR
+      (paym.DocKind == 410 /*CASH_PS_INCORDER*/ ) OR
+      (paym.DocKind == 420 /*CASH_PS_OUTORDER*/ ) OR
+      (paym.DocKind == 16 /*DLDOC_BANKPAYMENT*/ ) OR
+      (paym.DocKind == 17 /*DLDOC_BANKCLAIM*/ ) OR
+      (paym.DocKind == 27 /*BBANK_CPORDER*/ ) OR
+      (paym.DocKind == 400 /*CASH_BOF_ADDORDER*/ ) OR
+      (paym.DocKind == 430 /*CASH_BOF_INCORDER*/ ) OR
+      (paym.DocKind == 440 /*CASH_BOF_OUTORDER*/ ) )
+    return 1; /*CHAPT1*/
+  elif( paym.DocKind == 70 /*DLDOC_MEMORIALORDER*/ )
+    return docum.Chapter;
+  end;
+  return -1; /*ALLCHAPT*/
+END;
+
+//----------------------------------------------------------------------------
+// Проверить, нужно ли производить проверки документов по 117-И
+// true - надо производить, false - не надо производить
+//----------------------------------------------------------------------------
+PRIVATE MACRO NeedCheckDocuments_117():bool
+  
+  var err      :integer = 0;
+  var NeedCheck:integer = 0;
+    
+  GetRegistryValue( "PS\\REQOPENACC\\173-ФЗ отключить проверки", V_INTEGER, NeedCheck, err );
+  if( ( err ) OR ( NOT NeedCheck ) )
+    return true;
+  end;
+  return false;
+
+END;
+
+//---------------------------------------------------------------------------
+// Проверки по 117-И при сохранении документа
+//
+//  Принимаемые параметры:
+//    paym - запись в pmpaym.dbt;
+//    debet - запись в pmprop.dbt (соответствует стороне плательщика);
+//    credit - запись в pmprop.dbt (соответствует стороне получателя);
+//    docum - запись, соответствующая первичному документу;
+//    rm - запись в pmrmprop.dbt;
+//  Возвращаемое значение:
+//    0 - проверка выполнена успешно;
+//    1 - изменения в документе не могут быть сохранены.
+//
+//---------------------------------------------------------------------------
+MACRO CheckOnSave_117( paym, debet, credit, docum, rm ):integer
+
+  var Payer:integer = -1;
+  var Receiver:integer = -1;
+
+  if( GetChapter( paym, docum ) != 1 /*CHAPT1*/ )
+    return 0;
+  end;
+
+  if( NOT NeedCheckDocuments_117() or not IsResident(paym.ReceiverBankID) )
+    return 0;
+  end;
+
+  // для документа, вставляемого DLM, проверки по 117-И не выполняются
+  if( isDLMRuning() )
+    return 0;
+  end;
+  
+  // Определим реального плательщика и получателя
+  Payer    = SetRealPayerReceiver( paym.Payer,    paym.PayerBankID,    paym.PayerAccount    );
+  Receiver = SetRealPayerReceiver( paym.Receiver, paym.ReceiverBankID, paym.ReceiverAccount );
+
+  if( IsResident( Payer, paym.PayerAccount, paym.primdockind ) ) // плательщик - резидент 
+    
+    if( IsResident( Receiver, paym.ReceiverAccount, paym.primdockind ) ) // получатель - резидент
+      return 0; // разрешить сохранение документа, закончить проверку
+    else // получатель - нерезидент
+
+      if( PM_FindBalanceInReg_117( RegPath_117_Rest, paym.ReceiverAccount, 0 ) )
+
+        if( IsOurBank( Payer ) AND IsAccountEqMask( "47426*", paym.PayerAccount ) )
+          return 0; // разрешить сохранение документа, закончить проверку
+        else
+          MsgBox( "В сохраняемом документе заданы недопустимый|получатель или номер счета получателя" );
+          return 1; // запретить сохранение документа
+        end;
+      else
+        return 0; // разрешить сохранение документа, закончить проверку
+      end;
+
+    end;
+
+  elif( PM_FindBalanceInReg_117( RegPath_117_Rest, paym.PayerAccount, 0 ) ) // плательщик - нерезидент
+    if( IsResident( Receiver, paym.ReceiverAccount, paym.primdockind ) ) // получатель - резидент
+
+      if( IsOurBank( Receiver ) )
+
+        if( IsAccountEqMask( "70601*,60301*", paym.ReceiverAccount ) )
+          return 0; // разрешить сохранение документа, закончить проверку
+        elif( IsAccountEqMask( "47408*,47405*", paym.ReceiverAccount ) AND
+              IsAccountEqMask( "30122*,30123*,40803*,40804*,40805*,40813*,40814*,40815*", paym.PayerAccount ) )
+          return 0; // разрешить сохранение документа, закончить проверку
+        else
+          msgbox("В сохраняемом документе указан недопустимый счет получателя");
+          return 1;
+        end;
+
+      else
+        MsgBox( "Для сохраняемого документа получателем должен быть 'Наш банк'" );
+        return 1;
+      end;
+    
+    else // получатель - нерезидент
+
+      if( Receiver == Payer )
+        if( IsAccountEqMask( "40806*,40809*,40812*", paym.PayerAccount ) )
+            if( ( not IsPerson( Receiver ) ) and /* Юридическое лицо */
+                ( IsAccountEqMask( "40807*,40818*", paym.ReceiverAccount ) ) )
+              return 0; // разрешить сохранение документа, закончить проверку
+            elif( IsPerson( Receiver ) and /* Физическое лицо */
+                  IsAccountEqMask( "40818*,40820*", paym.ReceiverAccount ) )
+              return 0; // разрешить сохранение документа, закончить проверку
+            else
+              msgbox("Недопустимый счет получателя в сохраняемом документе");
+              return 1;
+            end;
+        elif( IsAccountEqMask( "30122*,30123*", paym.PayerAccount ) and
+              IsAccountEqMask( "30231*,30111*", paym.ReceiverAccount ) )
+          return 0; // разрешить сохранение документа, закончить проверку
+        elif( IsAccountEqMask( "40803*,40813*", paym.PayerAccount ) and
+              IsAccountEqMask( "40820*", paym.ReceiverAccount ) )
+          return 0; // разрешить сохранение документа, закончить проверку
+        elif( IsAccountEqMask( "40804*,40805*,40814*,40815*", paym.PayerAccount ) and 
+              IsAccountEqMask( "40807*", paym.ReceiverAccount ) )
+          return 0; // разрешить сохранение документа, закончить проверку
+        else
+          msgbox("Недопустимый счет получателя в сохраняемом документе");
+          return 1;
+        end;
+      else
+        MsgBox( "В сохраняемом документе получателем может быть только сам субъект" );
+        return 1;
+      end;
+
+    end;
+  end;
+
+  return 0;
+end;

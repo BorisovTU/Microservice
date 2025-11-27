@@ -1,0 +1,2 @@
+--Исправление цены в сделке, введённой при переносе данных из сторонней системы
+update ddl_leg_dbt leg set leg.t_relativeprice = 'X', leg.t_price = 100 where leg.t_dealid = (select t_dealid from ddl_tick_dbt where t_dealcode = 'LSEB/49')/

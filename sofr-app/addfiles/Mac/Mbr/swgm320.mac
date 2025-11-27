@@ -1,0 +1,663 @@
+/*
+$Name: swgm320.mac
+$Module: Межбанковские расчеты
+$Description: Генерация сообщения по SWIFT MT320
+*/
+/****************************************************************************/
+/*                   R-Style SoftWare Lab, RS-Bank 5.1                      */
+/****************************************************************************/
+/*                  Подсистема "Межбанковские расчеты"                      */
+/*  Генерация сообщения по SWIFT MT320                                      */
+/*                                                                          */
+/*  Имя файла: swgm320.mac                                                  */
+/*  Создан:  11.04.01                                        Алешин А.В.    */
+/****************************************************************************/
+
+import "wlgenmes.mac",funk, "swtools.mac", "wltools.mac", OprInter,"oralib.mac", mmcateg, mmlibr, fx_globals,dl_prol,dl_lib;
+IMPORT BankInter,rsexts, Календарь,FIInter,"osfile.d32", PTinter,"cb_sql.mac",funk;    
+                     
+Var pmprop   = TBFile ( "pmprop.dbt", "w" );
+Var pmprop2   = TBFile ( "pmprop.dbt", "w" );
+
+private var СделкаПривлечения = TRUE; /* Тип сделки: размещение/привлечение */
+
+FILE ПодтвержденияМБК( wldlmm ) key 1;
+
+/* Виды базисов RS-Bank */
+const RS_BASIS_30360  = 1,    /* 360 дней в году, 30 в месяце */
+      RS_BASIS_ACTACT = 4,    /* в году и в месяце по календарю */
+      RS_BASIS_ACT360 = 2,    /* 360 дней в году, в месяце по календ. */
+      RS_BASIS_ACT365 = 8,    /* в году и в месяце по календарю без учета високосности */
+      RS_BASIS_31360  = 1001; /* 360 дней в году, 31 в месяце */
+
+/*Определение следующего платежа по %%*/
+macro GetPercDate(DealID)
+    var rs = TRsbDataSet("select t_ValueDate from dpmpaym_dbt where " +
+                     "t_DocKind = 102 and t_DocumentID = " + DealID +
+                     " and t_Purpose = 11 and t_PaymStatus in (0, 1000) order by t_SubPurpose");
+
+    if (rs.MoveNext())
+        return date(rs.ValueDate);
+    else
+        return date(0,0,0);
+    end;
+end;
+
+macro GetPaymBaseamount(dealid, purpose)  //SVE получение суммы платежа для корректного расчета поля 32H 
+   var data = TRsbDataSet("select t_baseamount from dpmpaym_dbt where t_dockind = 102 and t_documentid = " + dealid + "and t_purpose = " + purpose);   
+   if ( data.MoveNext() )
+      return data.baseamount;
+   end;
+   return 0;
+end;
+
+/* Определение типа операции */
+macro ОпределитьТипОперации( dlmmbuf, Sending )
+  var Found = FALSE;
+  record LastDlMM( wldlmm );
+ 
+  /* Определяем, были ли уже отосланы подтверждения c данным типом, ищем последнее из них */
+  ПодтвержденияМБК.DealID = dlmmbuf.DealID;
+  ПодтвержденияМБК.Direct = dlmmbuf.Direct;     /* Ищем исходящие */ 
+  if( not GetEQ( ПодтвержденияМБК ) ) /* Вообще ничего не отсылалось */
+    return TYPE_OPERATION_NEWT; /* Тип - новое подтверждение */
+  end;
+
+  /* Что-то уже отсылали, проверяем тип */
+  if( ПодтвержденияМБК.Type ==  dlmmbuf.Type )
+    Found = TRUE;
+    Copy( LastDlMM, ПодтвержденияМБК );
+  end;
+  /* Перебираем остальные */
+  while( (Next(ПодтвержденияМБК)  == TRUE)           AND 
+	         (ПодтвержденияМБК.DealID == dlmmbuf.DealID) AND 
+         (ПодтвержденияМБК.Direct == dlmmbuf.Direct) AND
+         (ПодтвержденияМБК.Type   == dlmmbuf.Type) ) 
+    Found = TRUE;
+    Copy( LastDlMM, ПодтвержденияМБК );
+  end;
+
+  setparm( 1, TRUE ); /* Были любые отсылки - нужно заполнять поле 21 */
+
+  if( not Found ) /* С данным типом еще ничего не отсылали */
+    return TYPE_OPERATION_NEWT; /* Тип - новое подтверждение */
+  end;
+/*
+  /* Если изменились существенные параметры сделки, считаем что это поправки */
+  if( (LastDlMM.DealCodePS != dlmmbuf.DealCodePS) OR
+      (LastDlMM.PartyID    != dlmmbuf.PartyID)    OR
+      (LastDlMM.PaymAgent  != dlmmbuf.PaymAgent)  OR
+      (LastDlMM.DealDate   != dlmmbuf.DealDate)   OR
+      (LastDlMM.PFI        != dlmmbuf.PFI)        OR
+      (LastDlMM.CFI        != dlmmbuf.CFI)        OR
+      (LastDlMM.Start      != dlmmbuf.Start)      OR
+      (LastDlMM.Maturity   != dlmmbuf.Maturity)   OR
+      (LastDlMM.Expiry     != dlmmbuf.Expiry)     OR
+      (LastDlMM.Principal  != dlmmbuf.Principal)  OR
+      (LastDlMM.Price      != dlmmbuf.Price)      OR
+      (LastDlMM.Basis      != dlmmbuf.Basis)      OR
+      (LastDlMM.Duration   != dlmmbuf.Duration)   OR
+      (LastDlMM.Pitch      != dlmmbuf.Pitch)      OR
+      (LastDlMM.Cost       != dlmmbuf.Cost) )
+    return TYPE_OPERATION_AMND;
+  end;
+*/
+  return TYPE_OPERATION_DUPL; /* Иначе считаем, что дубликат */
+end;
+
+macro ОпределитьГенСоглашение(DealID)
+  var rs:object;
+  var select:string;
+  var params:TArray;
+  select = "select ga.t_code, to_char(ga.t_start,'dd.mm.yyyy') from ddl_genagr_dbt ga, ddl_tick_dbt tick " +
+            " where ga.t_genagrid = tick.t_genagrid and tick.t_dealid = :DEALID";
+  params = makeArray(SQLParam("DealID", DealID));
+  rs = execSQLselect(select, params, FALSE);
+  
+  if( rs.moveNext() )
+    if (rs.value(0) == "б/н")
+       return rs.value(0);
+    else
+       return rs.value(0) + " " + rs.value(1);
+    end;
+  else
+    return NULL; 
+  end;
+end;
+
+/* Получить курс в формате SWIFT */
+private macro FormatRate( Rate )
+  var SWIFTRate = String(Rate);
+
+  if( index( SWIFTRate, "." ) )
+    SWIFTRate = GetSWIFTAmount( Rate );
+  end;
+  
+  /* Обрезаем все нули справа */
+  while( SubStr( SWIFTRate, StrLen(SWIFTRate), 1 ) == "0" )    
+    SWIFTRate = substr( SWIFTRate, 1, StrLen(SWIFTRate)-1 );
+  end;
+  
+  return SWIFTRate;
+END;
+
+private macro GetSubjectName(PartyID)
+  var dparty = TBFile("party");
+  if (PartyID == 1)
+    PartyID = {OurBank};
+  end;
+  dparty.rec.PartyID = PartyID;
+  if( dparty.GetEQ() )
+    return dparty.rec.Shortname;
+  end;
+  return "";
+END;
+
+private macro ЗаписатьНалог()
+  var genagr, taxRate = 0.0, taxAmount = $0, deal_pd;
+  
+  deal_pd = MMFirstDoc(DL_IBCDOC, wldlmm.DealID, true);
+  if (СделкаПривлечения)
+    taxRate = GetTaxContr(deal_pd.GetTick());
+  else
+    taxRate = GetTaxBank(deal_pd.GetTick());
+  end;
+  
+  if (TaxRate > 0)
+    УстановитьКонтекстБлокаЛог( "" );
+    УстановитьКонтекстБлокаЛог( "Sequence G" );
+    
+    taxAmount = round(wldlmm.Cost * (taxRate/100), 2);
+
+    ЗаписатьПолеЛог( "15G", "" );
+    ЗаписатьПолеЛог( "37L", FormatRate(taxRate) );
+    ЗаписатьПолеЛог( "33B", ПолучитьКодВалютыЛог( wldlmm.PFI ) + GetSWIFTAmount(wldlmm.Cost - taxAmount) );
+    ЗаписатьПолеЛог( "33E", ПолучитьКодВалютыЛог( wldlmm.PFI ) + GetSWIFTAmount(taxAmount) );
+  end;
+END;
+
+/* Записать поле */
+macro ЗаписатьБанкЛогНовый(SequenceName, BlockName, PaymAgent, CodeKind, CodeValue, CorrName, CorrAccount, BankCodeKind, BankCodeValue, BankName, BankAccount )       //SVE 528368 28.05.2021 добавлена переменная SequenceName для восстановления работы старого кода
+  var field_value = "", Tag, tempv, ID, BankCode, error, INN = "", SubjectName = "";
+
+  /* Только по наименованию пока банк не заполняем */
+  if( (PaymAgent != 0) OR ((CodeKind != 0) AND (CodeValue != "")) )
+    if( (CodeKind != 0) AND (CodeValue != "") )
+      ID = ПолучитьКодСубъекта( CodeValue, CodeKind, error );
+      if( error ) RunError( "|Не найден банк c кодом: " + CodeValue + " и видом кода: " + CodeKind ); end;
+    else
+      ID = PaymAgent;
+    end;
+
+    /* Ищем для субъекта SWIFT-код. Если не нашли - отваливаем,   */
+    /* так как настоятельно рекомендуется использовать именно его */
+    CodeKind = PTCK_SWIFT;
+    if (wldlmm.PFI == NATCUR)
+      BankCode = ПолучитьКодСубъекта( ID, PTCK_BIC, error ); CodeKind = PTCK_BIC;
+      if( error ) RunError( "|Не найден BIC-код для банка с кодом: "+ CodeValue + " и видом кода: " + CodeKind ); end;
+    else
+      BankCode = ПолучитьКодСубъекта( ID, PTCK_SWIFT, error ); CodeKind = PTCK_SWIFT;
+      if( error ) BankCode = ПолучитьКодСубъекта( ID, PTCK_BIC, error ); CodeKind = PTCK_BIC; end;
+      if( error ) RunError( "|Не найден BIC-код для банка с кодом: "+ CodeValue + " и видом кода: " + CodeKind ); end;
+    end;
+
+    if (BankCode != "")
+      if (CodeKind == PTCK_BIC)
+        BankCode = "BIC " + BankCode;
+      else
+        if (wldlmm.PFI == NATCUR)
+          BankCode = "SWIFT " + BankCode;
+        end;
+      end;
+    end;
+
+    if( not УстановитьКонтекстБлока( BlockName ) )
+      RunError("|Ошибка при установке контекста блока " + BlockName);
+    end;                                                                                 
+    if (SequenceName == "15C")                                                           /*SVE 528368*/
+        field_value = field_value + "ACC YOUR INSTRUCTION" + SYMB_ENDL;
+    elif (SequenceName == "15E")                                                         /*SVE 528810 02.06.2021*/
+        field_value = field_value + "ACC YOUR INSTRUCTION" + SYMB_ENDL;
+    elif ( CorrAccount != "" )                                                          
+        field_value = field_value + SYMB_SLASH + CorrAccount + SYMB_ENDL;
+    elif (wldlmm.PFI == NATCUR)
+        field_value = field_value + "ACC YOUR INSTRUCTION" + SYMB_ENDL;
+    elif (wldlmm.PFI != NATCUR)                                                          /*SVE 532307 30.08.2021 для сделок в валюте подставляем корр. счет, а не счет банка плательщика*/
+        field_value = field_value + SYMB_SLASH + BankAccount + SYMB_ENDL;
+    end;
+    field_value = field_value + BankCode + SYMB_ENDL;
+
+    if (wldlmm.PFI == NATCUR)
+      if( BankAccount != "" )
+          field_value = field_value + "CA " + BankAccount + SYMB_ENDL;
+      end;
+      INN = ПолучитьКодСубъекта( ID, PTCK_INN, error );
+      if (not error)
+        field_value = field_value + "INN " + INN;
+      end;
+      ЗаписатьПолеЛог( SubStr( BlockName, 1, 2 ) + "D", field_value );
+    else
+      /*    SVE 528305 21.05.2021 в мт320 не должно быть наименования банка
+      SubjectName = GetSubjectName(ID);
+      if (SubjectName != "")
+        field_value = field_value + SYMB_ENDL + SubjectName;
+      end;
+      */
+      if (((SequenceName == "15C") OR (SequenceName == "15E")) and  (SubStr( BlockName, 1, 2 ) == "57"))   // MAA: iS - 530892
+        ЗаписатьПолеЛог( SubStr( BlockName, 1, 2 ) + "D", field_value );        
+      else
+        ЗаписатьПолеЛог( SubStr( BlockName, 1, 2 ) + "A", field_value );
+      end;
+    end;
+
+    if( not УстановитьКонтекстБлока( ".." ) )
+      RunError("|Ошибка при установке контекста блока '..'");
+    end;
+  end;
+
+end;
+
+/*macro MakeCommonRef(BIC_A, BIC_B, Rate :string)
+var CommonRef,Bank1,Place1,RefCode,Bank2,Place2,
+    LastNonZero,i,symb;
+
+if (StrLen(BIC_A) < 8) RunError( "|Не найден SWIFT-код банка нашего банка" ); 
+end;
+if (StrLen(BIC_B) < 8) RunError( "|Не найден SWIFT-код банка-контрагента по сделке" ); 
+end;
+
+if (BIC_A > BIC_B)
+	Bank1 = SubStr(BIC_B,1,4);
+    Place1 = SubStr(BIC_B,7,2);
+	Bank2 = SubStr(BIC_A,1,4);
+    Place2 = SubStr(BIC_A,7,2);
+else
+    Bank1 = SubStr(BIC_A,1,4);
+    Place1 = SubStr(BIC_A,7,2);
+	Bank2 = SubStr(BIC_B,1,4);
+    Place2 = SubStr(BIC_B,7,2);
+end;
+
+LastNonZero = 0;
+for (i, 1, StrLen(Rate))
+	symb = SubStr(Rate,i,1);
+	if ((symb != "0") and (symb != ",") and (symb != "."))
+		LastNonZero = i;
+	end;
+end;
+
+if (LastNonZero >=4) 
+	RefCode = SubStr(Rate,LastNonZero-3,4);
+else 
+	RefCode = SubStr(Rate,1,LastNonZero);
+    while (StrLen(RefCode)<4)
+		RefCode = "0" + RefCode;
+	end;
+end;
+
+CommonRef = Bank1+Place1+RefCode+Bank2+Place2; 
+return CommonRef;
+END;
+*/
+
+macro IsPrevMesFirst(RelatedRef)  //SVE
+   var query = DL_RSDCommand("select t_relatedref from dwlmes_dbt where t_trn = ?");
+   query.AddParam(RelatedRef);
+   var data = query.Execute();
+   if (data.MoveNext() )
+      if (data.RelatedRef == "")
+          return true;
+      end;
+   end;
+   return false;
+end;
+
+/* Непосредственно генерация МТ320 */
+macro GenMes( addrMes, addrWlDlMm )
+var field_value, error, gr, Sending = FALSE, Letter = "",
+             PriceStr,ID, IntPart, FactPart, BankCode, 
+             PartyABIC, PartyBBIC, SwiftRate, PaymAgent;
+private var rs,nnum,PROL,sGenType = "";
+private var val_PBCK, val_PBC, val_PA;
+
+  SetBuff( wlmes,  addrMes );
+  SetBuff( wldlmm, addrWlDlMm );
+
+  PrintLog(2,"Генерация сообщения по МТ320 ");
+
+  if( isSale( getOperationGroup( wldlmm.DealType ) ) )
+    СделкаПривлечения = FALSE;  /* Это сделка размещения */
+    Letter = NEGATIVE_SYMB;
+  end;
+
+  //if(СделкаПривлечения)
+  PartyABIC = ПолучитьКодСубъекта( {OurBank}, PTCK_SWIFT, error );
+  if( error ) RunError( "|Не найден SWIFT-код банка нашего банка" ); end;
+  PartyBBIC = ПолучитьКодСубъекта( wldlmm.PaymAgent, PTCK_SWIFT, error );
+  if( error ) RunError( "|Не найден SWIFT-код банка-контрагента по сделке" ); end;
+/*
+  else
+    PartyBBIC = ПолучитьКодСубъекта( {OurBank}, PTCK_SWIFT, error );
+    if( error ) RunError( "|Не найден SWIFT-код банка нашего банка" ); end;
+    PartyABIC = ПолучитьКодСубъекта( wldlmm.PaymAgent, PTCK_SWIFT, error );
+    if( error ) RunError( "|Не найден SWIFT-код банка-контрагента по сделке" ); end;    
+  end;
+*/
+  /* Interest Rate - записываем значение с учетом того, что ставка хранится в двух полях */
+  PriceStr = SubStr( String(wldlmm.Price), 1, Index( String(wldlmm.Price), "." ) - 1 );
+  if( wldlmm.Point < StrLen(PriceStr) )
+    IntPart = SubStr( PriceStr, 1, StrLen(PriceStr) - wldlmm.Point );
+  else
+    IntPart = "0";
+  end;
+  if( (wldlmm.Point + 1) > StrLen(PriceStr) )
+    FactPart = MkStr( "0", wldlmm.Point - StrLen(PriceStr)) + PriceStr;
+  else
+    FactPart = SubStr( PriceStr, StrLen(PriceStr)-wldlmm.Point + 1 );
+  end;
+  //SwiftRate = GetSWIFTRate( String(IntPart, ",", FactPart) );   //SVE 12.03.2021 Адаптация. С запятой обнуляется дробная часть при приведение к типу DOUBLE.
+  SwiftRate = GetSWIFTRate( String(IntPart, ".", FactPart) ); 
+
+  /* Блок Sequence A */
+  УстановитьКонтекстБлокаЛог( "Sequence A" );
+
+  /* 15A New Sequence */
+  ЗаписатьПолеЛог( "15A", "" );
+
+  /* Определяем тип операции */
+  field_value = ОпределитьТипОперации( wldlmm, Sending );
+
+  /* 20 Sender's Reference */
+  prol=ПРОЛОНГАЦИЯ(wldlmm.dealid);
+  if ((prol != 0) and (wlmes.RelatedRef != ""))   //SVE если пролонгация то необходимо указать AMND
+    field_value = "AMND";
+  end;
+  if ( wldlmm.Type == DLMM_TYPE_MATU ) /* Ликвидация (завершение) */
+    rs = TRsbDataSet("select count(*) from dwldlmm_dbt a, ddl_tick_dbt b where b.t_dealcode='"+wldlmm.Dealcode+"' and  a.t_dealid=b.t_dealid"); 
+    if (rs.moveNext) 
+       nnum=int(rs.value(0));
+    end;  
+    if ( nnum > 0 )
+       nnum="/"+string(nnum);
+    else
+       nnum=" ";
+    end;
+    ЗаписатьПолеЛог( "20", substr(wldlmm.Dealcode,5)+nnum );
+  elif ((field_value == "NEWT") or (field_value == "NEW"))
+    ЗаписатьПолеЛог( "20", substr(wldlmm.Dealcode,5) );
+  elif ((field_value == "DUPL") or (field_value == "AMND"))
+    var code_20 = substr(wldlmm.Dealcode,5) + "-" + SubStr(wlmes.TRN, index(wlmes.TRN, "/") + 1);
+    if (StrLen(code_20) > 20)
+       code_20 = SubStr(code_20, 1, 20);
+    end;
+    ЗаписатьПолеЛог( "20", code_20); //SVE для повторных сообщений формат поля: числовой код сделки-числовая часть референса после знака "/"
+  end;
+
+  /* 21 Related Reference */
+  var ref_code = "";
+  if (wlmes.RelatedRef == "")  //SVE значит предыдущее сообщение было первым и референс это только числовая часть сделки
+     if (prol != 0)            //SVE по первом сообщению в пролонгации, в поле 20 указываем код сделки, которую текущая сделка пролонгирует
+        rs = TRsbDataSet("select t_dealcode  from ddl_tick_dbt  where  t_dealid= " + prol);
+        if (rs.MoveNext)
+           ref_code =  SubStr(rs.value(0), 5);
+           ЗаписатьПолеЛог( "21", ref_code );
+        end;
+     end;
+  elif (IsPrevMesFirst(wlmes.RelatedRef) )    //SVE для второго сообщения необходимо в поле 21 указать только числовой код сделки
+     ref_code = SubStr(wldlmm.dealcode, 5);
+  else                         //SVE если не пустое - значит поле должно иметь составной референс
+     ref_code = substr(wldlmm.Dealcode,5) + "-" + SubStr(wlmes.RelatedRef, index(wlmes.RelatedRef, "/") + 1);
+  end;
+  if ( wldlmm.Type == DLMM_TYPE_MATU ) /* Ликвидация (завершение) */
+     ref_code = wldlmm.Dealcode;
+  end;
+  if( (Sending == TRUE) AND (ref_code != "") )
+    ЗаписатьПолеЛог( "21", ref_code );
+  end;
+
+  /* 22A - Type of Operation */  
+  ЗаписатьПолеЛог( "22A", field_value );
+  
+  /* 22B - Type of Event - этап сделки*/
+  if (prol != 0)  //SVE пролонгация сделки
+    wldlmm.Type = TYPE_EVENT_ROLL;    
+    ЗаписатьПолеЛог( "22B", TYPE_EVENT_ROLL );
+  elif( wldlmm.Type == DLMM_TYPE_CONF )   /* Ввод */
+    ЗаписатьПолеЛог( "22B", TYPE_EVENT_CONF );
+  elif( wldlmm.Type == DLMM_TYPE_MATU ) /* Ликвидация (завершение) */
+    // ЗаписатьПолеЛог( "22B", TYPE_EVENT_MATU );
+    if ( (plat_dil(wldlmm.dealid,"102","9","USERTYPEDOCUMENT")) == "1" )
+      ЗаписатьПолеЛог( "22B", "CANC");
+    else
+      ЗаписатьПолеЛог( "22B", "AMND");
+    end;
+/*
+  else                                  /* Пролонгация */
+    ЗаписатьПолеЛог( "22B", TYPE_EVENT_ROLL );
+*/  
+  end;
+
+  /* 22C Common Reference */    
+  if (wldlmm.conftpid == 51)  //СПФС
+     ЗаписатьПолеЛог( "22C", wldlmm.DealCodePS );
+  else  
+     var bank1 = ПолучитьКодСубъекта( wldlmm.PartyID, PTCK_SWIFT, error );
+     if( error ) RunError( "|Не найден SWIFT-код банка-контрагента по сделке" ); end;
+     bank1 = SubStr(field_value,1,4) + SubStr(field_value,7,2);
+     var price = string(wldlmm.Price / 100);
+     price=int(price);
+     price=string(price);
+     var length=strlen(price);
+     if (substr(price,length,1) == "0")
+        price=substr(price,1,length-1);
+        length=length-1;
+        if (substr(price,length,1) == "0")
+           price=substr(price,1,length-1);
+           length=length-1;
+        end;
+     end;
+     price="0000"+price;
+     length=length+4;
+     price=substr(price,length-3,4);
+     var bank2="RUAGMM";
+     var code_22C =bank2 + price + bank1;
+     ЗаписатьПолеЛог( "22C", code_22C );
+  end;
+
+
+  /* 21N Contract Number Party A */
+  // ЗаписатьПолеЛог( "21N", wldlmm.DealCode );
+     ЗаписатьПолеЛог( "21N", "" );
+
+  /* 82a Party A */ 
+  УстановитьКонтекстБлокаЛог( "82a" ); 
+  ЗаписатьПолеЛог( "82A", PartyABIC );
+
+  /* 87a Party B */
+  УстановитьКонтекстБлокаЛог( ".." );  /* Возвращаемся в контекст блока 'Sequence A' */
+  УстановитьКонтекстБлокаЛог( "87a" );
+  ЗаписатьПолеЛог( "87A", PartyBBIC );
+
+  /* 77D Party A */ 
+  field_value = ОпределитьГенСоглашение(wldlmm.DealID);
+  if (ValType(field_value)  == V_STRING)
+      StrChangeRusXSet(field_value, sGenType); /* Транслитерация */
+      УстановитьКонтекстБлокаЛог( ".." );  /* Возвращаемся в контекст блока 'Sequence A' */
+      ЗаписатьПолеЛог( "77D", sGenType );
+  end;
+
+  /* Блок Sequence B*/
+  УстановитьКонтекстБлокаЛог( "" );
+  УстановитьКонтекстБлокаЛог( "Sequence B" );
+
+  /* 15B New Sequence */
+  ЗаписатьПолеЛог( "15B", "" );
+
+  /* 17R Party's A Role */
+  if( СделкаПривлечения )
+    field_value = PARTYS_ROLE_BORROWER; 
+  else
+    field_value = PARTYS_ROLE_LENDER;   
+  end;
+  ЗаписатьПолеЛог( "17R", field_value );
+
+  /* 30T Trade Date */
+  ЗаписатьПолеЛог( "30T", GetSWIFTDateFull(wldlmm.DealDate) );
+
+  /* 30V Value Date */
+  ЗаписатьПолеЛог( "30V", GetSWIFTDateFull(wldlmm.Start) );
+
+  /* 30P Maturity Date */
+  ЗаписатьПолеЛог( "30P", GetSWIFTDateFull(wldlmm.Maturity) );
+
+  /* 32B Currency and Principal Amount */
+  field_value = ПолучитьКодВалютыЛог( wldlmm.PFI ) +
+                GetSWIFTAmount( wldlmm.Principal );
+  ЗаписатьПолеЛог( "32B", field_value );
+
+/*
+  /*  - Amount ti be Settled */
+  if( wldlmm.Type == DLMM_TYPE_MATU )
+    field_value = Letter;
+    field_value = field_value + ПолучитьКодВалютыЛог( wldlmm.PFI ) + 
+                  GetSWIFTAmount( wldlmm.Principal + wldlmm.Cost );
+        ЗаписатьПолеЛог( "32H", field_value );
+  end;
+*/                                                                    
+   /* 32H - Amount ti be Settled */
+  if( wldlmm.Type == DLMM_TYPE_CONF )   /* Ввод */
+    field_value = GetSWIFTDateFull(GetPercDate(wldlmm.DealID));
+    ЗаписатьПолеЛог( "30X", field_value );
+  elif( wldlmm.Type == DLMM_TYPE_MATU ) /* Ликвидация (завершение) */
+     ;
+  else    /* Пролонгация */
+    var baseamount_was = GetPaymBaseamount(prol, "9");
+    var baseamount_is = GetPaymBaseamount(wldlmm.Dealid, "9");  //SVE 489925 необходимо считать поле 32H как разница между тем какая была сумма и на какую пролонгировали
+    field_value = ПолучитьКодВалютыЛог( wldlmm.PFI ) + GetSWIFTAmount(baseamount_was - baseamount_is);
+    ЗаписатьПолеЛог( "32H", field_value );
+    field_value = GetSWIFTDateFull(GetPercDate(wldlmm.DealID));
+    ЗаписатьПолеЛог( "30X", field_value );
+  end;
+
+  /* 34E Currency and Interest Amount */
+  field_value = ПолучитьКодВалютыЛог( wldlmm.PFI ) +
+                GetSWIFTAmount( wldlmm.Cost );
+   if( СделкаПривлечения )
+  else
+    field_value = "N"+field_value;   
+  end;
+  ЗаписатьПолеЛог( "34E", field_value );
+
+  /* 37G Interest Rate */
+  ЗаписатьПолеЛог( "37G", SwiftRate );
+
+  /* 14D Day Count Fraction */
+  if( wldlmm.Basis == RS_BASIS_30360 )   /* 360 дней в году, 30 в месяце */
+    field_value = SWIFT_BASIS_360_360;
+  elif(wldlmm.Basis == RS_BASIS_ACTACT)  /* в году и в месяце по календарю */
+    field_value = SWIFT_BASIS_ACT_365;
+  elif(wldlmm.Basis == RS_BASIS_ACT360)  /* 360 дней в году, в месяце по календ. */
+    field_value = SWIFT_BASIS_ACT_360;
+  elif(wldlmm.Basis == RS_BASIS_ACT360)  /* в году и в месяце по календарю без учета високосности */
+    field_value = SWIFT_BASIS_ACT_360;
+  else                                   /* 360 дней в году, 31 в месяце */
+    field_value = SWIFT_BASIS_360_360;
+  end;
+  if(wldlmm.Basis == 8)  /* в году и в месяце по календарю */
+    field_value = SWIFT_BASIS_ACT_365;
+  end;
+
+  ЗаписатьПолеЛог( "14D", field_value );
+
+  /* Блок Sequence C - инструкции по (поставке) оплате сумы сделки стороной A */
+  УстановитьКонтекстБлокаЛог( "" );
+  УстановитьКонтекстБлокаЛог( "Sequence C" );
+
+  /* 15C New Sequence */
+  ЗаписатьПолеЛог( "15C", "" );
+
+  if( СделкаПривлечения )
+    ЗаписатьБанкЛогНовый("15C", "57a", wldlmm.PaymAgent, wldlmm.PrincRetBankCodeKind, wldlmm.PrincRetBankCode, wldlmm.PrincRetBankName, wldlmm.PrincRetAccount,          /*SVE 528368*/
+           wldlmm.PrincRetCorrCodeKind, wldlmm.PrincRetCorrCode, wldlmm.PrincRetCorrName, wldlmm.PrincRetCorrAccount );
+  else
+    ЗаписатьБанкЛогНовый("15C", "57a", {OurBank}, wldlmm.PrincBankCodeKind, wldlmm.PrincBankCode, wldlmm.PrincBankName, wldlmm.PrincAccount, 
+           wldlmm.PrincCorrCodeKind, wldlmm.PrincCorrCode, wldlmm.PrincCorrName, wldlmm.PrincCorrAccount );
+  end;    
+
+  /* Блок Sequence D - инструкции по (поставке) оплате сумы сделки стороной B */
+  УстановитьКонтекстБлокаЛог( "" );
+  УстановитьКонтекстБлокаЛог( "Sequence D" );
+                   
+  /* 15D New Sequence */
+  ЗаписатьПолеЛог( "15D", "" );
+  if( (СделкаПривлечения) and (wldlmm.PFI == NATCUR) ) 
+    ЗаписатьБанкЛогНовый("15D", "57a", {OurBank}, wldlmm.PrincBankCodeKind, wldlmm.PrincBankCode, wldlmm.PrincBankName, wldlmm.PrincAccount,           
+           wldlmm.PrincCorrCodeKind, wldlmm.PrincCorrCode, wldlmm.PrincCorrName, wldlmm.PrincCorrAccount );
+  elif( (СделкаПривлечения) and (wldlmm.PFI != NATCUR) )  // MAA: iS - 530892
+     ЗаписатьБанкЛогНовый("15D", "57a", {OurBank}, wldlmm.PrincRetBankCodeKind, wldlmm.PrincRetBankCode, wldlmm.PrincBankName, wldlmm.PrincAccount,           
+           wldlmm.PrincCorrCodeKind, wldlmm.PrincCorrCode, wldlmm.PrincCorrName, wldlmm.PrincCorrAccount );
+  elif( (not СделкаПривлечения) and (wldlmm.PFI != NATCUR) )    /*SVE 532307 30.08.2021 используем данные из платежа по предоставлению средств, так как только там есть свифт код нужного банка*/
+    ЗаписатьБанкЛогНовый("15D", "57a", wldlmm.PaymAgent, wldlmm.PrincBankCodeKind, wldlmm.PrincBankCode, wldlmm.PrincBankName, wldlmm.PrincRetAccount, 
+           wldlmm.PrincRetCorrCodeKind, wldlmm.PrincRetCorrCode, wldlmm.PrincRetCorrName, wldlmm.PrincRetCorrAccount );
+  else
+    ЗаписатьБанкЛогНовый("15D", "57a", wldlmm.PaymAgent, wldlmm.PrincRetBankCodeKind, wldlmm.PrincRetBankCode, wldlmm.PrincRetBankName, wldlmm.PrincRetAccount, 
+           wldlmm.PrincRetCorrCodeKind, wldlmm.PrincRetCorrCode, wldlmm.PrincRetCorrName, wldlmm.PrincRetCorrAccount );
+  end;
+
+  /* Платежные инструкции по оплате процентов */
+  /* Заполняем только если не совпадают с инструкцией по оплате ОД сделки */
+  if( СделкаПривлечения )
+/*
+   if( ((wldlmm.PercentCodeKind     !=  0) AND (wldlmm.PercentCodeKind     != wldlmm.PrincRetCodeKind     )) OR
+      ((wldlmm.PercentCode         != "") AND (wldlmm.PercentCode         != wldlmm.PrincRetCode         )) OR
+      ((wldlmm.PercentBankCodeKind !=  0) AND (wldlmm.PercentBankCodeKind != wldlmm.PrincRetBankCodeKind )) OR
+      ((wldlmm.PercentBankCode     != "") AND (wldlmm.PercentBankCode     != wldlmm.PrincRetBankCode     )) OR
+      ((wldlmm.PercentAccount      != "") AND (wldlmm.PercentAccount      != wldlmm.PrincRetAccount  )) OR
+      ((wldlmm.PercentCorrCodeKind !=  0) AND (wldlmm.PercentCorrCodeKind != wldlmm.PrincRetCorrCodeKind )) OR
+      ((wldlmm.PercentCorrCode     != "") AND (wldlmm.PercentCorrCode     != wldlmm.PrincRetCorrCode     )) OR
+      ((wldlmm.PercentCorrAccount  != "") AND (wldlmm.PercentCorrAccount  != wldlmm.PrincRetCorrAccount  )) )
+*/
+      УстановитьКонтекстБлокаЛог( "" );
+      /* Блок Sequence E - платежные инструкции по оплате процентов стороной A */
+      УстановитьКонтекстБлокаЛог( "Sequence E" );
+      /* 15E New Sequence */
+      ЗаписатьПолеЛог( "15E", "" );
+      ЗаписатьБанкЛогНовый("15E", "57a", wldlmm.PaymAgent, wldlmm.PercentBankCodeKind, wldlmm.PercentBankCode, wldlmm.PercentBankName, wldlmm.PercentAccount, 
+           wldlmm.PercentCorrCodeKind, wldlmm.PercentCorrCode, wldlmm.PercentCorrName, wldlmm.PercentCorrAccount );
+    //end;
+   else
+    /*if( ((wldlmm.PercentCodeKind     !=  0) AND (wldlmm.PercentCodeKind     != wldlmm.PrincCodeKind     )) OR
+        ((wldlmm.PercentCode         != "") AND (wldlmm.PercentCode         != wldlmm.PrincCode         )) OR
+        ((wldlmm.PercentBankCodeKind !=  0) AND (wldlmm.PercentBankCodeKind != wldlmm.PrincBankCodeKind )) OR
+        ((wldlmm.PercentBankCode     != "") AND (wldlmm.PercentBankCode     != wldlmm.PrincBankCode     )) OR
+        ((wldlmm.PercentAccount      != "") AND (wldlmm.PercentAccount      != wldlmm.PrincAccount  )) OR
+        ((wldlmm.PercentCorrCodeKind !=  0) AND (wldlmm.PercentCorrCodeKind != wldlmm.PrincCorrCodeKind )) OR
+        ((wldlmm.PercentCorrCode     != "") AND (wldlmm.PercentCorrCode     != wldlmm.PrincCorrCode     )) OR
+        ((wldlmm.PercentCorrAccount  != "") AND (wldlmm.PercentCorrAccount  != wldlmm.PrincCorrAccount  )) )
+    */
+        УстановитьКонтекстБлокаЛог( "" );
+        /* Блок Sequence F */
+        УстановитьКонтекстБлокаЛог( "Sequence F" );
+          /* 15F New Sequence */
+          ЗаписатьПолеЛог( "15F", "" );
+
+        if (wldlmm.PFI == NATCUR)
+           ЗаписатьБанкЛогНовый("15F", "57a",  {OurBank}, wldlmm.PercentBankCodeKind, wldlmm.PercentBankCode, wldlmm.PercentBankName, wldlmm.PercentAccount, 
+              wldlmm.PercentCorrCodeKind, wldlmm.PercentCorrCode, wldlmm.PercentCorrName, wldlmm.PercentCorrAccount );
+        else
+           ЗаписатьБанкЛогНовый("15F", "57a",  {OurBank}, wldlmm.PrincBankCodeKind, wldlmm.PrincBankCode, wldlmm.PrincBankName, wldlmm.PercentAccount, 
+              wldlmm.PercentCorrCodeKind, wldlmm.PercentCorrCode, wldlmm.PercentCorrName, wldlmm.PercentCorrAccount );
+        end;
+     //end;  
+   end;
+     
+ ЗаписатьНалог();
+
+ return TRUE; /* Успешное завершение */
+
+  OnError(er) /* обработка ошибок */
+    ExeptionMessage(er);
+    return FALSE;
+end;
+
+/* МТ620 Пересено в макрос swgm620.mac SVE 20.04.2021*/

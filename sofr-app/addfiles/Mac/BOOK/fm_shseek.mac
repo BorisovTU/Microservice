@@ -1,0 +1,1222 @@
+/*
+$Name:               fm_shseek.mac
+$Module:             FM
+$Description:        Выгрузка в ФМ
+*/
+import FMInter;
+import globals, fm_rep;
+import vector;
+
+private var {OurBank};
+private var Branch = NumFNCash();
+
+private const ACCOUNT_OWNER   = 0; /* Владелец счета   */
+private const ANONIMUS_CLIENT = 3; /* Анонимный клиент */
+
+private class exception( msg )
+    var msg_ = msg;
+end;
+
+private macro StrContainsLetters( str ) : bool
+    var ln = strlen( str ), i = 1, ret = false, code;
+
+    if ( ln > 0 )
+        while ( i <= ln )
+            code = codefor( substr( str, i, 1 ) );  
+            if ( ( (code >= 65) and (code <= 90) )     /* буквы A-Z */
+                or ( (code >= 97) and (code <= 122) )  /* буквы a-z */
+                or ( (code >= 128) and (code <= 241) ) /* буквы А-Я, а-я, Ё, ё */
+               )
+                ret = true;
+                i = ln + ln;         
+            end;
+            i = i + 1;
+        end;
+    end;
+
+    return ret;
+end;
+
+/*-----------------------------------------------*/
+
+/* Информация по клиенту */         
+private class ClientInfo
+    var fullname       = "",
+        nrCountry      = "",
+        legalCountry   = "",   /* Страна юридического адреса */
+        factCountry    = "",   /* Страна фактического адреса */
+        birthPlace     = "";
+end;
+
+                                                                   
+/* Класс, реализующий обработку подозрительных операций */
+class FM_ShadySeeker( dPrint, noExport )                                                         
+
+    private var depdoc, depositr, addpdoc, exdoc, paydoc, retop, cidoc;
+
+    private var FRecs = FM_FindMainRecords;
+    private var FMRep = FM_Reports;
+
+    private var countOpTakeC = 0, 
+                countOpShady = 0,
+                needDocPrint = dPrint,
+                needExport   = not noExport;
+
+    private var opcontr  = Tbfile( "opcontr.dbt", "W" ),
+                opcntrpt = Tbfile( "opcntrpt.dbt", "W" ); 
+
+    private var IsMetalAcc,
+                CountryCodes = "",
+                ConvertCode = "",
+                clientKind;    
+
+    private var FM_Operation = RsbFMOperation();
+
+    private var clInfo = ClientInfo(), clientFound;    /* информация по клиенту */ 
+    
+    private var codesOC = vector(),
+                codesUO = vector();
+
+    /*------------------------------------------------------------*/   
+    
+    private macro OperatErr( op : Operat, msg : string )
+        return "Ошибка: " + msg + " : операция " + op.opappkind + "-" + op.opappkey;     
+    end;    
+
+    /*!
+     * Генерирует исключение OperatErr
+     */
+    private macro XFM( op : Operat, msg : string )
+      RunError("", exception(OperatErr(op, msg)));
+    end;
+    /* Выбор найденных подозрительных операций */
+    private macro GetShadyOperats() : RsdRecordSet
+        var cmd, rs;    
+        cmd = RSDCommand( " select * from dfm_operat_tmp " +
+                          " order by t_date, t_opappkind, t_operation, t_opertype, t_clientcode, t_clientname" );
+        rs = RsdRecordSet( cmd );
+        cmd.Execute();
+        return rs;
+    end;
+
+    private macro GetCoinKind( issue : integer ) : integer
+        var cmd, rs, ret = 0;
+        cmd = RsdCommand( "select t_kindofcoin FROM dci_misc_dbt where t_type = 4 and t_issueid = :issue" );
+        cmd.addParam( "issue", RSDBP_IN, issue );
+        rs = RsdRecordSet( cmd );
+        cmd.execute();
+        if ( rs.moveNext() )
+            ret =  rs.Value(0);
+        end;
+        return ret;
+    end; 
+    
+    /*------------------------------------------------------------*/   
+
+    private macro GetDocNumber( opKind : integer, opKey : string ) : string
+        var cmd, rs, ret = "";
+        cmd = RsdCommand( "select RD.T_DOCUMENTNUMBER from drtdocument_dbt rd where RD.T_DOCUMENTID=(select min(D.T_DOCUMENTID) from drtdocument_dbt d where D.T_OPAPPLICATIONKIND=:kind and D.T_OPAPPLICATIONKEY=:key)" );
+        cmd.addParam( "kind", RSDBP_IN, opKind );
+        cmd.addParam( "key",  RSDBP_IN, opKey );
+        rs = RsdRecordSet( cmd );
+        cmd.execute();
+        if ( rs.moveNext() )
+          ret = rs.Value(0);
+        end;
+        return ret;
+    end; 
+
+    /*------------------------------------------------------------*/   
+
+    /* Возвращает true, если - не в черном списке */
+    private macro ShadyTest_Once( TestCode )
+        var ret = true, testc = Trim(TestCode), rs;
+
+        if (  (testc != "") and (testc != "RUS") and (testc != "643") )  /* Россию не проверяем */
+            if ( Index(CountryCodes,testc) != 0 ) /* Обещали в клиенте держать коды, как в списке */
+                ret = false;
+            else  /* Пока в клиенте - код из country.CodeLat3, а в списке - из country.CodeNum3 */
+                testc = GetCountryCode( testc );
+                if ( Index(CountryCodes,testc) != 0 ) 
+                    ret = false;
+                end;                
+            end;
+        end;
+        return ret;
+    end;  
+
+    /* Проверка,  входит ли территория в "черный список"
+       true - в черном списке
+       Проверяем три кода государства, введенные в клиенте:
+       - страна нерезидентности         - party.NRCountry, commclnt.NRCountry
+       - страна из юридическгого адреса - adress.Country, commclnt.Country
+       - страна из фактического адреса  - adress.Country, commclnt.Country */
+    private macro isClientInBlackList( clientCode )
+        var ret = true;
+        var testc;
+
+        if ( (clientCode > 0) and (CountryCodes != "") )            
+            /* Страна нерезидентности */
+            testc = clInfo.NRCountry;
+            ret = ShadyTest_Once( testc );
+            
+            if ( ret ) /* Страна из юридического адреса */                
+                if ( clInfo.legalCountry != "" )
+                    testc = clInfo.legalCountry;
+                    ret = ShadyTest_Once( testc );
+                end;
+            end;
+            if ( ret ) /* Страна из фактического адреса */                
+                if ( clInfo.factCountry != "" )
+                    testc = clInfo.factCountry;
+                    ret = ShadyTest_Once( testc );
+                end;
+            end;
+        end;
+        return not ret;
+    end;
+
+    
+    /* Получить суммы из вкладных документов для 42-45 валютообменных операций */
+    private macro GetCorrespondingSum ( applKind, applKey )
+        var cmd,rs, ret = 0;
+
+        cmd = RsdCommand( " SELECT doc.t_InSum "
+                          "  FROM dsb_casln_dbt cas1,dsb_casln_dbt cas, dsbdepdoc_dbt doc"
+                          " WHERE cas.t_ApplicationKind2 = ? "
+                          "   AND cas.t_ApplicationKey2  = ? "
+                          "   AND cas1.T_APPLICATIONKEY1  = cas.T_APPLICATIONKEY1  "
+                          "   AND cas1.T_APPLICATIONKIND1 = cas.T_APPLICATIONKIND1 "
+                          "   AND doc.t_iApplicationKind  = cas1.t_ApplicationKind2"
+                          "   AND doc.t_ApplicationKey    = cas1.t_ApplicationKey2 " );
+        cmd.addParam( "applKind", RsdBp_in, applKind);
+        cmd.addParam( "applKey", RsdBp_in, applKey);
+        cmd.execute();
+        rs = RsdRecordset(cmd); 
+        if ( rs.moveNext() )
+            ret  = rs.value(0);
+        end;
+
+        return ret;
+    end;
+
+   
+    /* Проверка анонимности плательщика для кассовых операций */
+    private macro IsAnonymClientForOutDesk() : bool
+        var cmd, rs;
+        var ret, fio = "";
+        var paydoc40 = TRecHandler( "pay_doc.n40" );
+
+        setrecordaddr( paydoc40, paydoc, 0, 0, true );
+
+        if ( paydoc.rec.GroupOpert == 41 )
+
+            if ( (paydoc.rec.NumOpert == 1) and (paydoc40.rec.RefUncalimed > 0) ) /* Выдача перевода */
+                cmd = RsdCommand("select t_avizo_sname, t_avizo_name, t_avizo_pname from ddplanpay_dbt where t_ref = :ref" );
+                cmd.addParam( "ref", RSDBP_IN, paydoc40.rec.RefUncalimed );
+                cmd.execute();
+                rs = RsdRecordset( cmd ); 
+                if ( rs.moveNext() )
+                    fio = SQL_ConvTypeStr(rs.value(0)) + SQL_ConvTypeStr(rs.value(1)) + SQL_ConvTypeStr(rs.value(2));
+                end;
+            elif ( clientFound )
+                fio = clInfo.fullName;
+            else
+                fio = paydoc.rec.ClientLastName + paydoc.rec.ClientFirstName + paydoc.rec.ClientSecondName;
+            end;
+
+        elif ( paydoc.rec.NumOpert == 40 )
+            fio = paydoc40.rec.FNameRecp + paydoc40.rec.NameRecp + paydoc40.rec.SNameRecp;
+        end;
+        
+        ret = (not StrContainsLetters( fio ));
+
+        return ret;
+    end; 
+
+    /* Принадлежит ли счет нашему банку */
+    private macro IsSBAccount( account : string ) : bool
+        var cmd, rs;
+        cmd = RsdCommand( "select t_Referenc from ddepositr_dbt where t_Account = :acc" );
+        rs = RsdRecordSet( cmd );
+        cmd.addParam( "acc", RSDBP_IN, account );        
+        cmd.Execute();
+        if ( rs.MoveNext() )
+            return true;
+        else
+            return false;
+        end;
+    end;    
+
+    private macro GetClientBirthPlace( clCode ) : string 
+        var place = "";                  
+       
+        var cmd = RsdCommand( " select t_birsplase from dpersn_dbt where t_personid = :code " );
+        cmd.addParam( "code", RSDBP_IN, clCode );       
+
+        var rs = RsdRecordSet( cmd );
+        cmd.execute();
+
+        if ( rs.moveNext() )
+            place = rs.Value(0);
+        end;   
+
+        return place;
+    end;
+
+    /* Поиск реквизитов получателя */
+    private macro GetRecvAccount( AppKind, AppKey )
+        var cmd, rs, acc = "";
+        cmd = RsdCommand( "select t_Account from dRTPaymentProp_dbt where "
+                          " t_DocApplicationKind = :appkind and t_DocApplicationKey = :appkey" );
+        rs = RsdRecordSet( cmd );
+        cmd.addParam( "appkind", RSDBP_IN, AppKind );
+        cmd.addParam( "appkey", RSDBP_IN, AppKey );
+        cmd.execute();
+        if ( rs.movenext() )
+            acc = SQL_ConvTypeStr( rs.Value(0) );
+        end;
+        return acc;
+    end;
+
+
+    /*------------------------------------------------------------*/   
+
+    private macro GetDepositMismatches( op : Operat )
+        var clntRegDate, carryDate;
+        var recvAccount = "";
+        var codes = vector();
+            
+        if ( CodeFor(depdoc.rec.Author) == ANONIMUS_CLIENT )
+            codes.push_back(4001);
+        end;
+
+        if ( ( (retop.rec.Operation == 1) or (retop.rec.Operation == 1401) ) 
+             and (CodeFor(depdoc.rec.Author) != ACCOUNT_OWNER) )
+          codes.push_back(4002);
+        end;
+
+        if ( isClientInBlackList( op.clientcode ) )
+            codes.push_back(3001);
+        end;
+        
+        if ( depdoc.rec.TypeOper == 66 )
+            recvAccount = GetRecvAccount(depdoc.rec.iApplicationKind, depdoc.rec.ApplicationKey);
+            if ( recvAccount != "" )
+               clntRegDate = ДатаРегистрацииКлиента( recvAccount, depdoc.rec.Code_Currency );
+               if ( ( depdoc.rec.Date_Document - clntRegDate ) < 91 ) /* С момента регистрации не прошло 3 месяцев */
+                codes.push_back(4005);
+               end;
+
+               carryDate = ДатаПоследнейПроводки( recvAccount, depdoc.rec.Code_Currency );
+               if ( ( carryDate == Date(0,0,0) ) or (depdoc.rec.Date_Document < carryDate) ) /* Не было проводок по счету */
+                codes.push_back(4006);
+               end;
+            end;
+        end;
+
+        if ( IsMetalAcc )
+            codes.push_back(5005);
+        end;
+
+        if ( op.operation == 73 ) /* Зачисление на счет */
+            if ( (retop.rec.SubOp == 3) /* Зачисление выигрыша */
+                 or ( index( strlwr( depdoc.rec.Ground ), "лотере" ) != 0 ) 
+                 or ( index( strlwr( depdoc.rec.Ground ), "тотализ") != 0 ) 
+                 or ( index( strlwr( depdoc.rec.Ground ), "пари"   ) != 0 ) 
+                 or ( index( strlwr( depdoc.rec.Ground ), "выигрыш") != 0 ) )
+                codes.push_back(5006);
+
+            elif ( ( ( ( index( strlwr( depdoc.rec.Ground ), "страхов" ) != 0 ) or
+                       ( index( strlwr( depdoc.rec.Ground ), "перестр" ) != 0 ) ) and
+                     (   ( index( strlwr( depdoc.rec.Ground ), "жизн" ) != 0 )  
+                      or (( index( strlwr( depdoc.rec.Ground ), "личн" ) != 0 ) and ( index( strlwr( depdoc.rec.Ground ), "накопит" ) != 0 )) 
+                      or ( index( strlwr( depdoc.rec.Ground ), "болезн" ) != 0 ) 
+                      or ( index( strlwr( depdoc.rec.Ground ), "медицин") != 0 ) 
+                      or (( index( strlwr( depdoc.rec.Ground ), "несч" ) != 0 ) and ( index( strlwr( depdoc.rec.Ground ), "случ" ) != 0 ))
+                      or ( index( strlwr( depdoc.rec.Ground ), "преми" ) != 0 ) 
+                      or ( index( strlwr( depdoc.rec.Ground ), "возмещ" ) != 0 ) 
+                     )
+                   ) or ( index( strlwr( depdoc.rec.Ground ), "аннуитет" ) != 0 ) or ( index( strlwr( depdoc.rec.Ground ), "ануитет" ) != 0 ) 
+                 )   
+               codes.push_back(5002);
+            end;
+        end; 
+        
+        return codes;
+    end; 
+
+
+    private macro GetCapIssueMismatches( op : Operat )
+        var codes = vector();        
+         
+        if ( ((cidoc.rec.Type == CI_OGSZ) or (cidoc.rec.Type == CI_CERT)) and isClientInBlackList(op.clientcode) )
+            codes.push_back(3021);
+        end;
+
+        if ( ( cidoc.rec.Type == CI_LOTTERY ) and ( cidoc.rec.Operation == 2 ) ) /* Получение выигрыша по лотерее */
+            codes.push_back(5006);
+
+        elif ( cidoc.rec.Type == CI_COIN )
+             codes.push_back(5005);
+
+        elif ( cidoc.rec.Type == CI_INGOT )
+            codes.push_back(5005);
+
+        elif ( ( (cidoc.rec.Type == CI_OGSZ) or (cidoc.rec.Type == CI_CERT) ) and ( cidoc.rec.Operation == 1 ) ) /* Банк продает за наличные */
+            codes.push_back(1005);
+            if ( cidoc.rec.Type == CI_CERT )
+                codes.push_back(4001);
+            end;
+
+        elif ( ( cidoc.rec.Type == CI_CERT ) and ( cidoc.rec.Operation == 6 ) )            
+            codes.push_back(4001);  /* Банк продает безналично  */
+        end;
+        
+        return codes;                
+    end; 
+
+
+    private macro GetExchangeMismatches( op : Operat )
+        var codes = vector();
+        const opnum = exdoc.rec.kind_Oper;
+        
+        if( makeVector(4,7,18,21,39,41,44).contains(opnum) )
+          codes.push_back(1003);
+
+        elif( makeVector(6,42).contains(opnum) )
+          codes.push_back(1004);
+        
+        elif( makeVector(3,20,38,40).contains(opnum) )
+          codes.push_back(1006);
+          
+        elif( makeVector(22,23).contains(opnum) )
+          codes.push_back(1007);
+        end;
+
+        if( makeVector(38,40,42,43).contains(opnum) 
+            and isClientInBlackList(op.clientcode) )
+          codes.push_back(3001);
+        end;
+
+        return codes;        
+    end; 
+
+    
+    private macro GetCashOpMismatches( op : Operat )
+        var codes = vector();
+        var p1, p2, sub, clientFIO;        
+        
+        if ( op.InOut != "" ) /* Приходная операция */
+            /* Приобретение ценных бумаг */
+            if (   ( ( index( strlwr( paydoc.rec.Ground ), "ценны" ) != 0 ) and ( index( strlwr( paydoc.rec.Ground ), "бумаг") != 0 ) )
+                or ( index( strlwr( paydoc.rec.Ground ), "акци"   ) != 0 ) 
+                or ( index( strlwr( paydoc.rec.Ground ), "вексел") != 0 )
+                or ( index( strlwr( paydoc.rec.Ground ), "облигаци") != 0 )
+                or ( index( strlwr( paydoc.rec.Ground ), "сертиф") != 0 )
+                or ( index( strlwr( paydoc.rec.Ground ), "ПИФ") != 0 )
+               )
+                codes.push_back(1005);
+                
+                if ( isClientInBlackList(op.clientcode) )
+                    codes.push_back(3021);
+                end;
+            end;
+
+            /* Пришел перевод */
+            if ( (paydoc.rec.NumOpert == 41) and (paydoc.rec.GroupOpert == 11) )
+                clientFIO = paydoc.rec.ClientLastName + paydoc.rec.ClientSecondName + paydoc.rec.ClientFirstName; 
+              if (not StrContainsLetters( clientFIO )  )                 
+                codes.push_back(4004);
+            end;
+            end;
+
+        /* Выплата перевода */
+        elif ( (paydoc.rec.NumOpert == 1) and IsAnonymClientForOutDesk() )
+            codes.push_back(4004);
+        end;
+
+        /* Драгметаллы и камни */
+        if (     ( index( strlwr( paydoc.rec.Ground ), "золот" ) != 0 ) 
+              or ( index( strlwr( paydoc.rec.Ground ), "серебр") != 0 ) 
+              or ( index( strlwr( paydoc.rec.Ground ), "платин"   ) != 0 ) 
+              or ( index( strlwr( paydoc.rec.Ground ), "палад") != 0 )
+              or ( index( strlwr( paydoc.rec.Ground ), "паллад") != 0 )
+              or ( ( index( strlwr( paydoc.rec.Ground ), "драг") != 0 ) and ( index( strlwr( paydoc.rec.Ground ), "металл") != 0 ) )       
+           )
+            codes.push_back(5005);
+        end;  
+
+        /* проверяем наличие "юв" "изд" в соседних словах */
+        p1 = index( strlwr(paydoc.rec.Ground), "юв" );
+        p2 = index( strlwr(paydoc.rec.Ground), "изд" );
+        if ( (p1 != 0) and (p2 != 0) )
+            sub = trim( substr( paydoc.rec.Ground, min(p1, p2), abs(p1 - p2) ) );
+            if ( Index(sub," ") == 0 )
+                codes.push_back(5005);
+            end;
+        end;          
+
+        return codes;    
+    end; 
+
+    /*------------------------------------------------------------*/   
+
+    private macro GetClientInfo( clientCode : integer,
+                                 info_out   : ClientInfo )
+        var info = ClientInfo();
+        
+        /*  вытаскиваем полное имя и код страны нерезидента */
+        var cmd = RSDCommand( " select t_nrcountry, t_name " +
+                              " from   dparty_dbt   " +
+                              " where  t_partyid = :id " );
+        cmd.addParam( "id" , RSDBP_IN, clientCode );    
+        var rs = RsdRecordSet( cmd );
+        cmd.execute();
+        
+        if ( rs.moveNext() )
+            info.nrCountry      = rs.Value(0);
+            info.fullname       = rs.Value(1);
+        end;
+
+        /*  вытаскиваем фактический и юридический адрес */
+        cmd = RSDCommand( " select   t_country " +
+                          " from     dadress_dbt   " +
+                          " where    t_partyid = :id and (t_type in (1, 2) ) " +
+                          " order by t_type " );
+        cmd.addParam( "id", RSDBP_IN, clientCode );    
+        rs = RsdRecordSet( cmd );
+        cmd.execute();
+        
+        if ( rs.moveNext() )
+            info.legalCountry       = rs.Value(0);
+            if ( rs.moveNext() )
+                info.factCountry    = rs.Value(0);
+            end;
+        end;
+        
+        info.birthPlace = GetClientBirthPlace( clientCode );
+        
+        setparm( 2, info );
+    end;
+
+    /* Вытаскивает информацию по операции */
+    private macro PumpOperationInfo( op : Operat )
+
+        if ( (op.maindockind <= 0) or (op.maindockey == "") )
+            XFM(op, "Нарушена целостность БД для операции");
+        end;
+
+        if ( FRecs.FindRecords( op ) )
+            depdoc   = FRecs.sbdepdoc;
+            depositr = FRecs.depositr;
+            addpdoc  = FRecs.addpdoc;
+            exdoc    = FRecs.exoperat;
+            paydoc   = FRecs.paydoc;
+            retop    = FRecs.retop;
+            cidoc    = FRecs.cidoc;
+        else
+            XFM(op, "Не удалось найти информацию по операции");                
+        end;
+
+        if ( (op.OpAppKind == FM_SB_DEPOSIT) or (op.OpAppKind == FM_SB_DEPSC) or (op.OpAppKind == FM_SB_TRN) or (op.OpAppKind == FM_SB_LOGREC) )
+            IsMetalAcc = strbrk( depositr.rec.UserTypeAccount, "Мм" );
+        else
+            IsMetalAcc = false;
+        end;                                                                  
+
+        if ( op.clientcode > 0 ) /* клиент может быть не задан */ 
+            GetClientInfo( op.clientcode, clInfo );
+            clientFound = true;
+        else
+            clientFound = false;
+        end;
+    end;
+
+    /* Получение кодов проверки из строки */
+    private macro GetOperatCodesFromStr( str ) : vector
+        var ln = strlen( str ), ind = 1, code;
+
+        while ( ind > 0 )
+            ind = index( str, "," );
+            if ( ind > 0 )
+                code = substr( str, 1, ind - 1 );
+                str = substr( str, ind + 1 );
+            else
+                code = str;
+            end;
+
+            if ( code != "" )
+                if ( IsExistsCodeFM( OPCONTR_TYPE_OC, code ) )
+                    codesOC.add( int(code) );
+                else
+                    codesUO.add( int(code) );
+                end;
+            end;
+        end;
+    end;
+
+    /* Получение кодов проверки */
+    private macro GetOperatCodes( op : Operat )
+        if ( retop.rec.FMOpCode_Offline != "" )
+            GetOperatCodesFromStr( retop.rec.FMOpCode_Offline );
+        end;
+
+        if ( op.Status == SHADY_GROUP )
+            codesUO.add(1103);
+
+        else /* SHADY_OPERATION */
+            if ( (op.opappkind == FM_SB_DEPOSIT) or (op.opappkind == FM_SB_DEPSC) or (op.opappkind == FM_SB_TRN) or (op.opappkind == FM_SB_LOGREC) )
+                codesOC.add( GetDepositMismatches( op ) );
+            elif (op.opappkind == FM_SB_CAPISSUE) 
+                codesOC.add( GetCapIssueMismatches( op ) );
+            elif (op.opappkind == FM_SB_EXCHNDOC)
+                codesOC.add( GetExchangeMismatches( op ) );
+            elif (op.opappkind == FM_SB_CASHOPERT)
+                codesOC.add( GetCashOpMismatches( op ) );
+            end;            
+
+            if ( codesOC.empty )
+                codesUO.add(1199);
+            end;
+        end;
+        
+        if ( not codesUO.empty )
+            codesOC.add(6001);
+        end;
+    end;
+
+    /*------------------------------------------------------------*/   
+    
+    /* Заполняет данные по операции */
+    private macro FillOperationInfo( op: Operat, codes : vector )
+        var i = 0;
+        
+        FM_Operation.Clear;
+        FM_Operation.DocKind    = AppKindToDocKind( op.maindockind );
+        FM_Operation.DocumentID = MakeDocIDbyAppKind( op.maindockind, op.maindockey );
+        FM_Operation.FIID       = GKBO_GetFICodeByISO( GetCurExtCodeByCode(op.CurCode) );   
+        FM_Operation.DateCarry  = op.date;
+        FM_Operation.Date       = op.date;
+        FM_Operation.DateReveal = op.date;
+        FM_Operation.Executer   = {oper};
+        FM_Operation.Oper       = retop.rec.Oper;
+        FM_Operation.Department = getFilialNum( retop.rec.Branch );
+        FM_Operation.ConvOprCurrency = -1;
+
+        FM_Operation.Sum = op.SumCur;
+        if( op.SumRub > 0 )
+            FM_Operation.SumEquivalent = op.SumRub;
+        end;
+
+        FM_Operation.TerrorSign = 0;
+        FM_Operation.PayerBankSign = 0;
+        FM_Operation.ReceiverBankSign = 0;
+        FM_Operation.OprByOrderSign = 0;
+        FM_Operation.Descr = "";
+
+        if ( (op.OpAppKind == FM_SB_DEPOSIT) or (op.OpAppKind == -FM_SB_DEPOSIT) or (op.OpAppKind == FM_SB_DEPSC) or (op.OpAppKind == FM_SB_TRN) or (op.OpAppKind == FM_SB_LOGREC) )
+            FM_Operation.PaymDocNumber = GetDocNumber( op.OpAppKind, op.OpAppKey );
+            FM_Operation.PaymDocDate   = addpdoc.rec.DocDate;
+            FM_Operation.Ground = depdoc.rec.Ground;        
+
+            if ( IsMetalAcc )
+                FM_Operation.DateCarry = depositr.rec.Open_Date;
+            end;
+        end;
+        
+        if ( op.OpAppKind == FM_SB_CASHOPERT )
+            FM_Operation.PaymDocNumber =  GetDocNumber( op.OpAppKind, op.OpAppKey );
+            FM_Operation.PaymDocDate   = addpdoc.rec.DocDate;        
+            FM_Operation.Ground = paydoc.rec.Ground;        
+        end;        
+
+        if ( op.OpAppKind == FM_SB_EXCHNDOC )
+           FM_Operation.FIID           = GKBO_GetFICodeByISO( GetCurExtCodeByCode(op.curcode) );
+           FM_Operation.Sum            = op.sumCur;
+           FM_Operation.SumEquivalent  = op.sumRub;
+
+           if( exdoc.rec.kind_oper == 18 ) 
+              FM_Operation.ConvOprCurrency   = GKBO_GetFICodeByISO( GetCurExtCodeByCode(exdoc.rec.IncomeCodIntValue) );
+              FM_Operation.ConvOprSum        = exdoc.rec.IncomeAmount;        
+           end;
+            FM_Operation.Ground = exdoc.rec.ExtInfo;                   
+        end;
+            
+        if ( op.OpAppKind == FM_SB_CAPISSUE )
+            FM_Operation.MoneySign = 1;            
+        end;        
+        
+        while ( i < codesOC.Size )
+            if( not FM_Operation.AddCode( string(codesOC(i)), OPCONTR_TYPE_OC ) )
+                XFM(op, FM_Operation.ErrorMessage());
+            end;
+            i = i + 1;
+        end;
+
+        i = 0;
+        while ( i < codesUO.Size )
+            if( not FM_Operation.AddCode( string(codesUO(i)), OPCONTR_TYPE_UO ) )
+                XFM(op, FM_Operation.ErrorMessage());
+            end;
+            i = i + 1;
+        end;
+    end;
+
+    /*------------------------------------------------------------*/   
+
+    /* Заполняет информацию по получателю оп.65,80 */
+    private macro Deposit_FillClientInfo_65_80
+        var cmd, rs;
+        var accRef = 0, bankID = -1; 
+        var depdoc11 = TRecHandler( "sbdepdoc.11" );
+        var depdoc1  = TRecHandler( "sbdepdoc.1" );
+        
+        if ( (depdoc.rec.TypeOper == 65) and (depdoc.rec.TypeComplexOper == 6) )
+            setrecordaddr( depdoc11, depdoc, 0, 0, true );
+            accRef = depdoc11.rec.CorrAcc_Referenc;
+        else
+            setrecordaddr( depdoc1, depdoc, 0, 0, true );    
+            accRef = depdoc1.rec.CorrAcc_Referenc;
+        end;
+
+        cmd = RSDCommand( "select t_Account, t_CodClient, t_FNcash from ddepositr_dbt where t_Referenc = :ref" );        
+        rs = RsdRecordSet( cmd );        
+        cmd.addParam( "ref", RSDBP_IN, accRef );        
+        cmd.execute();
+
+        if ( (rs.moveNext) and (rs.Value(1) != depositr.rec.CodClient) )
+            FM_Operation.OprParty( clientKind ).PartyType = "Ф";
+            FM_Operation.OprParty( clientKind ).Account = rs.Value(0);
+            FM_Operation.OprParty( clientKind ).PartyID = rs.Value(1);
+            bankID = GetOtherBankID( rs.value(2), depdoc.rec.RealFNcash );
+            if ( bankID > 0 )
+                FM_Operation.OprParty( clientKind ).BankID = bankID;
+            end;
+        end;
+    end;
+
+    /* Заполняет информацию по первому клиенту вкладной операции */
+    private macro Deposit_FillClientInfo_First
+        var bankID, issuerID = -1, holderSign = 0;
+
+        bankID = GetOtherBankID( depositr.rec.FNcash, depdoc.rec.RealFNcash );
+        if ( depdoc.rec.TypeOper == 84 )
+            if ( not GetCardIssuerID( depdoc.rec.FNcash, issuerID, holderSign ) )
+                issuerID = {OurBank};
+                holderSign = "1";
+            end;
+        end;                      
+
+        FM_Operation.OprParty( clientKind ).PartyType = "Ф";
+        FM_Operation.OprParty( clientKind ).PartyID = depositr.rec.CodClient;
+        FM_Operation.OprParty( clientKind ).Account = depositr.rec.Account;
+        if ( bankID > 0 )
+            FM_Operation.OprParty( clientKind ).BankID = bankID;
+        end;
+
+        if ( clientKind == _FM_PARTY_PAYER )
+            FM_Operation.OprParty( clientKind ).CardHolderSign = 0;
+        else
+            FM_Operation.OprParty( clientKind ).CardHolderSign = holderSign;
+        end;
+
+        if ( issuerID > 0 )
+            FM_Operation.OprParty( clientKind ).CardIssuerID = issuerID;
+        end;
+    end;
+
+    /* Заполняет информацию по первому клиенту вкладной операции по карточному счету */
+    private macro Deposit_FillClientInfo_First_Card()
+      var i_ddep     = TRecHandler( "i_dp_dep.rec" );
+      var i_party    = TRecHandler( "i_party.rec" );
+      var party      = Tbfile( "party.dbt", "r", 0 );
+      var partcode   = Tbfile( "partcode.dbt", "r", 0 );
+      var mainBranch = getFilialNum( depdoc.rec.FNCash );
+      var code_kind  = 3;
+
+      if ( ( depdoc.rec.TypeOper == 41 )  OR  ( depdoc.rec.TypeOper == 42 )  OR  ( depdoc.rec.TypeOper == 73 ) )
+        clientKind = _FM_PARTY_RECEIVER;
+      else
+        clientKind = _FM_PARTY_PAYER;
+      end;
+
+      if ( ( depdoc.rec.TypeOper == 84 )  AND  ( depdoc.rec.InSum > 0 ) )  // Оплата транзакции оп.84 может быть приходной.
+        clientKind = _FM_PARTY_RECEIVER;
+      end;
+
+      Deposit_FillClientInfo_First();
+      if ( findDepartment( mainBranch, NULL, i_ddep, i_party ) )
+        FM_Operation.OprParty( clientKind ).CardIssuerName = i_party.rec.Name;
+        party.rec.PartyID = i_ddep.rec.PartyID;
+        if ( party.GetEQ() )
+          if ( trim( party.rec.NotResident ) == "" )
+            code_kind = 3;
+          else
+            code_kind = 11;
+          end;
+        else
+          code_kind = 3;
+        end;
+        partcode.rec.CodeKind = code_kind;
+        partcode.rec.PartyID = i_ddep.rec.PartyID;
+        if ( partcode.GetEQ() )
+          FM_Operation.OprParty( clientKind ).CardIssuerCode = partcode.rec.Code;
+        else
+          FM_Operation.OprParty( clientKind ).CardIssuerCode = "0";
+        end;
+      else
+        FM_Operation.OprParty( clientKind ).CardIssuerName = "0";
+        FM_Operation.OprParty( clientKind ).CardIssuerCode = "0";
+      end;
+      FM_Operation.OprParty( clientKind ).CardHolderSign = "1";
+    end;
+
+    /* Заполняет информацию по клиенту вкладной операции */
+    private macro Deposit_FillClientInfo( op )
+
+      if ( Index( depositr.rec.UserTypeAccount, "К" ) > 0 )  // Карточный счет.
+        Deposit_FillClientInfo_First_Card();
+      else
+        /* Наличная приходная оп."Открытие наличными" */
+        if ( depdoc.rec.TypeOper == 1 )
+            clientKind = _FM_PARTY_RECEIVER;                /* участник №1 */
+            Deposit_FillClientInfo_First;
+
+            if ( depositr.rec.CodClient != depdoc.rec.CodClient )
+                clientKind = _FM_PARTY_PAYER;               /* участник №2 */
+                FM_Operation.OprParty( clientKind ).PartyType = "Ф";
+                FM_Operation.OprParty( clientKind ).PartyID = depdoc.rec.CodClient;
+            end;
+        /* Наличные приходные, безналичные расходные */
+        elif ( ( (depdoc.rec.VidDoc == 1) and (depdoc.rec.InSum > 0) ) or
+               ( (depdoc.rec.VidDoc == 0) and (depdoc.rec.OutSum > 0) ) )
+            clientKind = _FM_PARTY_PAYER;                   /* участник №1 */
+            Deposit_FillClientInfo_First;
+
+            if ( depositr.rec.CodClient != depdoc.rec.CodClient )
+                clientKind = _FM_PARTY_PAYER_REPRESENT;     /* участник №2 */
+                FM_Operation.OprParty( clientKind ).PartyType = "Ф";
+                FM_Operation.OprParty( clientKind ).PartyID = depdoc.rec.CodClient;
+            end;
+
+            if ( (depdoc.rec.TypeOper == 65) or (depdoc.rec.TypeOper == 80) )
+                clientKind = _FM_PARTY_RECEIVER;            /* участник №3 */
+                Deposit_FillClientInfo_65_80;
+            end;
+        /* Наличные расходные, безналичные приходные */
+        else
+            clientKind = _FM_PARTY_RECEIVER;                /* участник №1 */
+            Deposit_FillClientInfo_First;
+
+            if ( depositr.rec.CodClient != depdoc.rec.CodClient )
+                clientKind = _FM_PARTY_RECEIVER_REPRESENT;  /* участник №2 */
+                FM_Operation.OprParty( clientKind ).PartyType = "Ф";
+                FM_Operation.OprParty( clientKind ).PartyID = depdoc.rec.CodClient;
+            end;
+
+        end;
+      end;
+    end;
+    
+    /* Заполняет информацию по клиенту операции с ЦБиЦ */
+    private macro CapIssue_FillClientInfo( op )
+        var client2Kind, bankID;
+
+        if ( ( (cidoc.rec.Operation == 2) and 
+               (( (cidoc.rec.Type >= CI_LOTTERY) and (cidoc.rec.Type <= CI_INGOT) ) or 
+                ( (cidoc.rec.Type == CI_MISC) )) ) or
+             ( (cidoc.rec.Operation == 3) and (cidoc.rec.Type == CI_CERT) ) )
+            clientKind = _FM_PARTY_RECEIVER;
+            client2Kind = _FM_PARTY_PAYER;
+        else
+            clientKind = _FM_PARTY_PAYER;
+            client2Kind = _FM_PARTY_RECEIVER;
+        end;
+
+        /* участник №1 */
+        FM_Operation.OprParty( clientKind ).PartyType = "Ф";
+        FM_Operation.OprParty( clientKind ).Account = op.Account;
+        bankID = GetOtherBankID( op.accountbranch, cidoc.rec.Branch );
+        if ( bankID > 0 )
+            FM_Operation.OprParty( clientKind ).BankID = bankID;
+        end;
+
+        if ( cidoc.rec.CodClient <= 0 )
+            FM_Operation.OprParty( clientKind ).Name = Trim(cidoc.ClientLastName) + " " + Trim(cidoc.ClientFirstName) + " " + Trim(cidoc.ClientSecondName);
+            FM_Operation.OprParty( clientKind ).RegAddress = cidoc.ClientAddress;
+            FM_Operation.OprParty( clientKind ).RegCountry = GetCountryCode( cidoc.ClientCountry );
+            FM_Operation.OprParty( clientKind ).CodeDocum  = cidoc.PersIDType;
+            FM_Operation.OprParty( clientKind ).PaperSeries= cidoc.PassportSer;
+            FM_Operation.OprParty( clientKind ).PaperNumber= cidoc.PassportNumb;
+            FM_Operation.OprParty( clientKind ).PaperIssuer= cidoc.PassportIssuer;
+            FM_Operation.OprParty( clientKind ).PaperIssuedDate= cidoc.PassportDate;
+            FM_Operation.OprParty( clientKind ).INN        = cidoc.INN_Payer;
+            FM_Operation.OprParty( clientKind ).Birthday   = cidoc.BirthDate;
+            FM_Operation.OprParty( clientKind ).BirthPlace = cidoc.BirthPlace;
+        else
+            FM_Operation.OprParty( clientKind ).PartyID = cidoc.rec.CodClient;
+        end;
+
+        /* участник №2 */
+        FM_Operation.OprParty( client2Kind ).PartyType = "Ф";
+        FM_Operation.OprParty( client2Kind ).PartyID = GetBankID( cidoc.rec.Branch );
+    end; 
+
+    private macro Exchange_CopyClientData
+        FM_Operation.OprParty( clientKind ).PartyType = "Ф";
+        if ( exdoc.rec.ClientCode <= 0 )
+            FM_Operation.OprParty( clientKind ).Name = Trim(exdoc.rec.Sname) + " " + Trim(exdoc.rec.Name) + " " + Trim(exdoc.rec.Pname);
+            FM_Operation.OprParty( clientKind ).RegAddress = exdoc.rec.ClientAddress;
+            FM_Operation.OprParty( clientKind ).RegCountry = GetCountryCode( exdoc.rec.ClientCountry );
+            FM_Operation.OprParty( clientKind ).CodeDocum  = exdoc.rec.ClientDocType;
+            FM_Operation.OprParty( clientKind ).PaperSeries= exdoc.rec.ClientDocSeria;
+            FM_Operation.OprParty( clientKind ).PaperNumber= exdoc.rec.ClientDocNumber;
+            FM_Operation.OprParty( clientKind ).PaperIssuedDate = exdoc.rec.ClientDocIssuedDate;
+            FM_Operation.OprParty( clientKind ).PaperIssuer= exdoc.rec.ClientDocInfo;
+            FM_Operation.OprParty( clientKind ).INN        = exdoc.rec.INN;
+            FM_Operation.OprParty( clientKind ).Birthday   = exdoc.rec.BirthDate;
+            FM_Operation.OprParty( clientKind ).BirthPlace = exdoc.rec.BirthPlace;
+        else
+            FM_Operation.OprParty( clientKind ).PartyID = exdoc.rec.ClientCode;
+        end;
+    end;
+
+    /* Заполняет информацию по клиенту ВОО */
+    private macro Exchange_FillClientInfo( op )
+        var client2Kind = 0, bankID = -1;
+        const opnum = exdoc.rec.Kind_Oper;
+
+        if( makeVector(1,3,6,14,20,24,25,29,30,38,40,42,45).contains(opnum) )
+            clientKind = _FM_PARTY_RECEIVER;
+            client2Kind = _FM_PARTY_PAYER;
+
+        elif( makeVector(4,7,13,16,17,18,21,22,23,26,27,28,39,41,43,44).contains(opnum) )
+            clientKind = _FM_PARTY_PAYER;
+            client2Kind = _FM_PARTY_RECEIVER;
+
+        else
+            XFM(op, "Неверный номер операции");
+        end; 
+
+        /* участник №1 */
+        Exchange_CopyClientData;
+        if ( (exdoc.rec.Kind_Oper >= 38) and (exdoc.rec.Kind_Oper <= 45) )
+            FM_Operation.OprParty( clientKind ).Account = op.account;
+            bankID = GetOtherBankID( op.accountbranch, exdoc.rec.Branch );
+            if ( bankID > 0 )
+                FM_Operation.OprParty( clientKind ).BankID = bankID;
+            end;
+        end;    
+
+        /* участник №2 */
+        if( makeVector(22,23).contains(opnum) )
+            clientKind = client2Kind;
+            Exchange_CopyClientData;
+        else
+            FM_Operation.OprParty( client2Kind ).PartyType = "Ф";
+            FM_Operation.OprParty( client2Kind ).PartyID = GetBankID( exdoc.rec.Branch );
+        end;
+    end;
+
+    /* Получить номер и название эмитента карты для кассовой операции */
+    private macro Cash_GetCardData( cardNumber, /* out */
+                                    cardIssuer  /* out */ )
+        var cmd, rs, ret = false;
+        var paydoc36 = TRecHandler( "pay_doc.n36" );        
+        record rt_paym_rrn("rt_paym.rrn"); 
+        file rt_paym("rt_paym.dbt") key 0;         
+
+        if ( paydoc.rec.NumOpert == 36 )                
+            setrecordaddr(paydoc36, paydoc, 0, 0, true );
+            cardNumber = paydoc36.rec.cardNumber;
+            cardIssuer = paydoc36.rec.cardBankName;
+            
+        elif ( paydoc.rec.NumOpert == 38 )
+            ClearRecord(rt_paym);
+            rt_paym.iApplicationKind = paydoc.rec.iApplicationKind;
+            rt_paym.ApplicationKey   = paydoc.rec.ApplicationKey;
+            rt_paym.AttrID = "RRN";
+            if ( GetEQ(rt_paym) )
+              SetRecordAddr(rt_paym_rrn, rt_paym, 0, FldOffset(rt_paym, "Payment" ), true);
+              CardNumber = rt_paym_rrn.CardNumber;
+            end;
+
+        else
+            cmd = RsdCommand( "select t_CardNumber, t_CardIssuer2 from dscacqu_dbt where t_PayDocApplKind = :kind and t_PayDocApplKey = :key" );
+            cmd.addParam( "kind", RSDBP_IN, paydoc.rec.iApplicationKind );
+            cmd.addParam( "key", RSDBP_IN, paydoc.rec.ApplicationKey );
+            rs = RsdRecordSet( cmd );
+            if ( rs.MoveNext() )                    
+                cardNumber = rs.value(0);
+                cardIssuer = rs.value(1);
+            end;
+        end;                
+
+        if ( Trim(CardNumber) != "" )
+            ret = true;
+            setparm( 1, cardNumber );
+            setparm( 2, cardIssuer );
+        end;
+        return ret;
+    end;
+
+    /* Получить ФИО клиента кассовой операции */ 
+    private macro Cash_GetClientName
+        return trim(paydoc.rec.ClientLastName) + " " + trim(paydoc.rec.ClientFirstName) + " " + trim(paydoc.rec.ClientSecondName);
+    end;
+
+    private macro Cash_CopyClientData
+        FM_Operation.OprParty( clientKind ).Name       = Cash_GetClientName;
+        FM_Operation.OprParty( clientKind ).RegAddress = paydoc.rec.ClientAddress;
+        FM_Operation.OprParty( clientKind ).RegCountry = GetCountryCode( paydoc.rec.ClientCountry );
+        FM_Operation.OprParty( clientKind ).CodeDocum  = paydoc.rec.PersIDType;
+        FM_Operation.OprParty( clientKind ).PaperSeries= paydoc.rec.PassportSer;
+        FM_Operation.OprParty( clientKind ).PaperNumber= paydoc.rec.PassportNumb;
+        FM_Operation.OprParty( clientKind ).PaperIssuer= paydoc.rec.PassportIssuer;
+        FM_Operation.OprParty( clientKind ).PaperIssuedDate= paydoc.rec.PassportDate;
+        FM_Operation.OprParty( clientKind ).INN        = paydoc.rec.INN_Payer;
+        FM_Operation.OprParty( clientKind ).Birthday   = paydoc.rec.BirthDate;
+        FM_Operation.OprParty( clientKind ).BirthPlace = paydoc.rec.BirthPlace;
+    end;
+    
+    /* Заполняет информацию по клиентам кассовой оп.42 */ 
+    private macro Cash_FillClientInfo_11_42( op )   
+        clientKind = _FM_PARTY_PAYER;                 /* участник №1 */
+        FM_Operation.OprParty( clientKind ).PartyType = "Ф";
+        Cash_CopyClientData;
+    end;    
+
+    /* Заполняет информацию по клиентам кассовой оп.40 */ 
+    private macro Cash_FillClientInfo_11_40( op )
+        var bankID = -1, name = "";
+        var paydoc40 = TRecHandler( "pay_doc.n40" );
+        
+        setrecordaddr( paydoc40, paydoc, 0, 0, true );  
+
+        name = Trim(paydoc40.rec.FNameRecp) + " " + Trim(paydoc40.rec.NameRecp) + " " + Trim(paydoc40.rec.SNameRecp);
+        if ( (name != "") and (op.account != "") )
+            clientKind = _FM_PARTY_PAYER;                      /* участник №1 */
+            FM_Operation.OprParty( clientKind ).PartyType = "Ф";
+            FM_Operation.OprParty( clientKind ).Name = name;
+            FM_Operation.OprParty( clientKind ).Account = op.account;
+            FM_Operation.OprParty( clientKind ).RegAddress = paydoc40.rec.AddrRecp;
+            bankID = GetOtherBankID( op.accountbranch, paydoc.rec.FNcash );
+            if ( bankID > 0 )
+                FM_Operation.OprParty( clientKind ).BankID = bankID;
+            end;
+        end;
+
+        clientKind = _FM_PARTY_RECEIVER;                       /* участник №2 */
+        FM_Operation.OprParty( clientKind ).PartyType = "Ф";
+        FM_Operation.OprParty( clientKind ).PartyID = GetBankID( paydoc.rec.FNcash );
+    end;
+
+    /* Заполняет информацию по клиенту кассовой операции */
+    private macro Cash_FillClientInfo( op )   
+        var client2Kind, cardNumber, cardIssuer, cardBranch;       
+        var issuerID = -1, holderSign = 0;
+
+        // частные случаи
+        if( (paydoc.rec.GroupOpert == 11) and (paydoc.rec.NumOpert == 42) ) 
+            return Cash_FillClientInfo_11_42( op );
+        elif( (paydoc.rec.GroupOpert == 11) and (paydoc.rec.NumOpert == 40) ) 
+            return Cash_FillClientInfo_11_40( op );
+        end;
+
+        // общий случай
+        if( paydoc.rec.GroupOpert == 11 )
+            clientKind = _FM_PARTY_PAYER;
+            client2Kind = _FM_PARTY_RECEIVER;
+        else
+            clientKind = _FM_PARTY_RECEIVER;
+            client2Kind = _FM_PARTY_PAYER;
+        end;
+       
+        /* участник №1 */
+        FM_Operation.OprParty( clientKind ).PartyType = "Ф";
+        if ( (paydoc.rec.GroupOpert == 41) or (paydoc.rec.NumOpert != 41) )
+            if ( paydoc.rec.CodClient <= 0 )
+                Cash_CopyClientData;
+            else
+                FM_Operation.OprParty( clientKind ).PartyID = paydoc.rec.CodClient;
+            end;
+        else
+            FM_Operation.OprParty( clientKind ).Name = Cash_GetClientName;
+        end;
+
+        /* заполняются реквизиты карты */
+        if ( (( (paydoc.rec.GroupOpert == 41) and 
+                (( (paydoc.rec.NumOpert >= 30) and (paydoc.rec.NumOpert <= 33) ) or (paydoc.rec.NumOpert == 35)) ) or
+              (paydoc.rec.NumOpert == 36) or (paydoc.rec.NumOpert == 38)) and
+             Cash_GetCardData( cardNumber, cardIssuer ) )
+
+            cardBranch = GetCardBranch( cardNumber );
+            if ( cardBranch > 0 ) /* Карта наша */
+                if ( not GetCardIssuerID( cardBranch, issuerID, holderSign ) )
+                    issuerID = {OurBank};
+                    holderSign = "1";
+                end;
+            else
+                FM_Operation.OprParty( clientKind ).CardIssuerName = cardIssuer;
+                holderSign = "2"; 
+            end;
+
+            if ( clientKind == _FM_PARTY_PAYER )
+                FM_Operation.OprParty( clientKind ).CardHolderSign = 0;
+            else
+                FM_Operation.OprParty( clientKind ).CardHolderSign = holderSign;
+            end;
+
+            if ( issuerID > 0 )
+                FM_Operation.OprParty( clientKind ).CardIssuerID = issuerID;
+            end;
+        end;
+
+        /* участник №2 */
+        FM_Operation.OprParty( client2Kind ).PartyType = "Ф";
+        FM_Operation.OprParty( client2Kind ).PartyID = GetBankID( paydoc.rec.FNcash );
+    end;
+
+    /* Запись данных участников операции в opcntrpt.dbt */
+    private macro FillClientInfo( op: Operat )        
+        
+        FM_Operation.OprParty( _FM_PARTY_PAYER ).Clear;
+        FM_Operation.OprParty( _FM_PARTY_PAYER_REPRESENT ).Clear;
+        FM_Operation.OprParty( _FM_PARTY_RECEIVER_REPRESENT ).Clear;
+        FM_Operation.OprParty( _FM_PARTY_RECEIVER ).Clear;
+        FM_Operation.OprParty( _FM_PARTY_ORDER ).Clear;
+
+        if ( (op.opappkind == FM_SB_DEPOSIT) or (op.opappkind == -FM_SB_DEPOSIT) or (op.opappkind == FM_SB_DEPSC) or (op.opappkind == FM_SB_TRN) or (op.opappkind == FM_SB_LOGREC) )
+            Deposit_FillClientInfo( op );
+        elif (op.opappkind == FM_SB_CAPISSUE) 
+            CapIssue_FillClientInfo( op );
+        elif (op.opappkind == FM_SB_EXCHNDOC)
+            Exchange_FillClientInfo( op );
+        elif (op.opappkind == FM_SB_CASHOPERT)
+            Cash_FillClientInfo( op );
+        end;
+        
+    end;   
+    
+    /*------------------------------------------------------------*/   
+
+    private macro GetLegacyOperatCodes( op );
+        var codes1, codes2;
+
+        FM_Operation.Clear;
+ /*       FM_Operation.DocKind    = AppKindToDocKind( op.maindockind );
+        FM_Operation.DocumentID = MakeDocIDbyAppKind( op.maindockind, op.maindockey );
+        FM_Operation.Department = getFilialNum( retop.rec.Branch );*/
+
+        if( FM_Operation.Find( retop.rec.FMOpId_Offline ) )
+            FM_Operation.GetCodes( codes1, codes2 );
+            codesOC.merge(codes1);
+            codesUO.merge(codes2);
+        else
+            XFM(op, "Не удалось найти запись dopcontr_dbt");
+        end;
+    end;
+
+    /*------------------------------------------------------------*/   
+
+    private macro ProcessOperat( op : Operat, operationType : integer )         
+        var fmopc;
+
+        codesOC.clear;
+        codesUO.clear;
+
+        /* 1. Подкачка данных по оперции */
+        PumpOperationInfo( op );
+
+        if( op.status == UPLOADED_OPERATION ) /* Если операция уже есть в ФМ, то получим ее коды для вывода в отчет */
+            GetLegacyOperatCodes( op );
+        else
+            GetOperatCodes( op );
+
+            if( needExport )
+                /* 2. Запись данных данных по операции и участникам операции */ 
+                FillOperationInfo( op );
+                FillClientInfo( op );
+
+                fmopc = FM_Operation.Check(false,false);
+
+                if( fmopc == OPCONTR_CHECK_ERROR )
+                    XFM(op, FM_Operation.ErrorMessage());
+                else
+                    /* 3. Сохранение операции в ФМ */
+                    if( not FM_Operation.Save )
+                        XFM(op, FM_Operation.ErrorMessage());
+                    end;
+               end;
+            end;
+
+        end;
+
+        retop.rec.FMOpId_Offline = FM_Operation.OperationID;
+        if ( not retop.update() )
+           XFM(op, "Ошибка при обновлении ссылки на операцию в ФМ");
+        end;
+        
+        /* 4. Вывод данных гл. документа в отчет */
+        if ( needDocPrint )
+            FMRep.DocPrint( FRecs, op, codesOC, codesUO );
+        end;
+
+        if ( (codesOC.size == 0) or ((codesOC.size == 1) and (codesOC.contains(6001))) )
+            operationType = OPCONTR_TYPE_UO;
+        else
+            operationType = OPCONTR_TYPE_OC;
+        end;
+
+        SetParm( 2, operationType );
+        return true;
+
+        onerror( errObj );    
+            if ( isEqClass("exception", errObj.err) )
+               println( errObj.err.msg_ );
+            else
+               println( errObj.Message );
+            end;   
+            return false;
+    end;
+    
+    /* Начать выгрузку операций из таблицы fm_operat.tmp в ФМ */
+    macro Seek( cntOpTakeC,  /* out */
+                cntOpShady   /* out */ )
+        var operats, oprt, opType;
+        var err, stat = true;
+
+        CountryCodes = FM_GetCountryCodes();
+        GetRegistryValue( "ФИНМОНИТОРИНГ\\КОД КОНВЕРСИОННОЙ ОПЕРАЦИИ", V_STRING, ConvertCode, err );
+
+        operats = GetShadyOperats();
+
+        if ( operats.MoveNext )
+            if ( needDocPrint )
+                FMRep.DocPrint_Begin;
+            end;
+
+            while ( (stat) and (oprt = Operat( operats )) )
+                
+                if( ProcessOperat( oprt, opType ) )
+                    if ( opType == OPCONTR_TYPE_OC )
+                        countOpTakeC = countOpTakeC + 1;
+                    else
+                        countOpShady = countOpShady + 1;
+                    end;
+                end;
+
+                stat = operats.MoveNext;
+            end;
+
+            if ( needDocPrint )
+                FMRep.DocPrint_End;
+            end;
+        end;
+
+        setparm(1, countOpTakeC);
+        setparm(2, countOpShady);
+    end;   
+
+end;

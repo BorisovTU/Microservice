@@ -1,0 +1,16 @@
+BEGIN
+  INSERT INTO DBANK_MSG (T_NUMBER,T_PAGE,T_CONTENTS)
+                 VALUES (28136,0,'Услуга уже была подключена за более поздний период');
+
+EXCEPTION
+  WHEN OTHERS THEN NULL;
+END;
+/
+
+BEGIN
+  EXECUTE IMMEDIATE 'COMMIT';
+EXCEPTION
+  WHEN OTHERS THEN NULL;
+END;
+/
+

@@ -1,0 +1,352 @@
+/*
+$Name:        loaddeprprm.mac
+$Module:      Кредитование
+$Description: Прием ТФ с параметрами обесценения по МСФО
+*/
+
+import SbCrdInter, total, RtXmlFunc, RsbDataSet, RsExts, likepy;
+
+// Протокол загрузки файлов
+CONST ReportTypeFull = 0;           // Полный
+CONST ReportTypeParseError = 1;     // Не выполнена загрузка
+CONST ReportTypeObjectNotFound = 2; // Не найден объект в системе
+CONST ReportNone = 3;               // Не выдавать
+
+private macro TArrayOf(sample):TArray
+    var arr = TArray;
+    arr[0] = sample;
+    return arr;
+END;
+
+class CObject
+    var ObjectType     :integer;       // Вид объекта
+    var ID             :integer;       // Идентификатор экземпляра объекта системы в подсистеме <Кредитование>
+    var Number         :string;        // Номер экземпляра объекта системы
+    var VDate          :date = date(); // Дата экземпляра объекта системы
+    var ClientType     :integer;       // Тип заемщика
+    var NameFull       :string;        // Полное наименование заемщика - юридического лица в карточке субъекта УЯ
+    var LastName       :string;        // Фамилия заемщика - физ. лица в карточке субъекта УЯ
+    var FirstName      :string;        // Имя заемщика - физ. лица в карточке субъекта УЯ
+    var MiddleName     :string;        // Отчество заемщика - физ. лица
+    var Depreciation   :integer;       // Степень обесценения
+    var LossPercentage :double;         // Дробное число с 4 символами после запятой
+    var Comment        :string;        // Примечание к степени обесценения и проценту потерь
+end;
+
+class CDataList
+    var FilialCode     :integer;       // Код филиала в справочнике подразделений ТС
+    var UnitCode       :integer;       // Код ВСП в справочнике подразделений ТС
+    var Objects        = TArrayOf(CObject);
+end;
+
+class CTransportFile
+    class CHeader
+        var OperDate   :date = date(); // Дата формирования ТФ (выполнения операции)
+    end;
+    var Header         = CHeader;
+    var Data           = TArrayOf(CDataList);
+end;
+
+PRiVATE MACRO MakeLoansError(ErrorMessage)
+    var cmd = RSDcommand("INSERT INTO DLNSERROR_TMP (T_OBJID, T_OBJN, T_CREDOPERID, T_ERROR, T_ERRORCODE) VALUES (0, 0, 0, ?, 0)");
+    cmd.AddParam("t_error", RSDBP_IN, ErrorMessage);
+    cmd.NullConversion = true;
+    cmd.execute();
+END;
+
+// Ошибка разбора файла
+PRIVATE MACRO MakeParseError(ErrorMessage, XmlFile, ErrorLogLevel)
+    if ((ErrorLogLevel == ReportTypeFull) or (ErrorLogLevel == ReportTypeParseError))
+        MakeLoansError(XmlFile + ": " + ErrorMessage);
+    end;
+END;
+
+// Ошибка заполнения полей файла
+// Incorrect - булев флаг, Если true - ошибка напишет, что поле заполненно некорректно, 
+// иначе  напишет, что поле вобще не заполнено
+PRIVATE MACRO MakeFillError(FieldName, XmlFile, ErrorLogLevel, Incorrect)
+    if ((ErrorLogLevel == ReportTypeFull) or (ErrorLogLevel == ReportTypeParseError))
+        if (Incorrect)
+            MakeLoansError(XmlFile + ": Загрузка не выполнена. Поле " + FieldName + " заполнено некорректно");
+        else
+            MakeLoansError(XmlFile + ": Загрузка не выполнена. Не заполнено обязательное поле " + FieldName);
+        end;
+    end;
+END;
+
+// Ошибка поиска объекта в системе.
+PRIVATE MACRO MakeObjectError(ObjID, ObjN, UserNumber, XmlFile, ErrorLogLevel)
+    if ((ErrorLogLevel == ReportTypeFull) or (ErrorLogLevel == ReportTypeObjectNotFound))
+        var ObjectName = LnSelectValue("SELECT T_OBJECTNAME FROM DLOBJECT_DBT WHERE T_OBJECTID=" + ObjID, V_STRING, 0);
+        var ErrorString = XmlFile + ": Не найден " + ObjectName + ": ";
+        if (ObjN)
+            ErrorString = ErrorString + "ID - " + ObjN;
+        else
+            ErrorString = ErrorString + "№ - " + UserNumber;
+        end;
+        MakeLoansError(ErrorString);
+    end;
+END;
+
+
+
+// Делает из вида объекта ТФ - вид объекта Loans.
+// Допустим, если в ТФ вид объекта "Карта" имеет ID = 3, то в LOANS - имеет ID = 8 (LO_KARTA)
+// На вход - вид объекта из ТФ.
+// Возвращает - вид объекта Loans
+private macro ConvertObjectType(ObjectTypeFromTransportFile)
+    var result = 0;
+    if (ObjectTypeFromTransportFile == 1) // КД
+        result = LO_CREDIT;
+    elif (ObjectTypeFromTransportFile == 2) // Договор овердрафта
+        result = LO_OVERDRAFT;
+    elif (ObjectTypeFromTransportFile == 3) // Кредит по карте
+        result = LO_KARTA;
+    elif (ObjectTypeFromTransportFile == 4) // Договор гарантии
+        result = LO_GUARANTEE;
+    elif (ObjectTypeFromTransportFile == 5) // Портфель
+        result = LO_CASE;
+    else
+        RunError("");
+    end;
+    return result;
+end;
+
+// Поиск объекта в системе
+// Если находит объект - возвращает ObjN. Не находит - 0
+PRIVATE MACRO FindObject(ObjID, ObjN, UserNumber, fncash)
+    var result = 0;
+    var qStr = "";
+    if (InList(ObjID, LO_CREDIT, LO_KARTA, LO_GUARANTEE, LO_OVERDRAFT))
+        if (ObjN)
+            qStr = "SELECT T_CREDITNUMBER FROM DCREDIT_C_DBT WHERE T_CREDITNUMBER = " + ObjN + 
+                   " AND T_CRD_KIND = " + ObjID + " AND T_FNCASH = " + fncash;
+        else
+            qStr = "SELECT T_CREDITNUMBER FROM DCREDIT_C_DBT WHERE T_USCREDITNUMBER = '" + UserNumber + 
+                   "' AND T_CRD_KIND = " + ObjID + " AND T_FNCASH = " + fncash;
+        end;
+        result = LnSelectValue(qStr, V_INTEGER, 0);
+    elif (ObjID == LO_CASE)
+        if (ObjN)
+            qStr = "SELECT T_BRIEFCASEID FROM DLBRFCASE_DBT WHERE T_BRIEFCASEID = " + ObjN + 
+                   " AND T_FNCASH = " + fncash;
+        else
+            qStr = "SELECT T_BRIEFCASEID FROM DLBRFCASE_DBT WHERE T_USERNUMBER = '" + UserNumber + 
+                   "' AND T_FNCASH = " + fncash;
+        end;
+        result = LnSelectValue(qStr, V_INTEGER, 0);
+    end;
+    return result;
+END;
+
+
+// Проверка объекта на корректность заполнения полей
+// Всё ОК - возвращает true
+// Попутно добавляет ошибки в список
+PRIVATE MACRO CheckObject(CrdObject, FileName, ErrorLogLevel)
+    var result = true;  
+    if (ValType(CrdObject.ObjectType) == V_UNDEF)
+        MakeFillError("ObjectType", FileName, ErrorLogLevel);
+        result = result and false; 
+    elif ((CrdObject.ObjectType < 1) or (CrdObject.ObjectType > 5))
+        MakeFillError("ObjectType", FileName, ErrorLogLevel, true);
+        result = result and false; 
+    end;
+    
+    if (ValType(CrdObject.ID) == V_UNDEF)
+        if (ValType(CrdObject.Number) == V_UNDEF)
+            MakeFillError("Number", FileName, ErrorLogLevel);
+            result = result and false;
+        end; 
+        if (ValType(CrdObject.VDate) == V_UNDEF)
+            MakeFillError("VDate", FileName, ErrorLogLevel);
+            result = result and false;
+        end;
+    end;
+    
+    if (ValType(CrdObject.ClientType) == V_UNDEF)
+        MakeFillError("ClientType", FileName, ErrorLogLevel);
+        result = result and false; 
+    elif ((CrdObject.ObjectType == 2) and (CrdObject.ClientType != 1) and (CrdObject.ClientType != 3))
+        MakeFillError("ClientType", FileName, ErrorLogLevel, true);
+        result = result and false; 
+    elif ((CrdObject.ObjectType == 3) and (CrdObject.ClientType != 2))
+        MakeFillError("ClientType", FileName, ErrorLogLevel, true);
+        result = result and false;
+    end;
+    
+    if ((CrdObject.ClientType == 1) and ((CrdObject.ObjectType != 3) or (CrdObject.ObjectType != 5)) and (ValType(CrdObject.NameFull) == V_UNDEF))
+        MakeFillError("NameFull", FileName, ErrorLogLevel);
+        result = result and false;
+    end;
+    
+    if (((CrdObject.ClientType == 2) or (CrdObject.ClientType == 3)) and (CrdObject.ObjectType != 5) and (ValType(CrdObject.LastName) == V_UNDEF))
+        MakeFillError("LastName", FileName, ErrorLogLevel);
+        result = result and false;
+    end;
+    
+    if (((CrdObject.ClientType == 2) or (CrdObject.ClientType == 3)) and (CrdObject.ObjectType != 5) and (ValType(CrdObject.FirstName) == V_UNDEF))
+        MakeFillError("FirstName", FileName, ErrorLogLevel);
+        result = result and false; 
+    end;
+    
+    if (ValType(CrdObject.Depreciation) == V_UNDEF)
+        MakeFillError("Depreciation", FileName, ErrorLogLevel);
+        result = result and false; 
+    elif ((CrdObject.Depreciation < 1) or (CrdObject.Depreciation > 3))
+        MakeFillError("Depreciation", FileName, ErrorLogLevel, true);
+        result = result and false;
+    end;
+    
+    if (ValType(CrdObject.LossPercentage) == V_UNDEF)
+        MakeFillError("LossPercentage", FileName, ErrorLogLevel);
+        result = result and false;
+    end;
+    
+    return result;
+end;
+
+// Проверка филиала
+PRIVATE MACRO CheckFilialObject(FilialObj, FileName, ErrorLogLevel)
+    var result = true;
+    if (ValType(FilialObj.FilialCode) == V_UNDEF)
+        MakeFillError("FilialCode", FileName, ErrorLogLevel);
+        result = result and false;
+    end;
+    if (ValType(FilialObj.Objects) == V_UNDEF)
+        MakeFillError("Objects", FileName, ErrorLogLevel);
+        result = result and false;
+    end;
+    return result;
+end;
+
+// Функция фильтрации объекта по параметрам.
+// Параметры объекта:
+// ObjectType, ObjectFilial, ObjectVSP,
+// ------------------------------------------ 
+// Параметры фильтра:
+// TypeObjectList - виды объекта, Filial - филиал, VSP - ВСП
+// Возвращает True, если нужно отобрать объект. Иначе - false
+PRIVATE MACRO FilterObject(ObjectType, ObjectFilial, ObjectVSP, TypeObjectList:TArray, Filial:integer, VSP:integer)
+    var result = true;
+    if (TypeObjectList and (TypeObjectList.size > 0)) // нужно фильтровать по виду объекта
+        if (find(TypeObjectList, ObjectType) == -1) // не входит в массив
+            result = result and false;
+        end;
+    end;
+
+    if (Filial)
+        if (Filial != ObjectFilial)
+            result = result and false;
+        end;
+    end;
+
+    if (VSP)
+        if (VSP != ObjectVSP)
+            result = result and false;
+        end;
+    end;
+    return result;
+END;
+
+// Вставка объекта во временную таблицу
+PRIVATE MACRO InsertIntoTempTable(ObjectType, 
+                                  ObjectNumber,
+                                  Number,
+                                  FilialCode,
+                                  Deprecation,
+                                  LossPercentage,
+                                  Comment)
+    var cmd = RsdCommand("insert into ddeprprm_tmp(t_exception, t_objecttype, t_objectnumber, t_number,t_filialcode,t_deprication,t_losspercentage,t_comment) values(chr(0),?,?,?,?,?,?,?)");
+    cmd.AddParam("t_objecttype",     RSDBP_IN, ObjectType    );
+    cmd.AddParam("t_objectnumber",   RSDBP_IN, ObjectNumber  );
+    cmd.AddParam("t_number",         RSDBP_IN, Number        );
+    cmd.AddParam("t_filialcode",     RSDBP_IN, FilialCode    );
+    cmd.AddParam("t_deprication",    RSDBP_IN, Deprecation   );
+    cmd.AddParam("t_losspercentage", RSDBP_IN, LossPercentage);
+    cmd.AddParam("t_comment",        RSDBP_IN, Comment       );
+    cmd.NullConversion = true;
+    cmd.execute();
+    OnError(err)
+        LoansError("Ошибка вставки записи в таблицу: " + err.Message);
+END;
+
+MACRO ЗагрузкаПараметровОбесценения(DirName:string, 
+                                    FileName:string, 
+                                    OpDate:date, 
+                                    TypeObjectList:TArray,
+                                    Filial:integer, 
+                                    VSP:integer,
+                                    ReportType: integer)
+    var obj = CTransportFile;
+    var xml = CreateXMLParser();
+    var ImportFileList = TArray();
+
+    xml.validateOnParse = true;
+    xml.async = false;
+    
+    if (FileName != "") // задано имя файла. Значит импортируем файл
+        ImportFileList[ImportFileList.Size] = DirName + "\\" + FileName;
+    else                // имя файла не задано. Значит импортируем все файлы из каталога
+        var FileList = TDirList (DirName + "\\*.xml","f");
+        for(var i : integer, 0, FileList.count - 1)
+            var FName = FileList.name(i);
+            ImportFileList[ImportFileList.Size] = DirName + "\\" + FName;
+        end;
+    end;
+
+    for (var ImportFile, ImportFileList)
+        // Загрузили файл
+        if (not xml.load(ImportFile))
+            MakeParseError("Ошибка загрузки", ImportFile, ReportType);
+            continue;
+        end;
+
+        // Распарсили файл
+        if (RtXml2Rsl(xml.xml, obj) != 0)
+            MakeParseError("Ошибка разбора XML", ImportFile, ReportType);
+            continue;
+        end;
+        
+        // Проверим корректность даты
+        if (OpDate != obj.Header.OperDate)
+            MakeParseError("Дата формирования файла не совпадает с датой операции", ImportFile, ReportType);
+            continue;
+        end;
+
+        for (var FilialObj, obj.Data)                                   // пробегаемся по филиалам
+            if (CheckFilialObject(FilialObj, ImportFile, ReportType))   // проверяем филиал
+                for (var CrdObject, FilialObj.Objects)                  // пробегаемся по объектам филиала
+                    if (CheckObject(CrdObject, ImportFile, ReportType)) // Проверяем объект
+                        var ObjID = ConvertObjectType(CrdObject.ObjectType);
+                        if (FilterObject(ObjID, FilialObj.FilialCode, FilialObj.UnitCode, TypeObjectList, Filial, VSP)) // нужно ли нам вобще отбирать объект в список?
+                            var ObjN = FindObject(ObjID, CrdObject.ID, CrdObject.Number, FilialObj.FilialCode);
+                            if (ObjN) // объект существует в системе - вставляем во временную таблицу
+                                InsertIntoTempTable(ObjID, 
+                                                    ObjN, 
+                                                    CrdObject.Number, 
+                                                    FilialObj.FilialCode, 
+                                                    CrdObject.Depreciation, 
+                                                    CrdObject.LossPercentage, 
+                                                    CrdObject.Comment);
+                            else
+                                MakeObjectError(ObjID, ObjN, CrdObject.Number, ImportFile, ReportType);
+                                continue; // объект не существует в системе - переходим к след. объекту
+                            end; // if (ObjN != 0)
+                        else
+                            continue; // объект отбирать не нужно, потому что он из другого филиала, всп или имеет вид, не указанный на форме
+                        end; // if (FilterObject(ObjID, FilialObj.FilialCode, FilialObj.UnitCode, TypeObjectList, Filial, VSP))
+                    else
+                        continue; // если ошибки заполнения объекта - переходим к след. объекту
+                    end; // if (CheckObject(CrdObject, ImportFile, ReportType))
+                end; // for (var CrdObject, FilialObj.Objects)
+            else
+                continue; // ошибки филиала - переходим к следующему филиалу
+            end; // if (CheckFilialObject(FilialObj, ImportFile, ReportType))
+        end; // for (var FilialObj, obj.Data)
+    end; // for (var ImportFile, ImportFileList)
+END; // macro
+
+
+
+//ЗагрузкаПараметровОбесценения("D:\\RsBank60_3151(16)\\Source\\XML", "_привет.xml", {curdate}, NULL, 1, 0, 0);

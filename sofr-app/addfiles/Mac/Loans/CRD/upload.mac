@@ -1,0 +1,1376 @@
+/*
+$Name: upload.mac
+$Module: Кредитование
+$Description: Выгрузка документов в RS-Bank
+*/
+
+/*
+ ╔════════════════════════════════════════════════════════════════════════╗
+ ║                                                                        ║
+ ║   Programmer  : TFS                                                    ║
+ ║   12.05.04    : Создан                                                 ║
+ ║                                                                        ║
+ ╚════════════════════════════════════════════════════════════════════════╝
+*/
+
+IMPORT TOTAL, SbCrdInter, PaymInter, BankInter, rcw;
+/* Текущий буффер документа */
+private record docacc_ ("doc_acc.dbt",  "loans.def");
+VAR docaccRH   = TRecHandler("doc_acc.dbt",  "loans.def");
+private const UNLOAD_OK        = 0; // успешная выгрузка
+
+private const DEPARTMENT_TYPE_VSP = 2; //тип ТС - впс
+
+VAR acctrn = TRecHandler("acctrn.dbt", "bank.def");
+
+VAR PSPAYORD = TRecHandler("pspayord.dbt", "bank.def");
+VAR PSPAYDEM = TRecHandler("pspaydem.dbt", "bank.def");
+VAR PMPAYM   = TRecHandler("pmpaym.dbt",   "bank.def");
+VAR PMRMPROP = TRecHandler("pmrmprop.dbt", "bank.def");
+VAR KD       = TRecHandler("credit_c.dbt", "bank.def");
+
+VAR MemOrder : BOMemorialOrderParm;
+VAR MultyDoc : BOMultyDocParm;
+VAR BankPaym : BOBankPaymentParm;
+VAR CurrPay  : BOCurrencyPaymentParm;
+VAR CashOrder: BOCashOrderParm;
+VAR PayOrder : BOPsPayOrderParm;
+VAR BankOrder: BOBankOrderParm;
+VAR TransferOrder: BOTransferOrderParm;
+
+
+
+VAR BFininstr = TBFile ("fininstr.dbt", "R", 12, "fininstr.dbt", "bank.def");
+private VAR type_op  = TBFile ("type_op.dbt", "R", 0, "type_op.dbt", "loans.def");
+private VAR crd_op   = TBFile ("crd_op.dbt",  "R", 0, "crd_op.dbt",  "loans.def");
+private VAR duty_crd = TBFile ("duty_crd.dbt","R", 0, "duty_crd.dbt","loans.def");
+private VAR step_op  = TBFile ("step_op.dbt", "R", 0, "step_op.dbt","loans.def");
+private VAR partcode = TBFile ("partcode.dbt", "r", 1);
+
+RECORD credit_c ("credit_c.dbt", "loans.def");
+
+private CONST  CB_MULTYDOC         = 15, /* Мультивалютный документ   */
+       DLDOC_BANKPAYMENT   = 16, /* Платеж банка              */
+       DLDOC_MEMORIALORDER = 70, /* Новые мемориальные ордера */
+       STAT_CASH_ORDER_POST= 1;
+
+private const ПРОВОДКА_РУБЛИ = 1;
+private const ПРОВОДКА_ВАЛЮТА = 7;
+
+VAR {gEndExternDoc};
+PRIVATE VAR {ФИЛИАЛ};
+VAR CurCode;
+VAR FIID;
+VAR BOAction;
+VAR BOCode;
+VAR ID_Operation; // ID операции
+
+// !!! EXPORT !!!
+VAR Oper           = 0;
+VAR Kind_Operation = 0;
+VAR Planned_Doc    = 0;
+
+// Исправительная проводка
+PRIVATE MACRO IsStorno(CredOperID: integer)
+   VAR OperationType: string;
+
+   OperationType = LnSelectValue("SELECT T_OPERATIONTYPE FROM DCRD_OP_DBT WHERE T_CREDOPERID = " + CredOperID, V_STRING);
+
+   IF (OperationType == "И")
+      RETURN TRUE;
+   END;
+
+   RETURN FALSE;
+END;
+
+// Функция проверяет, попадает ли документ под валютный контроль
+PRIVATE MACRO ВалютныйКонтроль(SystemOp)
+
+   // Под валютный контроль подпадают только рублевые выдачи (CS_PAY) и погашения (CS_DUTY) нерезидентов
+   IF (NOT Loans_FindCrdContract(docaccRH.rec.CreditNumber_Ref, credit_c))
+       RETURN FALSE;
+   END;
+
+   IF (DepClnt.GetRecord(credit_c.ClientID_Ref)
+         and (trim(Depclnt.NotResident) != "")
+         and (docaccRH.rec.CurCode == 0)
+         and ((SystemOp == CS_PAY) OR (SystemOp == CS_DUTY))
+      )
+      RETURN TRUE;
+   END;
+
+   RETURN FALSE;
+END;
+
+
+// Функция возвращает номер шага в операции по его ID
+PRIVATE MACRO GetStepNumber (StepID)
+
+   step_op.Clear;
+   step_op.rec.StepID = StepID;
+   if (step_op.GetEQ)
+      RETURN step_op.rec.StepNumber;
+   END;
+
+   RETURN 0;
+END;
+
+//Функция добавялет в основание код валютной операции
+MACRO ПолучитьКодВидаВО()
+
+   VAR SystemOp = 0;
+   VAR ТипОперации = 0;
+   VAR DutyID   = 0;
+   VAR ErrCode;
+   VAR СрокОбязательства_год = 0, // Срок обязательства - количество полных лет
+       d1 = 0, d2 = 0, m1 = 0, m2 = 0, y1 = 0, y2 = 0;
+   VAR КодВидаВО = ""; // Код вида валютной операции
+   record ШагОперации("step_op") btr;
+   VAR УчитыватьВО = TRUE;
+   VAR КУ = 0;
+   Loans_FindCrdContract(docacc_.CreditNumber_Ref, credit_c);
+   var iParty = RsbParty(credit_c.Clientid_ref);
+
+   crd_op.Clear;
+   crd_op.rec.CredOperID = docaccRH.rec.CredOperID_Ref;
+   if (crd_op.GetEQ)
+      SystemOp = crd_op.rec.SystemOperationID;
+      ТипОперации = crd_op.rec.OperTypenumber_ref;
+      if (crd_op.rec.ObjectTypeID_Ref == LO_DUTY)
+         DutyID = crd_op.rec.ObjectID_Ref;
+      END;
+   END;
+
+
+   IF (GetRegistryValue ("COMMON\\ВЕДЕНИЕ БД ВО В ПРИКЛАДНЫХ БО", V_BOOL, УчитыватьВО, ErrCode) != V_BOOL)
+       УчитыватьВО = false;
+   END;
+
+   IF (УчитыватьВО == TRUE)
+      var TypeOpID = 0;      
+      TypeOpID = LnSelectValue("select t_typeoperid from dtype_op_dbt where t_typeopernumber = " + ТипОперации, V_INTEGER);
+
+      IF(Loans_FindTypeOpStep (TypeOpID, GetStepNumber (docaccRH.rec.StepID), 0, ШагОперации)) 
+         IF(SystemOp == CS_PAY) 
+            КУ = ШагОперации.Category_C;
+         ELSE IF (SystemOp == CS_DUTY)
+            КУ = ШагОперации.Category_D;
+            end;
+         END;
+         IF((КУ == 70) OR (КУ == 72) OR (КУ == 84) OR (КУ == 73) OR (КУ == 117))
+            if(iParty.isNotResident)
+               КодВидаВО = "{VO80010}";
+            else
+               if(
+                  ((iParty.LegalForm == 1) and  (iParty.isOwned(2)==false)) OR  
+                  ((iParty.LegalForm == 2) and ((iParty.IsEmployer) OR     
+                   (iParty.Category.IsAttrPresense(16, 2, null, null, false, {curdate})) OR 
+                   (iParty.Category.IsAttrPresense(16, 3, null, null, false, {curdate}))
+                   ))
+                  )
+                  КодВидаВО = "{VO80110}";
+               end;
+            end;
+         end;
+      end;
+   END;
+
+   RETURN КодВидаВО;
+END;
+
+private macro CheckGround (Ground)
+   var Len     : integer = strlen(Ground);
+   var i       : integer = 0;
+   var CurSymb : string  = "";
+
+   if (Len == 0)
+      return true; // 110436
+   end;
+
+   while (i < Len)
+      i = i + 1;
+      
+      // замена символов
+      CurSymb = Substr(Ground, i, 1);
+             
+      // проверка на наличие запрещенных символов
+      if ((CurSymb < " ") OR ((CurSymb > "~") AND (CurSymb < "А")) OR ((CurSymb > "п") AND (CurSymb < "р")) OR ((CurSymb > "ё") AND (CurSymb != "№")))
+         Loans_FindCrdContract(docacc_.CreditNumber_Ref, credit_c);
+         MsgBox("Запрещенные символы в основании документа! КД № " + credit_c.UsCreditNumber);
+         return false;
+      end;
+   end;
+   
+   return ПолучитьКодВидаВО(docaccRH.rec) + Ground;
+END;
+
+// конвертация суммы с учетом кросс-курсов
+private macro SmartConvertSum (sumTo, sumFrom, sinceDate, fiidFrom, fiidTo)
+   var NewSum : money = $0;
+   var SumConv : money = $0;
+
+   if (fiidFrom == fiidTo) 
+      NewSum = sumFrom;
+
+   elif (ConvSum (NewSum, sumFrom, sinceDate, fiidFrom, fiidTo) != 0)
+
+     if (ConvSumCross (NewSum, sumFrom, sinceDate, fiidFrom, fiidTo) != true)
+        return false;
+     end;
+   end;
+
+   SetParm (0, NewSum);
+
+   return true;
+end;
+
+// Функция заполняет буфер документа для выгрузки в  ГК
+// .. простые проводки arhdoc.dbt
+// .. мультивалютные проводки multycar.dbt #138094, 137855
+macro ВыгрузитьВГлавнуюКнигу ()
+   VAR pmpaym = TRecHandler ("pmpaym.dbt", "bank.def");
+   VAR Ground : string = "", Op1 = 0, Op2 = 0;
+   VAR ErrCode = 0;
+   // Если документ уже выгружался
+   IF (docaccRH.rec.AccTrnID > 0)
+      RETURN FALSE;
+   END;
+
+   // Эти операции выгружаем всегда
+   IF (OV_GetOverdraftProcMode() == 1)
+      IF ((GetRegistryValue ("RS-LOANS\\ОВЕРДРАФТ_ЮР_ЛИЦ\\ОПЕРАЦИЯ_ПОГАШЕНИЯ", V_INTEGER, Op1, ErrCode) != V_INTEGER) OR (Op1 == 0))
+         Op1 = CF_OVC_PAY;
+      END;
+
+      IF ((GetRegistryValue ("RS-LOANS\\ОВЕРДРАФТ_ЮР_ЛИЦ\\ОПЕРАЦИЯ_ВЫДАЧИ",    V_INTEGER, Op2, ErrCode) != V_INTEGER) OR (Op2 == 0))
+         Op2 = CF_OVC_DUTY;
+      END;
+   END;
+
+   // Если "внешний" платеж, проверим получателя 'Ц' - 150
+   // Если платеж "внутренний" проводки в ГК не выгружаются
+   if ((      (docacc_.OperTypeNumber_Ref != Op1) // Возникновение овердрафта юридических лиц
+          and (docacc_.OperTypeNumber_Ref != Op2) // Погашение овердрафта юридических лиц
+       )
+       and
+       (      (docaccRH.rec.InDocID == 0)
+          or  (FindPayment(docaccRH.rec.InDocID, 0,0,0,0, true, pmpaym) != 0)
+       )
+      )
+      return false;
+   end;
+
+   Ground = CheckGround (docaccRH.rec.Ground);
+   if (Ground == FALSE)
+      return false;
+   end;
+
+   if (IsStorno(docaccRH.rec.CredOperID_Ref) == TRUE)
+
+      Ground =
+         "Сторно проводка N" + docaccRH.rec.NumExternDoc + " от "
+         + docaccRH.rec.CarryDate + " на сумму " + docaccRH.rec.CarrySum + " "
+         + LnSelectValue ("SELECT t_ccy FROM DFININSTR_DBT WHERE t_fiid = " + docaccRH.rec.CurCode, V_STRING)
+         + " \n " + Ground;
+   end;
+
+   FindPayment(docaccRH.rec.InDocID, 0,0,0,0, true, pmpaym);
+   pmpaym.rec.checkterror = docaccRH.rec.checkterror;
+
+   acctrn.rec.FIID_Payer    = docaccRH.rec.OutDebCur;
+   acctrn.rec.Account_Payer = docaccRH.rec.OutDebAccount;
+   IF (NOT SmartConvertSum (acctrn.rec.Sum_Payer, docaccRH.rec.CarrySum, docaccRH.rec.RegDate, docaccRH.rec.CurCode, docaccRH.rec.OutDebCur))
+      return FALSE;
+   END;
+
+   // кредит
+   acctrn.rec.FIID_Receiver = docaccRH.rec.OutCredCur;
+   acctrn.rec.Account_Receiver = docaccRH.rec.OutCredAccount;
+   IF (NOT SmartConvertSum (acctrn.rec.Sum_Receiver, docaccRH.rec.CarrySumCredit, docaccRH.rec.RegDate, docaccRH.rec.CurCodeCredit, docaccRH.rec.OutCredCur))
+      RETURN FALSE;
+   END;
+
+   acctrn.rec.Ground = Ground;
+   acctrn.rec.UserTypeDocument = docaccRH.rec.ODBUserType;
+
+   acctrn.rec.TypeDocument     = docaccRH.rec.TypeDocument;
+   acctrn.rec.Numb_Document    = docaccRH.rec.NumExternDoc;
+   acctrn.rec.Number_Pack      = docaccRH.rec.Number_Pack;
+   acctrn.rec.Date_Carry       = docaccRH.rec.CarryDate;
+   acctrn.rec.Date_Rate        = docaccRH.rec.RegDate;
+   acctrn.rec.Oper             = {OPER};
+   // общее
+   IF (ValType({ФИЛИАЛ}) == V_UNDEF)
+      acctrn.rec.Department = 0;
+   ELSE
+      acctrn.rec.Department = docaccRH.rec.Department; // #109787 {ФИЛИАЛ};
+   END;
+
+   IF (docaccRH.rec.Chapter == "А")
+      acctrn.rec.Chapter = 1;
+   ELSE
+      acctrn.rec.Chapter = 3;
+   END;
+
+   RETURN TRUE;
+end; // ВыгрузитьВГлавнуюКнигу
+
+
+/*********************************************************************************************
+*                  Вставка примечаний и категорий в выгружаемые документы                    *
+**********************************************************************************************
+   var notetext:TRecHandler = TRecHandler("notetext.dbt", "bank.def");
+   var notes = TArray;
+   var CategType:TRecHandler = TRecHandler("objattr.dbt", "bank.def");
+   var categories = TArray;
+   var Value;
+
+   //Вставка примечания.В буфере NoteKind и ObjectType заполнить обязательно
+   notetext.rec.NoteKind = 1;
+   notetext.rec.ObjectType = OBJTYPE_MEMORIALORDER; //константы разные для разных документов
+   Value = "Текст примечания";
+   fillNoteValue(notetext, Value); //Тип Value должен соответствовать типу примечния!
+   notes(notes.Size()) = notetext;
+   MemOrder.SetNotes(notes);
+
+   //Вставка примечания платежа.
+   notetext.rec.NoteKind = 25;
+   notetext.rec.ObjectType = OBJTYPE_PAYMENT; //константа для платежа
+   Value = {curdate};
+   fillNoteValue(notetext, Value);
+   notes(notes.Size()) = notetext;
+   MemOrder.SetPaymNotes(notes);       
+
+   //Вставка категории платежа. В буфере GroupID, ObjectType, AttrID заполнить обязательно
+   CategType.rec.GroupID = 1;
+   CategType.rec.ObjectType = OBJTYPE_PAYMENT;
+   CategType.rec.AttrID = 1;
+   categories(categories.Size()) = CategType;
+   MemOrder.SetPaymCategories(categories);
+
+************************************************************************************************/
+
+/* Вставляем отложенный мемориальный ордер */
+MACRO ВыгрузитьМемориальныйОрдер()
+  VAR SystemOp = 0;
+  VAR Ground;
+  VAR Проводка: integer = 0;
+  file ListSymb("listsymb.dbt", "bank.def");
+
+   Ground = CheckGround(docaccRH.rec.Ground);
+   IF (Ground == FALSE)
+      RETURN FALSE;
+   END;
+
+   IF (docaccRH.rec.Chapter == "А")
+      MemOrder.Chapter = 1;
+   ELSE
+      MemOrder.Chapter = 3;
+   END;
+
+   MemOrder.BaseAmount       = docaccRH.rec.CarrySum;
+   MemOrder.BaseFIID         = docaccRH.rec.OutDebCur;
+   MemOrder.Kind_Operation   = docaccRH.rec.Kind_Oper;
+   MemOrder.NumberPack       = docaccRH.rec.Number_Pack;
+   MemOrder.Oper             = {OPER};
+   MemOrder.PayerAccount     = docaccRH.rec.OutDebAccount;
+   MemOrder.ReceiverAccount  = docaccRH.rec.OutCredAccount;
+   MemOrder.Number           = docaccRH.rec.NumExternDoc;
+   MemOrder.TypeDocument     = docaccRH.rec.TypeDocument;
+   MemOrder.UserTypeDocument = docaccRH.rec.ODBUserType;
+   MemOrder.Ground           = Ground;
+   MemOrder.NotForBackOffice = "X";
+
+   MemOrder.PayerBankCodeKind    = docaccRH.rec.OutDebBankCodeKind;   /* Вид кода банка  */
+   MemOrder.PayerBankCode        = docaccRH.rec.OutDebBankCode;       /* Код банка       */
+   MemOrder.ReceiverBankCodeKind = docaccRH.rec.OutCredBankCodeKind;  /* Вид кода банка  */
+   MemOrder.ReceiverBankCode     = docaccRH.rec.OutCredBankCode;      /* Код банка       */
+   MemOrder.CheckTerror   = docaccRH.rec.checkterror;
+
+
+
+   MemOrder.ValueDate = docaccRH.rec.CarryDate;   //заполняем дату валютирования датой проводки документа Loans
+   MemOrder.Date = docaccRH.rec.RegDate;        //заполняем клиентскую дату датой проводки документа Loans
+  
+   MemOrder.ShifrOper        = docaccRH.rec.Shifr_Oper;
+
+   IF (MemOrder.Result_Carry == 0)
+       MemOrder.Result_Carry = 1; /* Ввод и проводка документа INPCARRY; */
+   END;
+
+   IF (MemOrder.ValueDate == date(0,0,0))
+       MemOrder.ValueDate = {curdate};
+   END;
+
+   IF (docaccRH.rec.CurCode)
+      Проводка = ПРОВОДКА_ВАЛЮТА;
+   ELSE
+      Проводка = ПРОВОДКА_РУБЛИ;
+   END;
+
+   ListSymb.DocKind = Проводка;
+   ListSymb.Symb_Cash = docaccRH.rec.Symb;
+   IF (getEQ(ListSymb))
+      IF (ListSymb.Type_Symbol == 1)//дебетовый
+         MemOrder.CashSymbolDebet = docaccRH.rec.Symb;
+      END;
+
+      IF (ListSymb.Type_Symbol == 2)//кредитовый
+         MemOrder.CashSymbolCredit = docaccRH.rec.Symb;
+      END;
+   END;
+
+   IF (IsStorno(docaccRH.rec.CredOperID_Ref) == TRUE)
+      MemOrder.Ground = "Сторно документа N" + MemOrder.Number + " от "+
+                            MemOrder.ValueDate + " на сумму " + MemOrder.BaseAmount + " " +
+              LnSelectValue("SELECT T_CCY FROM DFININSTR_DBT WHERE T_FIID = " + MemOrder.BaseFIID, V_STRING) +
+                            "  \n " + MemOrder.Ground;
+   END;
+
+   RETURN TRUE;
+END;
+
+//  Функция заполняет буфер мультивалютного домента для создания отложенного
+//  multydoc.dbt
+macro ВыгрузитьМультивалютныйДокумент ()
+   VAR Ground;
+   VAR Проводка: integer = 0;
+   file ListSymb("listsymb.dbt", "bank.def");
+
+   // Глава счетов
+   if (docaccRH.rec.Chapter == "А")
+      MultyDoc.Chapter = 1;
+   elif (docaccRH.rec.Chapter == "В")
+      MultyDoc.Chapter = 3;
+   else
+      return false;
+   end;
+
+   MultyDoc.Oper             = {OPER};
+   MultyDoc.Kind_Operation   = docaccRH.rec.Kind_Oper;   // Kind_Operation
+   MultyDoc.NotForBackOffice = "X";
+   MultyDoc.ValueDate        = docaccRH.rec.CarryDate;   // Дата валютирования
+   MultyDoc.NumberPack       = docaccRH.rec.Number_Pack; // Номер пачки
+   MultyDoc.ShifrOper        = docaccRH.rec.Shifr_Oper;
+   MultyDoc.TypeDocument     = docaccRH.rec.TypeDocument;
+
+   // Плательщик
+   MultyDoc.PayerAccount      = docaccRH.rec.OutDebAccount;      // Счет в исходящей валюте
+   MultyDoc.PayerBankCodeKind = docaccRH.rec.OutDebBankCodeKind; // Вид кода банка
+   MultyDoc.PayerBankCode     = docaccRH.rec.OutDebBankCode;     // Код банка
+   MultyDoc.PayerFIID         = docaccRH.rec.OutDebCur;          // Входящая валюта
+   if (not SmartConvertSum (MultyDoc.PayerAmount, docaccRH.rec.CarrySum, docaccRH.rec.RegDate, docaccRH.rec.CurCode, MultyDoc.PayerFIID))
+      return false;
+   end;
+
+   // Получатель
+   MultyDoc.ReceiverAccount      = docaccRH.rec.OutCredAccount;      // Счет во входящей валюте
+   MultyDoc.ReceiverBankCodeKind = docaccRH.rec.OutCredBankCodeKind; // Вид кода банка
+   MultyDoc.ReceiverBankCode     = docaccRH.rec.OutCredBankCode;     // Код банка
+   MultyDoc.ReceiverFIID = docaccRH.rec.OutCredCur;                  // Исходящая валюта
+   if (not SmartConvertSum (MultyDoc.ReceiverAmount, docaccRH.rec.CarrySumCredit, docaccRH.rec.RegDate, docaccRH.rec.CurCodeCredit, MultyDoc.ReceiverFIID))
+      return false;
+   end;
+
+   MultyDoc.RateScale = 1;
+   MultyDoc.RatePoint = 4;
+   MultyDoc.RateValue = ConvSumRate (MultyDoc.PayerAmount, MultyDoc.ReceiverAmount, MultyDoc.RateScale, MultyDoc.RatePoint, "");
+
+   Ground = CheckGround(docaccRH.rec.Ground);
+   if (Ground == "")
+      return false;
+   end;
+
+   MultyDoc.Date   = docaccRH.rec.RegDate;      // Дата документа
+   MultyDoc.Number = docaccRH.rec.NumExternDoc;   // Номер документа
+   MultyDoc.Ground = Ground;
+   MultyDoc.CheckTerror   = docaccRH.rec.checkterror;
+
+
+   if (docaccRH.rec.CurCode)
+      Проводка = ПРОВОДКА_ВАЛЮТА;
+   else
+      Проводка = ПРОВОДКА_РУБЛИ;
+   end;
+
+   ListSymb.DocKind = Проводка;
+   ListSymb.Symb_Cash = docaccRH.rec.Symb;
+
+   if (getEQ(ListSymb))
+      if (ListSymb.Type_Symbol == 1)//дебетовый
+          MultyDoc.CashSymbolDebet = docaccRH.rec.Symb;
+      end;
+
+      if (ListSymb.Type_Symbol == 2)//кредитовый
+          MultyDoc.CashSymbolCredit = docaccRH.rec.Symb;
+      end;
+   end;
+
+   return true;
+end;
+
+/*
+  г================================================┐
+  │ Функция вставляет отложенный платеж банка      │
+  │                                                │
+  L================================================-
+*/
+MACRO ВыгрузитьПлатежноеПоручение()
+VAR Ground;
+var flag = 0;
+   BankPaym.BaseAmount           = docaccRH.rec.CarrySum;        // Сумма комиссии
+//   PMPAYM.rec.PayAmount          = docaccRH.rec.CredCarrySum;    // Сумма перевода
+   BankPaym.PayerAccount         = docaccRH.rec.OutDebAccount;   // Счет плательщика
+   BankPaym.ReceiverAccount      = docaccRH.rec.OutCredAccount;  // Счет получателя
+   BankPaym.ValueDate            = docaccRH.rec.CarryDate;       // Дата валютирования
+   BankPaym.NumberPack           = docaccRH.rec.Number_Pack;     // Номер пачки
+   BankPaym.NotForBackOffice     = "X";
+
+   if (trim(docaccRH.rec.OutCredBankCode) != "")
+      partcode.Clear;
+      partcode.rec.CodeKind = docaccRH.rec.OutCredBankCodeKind;
+      partcode.rec.Code = docaccRH.rec.OutCredBankCode;
+      if (not partcode.GetEQ())
+         msgbox("По указанным параметрам банк получателя не найден!");
+         RETURN FALSE
+      END;
+      BankPaym.ReceiverBankID    = partcode.rec.partyid;
+   END;
+
+   BankPaym.PayerBankCodeKind    = docaccRH.rec.OutDebBankCodeKind;   /* Вид кода банка  */
+   BankPaym.PayerBankCode        = docaccRH.rec.OutDebBankCode;       /* Код банка       */
+   BankPaym.ReceiverBankCodeKind = docaccRH.rec.OutCredBankCodeKind;  /* Вид кода банка  */
+   BankPaym.ReceiverBankCode     = docaccRH.rec.OutCredBankCode;      /* Код банка       */
+   BankPaym.Number               = docaccRH.rec.NumExternDoc;      // Номер (заполняется клиентом)
+  // BankPaym.PayerBankName        = {Name_Bank};
+   BankPaym.PayerName            = docaccRH.rec.OutDebRecName;     // Наименование плательщика
+   BankPaym.PayerINN             = docaccRH.rec.OutDebINN;         // ИНН плательщика
+  // BankPaym.ReceiverBankName     = docaccRH.rec.OutCredBankName;   // Наименование банка получателя
+   BankPaym.ReceiverName         = docaccRH.rec.OutCredRecName;    // Наименование получателя
+   BankPaym.ReceiverINN          = docaccRH.rec.OutCredINN;        // ИНН получателя
+   BankPaym.CheckTerror       = docaccRH.rec.checkterror;
+   BankPaym.Kind_Operation       = docaccRH.rec.Kind_Oper;
+
+   flag = CRSDCommand ("SELECT T_ISINSTANCY FROM DIGCRDACC_DBT icr, DIGSETACC_DBT isa WHERE icr.T_CREDITNUMBER = ?" + 
+      " AND icr.T_SETACCID = isa.T_SETTACCID AND (isa.T_ACCOUNT = ? OR isa.T_ACCOUNT = ?)",
+          "crdnum", docaccRH.rec.CreditNumber_Ref,
+          "debacc", docaccRH.rec.OutDebAccount,
+          "credacc", docaccRH.rec.OutCredAccount,
+          V_INTEGER);
+          
+   if (flag == 88)
+      BankPaym.PaymentKind = "С";
+   end;
+
+   Ground = CheckGround(docaccRH.rec.Ground);
+   IF (Ground == FALSE)
+    RETURN FALSE;
+   END;
+   BankPaym.Ground               = Ground;            // Основание платежа
+   BankPaym.ShifrOper            = docaccRH.rec.Shifr_Oper;
+   BankPaym.Date                 = docaccRH.rec.RegDate;      // Клиентская дата
+
+   RETURN TRUE;
+END;
+
+MACRO ВыгрузитьПлатежноеТребование()
+VAR Ground;
+   PayOrder.BaseAmount           = docaccRH.rec.CarrySum;        // Сумма комиссии
+   PayOrder.PayerAccount         = docaccRH.rec.OutDebAccount;   // Счет плательщика
+   PayOrder.ReceiverAccount      = docaccRH.rec.OutCredAccount;  // Счет получателя
+   PayOrder.ValueDate            = docaccRH.rec.CarryDate;       // Дата валютирования
+   PayOrder.NumberPack           = docaccRH.rec.Number_Pack;     // Номер пачки
+//   PayOrder.NotForBackOffice     = "X";
+
+   if (trim(docaccRH.rec.OutCredBankCode) != "")
+      partcode.Clear;
+      partcode.rec.CodeKind = docaccRH.rec.OutCredBankCodeKind;
+      partcode.rec.Code = docaccRH.rec.OutCredBankCode;
+      if (not partcode.GetEQ())
+         msgbox("По указанным параметрам банк получателя не найден!");
+         RETURN FALSE
+      END;
+      PayOrder.ReceiverBankID    = partcode.rec.partyid;
+   END;
+
+   PayOrder.PayerBankCodeKind    = docaccRH.rec.OutDebBankCodeKind;   /* Вид кода банка  */
+   PayOrder.PayerBankCode        = docaccRH.rec.OutDebBankCode;       /* Код банка       */
+   PayOrder.ReceiverBankCodeKind = docaccRH.rec.OutCredBankCodeKind;  /* Вид кода банка  */
+   PayOrder.ReceiverBankCode     = docaccRH.rec.OutCredBankCode;      /* Код банка       */
+   PayOrder.Number               = docaccRH.rec.NumExternDoc;      // Номер (заполняется клиентом)
+   PayOrder.PayerBankName        = {Name_Bank};
+   PayOrder.PayerName            = docaccRH.rec.OutDebRecName;     // Наименование плательщика
+   PayOrder.PayerINN             = docaccRH.rec.OutDebINN;         // ИНН плательщика
+   PayOrder.ReceiverBankName     = docaccRH.rec.OutCredBankName;   // Наименование банка получателя
+   PayOrder.ReceiverName         = docaccRH.rec.OutCredRecName;    // Наименование получателя
+   PayOrder.ReceiverINN          = docaccRH.rec.OutCredINN;        // ИНН получателя
+   PayOrder.Kind_Operation       = docaccRH.rec.Kind_Oper;
+   PayOrder.CheckTerror          = docaccRH.rec.checkterror;
+
+   Ground = CheckGround(docaccRH.rec.Ground);
+   IF (Ground == FALSE)
+    RETURN FALSE;
+   END;
+   PayOrder.Ground               = Ground;            // Основание платежа
+   PayOrder.ShifrOper            = docaccRH.rec.Shifr_Oper;
+   PayOrder.Date                 = docaccRH.rec.RegDate;      // Клиентская дата
+   
+   RETURN TRUE;
+END;
+
+
+/*
+  ╔═════════════════════════════════════════════════════════╗
+  ║ Функция вставляет отложенный валютный платеж банка      ║
+  ║                                                         ║
+  ╚═════════════════════════════════════════════════════════╝
+*/
+MACRO ВыгрузитьВалютныйПлатежБанка()
+VAR Ground;
+   CurrPay.BaseFIID          = docaccRH.rec.OutDebCur;    // int(FindExtCode(docaccRH.rec.OutCredCur)); ?
+   CurrPay.BaseAmount        = docaccRH.rec.CarrySum;     // Сумма комиссии
+   CurrPay.ValueDate         = docaccRH.rec.CarryDate;    // Дата валютирования
+   CurrPay.NumberPack        = docaccRH.rec.Number_Pack;  // Номер пачки
+   CurrPay.NotForBackOffice  = "X";
+   CurrPay.Number            = docaccRH.rec.NumExternDoc; // Номер (заполняется клиентом)
+
+   CurrPay.ReceiverAccount          = docaccRH.rec.OutCredAccount;      // Счет получателя
+   CurrPay.ReceiverBankCodeKind     = docaccRH.rec.OutCredBankCodeKind; // Вид кода банка
+   CurrPay.ReceiverBankCode         = docaccRH.rec.OutCredBankCode;     // Код банка
+   CurrPay.ReceiverCorrBankID       = docaccRH.rec.BankCorrID;
+   CurrPay.ReceiverCorrBankCodeKind = docaccRH.rec.BankCorrCodeKind;
+   CurrPay.ReceiverCorrBankCode     = docaccRH.rec.BankCorrCode;
+   CurrPay.ReceiverBankName         = docaccRH.rec.OutCredBankName;    // Наименование банка получателя
+   CurrPay.ReceiverName             = docaccRH.rec.OutCredRecName;     // Наименование получателя
+   CurrPay.ReceiverINN              = docaccRH.rec.OutCredINN;         // ИНН получателя
+   CurrPay.ReceiverCorrBankName     = docaccRH.rec.BankCorrName;
+
+   CurrPay.PayerFIID                = docaccRH.rec.OutCredCur;
+   CurrPay.PayerAmount              = docaccRH.rec.CredCarrySum;        // Сумма перевода
+   CurrPay.PayerAccount             = docaccRH.rec.OutDebAccount;       // Счет плательщика
+   CurrPay.PayerBankName            = docaccRH.rec.OutDebBankName;      // {Name_Bank} Наименование банка плательщика
+   CurrPay.PayerName                = docaccRH.rec.OutDebRecName;       // Наименование плательщика
+   CurrPay.PayerINN                 = docaccRH.rec.OutDebINN;           // ИНН плательщика
+   CurrPay.PayerBankCodeKind        = docaccRH.rec.OutDebBankCodeKind;  // Вид кода банка
+   CurrPay.PayerBankCode            = docaccRH.rec.OutDebBankCode;      // Код банка
+   CurrPay.CheckTerror    = docaccRH.rec.checkterror;
+
+   Ground = CheckGround(docaccRH.rec.Ground);
+   IF (Ground == FALSE)
+    RETURN FALSE;
+   END;
+   CurrPay.Ground           = Ground;            // Основание платежа
+   CurrPay.ShifrOper        = docaccRH.rec.Shifr_Oper;
+   CurrPay.Date             = docaccRH.rec.RegDate;      // Клиентская дата
+
+   RETURN TRUE;
+END;
+
+// Вставить отложенный кассовый ордер
+// 0 - расходный ордер; 1 - приходный ордер
+private macro ВыгрузитьКассовыйОрдер (Incorder);
+   var Ground;
+
+   if (docaccRH.rec.IsSvod != 2)
+      if (not Loans_FindCrdContract (docaccRH.rec.CreditNumber_Ref, credit_c))
+         return false;
+      end;
+      CashOrder.FIOClient       = ""; 
+      CashOrder.PaperKind       = 0;
+      CashOrder.PaperSeries     = "";
+      CashOrder.PaperNumber     = "";
+      CashOrder.PaperIssuedDate = date(0,0,0);
+      CashOrder.PaperIssuer     = ""; 
+      if (DepClnt.GetRecord(credit_c.ClientID_Ref))
+          CashOrder.FIOClient       = DepClnt.ConvertFIOFull(); // ФИО клиента
+          CashOrder.PaperKind       = DepClnt.PaperKind;
+          CashOrder.PaperSeries     = DepClnt.PaperSeries;
+          CashOrder.PaperNumber     = DepClnt.PaperNumber;
+          CashOrder.PaperIssuedDate = DepClnt.PaperIssuedDate;
+          CashOrder.PaperIssuer     = DepClnt.PaperIssuer;
+      end;
+   end;
+
+   CashOrder.Kind_Operation = docaccRH.rec.Kind_Oper;
+   Ground = CheckGround (docaccRH.rec.Ground);
+   if (Ground == false)
+      return false;
+   end;
+
+   CashOrder.Oper                 = {OPER};
+   CashOrder.Number               = docaccRH.rec.NumExternDoc;    // номер документа
+   CashOrder.Date                 = docaccRH.rec.RegDate;       // Дата документа
+   CashOrder.Ground               = Ground;
+   CashOrder.BaseFIID             = docaccRH.rec.CurCode;         // Фин. инструмент
+   CashOrder.BaseAmount           = docaccRH.rec.CarrySum;        // Сумма комиссии
+   CashOrder.ValueDate            = docaccRH.rec.CarryDate;       // Дата валютирования
+   CashOrder.NumberPack           = docaccRH.rec.Number_Pack;     // Номер пачки
+
+   CashOrder.PayerAccount         = docaccRH.rec.OutDebAccount;   // Счет плательщика
+   CashOrder.PayerFIID            = docaccRH.rec.OUTDEBCUR;           // Счет плательщика
+   CashOrder.PayerAmount          = docaccRH.rec.DEBCARRYSUM;         // Счет плательщика
+   CashOrder.PayerBankCodeKind    = docaccRH.rec.OutDebBankCodeKind;  // Вид кода банка
+   CashOrder.PayerBankCode        = docaccRH.rec.OutDebBankCode;      // Код банка
+
+   CashOrder.ReceiverAccount      = docaccRH.rec.OutCredAccount;      // Счет получателя
+   CashOrder.ReceiverFIID         = docaccRH.rec.OUTCREDCUR;          // Счет плательщика
+   CashOrder.ReceiverAmount       = docaccRH.rec.CREDCARRYSUM;        // Счет плательщика
+   CashOrder.ReceiverBankCodeKind = docaccRH.rec.OutCredBankCodeKind; // Вид кода банка
+   CashOrder.ReceiverBankCode     = docaccRH.rec.OutCredBankCode;     // Код банк
+
+   CashOrder.NotForBackOffice     = "X";
+   CashOrder.CheckTerror      = docaccRH.rec.checkterror;
+
+   if (Incorder)
+      CashOrder.ReceiverINN = docaccRH.rec.OutCredINN; // Код получателя
+   else
+      CashOrder.PayerINN = docaccRH.rec.OutDebINN;  // Код плательщика
+   end;
+
+   return true;
+end; // ВыгрузитьКассовыйОрдер (Incorder);
+
+/* Вставляем отложенный банковский ордер */
+MACRO ВыгрузитьБанковскийОрдер()
+  VAR Ground;
+
+   Ground = CheckGround(docaccRH.rec.Ground);
+   IF (Ground == FALSE)
+      RETURN FALSE;
+   END;
+
+   BankOrder.BaseAmount       = docaccRH.rec.CarrySum;
+   BankOrder.BaseFIID         = docaccRH.rec.CurCode;
+   BankOrder.Kind_Operation   = docaccRH.rec.Kind_Oper;
+   BankOrder.NumberPack       = docaccRH.rec.Number_Pack;
+   BankOrder.Oper             = {OPER};
+   BankOrder.Number           = docaccRH.rec.NumExternDoc;                 
+   BankOrder.TypeDocument     = docaccRH.rec.TypeDocument;                  
+   BankOrder.UserTypeDocument = docaccRH.rec.ODBUserType;
+   BankOrder.Ground           = Ground;
+   BankOrder.NotForBackOffice = "X";
+
+   BankOrder.PayerAccount         = docaccRH.rec.OutDebAccount;
+   BankOrder.PayerFIID            = docaccRH.rec.OutDebCur;
+   BankOrder.PayerBankCodeKind    = docaccRH.rec.OutDebBankCodeKind;   /* Вид кода банка  */
+   BankOrder.PayerBankCode        = docaccRH.rec.OutDebBankCode;       /* Код банка       */
+   BankOrder.PayerBankName        = docaccRH.rec.OutDebBankName;      // {Name_Bank} Наименование банка плательщика
+   BankOrder.PayerName            = docaccRH.rec.OutDebRecName;       // Наименование плательщика
+   BankOrder.PayerINN             = docaccRH.rec.OutDebINN;           // ИНН плательщика
+
+   BankOrder.ReceiverAccount      = docaccRH.rec.OutCredAccount;
+   BankOrder.ReceiverFIID         = docaccRH.rec.OutCredCur;
+   BankOrder.ReceiverBankName     = docaccRH.rec.OutCredBankName;    // Наименование банка получателя
+   BankOrder.ReceiverName         = docaccRH.rec.OutCredRecName;     // Наименование получателя
+   BankOrder.ReceiverINN          = docaccRH.rec.OutCredINN;         // ИНН получателя
+   BankOrder.ReceiverBankCodeKind = docaccRH.rec.OutCredBankCodeKind;  /* Вид кода банка  */
+   BankOrder.ReceiverBankCode     = docaccRH.rec.OutCredBankCode;      /* Код банка       */
+
+   BankOrder.ValueDate = docaccRH.rec.CarryDate;   //заполняем дату валютирования датой проводки документа Loans
+   BankOrder.Date = docaccRH.rec.RegDate;        //заполняем клиентскую дату датой проводки документа Loans
+  
+   BankOrder.ShifrOper = docaccRH.rec.Shifr_Oper;
+   BankOrder.CheckTerror      = docaccRH.rec.checkterror; 
+
+   IF (BankOrder.ValueDate == date(0,0,0))
+       BankOrder.ValueDate = {curdate};
+   END;
+
+   RETURN TRUE;
+END;
+
+macro ВыгрузитьОрдерПоПередачеЦенностей()
+
+    var lobject = TRecHandler("lobject.dbt");
+    var typeopBuff = TRecHandler("type_op.dbt");
+    var COP = TRecHandler("crd_op.dbt");
+    var pmstVal = TRecHandler("pmstval.dbt");
+    var credit = TRecHandler("credit_c.dbt");
+    
+    TransferOrder.Number           = docaccRH.rec.NumExternDoc; //  NumDoc    //номер документа
+    TransferOrder.Date             = docaccRH.rec.RegDate;      //.DocDate    //дата выполнения проводки
+    TransferOrder.BaseFIID         = docaccRH.rec.CurCode;      //.CurCode    //код валюты операции
+    
+    var OwnerValues:string  = "";
+    var OwnerValuesTemp:string  = "";
+/*
+    if (findDepartment(docaccRH.rec.Department, null, ddep, partyParams)== true)
+        OwnerValues = partyParams.rec.Name;
+        if (OwnerValues == "")
+            OwnerValues = partyParams.rec.ShortName;
+        end;
+        if (ddep.rec.NodeType == DEPARTMENT_TYPE_VSP)
+            if (findDepartment(ddep.rec.FMParentCode, null, ddep, partyParams)== true)
+                OwnerValuesTemp = partyParams.rec.Name;
+                if (OwnerValuesTemp == "")
+                    OwnerValuesTemp = partyParams.rec.ShortName;
+                end;
+                OwnerValues = OwnerValuesTemp + " " + OwnerValues;
+            else
+                RETURN FALSE;
+            end;   
+        end;
+    else
+        RETURN FALSE;   
+    end;
+*/
+
+  OwnerValues = CRSDCommand ("SELECT dp.t_name||' '||DECODE (dp.t_NodeType,"+
+                                                             " 2, (SELECT ldp.t_Name FROM ddp_dep_dbt ldp WHERE ldp.t_code = dp.t_parentcode),"+
+			               			     " ' ') as t_Name "+
+			        "FROM ddp_dep_dbt dp  WHERE dp.t_Code = ?",
+          "depart",docaccRH.rec.Department,
+          V_STRING);
+
+    TransferOrder.OwnerValues = OwnerValues;                          //OwnerName   Владелец ценностей
+      
+    TransferOrder.BaseAmount      = docaccRH.rec.DEBCARRYSUM;            //.DAm       // Сумма проводки по ДТ   
+    //TransferOrder.PayerFIID        = docaccRH.rec.OutDebCur;           //.DFI       // валюта счета ДТ 
+
+    TransferOrder.PayerBankCodeKind  = docaccRH.rec.OutDebBankCodeKind;   /* Вид кода банка  */
+    TransferOrder.PayerBankCode      = docaccRH.rec.OutDebBankCode;       /* Код банка       */
+    TransferOrder.PayerBankName      = docaccRH.rec.OutDebBankName;      // {Name_Bank} Наименование банка плательщика
+    TransferOrder.PayerAccount       = docaccRH.rec.OutDebAccount;       //.DebAcc    // Счет ДТ
+    TransferOrder.PayerName          = docaccRH.rec.OutDebRecName;       // Наименование плательщика
+    TransferOrder.PayerINN           = docaccRH.rec.OutDebINN;           // ИНН плательщика    
+ 
+    //TransferOrder.ReceiverAmount       = docaccRH.rec.CREDCARRYSUM;    //.CAm     //Сумма проводки по КД
+    //TransferOrder.ReceiverFIID         = docaccRH.rec.OUTCREDCUR;      //.CFI     //Валюта счета КД
+    TransferOrder.ReceiverBankCodeKind = docaccRH.rec.OutCredBankCodeKind;  /* Вид кода банка  */ 
+    TransferOrder.ReceiverBankCode     = docaccRH.rec.OutCredBankCode;      /* Код банка       */   
+    TransferOrder.ReceiverBankName     = docaccRH.rec.OutCredBankName;    // Наименование банка получателя
+    TransferOrder.ReceiverAccount      = docaccRH.rec.OutCredAccount;       //.CredAcc //Счет КД
+    TransferOrder.ReceiverName         = docaccRH.rec.OutCredRecName;     // Наименование получателя
+    TransferOrder.ReceiverINN          = docaccRH.rec.OutCredINN;         // ИНН получателя
+    
+    TransferOrder.ShifrOper        = docaccRH.rec.Shifr_Oper; //Shifr
+
+    TransferOrder.Oper = {OPER};    //операционист
+    
+    TransferOrder.ReceiverNameValues =  GetFioOper(TransferOrder.Oper);              //.FIO
+    
+    IF (NOT Loans_FindCrdContract(docaccRH.rec.CreditNumber_Ref, credit))
+       RETURN FALSE;
+    END;
+    Loans_FindObject(credit.rec.Crd_kind,lobject);    
+    Loans_FindCrdOp(docaccRH.rec.CredOperID_Ref,COP);
+    Loans_FindTypeOp(COP.rec.SystemOperationID, COP.rec.OperTypeNumber_Ref, typeopBuff);
+    pmstVal.rec.NameValue = lobject.rec.OBJECTNAME+" №"+credit.rec.UsCreditNumber; //TransferOrder.ValName  
+    pmstVal.rec.CountValue = docaccRH.rec.DEBCARRYSUM;  //TransferOrder.ValCount
+    pmstVal.rec.AmountValue = docaccRH.rec.DEBCARRYSUM; //TransferOrder.ValSum    
+    VAR temp : Tarray = TArray();
+    temp(temp.Size) = pmstVal;
+    TransferOrder.SetPmStVals(temp);
+    
+    TransferOrder.Ground = typeopBuff.rec.TYPEOPERNAME + ":"+ lobject.rec.OBJECTNAME+" №"+credit.rec.UsCreditNumber +"," + TransferOrder.ReceiverNameValues;//.Basis
+
+    IF (COP.rec.SYSTEMOPERATIONID == CS_NOREG)
+        var PartyId_Oper = LnSelectValue("select T_PARTYID from dperson_dbt where T_OPER = " + TransferOrder.Oper, V_INTEGER);
+        if (DepClnt.GetRecord(PartyId_Oper))
+              TransferOrder.PaperKind       = DepClnt.PaperKind;             //RegDoc
+              TransferOrder.PaperSeries     = DepClnt.PaperSeries;           //RegSer
+              TransferOrder.PaperNumber     = DepClnt.PaperNumber;           //RegNum
+              TransferOrder.PaperIssuedDate = DepClnt.PaperIssuedDate;       //RegDate
+              TransferOrder.PaperIssuer     = DepClnt.PaperIssuer;           //Organ
+        end;
+    END;
+    
+    
+    TransferOrder.Kind_Operation =  docaccRH.rec.Kind_Oper; //.OpCode
+    TransferOrder.NumberPack           = docaccRH.rec.Number_Pack; //.Pack
+    
+    TransferOrder.ValueDate            =  docaccRH.rec.CarryDate;    //.PayDate
+    IF (TransferOrder.ValueDate == date(0,0,0))
+        TransferOrder.ValueDate = {curdate};
+    END;    
+    
+    return true;
+END;
+
+
+macro IsOnLineExportDoc(StepID, CurCode)
+   VAR ШагОперации = TRecHandler("step_op.dbt", "loans.def");
+   VAR OnLineExportDoc:bool = FALSE;
+   VAR ErrCode;
+   VAR query:string = "";
+   VAR IsSvod:integer = 0;
+
+   IF (GetRegistryValue("RS-LOANS\\ВЫГРУЗКА\\ON-LINE_ВЫГРУЗКА_ДОКУМЕНТОВ",
+                        V_BOOL, OnLineExportDoc, ErrCode) != V_BOOL)
+       msgBox(ErrCode);
+       RETURN FALSE;
+   END;
+
+   IF (Loans_FindTypeOpStep(0, 0, StepID, ШагОперации))
+       IF (ШагОперации.rec.MakeSvod == "X") // На шаге требуется выгрузка
+           query = "select t_IsSvod from dstepparm_dbt where t_StepID_Ref = " + StepID;
+           IF (CurCode)
+               query = query + " and t_IsCur = 'X'";
+           ELSE
+               query = query + " and t_IsCur = chr(0)";
+           END;
+
+           IsSvod = LnSelectValue(query, V_INTEGER, 0);
+
+           IF (IsSvod != 88)   // Если выгружаем сводный документ
+               RETURN OnLineExportDoc; // RS-LOANS\ON-LINE_ВЫГРУЗКА_ДОКУМЕНТОВ
+           ELSE RETURN TRUE;
+         END;
+       END;
+   END;
+
+   RETURN FALSE;
+END;
+
+/* Выгружать/не выгружать */
+macro ToExportOrNotToExport()
+VAR ToBackOffice :string = "";
+VAR pmpaym = TRecHandler("pmpaym.dbt", "bank.def");
+
+/* Если "внешний" платеж, проверим получателя 'Ц' - 150 */
+    IF ((docaccRH.rec.InDocID) and
+       (FindPayment(docaccRH.rec.InDocID, 0,0,0,0, true, pmpaym) == 0) and
+       ((pmpaym.rec.ToBackOffice == "Ц") OR (pmpaym.rec.IsFactPaym == "X")))
+       ToBackOffice = "Ц";
+    END;
+
+    // Выгрузка документа в др. подсистему
+    if ((IsOnLineExportDoc(docaccRH.rec.StepID, docaccRH.rec.CurCode)) and /* Выгружать/не выгружать */
+        (((docaccRH.rec.InDocID) and (ToBackOffice == "Ц")) OR /* Платеж "внешний", выгружаем проводки в ГК       */
+         (docaccRH.rec.InDocID == 0)))                  /* Платеж сформирован RS-Loans, выгружаем в ББ/РКО */
+        RETURN TRUE;
+    END;
+
+    RETURN FALSE;
+END;
+
+// возвращает 666 только в случае, если был msgbox, это сигнал, что сообщение надо показать. Если вернуть 666, а msgbox'а не было, будет пустое сообщение!!!
+macro ExportDoc(DocAccBuf, OffLine)
+
+   VAR ErrCode = 0;
+   VAR Incorder:integer = 0, Op1 = 0, Op2 = 0;
+
+   SetBuff(docacc_, DocAccBuf);
+   Copy(docaccRH, docacc_);
+
+   IF (docaccRH.rec.NumExternDoc == "")
+      msgBox ("Не определен номер документа другой подсистемы!");
+      RETURN 666;
+   END;  
+
+   // Эти операции выгружаем всегда
+   IF (OV_GetOverdraftProcMode() == 1)
+      IF ((GetRegistryValue ("RS-LOANS\\ОВЕРДРАФТ_ЮР_ЛИЦ\\ОПЕРАЦИЯ_ПОГАШЕНИЯ", V_INTEGER, Op1, ErrCode) != V_INTEGER) OR (Op1 == 0))
+         Op1 = CF_OVC_PAY;
+      END;
+
+      IF ((GetRegistryValue ("RS-LOANS\\ОВЕРДРАФТ_ЮР_ЛИЦ\\ОПЕРАЦИЯ_ВЫДАЧИ",    V_INTEGER, Op2, ErrCode) != V_INTEGER) OR (Op2 == 0))
+         Op2 = CF_OVC_DUTY;
+      END;
+
+      IF ((Op1 == docacc_.OperTypeNumber_Ref) OR (Op2 == docacc_.OperTypeNumber_Ref))
+         ВыгрузитьВГлавнуюКнигу();
+         RETURN TRUE;
+      END;
+   END;
+
+   IF ((NOT OffLine) and (NOT ToExportOrNotToExport()))
+      RETURN FALSE;
+   END;
+
+   /* Выгрузка в Главную книгу */
+   IF (docaccRH.rec.InDocID)
+      IF (ВыгрузитьВГлавнуюКнигу())
+         RETURN TRUE;
+      ELSE
+         RETURN 6666;
+      END;
+   END;
+
+   IF (docaccRH.rec.AlgoID == IgAlgoID_MO)  /* Мемориальный ордер */
+   /* Выгружаем мемориальный ордер */
+      IF (ВыгрузитьМемориальныйОрдер())
+         RETURN TRUE;
+      ELSE
+         RETURN 6666;
+      END;
+   ELIF (docaccRH.rec.AlgoID ==IgAlgoID_MCD)
+      /* Выгружаем мультивалютный документ */
+      IF (ВыгрузитьМультивалютныйДокумент())
+         RETURN TRUE;
+      END;
+   ELIF (docaccRH.rec.AlgoID ==IgAlgoID_CURPAY)
+
+      /* Выгружаем валютный платеж банка */
+      IF (ВыгрузитьВалютныйПлатежБанка())
+         RETURN TRUE;
+      ELSE
+         RETURN 6666;
+      END;
+   ELIF (docaccRH.rec.AlgoID == IgAlgoID_PP) /* Платежное поручение */
+      IF (docaccRH.rec.OutDebCur OR docaccRH.rec.OutCredCur)
+         IF (ВыгрузитьВалютныйПлатежБанка())
+            RETURN TRUE;
+         ELSE
+            RETURN 6666;
+         END;
+      ELSE
+         IF (ВыгрузитьПлатежноеПоручение())
+            RETURN TRUE;
+         ELSE
+            RETURN 6666;
+         END;
+      END;
+   ELIF (docaccRH.rec.AlgoID == IgAlgoID_PT)  /* Платежное Требование */
+      IF (ВыгрузитьПлатежноеТребование())
+         RETURN TRUE;
+      ELSE
+         RETURN 6666;
+      END;
+   ELIF ((docaccRH.rec.AlgoID == IgAlgoID_KOP) OR // Кассовый ордер (приход)
+         (docaccRH.rec.AlgoID == IgAlgoID_COR))   // Кассовый ордер (расход)
+      IF (docaccRH.rec.AlgoID == IgAlgoID_KOP)
+         Incorder = 1;
+      END;
+
+      IF (ВыгрузитьКассовыйОрдер(Incorder))
+         RETURN TRUE;
+      ELSE
+         RETURN 6666;
+      END;
+   ELIF (docaccRH.rec.AlgoID == IgAlgoID_BO)  /* Банковский ордер */
+      IF (ВыгрузитьБанковскийОрдер())
+         RETURN TRUE;
+      ELSE
+         RETURN 6666;
+      END;
+   ELIF (docaccRH.rec.AlgoID == IgAlgoID_OPC)  /* Ордер по передаче ценностей */
+      IF (ВыгрузитьОрдерПоПередачеЦенностей())
+         RETURN TRUE;
+      ELSE
+         RETURN 6666;
+      END;      
+   ELSE
+      MsgBox("Не определен вид банковского документа другой подсистемы!");
+      RETURN 666;
+   END;
+   RETURN FALSE;
+END;
+
+/*
+ Запускается перед выгрузкой платежного требования в РКО
+ Буферы PMPAYM, PMRMPROP, PSPAYORD, PSPAYDEM установлены
+*/
+macro ВыгрузкаТребования()
+   // Если настройка реестра ВЫГРУЗКА_В_RS-BANK == NO, то выгрузку требований должна выполнить
+   // данная пользовательская функция. При этом необходимо заполнить PMPAYM.rec.PaymentID значением PaymentID вставленного требования
+   // Если ВЫГРУЗКА_В_RS-BANK == YES, то только до-/пере-инициализировать буферы перед вставкой
+
+
+   // Функция должна вернуть 0 в случае успешного завершения
+   return 0;
+end;
+macro GetCurrCodeForRetail(FIID:integer)
+   var CurrCode = 0;
+   var query = "select CR.T_CODE_CURRENCY from dcurrency_dbt cr, dfininstr_dbt fi "+
+               "where FI.T_FIID ="+FIID+
+               " and FI.T_FI_KIND = 1 "+
+               "and (CR.T_EXTERNALCODE = FI.T_CODEINACCOUNT or CR.T_EXTERNALCODE = FI.T_ISO_NUMBER)";
+   var CurSet = LnGetRecordSet(query); 
+   if (CurSet.MoveNext())
+        CurrCode = CurSet.Value("T_CODE_CURRENCY");
+   else
+       return FIID;
+   end;
+
+   return CurrCode;
+end;
+
+macro MemorialOrderUpload(DocTypeId)
+   var jvm    = createObject("rsjvm", "TJavaHost");
+   var doc =  jvm.CreateJavaObject("ru.softlab.rsretail.documents.MemorialOrder");
+   var javaObj : TArray = TArray();
+   var retailRes : TArray = TArray();
+
+   doc.setDate(docaccRH.rec.RegDate);
+   doc.setValueDate(docaccRH.rec.CarryDate);
+   if (docaccRH.rec.chapter == "А")
+     doc.setChapter(1);
+   else
+     doc.setChapter(2);
+   end;
+   doc.setId(docaccRH.rec.docaccid);
+   doc.setOper({OPER});
+   doc.setDebitAmount(docaccRH.rec.CarrySum);
+   doc.setCreditAmount(docaccRH.rec.CarrySumCredit);
+   doc.setDebitCurrCode(GetCurrCodeForRetail(docaccRH.rec.OutDebCur));
+   doc.setCreditCurrCode(GetCurrCodeForRetail(docaccRH.rec.OutCredCur));
+   doc.setDebitAccount(docaccRH.rec.debit);
+   doc.setCreditAccount(docaccRH.rec.credit);
+   doc.setGround(docaccRH.rec.ground);
+   doc.setDebitCashSymbol(docaccRH.rec.Symb);
+   doc.setPackNumber(docaccRH.rec.Number_Pack);
+   doc.setDocumentNumber(docaccRH.rec.NumExternDoc);
+   doc.setOper(docaccRH.rec.opernumb);
+   doc.setOperationCipher(docaccRH.rec.kind_oper_);
+   doc.setCurrOperationCode(docaccRH.rec.curcode);
+   doc.setDepartmentId(docaccRH.rec.department);
+   doc.setPayerName(docaccRH.rec.OutDebRecName);
+   doc.setReceiverName(docaccRH.rec.OutCredRecName);
+   doc.setNatCurrEquivalent(ConvSumRate (docaccRH.rec.CarrySum, docaccRH.rec.CarrySumCredit, 1, 4, ""));
+   doc.setDocumentTypeId(DocTypeId); 
+
+   javaObj[0]=doc;
+
+   InstLoadModule("BookInter");
+   var MacroFun = "ExportAccountingDocumentsExt";
+   retailRes =  ExecMacro2(MacroFun, javaObj, GetIdentProgram());
+   if (retailRes.size!=0)
+      if (retailRes[0].ResultCode==UNLOAD_OK)
+          MsgBox("Выгрузка успешно выполнена!");
+          return true;
+      else
+         MsgBox("Выгрузка не выполнена!");
+         return false; 
+      end; 
+   end;
+
+   MsgBox("Выгрузка не выполнена!");
+   return false;
+
+end;
+
+macro PaymentOrderUpload()
+var jvm    = createObject("rsjvm", "TJavaHost");
+var doc =  jvm.CreateJavaObject("ru.softlab.rsretail.documents.PaymentOrder");
+var javaObj : TArray = TArray();
+var retailRes : TArray = TArray();
+
+   doc.setDate(docaccRH.rec.RegDate);
+   doc.setValueDate(docaccRH.rec.CarryDate);
+
+   if (docaccRH.rec.chapter == "А")
+     doc.setChapter(1);
+   else
+     doc.setChapter(2);
+   end;
+   doc.setId(docaccRH.rec.docaccid);
+   doc.setOper({OPER});
+   doc.setDebitAmount(docaccRH.rec.CarrySum);
+   doc.setCreditAmount(docaccRH.rec.CarrySumCredit);
+   doc.setDebitCurrCode(GetCurrCodeForRetail(docaccRH.rec.OutDebCur));
+   doc.setCreditCurrCode(GetCurrCodeForRetail(docaccRH.rec.OutCredCur));
+   doc.setDebitAccount(docaccRH.rec.debit);
+   doc.setCreditAccount(docaccRH.rec.credit);
+   doc.setGround(docaccRH.rec.ground);
+   doc.setDebitCashSymbol(docaccRH.rec.Symb);
+   doc.setPackNumber(docaccRH.rec.Number_Pack);
+   doc.setDocumentNumber(docaccRH.rec.NumExternDoc);
+   doc.setOper(docaccRH.rec.opernumb);
+   doc.setOperationCipher(docaccRH.rec.kind_oper_);
+   doc.setCurrOperationCode(docaccRH.rec.curcode);
+   doc.setDepartmentId(docaccRH.rec.department);
+   doc.setPayerName(docaccRH.rec.OutDebRecName);
+   doc.setReceiverName(docaccRH.rec.OutCredRecName);
+
+   javaObj[0]=doc;
+
+   InstLoadModule("BookInter");
+   var MacroFun = "ExportAccountingDocumentsExt";
+   retailRes =  ExecMacro2(MacroFun, javaObj, GetIdentProgram());
+
+   if (retailRes.size!=0)
+      if (retailRes[0].ResultCode==UNLOAD_OK)
+          MsgBox("Выгрузка успешно выполнена!");
+          return true;
+      else
+         MsgBox("Выгрузка не выполнена!");
+         return false; 
+      end; 
+   end;
+ 
+   MsgBox("Выгрузка не выполнена!");
+   return false;
+
+end;
+
+macro PaymentRequestUpload()
+
+var jvm    = createObject("rsjvm", "TJavaHost");
+var doc =  jvm.CreateJavaObject("ru.softlab.rsretail.documents.PaymentRequest");
+var javaObj : TArray = TArray();
+var retailRes : TArray = TArray();
+
+   doc.setDate(docaccRH.rec.RegDate);
+   doc.setValueDate(docaccRH.rec.CarryDate);
+
+   if (docaccRH.rec.chapter == "А")
+     doc.setChapter(1);
+   else
+     doc.setChapter(2);
+   end;
+   doc.setId(docaccRH.rec.docaccid);
+   doc.setOper({OPER});
+   doc.setDebitAmount(docaccRH.rec.CarrySum);
+   doc.setCreditAmount(docaccRH.rec.CarrySumCredit);
+   doc.setDebitCurrCode(GetCurrCodeForRetail(docaccRH.rec.OutDebCur));
+   doc.setCreditCurrCode(GetCurrCodeForRetail(docaccRH.rec.OutCredCur));
+   doc.setDebitAccount(docaccRH.rec.debit);
+   doc.setCreditAccount(docaccRH.rec.credit);
+   doc.setGround(docaccRH.rec.ground);
+   doc.setDebitCashSymbol(docaccRH.rec.Symb);
+   doc.setPackNumber(docaccRH.rec.Number_Pack);
+   doc.setDocumentNumber(docaccRH.rec.NumExternDoc);
+   doc.setOper(docaccRH.rec.opernumb);
+   doc.setOperationCipher(docaccRH.rec.kind_oper_);
+   doc.setCurrOperationCode(docaccRH.rec.curcode);
+   doc.setDepartmentId(docaccRH.rec.department); 
+   doc.setPayerName(docaccRH.rec.OutDebRecName);
+   doc.setReceiverName(docaccRH.rec.OutCredRecName);
+
+   javaObj[0]=doc;
+
+   InstLoadModule("BookInter");
+   var MacroFun = "ExportAccountingDocumentsExt";
+   retailRes =  ExecMacro2(MacroFun, javaObj, GetIdentProgram());
+
+   if (retailRes.size!=0)
+      if (retailRes[0].ResultCode==UNLOAD_OK)
+          MsgBox("Выгрузка успешно выполнена!");
+          return true;
+      else
+         MsgBox("Выгрузка не выполнена!");
+         return false; 
+      end; 
+   end;
+
+   MsgBox("Выгрузка не выполнена!");
+   return false;
+
+end;
+
+private macro CashOrderUpload (DocTypeId);
+   var jvm    = createObject("rsjvm", "TJavaHost");
+   var doc =  jvm.CreateJavaObject("ru.softlab.rsretail.documents.CashOrder");
+   var javaObj : TArray = TArray();
+   var retailRes : TArray = TArray();
+
+   doc.setDate(docaccRH.rec.RegDate);
+   doc.setValueDate(docaccRH.rec.CarryDate);
+
+   if (docaccRH.rec.chapter == "А")
+     doc.setChapter(1);
+   else
+     doc.setChapter(2);
+   end;
+   doc.setId(docaccRH.rec.docaccid);
+   doc.setOper({OPER});
+   doc.setDebitAmount(docaccRH.rec.CarrySum);
+   doc.setCreditAmount(docaccRH.rec.CarrySumCredit);
+   doc.setDebitCurrCode(GetCurrCodeForRetail(docaccRH.rec.OutDebCur));
+   doc.setCreditCurrCode(GetCurrCodeForRetail(docaccRH.rec.OutCredCur));
+   doc.setDebitAccount(docaccRH.rec.debit);
+   doc.setCreditAccount(docaccRH.rec.credit);
+   doc.setGround(docaccRH.rec.ground);
+   doc.setDebitCashSymbol(docaccRH.rec.Symb);
+   doc.setPackNumber(docaccRH.rec.Number_Pack);
+   doc.setDocumentNumber(docaccRH.rec.NumExternDoc);
+   doc.setOper(docaccRH.rec.opernumb);
+   doc.setOperationCipher(docaccRH.rec.kind_oper_);
+   doc.setCurrOperationCode(docaccRH.rec.curcode);
+   doc.setDepartmentId(docaccRH.rec.department);
+   doc.setPayerName(docaccRH.rec.OutDebRecName);
+   doc.setReceiverName(docaccRH.rec.OutCredRecName);
+   doc.setDocumentTypeId(DocTypeId);
+   
+   javaObj[0]=doc;
+
+   InstLoadModule("BookInter");
+   var MacroFun = "ExportAccountingDocumentsExt";
+   retailRes =  ExecMacro2(MacroFun, javaObj, GetIdentProgram());
+
+   if (retailRes.size!=0)
+      if (retailRes[0].ResultCode==UNLOAD_OK)
+          MsgBox("Выгрузка успешно выполнена!");
+          return true;
+      else
+         MsgBox("Выгрузка не выполнена!");
+         return false; 
+      end; 
+   end;
+
+   MsgBox("Выгрузка не выполнена!");
+   return false;
+end; // ВыгрузитьКассовыйОрдер
+//////////////////////////////////////////////////////////////
+
+//выгрузка документа во внешнюю систему
+macro ExportDocUniRetail(DocAccBuf, OffLine):bool
+    VAR ErrCode = 0;
+    VAR DocTypeId = 0;
+ 
+   SetBuff(docacc_, DocAccBuf);
+   Copy(docaccRH, docacc_);
+
+   IF (docaccRH.rec.NumExternDoc == "")
+      msgBox ("Не определен номер документа другой подсистемы!");
+      RETURN FALSE;
+   END;  
+  
+  //Если есть мультивалютные проводки в документе, то выгружаем как МО
+   IF (docaccRH.rec.outdebcur != docaccRH.rec.outcredcur)
+       IF (MemorialOrderUpload(3))
+           return true;
+       ELSE
+           RETURN FALSE;
+       END; 
+    END;
+
+   IF ((docaccRH.rec.AlgoID == IgAlgoID_MO)  /* Мемориальный ордер */
+      OR (docaccRH.rec.AlgoID ==IgAlgoID_MCD)  /*Мультивалютный документ*/
+      OR (docaccRH.rec.AlgoID == IgAlgoID_BO))  /* Банковский ордер */
+       IF (docaccRH.rec.AlgoID == IgAlgoID_BO)
+           DocTypeId = 4;
+         ELSE
+           DocTypeId = 3;
+         END;
+       IF (MemorialOrderUpload(DocTypeId))
+              return true;
+         ELSE
+              RETURN FALSE;
+         END;
+
+   ELIF (docaccRH.rec.AlgoID == IgAlgoID_PP) /* Платежное поручение */
+             IF (PaymentOrderUpload())
+                RETURN TRUE;
+             ELSE
+                RETURN FALSE;
+             END;
+   ELIF (docaccRH.rec.AlgoID == IgAlgoID_PT)  /* Платежное Требование */
+          IF (PaymentRequestUpload())
+            RETURN TRUE;
+          ELSE
+              RETURN FALSE;
+          END;
+
+      ELIF ((docaccRH.rec.AlgoID == IgAlgoID_KOP) OR // Кассовый ордер (приход)
+            (docaccRH.rec.AlgoID == IgAlgoID_COR))   // Кассовый ордер (расход)
+         IF (docaccRH.rec.AlgoID == IgAlgoID_KOP)
+              DocTypeId = 1;
+           ELSE
+              DocTypeId = 2;
+           END;
+  
+          IF (CashOrderUpload(DocTypeId))
+                  RETURN TRUE;
+               ELSE
+                  RETURN FALSE;
+               END;
+   
+      ELSE
+         MsgBox("Не определен вид банковского документа другой подсистемы!");
+         RETURN FALSE;         
+      END;
+      
+   return true;
+end;

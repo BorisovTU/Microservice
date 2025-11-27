@@ -1,0 +1,916 @@
+/*
+  $Name:         psprcrgd_RP.mac
+  $Module:       РКО
+  $Description:  Процедура обработки решения рег. органа (RPO, ROO)
+*/
+
+//-----------------------------------------------------------------------------
+//          Автоматизированная банковская система RS-Bank               
+//                 Copyright (c) R-Style Software Lab
+//
+// Подсистема   : РКО
+//
+// Описание     : Процедура обработки решения рег. органа
+//                RPO, ROO
+//
+// Создан       : 26.01.2018
+//
+//-----------------------------------------------------------------------------
+
+import FIInter, WldInter, PSInter, BankInter, "wlmnstls.mac", "pmlib.mac", "rmcmptl.mac",
+       "bnk_dttmfrmt.mac", pm_const, "FnsAddClntDbl.mac";
+
+var fps:TBFile = TBFile("persn.dbt");
+RECORD party("party.dbt");
+
+var AccLnkList:RsbWlAccLnk;
+  
+private macro  LZ( num, len )
+     var str1, len1;
+     str1 = trim( string( num ) );
+     len1 = strlen( str1 );
+     if ( len1 >= len ) return str1;
+     else   return  mkstr("0", len-len1 ) + str1;
+  end;
+end;
+
+private macro GetMesInsideAbonentID(wlregdec) : integer
+  var InsideAbonentID : integer = 0;
+
+  var q : string = 
+    " select mes.t_InsideAbonentID "
+    "   from dwlmeslnk_dbt lnk, dwlmes_dbt mes "
+    "  where lnk.t_ObjKind = :OBJTYPE_WLD_DECISION "
+    "    and lnk.t_ObjID = :DecisionID "
+    "    and lnk.t_Direct = 'X' "
+    "    and mes.t_MesID = lnk.t_MesID ";
+
+  var params : TArray = makeArray( SQLParam("OBJTYPE_WLD_DECISION", OBJTYPE_DECISION),
+                                   SQLParam("DecisionID", wlregdec.DecisionID) );
+
+  var rs : RsdRecordset = execSQLselect(q, params);
+  if(rs and rs.moveNext())
+    InsideAbonentID = rs.value("t_InsideAbonentID");
+  end;
+
+  return InsideAbonentID;
+end;
+
+//------------------------------------------------------------------------
+// Предтранзакционная часть процедуры обработки решения рег.органа   
+// Основные проверки, отбор счетов для обработки
+//------------------------------------------------------------------------
+private macro PrepProcRPO(ClientList : TArray)
+
+  return PSAccLnkListRegDecProcess
+    ( ClientList, 
+      GetMesInsideAbonentID(wlregdec), 
+      wlregdec.DeliveryDate, 
+      wlregdec.ClientName, 
+      AccLnkList, 
+      ConstructINN(wlregdec.ClientINN, wlregdec.ClientKPP), 
+      wlregdec.Type,
+      ClientList
+    );
+
+end;
+
+/* сюда будем записывать ID отменяемой претензии */
+private var saveClaimID:TArray = TArray();
+/* признак отбраковки всего решения. Переменная используется С-шным кодом */
+var isDefectROO = 0;
+
+private macro GetChangeAccount( acclnk:TRecHandler):bool
+
+  var rs = execSQLSelect( "select t_NewAccount, t_NewAccountFIID from dreqchnga_dbt where t_OldAccount = ? and t_OldAccountFIID = ? ", 
+                           makeArray( SQLParam( "", acclnk.rec.Account ), SQLParam( "", acclnk.rec.FIID ) ), true );
+  if( rs and rs.movenext() ) 
+    
+    if((acclnk.rec.Account != rs.value(0)) or (acclnk.rec.FIID != rs.value(1)))
+      acclnk.rec.Account = rs.value(0);
+      acclnk.rec.FIID    = rs.value(1);
+      return true;
+    end;    
+  end;
+  return false;
+end;
+
+private macro HasSubDprtOutOfCABS(PartyID : integer) : bool
+  var q : string = 
+    "select 1 "
+    "  from ddp_dep_dbt "
+    " where t_AccessMode = :DEPARTMENT_ACCESS_NOTCABS "
+    "   and t_PartyID <> :PartyID1 "
+    " start with t_PartyID = :PartyID2 "
+    " connect by prior t_Code = t_ParentCode ";
+
+  var params : TArray = makeArray( SQLParam("DEPARTMENT_ACCESS_NOTCABS", 3),
+                                   SQLParam("PartyID1", PartyID),
+                                   SQLParam("PartyID2", PartyID) );
+
+  var rs : RsdRecordset = execSQLselect(q, params);
+
+  if(rs and rs.moveNext())
+    return TRUE;
+  end;
+
+  return FALSE;
+end;
+
+private macro FindAcclaim( acclnk:TRecHandler, errstr:@string, oldacclnk:TRecHandler )
+
+  var ClaimID = 0;
+  var select_acclm = " from dacclaim_dbt" 
+                    " where t_account      = ?"
+                      " and t_FIID         = ?"
+                      " and t_Chapter      = 1"
+                      " and t_ClaimKind    = ?"
+                      " and t_Initiator    = ?"
+                      " and t_DocNumber    = ?"
+                      " and t_DocDate      = ?"
+                      " and t_FiscOrgCode  = ?"
+                      " and t_Auto         = 'X'";      
+
+  var params_acclm = makeArray( SQLParam( "", acclnk.rec.Account       ),
+                                SQLParam( "", acclnk.rec.FIID          ),
+                                SQLParam( "", ACCLAIM_KIND_ARREST      ),
+                                SQLParam( "", ACCLAIM_INITIATOR_TAX    ),
+                                SQLParam( "", wlregdec.LnkDocNumber    ),
+                                SQLParam( "", wlregdec.LnkDocDate      ),
+                                SQLParam( "", wlregdec.OriginatorCode  ) );
+  var rs_acclm = execSQLSelect( "select count(*)" + select_acclm, params_acclm, true );
+  rs_acclm.movenext(); 
+  /* нет к счету претензий от налоговых органов */
+  if( rs_acclm.value(0) == 0 )
+    /* ищем заявление на изменение номера счета*/
+    var newacc:TRecHandler = TRecHandler("wlacclnk.dbt");
+    copy( newacc, acclnk );
+    if( GetChangeAccount( newacc ) == true ) /* и проверяем новый номер счета */
+      return FindAcclaim( newacc, @ errstr, oldacclnk );
+    else   
+      errstr = "Не найдена отменяемая претензия";
+
+      if( HasSubDprtOutOfCABS(wlregdec.RecipientID) )
+        oldacclnk.rec.State = WLD_STATUS_ACCLNK_MANUAL;
+      else
+        isDefectROO = 1;
+      end;
+    end;
+  else 
+    if( rs_acclm.value(0) > 1 ) /* если претензий больше одной */
+      if( not GetDialogFlag() ) /* в массовом режиме пропускаем с ошибкой */
+        errstr = "Не найдена претензия ареста к счету " + acclnk.rec.Account + ". Сообщение должно быть обработано в индивидуальном режиме";
+        isDefectROO = 1;
+      else                      /* в единичном даем возможность выбрать претензию из списка */
+        if( ListAccClaim( ClaimID, acclnk.rec.Chapter, acclnk.rec.FIID, acclnk.rec.Account, {curdate}, ACCLAIM_KIND_ARREST, 
+                      0, ACCLAIM_INITIATOR_TAX, wlregdec.LnkDocNumber, wlregdec.LnkDocDate, wlregdec.OriginatorCode, "X" ) != 0 )
+          errstr = "Не найдена претензия ареста к счету " + acclnk.rec.Account + ". Невозможно отменить приостановление операций";
+          isDefectROO = 1;
+        end;
+      end;
+    elif( rs_acclm.value(0) == 1 )        
+      rs_acclm = execSQLSelect( "select t_ClaimID" + select_acclm, params_acclm, true );
+      rs_acclm.movenext();
+      ClaimID = rs_acclm.value("t_ClaimID");     
+    end;
+    if( ClaimID > 0 )
+      var select_acclmst = " select t_State, t_StateDate"+
+                             " from dacclaimstate_dbt"+
+                            " where t_StateID = (select max(state.t_StateID)"
+                                                 " from dacclaimstate_dbt state"
+                                                " where state.t_ClaimID = " + ClaimID + ")";
+      var rs_acclmst = execSQLSelect( select_acclmst, NULL, true );
+      if( rs_acclmst.movenext() )
+        if( rs_acclmst.value("t_state") == 4/*ACCLAIM_STATUS_CANCELED*/ )
+          errstr = "Претензия ареста к счету " + acclnk.rec.Account + " была отменена " + date(rs_acclmst.value("t_StateDate"));
+        elif( rs_acclmst.value("t_state") == 5/*ACCLAIM_STATUS_CLOSED*/ )
+          errstr = "Претензия ареста к счету " + acclnk.rec.Account + " была закрыта " + date(rs_acclmst.value("t_StateDate"));
+        end;
+      end;
+      if( errstr == "" ) /* для нормально обработанных счетов запоминаем ClaimID */
+        saveClaimID(saveClaimID.size) = ClaimID;
+      end;
+    end;
+  end;
+  return isDefectROO;
+end;
+
+private macro PrepProcROOLnkAcc( acclnk:TRecHandler )
+
+  if(acclnk.rec.Type == WLACCLNK_TYPE_ACCOUNT)
+    var errstr = "";
+    FindAcclaim( acclnk, @errstr, acclnk );
+    if( errstr != "" )
+      acclnk.rec.Description = errstr;
+      errstr = "";
+    else 
+      acclnk.rec.State = WLD_STATUS_ACCLNK_CLOSED;
+    end;
+  else
+    var ProcessKESP = 0;
+    GetRegistryValue( "PS\\REQOPENACC\\OPERATION\\ОБРАБОТКА КЭСП", V_INTEGER, ProcessKESP, errstr );
+    if( ProcessKESP == 0 )
+      acclnk.rec.Description = "Обработка КЭСП не поддерживается системой";
+      acclnk.rec.State = WLD_STATUS_ACCLNK_MANUAL;
+    else
+      var bankName = Bnk_GetPartyName(wlregdec.RecipientID);
+      var bankBIC = "";
+      GetPartyCodeEx(wlregdec.RecipientID, PTCK_BIC, @bankBIC);
+      acclnk.rec.Description = "КЭСП отсутствует в банке (филиале банка) " + string( bankBIC ) +
+                               " " + string( bankName ) + " и подчиненных ему филиалах";
+    end;
+  end;
+  if( AccLnkList.Update( acclnk ) != 0 )
+    msgbox("Невозможно обновить запись связанного счета");
+  end;
+
+  return isDefectROO;
+end;
+
+private macro PrepProcROO(ClientList : TArray)
+  var error : integer = 0, errstr : string = "", retval : bool = false;
+
+  error = PSAccLnkListRegDecProcess
+    ( ClientList, 
+      GetMesInsideAbonentID(wlregdec), 
+      wlregdec.DeliveryDate, 
+      wlregdec.ClientName, 
+      AccLnkList, 
+      ConstructINN(wlregdec.ClientINN, wlregdec.ClientKPP), 
+      wlregdec.Type,
+      ClientList
+    );
+  if(error)
+    return error;
+  end;
+
+  if( wlregdec.Kind == WLD_KIND_REGDEC_CANSELEXCESSAMOUNT )
+    GetRegistryValue( "CB\\Претензии\\Решение об отмене вид 2", V_BOOL, retval, error );
+    if( retval == false )
+      errstr = "Решение об отмене приостановления операций по счетам в части превышения суммы, указанной в решении, обрабатываются вручную";
+      AddNoteForObject( OBJTYPE_DECISION, LZ( wlregdec.DecisionID, 34 ), NOTEKIND_WLDECISION_ERRDESCRIPTION, errstr);
+      if( GetDialogFlag() )
+        InsertWlRepClm( wlregdec, 456/*OBJTYPE_ACCCLMCHNGDOC*/, 0, "", errstr );
+      end;
+      return 1;
+    end;
+  end;
+
+  var acclnk = TRecHandler("wlacclnk.dbt");
+
+  var IsAccFound : bool = (AccLnkList.First( acclnk ) == 0);
+  while( IsAccFound )
+    if( not InList(acclnk.rec.State, WLD_STATUS_ACCLNK_MANUAL, 
+                                     WLD_STATUS_ACCLNK_MANUALRJT,
+                                     WLD_STATUS_ACCLNK_MANUALCLS) )
+      PrepProcROOLnkAcc( acclnk );
+    end;
+
+    IsAccFound = (AccLnkList.Next( acclnk ) == 0);
+  end;
+
+  return 0;
+
+  OnError(er) /* Обработка ошибок времени выполнения */
+    ExeptionMessage(er);
+    return 1;
+end;
+
+private macro CheckAccList( AccLnkList, AccManual : @bool, AccSuccess : @bool )
+  var acclnk = TRecHandler("wlacclnk.dbt");
+  if( not AccLnkList.First( acclnk ) )
+    if( acclnk.rec.state == WLD_STATUS_ACCLNK_MANUAL )
+      AccManual = true;
+    elif ( (acclnk.rec.state != WLD_STATUS_ACCLNK_PREPARING) or ( acclnk.rec.state != WLD_STATUS_ACCLNK_MANUALRJT ) )
+      AccSuccess = true;
+    end;
+  end;
+
+  while( not AccLnkList.Next( acclnk ) )
+    if( acclnk.rec.state == WLD_STATUS_ACCLNK_MANUAL )
+      AccManual = true;
+    elif ( (acclnk.rec.state != WLD_STATUS_ACCLNK_PREPARING) or ( acclnk.rec.state != WLD_STATUS_ACCLNK_MANUALRJT ) )
+      AccSuccess = true;
+    end;
+  end;
+end;
+
+// Проверка статуса банкротства
+private macro CheckBankruptStatus()
+  var select = "";
+  var rs;           
+  if( not ( IsIndividualEmployer(wlregdec.ClientID) ) )
+    return 0;
+  end;
+  
+  var BankruptStatus = 0;
+  var Mes = TArray();
+  var Buttons = TArray();
+  var RegVal;
+  var RegPath : string;
+  var stat = 0;
+  var ret = 0;
+  
+  if( InList(wlregdec.RegPartyKind, 0, 7 ) ) //REGPT_TAXINSTITUTE = 7
+    RegPath = "PS\\СООБЩЕНИЯ ФНС\\SKIPBANKRUPTSTATUS";
+  elif( InList(wlregdec.RegPartyKind, 14 ) ) //REGPT_CUSTOM = 14
+    RegPath = "PS\\СООБЩЕНИЯ ФТС\\SKIPBANKRUPTSTATUS";
+  end;
+  if( ( not GetPartyBankruptStatus( wlregdec.ClientID, date(), @BankruptStatus ))
+    and (GetRegistryValue( RegPath, V_STRING, RegVal )) )
+    var BStatus : String = BankruptStatus;
+    if( (not stat) and CompareStrWithMasks( RegVal, BStatus, 4 ) )
+      select = " select t_Name "
+               " from   dllvalues_dbt "
+               " where  t_List = 3564 "
+               " and t_Element = :Element ";
+      rs = execSQLSelect( select, makeArray( SQLParam( "Element", BankruptStatus ) ));
+      if( rs.MoveNext() )
+        BStatus = rs.value(0);
+      end;
+      Mes(Mes.size) = "ВНИМАНИЕ! Физическое лицо " + wlregdec.ClientID + " " + wlregdec.ClientName 
+      + " имеет по состоянию на " + date() + " статус банкротства \"" + BStatus + "\"";
+      Mes(Mes.size) = "Убедитесь в правомерности приостановления операции по счетам";
+      Buttons(Buttons.size) = "На ручную обработку";
+      Buttons(Buttons.size) = "Продолжить";
+      Buttons(Buttons.size) = "Прервать";
+      // В интерфейсном режиме выводим предупреждение с выбором вариантов действи, в безинтерфесном - выполняем действие по умолчанию и записываем в протоколо
+      if( GetDialogFlag() )
+        ret = ConfWin( Mes, Buttons, 0 );
+      else
+        ret = 0;
+      end;
+      if( ret == 0 )
+        //Записать примечание ошибки
+        var NoteText = "";
+        if( InList(wlregdec.RegPartyKind, 0, 7 ) ) //REGPT_TAXINSTITUTE = 7
+          NoteText = "На дату получения банком(филиалом банка) БИК " + wlregdec.RecipientCode + " " + wlregdec.RecipientName 
+          + " решения налогового органа о приостановлении операции № " + wlregdec.Number + " от " 
+          + wlregdec.Date + " по клиенту " + wlregdec.ClientName + " ИНН " + wlregdec.ClientINN
+          + " инициирована процедура банкротства в стадии \"" + BankruptStatus + "\"";
+        elif( InList(wlregdec.RegPartyKind, 14 ) ) //REGPT_CUSTOM = 14
+          NoteText = "На дату получения банком(филиалом банка) БИК " + wlregdec.RecipientCode + " " + wlregdec.RecipientName 
+          + " решения таможенного органа о приостановлении операции № " + wlregdec.Number + " от " 
+          + wlregdec.Date + " по клиенту " + wlregdec.ClientName + " ИНН " + wlregdec.ClientINN
+          + " инициирована процедура банкротства в стадии \"" + BankruptStatus + "\"";
+        end;
+        AddNoteForObject( OBJTYPE_DECISION, LZ( wlregdec.DecisionID, 34 ), NOTEKIND_WLDECISION_ERRDESCRIPTION, NoteText );
+        if( GetDialogFlag() == 0 )
+          InsertWlRepClm( wlregdec, OBJTYPE_DECISION, wlregdec.DecisionID, "", NoteText );
+        end;
+        //Установить статус отбракованно(статус устанавливает в си)
+        //Завершить выполнение процедуры
+        return 1;
+      elif( ret == 1 )
+        //Продолжить выполнение процедуры
+        return 0;
+      elif( ret == 2 )
+        //Прервать выполнение процедуры
+        return -1;
+      end;
+    else
+      return stat;
+    end;
+  end;
+end;
+
+private macro CheckManualProc( AccLnkList )
+  var error = 0;
+  var errstr;
+  var ObjType = IfThenElse( wlregdec.Type == WLD_TYPE_REGDEC_RPO, 455/*OBJTYPE_ACCLAIM*/, 456/*OBJTYPE_ACCCLMCHNGDOC*/ );
+  // Проверить, что код клиента вида 1 совпадает с указанным в настройке
+  if( wlregdec.state == WLD_STATUS_DECISION_RECEIVED )
+    var regVal1 = "";
+    var path : string = "PS\\REQOPENACC\\OPERATION\\365-П\\РУЧНАЯ ОБРАБОТКА\\РЕШЕНИЯПРИОСТ\\КЛИЕНТ";
+    var ClientCode = GetPartyCode(wlregdec.ClientID, PTCK_CONTR);
+    GetRegistryValue( path, V_STRING, regVal1 );
+    if( not CompareStrWithMasks( regVal1, ClientCode ) )
+      errstr = "Клиент " + ClientCode + " " + wlregdec.ClientName + " попадает под настройку направления на ручную обработку";
+      AddNoteForObject( OBJTYPE_DECISION, LZ( wlregdec.DecisionID, 34 ), NOTEKIND_WLDECISION_ERRDESCRIPTION,
+      errstr);
+      InsertWlRepClm( wlregdec, ObjType, 0, "", errstr );
+      MsgBox("Решение направлено на ручную обработку");
+      return error = 31978;
+    end;
+  end;
+  // Проверить, что в списке счетов есть хотя бы одна запись со статусом $(на ручную обработку)
+  var AccManual = false,
+      AccSuccess = false;
+  if( (wlregdec.state == WLD_STATUS_DECISION_RECEIVED)  or (wlregdec.state == WLD_STATUS_DECISION_DEFECT) )
+    CheckAccList( AccLnkList, @AccManual, @AccSuccess );
+    if( AccManual )
+      if( wlregdec.state == WLD_STATUS_DECISION_RECEIVED )
+        var regVal2;
+        var path2 : string = "PS\\REQOPENACC\\OPERATION\\365-П\\РУЧНАЯ ОБРАБОТКА\\РЕШЕНИЯПРИОСТ\\ОТЛОЖИТЬВСЕРЕШЕНИЕ"; 
+        GetRegistryValue( path2, V_BOOL, regVal2 );
+        if( regVal2 )
+          errstr = "Решение направлено на ручную обработку";
+          InsertWlRepClm( wlregdec, ObjType, 0, "", errstr );
+          MsgBox(errstr);
+          return error = 31978;
+        elif ( AccSuccess )
+          return 0;
+        else
+          errstr = "Решение направлено на ручную обработку";
+          InsertWlRepClm( wlregdec, ObjType, 0, "", errstr );
+          MsgBox(errstr);
+          return error = 31978;
+        end;
+      end;
+    end;
+  end;
+  return error;
+end;
+
+private macro ExistsNameFromHist( Name, PartyID, ParamKindID )
+
+  var select:string = " select t_valuebefore  " +
+                      "   from dptprmhist_dbt "+
+                      "  where t_partyid     = :PartyID "+
+                      "    and t_paramkindid = :PKID ";
+  var params:TArray = makeArray( SQLParam( "PartyID", PartyID ) );
+  
+  var rset:RsdRecordset = execSQLselect( select, makeArray( SQLParam( "PartyID", PartyID ), SQLParam( "PKID", ParamKindID ) ) );
+  while( rset and rset.moveNext() )
+    if( rset.value(0) == Name )
+      return true;
+    end;
+  end;
+  return false;
+
+end;
+/* true, если наименование совпадает с данными в базе*/
+private macro IsEQClientName( PartyID:integer, ClientName:string )
+
+  fps.rec.PersonID = PartyID;                               
+  var systClientName = "";/*Системное наименование клиента*/
+  var isEQName = false;
+  if( fps.GetEQ() ) /* для физлиц особая процедура поиска */
+    var trueClientName = fps.rec.Name1 + " " + fps.rec.Name2 + " " + fps.rec.Name3;
+    if( ClientName == trueClientName )
+      return true;
+    end;
+    var cNames:TArray = split( ClientName, " " );/* Имя, Фамилия, Отчество в ClientName */
+    /* Каждый несовпадающий компонент в ClientName ищем в истории */
+    if( ( cNames[0] != fps.rec.Name1 ) and ( ExistsNameFromHist( cNames[0], PartyID, 320/*PERSN_NAME1*/ ) ) )
+      cNames[0] = fps.rec.Name1;
+    end;
+
+    if( ( cNames[1] != fps.rec.Name2 ) and ( ExistsNameFromHist( cNames[1], PartyID, 330/*PERSN_NAME2*/ ) ) )
+      cNames[1] = fps.rec.Name2;
+    end;
+
+    if( ( cNames[2] != fps.rec.Name3 ) and ( ExistsNameFromHist( cNames[2], PartyID, 340/*PERSN_NAME3*/ ) ) )
+      cNames[2] = fps.rec.Name3;
+    end;
+    
+    if( cNames[0] + " " + cNames[1] + " " + cNames[2] == trueClientName )
+      isEQName = true;
+    end;
+    SystClientName = fps.rec.Name1 + " " + fps.rec.Name2 + " " + fps.rec.Name3;
+  else 
+    if( ( party.Name == "" ) or ( ПолучитьСубъекта( PartyID, party ) != 0 ) )  
+      return 1;    
+    end;
+    SystClientName = party.Name;
+    if(SystClientName == ClientName)
+      isEQName = true;
+    end;
+  end;   
+  /* Если так и не нашли нужное сочетание, выполняем системную процедуру сравнения наименования */
+  if( not isEQName )
+    isEQName = ( CompareNamesByClientID(PartyID, ClientName, 0, "", 1) == 0 );
+  end;
+  /* Если все-таки нашли, добавим системное наименование в примечание RPO */
+  if( ( isEQName ) and (( wlregdec.Type == WLD_TYPE_REGDEC_RPO ) or ( wlregdec.Type == WLD_TYPE_REGDEC_ROO )) and ( SystClientName != "" ) )
+    AddNoteForObject( OBJTYPE_DECISION, LZ( wlregdec.DecisionID, 34 ), NOTEKIND_WLDECISION_NEWNAMECLIENT, SystClientName );
+  end;
+  return isEQName;
+
+ONERROR(x)
+  return false;
+end;
+
+private macro GetErrNote(wlregdec, ErrList : RsbWlError) : string
+  var errstr : string = "";
+
+  if(ErrList.Size > 1)
+    var RegDecName : string = IfThenElse(wlregdec.Type == WLD_TYPE_REGDEC_RPO, "решение о приостановлении операций", "решение об отмене приостановления операций");
+
+    errstr = "Наименование " + wlregdec.ClientName + " и КПП " + wlregdec.ClientKPP +
+             " клиента не соответствуют ИНН " + wlregdec.ClientINN + "," +
+             " указанному в электронном документе налогового органа " + RegDecName + 
+             " № " + wlregdec.Number + " от " + DDpMMpYYYY(wlregdec.Date);
+  else
+    var RecWlerror : TRecHandler = TRecHandler("wlerror.dbt");
+    if( ErrList.First(RecWlerror) == 0 )
+      errstr = RecWlerror.rec.Description;
+    end;
+  end;
+
+  return errstr;
+end;
+
+private macro NeedReject(err : integer, ErrList : RsbWlError) : bool
+  if( InList(err, WLD_ERR_FNSCHEKCLIENT_NOTFOUND, WLD_ERR_FNSINFO_CLIENTNOTFOUND) )
+    return TRUE;
+  end;
+
+  var ExecWithErrKPP : bool = Bnk_GetRegistryValue(RegOpenAcc + "ИСПОЛНЯТЬ_С_ОШИБКОЙ_КПП", V_BOOL, false),
+      ExecWithErrName : bool = Bnk_GetRegistryValue(RegOpenAcc + "ИСПОЛНЯТЬ_С_ОШИБКОЙ_НАИМ-НИЯ", V_BOOL, false);
+  var RecWlerror : TRecHandler = TRecHandler("wlerror.dbt");
+
+  if( ErrList.First(RecWlerror) == 0 )
+    var EndOfList : bool = false;
+
+    while( not EndOfList )
+      if( (not ExecWithErrKPP) and (int(RecWlerror.rec.Code) == T_PS_CHECKFNSWRONGKPP) )
+        return TRUE;
+      end;
+
+      if( (not ExecWithErrName) and (int(RecWlerror.rec.Code) == T_PS_CHECKFNSWRONGNAME) )
+        return TRUE;
+      end;
+
+      EndOfList = (ErrList.Next(RecWlerror) != 0);
+    end;
+  end;
+
+  return FALSE;
+end;
+
+private macro FillClientList(wlregdec, ClientList : TArray)
+  if(wlregdec.ClientID > 0)
+    var ClientID : integer = wlregdec.ClientID;
+    if(not FnsFillClientDoublers(@ClientID, ClientList, wlregdec.ClientType) )
+      RunError("Ошибка при добавлении дублеров клиента");
+    end;
+
+    if(ClientID != wlregdec.ClientID)
+      wlregdec.ClientID = ClientID;
+    end;
+  end;
+end;
+
+macro PrepProcessRegDecisionTrn(addrWlregdec, ClientList : TArray):integer
+  SetBuff( wlregdec, addrWlregdec );
+
+  /* Общая часть проверок - проверки клиента, его наименования и КПП */
+  var err    : integer = 0, 
+      errstr : string = "";
+  var ObjType = IfThenElse( wlregdec.Type, WLD_TYPE_REGDEC_RPO, 455/*OBJTYPE_ACCLAIM*/, 456/*OBJTYPE_ACCCLMCHNGDOC*/ );
+  var NewName : string = "";
+  var IgnoreNameKppErrors : bool = false;
+
+  if( not err )
+    var ErrList : RsbWlError = RsbWlError(0);
+
+    err = PSFNSCheckClientData
+        ( wlregdec.ClientINN,
+          wlregdec.ClientKPP,
+          wlregdec.ClientName,
+          "", // ClientAddress
+          wlregdec.ClientID,
+          wlregdec.ClientType,
+          ( GetDialogFlag() == 0 ), // IsMassMode
+          ErrList,
+          NewName
+        );
+
+    if( (wlregdec.Type == WLD_TYPE_REGDEC_RPO) and NewName )
+      if( AddNoteForObject( OBJTYPE_DECISION, LZ( wlregdec.DecisionID, 34 ), NOTEKIND_WLDECISION_NEWNAMECLIENT, NewName ) != 0 )
+        RunError("Ошибка при записи примечания \"Новое наименование клиента\"");
+      end;
+    end;
+
+    if( (wlregdec.ClientID > 0) and (wlregdec.State == WLD_STATUS_DECISION_DEFECT) )
+      IgnoreNameKppErrors = true;
+      err = 0;
+    end;
+
+    // Если процедура вернула непустой список ошибок
+    if( (ErrList.Size > 0) and not IgnoreNameKppErrors ) 
+      errstr = GetErrNote(wlregdec, ErrList);
+
+      if(errstr)
+        if( AddNoteForObject( OBJTYPE_DECISION, LZ( wlregdec.DecisionID, 34 ), NOTEKIND_WLDECISION_ERRDESCRIPTION, errstr ) != 0 )
+          RunError("Ошибка при записи примечания \"Описание ошибки\"");
+        end;
+      end;
+
+      if( NeedReject(err, ErrList) )
+        ErrList = null;
+
+        if(not errstr)
+          MemoryError(err);
+          errstr = GetErrMsg();
+        end;
+
+        if( GetDialogFlag() == 0 ) /* в массовом режиме все пишем в протокол */
+          InsertWlRepClm( wlregdec, ObjType, 0, "", errstr );
+        else
+          msgbox( errstr ); 
+        end;
+
+        // Завершить процедуру
+        if(not err)
+          err = 1;
+        end;
+        return err;
+      end;
+    end;
+  end;
+            
+  var errbnk = 0;
+  if( err == 0 )
+    errbnk = CheckBankruptStatus();
+  end;
+  
+  if( errbnk )
+    return errbnk;
+  end;
+  
+  if( err )
+    if( GetDialogFlag() == 0 )
+      InsertWlRepClm( wlregdec, ObjType, 0, "", GetErrMsg() );
+    else
+      msgbox( errstr ); 
+    end;
+  end;  
+
+
+  if(not ClientList.size) // Если нет привязанных записей Wlptlnk, где Wlptlnk.ObjectID = wlregdec.DecisionID, Wlptlnk.ObjectType = $(Решение регоргана)
+    FillClientList(wlregdec, ClientList);
+  end;
+
+  var errspec = 0;
+  if( wlregdec.Type == WLD_TYPE_REGDEC_RPO )
+    errspec = PrepProcRPO(ClientList);
+  else
+    isDefectROO = 0;
+    errspec = PrepProcROO(ClientList);
+  end;
+  var errman = 0;  
+  errman = CheckManualProc( AccLnkList );
+
+  if( err )
+    return err;
+  end;
+  if( errman )
+    return errman;
+  end;
+  if( errspec )
+    return 1;
+  end;
+  return 0;
+
+  OnError(er) /* Обработка ошибок времени выполнения */
+    ExeptionMessage(er);
+    InsertWlRepClm( wlregdec, ObjType, 0, "", GetErrMsg() );
+    return 1;
+end;
+
+private macro GetLnkMesFldValue( DecID:integer ):integer
+
+  var select = " select numdec.t_value, datedec.t_value          "+
+                "  from dwlmeslnk_dbt lnk,                       "+
+                "       dwlmesval_dbt numdec,                    "+
+                "       dwlmesval_dbt datedec                    "+
+                " where lnk.t_ObjID         = :ObjID             "+
+                "   and lnk.t_ObjKind       = 519                "+/*OBJTYPE_WLD_DECISION*/
+                "   and lnk.t_MesID         = numdec.t_MesID     "+
+                "   and numdec.t_TpFieldID  = 740                "+
+                "   and lnk.t_MesID         = datedec.t_MesID    "+
+                "   and datedec.t_TpFieldID = 741                ";
+
+  var params = makeArray( SQLParam("ObjID", DecID ) );
+  var rs = execSQLselect( select, params, FALSE );
+  if( rs.MoveNext() )
+    SetParm( 1, rs.value(0) );
+    SetParm( 2, rs.value(1) );
+    return 0;
+  end;
+  return 1;
+end;
+
+private macro GetAcclaimPriority() : integer
+  var Priority : integer = 0, err : integer = 0,
+      path : string = "PS\\REQOPENACC\\OPERATION\\365-П\\АРЕСТ_ОЧЕР_ПРЕТЕНЗИИ", 
+      TypeVal : integer = GetRegistryValue( path, V_INTEGER, Priority, err );
+
+  if( ( TypeVal == V_UNDEF ) OR ( err != 0 ) )
+    Priority = 3;
+  end;
+
+  var MaxPriority : integer = PM_DefaultMaxPriority();
+  if( (Priority < 0) or (Priority > MaxPriority) )
+    RsbThrow( "В настройке реестра PS\\REQOPENACC\\OPERATION\\365-П\\Арест_Очер_Претензии " +
+              "задано некорректное значение очередности для создаваемой по решению " +
+              "претензии ареста. Укажите значение в диапазоне от 0 до " + MaxPriority );
+  end;
+
+  return Priority;
+end;
+
+//------------------------------------------------------------------------
+// Транзакционная часть процедуры обработки решения рег.органа   
+// Создание и привязка к счету претензии ареста
+//------------------------------------------------------------------------
+private macro ProcRPO( acclnk:TRecHandler ):integer
+  record acclaim     ( acclaim      );
+  record acclaimstate( acclaimstate );
+
+  var НомРешВзыск = "", ДатаРешВзыск = "";
+  var AcclaimID = 0;
+  
+  // создаем претензию
+  acclaim.SysDate       = {curdate};
+  acclaim.DocDate       = wlregdec.Date;
+  acclaim.StartDate     = wlregdec.DeliveryDate;
+  acclaim.FinishDate    = date(0,0,0);
+  acclaim.Account       = acclnk.rec.Account;
+  acclaim.FIID          = acclnk.rec.FIID;
+  acclaim.Chapter       = acclnk.rec.Chapter;
+  acclaim.DocNumber     = wlregdec.Number;
+  acclaim.Initiator     = ACCLAIM_INITIATOR_TAX;
+  acclaim.RestKind      = IfThenElse((wlregdec.Amount == 0.0), ACCLAIM_TYPE_PARTIAL, ACCLAIM_TYPE_AMOUNT );
+  acclaim.Incremental   = IfThenElse((wlregdec.Amount == 0.0), "", "X");  
+  if( GetLnkMesFldValue( wlregdec.DecisionID, @НомРешВзыск, @ДатаРешВзыск ) == 0 )
+    acclaim.Comment     = "Решение о взыскании № " + НомРешВзыск + " от " + ДатаРешВзыск + ". ";
+  end;
+  acclaim.Comment       = acclaim.Comment + "Причина: " + wlregdec.Ground + ". Обстоятельства: " + wlregdec.Description;
+  acclaim.ClaimKind     = ACCLAIM_KIND_ARREST;
+  if( wlregdec.Amount != 0.0 )
+    if(acclaim.FIID == NATCUR)
+      acclaim.StartAmount = wlregdec.Amount;
+    else    
+      ConvSumCross( acclaim.StartAmount, wlregdec.Amount, acclaim.StartDate, NATCUR, acclaim.FIID );
+    end;
+  end;
+  acclaim.Priority      = GetAcclaimPriority();
+  acclaim.Oper          = {Oper};
+  acclaim.FiscOrgCode   = wlregdec.OriginatorCode;
+  acclaim.Auto          = "X";
+  acclaimstate.State    = 1;
+  acclaimstate.CurrentAmount = acclaim.StartAmount;
+
+  if( not ВставитьПретензию( acclaim, acclaimstate, AcclaimID ) )
+    msgbox(( "Не удалось создать претензию к счету " + acclnk.rec.Account ) );
+    return 0;    
+  end; 
+  return AcclaimID;
+
+  OnError(er) /* Обработка ошибок времени выполнения */
+    ExeptionMessage(er);
+    return 0;
+end;
+
+private macro isAcclaim( acclnk:TRecHandler )
+
+  var select_acclm = " select count(*) from dacclaim_dbt" 
+                     " where t_account     = ?"
+                      " and t_FIID         = ?"
+                      " and t_Chapter      = 1"
+                      " and t_ClaimKind    = ?"
+                      " and t_Initiator    = ?"
+                      " and t_DocNumber    = ?"
+                      " and t_DocDate      = ?"
+                      " and t_FiscOrgCode  = ?"
+                      " and t_Auto         = 'X'";      
+
+  var params_acclm = makeArray( SQLParam( "", acclnk.rec.Account       ),
+                                SQLParam( "", acclnk.rec.FIID          ),
+                                SQLParam( "", ACCLAIM_KIND_ARREST      ),
+                                SQLParam( "", ACCLAIM_INITIATOR_TAX    ),
+                                SQLParam( "", wlregdec.LnkDocNumber    ),
+                                SQLParam( "", wlregdec.LnkDocDate      ),
+                                SQLParam( "", wlregdec.OriginatorCode  ) );
+  var rs_acclm = execSQLSelect( select_acclm, params_acclm, true );
+  rs_acclm.movenext(); 
+  if( rs_acclm.value(0) > 0 )
+    return TRUE;
+  else
+    /* нет к счету претензий от налоговых органов */
+    /* ищем заявление на изменение номера счета*/
+    var newacc:TRecHandler = TRecHandler("wlacclnk.dbt");
+    copy( newacc, acclnk );
+    if( GetChangeAccount( newacc ) == true ) /* и проверяем новый номер счета */
+      return isAcclaim(newacc);
+    end;  
+  end;
+  return FALSE;
+end;
+
+private macro ProcROO( acclnk:TRecHandler ):integer
+
+  record acclmcng( acclmcng );
+  var    ClmngID = 0;
+
+  if( (saveClaimID.size > 0) AND isAcclaim(acclnk) )
+    ClearRecord( acclmcng );
+    acclmcng.ClaimID    = int(saveClaimID(0));
+    acclmcng.DocNumber  = wlregdec.Number;
+    acclmcng.DocDate    = wlregdec.Date;
+    acclmcng.SysDate    = {curdate};
+    acclmcng.Initiator  = ACCLAIM_INITIATOR_TAX;
+    acclmcng.ChangeKind = ACCLMCNG_KIND_CANCEL;
+    acclmcng.Delta      = 0;
+    acclmcng.Priority   = 0;
+    acclmcng.StartDate  = wlregdec.DeliveryDate;
+    acclmcng.Oper       = {oper};
+    acclmcng.Comment    = "Отмена приостановления операций по счетам налогоплательщика в банке" + 
+                           IfThenElse( wlregdec.Kind == WLD_KIND_REGDEC_CANSELALLACCOUNTS, "", " в части превышения суммы, указанной в решении");
+    acclmcng.Auto       = "X";
+    acclmcng.FiscOrgCode=wlregdec.OriginatorCode;
+
+    if( not ВставитьИзменениеПретензии( acclmcng, ClmngID ) )
+      msgbox( "Не удалось создать изменяющий претензию документ для счета " + acclnk.rec.Account );
+      return 0;    
+    end;
+    saveClaimID = subArray( saveClaimID, 1, saveClaimID.size ); /* удалим использованный ClaimID */
+    return ClmngID;
+  end;
+  return 0;
+
+  OnError(er) /* Обработка ошибок времени выполнения */
+    ExeptionMessage(er);
+    return 0;
+end;
+
+private macro ProcessAccLnkRec( acclnk:TRecHandler )
+  
+  var ObjType = IfThenElse( wlregdec.Type == WLD_TYPE_REGDEC_RPO, 455/*OBJTYPE_ACCLAIM*/, 456/*OBJTYPE_ACCCLMCHNGDOC*/ );
+  var ObjID   = 0;
+  var Comment = "";
+
+  if( wlregdec.Type == WLD_TYPE_REGDEC_RPO )
+    if( InList(acclnk.rec.State, WLD_STATUS_ACCLNK_PREPARING, WLD_STATUS_ACCLNK_MANUAL, 
+                                 WLD_STATUS_ACCLNK_MANUALRJT, WLD_STATUS_ACCLNK_MANUALCLS)
+        and
+        not Index(acclnk.rec.Description, "Счет закрыт")
+      )
+      InsertWlRepClm( wlregdec, 455/*OBJTYPE_ACCLAIM*/, 0, acclnk.rec.Account, acclnk.rec.Description );
+    else                                        
+      if( AccClaimIncomplete( acclnk.rec.Account, acclnk.rec.Chapter, acclnk.rec.FIID ) )
+        acclnk.rec.Description = "По лицевому счету " + acclnk.rec.Account + " имеются незавершенные операции. Созданное ограничение не повлияет на их исполнение";
+        AccLnkList.Update( acclnk );
+      end;
+      ObjID = ProcRPO( acclnk );
+      if( ObjID > 0 )
+        Comment = "Претензия к счету создана успешно";
+      else
+        msgbox( "Не удалось создать претензию к счету " + acclnk.rec.Account );
+      end;
+    end;
+  else
+    if( acclnk.rec.Type == WLACCLNK_TYPE_ACCOUNT )
+      if( InList(acclnk.rec.State, WLD_STATUS_ACCLNK_PREPARING, WLD_STATUS_ACCLNK_MANUAL, 
+                                 WLD_STATUS_ACCLNK_MANUALRJT, WLD_STATUS_ACCLNK_MANUALCLS)
+           and ( Index( acclnk.rec.Description, "Счет закрыт" ) <= 0 ) ) 
+        InsertWlRepClm( wlregdec, 456/*OBJTYPE_ACCCLMCHNGDOC*/, 0, acclnk.rec.Account, acclnk.rec.Description );
+      else                                        
+        ObjID = ProcROO( acclnk );
+
+        if( ObjID > 0 )
+          Comment = "Претензия ареста отменена успешно";
+        else
+          msgbox( "Не удалось создать изменяющий претензию документ для счета " + acclnk.rec.Account );
+        end;
+      end;
+    end;
+  end;
+
+  if( ObjID > 0 )
+    acclnk.rec.LnkObjectID = ObjID;
+    acclnk.rec.LnkObjectType = ObjType;
+    WldSetStateStamp(acclnk.rec, acclnk.rec.State);
+    AccLnkList.Update( acclnk );
+    InsertWlRepClm( wlregdec, ObjType, ObjID, acclnk.rec.Account, Comment );
+  end;
+  return true;
+end;
+
+macro ProcessRegDecisionTrn():integer
+  var acclnk = TRecHandler("wlacclnk.dbt");
+  var isNotAcc = true;
+
+  if( not AccLnkList.First( acclnk ) )
+    isNotAcc = false;
+    if( not ProcessAccLnkRec( acclnk ) )
+      return 1;
+    end;
+  end;
+
+  while( not AccLnkList.Next( acclnk ) )
+    if( not ProcessAccLnkRec( acclnk ) )
+      return 1;
+    end;
+  end;
+
+  if( isNotAcc == true )
+    msgbox("Не найдена отменяемая претензия");
+    return 1;
+  end;
+
+  return 0;
+end;

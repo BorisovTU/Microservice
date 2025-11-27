@@ -1,0 +1,2634 @@
+/*
+    $Name: ir_repacc.mac
+    $Module:   Репозитарий
+    $Description:  Выполнение сервисной операции репозитарного учета
+*/
+
+import "ir_CM010.mac",
+       "ir_CM011.mac",
+       "ir_CM021.mac",
+       "ir_CM022.mac",
+       "ir_CM023.mac",
+       "ir_CM032.mac",
+       "ir_CM041.mac",
+       "ir_CM042.mac",
+       "ir_CM043.mac",
+       "ir_CM044.mac",
+       "ir_CM045.mac",
+       "ir_CM046.mac",
+       "ir_CM047.mac",
+       "ir_CM048.mac",
+       "ir_CM051.mac",
+       "ir_CM053.mac",
+       "ir_CM083.mac",
+       "ir_CM093.mac",
+       "ir_CM094.mac",
+       "ir_CM092.mac",
+       "ir_CMgeninf.mac";
+import "UL_PTImp.mac";
+
+
+PRIVATE Var MaxDateTO = date(0,0,0);
+
+var ir_cmArr = TArray();
+
+/*DAN*/
+private macro set_conract_ir(DocKind, DocID, ContractIR)
+  var sql,cmd,rs;
+  if(ContractIR!="")
+    sql = "UPDATE ddl_repozdeal_dbt " +
+          "   SET t_contract_ir = ? " +
+          " WHERE     t_dockind = ? " +
+          "       AND t_docid = ? ";
+    cmd = RSDCommand(sql);
+    cmd.addparam("",rsdbp_in,ContractIR);
+    cmd.addparam("",rsdbp_in,DocKind);
+    cmd.addparam("",rsdbp_in,DocID);
+    cmd.execute;
+  end;
+end;
+
+/*Закрывает графики по Справедливой стоимости для сделок не вошедших в последний файл переоценкой на дату выполнения сервисной операции*/
+macro CloseNotNeedGrFairVl(dt)
+ var sql, cmd, rs;
+ sql = "SELECT grdeal.t_dockind, grdeal.t_docid " +
+"  FROM ddlgracc_dbt gracc, ddlgrdeal_dbt grdeal " +
+" WHERE     gracc.t_grdealid = GRDEAL.T_ID " +
+"       AND grdeal.T_DOCKIND = 199 " +
+"       AND grdeal.t_templnum = 75 " +
+"       AND gracc.t_accnum = 5 " +
+"       AND gracc.t_state = 1 " +
+"       AND grdeal.t_docid NOT IN " +
+"              (SELECT loadfrval1.t_dealid " +
+"                 FROM DDVNLOADFRVAL_DBT loadfrval1 " +
+"                WHERE LOADFRVAL1.T_DATEFRVAL = " +
+"                         (SELECT MAX (loadfrval2.t_datefrval) " +
+"                            FROM DDVNLOADFRVAL_DBT loadfrval2 " +
+"                           WHERE loadfrval2.t_datefrval <= ?)) AND grdeal.t_plandate <= ? " ;
+
+ cmd = RSDCommand(sql);
+ cmd.AddParam("", rsdbp_in, dt);
+ cmd.AddParam("", rsdbp_in, dt);
+ rs = RSDRecordset(cmd);
+  while(rs.movenext())
+   if( DL_UpdateGrDealAcc( rs.value("t_dockind"), rs.value("t_docid"), -1, /*DLGR_TEMPL_FAIRVALUE*/ 75, DLGR_ACCKIND_REPOSITORY, date(0,0,0), DLGRACC_STATE_FACTEXEC/*DLGRACC_STATE_NOTNEED*/ ) != 0)
+//      return 1;
+   end;
+  end;
+end;
+/*DAN*/
+
+class RepDealParm(_DealId, _DealKind)
+    var DealID      = _DealId;
+    var DealKind    = _DealKind;
+END;
+
+private macro SaveErrForReport_XML( ID:integer, DocKind:integer )
+    var RepXML = "";
+    
+    if( RepErrArr.Size > 0 )
+        RepXML = IR_REPACC_ERROR_LOG_DATA_XML(DocKind, ID, RepErrArr, LOG_TYPE_ERROR).GetDataXML();
+    end;
+    
+    if( RepXML != "" )
+        var Header = DL_LOG_HEADER_XML(DocKind).GetHeaderXML();
+        var ir_op = tbfile("ir_op.dbt");
+        ir_op.rec.id = ID;
+        if( ir_op.geteq() )
+            var Oper = ir_op.rec.operator;
+            DL_InsertHeaderLog(ID, DocKind, {Oper}, Header);
+            DL_InsertLogXMLData(ID, DocKind, LOG_TYPE_ERROR, {Oper}, RepXML);
+        end;
+    end;
+    
+end;
+
+class RepAccDataTrn( ir_op:object, _execID, _conveyerID, _packetID, _isRecon )
+  var m_ir_op = TBFile("ir_op.dbt");
+  var m_isRecon = _isRecon;
+  var m_ReconMsgID = 0;
+  var m_SrvDocArr = TArray();  /*массив привязок строк графика к СОРУ*/
+  var m_execID, m_conveyerID, m_packetID;
+  var m_RepDataArr = TArray();
+  var arrsize = 0;
+  
+  /*вставка сформированных СРС */
+  macro insert()
+    var err = 0, i = 0;
+    var sql, cmd;
+
+    while(ir_cmArr.size > i)
+      if( not err )
+        err = ir_cmArr[i].insertAll();
+      end;
+
+      if (i == 0)
+        m_ReconMsgID = ir_cmArr[i].m_ReconMsgID;
+      end;
+      // Т.к. для каждого сообщение теперь есть свой объект (раньше это были массивы по типам сообщений),
+      // то данные для отчета у каждого сообщения будут храниться только в первом элементе массива
+      m_RepDataArr[m_RepDataArr.size] = ir_cmArr[i].m_RepDataArr[0];
+      i = i + 1;
+    end;
+
+    if( (not err) and (not m_isRecon) )
+      /*6. Изменяем статус вида учета РУ для обработанных строк графика*/
+      sql =  "DECLARE "
+      + "BEGIN "
+      + "  FOR one_gracc IN (";
+      if( m_packetID )
+        sql = sql 
+        + "SELECT gracc.*, grdeal.t_PlanDate"
+        + "  FROM ddlgracc_dbt gracc, ddlgrdeal_dbt grdeal "
+        + " WHERE gracc.t_ID IN (SELECT cnvdoc.t_ObjectID "
+        + "                        FROM dcnvdoc_dbt cnvdoc"
+        + "                       WHERE cnvdoc.t_ExecID = ? "
+        + "                         AND cnvdoc.t_ConvTypeID = ? "
+        + "                         AND cnvdoc.t_PackID = ? "
+        + "                         AND cnvdoc.t_ObjectType = 0 "
+        + "                      ) "
+        + "   AND grdeal.t_ID = gracc.t_GrDealID "
+        + "   AND gracc.t_State <> " + DLGRACC_STATE_FACTEXEC
+        + "   AND gracc.t_State <> " + DLGRACC_STATE_NOTNEED
+        + "   AND Exists(SELECT 1 FROM ddlgrdoc_dbt grdoc WHERE grdoc.t_GrDealID = gracc.t_GrDealID AND grdoc.t_DocKind = 0 AND grdoc.t_DocID = 0 AND grdoc.t_ServDocKind = ?  AND grdoc.t_ServDocID = ?)";
+      else
+        sql = sql
+        + "SELECT gracc.*, grdeal.t_PlanDate"
+        + "  FROM ddlgracc_dbt gracc, ddlgrdeal_dbt grdeal, ddlgrdoc_dbt grdoc "
+        + " WHERE grdoc.t_ServDocKind = ? "
+        + "   AND grdoc.t_ServDocID = ? "
+        + "   AND grdoc.t_DocKind = 0 "
+        + "   AND grdoc.t_DocID = 0 "
+        + "   AND gracc.t_GrDealID = grdoc.t_GrDealID "
+        + "   AND grdeal.t_ID = gracc.t_GrDealID "
+        + "   AND gracc.t_AccNum = " + DLGR_ACCKIND_REPOSITORY
+        + "   AND gracc.t_State <> " + DLGRACC_STATE_NOTNEED
+        + "   AND gracc.t_State <> " + DLGRACC_STATE_FACTEXEC;
+      end;
+      sql = sql
+      + "   ) LOOP "
+      
+      + " begin "
+          // вставляем запись в таблицу истории учета по графику
+      + " INSERT INTO DDLGRACCBC_DBT (T_ID, T_GRACCID, T_PLANDATE, T_FACTDATE, T_STATE, T_INSTANCE, T_ID_OPERATION, T_ID_STEP) "
+      + " VALUES (0, one_gracc.t_ID, one_gracc.t_PlanDate, one_gracc.t_FactDate, one_gracc.t_State, one_gracc.T_Instance, one_gracc.T_ID_Operation, one_gracc.T_ID_Step); "
+      
+      + " exception when others then continue; end; "
+      
+          // обновляем запись учета по графику
+      + " UPDATE  DDLGRACC_DBT "
+      + " SET t_FactDate = " + GetSQLDate(date(m_ir_op.rec.Date)) + ", "
+      + "     t_State = " + DLGRACC_STATE_FACTEXEC + ", "
+      + "     t_Instance = t_Instance + 1, "
+      + "     t_ID_Operation = " + m_ir_op.rec.ID + ", "
+      + "     t_ID_Step = 0 "
+      + " WHERE t_ID = one_gracc.T_ID; "
+      
+      + "  END LOOP; "
+      + "END; ";
+
+      cmd = RSDCommand(sql);
+
+      if( m_packetID )
+        cmd.addParam( "", RSDBP_IN, m_execID );
+        cmd.addParam( "", RSDBP_IN, m_conveyerID );
+        cmd.addParam( "", RSDBP_IN, m_packetID );
+        cmd.addParam( "", RSDBP_IN, m_ir_op.rec.DocKind );
+        cmd.addParam( "", RSDBP_IN, m_ir_op.rec.ID );
+      else
+        cmd.addParam( "", RSDBP_IN, m_ir_op.rec.DocKind );
+        cmd.addParam( "", RSDBP_IN, m_ir_op.rec.ID );
+      end;
+
+      cmd.execute(); 
+      DL_SaveDataForReport_XML(m_ir_op.rec.ID, m_ir_op.rec.DocKind, m_RepDataArr, LOG_TYPE_DATA);
+    end;
+
+    return err;
+    OnError(er)
+
+    var j = 0;
+    var Error = er.message;
+    RepErrArr[RepErrArr.size] = CIR_RepAccRepErr("", "", "", "", er.module + " " + er.line + " " + Error, "", "", 0);   // добавил "" 7-ым параметром
+    SaveErrForReport_XML( m_ir_op.rec.ID, m_ir_op.rec.DocKind );
+  end;
+
+  m_execID = _execID; 
+  m_conveyerID =_conveyerID; 
+  m_packetID = _packetID;
+  m_ir_op = ir_op;
+  m_RepDataArr.size = 0;
+end;
+
+macro DL_DeleteDataByOper_XML( ID:integer,TYPE:integer )
+    var qvery = "delete  from DDL_LOGDATA_DBT"
+    +"  where t_type = "+TYPE
+    +"  and t_logid ="
+    +"  (select t_id"
+    +"  from DDL_LOG_DBT "
+    +"  where t_dockind between 4851 and 4857 and t_docid = ?)";
+    
+    var cmd = RSDCommand(qvery);
+    cmd.addParam("", RSDBP_IN, ID);
+    cmd.Execute();
+end;
+
+macro ОшибкаSenderPartyName(Sender:@TrecHandler, DataSet, GenAgr, first:bool, error, field, MessageType, iParty, DealParmForReport)
+    var stat = 0;
+    var err = false;
+    if ((field == "PartyName") and
+        (error == "Для участника \"Информирующее лицо\" не задано краткое наименование участника репозитария"))
+        err=true;
+    end;
+    if (first or err)
+        Sender.rec.PartyName = GetPtShortName(iParty.rec.PartyID);
+        if( Sender.rec.PartyName == "" )
+            stat = 1;
+            RepErrArr[RepErrArr.size] = CIR_RepAccRepErr(DealParmForReport.DealID, DealParmForReport.DealKind, DataSet.DealCode, MessageType, "Для участника \"Информирующее лицо\" не задано краткое наименование участника репозитария", "PartyName", GetReportAction(DataSet.TemplNum), 200 + 37);
+        end;
+    end;
+    return stat;
+end;
+
+macro ОшибкаSenderPartyID1(Sender:@TrecHandler, DataSet, GenAgr, first:bool, error, field, MessageType, iParty, DealParmForReport)
+    var stat = 0;
+    var err = false;
+    if ((field == "PartyID1") and
+    (error=="Для участника \"Информирующее лицо\" не задан репозитарный идент. код"))
+        err=true;
+    end;
+    if(first or err)
+        Sender.rec.PartyID1 = ПолучитьКодСубъекта(Sender.rec.PartyID, PTCK_RIC);
+        if( Sender.rec.PartyID1 == "" )
+            stat = 1;
+            RepErrArr[RepErrArr.size] = CIR_RepAccRepErr(DealParmForReport.DealID, DealParmForReport.DealKind, DataSet.DealCode, MessageType, "Для участника \"Информирующее лицо\" не задан репозитарный идент. код", "PartyID1", GetReportAction(DataSet.TemplNum), 200 + 36);
+        end;
+    end;
+    return stat;
+end;
+
+macro ОшибкаSenderPartyID2(Sender:@TrecHandler, DataSet, GenAgr, first:bool, error, field, MessageType, iParty, DealParmForReport)
+    var stat = 0;
+    var err = false;
+    if ((field=="PartyID2") and
+    (error=="Для участника \"Информирующее лицо\" не задан код LEI"))
+        err=true;
+    end;
+    if (first or err)
+        Sender.rec.PartyID2 = ПолучитьКодСубъекта(Sender.rec.PartyID, PTCK_LEI);
+        if( Sender.rec.PartyID2 == "" )
+            stat = 1;
+        RepErrArr[RepErrArr.size] = CIR_RepAccRepErr(DealParmForReport.DealID, DealParmForReport.DealKind, DataSet.DealCode, MessageType, "Для участника \"Информирующее лицо\" не задан код LEI", "PartyID2", GetReportAction(DataSet.TemplNum), 200 + 38);
+        else
+            Sender.rec.PartyID2 = "LEI_" + Sender.rec.PartyID2;
+        end;
+    end;
+    return stat;
+end;
+
+macro ОшибкаSender(Sender:@TrecHandler,DataSet, GenAgr,first:bool,error,field,MessageType, DealParmForReport)
+    var stat = 0;
+    var err = false;
+    var iParty = TRecHandler("party");
+    if (Index( error, "Для участника \"Информирующее лицо\"" ) and
+        ((field == "PartyName")or
+         (field == "PartyID2") or  
+         (field == "PartyID1") or
+         (field == "PartyID")))
+        err=true
+    end;
+    if (first or err)
+        if (first or (field == "PartyID"))
+            Sender.rec.PartyID = DataSet.REPORTER_BANK;
+        end;
+        if( (Sender.rec.PartyID > 0) and (ПолучитьСубъекта(Sender.rec.PartyID, iParty) == 0) )
+            stat = stat + ОшибкаSenderPartyName(Sender, DataSet, GenAgr, first, error, field, MessageType, iParty, DealParmForReport);
+            stat = stat + ОшибкаSenderPartyID1(Sender, DataSet, GenAgr, first, error, field, MessageType, iParty, DealParmForReport);
+            stat = stat + ОшибкаSenderPartyID2(Sender, DataSet, GenAgr, first, error, field, MessageType, iParty, DealParmForReport);
+        else
+            stat = 1;
+            RepErrArr[RepErrArr.size] = CIR_RepAccRepErr(DealParmForReport.DealID, DealParmForReport.DealKind, DataSet.DealCode, MessageType, "Не найден участник \"Информирующее лицо\"", "PartyID", GetReportAction(DataSet.TemplNum), 200 + 36);
+        end;
+    end;
+    return stat;
+end;
+
+macro ОшибкаUTIGeneratingPartyID2(UTIGeneratingParty:@TrecHandler, DataSet, GenAgr, first:bool, error, field, MessageType, iParty, DealParmForReport)
+    var stat = 0;
+    var err = false;
+    if ((field == "PartyID2") and
+        (error == "Для участника \"Лицо, формирующее UTI код\" не задан код LEI"))
+        err = true;
+    end;
+    if(first or err)
+        UTIGeneratingParty.rec.PartyID2 = ПолучитьКодСубъекта(UTIGeneratingParty.rec.PartyID, PTCK_LEI);
+        if( UTIGeneratingParty.rec.PartyID2 == "" )
+            stat = 1;
+        RepErrArr[RepErrArr.size] = CIR_RepAccRepErr(DealParmForReport.DealID, DealParmForReport.DealKind, DataSet.DealCode, MessageType, "Для участника \"Лицо, формирующее UTI код\" не задан код LEI", "PartyID2", GetReportAction(DataSet.TemplNum), 200 + 41);
+        else
+            UTIGeneratingParty.rec.PartyID2 = "LEI_" + UTIGeneratingParty.rec.PartyID2;
+        end;
+    end;
+    return stat;
+end;
+
+macro ОшибкаUTIGeneratingPartyID1(UTIGeneratingParty:@TrecHandler, DataSet, GenAgr, first:bool, error, field, MessageType, iParty, DealParmForReport)
+    var stat = 0;
+    var err = false;
+    if ((field == "PartyID1") and (error == "Для участника \"Лицо, формирующее UTI код\" не задан репозитарный идент. код"))
+        err = true;
+    end;
+    if(first or err)
+        UTIGeneratingParty.rec.PartyID1 = ПолучитьКодСубъекта(UTIGeneratingParty.rec.PartyID, PTCK_RIC);
+        if( UTIGeneratingParty.rec.PartyID1 == "" )
+            if( ВидСубъекта(UTIGeneratingParty.rec.PartyID, PTK_REPOSPRT) )
+                stat = 1;
+            RepErrArr[RepErrArr.size] = CIR_RepAccRepErr(DealParmForReport.DealID, DealParmForReport.DealKind, DataSet.DealCode, MessageType, "Для участника \"Лицо, формирующее UTI код\" не задан репозитарный идент. код", "PartyID1", GetReportAction(DataSet.TemplNum), 200 + 39);
+            else
+                UTIGeneratingParty.rec.PartyID1 = "NONREF";
+            end;
+        end;
+    end;
+    return stat;
+end;
+
+macro ОшибкаUTIGeneratingPartyName(UTIGeneratingParty:@TrecHandler, DataSet, GenAgr, first:bool, error, field, MessageType, iParty, DealParmForReport)
+    var stat = 0;
+    var err = false;
+    if ((field=="PartyName") and (error=="Для участника \"Лицо, формирующее UTI код\" не задано ни краткое наименование участника репозитария, ни полное наименование"))
+        err = true;
+    end;
+    UTIGeneratingParty.rec.PartyName = GetPtShortName(iParty.rec.PartyID);
+    if( UTIGeneratingParty.rec.PartyName == "" )
+        UTIGeneratingParty.rec.PartyName = iParty.rec.Name;
+    end;
+    if( UTIGeneratingParty.rec.PartyName == "" )
+        stat = 1;
+        RepErrArr[RepErrArr.size] = CIR_RepAccRepErr(DealParmForReport.DealID, DealParmForReport.DealKind, DataSet.DealCode, MessageType, "Для участника \"Лицо, формирующее UTI код\" не задано ни краткое наименование участника репозитария, ни полное наименование", "PartyName", GetReportAction(DataSet.TemplNum), 200 + 40);
+    end;
+    return stat;
+end;
+
+macro ОшибкаUTIGeneratingParty(UTIGeneratingParty:@TrecHandler, DataSet, GenAgr, first:bool, error, field, MessageType, DealParmForReport)
+    var stat = 0;
+    var err = false;
+    var iParty = TRecHandler("party");
+    if ( Index( error, "Для участника \"Лицо, формирующее UTI код\"" ) and 
+         ((field=="PartyName") or
+        (field=="PartyID2") or  
+        (field=="PartyID1") or
+        (field=="PartyID")))
+        err = true;
+    end;
+    if (first or err)
+        if (first or (field=="PartyID"))
+            if ( DataSet.CREATOR_UTI == 1 ) // Банк
+            UTIGeneratingParty.rec.PartyID = {OurBank};
+            else
+                UTIGeneratingParty.rec.PartyID = DataSet.Contractor;
+            end;
+        end;
+        if( (UTIGeneratingParty.rec.PartyID > 0) and (ПолучитьСубъекта(UTIGeneratingParty.rec.PartyID, iParty) == 0) )
+            stat = stat + ОшибкаUTIGeneratingPartyName(UTIGeneratingParty, DataSet, GenAgr, first, error, field, MessageType, iParty, DealParmForReport);
+            stat = stat + ОшибкаUTIGeneratingPartyID1(UTIGeneratingParty, DataSet, GenAgr, first, error, field, MessageType, iParty, DealParmForReport);
+            stat = stat + ОшибкаUTIGeneratingPartyID2(UTIGeneratingParty, DataSet, GenAgr, first, error, field, MessageType, iParty, DealParmForReport);
+        else
+            stat = 1;
+            RepErrArr[RepErrArr.size] = CIR_RepAccRepErr(DealParmForReport.DealID, DealParmForReport.DealKind, DataSet.DealCode, MessageType, "Не найден участник \"Лицо, формирующее UTI код\"", "PartyID", GetReportAction(DataSet.TemplNum), 200 + 39);
+        end;
+    end;
+    return stat;
+end;
+
+macro ОшибкаTradeRepositoryPartyID2(TradeRepository:@TrecHandler, DataSet, GenAgr, first:bool, error, field, MessageType, iParty, DealParmForReport)
+    var stat = 0;
+    var err = false;
+    if ((field == "PartyID2")and
+        (error == "Для участника \"Репозитарий\" не задан код LEI"))
+        err = true;
+    end;
+    if (first or err)
+        TradeRepository.rec.PartyID2 = ПолучитьКодСубъекта(TradeRepository.rec.PartyID, PTCK_LEI);
+        if ( TradeRepository.rec.PartyID2 == "" )
+            stat = 1;
+        RepErrArr[RepErrArr.size] = CIR_RepAccRepErr(DealParmForReport.DealID, DealParmForReport.DealKind, DataSet.DealCode, MessageType, "Для участника \"Репозитарий\" не задан код LEI", "PartyID2", GetReportAction(DataSet.TemplNum), 200 + 10);
+        else
+            TradeRepository.rec.PartyID2 = "LEI_" + TradeRepository.rec.PartyID2;
+        end;    
+    end;
+    return stat;
+end;
+
+macro ОшибкаTradeRepositoryPartyID1(TradeRepository:@TrecHandler, DataSet, GenAgr, first:bool, error, field, MessageType, iParty, RepositaryCodeRIC, DealParmForReport)
+    var stat = 0;
+    var err = false;
+    if (field)
+        err = true;
+    end;
+    if (first or err)
+        TradeRepository.rec.PartyID1 = RepositaryCodeRIC;
+        if( TradeRepository.rec.PartyID1 == "" )
+            stat = 1;
+            RepErrArr[RepErrArr.size] = CIR_RepAccRepErr(DealParmForReport.DealID, DealParmForReport.DealKind, DataSet.DealCode, MessageType, "Для участника \"Репозитарий\" не задан репозитарный идент. код", "PartyID1", GetReportAction(DataSet.TemplNum), 200 + 8);
+        end;
+    end;
+    return stat;
+end;
+
+macro ОшибкаTradeRepositoryPartyName(TradeRepository:@TrecHandler, DataSet, GenAgr, first:bool, error, field, MessageType, iParty, DealParmForReport)
+    var stat = 0;
+    var err = false;
+    if ((field == "PartyName") and
+        (error == "Для участника \"Репозитарий\" не задано краткое наименование участника репозитария"))
+        err = true;
+    end;
+    if ( first or err )
+        TradeRepository.rec.PartyName = GetPtShortName(iParty.rec.PartyID);      
+        if ( TradeRepository.rec.PartyName == "" )
+            stat = 1;
+            RepErrArr[RepErrArr.size] = CIR_RepAccRepErr(DealParmForReport.DealID, DealParmForReport.DealKind, DataSet.DealCode, MessageType, "Для участника \"Репозитарий\" не задано краткое наименование участника репозитария", "PartyName", GetReportAction(DataSet.TemplNum), 200 + 9);
+        end;
+    end;
+    return stat;
+end;
+
+macro ОшибкаTradeRepository(TradeRepository:@TrecHandler, DataSet, GenAgr, first:bool, error, field, MessageType, RepositaryID, RepositaryCodeRIC, DealParmForReport)
+    var stat = 0;
+    var err = false;
+    var iParty = TRecHandler("party");
+    if (((Index(error, "Для участника \"Репозитарий\"") == 0) and
+        ((field == "PartyName")or
+         (field == "PartyID2") or  
+         (field == "PartyID1"))) or
+         (Index(error, "Не найден участник \"Репозитарий\"") and (field == "PartyID")) )
+        err = true
+    end;
+    if(first or err)
+        if (first or (field == "PartyID"))
+           TradeRepository.rec.PartyID = RepositaryID;
+        end;
+        if ( (TradeRepository.rec.PartyID > 0) and (ПолучитьСубъекта(TradeRepository.rec.PartyID, iParty) == 0) )
+            stat = stat + ОшибкаTradeRepositoryPartyName(TradeRepository, DataSet, GenAgr, first, error, field, MessageType, iParty, DealParmForReport);
+            stat = stat + ОшибкаTradeRepositoryPartyID1(TradeRepository, DataSet, GenAgr, first, error, field, MessageType, iParty, RepositaryCodeRIC, DealParmForReport);
+            stat = stat + ОшибкаTradeRepositoryPartyID2(TradeRepository, DataSet, GenAgr, first, error, field, MessageType, iParty, DealParmForReport);
+        else
+            stat = 1;
+            RepErrArr[RepErrArr.size] = CIR_RepAccRepErr(DealParmForReport.DealID, DealParmForReport.DealKind, DataSet.DealCode, MessageType, "Не найден участник \"Репозитарий\"", "PartyID", GetReportAction(DataSet.TemplNum), 200 + 8);
+        end;
+    end;
+    return stat;
+end;
+
+macro ОшибкаParty1PartyID1(Party1:@TrecHandler, DataSet, GenAgr, first:bool, error, field, MessageType, iParty, DealParmForReport)
+    var stat=0;
+    var err=false;
+    if((field=="PartyID1")and
+    ((error=="Для участника \"Банк\" не задан репозитарный идент. код")or
+    (error=="Для участника \"Контрагент\" не задан репозитарный идент. код")))
+        err=true;
+    end;
+    if(first or err)
+        if( Party1.rec.PartyID == {OurBank} ) // Банк
+            if (Party1.rec.PartyID1 == "")
+                Party1.rec.PartyID1 = DataSet.REPOZID_BANK;
+            end;
+            if( Party1.rec.PartyID1 == "" )
+                stat = 1;
+                RepErrArr[RepErrArr.size] = CIR_RepAccRepErr(DealParmForReport.DealID, DealParmForReport.DealKind, DataSet.DealCode, MessageType, "Для участника \"Банк\" не задан репозитарный идент. код", "PartyID1", GetReportAction(DataSet.TemplNum), 200 + 14);
+            end;
+        else
+            Party1.rec.PartyID1 = ПолучитьКодСубъекта(Party1.rec.PartyID, PTCK_RIC);
+            if( Party1.rec.PartyID1 == "" )
+                if( ВидСубъекта(Party1.rec.PartyID, PTK_REPOSPRT) )
+                    stat = 1;
+                    RepErrArr[RepErrArr.size] = CIR_RepAccRepErr(DealParmForReport.DealID, DealParmForReport.DealKind, DataSet.DealCode, MessageType, "Для участника \"Контрагент\" не задан репозитарный идент. код", "PartyID1", GetReportAction(DataSet.TemplNum), 200 + 14);
+                else
+                    Party1.rec.PartyID1 = "NONREF";
+                end;
+            end;
+        end;
+    end;
+    return stat;
+end;
+    
+macro ОшибкаParty1PartyID2(Party1:@TrecHandler, DataSet, GenAgr, first:bool, error, field, MessageType, iParty, ir_generalinf, DealParmForReport)
+    var stat=0;
+    var err=false;
+    if((field=="PartyID2")and
+    ((error=="Для участника \"Банк\" не задан код LEI")or
+     (error=="Для участника \"Контрагент\" не задан код LEI")or
+     (error=="Для участника \"Контрагент\" юр. лица не заданы ни LEI, ни INN")or
+     (error=="Для участника \"Контрагент\" нерезидента не задан ни один код")))
+        err=true;
+    end;
+    if(first or err)
+        if( Party1.rec.PartyID == {OurBank} ) // Банк
+            Party1.rec.PartyID2 = ПолучитьКодСубъекта(Party1.rec.PartyID, PTCK_LEI);
+            if( Party1.rec.PartyID2 == "" )
+                stat = 1;
+                RepErrArr[RepErrArr.size] = CIR_RepAccRepErr(DealParmForReport.DealID, DealParmForReport.DealKind, DataSet.DealCode, MessageType, "Для участника \"Банк\" не задан код LEI", "PartyID2", GetReportAction(DataSet.TemplNum), 200 + 16);
+            else
+                Party1.rec.PartyID2 = "LEI_" + Party1.rec.PartyID2;
+            end;
+        else
+            stat = stat + ПолучитьPartyID2Контрагента(Party1, iParty, DataSet, GenAgr, ir_generalinf, 200 + 16, DealParmForReport);
+        end;
+    end;
+    return stat;
+end;
+
+macro ОшибкаParty1ClassificationID(Party1:@TrecHandler, DataSet, GenAgr, first:bool, error, field, MessageType, iParty, DealParmForReport)
+    var stat = 0;
+    var err = false;
+    if ((field == "Classification") and
+       (((error == "Для участника \"Банк\" в ГС (ПГС) не задан параметр \"Вид экономической деятельности\"") and (GenAgr.Side1 == 1)) or
+        ((error == "Для участника \"Контрагент\" в ГС (ПГС) не задан параметр \"Вид экономической деятельности\"") and (GenAgr.Side1 == 2))))
+        err=true;
+    end;
+    if (first or err)
+        if ( Party1.rec.PartyID == {OurBank} ) // Банк
+            Party1.rec.ClassificationID = GenAgr.EconomicBank;
+            if ( Party1.rec.ClassificationID <= 0 )
+                stat = 1;
+                RepErrArr[RepErrArr.size] = CIR_RepAccRepErr(DealParmForReport.DealID, DealParmForReport.DealKind, DataSet.DealCode, MessageType, "Для участника \"Банк\" в ГС (ПГС) не задан параметр \"Вид экономической деятельности\"", "Classification", GetReportAction(DataSet.TemplNum), 200 + 17);
+            else
+                DL_GetObjAttrName(OBJTYPE_PARTY, 80, Party1.rec.ClassificationID, null, null, @Party1.rec.Classification);
+            end;
+        else
+            Party1.rec.ClassificationID = GenAgr.EconomicContr;
+            if( Party1.rec.ClassificationID <= 0 )
+                stat = 1;
+                RepErrArr[RepErrArr.size] = CIR_RepAccRepErr(DealParmForReport.DealID, DealParmForReport.DealKind, DataSet.DealCode, MessageType, "Для участника \"Контрагент\" в ГС (ПГС) не задан параметр \"Вид экономической деятельности\"", "Classification", GetReportAction(DataSet.TemplNum), 200 + 17);
+            else
+                DL_GetObjAttrName(OBJTYPE_PARTY, 80, Party1.rec.ClassificationID, null, null, @Party1.rec.Classification);
+            end;
+        end;
+    end;
+    return stat;
+end;
+    
+macro ОшибкаParty1Country(Party1:@TrecHandler, DataSet, GenAgr, first:bool, error, field, MessageType, iParty, DealParmForReport)
+    var stat = 0;
+    var err = false;
+    if((field == "Country")and
+       (error == "Для участника \"Контрагент\" в справочнике не указана страна"))
+        err=true;
+    end;
+    if(first or err)
+        if( iParty.rec.NotResident == UNSET_CHAR )
+            Party1.rec.Country = "RU";
+        else
+            var Adress = TRecHandler("adress.dbt");
+            Adress.Clear();
+            if( НайтиЮридическийАдресСубъекта(iParty.rec.PartyID, Adress) and (Adress.rec.Country != "") )
+                Party1.rec.Country = DL_GetCountryByCodeLat3(Adress.rec.Country).CodeLat2;
+            end;
+            if( НайтиАдресСубъекта(iParty.rec.PartyID, PTADDR_REAL, Adress) and  (Adress.rec.Country != ""))
+               Party1.rec.Country = DL_GetCountryByCodeLat3(Adress.rec.Country).CodeLat2;
+            end;
+
+            if( Party1.rec.Country == "" )
+                stat = 1;
+                RepErrArr[RepErrArr.size] = CIR_RepAccRepErr(DealParmForReport.DealID, DealParmForReport.DealKind, DataSet.DealCode, MessageType, "Для участника \"Контрагент\" в справочнике не указана страна", "Country", GetReportAction(DataSet.TemplNum), 200 + 19);
+            end;
+        end;
+    end;
+    return stat;
+end;
+    
+macro ОшибкаParty1PartyName(Party1:@TrecHandler, DataSet, GenAgr, first:bool, error, field, MessageType, iParty, DealParmForReport)
+    var stat = 0;
+    var err = false;
+    if((field=="PartyName") and
+    ((error=="Для участника \"Банк\" не задано краткое наименование участника репозитария") or
+    (error=="Для участника \"Контрагент\" не задано краткое наименование участника репозитария")))
+        err=true;
+    end;
+    if(first or err)
+        Party1.rec.PartyName = GetPtShortName(iParty.rec.PartyID);
+        if( Party1.rec.PartyName == "" )
+            stat = 1;
+            RepErrArr[RepErrArr.size] = CIR_RepAccRepErr(DealParmForReport.DealID, DealParmForReport.DealKind, DataSet.DealCode, MessageType, "Для участника \"" + IIF(Party1.rec.PartyID == {OurBank}, "Банк", "Контрагент") + "\" не задано краткое наименование участника репозитария", "PartyName", GetReportAction(DataSet.TemplNum), 200 + 15);
+        end;
+    end;
+    return stat;
+end;
+
+macro ОшибкаParty1_(Party1:@TrecHandler, DataSet, GenAgr, first:bool, error, field, MessageType, iParty, ir_generalinf, DealParmForReport)
+    var stat = 0;
+    if(first or 
+        ((error=="Не найден участник \"Party2\"")or
+        (error=="Для участника \"Банк\" не задано краткое наименование участника репозитария")or
+        (error=="Для участника \"Контрагент\" не задано краткое наименование участника репозитария")or
+        (error=="Для участника \"Контрагент\" в справочнике не указана страна")or
+        (error=="Для участника \"Контрагент\" в ГС (ПГС) не задан параметр \"Вид экономической деятельности\"")or
+        (error=="Для участника \"Банк\" в ГС (ПГС) не задан параметр \"Вид экономической деятельности\"")or
+        (error=="Для участника \"Банк\" не задан код LEI")or
+        (error=="Для участника \"Контрагент\" не задан код LEI")or
+        (error=="Для участника \"Контрагент\" юр. лица не заданы ни LEI, ни INN")or
+        (error=="Для участника \"Контрагент\" нерезидента не задан ни один код")or
+        (error=="Для участника \"Банк\" не задан репозитарный идент. код")or
+        (error=="Для участника \"Контрагент\" не задан репозитарный идент. код")))
+        if(first)
+            if( ir_generalinf.rec.Bulk == UNSET_CHAR )
+                if( GenAgr.Side1 == 1 ) // Банк
+                    Party1.rec.PartyID = {OurBank};
+                else
+                    Party1.rec.PartyID = DataSet.Contractor;
+                end;
+            else
+                Party1.rec.PartyID = {OurBank};
+            end;
+        end;
+        
+        if( (Party1.rec.PartyID > 0) and (ПолучитьСубъекта(Party1.rec.PartyID, iParty) == 0))
+            stat = stat + ОшибкаParty1PartyName(Party1,DataSet, GenAgr, first, error, field, MessageType, iParty, DealParmForReport);
+            stat = stat + ОшибкаParty1PartyID1(Party1, DataSet, GenAgr, first, error, field, MessageType, iParty, DealParmForReport);
+            stat = stat + ОшибкаParty1PartyID2(Party1, DataSet, GenAgr, first, error, field, MessageType, iParty, ir_generalinf, DealParmForReport);
+            stat = stat + ОшибкаParty1ClassificationID(Party1, DataSet, GenAgr, first, error, field, MessageType, iParty, DealParmForReport);
+
+            if( Party1.rec.PartyID == {OurBank} ) // Банк
+                Party1.rec.OrganizationType = "L";
+            else
+                if( iParty.rec.LegalForm == PTLEGF_PERSN )
+                    Party1.rec.OrganizationType = "P";
+                else
+                    Party1.rec.OrganizationType = "L";
+                end;
+            end;
+            stat = stat + ОшибкаParty1Country(Party1, DataSet, GenAgr, first, error, field, MessageType, iParty, ir_generalinf, DealParmForReport);
+        elif ( ir_generalinf.rec.Bulk == UNSET_CHAR )
+            stat = 1;
+            RepErrArr[RepErrArr.size] = CIR_RepAccRepErr(DealParmForReport.DealID, DealParmForReport.DealKind, DataSet.DealCode, MessageType, "Не найден участник \"Party1\"", "PartyID", GetReportAction(DataSet.TemplNum), 200 + 14);
+        end;
+    end;
+    return stat;
+end;
+
+macro ОшибкаParty2PartyID1(Party2:@TrecHandler, DataSet, GenAgr, first:bool, error, field, MessageType, iParty, DealParmForReport)
+    var stat=0;
+    var err=false;
+    if((field=="PartyID1")and
+    ((error=="Для участника \"Банк\" не задан репозитарный идент. код")or
+    (error=="Для участника \"Контрагент\" не задан репозитарный идент. код")))
+        err=true;
+    end;
+    if(first or err)
+        if( Party2.rec.PartyID == {OurBank} ) // Банк
+            Party2.rec.PartyID1 = DataSet.REPOZID_BANK;
+            
+/*DAN*/     if( Party2.rec.PartyID1 == "" )
+             Party2.rec.PartyID1 = "RP0134700001";
+            end;
+            if( Party2.rec.PartyID1 == "" )
+                stat = 1;
+                RepErrArr[RepErrArr.size] = CIR_RepAccRepErr(DealParmForReport.DealID, DealParmForReport.DealKind, DataSet.DealCode, MessageType, "Для участника \"Банк\" не задан репозитарный идент. код", "PartyID1", GetReportAction(DataSet.TemplNum), 200 + 25);
+            end;
+        else
+            Party2.rec.PartyID1 = ПолучитьКодСубъекта(Party2.rec.PartyID, PTCK_RIC);
+            if( Party2.rec.PartyID1 == "" )
+                if( ВидСубъекта(Party2.rec.PartyID, PTK_REPOSPRT) )
+                    stat = 1;
+                    RepErrArr[RepErrArr.size] = CIR_RepAccRepErr(DealParmForReport.DealID, DealParmForReport.DealKind, DataSet.DealCode, MessageType, "Для участника \"Контрагент\" не задан репозитарный идент. код", "PartyID1", GetReportAction(DataSet.TemplNum), 200 + 25);
+                else
+                    Party2.rec.PartyID1 = "NONREF";
+                end;
+            end;
+        end;
+    end;
+    return stat;
+end;
+
+macro ОшибкаParty2PartyID2(Party2:@TrecHandler, DataSet, GenAgr, first:bool, error, field, MessageType, iParty, ir_generalinf, DealParmForReport)
+    var stat = 0;
+    var err = false;
+    if((field=="PartyID2") and
+    ((error=="Для участника \"Банк\" не задан код LEI") or
+     (error=="Для участника \"Контрагент\" не задан код LEI") or
+     (error=="Для участника \"Контрагент\" юр. лица не заданы ни LEI, ни INN") or
+     (error=="Для участника \"Контрагент\" нерезидента не задан ни один код")))
+        err=true;
+    end;
+    if(first or err)
+        if( Party2.rec.PartyID == {OurBank} ) // Банк
+            Party2.rec.PartyID2 = ПолучитьКодСубъекта(Party2.rec.PartyID, PTCK_LEI);
+            if( Party2.rec.PartyID2 == "" )
+                stat = 1;
+                RepErrArr[RepErrArr.size] = CIR_RepAccRepErr(DealParmForReport.DealID, DealParmForReport.DealKind, DataSet.DealCode, ir_generalinf.rec.MessageType, "Для участника \"Банк\" не задан код LEI", "PartyID2", GetReportAction(DataSet.TemplNum), 200 + 27);
+            else
+                Party2.rec.PartyID2 = "LEI_" + Party2.rec.PartyID2;
+            end;
+        else
+            stat = stat + ПолучитьPartyID2Контрагента(Party2, iParty, DataSet, GenAgr, ir_generalinf, 200 + 27, DealParmForReport);
+        end;
+    end;
+    return stat;
+end;
+    
+macro ОшибкаParty2ClassificationID(Party2:@TrecHandler, DataSet, GenAgr, first:bool, error, field, MessageType, iParty, DealParmForReport)
+    var stat = 0;
+    var err = false;
+    if((field == "Classification") and
+      (((error == "Для участника \"Банк\" в ГС (ПГС) не задан параметр \"Вид экономической деятельности\"") and (GenAgr.Side2 == 1)) or
+       ((error == "Для участника \"Контрагент\" в ГС (ПГС) не задан параметр \"Вид экономической деятельности\"") and (GenAgr.Side2 == 2))))
+        err = true;
+    end;
+    if(first or err)
+        if( Party2.rec.PartyID == {OurBank} ) // Банк
+            Party2.rec.ClassificationID = GenAgr.EconomicBank;
+            if( Party2.rec.ClassificationID <= 0 )
+                stat = 1;
+                RepErrArr[RepErrArr.size] = CIR_RepAccRepErr(DealParmForReport.DealID, DealParmForReport.DealKind, DataSet.DealCode, MessageType, "Для участника \"Банк\" в ГС (ПГС) не задан параметр \"Вид экономической деятельности\"", "Classification", GetReportAction(DataSet.TemplNum), 200 + 28);
+            else
+                DL_GetObjAttrName(OBJTYPE_PARTY, 80, Party2.rec.ClassificationID, null, null, @Party2.rec.Classification);
+            end;
+        else
+            Party2.rec.ClassificationID = GenAgr.EconomicContr;
+            if( Party2.rec.ClassificationID <= 0 )
+                stat = 1;
+                RepErrArr[RepErrArr.size] = CIR_RepAccRepErr(DealParmForReport.DealID, DealParmForReport.DealKind, DataSet.DealCode, MessageType, "Для участника \"Контрагент\" в ГС (ПГС) не задан параметр \"Вид экономической деятельности\"", "Classification", GetReportAction(DataSet.TemplNum), 200 + 28);
+            else
+                DL_GetObjAttrName(OBJTYPE_PARTY, 80, Party2.rec.ClassificationID, null, null, @Party2.rec.Classification);
+            end;
+        end;
+    end;
+    return stat;
+end;
+    
+macro ОшибкаParty2Country(Party2:@TrecHandler, DataSet, GenAgr, first:bool, error, field, MessageType, iParty, DealParmForReport)
+    var stat = 0;
+    var err = false;
+    if((field == "Country") and
+       (error == "Для участника \"Контрагент\" в справочнике не указана страна"))
+        err = true;
+    end;
+    if(first or err)
+        if( iParty.rec.NotResident == UNSET_CHAR )
+            Party2.rec.Country = "RU";
+        else
+            var Adress = TRecHandler("adress.dbt");
+            Adress.Clear();
+            if( НайтиЮридическийАдресСубъекта(iParty.rec.PartyID, Adress) and (Adress.rec.Country != "") )
+                Party2.rec.Country = DL_GetCountryByCodeLat3(Adress.rec.Country).CodeLat2;
+            end;
+            if( НайтиАдресСубъекта(iParty.rec.PartyID, PTADDR_REAL, Adress) and  (Adress.rec.Country != ""))
+               Party2.rec.Country = DL_GetCountryByCodeLat3(Adress.rec.Country).CodeLat2;
+            end;
+
+            if( Party2.rec.Country == "" )
+                stat = 1;
+                RepErrArr[RepErrArr.size] = CIR_RepAccRepErr(DealParmForReport.DealID, DealParmForReport.DealKind, DataSet.DealCode, MessageType, "Для участника \"Контрагент\" в справочнике не указана страна", "Country", GetReportAction(DataSet.TemplNum), 200 + 30);
+            end;
+        end;
+    end;
+    return stat;
+end;
+    
+macro ОшибкаParty2PartyName(Party1:@TrecHandler, DataSet, GenAgr, first:bool, error, field, MessageType, iParty, DealParmForReport)
+    var stat = 0;
+    var err = false;
+    if((field == "PartyName") and
+      ((error == "Для участника \"Банк\" не задано краткое наименование участника репозитария") or
+       (error == "Для участника \"Контрагент\" не задано краткое наименование участника репозитария")))
+        err = true;
+    end;
+    if(first or err)
+        if (GenAgr.contrnotreport == set_char)
+            Party1.rec.PartyName = GetPtShortName(iParty.rec.PartyID,2); 
+        else
+        Party1.rec.PartyName = GetPtShortName(iParty.rec.PartyID);
+        end; 
+        if( Party1.rec.PartyName == "" )
+            stat = 1;
+            RepErrArr[RepErrArr.size] = CIR_RepAccRepErr(DealParmForReport.DealID, DealParmForReport.DealKind, DataSet.DealCode, MessageType, "Для участника \"" + IIF(Party1.rec.PartyID == {OurBank}, "Банк", "Контрагент") + "\" не задано краткое наименование участника репозитария", "PartyName", GetReportAction(DataSet.TemplNum), 200 + 26);
+        end;
+    end;
+    return stat;
+end;
+
+macro ОшибкаParty2_(Party2:@TrecHandler, DataSet, GenAgr, first:bool, error, field, MessageType, iParty, ir_generalinf, DealParmForReport)
+    var stat = 0;
+    if(first or 
+        ((error == "Не найден участник \"Party2\"")and
+        ( error == "Для участника \"Банк\" не задано краткое наименование участника репозитария")or
+        ( error == "Для участника \"Контрагент\" не задано краткое наименование участника репозитария")or
+        ( error == "Для участника \"Контрагент\" в справочнике не указана страна")or
+        ( error == "Для участника \"Банк\" в ГС (ПГС) не задан параметр \"Вид экономической деятельности\"")or
+        ( error == "Для участника \"Контрагент\" в ГС (ПГС) не задан параметр \"Вид экономической деятельности\"")or
+        ( error == "Для участника \"Банк\" не задан код LEI")or
+        ( error == "Для участника \"Контрагент\" не задан код LEI")or
+        ( error == "Для участника \"Контрагент\" юр. лица не заданы ни LEI, ни INN")or
+        ( error == "Для участника \"Контрагент\" нерезидента не задан ни один код")or
+        ( error == "Для участника \"Банк\" не задан репозитарный идент. код")or
+        ( error == "Для участника \"Контрагент\" не задан репозитарный идент. код")))
+        if (first)
+            if( ir_generalinf.rec.Bulk == UNSET_CHAR )
+                if( GenAgr.Side2 == 1 ) // Банк
+                    Party2.rec.PartyID = {OurBank};
+                else
+                    Party2.rec.PartyID = DataSet.Contractor;
+                end;
+            else
+                if( DataSet.GenAgrID <= 0 )
+                    Party2.rec.PartyID = -1;
+                    Party2.rec.PartyID1 = "NONREF";
+                    Party2.rec.PartyID2 = "NONREF";
+                else
+                    Party2.rec.PartyID = DataSet.Contractor;
+                end;
+            end;
+        end;
+
+        if( (Party2.rec.PartyID > 0) and (ПолучитьСубъекта(Party2.rec.PartyID, iParty) == 0))
+            stat = stat + ОшибкаParty2PartyName(Party2, DataSet, GenAgr, first, error, field, MessageType, iParty, DealParmForReport);
+            stat = stat + ОшибкаParty2PartyID1(Party2, DataSet, GenAgr, first, error, field, MessageType, iParty, DealParmForReport);
+            stat = stat + ОшибкаParty2PartyID2(Party2, DataSet, GenAgr, first, error, field, MessageType, iParty, ir_generalinf, DealParmForReport);
+            stat = stat + ОшибкаParty2ClassificationID(Party2, DataSet, GenAgr, first, error, field, MessageType, iParty, DealParmForReport);
+
+            if( Party2.rec.PartyID == {OurBank} ) // Банк
+                Party2.rec.OrganizationType = "L";
+            else
+                if( iParty.rec.LegalForm == PTLEGF_PERSN )
+                    Party2.rec.OrganizationType = "P";
+                else
+                    Party2.rec.OrganizationType = "L";
+                end;
+            end;
+            stat = stat + ОшибкаParty2Country(Party2, DataSet, GenAgr, first, error, field, MessageType, iParty, ir_generalinf, DealParmForReport);
+        elif ( ir_generalinf.rec.Bulk == UNSET_CHAR )
+            stat = 1;
+            RepErrArr[RepErrArr.size] = CIR_RepAccRepErr(DealParmForReport.DealID, DealParmForReport.DealKind, DataSet.DealCode, MessageType, "Не найден участник \"Party2\"", "PartyID", GetReportAction(DataSet.TemplNum), 200 + 25);
+        end;
+    end;
+    return stat;
+end;
+
+private macro GetRStatus(ir_generalinf:@TrecHandler, stat, isRecon)
+    if( stat == 0 )
+        if ( (ValType(isRecon) != V_UNDEF) and isRecon )
+            ir_generalinf.rec.RStatus = 12/*Сверочное*/;
+            ir_generalinf.rec.RStatusName = Bnk_GetNameAlg(ALG_GENINF_RSTATUS, 12);
+        else
+            ir_generalinf.rec.RStatus = 1/*Подготовлено*/;
+            ir_generalinf.rec.RStatusName = Bnk_GetNameAlg(ALG_GENINF_RSTATUS, 1);
+        end;
+    else
+        ir_generalinf.rec.RStatus = 2/*Ошибка подготовки*/;
+        ir_generalinf.rec.RStatusName = Bnk_GetNameAlg(ALG_GENINF_RSTATUS, 2);
+    end;
+end;
+
+PRIVATE MACRO GetGeneralAgreementData( GenAgrID:integer, PartyID:integer )
+    var query, cmd, DataSet;
+    cmd = DL_RSDCommand();
+    
+    query = "SELECT pt.t_PartyID, "
+          + "       NVL(GenAgr.t_GenAgrID, 0) AS GenAgrID, "
+          + "       NVL(GenAgr.t_Code, CHR(1)) AS Code, "
+          + "       NVL(GenAgr.t_NumRepoz, CHR(1)) AS NumRepoz, "
+          + "       NVL(GenAgr.t_Num_CSA_Repoz, CHR(1)) AS NumCSARepoz, "
+          + "       NVL(GenAgr.t_Side1, 0) AS Side1, "
+          + "       NVL(GenAgr.t_Side2, 0) AS Side2, "
+          + "       NVL(GenAgr.t_ScanCopy, CHR(1)) AS ScanCopy, "
+          + "       NVL(GenAgr.t_SignConnect, chr(0)) AS SignConnect, "
+          + "       NVL(GenAgr.t_Contr_NotReport, chr(0)) AS ContrNotReport, "
+          + "       NVL(GenAgr.t_Num_CSA_Contr, CHR(1)) AS NumCSAContr, "
+          + "       NVL(GenAgr.t_Num_CSA_Bank, CHR(1)) AS NumCSABank, "
+          + "       NVL(GenAgr.t_Economic_Bank, 0) AS EconomicBank, "
+          + "       NVL(GenAgr.t_Economic_Contr, 0) AS EconomicContr, "
+          + "       NVL(GenAgr.T_PSEUDOGA, CHR(0)) AS PGA, "
+          + "       NVL(GenAgr.T_NUMREPOZ, chr(1)) AS NUMREPOZ, "
+          + "       NVL(GenAgr.t_Type_GS, 0) AS Type, "
+          + "       NVL(GenAgr.t_Version_GS, 0) AS Version, "
+          + "       NVL(GenAgr.t_AuthorForm, 0) AS AuthorForm, "
+          + "       NVL(GenAgr.t_SpecificationForm, chr(1)) AS SpecificationForm, "
+          + "       NVL(GenAgr.t_ReasonTermination, chr(1)) AS ReasonTermination, "
+          + "       NVL(GenAgr.t_SenderSideFR, 0) AS SenderSide, "
+          + "       NVL(GenAgr.t_NumContr, 0) AS NumContr "
+          + "  FROM ddl_genagr_dbt GenAgr, dparty_dbt pt "
+          + " WHERE pt.t_PartyID = ? AND GenAgr.t_PartyID(+) = pt.t_PartyID AND ";
+    
+    cmd.AddParam(PartyID);
+    if ( GenAgrID > 0 )
+        query = query + "GenAgr.t_GenAgrID(+) = ? ";
+        cmd.AddParam(GenAgrID);
+    else
+        query = query + "GenAgr.t_PseudoGA(+) = 'X'";
+    end;
+    
+    DataSet = cmd.Execute(query);
+    DataSet.moveNext();
+    return DataSet;
+END;
+
+macro AddToIrArr( IrCM )
+  ir_cmArr[ir_cmArr.size] = IrCM;
+end;
+
+PRIVATE MACRO CheckWithRequest(repaccdata:@variant, TemplNum, GrDealID, prevGrDealID, ir_op, isRecon, messageSendingMode, DealParmForReport, MessageCode, DealCode)
+  var sql  = "";
+  var cmd;
+  if ( (not messageSendingMode) AND 
+       ((TemplNum == DLGR_TEMPL_MAKEDEALWTHREQUEST) OR
+       (TemplNum == DLGR_TEMPL_CHANGEMSGWTHREQUEST) OR
+       (TemplNum == DLGR_TEMPL_CLOSECONTRWTHREQUEST) OR
+       (TemplNum == DLGR_TEMPL_EXECDELAYMSGWTHREQUEST) OR
+       (TemplNum == DLGR_TEMPL_EXECHOLDMSGWTHREQUEST) OR
+       (TemplNum == DLGR_TEMPL_EARLYEXECMSGWTHREQUEST) OR
+       (TemplNum == DLGR_TEMPL_REJECTIONMSGWTHREQUEST) OR
+       (TemplNum == DLGR_TEMPL_NETTINGSUSPWTHREQUEST) OR
+       (TemplNum == DLGR_TEMPL_MAKECONTRACTWTHREQUEST)))
+      if( (not isRecon) )
+          /*6. Изменяем статус вида учета РУ для обработанных строк графика*/
+          sql =  "DECLARE "
+          + "BEGIN "
+          + "  FOR one_gracc IN ("
+          + "SELECT gracc.*, grdeal.t_PlanDate"
+          + "  FROM ddlgracc_dbt gracc, ddlgrdeal_dbt grdeal"
+          + " WHERE grdeal.t_ID  = " + GrDealID
+          + "   AND gracc.t_GrDealID = grdeal.t_ID "
+          + "   AND gracc.t_AccNum = " + DLGR_ACCKIND_REPOSITORY
+          + "   AND gracc.t_State <> " + DLGRACC_STATE_FACTEXEC
+          + "   AND gracc.t_State <> " + DLGRACC_STATE_NOTNEED
+          + "   ) LOOP "
+          
+          + " begin "
+              // вставляем запись в таблицу истории учета по графику
+          + " INSERT INTO DDLGRACCBC_DBT (T_ID, T_GRACCID, T_PLANDATE, T_FACTDATE, T_STATE, T_INSTANCE, T_ID_OPERATION, T_ID_STEP) "
+          + " VALUES (0, one_gracc.t_ID, one_gracc.t_PlanDate, one_gracc.t_FactDate, one_gracc.t_State, one_gracc.T_Instance, one_gracc.T_ID_Operation, one_gracc.T_ID_Step); "
+          
+          + " exception when others then continue; end; "
+          
+              // обновляем запись учета по графику
+          + " UPDATE  DDLGRACC_DBT "
+          + " SET t_FactDate = " + GetSQLDate(date(ir_op.rec.Date)) + ", "
+          + "     t_State = " + DLGRACC_STATE_NOTNEED + ", "
+          + "     t_Instance = t_Instance + 1, "
+          + "     t_ID_Operation = " + ir_op.rec.ID + ", "
+          + "     t_ID_Step = 0 "
+          + " WHERE t_ID = one_gracc.T_ID; "
+          
+          + "  END LOOP; "
+          + "END; ";
+          
+          cmd = RSDCommand(sql);
+          
+          cmd.execute(); 
+
+          if( prevGrDealID != GrDealID ) 
+              var no_msg = NOMSG(ir_op);
+              AddToIrArr( no_msg );
+              ir_cmArr[ir_cmArr.size - 1].SetGrDealID(GrDealID);
+          end;
+
+          ir_cmArr[ir_cmArr.size - 1].m_RepDataArr[repaccdata.m_RepDataArr.size] = CIR_RepAccRepParm(
+                              GetReportAction(TemplNum),
+                              DealCode,
+                              MessageCode,
+                              "Без создания сообщения",
+                              DealParmForReport.DealID, 
+                              DealParmForReport.DealKind);
+          return 1;
+      end;
+  end;
+  return 0;
+END;
+
+// /**************************************************************/
+PRIVATE MACRO GetRepAccData( repaccdata:@variant, _taskID, _execID, _conveyerID, _operationID, _packetID, ir_op, forceTemplate, DealDate, PayDate1, PayDate2, Netting, GenAgrID, DealID, Kind, PartyID, side1, side2, DateTO, RepContr, GroupNumber )
+  var ir_generalinf = TRecHandler("ir_generalinf.dbt");
+  var TradeRepository = TRecHandler("ir_party.dbt");
+  var Party1 = TRecHandler("ir_party.dbt");
+  var Party2 = TRecHandler("ir_party.dbt");
+  var UTIGeneratingParty = TRecHandler("ir_party.dbt");
+  var Sender = TRecHandler("ir_party.dbt");
+  var CounterParty = TRecHandler("ir_party.dbt");
+  var Instruments = TRecHandler("ir_instruments.dbt");
+  
+  var err = 0;
+  var query, cmd, DataSet;
+  var cnt = 0, i = 0;
+  var prevGrDealID = 0;
+  var RepositaryID = null, RepositaryCodeRIC = "";
+  var Adress = TRecHandler("adress.dbt");
+  var iParty = TRecHandler("party");
+  var Country:string = "";
+  var first = true, firstInGroup = true, error = "", field = "";
+  var m_isRecon = ValType(forceTemplate) == V_INTEGER;
+  var messageSendingMode = false;
+  var ir_cm;
+  ir_cmArr.size = 0;
+  GetRegistryValue("РЕПОЗИТАРИЙ\\ОБРАБОТКА ВХОДЯЩИХ СООБЩЕНИЙ", V_BOOL, @messageSendingMode, null);
+  cmd = DL_RSDCommand();
+
+  if( _packetID )
+      query = "with cnvdoc as (select * from dcnvdoc_dbt where t_ExecID = ? and t_ConvTypeID = ? and t_PackID = ?)";
+      cmd.AddParam(_execID);
+      cmd.AddParam(_conveyerID);
+      cmd.AddParam(_packetID);
+  else
+      if( _conveyerID == IR_REPACC_SVODSRS )
+        query =  "with cnvdoc as ("+GetRepAccObjectQuerySvod(ir_op, DealDate, PayDate1, PayDate2, Netting, GenAgrID)+")";
+        var queryDate, cmdDate, DataSetDate;
+        cmdDate = DL_RSDCommand();
+        
+        queryDate = "SELECT Max( rq.t_PlanDate) DateTO from ddlrq_dbt rq, (" + GetRepAccObjectQuerySvod(ir_op, DealDate, PayDate1, PayDate2, Netting, GenAgrID) + ") q2  Where rq.t_docId = q2.t_DealID and rq.t_docKind = q2.t_Kind ";
+        DataSetDate = cmdDate.Execute(queryDate);
+        if(DataSetDate.moveNext())
+          MaxDateTO = DataSetDate.DateTO;
+        end;
+      elif( _conveyerID == IR_REPACC_SVODSRS093  )
+        query =  "with cnvdoc as ("+GetRepAccObjectQuerySvod093(ir_op, DealID, Kind, PartyID, side1, side2, DateTO, RepContr, forceTemplate)+")";
+
+      elif( _conveyerID == IR_REPACC_SRS_GA )
+        query =  "with cnvdoc as ("+GetRepAccObjectQueryGA(ir_op, forceTemplate)+")";
+      elif( _conveyerID == IR_REPACC_SRS094 )
+        query =  "with cnvdoc as ("+GetRepAccObjectQueryCM094(ir_op, GenagrID, DateTO, PartyID)+")";
+      elif( _conveyerID == IR_REPACC_SRS092 )
+        query =  "with cnvdoc as ("+GetRepAccObjectQueryCSA(ir_op, DealID)+")";
+      else
+        query =  "with cnvdoc as ("+GetRepAccObjectQuery(ir_op, IIF(m_isRecon, DLGR_TEMPL_RECONCILIATION, forceTemplate))+")";     
+      end;
+  end;
+  if ( _conveyerID == IR_REPACC_SRS_GA )
+    GAmsg = true;
+    query = query + " select grdeal.t_TemplNum as TemplNum, "
+                  + "        grdeal.t_PlanDate as PlanDate, "
+                  + "        grdeal.t_ID as GrDealID, "
+                  + "        grdeal.t_DocID as GenAgrID, "
+                  + "        ga.t_PartyID as Contractor, "
+                  + "        ga.t_CodeRepo as DealCode, "
+                  + "        ga.t_Date_GenAgr as DealDate, "
+                  + "        (case when grdeal.t_TemplNum = " + DLGR_TEMPL_CLOSECONTR + " " 
+                  + "              then (select tm1.t_XMLProduct from dir_typesmessage_dbt tm1 where tm1.t_MessageCode(+) = 'CM011') "
+                  + "              else tm.t_XMLProduct  "
+                  + "        end ) AS XMLProduct, "
+                  + "        (case when grdeal.t_TemplNum = " + DLGR_TEMPL_CLOSECONTR + " " 
+                  + "              then (select tm1.t_XMLName from dir_typesmessage_dbt tm1 where tm1.t_MessageCode(+) = 'CM011') "
+                  + "              else tm.t_XMLName "
+                  + "        end ) AS XMLType, "
+                  + "        (case when grdeal.t_TemplNum = " + DLGR_TEMPL_CLOSECONTR + " then 'CM011' "
+                  + "                                                                     else rd.t_MessageCode "
+                  + "        end ) as MessageCode, "
+                  + "        rd.* "
+                  + "   from cnvdoc, "
+                  + "        ddlgracc_dbt gracc, "
+                  + "        ddlgrdeal_dbt grdeal, "
+                  + "        ddl_repozdeal_dbt rd, "
+                  + "        dir_typesmessage_dbt tm, "
+                  + "        ddl_genagr_dbt ga "
+                  + "  where     cnvdoc.t_ObjectType = 0 "
+                  + "        and gracc.t_ID = cnvdoc.t_ObjectID "
+                  + "        and grdeal.t_ID = gracc.t_GrDealID "
+                  + "        and ga.t_GenAgrID = grdeal.t_DocID "
+                  + "        and rd.t_DocKind = grdeal.t_DocKind "
+                  + "        and rd.t_DocID = grdeal.t_DocID "
+                  + "        and 1 = (case when(ga.t_pseudoGA != chr(88) and ga.t_reporting = CHR(88)) then 1 else 0 end) "
+                  + "        and tm.t_MessageCode(+) = rd.t_MessageCode "
+                  + " order by GrDealID ";
+  else
+    GAmsg = false;
+    query = query + " select grdeal.t_TemplNum as TemplNum, "           
+                  + "        grdeal.t_PlanDate as PlanDate, "
+                  + "        grdeal.t_ID as GrDealID, "
+                  + "        td.t_DocID, "
+                  + "        td.t_DocKind, "
+                  + "        td.t_Code AS DealCode, "
+                  + "        td.t_GenAgrID, "
+                  + "        td.t_Date AS DealDate, "
+                  + "        td.t_Client, "
+                  + "        td.t_Contractor, "
+                  + "        td.t_isPFI, "
+                  + "        tm.t_XMLProduct, "
+                  + "        tm.t_XMLName as XMLType, "
+                  + "        rd.* "
+                  + "   from cnvdoc, "
+                  + "        ddlgracc_dbt gracc, "
+                  + "        ddlgrdeal_dbt grdeal, "
+                  + "        dv_irdeal td, "
+                  + "        ddl_repozdeal_dbt rd, "
+                  + "        dir_typesmessage_dbt tm, "
+                  + "        ddl_genagr_dbt ga "
+                  + "  where     cnvdoc.t_ObjectType = 0 "
+                  + "        and gracc.t_ID   = cnvdoc.t_ObjectID "
+                  + "        and grdeal.t_ID  = gracc.t_GrDealID "
+                  + "        and td.t_DocKind = grdeal.t_DocKind "
+                  + "        and td.t_DocID   = grdeal.t_DocID  "
+                  + "        and rd.t_DocKind = grdeal.t_DocKind "
+                  + "        and rd.t_DocID   = grdeal.t_DocID "
+                  + "        and 1 = (case when(td.t_genagrid > 0 and ga.t_genagrid = td.t_genagrid and ga.t_pseudoGA != chr(88) and ga.t_reporting = CHR(88)) then 1 "
+                  + "        when (td.t_genagrid <= 0 and ga.t_genagrid = 1) then 1 else 0 end) "
+                  + "        and tm.t_MessageCode (+)= rd.t_MessageCode "
+                  + "        and tm.t_Generate_report = chr(88)"                                              
+                  + " order by GrDealID ";
+  end;
+  if(( _packetID == 0 ))
+      cnt = cmd.GetCount(query);
+      if(cnt)
+          InitProgress( cnt, "Идет выполнение операции...", "Репозитарный учет" );
+      end;
+  end;
+  DataSet = cmd.Execute(query);
+  var GenAgr = null;
+  while( DataSet.moveNext() )
+    var FD = null;
+    var stat = 0;
+    var IsPartyClient = UNSET_CHAR;
+    var KindDealPartyClient = -1;
+    var DealParmForReport;
+
+    if( DataSet.DocKind == DL_SECURITYDOC )
+      FD = SPFirstDoc(LEG_KIND_DL_TICK, DataSet.DocID);
+      IsPartyClient = FD.tick.rec.IsPartyClient;
+      KindDealPartyClient = FD.tick.rec.KindDealPartyClient;
+    elif( (DataSet.DocKind == DL_DVNDEAL) or (DataSet.DocKind == DL_DVDEALT3) or (DataSet.DocKind == DL_DVFXDEAL))
+      FD = DVFirstDocNDeal(DataSet.DocKind, DataSet.DocID);
+      KindDealPartyClient = FD.Deal.rec.KindDealPartyClient;
+    elif( DataSet.DocKind == DV_CSA )
+      FD = DVFirstCSA(sql_ConvTypeInteger(DataSet.DocKind), DataSet.DocID);
+    /*else
+        continue;*/
+    end;
+
+    if(_conveyerID != IR_REPACC_SRS_GA)
+      DealParmForReport = RepDealParm(DataSet.DocID, DataSet.DocKind);
+    else
+      DealParmForReport = RepDealParm("", "");
+    end;
+
+    GenAgr = GetGeneralAgreementData( DataSet.GenAgrID, DataSet.Contractor );
+
+    if( RepositaryID == null )
+      RepositaryID = DL_GetPartyWithOwn(PTK_REPOSITARY);
+      RepositaryCodeRIC = ПолучитьКодСубъекта(RepositaryID, PTCK_RIC);
+    end;
+
+    if( (i == 0) or (_conveyerID == IR_REPACC_SRS) or (_conveyerID == IR_REPACC_SRS_GA) or (_conveyerID == IR_REPACC_SRS094) or
+        ((_conveyerID == IR_REPACC_SRS092) and (ir_op.rec.Setting_Date_Select_MP == IR_SENDING_BILL_MESSAGESMP_EVENT_DATE))) // для сводного для всей пачки один generalinf
+      if (CheckWithRequest(repaccdata, DataSet.TemplNum, DataSet.GrDealID, prevGrDealID, ir_op, m_isRecon, messageSendingMode, DealParmForReport, DataSet.MessageCode, DataSet.DealCode))
+        continue;
+      end;
+      ir_generalinf.Clear();
+      TradeRepository.Clear();
+/*DAN*/
+            TradeRepository.rec.PartyType = "TradeRepository"; // !?
+      TradeRepository.rec.PartyKind = IR_PARTY_KIND_TRADEREPOSITORY;
+      Party1.Clear();
+            Party1.rec.PartyType = "Party1"; // !?
+      Party1.rec.PartyKind = IR_PARTY_KIND_PARTY1;
+      Party2.Clear();
+            Party2.rec.PartyType = "Party2"; // !?
+      Party2.rec.PartyKind = IR_PARTY_KIND_PARTY2;
+      UTIGeneratingParty.Clear();
+            UTIGeneratingParty.rec.PartyType = "UTIGeneratingParty"; // !?
+      UTIGeneratingParty.rec.PartyKind = IR_PARTY_KIND_UTIGENERATINGPARTY;
+      Sender.Clear();
+            Sender.rec.PartyType = "Sender"; // !?
+      Sender.rec.PartyKind = IR_PARTY_KIND_SENDER;
+
+      if( (DataSet.TemplNum == DLGR_TEMPL_MAKEDEAL) OR
+          (DataSet.TemplNum == DLGR_TEMPL_MAKEDEALWTHREQUEST) OR
+          (DataSet.TemplNum == DLGR_TEMPL_MAKECONTRACT) OR
+          (DataSet.TemplNum == DLGR_TEMPL_MAKECONTRACTWTHREQUEST) OR
+          (DataSet.TemplNum == DLGR_TEMPL_CHANGEMSG) OR
+          (DataSet.TemplNum == DLGR_TEMPL_CHANGEMSGWTHREQUEST) OR
+          (DataSet.TemplNum == DLGR_TEMPL_BULKREPORT) OR
+          (DataSet.TemplNum == DLGR_TEMPL_REVALUATION_FAIRVALUE) OR
+          (DataSet.TemplNum == DLGR_TEMPL_CSA_MARGIN_PAYMENT) OR
+          (DataSet.TemplNum == DLGR_TEMPL_MAKEDEAL_CORRECTION) OR
+          (DataSet.TemplNum == DLGR_TEMPL_MAKECONTRACT_CORRECTION) OR
+          (DataSet.TemplNum == DLGR_TEMPL_RECONCILIATION) OR
+          ( ( not (DataSet.TemplNum < DLGR_TEMPL_CLOSECONTR) ) AND ( not (DataSet.TemplNum > DLGR_TEMPL_NETTINGSUSPWTHREQUEST) ) )
+        )
+
+        stat = stat + ЗаполнениеGenInf(@ir_generalinf,
+                                       DataSet,
+                                       messageSendingMode,
+                                       GenAgr,
+                                       first,
+                                       error,
+                                       field,
+                                       forceTemplate,
+                                       DealParmForReport,
+                                       ir_op,
+                                       FD,
+                                       MaxDateTO,
+                                       KindDealPartyClient,
+                                       IsPartyClient,
+                                       firstInGroup,
+                                       @err);
+
+          /*if(ValType(forceTemplate) == V_INTEGER)   // сверка
+              ir_generalinf.rec.correlationID = "";
+              var cmd2 = RsdRecordset("SELECT DISTINCT gif.T_CorrelationID FROM dir_generalinf_dbt gif, ddlgrdoc_dbt grdoc"
+                + " WHERE grdoc.t_grdealid IN (SELECT deal.t_id FROM ddlgrdeal_dbt deal WHERE"
+                    + " deal.t_dockind = " + DataSet.DocKind
+                    + " AND deal.t_docid = " + DataSet.DocID + ")" 
+                + " AND grdoc.t_dockind = " + REPOS_RECONCILIATION
+                + " AND gif.t_InternalMessageID = grdoc.t_docid" 
+                + " AND gif.t_Rstatus <> 8 AND gif.t_messagetype = 'RM005'");
+              if(cmd2.MoveNext())
+                ir_generalinf.rec.correlationID = cmd2.value(0);
+              end;
+          end; */
+        // Заполнение субъектов
+        // TradeRepository
+        iParty.Clear();
+        stat = stat + ОшибкаTradeRepository(TradeRepository, DataSet, GenAgr, first, error, field, ir_generalinf.rec.MessageType, RepositaryID, RepositaryCodeRIC, DealParmForReport);
+
+        // Party1
+        iParty.Clear();
+        stat = stat + ОшибкаParty1_(Party1, DataSet, GenAgr, first, error, field, ir_generalinf.rec.MessageType, iParty,ir_generalinf, DealParmForReport);
+
+        // Party2
+        iParty.Clear();
+        stat = stat + ОшибкаParty2_(Party2, DataSet, GenAgr, first, error, field, ir_generalinf.rec.MessageType, iParty,ir_generalinf, DealParmForReport);
+
+        // UTIGeneratingParty
+        if( not (ir_generalinf.rec.MessageType == "CM093") and 
+            not (ir_generalinf.rec.MessageType == "CM094") and 
+            not (ir_generalinf.rec.MessageType == "CM092") and 
+            not (ir_generalinf.rec.MessageType == "CM083"))
+            stat = stat + ОшибкаUTIGeneratingParty(UTIGeneratingParty, DataSet, GenAgr, first, error,field, ir_generalinf.rec.MessageType, DealParmForReport);
+        end;                                    
+        // Sender
+        stat = stat + ОшибкаSender(Sender, DataSet, GenAgr, first, error, field, ir_generalinf.rec.MessageType, DealParmForReport);
+      end;
+    end;
+
+    var cm;
+
+    // Если у сообщения нет вкладки "Экономические параметры", то дополнить это условие
+    if((ir_generalinf.rec.MessageType != "CM010") AND (ir_generalinf.rec.MessageType != "CM011"))
+      cm = TRecHandler("ir_" + ir_generalinf.rec.MessageType + ".dbt");
+      cm.clear();
+    end;
+
+    if(ir_generalinf.rec.MessageType == "CM010")
+      ir_cm = CM010(ValType(forceTemplate) == V_INTEGER, _conveyerID, ir_op);
+      ir_cm.m_MessageType = ir_generalinf.rec.MessageType;
+      stat = stat + ir_cm.ЗаполнениеCM(ir_generalinf, GenAgr);
+      GetRStatus(ir_generalinf, stat, ValType(forceTemplate) == V_INTEGER);
+      ir_cm.addCMAll(ir_generalinf,
+                     TradeRepository,
+                     Party1,
+                     Party2,
+                     UTIGeneratingParty,
+                     Sender,
+                     DataSet.GrDealID,
+                     DataSet.TemplNum,
+                     DealParmForReport);
+
+    elif( ir_generalinf.rec.MessageType == "CM011" )
+      ir_cm = CM011(ValType(forceTemplate) == V_INTEGER, _conveyerID, ir_op);
+      ir_cm.m_MessageType = ir_generalinf.rec.MessageType;
+      stat = stat + ir_cm.ЗаполнениеCM(ir_generalinf, GenAgr);
+      GetRStatus(ir_generalinf, stat, ValType(forceTemplate) == V_INTEGER);
+      ir_cm.addCMAll(ir_generalinf,         
+                     TradeRepository,
+                     Party1,
+                     Party2,
+                     UTIGeneratingParty,
+                     Sender,
+                     DataSet.GrDealID,
+                     DataSet.TemplNum,
+                     DealParmForReport);
+
+    elif( ir_generalinf.rec.MessageType == "CM021" )
+      ir_cm = CM021(ValType(forceTemplate) == V_INTEGER, _conveyerID, ir_op);
+      ir_cm.m_MessageType = ir_generalinf.rec.MessageType;
+      stat = stat + ir_cm.ЗаполнениеCM(@cm, DataSet, GenAgr, FD);
+      GetRStatus(ir_generalinf, stat, ValType(forceTemplate) == V_INTEGER);
+      ir_cm.addCMAll(ir_generalinf,
+                     TradeRepository,
+                     Party1,
+                     Party2,
+                     UTIGeneratingParty,
+                     Sender,
+                     cm,
+                     DataSet.GrDealID,
+                     DataSet.TemplNum,
+                     DealParmForReport,
+                     CounterParty);
+
+    elif( ir_generalinf.rec.MessageType == "CM022" )
+      ir_cm = CM022(ValType(forceTemplate) == V_INTEGER, _conveyerID, ir_op);
+      ir_cm.m_MessageType = ir_generalinf.rec.MessageType;
+      stat = stat + ir_cm.ЗаполнениеCM(@cm, DataSet, GenAgr, FD);
+      GetRStatus(ir_generalinf, stat, ValType(forceTemplate) == V_INTEGER);
+      ir_cm.addCMAll(ir_generalinf,
+                     TradeRepository,
+                     Party1,
+                     Party2,
+                     UTIGeneratingParty,
+                     Sender,
+                     cm,
+                     DataSet.GrDealID,
+                     DataSet.TemplNum,
+                     DealParmForReport,
+                     CounterParty);
+
+    elif( ir_generalinf.rec.MessageType == "CM023" )
+      ir_cm = CM023(ValType(forceTemplate) == V_INTEGER, _conveyerID, ir_op);
+      ir_cm.m_MessageType = ir_generalinf.rec.MessageType;
+      stat = stat + ir_cm.ЗаполнениеCM(@cm, DataSet, GenAgr, FD);
+      GetRStatus(ir_generalinf, stat, ValType(forceTemplate) == V_INTEGER);
+      ir_cm.addCMAll(ir_generalinf,
+                     TradeRepository,
+                     Party1,
+                     Party2,
+                     UTIGeneratingParty,
+                     Sender,
+                     cm,
+                     DataSet.GrDealID,
+                     DataSet.TemplNum,
+                     DealParmForReport,
+                     CounterParty);
+
+    elif( ir_generalinf.rec.MessageType == "CM032" )
+      ir_cm = CM032(ValType(forceTemplate) == V_INTEGER, _conveyerID, ir_op);
+      ir_cm.m_MessageType = ir_generalinf.rec.MessageType;
+      stat = stat + ir_cm.ЗаполнениеCM(@cm, DataSet, GenAgr, FD);
+      GetRStatus(ir_generalinf, stat, ValType(forceTemplate) == V_INTEGER);
+      ir_cm.addCMAll(ir_generalinf,
+                     TradeRepository,
+                     Party1,
+                     Party2,
+                     UTIGeneratingParty,
+                     Sender,
+                     cm,
+                     DataSet.GrDealID,
+                     DataSet.TemplNum,
+                     DealParmForReport,
+                     CounterParty);
+
+    elif( ir_generalinf.rec.MessageType == "CM041" )
+      ir_cm = CM041(ValType(forceTemplate) == V_INTEGER, _conveyerID, ir_op);
+      ir_cm.m_MessageType = ir_generalinf.rec.MessageType;
+      stat = stat + ir_cm.ЗаполнениеCM(@cm, DataSet, GenAgr, FD, first, field, @Instruments, DealParmForReport);
+      GetRStatus(ir_generalinf, stat, ValType(forceTemplate) == V_INTEGER);
+      ir_cm.addCMAll(ir_generalinf,
+                     TradeRepository,
+                     Party1,
+                     Party2,
+                     UTIGeneratingParty,
+                     Sender,
+                     cm,
+                     Instruments,
+                     DataSet.GrDealID,
+                     DataSet.TemplNum,
+                     DealParmForReport,
+                     CounterParty);
+
+    elif( ir_generalinf.rec.MessageType == "CM042" )
+      ir_cm = CM042(ValType(forceTemplate) == V_INTEGER, _conveyerID, ir_op);
+      ir_cm.m_MessageType = ir_generalinf.rec.MessageType;
+      stat = stat + ir_cm.ЗаполнениеCM(@cm, DataSet, GenAgr, FD, first, field, @Instruments, DealParmForReport);
+      GetRStatus(ir_generalinf, stat, ValType(forceTemplate) == V_INTEGER);
+      ir_cm.addCMAll(ir_generalinf,
+                     TradeRepository,
+                     Party1,
+                     Party2,
+                     UTIGeneratingParty,
+                     Sender,
+                     cm,
+                     Instruments,
+                     DataSet.GrDealID,
+                     DataSet.TemplNum,
+                     DealParmForReport,
+                     CounterParty);
+
+    elif( ir_generalinf.rec.MessageType == "CM043" )
+      ir_cm = CM043(ValType(forceTemplate) == V_INTEGER, _conveyerID, ir_op);
+      ir_cm.m_MessageType = ir_generalinf.rec.MessageType;
+      stat = stat + ir_cm.ЗаполнениеCM(@cm, DataSet, GenAgr, FD, first, field, @Instruments, DealParmForReport);
+      GetRStatus(ir_generalinf, stat, ValType(forceTemplate) == V_INTEGER);
+      ir_cm.addCMAll(ir_generalinf,
+                     TradeRepository,
+                     Party1,
+                     Party2,
+                     UTIGeneratingParty,
+                     Sender,
+                     cm,
+                     Instruments,
+                     DataSet.GrDealID,
+                     DataSet.TemplNum,
+                     DealParmForReport,
+                     CounterParty);
+
+    elif( ir_generalinf.rec.MessageType == "CM044" )
+      ir_cm = CM044(ValType(forceTemplate) == V_INTEGER, _conveyerID, ir_op);
+      ir_cm.m_MessageType = ir_generalinf.rec.MessageType;
+      stat = stat + ir_cm.ЗаполнениеCM(@cm, DataSet, GenAgr, FD, first, field, @Instruments, DealParmForReport);
+      GetRStatus(ir_generalinf, stat, ValType(forceTemplate) == V_INTEGER);
+      ir_cm.addCMAll(ir_generalinf,
+                     TradeRepository,
+                     Party1,
+                     Party2,
+                     UTIGeneratingParty,
+                     Sender,
+                     cm,
+                     Instruments,
+                     DataSet.GrDealID,
+                     DataSet.TemplNum,
+                     DealParmForReport,
+                     CounterParty);
+
+    elif( ir_generalinf.rec.MessageType == "CM045" )
+      ir_cm = CM045(ValType(forceTemplate) == V_INTEGER, _conveyerID, ir_op);
+      ir_cm.m_MessageType = ir_generalinf.rec.MessageType;
+      stat = stat + ir_cm.ЗаполнениеCM(@cm, DataSet, GenAgr, FD, first, field, @Instruments, DealParmForReport);
+      GetRStatus(ir_generalinf, stat, ValType(forceTemplate) == V_INTEGER);
+      ir_cm.addCMAll(ir_generalinf,
+                     TradeRepository,
+                     Party1,
+                     Party2,
+                     UTIGeneratingParty,
+                     Sender,
+                     cm,
+                     Instruments,
+                     DataSet.GrDealID,
+                     DataSet.TemplNum,
+                     DealParmForReport,
+                     CounterParty);
+
+    elif( ir_generalinf.rec.MessageType == "CM046" )
+      ir_cm = CM046(ValType(forceTemplate) == V_INTEGER, _conveyerID, ir_op);
+      ir_cm.m_MessageType = ir_generalinf.rec.MessageType;
+      stat = stat + ir_cm.ЗаполнениеCM(@cm, DataSet, GenAgr, FD, first, field, @Instruments, DealParmForReport);
+      GetRStatus(ir_generalinf, stat, ValType(forceTemplate) == V_INTEGER);
+      ir_cm.addCMAll(ir_generalinf,
+                     TradeRepository,
+                     Party1,
+                     Party2,
+                     UTIGeneratingParty,
+                     Sender,
+                     cm,
+                     Instruments,
+                     DataSet.GrDealID,
+                     DataSet.TemplNum,
+                     DealParmForReport,
+                     CounterParty);
+
+    elif( ir_generalinf.rec.MessageType == "CM048" )
+      ir_cm = CM048(ValType(forceTemplate) == V_INTEGER, _conveyerID, ir_op);
+      ir_cm.m_MessageType = ir_generalinf.rec.MessageType;
+      stat = stat + ir_cm.ЗаполнениеCM(@cm, DataSet, GenAgr, FD, first, field, @Instruments, DealParmForReport);
+      GetRStatus(ir_generalinf, stat, ValType(forceTemplate) == V_INTEGER);
+      ir_cm.addCMAll(ir_generalinf,
+                     TradeRepository,
+                     Party1,
+                     Party2,
+                     UTIGeneratingParty,
+                     Sender,
+                     cm,
+                     Instruments,
+                     DataSet.GrDealID,
+                     DataSet.TemplNum,
+                     DealParmForReport,
+                     CounterParty);
+
+    elif( ir_generalinf.rec.MessageType == "CM047" )
+        ir_cm = CM047(ValType(forceTemplate) == V_INTEGER, _conveyerID, ir_op);
+      ir_cm.m_MessageType = ir_generalinf.rec.MessageType;
+      stat = stat + ir_cm.ЗаполнениеCM(@cm, DataSet, GenAgr, FD, first, field, @Instruments, DealParmForReport);
+      GetRStatus(ir_generalinf, stat, ValType(forceTemplate) == V_INTEGER);
+      ir_cm.addCMAll(ir_generalinf,
+                     TradeRepository,
+                     Party1,
+                     Party2,
+                     UTIGeneratingParty,
+                     Sender,
+                     cm,
+                     Instruments,
+                     DataSet.GrDealID,
+                     DataSet.TemplNum,
+                     DealParmForReport,
+                     CounterParty);
+
+    elif( ir_generalinf.rec.MessageType == "CM051" )
+      ir_cm = CM051(ValType(forceTemplate) == V_INTEGER, _conveyerID, ir_op);
+      ir_cm.m_MessageType = ir_generalinf.rec.MessageType;
+      stat = stat + ir_cm.ЗаполнениеCM(@cm, DataSet, GenAgr, FD, first, field, DealParmForReport);
+      GetRStatus(ir_generalinf, stat, ValType(forceTemplate) == V_INTEGER);
+      ir_cm.addCMAll(ir_generalinf,
+                     TradeRepository,
+                     Party1,
+                     Party2,
+                     UTIGeneratingParty,
+                     Sender,
+                     cm,
+                     DataSet.GrDealID,
+                     DataSet.TemplNum,
+                     DealParmForReport,
+                     CounterParty);
+
+    elif( ir_generalinf.rec.MessageType == "CM053" )
+      ir_cm = CM053(ValType(forceTemplate) == V_INTEGER, _conveyerID, ir_op);
+      ir_cm.m_MessageType = ir_generalinf.rec.MessageType;
+      stat = stat + ir_cm.ЗаполнениеCM(@cm, DataSet, GenAgr, ir_cm.m_MessageType, FD, first, field, DealParmForReport);
+      GetRStatus(ir_generalinf, stat, ValType(forceTemplate) == V_INTEGER);
+      ir_cm.addCMAll(ir_generalinf,
+                     TradeRepository,
+                     Party1,
+                     Party2,
+                     UTIGeneratingParty,
+                     Sender,
+                     cm,
+                     DataSet.GrDealID,
+                     DataSet.TemplNum,
+                     DealParmForReport);
+
+    elif(ir_generalinf.rec.MessageType == "CM083")
+      if(firstInGroup)
+      ir_cm = CM083(ValType(forceTemplate) == V_INTEGER, _conveyerID, ir_op);
+      ir_cm.m_MessageType = ir_generalinf.rec.MessageType;
+          GetRStatus(ir_generalinf, stat, ValType(forceTemplate) == V_INTEGER);
+      end;
+      stat = stat + ir_cm.ЗаполнениеCM(@cm, DataSet, GenAgr, first, error, field, FD, @CounterParty, @ir_generalinf, @Instruments, i, DealParmForReport);
+      ir_cm.addCMAll(ir_generalinf,
+                     TradeRepository,
+                     Party1,
+                     Party2,
+                     NULL,
+                     Sender,
+                     cm,
+                     Instruments,
+                     DataSet.GrDealID,
+                     DataSet.TemplNum,
+                     DealParmForReport,
+                     CounterParty);
+
+    elif( ir_generalinf.rec.MessageType == "CM093" )
+      if (firstInGroup)
+      ir_cm = CM093(ValType(forceTemplate) == V_INTEGER, _conveyerID, ir_op);
+      ir_cm.m_MessageType = ir_generalinf.rec.MessageType;
+      stat = stat + ir_cm.ЗаполнениеCM(@cm, DataSet, GenAgr, first, error, field, FD, @ir_generalinf, i, DealParmForReport);
+      GetRStatus(ir_generalinf, stat, ValType(forceTemplate) == V_INTEGER);
+      ir_cm.addCMAll(ir_generalinf,
+                     TradeRepository,
+                     Party1,
+                     Party2,
+                     Sender,
+                     cm,
+                     Instruments,
+                     DataSet.GrDealID,
+                     DataSet.TemplNum,
+                     DealParmForReport);
+       else
+         stat = stat + ir_cm.ЗаполнениеCM(@cm, DataSet, GenAgr, first, error, field, FD, @ir_generalinf, i, DealParmForReport);
+         ir_cm.addCM(cm);
+         ir_cm.m_RepAccGrDocArr[ir_cm.arrsize] = TRecHandler("dlgrdoc.dbt");
+         ir_cm.m_RepAccGrDocArr[ir_cm.arrsize].Clear();
+         ir_cm.m_RepAccGrDocArr[ir_cm.arrsize].rec.GrDealID= 0;   //// поправить IR_REPACC_SVODSRS для нового конвейера
+         ir_cm.m_RepAccGrDocArr[ir_cm.arrsize].rec.DocKind = REPOS_GENERALINF;
+         ir_cm.m_RepAccGrDocArr[ir_cm.arrsize].rec.ServDocKind = ir_cm.m_ir_op.rec.DocKind;
+         ir_cm.m_RepAccGrDocArr[ir_cm.arrsize].rec.ServDocID   = ir_cm.m_ir_op.rec.ID;
+         ir_cm.addcmGrDoc(DataSet.GrDealID);
+       end;
+
+     elif(ir_generalinf.rec.MessageType == "CM094")
+       if (firstInGroup)
+         ir_cm = CM094(ValType(forceTemplate) == V_INTEGER, _conveyerID, ir_op);
+         var m_cm094ArrTmp = TArray();
+         var TradesTmp = TRecHandler("ir_trades.dbt");
+         TradesTmp.clear();
+         ir_cm.m_MessageType = ir_generalinf.rec.MessageType;
+       end;
+       stat = stat + ir_cm.ЗаполнениеCM(ir_op, m_cm094ArrTmp, @TradesTmp, DataSet, GenAgr, first, error, field, FD, ir_generalinf, i, DealParmForReport);
+       GetRStatus(ir_generalinf, stat, ValType(forceTemplate) == V_INTEGER);
+         ir_cm.addCMAll(ir_generalinf,
+                        TradeRepository,
+                        Party1,
+                        Party2,
+                        Sender,
+                        m_cm094ArrTmp,
+                       TradesTmp,
+                        DataSet.GrDealID,
+                        DataSet.TemplNum,
+                        DealParmForReport);
+        TradesTmp.rec.INTERNALMESSAGEID = ir_cm.M_MESSAGEID;               
+                       
+    elif(ir_generalinf.rec.MessageType == "CM092")
+        if(firstInGroup)
+      ir_cm = CM092(ValType(forceTemplate) == V_INTEGER, _conveyerID, ir_op);
+      ir_cm.m_MessageType = ir_generalinf.rec.MessageType;
+            GetRStatus(ir_generalinf, stat, ValType(forceTemplate) == V_INTEGER);
+        end;
+      stat = stat + ir_cm.ЗаполнениеCM(@cm, DataSet, GenAgr, first, error, field, FD, ir_generalinf, i, DealParmForReport);
+      ir_cm.addCMAll(ir_generalinf,
+                     TradeRepository,
+                     Party1,
+                     Party2,
+                     Sender,
+                     cm,
+                     DataSet.GrDealID,
+                     DataSet.TemplNum,
+                     DealParmForReport);                      
+     end;
+    //AddToIrArr(ir_cm);
+    if(firstInGroup)
+      ir_cmArr[ir_cmArr.size] = ir_cm;
+      if( GroupNumber )
+        firstInGroup = false;
+      end;
+    else
+      ir_cmArr[ir_cmArr.size - 1] = ir_cm;
+    end;
+
+    if( (not err) and (not m_isRecon) and (prevGrDealID != DataSet.GrDealID) )
+      ir_cmArr[ir_cmArr.size - 1].SetGrDealID(DataSet.GrDealID);
+    end;
+
+    prevGrDealID = DataSet.GrDealID;
+    i = i + 1;
+    if(cnt)
+      UseProgress(i);
+    end;
+  end;    // while
+
+  if(cnt)
+    RemProgress();
+  end;
+
+  // Сохранение данных при сверке 
+  if (m_isRecon)
+    var j = 0;
+    var m_RepDataArr = TArray();
+    while(ir_cmArr.size > j)
+      if (ir_cmArr[j].m_GeneralInfArr[0].rec.RStatus != 2) // Не учитываем ошибочные, т.к. сообщение сверочное не 
+        m_RepDataArr[m_RepDataArr.size] = CIR_RepAccRepParm(
+                            ir_cmArr[j].m_RepActionArr[0],
+                            ir_cmArr[j].m_GeneralInfArr[0].rec.DealCode,
+                            ir_cmArr[j].m_GeneralInfArr[0].rec.MessageType,
+                            DL_GetNameAlg(ALG_GENINF_RSTATUS, ir_cmArr[j].m_GeneralInfArr[0].rec.RStatus),
+                            ir_cmArr[j].m_RepDealParmArr[0].DealID, 
+                            ir_cmArr[j].m_RepDealParmArr[0].DealKind);
+      end;
+      j = j + 1;
+    end;
+    DL_SaveDataForReport_XML(ir_op.rec.ID, ir_op.rec.DocKind, m_RepDataArr, LOG_TYPE_DATA);
+    SaveErrForReport_XML( ir_op.rec.ID, ir_op.rec.DocKind );
+  end;
+
+  return IIF(m_isRecon, stat, err);
+END;
+
+private var repaccdata = NULL;
+
+private macro InsertTrn
+  if(repaccdata.insert() != 0)
+     AbortTrn;
+  end;
+end;
+
+private macro _ExecuteRepAcc( _taskID, _execID, _conveyerID, _operationID, _packetID, ir_op, forceTemplate, reconMessageID:@integer, DealDate, PayDate1, PayDate2, Netting, GenAgrID, DealID, DealKind, PartyID, side1, side2, DateTO, RepContr, GroupNumber )
+  var err = 0;
+
+  repaccdata = RepAccDataTrn(ir_op, _execID, _conveyerID, _packetID, ValType(forceTemplate) == V_INTEGER);
+  err = GetRepAccData(@repaccdata, _taskID, _execID, _conveyerID, _operationID, _packetID, ir_op, forceTemplate, DealDate, PayDate1, PayDate2, Netting, GenAgrID, DealID, DealKind, PartyID, side1, side2, DateTO, RepContr, GroupNumber);
+  if( (not err) and (ValType(repaccdata) != V_UNDEF))
+        RslDefCon.BeginTrans();
+        if(repaccdata.insert() != 0)
+            RslDefCon.RollbackTrans();
+        else
+            RslDefCon.CommitTrans();
+    end;
+        // if( ProcessTrn(null, "InsertTrn") != true)
+        //    err = 1;
+        // end;
+    end;
+  
+    if ( ValType(reconMessageID) != V_UNDEF )
+      reconMessageID = repaccdata.m_ReconMsgID;
+    end;
+  
+    return err;
+end;
+
+macro ExecuteRepAcc( _taskID, _execID, _conveyerID, _operationID, _packetID, _Params )
+    var ir_op = TBFile("ir_op.dbt");
+    var err = 0;
+
+    RepErrArr.size = 0;
+    if( _Params.ID > 0 )
+        ReplaceMacro("msgbox", "RepAcc_msgbox");
+        
+        ir_op.rec.ID = _Params.ID;
+        if( ir_op.GetEQ() )
+            
+            if( _packetID )
+              err = _ExecuteRepAcc(_taskID, _execID, _conveyerID, _operationID, _packetID, ir_op);
+            else
+                if( _conveyerID == IR_REPACC_SRS )
+                    err = _ExecuteRepAcc(0, 0, _conveyerID, 0, 0, ir_op);
+
+                elif ( _conveyerID == IR_REPACC_SVODSRS093 )
+                    var ModeForm = 0 ;
+                    GetRegistryValue("РЕПОЗИТАРИЙ\\РЕЖИМ ФОРМ. СООБЩ. CM093", V_INTEGER, @ModeForm, null);
+                    var query093 = "";
+                    if (ModeForm == 1)// одиночная
+                      query093 = "select distinct q.t_DealID, q.t_Kind, q.t_DateTO from (" + GetRepAccObjectQuerySvod093(ir_op) + ") q order by q.t_DealID";
+                    else 
+                      query093 = "select distinct q.t_PartyID, q.t_side1, q.t_side2, q.RepContr, q.T_DateTO from ("+GetRepAccObjectQuerySvod093(ir_op)+") q order by q.t_PartyID, q.t_side1, q.t_side2, q.RepContr, q.t_DateTO";
+                    end;
+                          
+                    var cmd093 = DL_RSDCommand(query093);
+                    var cnt093 = cmd093.GetCount();
+                    if(cnt093 > 0)
+                        InitProgress(cnt093, "Идет выполнение операции...", "Репозитарный учет");
+                        
+                        var DataSet093 = cmd093.Execute();
+                        var i093 = 0;
+                        while( (not err) and (DataSet093.moveNext()) )
+                            AsOfDate093 = DataSet093.DateTO;
+                            if(ModeForm == 1)
+                              err = _ExecuteRepAcc(0, 0, _conveyerID, 0, 0, ir_op, null, null, 0, 0, 0, 0, 0, DataSet093.DealID, DataSet093.Kind);
+                            else
+                              err = _ExecuteRepAcc(0, 0, _conveyerID, 0, 0, ir_op, null, null, 0, 0, 0, 0, 0, 0, 0, DataSet093.PartyID,DataSet093.side1,DataSet093.side2,DataSet093.DateTO, DataSet093.RepContr, i093 + 1);
+                            end;
+                            UseProgress(i093 = i093 + 1);
+                        end;
+                        
+                        RemProgress();
+                    end;
+
+                elif ( _conveyerID == IR_REPACC_SRS_GA )
+                    err = _ExecuteRepAcc(0, 0, _conveyerID, 0, 0, ir_op);
+                elif( _conveyerID == IR_REPACC_SRS094 )
+
+                    //CloseNotNeedGrFairVl(ir_op.rec.date); //DAN i-support 521174(IM4205388) 
+                    var query094 = GetRepAccObjectQueryCM094(ir_op);
+                    if(ir_op.rec.Setting_Date_Select_FR == IR_SENDING_BILL_MESSAGESFR_EVENT_DATE)
+//                        query094 = "select q.t_GenAgrID, q.t_DateTO from (" + GetRepAccObjectQueryCM094(ir_op) + ") q group by q.t_GenAgrID, q.t_DateTO order by q.t_GenAgrID, q.t_DateTO";                        
+                        query094 = "select q.t_DateTO, q.T_CONTRACTOR, q.t_GroupNumber from (" + query094 +") q group by  q.t_DateTO, q.T_CONTRACTOR, q.t_GroupNumber order by q.t_DateTO, q.T_CONTRACTOR, q.t_GroupNumber ";
+                    else
+/*dan*/
+                        query094 = "select q.t_GenAgrID from (" + GetRepAccObjectQueryCM094(ir_op) + ") q group by q.t_GenAgrID order by q.t_GenAgrID";
+ //                       query094 = "select q.T_CONTRACTOR from (" + query094 + ") q group by q.T_CONTRACTOR order by q.T_CONTRACTOR";
+                    end;
+                    var cmd094 = DL_RSDCommand(query094);
+                    var cnt094 = cmd094.GetCount();
+                    if(cnt094 > 0)
+                        InitProgress(cnt094, "Идет выполнение операции...", "Репозитарный учет");
+                        
+                        var DataSet094 = cmd094.Execute();
+                        var i094 = 0;
+                        while( (not err) and (DataSet094.moveNext()) )
+                            if(ir_op.rec.Setting_Date_Select_FR == IR_SENDING_BILL_MESSAGESFR_EVENT_DATE)
+                                err = _ExecuteRepAcc(0, 0, _conveyerID, 0, 0, ir_op, null, null, 0, 0, 0, 0, null/*DataSet094.GenAgrID*/, null, null, DataSet094.CONTRACTOR/*null*/, null, null, DataSet094.DateTO, null, DataSet094.GroupNumber);
+//                                err = _ExecuteRepAcc(0, 0, _conveyerID, 0, 0, ir_op, null, null, 0, 0, 0, 0, DataSet094.GenAgrID, null, null, null, null, null, DataSet094.DateTO, null, DataSet094.GroupNumber);
+                            else
+/*dan*/
+                                err = _ExecuteRepAcc(0, 0, _conveyerID, 0, 0, ir_op, null, null, 0, 0, 0, 0, DataSet094.GenAgrID, null, null, null, null, null, null, null,i094+1);
+//                                err = _ExecuteRepAcc(0, 0, _conveyerID, 0, 0, ir_op, null, null, 0, 0, 0, 0, null/*DataSet094.GenAgrID*/, null, null, DataSet094.CONTRACTOR/*null*/, null, null, null, null, i094+1);
+                            end;
+                            UseProgress(i094 = i094 + 1);
+                        end;
+                        
+                        RemProgress();
+                    end;
+                elif( _conveyerID == IR_REPACC_SRS092 )
+                  var query092 = GetRepAccObjectQueryCSA(ir_op);
+                  var cmd092 = DL_RSDCommand(query092);
+                  var cnt092 = cmd092.GetCount();
+                  if(cnt092 > 0)
+                      InitProgress(cnt092, "Идет выполнение операции...", "Репозитарный учет");
+                      
+                      var DataSet092 = cmd092.Execute();
+                      var i092 = 0;
+                      while( (not err) and (DataSet092.moveNext()) )
+                          if(ir_op.rec.Setting_Date_Select_MP == IR_SENDING_BILL_MESSAGESMP_EVENT_DATE)
+                            err = _ExecuteRepAcc(0, 0, _conveyerID, 0, 0, ir_op, null, null, 0, 0, 0, 0, DataSet092.CsaGenAgrID, DataSet092.DocID, DataSet092.DocKind);
+                          else
+                            err = _ExecuteRepAcc(0, 0, _conveyerID, 0, 0, ir_op, null, null, 0, 0, 0, 0, DataSet092.CsaGenAgrID, DataSet092.DocID, DataSet092.DocKind, 0, 0, 0, 0, 0, i092 + 1);
+                          end;
+                          UseProgress(i092 = i092 + 1);
+                          if(not err)
+                            ir_cmArr.size = 0;
+                          end;
+                      end;
+                      
+                      RemProgress();
+                  end;
+                else                    
+                    var query = "select distinct q.t_DealDate, q.t_PayDate1, q.t_PayDate2, q.t_Netting, q.t_GenAgrID from ("+GetRepAccObjectQuerySvod(ir_op)+") q order by q.t_DealDate, q.t_PayDate1, q.t_PayDate2, q.t_Netting, q.t_GenAgrID";
+                    var cmd = DL_RSDCommand(query);
+                    var cnt = cmd.GetCount();
+                    
+                    if(cnt > 0)
+                        InitProgress(cnt, "Идет выполнение операции...", "Репозитарный учет");
+                        
+                        var DataSet = cmd.Execute();
+                        var i = 0;
+                        while( (not err) and (DataSet.moveNext()) )
+                            if( _conveyerID == IR_REPACC_SVODSRS )
+                              err = _ExecuteRepAcc(0, 0, _conveyerID, 0, 0, ir_op, null, null, DataSet.DealDate, DataSet.PayDate1, DataSet.PayDate2, DataSet.Netting, DataSet.GenAgrID, null, null, null, null, null, null, null, i+1);
+                            else
+                            err = _ExecuteRepAcc(0, 0, _conveyerID, 0, 0, ir_op, null, null, DataSet.DealDate, DataSet.PayDate1, DataSet.PayDate2, DataSet.Netting, DataSet.GenAgrID);
+                            end;
+                            UseProgress(i = i + 1);
+                        end;
+                        
+                        RemProgress();
+                    end;
+                end;
+            end;
+        end;
+        
+        ReplaceMacro("msgbox", NULL);
+        
+        SaveErrForReport_XML(ir_op.rec.ID, ir_op.rec.DocKind);
+    end;
+    
+    if( (_conveyerID) and (_packetID) )
+        /*не зависимо от того, делали что-то или нет - ставим исходящий статус обрабатываемой пачке*/
+        var exec = RSDCommand(  " UPDATE dcnvpack_dbt "
+        + "SET t_State = t_State + 1 "
+        + "  WHERE t_ExecID = ? "
+        + "AND t_ConvTypeID = ? "
+        + "AND t_PackID = ? ");
+        
+        exec.addParam( "", RSDBP_IN, _execID );
+        exec.addParam( "", RSDBP_IN, _conveyerID );
+        exec.addParam( "", RSDBP_IN, _packetID );
+        exec.execute();
+    end;
+    
+    return err;
+    
+    OnError(er)
+    ReplaceMacro( "msgbox", NULL );
+    
+    if(RslDefCon.IsInTrans)
+        RslDefCon.RollbackTrans();
+    end;
+    
+    RepErrArr[RepErrArr.size] = CIR_RepAccRepErr("", "", "", "", er.module+ " "+er.line+" "+er.message, "", "", 0);   // добавил "" 7-ым параметром
+    SaveErrForReport_XML( ir_op.rec.ID, ir_op.rec.DocKind );
+    return 1;
+end;
+
+macro ExecuteRepAccFromRecon(parent_op, ir_op, forceConveyer, forceTemplate, reconMessageID:@integer)
+    ReplaceMacro("msgbox", "RepAcc_msgbox");
+    
+  var err;
+    RepErrArr.size = 0;
+    if( forceConveyer == IR_REPACC_SRS )
+    err = _ExecuteRepAcc(0, 0, forceConveyer, 0, 0, ir_op, forceTemplate, @reconMessageID);
+    elif ( forceConveyer == IR_REPACC_SVODSRS093 )
+        var ModeForm = 0 ;
+        GetRegistryValue("РЕПОЗИТАРИЙ\\РЕЖИМ ФОРМ. СООБЩ. CM093", V_INTEGER, @ModeForm, null);
+        var query093 = "";
+        if (ModeForm == 1)// одиночная
+          query093 = "select distinct q.t_DealID, q.t_Kind, q.t_DateTO from (" + GetRepAccObjectQuerySvod093(ir_op) + ") q order by q.t_DealID";
+        else 
+          query093 = "select distinct q.t_PartyID, q.t_side1, q.t_side2, q.RepContr, q.T_DateTO from ("+GetRepAccObjectQuerySvod093(ir_op)+") q order by q.t_PartyID, q.t_side1, q.t_side2, q.RepContr, q.t_DateTO";
+        end;
+        var cmd093 = DL_RSDCommand(query093);
+        var cnt093 = cmd093.GetCount();
+        if(cnt093 > 0)
+            InitProgress(cnt093, "Идет выполнение операции...", "Репозитарный учет");
+            var DataSet093 = cmd093.Execute();
+            var i093 = 0;
+            while( (not err) and (DataSet093.moveNext()) )
+                AsOfDate093 = DataSet093.DateTO;
+                if(ModeForm == 1)
+          err = _ExecuteRepAcc(0, 0, forceConveyer, 0, 0, ir_op, forceTemplate, @reconMessageID, 0, 0, 0, 0, 0, DataSet093.DealID, DataSet093.Kind);
+                else
+                    err = _ExecuteRepAcc(0, 0, forceConveyer, 0, 0, ir_op, forceTemplate, @reconMessageID, 0, 0, 0, 0, 0, 0, 0, DataSet093.PartyID,DataSet093.side1,DataSet093.side2,DataSet093.DateTO, DataSet093.RepContr, i093 + 1);
+                end;
+                UseProgress(i093 = i093 + 1);
+            end;
+            
+            RemProgress();
+        end;
+    elif ( forceConveyer == IR_REPACC_SRS_GA )
+      err = _ExecuteRepAcc(0, 0, forceConveyer, 0, 0, ir_op, forceTemplate, @reconMessageID);
+    end;
+    
+    ReplaceMacro("msgbox", NULL);
+end;
+
+macro UpdateXMLReport(DocID, DocKind, SrsID, Status)
+    var m_RepDataArr = TArray();
+    var ErrData;
+    var ReportLineData_XML:variant;
+    var cmd, Dataset;
+    cmd = DL_RSDCommand();
+    var query=  "SELECT distinct DOC.T_SERVDOCID as SERVDOCID,"
+    +"  td.t_Code AS DealCode"
+    +"   FROM   ddlgracc_dbt gracc,"
+    +"  ddlgrdeal_dbt grdeal,"
+    +"  dv_irdeal td,"
+    +"  ddlgrdoc_dbt doc"
+    +"   WHERE  grdeal.T_DOCID = ?"
+    +"  AND grdeal.T_DOCKIND = ?"
+    +"  AND gracc.T_GRDEALID = grdeal.T_ID"
+    +"  AND gracc.T_ACCNUM = 5"
+    +"  AND DOC.T_DOCKIND = "+REPOS_GENERALINF
+    +"  AND DOC.T_GRDEALID = grdeal.T_ID"
+    +"  AND grdeal.t_ID = gracc.t_GrDealID"
+    +"  AND td.t_DocKind = grdeal.t_DocKind"
+    +"  AND td.t_DocID = grdeal.t_DocID"
+    +"  AND RSB_SECUR.GETRSTATUS(grdeal.T_DOCID, grdeal.T_DOCKIND ) not in(3,6) " // не для отправленных
+    ;
+    if(not SrsID)
+      query = query +"  AND  grdeal.t_ID  = RSB_SECUR.Get_GR_ID_SRS(td.t_DocID, td.t_DocKind ) " ;
+    else
+      query = query +"  AND  doc.t_DocID  = " + SrsID; 
+    end;
+    
+    cmd.addParam(DocID);
+    cmd.addParam(DocKind);
+    DataSet = cmd.Execute(query);
+    // if(not DataSet.moveNext())
+    //     return 0;
+    // end;
+    var isNotOp = true;
+    while(DataSet.moveNext())
+    
+    var code=dataset.rec.DealCode; 
+    var ir_op = tbfile("ir_op.dbt");
+    ir_op.rec.id = dataset.rec.servdocid;
+      // if( not ir_op.geteq() )
+      //     msgbox("ошибка поиска операции");
+      //     return 1;
+      // end;  
+    if( not ir_op.geteq() )
+        continue;
+    end;  
+      isNotOp = false;
+
+    RepErrArr.size=0;
+    m_RepDataArr.size=0;
+    ReportLineData_XML = IR_GetLogDataXML(ir_op.rec.DocKind, ir_op.rec.ID, LOG_TYPE_DATA, false);
+    ReportLineData_XML.SetReportNumber(0);
+    while( ReportLineData_XML.Next )
+        ErrData = ReportLineData_XML.GetReportLineData();
+        if(ErrData.DealCode!=string(dataset.rec.DealCode))
+            m_RepDataArr[m_RepDataArr.size] = CIR_RepAccRepParm(ErrData.Action, ErrData.DealCode, ErrData.MsgCode, ErrData.Status, DocID, DocKind);
+        else
+            m_RepDataArr[m_RepDataArr.size] = CIR_RepAccRepParm(ErrData.Action, ErrData.DealCode, ErrData.MsgCode, Status, DocID, DocKind);
+        end;
+    end;
+      
+    DL_DeleteDataByOper_XML(ir_op.rec.ID, LOG_TYPE_DATA);
+    DL_SaveDataForReport_XML(ir_op.rec.ID, ir_op.rec.DocKind, m_RepDataArr, LOG_TYPE_DATA);
+    end; // while
+    if(isNotOp)
+    //     msgbox("ошибка поиска операции");
+         return 1;    // нигде это значение не проверяется и не используется
+    end;
+    return 0;
+end;
+
+MACRO UpdateRepAccData(DocKind, DocID, code:@variant, op_id:@variant, MsgID)
+    var ir_generalinf_Tb = TBFile("ir_generalinf.dbt", "w");
+    var TradeRepository_Tb = TBFile("ir_party.dbt", "w",1);
+    var Party1_Tb = TBFile("ir_party.dbt", "w", 1);
+    var Party2_Tb = TBFile("ir_party.dbt", "w", 1);
+    var UTIGeneratingParty_Tb = TBFile("ir_party.dbt", "w", 1);
+    var Sender_Tb = TBFile("ir_party.dbt", "w", 1);
+    var CounterParty_Tb = TBFile("ir_party.dbt", "w", 1);
+    var Instruments_Tb = TBFile("ir_instruments.dbt", "w", 1);
+    var ir_generalinf = TRecHandler("ir_generalinf.dbt");
+    var TradeRepository = TRecHandler("ir_party.dbt");
+    var Party1 = TRecHandler("ir_party.dbt");
+    var Party2 = TRecHandler("ir_party.dbt");
+    var UTIGeneratingParty = TRecHandler("ir_party.dbt");
+    var Sender = TRecHandler("ir_party.dbt");
+    var CounterParty   = TRecHandler("ir_party.dbt");
+    var Instruments = TRecHandler("ir_instruments.dbt");
+    var err = 0;
+    var query = null, cmd, DataSet;
+    var cnt = 0, i = 0;
+    var prevGrDealID = 0;
+    var RepositaryID = null, RepositaryCodeRIC = "";
+    var Adress = TRecHandler("adress.dbt");
+    var iParty = TRecHandler("party");
+    var Country:string = "";
+    var FD = null;
+    VAR STAT = 0;
+    var IsPartyClient;
+    var KindDealPartyClient = -1;
+    var first = false;
+    var DealParmForReport;
+  
+  RepErrArr.size = 0;
+  cmd = DL_RSDCommand();
+    ir_generalinf.SetRecordAddr (ir_generalinf_Tb,0,0,true); 
+    TradeRepository.SetRecordAddr (TradeRepository_Tb,0,0,true);
+    Party1.SetRecordAddr (Party1_Tb,0,0,true); 
+    Party2.SetRecordAddr (Party2_Tb,0,0,true);
+    UTIGeneratingParty.SetRecordAddr (UTIGeneratingParty_Tb,0,0,true); 
+    Sender.SetRecordAddr (Sender_Tb,0,0,true); 
+    CounterParty.SetRecordAddr (CounterParty_Tb,0,0,true);   
+    Instruments.SetRecordAddr (Instruments_Tb,0,0,true);   
+    
+    query = "SELECT distinct DOC.T_DOCID as GenInfID,"
+    +" DOC.T_SERVDOCID as SERVDOCID,"
+    +" grdeal.t_TemplNum AS TemplNum,"
+    +" grdeal.t_PlanDate AS PlanDate,"
+    +" grdeal.t_ID AS GrDealID,";
+    if(DocKind == DL_GENAGRDVDOC)
+        query = query + " GenAgr.t_code AS DealCode, GenAgr.t_GenAgrID, GenAgr.t_date_genagr AS DealDate, -1, GenAgr.t_partyid,";
+    else
+        query = query + " td.t_Code AS DealCode,"
+    +" td.t_GenAgrID,"
+    +" td.t_Date AS DealDate,"
+    +" td.t_Client,"
+        +" td.t_Contractor,";
+    end;
+    query = query + " rd.*"
+    +"FROM ddlgracc_dbt gracc,"
+    +" ddlgrdeal_dbt grdeal,";
+    if(DocKind != DL_GENAGRDVDOC)
+        query = query + " dv_irdeal td,";
+    end;
+    query = query + " ddl_repozdeal_dbt rd,"
+    +" ddl_genagr_dbt GenAgr,"
+    +" ddlgrdoc_dbt doc"
+    +"   WHERE grdeal.T_DOCID = ?"
+    +" AND grdeal.T_DOCKIND = ?"
+    +" AND gracc.T_GRDEALID = grdeal.T_ID"      
+    +" AND gracc.T_ACCNUM = 5"                //  Виды учета по графику = репозитарный учет 
+    +" AND DOC.T_DOCKIND = "+ REPOS_GENERALINF
+    +" AND DOC.T_GRDEALID = grdeal.T_ID";
+    if(DocKind != DL_GENAGRDVDOC)
+        query = query + " AND td.t_DocKind = grdeal.t_DocKind"
+    +" AND td.t_DocID = grdeal.t_DocID"
+    +" AND GenAgr.t_GenAgrID(+) = td.t_GenAgrID";
+    else
+        query = query + " AND GenAgr.t_GenAgrID = ?";
+    end;
+    query = query + " AND rd.t_DocKind = grdeal.t_DocKind"
+    +" AND rd.t_DocID = grdeal.t_DocID";
+    
+    if ( ValType(MsgID) != V_UNDEF )
+        query = query + " AND DOC.T_DOCID = ?";
+    end;
+    cmd.addParam(DocID);
+    cmd.addParam(DocKind);
+    if(DocKind == DL_GENAGRDVDOC)
+        cmd.addParam(DocID);
+    end;
+    if ( ValType(MsgID) != V_UNDEF )
+        cmd.addParam(MsgID);
+    end;
+    DataSet = cmd.Execute(query);
+    if(not DataSet.moveNext())
+        msgbox("ошибка поиска операции");
+        return 1;
+    end;
+    op_id=DataSet.rec.SERVDOCID;
+    code=dataset.rec.DealCode;
+    
+    var ir_op = tbfile("ir_op.dbt");
+    ir_op.rec.id = dataset.rec.servdocid;
+    if( not ir_op.geteq() )
+        msgbox("ошибка поиска операции");
+        return 1;
+    end;  
+    
+    if( DocKind == DL_SECURITYDOC )
+        FD = SPFirstDoc(LEG_KIND_DL_TICK, DocID);
+        IsPartyClient = FD.tick.rec.IsPartyClient;
+        KindDealPartyClient = FD.tick.rec.KindDealPartyClient;
+        DealParmForReport = RepDealParm(DocID, DocKind);
+    elif( (DocKind == DL_DVNDEAL) or (DocKind == DL_DVDEALT3) or (DocKind == DL_DVFXDEAL))
+        FD = DVFirstDocNDeal(DocKind, DocID);
+        DealParmForReport = RepDealParm(DocID, DocKind);
+    elif( DocKind == DV_CSA )
+        FD = DVFirstCSA(DocKind, DocID);
+        DealParmForReport = RepDealParm(DocID, DocKind);
+    else
+        DealParmForReport = RepDealParm("", "");
+        continue;
+    end;
+    
+    if( RepositaryID == null )
+        RepositaryID = DL_GetPartyWithOwn(PTK_REPOSITARY);
+        RepositaryCodeRIC = ПолучитьКодСубъекта(RepositaryID, PTCK_RIC);
+    end;
+    
+    var ErrData;
+    var ReportLineData_XML:variant;
+    var ErrCount = 0;
+    var error = "";
+    var field = "";
+      
+    ReportLineData_XML = IR_GetLogDataXML(ir_op.rec.DocKind, ir_op.rec.ID, LOG_TYPE_ERROR, false);
+    first = true;   // использую для переподготовки заменяющих и т.п. сообщений 
+    ReportLineData_XML.SetReportNumber(0);
+    var GenAgr = GetGeneralAgreementData( DataSet.GenAgrID, DataSet.Contractor );
+    while(ReportLineData_XML.Next or first)
+        ErrData = ReportLineData_XML.GetReportLineData();
+        if(ErrData != null)       // у заменяющих тут будет NULL
+            error = ErrData.ErrStr;
+            field = ErrData.field;
+            first = false;        
+        end;
+        
+        if((ErrData != null) and (ErrData.DealCode != string(DataSet.DealCode)))
+            RepErrArr[RepErrArr.size] = CIR_RepAccRepErr(DocID, DocKind, ErrData.DealCode, ErrData.MsgCode, ErrData.ErrStr, ErrData.Field, ErrData.Action, ErrData.FldNumber);
+        else
+            ir_generalinf_Tb.rec.INTERNALMESSAGEID = DataSet.GenInfID;
+            if( not ir_generalinf_Tb.GetEQ() )
+                msgbox("Ошибка поиска операции");
+                return 1;
+            end;
+            
+      stat = stat + UpdateRepAccDataGenInf(@ir_generalinf, DataSet, GenAgr, first, error, field, DealParmForReport, FD, ir_op, IsPartyClient, KindDealPartyClient, iParty);
+      
+            // Заполнение субъектов
+            // TradeRepository
+            iParty.Clear();
+            TradeRepository_Tb.rec.INTERNALMESSAGEID = DataSet.GenInfID;
+            TradeRepository_Tb.rec.partykind = IR_PARTY_KIND_TRADEREPOSITORY;  
+            if( not TradeRepository_Tb.GetGE() )
+                msgbox("Ошибка поиска операции TradeRepository");
+                return 1;
+            end;
+            iParty.Clear();
+            stat = stat + ОшибкаTradeRepository(@TradeRepository, DataSet, GenAgr, first, error, field, ir_generalinf.rec.MessageType, RepositaryID, RepositaryCodeRIC, DealParmForReport);
+           TradeRepository_Tb.update();
+            
+            //Party1
+            iParty.Clear();
+            Party1_Tb.rec.INTERNALMESSAGEID = DataSet.GenInfID;
+            Party1_Tb.rec.partykind = IR_PARTY_KIND_PARTY1;  
+            if( not Party1_Tb.GetGE() )
+                msgbox("Ошибка поиска операции");
+                return 1;
+            end; 
+            iParty.Clear();
+            stat = stat + ОшибкаParty1_(@Party1, DataSet, GenAgr, first, error, field, ir_generalinf.rec.MessageType, iParty, ir_generalinf, DealParmForReport);
+            Party1_Tb.update();
+            
+            //Party2
+            iParty.Clear();
+            Party2_Tb.rec.INTERNALMESSAGEID = DataSet.GenInfID;
+            Party2_Tb.rec.partykind = IR_PARTY_KIND_PARTY2;  
+            if( not Party2_Tb.GetLE() )
+                msgbox("Ошибка поиска операции");
+                return 1;
+            end; 
+            iParty.Clear();
+            stat = stat + ОшибкаParty2_(@Party2, DataSet, GenAgr, first, error, field, ir_generalinf.rec.MessageType, iParty, ir_generalinf, DealParmForReport);
+            Party2_Tb.update();
+            
+            //UTIGeneratingParty
+            iParty.Clear();
+            UTIGeneratingParty_Tb.rec.INTERNALMESSAGEID = DataSet.GenInfID;
+            UTIGeneratingParty_Tb.rec.partykind = IR_PARTY_KIND_UTIGENERATINGPARTY;  
+            if( not UTIGeneratingParty_Tb.GetGE() )
+                msgbox("Ошибка поиска операции");
+                return 1;
+            end; 
+            stat = stat + ОшибкаUTIGeneratingParty(@UTIGeneratingParty, DataSet, GenAgr, first, error, field, ir_generalinf.rec.MessageType, DealParmForReport);
+            UTIGeneratingParty_Tb.update();
+            
+            // Sender
+            iParty.Clear();
+            Sender_Tb.rec.INTERNALMESSAGEID = DataSet.GenInfID;
+            Sender_Tb.rec.partykind = IR_PARTY_KIND_SENDER;  
+            if( not Sender_Tb.GetGE() )
+                msgbox("Ошибка поиска операции");
+                return 1;
+            end; 
+            stat = stat + ОшибкаSender(@Sender, DataSet, GenAgr, first, error, field, ir_generalinf.rec.MessageType, DealParmForReport);
+            Sender_Tb.update();
+            
+      var ir_cm;
+
+            if(ir_generalinf.rec.MessageType == "CM010")
+              ir_cm = CM010(0, 0, ir_op);
+              ir_cm.m_MessageType = ir_generalinf.rec.MessageType;
+              stat = stat + ir_cm.ЗаполнениеCM(@ir_generalinf, GenAgr);
+
+            elif( ir_generalinf.rec.MessageType == "CM011" )
+              ir_cm = CM011(0, 0, ir_op);
+              ir_cm.m_MessageType = ir_generalinf.rec.MessageType;
+              stat = stat + ir_cm.ЗаполнениеCM(@ir_generalinf, GenAgr);
+
+            elif( ir_generalinf.rec.MessageType == "CM021" )
+              var cm021_Tb = TBFile("ir_cm021.dbt", "w", 1); 
+              var cm21 = TRecHandler("ir_cm021.dbt"); 
+              cm21.SetRecordAddr (cm021_Tb, 0, 0, true); 
+              cm021_Tb.clear();
+              cm021_Tb.rec.INTERNALMESSAGEID = DataSet.GenInfID;
+              if( not cm021_Tb.GetGE() )
+                  msgbox("Ошибка поиска операции");
+                  return 1;
+              end;
+              ir_cm = CM021(0, 0, ir_op);
+              ir_cm.m_MessageType = ir_generalinf.rec.MessageType;
+              stat = stat + ir_cm.ЗаполнениеCM(@cm21, DataSet, GenAgr, FD);
+              cm021_Tb.update();
+
+            elif( ir_generalinf.rec.MessageType == "CM022" )
+              var cm022_Tb = TBFile("ir_cm022.dbt", "w"); 
+              var cm22 = TRecHandler("ir_cm022.dbt"); 
+              cm22.SetRecordAddr (cm022_Tb, 0, 0, true); 
+              cm022_Tb.clear();
+              cm022_Tb.rec.INTERNALMESSAGEID = DataSet.GenInfID;
+              if( not cm022_Tb.GetGE() )
+                  msgbox("Ошибка поиска операции");
+                  return 1;
+              end;
+              ir_cm = CM022(0, 0, ir_op);
+              ir_cm.m_MessageType = ir_generalinf.rec.MessageType;
+              stat = stat + ir_cm.ЗаполнениеCM(@cm22, DataSet, GenAgr, FD);
+              cm022_Tb.update();
+
+            elif( ir_generalinf.rec.MessageType == "CM023" )
+              var cm023_Tb = TBFile("ir_cm023.dbt", "w"); 
+              var cm23 = TRecHandler("ir_cm023.dbt"); 
+              cm23.SetRecordAddr (cm023_Tb, 0, 0, true); 
+              cm023_Tb.clear();
+              cm023_Tb.rec.INTERNALMESSAGEID = DataSet.GenInfID;
+              if( not cm023_Tb.GetGE() )
+                  msgbox("Ошибка поиска операции");
+                  return 1;
+              end;
+              ir_cm = CM023(0, 0, ir_op);
+              ir_cm.m_MessageType = ir_generalinf.rec.MessageType;
+              stat = stat + ir_cm.ЗаполнениеCM(@cm23, DataSet, GenAgr, FD);
+              cm023_Tb.update();
+
+            elif( ir_generalinf.rec.MessageType == "CM032" )
+              var cm032_Tb = TBFile("ir_cm032.dbt", "w", 1); 
+              var cm32 = TRecHandler("ir_cm032.dbt"); 
+              cm32.SetRecordAddr (cm032_Tb, 0, 0, true); 
+              cm032_Tb.clear();
+              cm032_Tb.rec.INTERNALMESSAGEID = DataSet.GenInfID;
+              if( not cm032_Tb.GetGE() )
+                    msgbox("Ошибка поиска операции");
+                    return 1;
+                end; 
+              ir_cm = CM032(0, 0, ir_op);
+          ir_cm.m_MessageType = ir_generalinf.rec.MessageType;
+              stat = stat + ir_cm.ЗаполнениеCM(@cm32, DataSet, GenAgr, FD);
+              cm032_Tb.update();
+
+            elif( ir_generalinf.rec.MessageType == "CM041" )
+              var cm041_Tb = TBFile("ir_cm041.dbt", "w", 1); 
+                var cm41 = TRecHandler("ir_cm041.dbt"); 
+                cm41.SetRecordAddr (cm041_Tb,0,0,true); 
+                cm041_Tb.clear();
+                cm041_Tb.rec.INTERNALMESSAGEID = DataSet.GenInfID;
+                if( not cm041_Tb.GetGE() )
+                    msgbox("Ошибка поиска операции");
+                    return 1;
+                end;
+              Instruments_Tb.rec.InternalMessageID = DataSet.GenInfID;
+              if( not Instruments_Tb.GetGE() )
+                  Instruments.clear();
+              end;
+          ir_cm = CM041(0, 0, ir_op);
+          ir_cm.m_MessageType = ir_generalinf.rec.MessageType;
+              stat = stat + ir_cm.ЗаполнениеCM(@cm41, DataSet, GenAgr, FD, first, field, @Instruments, DealParmForReport);
+              if(first)                 
+                  Instruments_Tb.update();
+              end;
+              cm041_Tb.update();
+    
+            elif( ir_generalinf.rec.MessageType == "CM042" )
+                var cm042_Tb = TBFile("ir_cm042.dbt", "w", 1); 
+                var cm42 = TRecHandler("ir_cm042.dbt"); 
+                cm42.SetRecordAddr (cm042_Tb,0,0,true); 
+                cm042_Tb.clear();
+                cm042_Tb.rec.INTERNALMESSAGEID = DataSet.GenInfID;
+                if( not cm042_Tb.GetGE() )
+                    msgbox("Ошибка поиска операции");
+                    return 1;
+                end;
+              Instruments_Tb.rec.InternalMessageID = DataSet.GenInfID;
+              if( not Instruments_Tb.GetGE() )
+                  Instruments.clear();
+              end;
+                ir_cm = CM042(0, 0, ir_op);
+                ir_cm.m_MessageType = ir_generalinf.rec.MessageType;
+              stat = stat + ir_cm.ЗаполнениеCM(@cm42, DataSet, GenAgr, FD, first, field, @Instruments, DealParmForReport);
+                cm042_Tb.update();
+              Instruments_Tb.update();
+
+            elif( ir_generalinf.rec.MessageType == "CM043" )
+              var cm043_Tb = TBFile("ir_cm043.dbt", "w", 1); 
+              var cm43 = TRecHandler("ir_cm043.dbt"); 
+              cm43.SetRecordAddr (cm043_Tb, 0, 0, true); 
+              cm043_Tb.clear();
+              cm043_Tb.rec.INTERNALMESSAGEID = DataSet.GenInfID;
+              if( not cm043_Tb.GetGE() )
+                  msgbox("Ошибка поиска операции");
+                  return 1;
+              end;
+              Instruments_Tb.rec.InternalMessageID = DataSet.GenInfID;
+              if( not Instruments_Tb.GetGE() )
+                  Instruments.clear();
+              end;
+              ir_cm = CM043(0, 0, ir_op);
+              ir_cm.m_MessageType = ir_generalinf.rec.MessageType;
+              stat = stat + ir_cm.ЗаполнениеCM(@cm43, DataSet, GenAgr, FD, first, field, @Instruments, DealParmForReport);
+              cm043_Tb.update();
+              if(first)                 
+              Instruments_Tb.update();
+              end;
+
+            elif( ir_generalinf.rec.MessageType == "CM044" )
+              var cm044_Tb = TBFile("ir_cm044.dbt", "w", 1); 
+              var cm44 = TRecHandler("ir_cm044.dbt"); 
+              cm44.SetRecordAddr (cm044_Tb, 0, 0, true); 
+              cm044_Tb.clear();
+              cm044_Tb.rec.INTERNALMESSAGEID = DataSet.GenInfID;
+              if( not cm044_Tb.GetGE() )
+                  msgbox("Ошибка поиска операции");
+                  return 1;
+              end;
+              Instruments_Tb.rec.InternalMessageID = DataSet.GenInfID;
+              if( not Instruments_Tb.GetGE() )
+                  Instruments.clear();
+              end;
+              ir_cm = CM044(0, 0, ir_op);
+              ir_cm.m_MessageType = ir_generalinf.rec.MessageType;
+              stat = stat + ir_cm.ЗаполнениеCM(@cm44, DataSet, GenAgr, FD, first, field, @Instruments, DealParmForReport);
+              cm044_Tb.update();
+              if(first)
+              Instruments_Tb.update();
+              end;
+
+            elif( ir_generalinf.rec.MessageType == "CM045" )
+              var cm045_Tb = TBFile("ir_cm045.dbt", "w", 1); 
+              var cm45 = TRecHandler("ir_cm045.dbt"); 
+              cm45.SetRecordAddr (cm045_Tb, 0, 0, true); 
+              cm045_Tb.clear();
+              cm045_Tb.rec.INTERNALMESSAGEID = DataSet.GenInfID;
+              if( not cm045_Tb.GetGE() )
+                  msgbox("Ошибка поиска операции");
+                  return 1;
+              end;
+              Instruments_Tb.rec.InternalMessageID = DataSet.GenInfID;
+              if( not Instruments_Tb.GetGE() )
+                  Instruments.clear();
+              end;
+              ir_cm = CM045(0, 0, ir_op);
+              ir_cm.m_MessageType = ir_generalinf.rec.MessageType;
+              stat = stat + ir_cm.ЗаполнениеCM(@cm45, DataSet, GenAgr, FD, first, field, @Instruments, DealParmForReport);
+              cm045_Tb.update();
+              if(first)
+              Instruments_Tb.update();
+              end;
+
+            elif( ir_generalinf.rec.MessageType == "CM046" )
+              var cm046_Tb = TBFile("ir_cm046.dbt", "w", 1); 
+              var cm46 = TRecHandler("ir_cm046.dbt"); 
+              cm46.SetRecordAddr (cm046_Tb, 0, 0, true); 
+              cm046_Tb.clear();
+              cm046_Tb.rec.INTERNALMESSAGEID = DataSet.GenInfID;
+              if( not cm046_Tb.GetGE() )
+                  msgbox("Ошибка поиска операции");
+                  return 1;
+        end;
+              Instruments_Tb.rec.InternalMessageID = DataSet.GenInfID;
+              if( not Instruments_Tb.GetGE() )
+                  Instruments.clear();
+              end;
+              ir_cm = CM046(0, 0, ir_op);
+              ir_cm.m_MessageType = ir_generalinf.rec.MessageType;
+              stat = stat + ir_cm.ЗаполнениеCM(@cm46, DataSet, GenAgr, FD, first, field, @Instruments, DealParmForReport);
+              cm046_Tb.update();
+              Instruments_Tb.update();
+
+            elif( ir_generalinf.rec.MessageType == "CM047" )
+              var cm047_Tb = TBFile("ir_cm047.dbt", "w", 1); 
+              var cm47 = TRecHandler("ir_cm047.dbt"); 
+              cm47.SetRecordAddr (cm047_Tb, 0, 0, true); 
+              cm047_Tb.clear();
+              cm047_Tb.rec.INTERNALMESSAGEID = DataSet.GenInfID;
+              if( not cm047_Tb.GetGE() )
+                  msgbox("Ошибка поиска операции");
+                  return 1;
+              end;
+              Instruments_Tb.rec.InternalMessageID = DataSet.GenInfID;
+              if( not Instruments_Tb.GetGE() )
+                  Instruments.clear();
+              end;
+              ir_cm = CM047(0, 0, ir_op);
+              ir_cm.m_MessageType = ir_generalinf.rec.MessageType;
+              stat = stat + ir_cm.ЗаполнениеCM(@cm47, DataSet, GenAgr, FD, first, field, @Instruments, DealParmForReport);
+              cm047_Tb.update();
+              if(first)
+              Instruments_Tb.update();
+              end;
+
+            elif( ir_generalinf.rec.MessageType == "CM048" )
+              var cm048_Tb = TBFile("ir_cm048.dbt", "w", 1); 
+              var cm48 = TRecHandler("ir_cm048.dbt"); 
+              cm48.SetRecordAddr (cm048_Tb, 0, 0, true); 
+              cm048_Tb.clear();
+              cm048_Tb.rec.INTERNALMESSAGEID = DataSet.GenInfID;
+              if( not cm048_Tb.GetGE() )
+                  msgbox("Ошибка поиска операции");
+                  return 1;
+              end;
+              Instruments_Tb.rec.InternalMessageID = DataSet.GenInfID;
+              if( not Instruments_Tb.GetGE() )
+                  Instruments.clear();
+              end;
+              ir_cm = CM048(0, 0, ir_op);
+              ir_cm.m_MessageType = ir_generalinf.rec.MessageType;
+              stat = stat + ir_cm.ЗаполнениеCM(@cm48, DataSet, GenAgr, FD, first, field, @Instruments, DealParmForReport);
+              cm048_Tb.update();
+              Instruments_Tb.update();
+
+            elif( ir_generalinf.rec.MessageType == "CM051" )
+              var cm051_Tb = TBFile("ir_cm051.dbt", "w", 1); 
+              var cm51 = TRecHandler("ir_cm051.dbt"); 
+              cm51.SetRecordAddr (cm051_Tb, 0, 0, true); 
+              cm051_Tb.clear();
+              cm051_Tb.rec.INTERNALMESSAGEID = DataSet.GenInfID;
+              if( not cm051_Tb.GetGE() )
+                  msgbox("Ошибка поиска операции");
+                  return 1;
+              end;
+              ir_cm = CM051(0, 0, ir_op);
+              ir_cm.m_MessageType = ir_generalinf.rec.MessageType;
+              stat = stat + ir_cm.ЗаполнениеCM(@cm51, DataSet, GenAgr, FD, first, field, DealParmForReport);
+              cm051_Tb.update();
+
+            elif( ir_generalinf.rec.MessageType == "CM053" )
+              var cm053_Tb = TBFile("ir_cm053.dbt", "w", 1); 
+              var cm53 = TRecHandler("ir_cm053.dbt"); 
+              cm53.SetRecordAddr (cm053_Tb, 0, 0, true); 
+              cm053_Tb.clear();
+              cm053_Tb.rec.INTERNALMESSAGEID = DataSet.GenInfID;
+              if( not cm053_Tb.GetGE() )
+                  msgbox("Ошибка поиска операции");
+                  return 1;
+        end;
+              ir_cm = CM053(0, 0, ir_op);
+              ir_cm.m_MessageType = ir_generalinf.rec.MessageType;
+              stat = stat + ir_cm.ЗаполнениеCM(@cm53, DataSet, GenAgr, ir_cm.m_MessageType, FD, first, field, DealParmForReport);
+              cm053_Tb.update();
+            
+            elif( ir_generalinf.rec.MessageType == "CM083")
+              var cm083_Tb = TBFile("ir_cm083.dbt", "w", 1); 
+              var cm83 = TRecHandler("ir_cm083.dbt"); 
+              cm83.SetRecordAddr (cm083_Tb, 0, 0, true); 
+              cm083_Tb.clear();
+              cm083_Tb.rec.INTERNALMESSAGEID = DataSet.GenInfID;
+              CounterParty.clear();
+              CounterParty.rec.INTERNALMESSAGEID = DataSet.GenInfID;
+              CounterParty.rec.partykind = IR_PARTY_KIND_COUNTERPARTY;  
+              if( (not CounterParty_Tb.GetGE()) or (not cm083_Tb.GetGE() ))
+                  msgbox("Ошибка поиска операции");
+                  return 1;
+              end; 
+              Instruments_Tb.rec.InternalMessageID = DataSet.GenInfID;
+              if( not Instruments_Tb.GetGE() )
+                  Instruments.clear();
+              end;
+              ir_cm = CM083(0, 0, ir_op);
+              ir_cm.m_MessageType = ir_generalinf.rec.MessageType;
+              stat = stat + ir_cm.ЗаполнениеCM(@cm83, DataSet, GenAgr, first, error, field, FD, @CounterParty, @ir_generalinf, @Instruments, i, DealParmForReport);
+              cm083_Tb.update();
+              if(first)
+              Instruments_Tb.update();            
+              end;
+              CounterParty_Tb.update();
+            end;
+            ErrCount = ErrCount + 1;
+            if(first)
+                GetRStatus(ir_generalinf, stat);
+                ir_generalinf_Tb.update();
+                break;
+            end;
+        end;
+        if((ir_generalinf_Tb) and (ir_generalinf_Tb.rec) and (ir_generalinf_Tb.rec.INTERNALMESSAGEID))    // если first, то сюда не попадаем
+        GetRStatus(ir_generalinf,stat);
+        ir_generalinf_Tb.update();
+    end;    
+    end;    
+    
+    if(ErrCount == 0)
+        ir_generalinf_Tb.rec.INTERNALMESSAGEID = DataSet.GenInfID;
+        if( (ir_generalinf_Tb.GetEQ()) and (ir_generalinf.rec.MessageType == "CM093"))
+          stat = stat + UpdateRepAccDataGenInf(@ir_generalinf, DataSet, GenAgr, first, error, field, DealParmForReport, FD, ir_op, IsPartyClient, KindDealPartyClient, iParty);
+        end;
+        if((ir_generalinf_Tb) and (ir_generalinf_Tb.rec) and (ir_generalinf_Tb.rec.INTERNALMESSAGEID))
+          GetRStatus(ir_generalinf, stat);
+          ir_generalinf_Tb.update();
+        end;
+    end;
+    
+    var count=RepErrArr.size;
+    DL_DeleteDataByOper_XML(ir_op.rec.ID, LOG_TYPE_ERROR);
+    SaveErrForReport_XML(ir_op.rec.ID, ir_op.rec.DocKind);
+    if(ir_generalinf.rec.MessageType != "CM093")    // для СМ093 общая обработка для всех сделок
+    UpdateXMLReport(DocID, DocKind, ir_generalinf.rec.INTERNALMESSAGEID,ir_generalinf.rec.RStatusName); 
+    end;
+    return 0;
+end;
+
+//Следующие функции вызываются из си
+
+macro UpdateReport_XML(DocID, DocKind, SrsID)
+    var m_RepDataArr = TArray();
+    var ErrData;
+    var ReportLineData_XML:variant;
+    var cmd, Dataset;
+    cmd = DL_RSDCommand();
+    var query=  "SELECT DOC.T_SERVDOCID as SERVDOCID,"
+    +"  td.t_Code AS DealCode"
+    +"   FROM   ddlgracc_dbt gracc,"
+    +"  ddlgrdeal_dbt grdeal,"
+    +"  dv_irdeal td,"
+    +"  ddlgrdoc_dbt doc"
+    +"   WHERE  grdeal.T_DOCID = ?"
+    +"  AND grdeal.T_DOCKIND = ?"
+    +"  AND gracc.T_GRDEALID = grdeal.T_ID"
+    +"  AND gracc.T_ACCNUM = 5"
+    +"  AND DOC.T_DOCKIND = "+REPOS_GENERALINF
+    +"  AND DOC.T_GRDEALID = grdeal.T_ID"
+    +"  AND grdeal.t_ID = gracc.t_GrDealID"
+    +"  AND td.t_DocKind = grdeal.t_DocKind"
+    +"  AND td.t_DocID = grdeal.t_DocID"
+    +"  AND RSB_SECUR.GETRSTATUS(grdeal.T_DOCID, grdeal.T_DOCKIND ) not in(3,6) " // не для отправленных
+    ;
+    if(not SrsID)
+      query = query +"  AND  grdeal.t_ID  = RSB_SECUR.Get_GR_ID_SRS(td.t_DocID, td.t_DocKind ) " ;
+    else
+      query = query +"  AND  doc.t_DocID  = " + SrsID; 
+    end;
+    
+    cmd.addParam(DocID);
+    cmd.addParam(DocKind);
+    DataSet = cmd.Execute(query);
+    
+    if(not DataSet.moveNext())
+        return 0;
+    end;
+    
+    var code=dataset.rec.DealCode; 
+    
+    var ir_op = tbfile("ir_op.dbt");
+    ir_op.rec.id = dataset.rec.servdocid;
+    if( not ir_op.geteq() )
+        msgbox("ошибка поиска операции");
+        return 1;
+    end;  
+    RepErrArr.size=0;
+    m_RepDataArr.size=0;
+    ReportLineData_XML = IR_GetLogDataXML(ir_op.rec.DocKind, ir_op.rec.ID, LOG_TYPE_ERROR, false);
+    ReportLineData_XML.SetReportNumber(0);
+    while( ReportLineData_XML.Next )
+        
+        ErrData = ReportLineData_XML.GetReportLineData();
+        
+        if(ErrData.DealCode!=string(dataset.rec.DealCode))
+            RepErrArr[RepErrArr.size] = CIR_RepAccRepErr(DocID, DocKind, ErrData.DealCode, ErrData.MsgCode, ErrData.ErrStr, ErrData.Field, ErrData.Action, ErrData.FldNumber);
+        end;
+        
+    end;
+    
+    ReportLineData_XML = IR_GetLogDataXML(ir_op.rec.DocKind, ir_op.rec.ID, LOG_TYPE_DATA, false);
+    ReportLineData_XML.SetReportNumber(0);
+    while( ReportLineData_XML.Next )
+        
+        ErrData = ReportLineData_XML.GetReportLineData();
+        
+        if(ErrData.DealCode!=string(dataset.rec.DealCode))
+            m_RepDataArr[m_RepDataArr.size] = CIR_RepAccRepParm(ErrData.Action, ErrData.DealCode, ErrData.MsgCode, ErrData.Status, DocID, DocKind);
+        end;
+        
+    end;
+    DL_DeleteDataByOper_XML(ir_op.rec.ID, LOG_TYPE_ERROR);
+    SaveErrForReport_XML(ir_op.rec.ID, ir_op.rec.DocKind);
+    DL_DeleteDataByOper_XML(ir_op.rec.ID, LOG_TYPE_DATA);
+    DL_SaveDataForReport_XML(ir_op.rec.ID, ir_op.rec.DocKind, m_RepDataArr, LOG_TYPE_DATA);
+end;
+
+macro GetErrorFields( GenInfID, DealCode )
+    var fields = TArray;
+    var ErrData;
+    var cmd = DL_RSDCommand();
+    var query = "select t_ServDocKind DocKind, t_ServDocID DocID from ddlgrdoc_dbt where t_DocID = ? and t_DocKind = " + REPOS_GENERALINF;
+    cmd.AddParam(GenInfID);
+    var DataSet = cmd.Execute(query);
+    
+    if ( DataSet.moveNext() )    
+        var ReportLineData_XML = IR_GetLogDataXML(DataSet.DocKind, DataSet.DocID, LOG_TYPE_ERROR, false);
+        ReportLineData_XML.SetReportNumber(0);
+        while ( ReportLineData_XML.Next )
+            ErrData = ReportLineData_XML.GetReportLineData();
+            if ( (ErrData.FldNumber != -1) and ((ErrData.MsgCode == "CM083") or (ErrData.DealCode == DealCode) or (ErrData.MsgCode == "CM094") or (ErrData.MsgCode == "CM092")) )
+                fields[fields.size] = ErrData.FldNumber;
+            end;
+        end;
+    end;
+    
+    return fields;
+end;
+//var rslObj = CnvDataIROP(3003);
+//var res = ExecuteRepAcc( 0, 0, 25, 0, 0, rslObj );

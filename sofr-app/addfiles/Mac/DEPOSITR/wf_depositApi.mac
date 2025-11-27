@@ -1,0 +1,311 @@
+/*
+$Name:               wf_depositApi.mac
+$Module:             DEPOSITR
+$Description:        API депозита
+*/
+/*
+*/
+import commonInter, deposInter, deskInter, wf_log, wf_appUtils, dep_utils, operCode;
+import "xr_wf_execute.mac";
+import fm_online;
+
+private class fm_forcedCheck
+  var blockMode :Integer;
+  var mandatoryControlCode :TArray;
+  var unusualOperationCode :TArray;
+  var groundDenialCode :String;
+  var comments: String;
+end;
+
+private file dep("depositr.dbt") key 8;
+private file tariff("sb_tarif.dbt") key 0;
+
+private const STEP_EXEC_ERROR = 4662;
+private const SB_DEPOSIT = 1;
+
+private const TYPERES_CURRENCY = 1;
+private const TYPE_RES_PAY = 0;
+private const CASHOP_DEBIT = 5;
+
+private const
+  D_IN      = 1,     // Приход
+  D_OUT     = 2,     // Расход
+  D_GET     = 3,     // Перечисление
+  D_GETIN   = 4,     // Внутреннее перечисление
+  D_PUT     = 5;     // Зачисление
+
+private const
+  ERRMSG_INITDEPDOC  = "Ошибка при инициализации документа",
+  ERRMSG_INSTODDLIST = "Ошибка при вставке документа в список",
+  ERRMSG_CARRYDDLIST = "Ошибка при проводке списка документов";
+
+private var {curdate}, {oper};
+
+/*************************************************
+ *  Вннутренние функции
+ ************************************************/
+
+private macro findAccount(ref : Integer)
+  dep.referenc = ref;
+  if (not getEq(dep))
+    runError(logError("Не найден счет с референсом " + ref));
+  end; 
+end;
+
+private macro getOperBrigade
+  var cmd = RsdCommand("select nvl(min(g.t_id), 0) " +
+                       "  from drtgroup_dbt g join dgroupmem_dbt gm on (gm.t_branch = g.t_branch and gm.t_date = g.t_date and gm.t_group = g.t_id) " +
+                       "   and g.t_branch = ? " +
+                       "   and g.t_type = 1 " +
+                       "   and g.t_date = ? " +
+                       "   and g.t_isActive <> chr(0) " +
+                       "   and gm.t_oper = ? " +
+                       "   and gm.t_dayclosed = chr(0)");
+
+  cmd.addParam("p_branch", RsdBp_In, numRealFnCash);
+  cmd.addParam("p_date", RsdBp_In, {curdate});
+  cmd.addParam("p_oper", RsdBp_In, {oper});
+
+  cmd.execute;
+   
+  var rs = RsdRecordset(cmd);
+  if (rs.moveNext)
+    return int(rs.value(0));
+  end;
+   return 0;
+end;
+
+var oldFnCash = -1, oldFlagCur = -1;
+private macro setAccountContext(ref : Integer)
+  findAccount(ref);
+  oldFnCash = setFnCash(dep.fnCash);
+  oldFlagCur = setFlagCur(dep.isCur);
+  {curdate} = getCurDate;
+  setOperBrigade(getOperBrigade); 
+end;
+
+private macro restoryAccountContext()
+  if ( oldFnCash>=0 )
+     setFnCash(oldFnCash);
+     setFlagCur(oldFlagCur);
+     {curdate} = getCurDate;
+     setOperBrigade(getOperBrigade); 
+     oldFnCash = -1;
+     oldFlagCur = -1;
+  end;
+end;
+
+private macro detectComplexOperFromRetOp(defaultValue : Integer) : Integer
+  var appKind, appKey;
+  if (interDesk_isDocBunchActive)
+    interDesk_getBunchApplic(appKind, appKey);
+    if (appKind == SB_DEPOSIT)
+      var cmd = RsdCommand("select t_operation from dret_op_dbt where t_applicationKind = ? and t_applicationKey = ?");
+      cmd.addParam("p_appKind", RsdBp_In, appKind);
+      cmd.addParam("p_appKey", RsdBp_In, appKey);
+      cmd.execute;
+      var rs = RsdRecordset(cmd);
+      if (rs.moveNext)
+        return rs.value(0);
+      end; 
+    end; 
+  end;
+  return defaultValue;
+end;
+
+private macro initDepDocument(doc,
+                              ref : Integer, 
+                              opNumber : Integer, subOpNumber : Integer, kindOp : Integer, vidDoc : Integer,
+                              clientCode : Integer, clientRole : String,
+                              inAmount : Money, outAmount : Money, 
+                              tokenNumber : String, ground : String)
+  if (not initDepDoc(ref, doc))
+    runError(logError(ERRMSG_INITDEPDOC), TAppError(STEP_EXEC_ERROR, ERRMSG_INITDEPDOC));
+  end;
+
+  doc.codClient        = clientCode;
+  doc.author           = clientRoleToDepDocAuthor(clientRole); 
+  doc.typeOper         = opNumber;
+  doc.typeComplexOper  = detectComplexOperFromRetOp(opNumber);
+  doc.applType         = subOpNumber;
+  doc.kindOp           = kindOp;
+  doc.vidDoc           = vidDoc;
+  doc.inSum            = inAmount;
+  doc.outSum           = outAmount;
+  if (tokenNumber != null)
+    doc.nDoc             = int(tokenNumber); 
+  end;
+  if (ground != null)
+    doc.ground = ground;
+  else
+    depSetGround(doc);
+  end;
+end;
+
+private macro ParseCodes ( Codes : String  )
+  var result = TArray;
+  var endlen : integer = 0;
+  var findnext = true;
+  if ( (Codes != "") and (ValType(Codes) == V_STRING) )
+    while( findnext )
+      var begin = endlen + 1;
+      endlen = Index( Codes, ";", begin );
+      if ( endlen == 0 )
+        findnext = false
+      else
+        var code = SubStr(Codes, begin, endlen - begin );
+        result[result.size] = code;
+      end;
+    end;
+  end;
+  return result;
+end;
+
+macro fm_check_prepare(paramStr : String) : String
+  // logMessage("fm_check_prepare called");
+
+  var inParams = TParameters(paramStr);
+  var workflowProcess = inParams.get("workflowProcess");
+  var clientRole = inParams.get("clientRole");
+  var clientId = inParams.get("clientId");
+  var accountId = inParams.get("accountId");
+  var kindOperation = inParams.get("kindOperation");
+  var clientAmount = inParams.get("clientAmount");
+  var currencyId = inParams.get("currencyId");
+  var receiveBankID = inParams.get("receiveBankID");
+  var receiverID = inParams.get("receiverID");
+  var receiverAccountId = inParams.get("receiverAccountId");
+  var receiverAmount = inParams.get("receiverAmount");
+  var receivercurrencyId = inParams.get("receivercurrencyId");
+  var blockMode = inParams.get("blockMode");
+  var mandatoryControlCode = inParams.get("mandatoryControlCode");
+  var unusualOperationCode = inParams.get("unusualOperationCode");
+  var groundDenialCode = inParams.get("groundDenialCode");
+  var isHumanitarian = inParams.get("isHumanitarian");
+  var comments = inParams.get("comments");
+
+  record depdoc ("sbdepdoc.dbt");
+  record depositr ("depositr.dbt");
+  var forcedCheck = fm_forcedCheck;
+  var OpNumber :integer = 0;
+  var AmountInNatCurr = $0;
+  var inAmount = $0;
+  var outAmount = $0;
+  var income;
+  var vidDoc :integer = 0;
+  
+  if ( clientAmount == null )
+    clientAmount = $0;
+  end;
+  
+  if ((kindOperation != null) and 
+      ((kindOperation == 10) or 
+       (kindOperation == 30) or 
+       (kindOperation == 50) or 
+       (kindOperation == 70)))
+    income = true;
+  else
+    income = false;
+  end;
+
+  if (income)
+    inAmount = clientAmount;
+  else
+    outAmount = clientAmount;
+  end;
+
+  if ( (inAmount > $0) and ((receiverAccountId == null) or (receiverAccountId == 0)) )
+    OpNumber = 3;
+  elif ( (outAmount > $0) and ((receiverAccountId == null) or (receiverAccountId == 0)) )
+    OpNumber = 4;
+  elif ( (receiverAccountId != null) and (receiverAccountId != 0) )
+    OpNumber = 65;
+  end;
+
+  if ((kindOperation != null) and 
+      ((kindOperation == 10) or 
+       (kindOperation == 20) or 
+       (kindOperation == 50) or 
+       (kindOperation == 80) or 
+       (kindOperation == 180) or 
+       (kindOperation == 210)))
+    vidDoc = 1;
+  else
+    vidDoc = 0;
+  end;
+
+  initDepDocument(depdoc, accountId, OpNumber, 0, kindOperation, vidDoc, clientId, clientRole, inAmount, outAmount);
+  
+  findAccount(accountId);
+  Copy( depositr, dep );
+
+  setAccountContext(accountId);
+
+  if (income)
+    AmountInNatCurr = inAmount;
+  else
+    AmountInNatCurr = outAmount;
+  end;
+  
+  if ( (currencyId != null) and (currencyId > 0))
+    var cmd = RsdCommand( "begin ? := RSU_RTLEXCH.ConvertSumToRub( ?, ?, ?, TO_DATE('01 01 0001 00:00:00','DD MM YYYY HH24:MI:SS'), ?, ?, ? ); end;" );
+    
+    cmd.AddParam( "amountInNatCurr", RSDBP_RETVAL, V_MONEYL );
+    cmd.addParam( "p_CodeCurrency", RSDBP_IN, currencyId );
+    cmd.addParam( "p_Branch", RSDBP_IN, depdoc.fncash );
+    cmd.addParam( "p_DateRate", RSDBP_IN, {curdate} );
+    cmd.addParam( "p_RateKind", RSDBP_IN, 1 );
+    if (income)
+      cmd.addParam( "p_Sum", RSDBP_IN, inAmount );
+    else
+      cmd.addParam( "p_Sum", RSDBP_IN, outAmount );
+    end;
+    cmd.addParam( "p_RateType", RSDBP_IN, 1 );
+    
+    cmd.execute;
+    
+    AmountInNatCurr = cmd.value( "amountInNatCurr" );
+  end;
+  
+  forcedCheck.blockMode = blockMode;
+  forcedCheck.mandatoryControlCode = ParseCodes(mandatoryControlCode);
+  forcedCheck.unusualOperationCode = ParseCodes(unusualOperationCode);
+  forcedCheck.groundDenialCode = groundDenialCode;
+  forcedCheck.comments = comments;
+
+  var msg :string = "";
+  var selectresult: integer = 0;
+  var operationID: integer = 0;
+
+  var resCheck = webCheck_DepOper(depdoc, depositr, clientAmount, AmountInNatCurr, forcedCheck, workflowProcess, inParams, msg, operationID );
+
+  // logMessage("fm_check_prepare resCheck = " + String(resCheck));
+
+  inParams.add("resCheck", resCheck);
+  inParams.add("msg", msg);
+  inParams.add("selectresult", selectresult);
+  inParams.add("operationID", operationID);
+  restoryAccountContext();
+  // logMessage("fm_check_prepare returns " + inParams.toString);
+  return inParams.toString;
+end;
+
+macro checkDelayOperation(paramStr : String) : String
+  var inParams = TParameters(paramStr);
+  var fmOperationID = inParams.get("fmOperationID");
+  var result = FM_CheckOperation( fmOperationID, false, false );
+  if ( result == 0 )
+    result = 1;
+  end;
+  var outParams = handleResult(0);
+  outParams.add("result", result);
+  return outParams.toString;
+onError(e)
+  return handleAppError(e, STEP_EXEC_ERROR).toString;     
+end;
+
+macro resumeProcessEx(processID : String)
+  var pd = TProcessData;
+  pd.PersistentId = processID;
+  return resumeProcess(pd, null);
+end;

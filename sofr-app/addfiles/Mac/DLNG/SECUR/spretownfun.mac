@@ -1,0 +1,1587 @@
+/*
+$Name:         spretownfun.mac 
+$Module:       Ценные бумаги
+$Description:  Операция погашения выпуска/купона ОЭБ. Функции
+*/
+import "sp_car.mac", "SCPeriodComm.mac", "nptxfun.mac";
+const LIC_MSG_DEMO_MODE_OFF = 932;
+
+private macro GetIsIIS(OwnerID:integer, dat:date, isIIS:@bool, ContractID:@integer)
+  var query, cmd, DataSet;
+
+  isIIS = false;
+  ContractID = 0;
+
+  query =   " select NVL((select sf.t_ID "
+          + "               from dsfcontr_dbt sf "
+          + "              where sf.t_ServKind = " + PTSK_STOCKDL
+          + "                and sf.t_PartyID = ? "
+          + "                and sf.t_DateBegin <= ? "
+          + "                and (sf.t_DateClose = "+GetSQLDate(date(0,0,0))+" or sf.t_DateClose >= ?) "
+          + "                and rsi_npto.CheckContrIIS(sf.t_ID) = 0 "
+          + "                and rownum = 1"
+          + "            ), 0) as NotIISSfContrID, "
+          + "        NVL((select sf.t_ID "
+          + "               from dsfcontr_dbt sf "
+          + "              where sf.t_ServKind = " + PTSK_STOCKDL
+          + "                and sf.t_PartyID = ? "
+          + "                and sf.t_DateBegin <= ? "
+          + "                and (sf.t_DateClose = "+GetSQLDate(date(0,0,0))+" or sf.t_DateClose >= ?) "
+          + "                and rsi_npto.CheckContrIIS(sf.t_ID) = 1 "
+          + "                and rownum = 1"
+          + "            ), 0) as IISSfContrID "
+          + "   from dual";
+
+  cmd = DL_RSDCommand(query);
+
+  cmd.AddParam(OwnerID);
+  cmd.AddParam(dat);
+  cmd.AddParam(dat);
+  cmd.AddParam(OwnerID);
+  cmd.AddParam(dat);
+  cmd.AddParam(dat);
+
+  DataSet = cmd.Execute();
+  if(DataSet.moveNext())
+    ContractID = int(DataSet.NotIISSfContrID);
+    isIIS = false;
+    if(ContractID == 0)
+      ContractID = int(DataSet.IISSfContrID);
+      if(ContractID > 0)
+         isIIS = true;
+      else
+         isIIS = false;
+      end;
+    end;
+  end;
+
+end;
+
+private Macro NptxCalcTaxPrevDate(Client, IIS, OperDate)
+   var RetVal = ZeroDate;
+   var query, DataSet, cmd;
+     Query = " SELECT max(T_OPERDATE) prev_date" + 
+                "   FROM dnptxop_dbt " +  
+                "  WHERE t_DocKind = " + DL_CALCNDFL +
+                "    AND t_Recalc = chr(0) " +
+                "    AND t_Client = ? " +
+                "    AND t_IIS = ? " +   
+                "    AND t_OPERDATE <= ?" +
+                "    AND t_STATUS != 0 ";   /*DL_TXOP_Prep*/
+
+   cmd = DL_RSDCommand(query);
+   cmd.AddParam(Client);
+   cmd.AddParam(IIS);
+   cmd.AddParam(OperDate);
+   DataSet = cmd.Execute();
+   if( DataSet.moveNext() AND  (ValType(DataSet.prev_date) != V_UNDEF))
+     RetVal = DataSet.prev_date;
+   end;
+   return RetVal;
+end;
+
+//Получить перераспределенную сумма налога по объектам НДР, сформированным в операциях расчета НОБ на шаге операции погашения
+macro ОЭБ_ПолучитьПераспределенныеСуммыНалога(DocKind:integer, DocID:integer, RedistrMainTax:@money, RedistrTax15:@money)
+  var query, cmd, DataSet;
+  
+  RedistrMainTax = $0;
+  RedistrTax15   = $0;
+
+  query =   " select sum(o.t_Sum0) as TaxSum0, (case when o.t_Kind IN ("+TXOBJ_PAIDGENERAL+","+TXOBJ_PAIDGENERAL_IIS+") then 1 else 2 end) as TaxType"
+          + "   from doproper_dbt opr, doprdocs_dbt odoc, dnptxobdc_dbt odc, dnptxobj_dbt o "
+          + "  where opr.t_DocKind = ? "
+          + "    and opr.t_DocumentID = LPAD(TO_CHAR(?), 34, '0')"
+          + "    and odoc.t_DocKind = 4752 "
+          + "    and odoc.t_ID_Operation = opr.t_ID_Operation "
+          + "    and odc.t_DocID = TO_NUMBER(odoc.t_DocumentID) "
+          + "    and o.t_ObjID = odc.t_ObjID "
+          + "    and o.t_Kind IN ("+TXOBJ_PAIDGENERAL+","+TXOBJ_PAIDGENERAL_15_2+","+TXOBJ_PAIDGENERAL_IIS+","+TXOBJ_PAIDGENERAL_15_IIS+")"
+          + " group by (case when o.t_Kind IN ("+TXOBJ_PAIDGENERAL+","+TXOBJ_PAIDGENERAL_IIS+") then 1 else 2 end) "; 
+
+  cmd = DL_RSDCommand(query);
+
+  cmd.AddParam(DocKind);
+  cmd.AddParam(DocID);
+
+  DataSet = cmd.Execute();
+  while(DataSet.moveNext())
+    if(DataSet.TaxType == 1)
+      RedistrMainTax = DataSet.TaxSum0;
+    elif(DataSet.TaxType == 2)
+      RedistrTax15 = DataSet.TaxSum0;
+    end;
+  end;
+end;
+
+macro ОЭБ_ПодготовкаКРасчетуПогашения(FD, dat:date, ID_Operation:integer, ID_Step:integer)
+  var DataSet, cmd, query;
+  var fiw = TBFile("fiwarnts.dbt");
+  var fin = TBfile("fininstr.dbt");
+  var Circulate = 0, TaxGroupNPTX = 0;
+  var isIIS = false;
+  var ContractID = 0;
+  var СуммаКуп = $0;
+  var err = 0;
+  
+  fin.Clear();
+  fin.rec.FIID = FD.tick.rec.PFI;
+  
+  if(not fin.GetEQ())
+    msgbox("Не найдена ц/б с идентификатором " + FD.tick.rec.PFI);
+    return 1;
+  end;
+
+  if(FD.tick.rec.Number_Coupon != "")
+    fiw.Clear();
+    fiw.rec.FIID      = FD.tick.rec.PFI;
+    fiw.rec.IsPartial = UNSET_CHAR;
+    fiw.rec.Number    = FD.tick.rec.Number_Coupon;
+
+    if(not fiw.GetEQ())
+      msgbox("Не найден купон с номером " + FD.tick.rec.Number_Coupon);
+      return 1;
+    end;
+  end;
+
+  query =  " select NPTO.Market1date(?, ?) t_Circulate, "
+         + "        NPTO.GetPaperTaxGroupNPTX(?) t_TaxGroupNPTX "
+         + "   from dual";
+
+  cmd = Dl_RSDCommand(query);
+
+  cmd.AddParam(fin.rec.FIID);
+  cmd.AddParam(dat);
+  cmd.AddParam(fin.rec.FIID);
+  cmd.AddParam(fin.rec.FIID);
+  cmd.AddParam(dat);
+
+  DataSet = cmd.Execute();
+  if(DataSet.moveNext())
+    Circulate    = int(DataSet.Circulate);
+    TaxGroupNPTX = int(DataSet.TaxGroupNPTX);
+  end;
+
+  query =   " select q.FactReceiverID, SUM(q.Amount) as SumAmount"
+          + "   from (select (sh.t_Total+ (CASE WHEN sh.t_Denominator != 0 THEN sh.t_Numerator/sh.t_Denominator ELSE 0 END)) as Amount, "
+          + "                (CASE WHEN pt.t_LegalForm = "+PTLEGF_PERSN+" THEN sh.t_OwnerID "
+          + "                      WHEN pt.t_LegalForm = "+PTLEGF_INST+" AND RSB_SECUR.IsTaxResident(sh.t_OwnerID, ?) = 0 THEN RSI_NUTX.GetFactReceiverForNUTX(sh.t_OwnerID) "
+          + "                      ELSE -1 END) as FactReceiverID "
+          + "           from dscownlist_dbt ls, dscownhist_dbt sh, dparty_dbt pt "
+          + "          where ls.t_FIID = ? "
+          + "            and ls.t_Number_Coupon = ? "
+          + "            and sh.t_ListID = ls.t_ListID "
+          + "            and (sh.t_AccType = '01' or sh.t_IsFullOpen = CHR(0)) "
+          + "            and (sh.t_ExcludeDate = "+GetSQLDate(date(0,0,0))+" or sh.t_ExcludeDate > ?)"
+          + "            and pt.t_PartyID = sh.t_OwnerID "
+          + "        ) q, dparty_dbt p "
+          + "  where p.t_PartyID = q.FactReceiverID "
+          + "    and p.t_LegalForm = " + PTLEGF_PERSN
+          + "    and p.t_NotResident = CHR(0) "
+          + "    and Exists(select 1 "
+          + "                 from dsfcontr_dbt sf "
+          + "                where sf.t_PartyID = p.t_PartyID "
+          + "                  and sf.t_ServKind = " + PTSK_STOCKDL
+          + "                  and sf.t_DateBegin <= ? "
+          + "                  and (sf.t_DateClose = "+GetSQLDate(date(0,0,0))+" or sf.t_DateClose >= ? ) "
+          + "              ) "
+          + " group by q.FactReceiverID ";
+
+  cmd = DL_RSDCommand(query);
+
+  cmd.AddParam(dat);
+  cmd.AddParam(FD.tick.rec.PFI);
+  cmd.AddParam(FD.tick.rec.Number_Coupon);
+  cmd.AddParam(dat);
+  cmd.AddParam(dat);
+  cmd.AddParam(dat);
+
+  DataSet = cmd.Execute();
+  while((not err) and (DataSet.moveNext()))
+    //Для всех владельцев из списка, являющихся клиентами Фондового дилинга, создать НДР на сумму купона и выполнить расчет НОБ
+    GetIsIIS(DataSet.FactReceiverID, dat, @isIIS, @ContractID);
+
+    СуммаКуп = $0;
+    if(FD.tick.rec.Number_Coupon != "")
+      СуммаКуп = СуммаКупона(fin.rec.FIID, int(DataSet.SumAmount), fiw.rec.DrawingDate);
+    end;
+
+    if(СуммаКуп != 0)
+      err = DL_NPTX_InsertTaxObject( dat                   // Дата НДР
+                                    ,DataSet.FactReceiverID// Клиент
+                                    ,TXOBJ_DIR_IN          // Направление
+                                    ,2                     // Уровень
+                                    ,""                    // Признак "Пользовательский"
+                                    ,TXOBJ_PROCSEC_TS      // Вид НДР
+                                    ,СуммаКуп              // Сумма дохода/расхода
+                                    ,fin.rec.FaceValueFI   // Валюта дохода/расхода
+                                    ,TXOBJ_KIND1020        // Вид аналитики 1
+                                    ,FD.tick.rec.DealID    // Аналитика 1
+                                    ,0                     // Вид аналитики 2
+                                    ,-1                    // Аналитика 2
+                                    ,TXOBJ_KIND3010        // Вид аналитики 3
+                                    ,FD.tick.rec.PFI       // Аналитика 3
+                                    ,TXOBJ_KIND4010        // Вид аналитики 4
+                                    ,Circulate             // Аналитика 4
+                                    ,TXOBJ_KIND5010        // Вид аналитики 5
+                                    ,TaxGroupNPTX          // Аналитика 5
+                                    ,TXOBJ_KIND6020        // Вид аналитики 6
+                                    ,ContractID            // Аналитика 6
+                                    ,""                    // Комментарий
+                                    ,ID_Operation          // ID операции
+                                    ,ID_Step               // ID шага операции
+                                    ,1 );                  // Признак вызова не из операции расчета НОБ
+
+      if(not err)
+        var nptxop_new = TRecHandler( "nptxop" );
+        var RefID = 0;
+
+        nptxop_new.Clear();
+      
+        err = DL_GetKindOperation(DL_CALCNDFL, nptxop_new.rec.Kind_Operation);
+        if( err != 0 )
+           msgbox("Не удалось получить номер вида операции");
+        else
+          GenerateNumberByReference( 132/*OBJTYPE_NPTXCALC*/, 1 /*REFOBJ_NPTXCALC*/, @RefID, @nptxop_new.rec.Code );
+
+          nptxop_new.rec.DocKind           = DL_CALCNDFL;
+          nptxop_new.rec.OperDate          = dat;
+          nptxop_new.rec.SubKind_Operation = DL_TXBASECALC_OPTYPE_NORMAL;  // Подвид операции
+          nptxop_new.rec.Department        = {OperDprt};
+          nptxop_new.rec.Oper              = {oper};
+          nptxop_new.rec.Status            = 0/*DL_TXOP_Prep*/;
+          nptxop_new.rec.Recalc            = UNSET_CHAR;
+          nptxop_new.rec.FIID              = ALLFININSTR;
+          nptxop_new.rec.BegRecalcDate     = ZeroDate;
+          nptxop_new.rec.EndRecalcDate     = ZeroDate;
+          nptxop_new.rec.Client            = DataSet.FactReceiverID;
+          nptxop_new.rec.IIS               = IIF(isIIS == true, SET_CHAR, UNSET_CHAR);
+          nptxop_new.rec.FlagTax           = UNSET_CHAR;  
+          nptxop_new.rec.PrevDate          = NptxCalcTaxPrevDate(DataSet.FactReceiverID, IIF(isIIS == true, SET_CHAR, UNSET_CHAR), dat);
+
+          if ( not CreateNptxOpStep(nptxop_new, true))
+            err = 1;
+          end;
+        end;
+      end;
+    end;
+
+  end;
+
+  return err;
+end;
+
+macro ОЭБ_ВычислитьВыплатыПоПогашению(FIID:integer, Number_Coupon:string, dat:date, PayFIID:integer, СуммаНалогаЮЛН:@money, СуммаНалогаФЛН:@money, СуммаНалогаФЛР:@money, IncNominal:bool, СуммаНалогаФЛР15:@money)
+  var DataSet, cmd, query;
+  var НалоговаяБаза = $0, НалоговаяБазаРуб = $0, НалоговаяБазаРуб15 = $0;
+  var НалоговаяБазаОбщ = $0, НалоговаяБазаОбщРуб15 = $0, НалоговаяБазаОбщРуб = $0;
+  var СуммаНалога  = $0, СуммаНалога15 = $0, СуммаНалогаОбщ = $0, СуммаНалогаОбщ15 = $0;
+  var СуммаНом = $0, СуммаКуп = $0;
+  var Nominal = $0;
+  var Circulate = 0, TaxGroupNPTX = 0, TaxGroupNUTX = 0;
+  var onwtaxCache = RsbSQLInsert("scowntax.tmp");
+  var owntaxArr = TArray();
+  var fin = TBfile("fininstr.dbt");
+  var fiw = TBFile("fiwarnts.dbt");
+  var party = TRecHandler("party.dbt");
+  var FactReceiverID = -1;
+  var Rate = 0;
+  var err = 0;
+  var Sum1 = 0.0, Sum2 = 0.0, Sum3 = 0.0, Sum4 = 0.0, Sum5 = 0.0, Sum6 = 0.0, Sum7 = 0.0, S5, S7;
+  var Year = 0;
+  DateSplit(dat, NULL, NULL, Year);
+  var BegDate = date(1, 1, Year);
+  var SumQuery, SumSelect, SumDS;
+  var isIIS = false;
+  var ContractID = 0;
+  var prevFactReceiverID = -1;
+  var СуммаКупонаОбщ = $0;
+  var ОстатокСуммыКупона = $0, ОстатокЦБ = 0;
+  var ОстатокСуммыНалогаОбщ        = $0;
+  var ОстатокСуммыНалогаОбщ15      = $0;
+  var ОстатокНалоговаяБазаОбщРуб   = $0;
+  var ОстатокНалоговаяБазаОбщРуб15 = $0;
+  var OurBankBIC = GetPartyBIK({OurBank});
+  var MainRate = 0.0;
+  var i = 0;
+
+  СуммаНалогаЮЛН   = $0; 
+  СуммаНалогаФЛН   = $0; 
+  СуммаНалогаФЛР   = $0;
+  СуммаНалогаФЛР15 = $0;
+
+  SQL_Execute("DELETE FROM DSCOWNTAX_TMP", "", false );
+
+  fin.Clear();
+  fin.rec.FIID = FIID;
+  
+  if(not fin.GetEQ())
+    msgbox("Не найдена ц/б с идентификатором " + FIID);
+    return 1;
+  end;
+
+  if(Number_Coupon != "")
+    fiw.Clear();
+    fiw.rec.FIID      = FIID;
+    fiw.rec.IsPartial = UNSET_CHAR;
+    fiw.rec.Number    = Number_Coupon;
+
+    if(not fiw.GetEQ())
+      msgbox("Не найден купон с номером " + Number_Coupon);
+      return 1;
+    end;
+  end;
+
+  Nominal = GetFaceValue(FIID, dat);
+
+  query =  " select NPTO.Market1date(?, ?) t_Circulate, "
+         + "        NPTO.GetPaperTaxGroupNPTX(?) t_TaxGroupNPTX, "
+         + "        RSI_NUTX.GetNUTaxGroup(?, ?) t_TaxGroupNUTX"
+         + "   from dual";
+
+  cmd = Dl_RSDCommand(query);
+
+  cmd.AddParam(fin.rec.FIID);
+  cmd.AddParam(dat);
+  cmd.AddParam(fin.rec.FIID);
+  cmd.AddParam(fin.rec.FIID);
+  cmd.AddParam(dat);
+
+  DataSet = cmd.Execute();
+  if(DataSet.moveNext())
+    Circulate    = int(DataSet.Circulate);
+    TaxGroupNPTX = int(DataSet.TaxGroupNPTX);
+    TaxGroupNUTX = int(DataSet.TaxGroupNUTX);
+  end;
+
+  query =   " with q as (select sh.t_ID as SHID, sh.t_OwnerID as Party, sh.t_ReceiverBankBIC as ReceiverBankBIC, "
+          + "                   (sh.t_Total+ (CASE WHEN sh.t_Denominator != 0 THEN sh.t_Numerator/sh.t_Denominator ELSE 0 END)) as Amount, "
+          + "                   (CASE WHEN pt.t_LegalForm = "+PTLEGF_PERSN+" THEN sh.t_OwnerID "
+          + "                         WHEN pt.t_LegalForm = "+PTLEGF_INST+" AND RSB_SECUR.IsTaxResident(sh.t_OwnerID, ?) = 0 THEN RSI_NUTX.GetFactReceiverForNUTX(sh.t_OwnerID) "
+          + "                         ELSE -1 END) as FactReceiverID "
+          + "              from dscownlist_dbt ls, dscownhist_dbt sh, dparty_dbt pt "
+          + "             where ls.t_FIID = ? "
+          + "               and ls.t_Number_Coupon = ? "
+          + "               and sh.t_ListID = ls.t_ListID "
+          + "               and (sh.t_AccType = '01' or sh.t_AccType = 'OWNE' or sh.t_IsFullOpen = CHR(0)) "
+          + "               and (sh.t_ExcludeDate = "+GetSQLDate(date(0,0,0))+" or sh.t_ExcludeDate > ?)"
+          + "               and pt.t_PartyID = sh.t_OwnerID "
+          + "           ) "
+          + " select q.*, "
+          + "        (select NVL(SUM(q1.Amount), 0) from q q1 where q1.FactReceiverID = q.FactReceiverID and q.FactReceiverID > 0) as TotalAmount, "
+          + "        (select COUNT(1) from q q1 where q1.FactReceiverID = q.FactReceiverID and q.FactReceiverID > 0) as TotalCnt "
+          + "   from q "
+          + "  order by q.FactReceiverID, (case when q.ReceiverBankBIC = '"+OurBankBIC+"' then 1 else 0 end) ASC, q.Amount";
+
+  cmd = DL_RSDCommand(query);
+
+  cmd.AddParam(dat);
+  cmd.AddParam(fin.rec.FIID);
+  cmd.AddParam(Number_Coupon);
+  cmd.AddParam(dat);
+
+  DataSet = cmd.Execute();
+   
+  i = 0; 
+  while((not err) and (DataSet.moveNext())) //для каждого владельца
+
+    Rate = 0.0;
+    СуммаНалога = $0;
+    СуммаНалога15 = $0;
+    FactReceiverID = int(DataSet.FactReceiverID);
+
+    i = i + 1;
+    if(FactReceiverID > 0)
+
+      if(prevFactReceiverID != FactReceiverID)
+        i = 1;
+
+        if(ПолучитьСубъекта(FactReceiverID, party) != 0 )
+          msgbox("Не найден субъект с идентификатором " + FactReceiverID);
+          return 1;
+        end;
+
+        СуммаКупонаОбщ = $0;
+        if(Number_Coupon != "")
+          СуммаКупонаОбщ = СуммаКупона(fin.rec.FIID, int(DataSet.TotalAmount), fiw.rec.DrawingDate);
+        end;
+
+        ОстатокСуммыКупона = СуммаКупонаОбщ;
+        ОстатокЦБ = DataSet.TotalAmount;
+
+        НалоговаяБазаОбщ = СуммаКупонаОбщ;
+        if(fin.rec.FaceValueFI != PayFIID)
+          if( not SmartConvertSum(НалоговаяБазаОбщ, СуммаКупонаОбщ, dat, fin.rec.FaceValueFI, PayFIID, true))
+            return 1;
+          end;
+        end;
+        if(fin.rec.FaceValueFI != NATCUR)
+          if( not SmartConvertSum(НалоговаяБазаОбщРуб, СуммаКупонаОбщ, dat, fin.rec.FaceValueFI, NATCUR, true))
+            return 1;
+          end;
+        else
+          НалоговаяБазаОбщРуб = СуммаКупонаОбщ;
+        end;
+
+        if(party.rec.LegalForm == PTLEGF_PERSN)
+                                                     
+          if(party.rec.NotResident == UNSET_CHAR)
+            GetIsIIS(party.rec.PartyID, dat, @isIIS, @ContractID);
+
+            MainRate = NPTXGENTAXRATE_RESIDENT;
+
+            if(ContractID > 0) //Состоит у нас на обслуживании
+              var НОБ = $0;
+
+              if(isIIS == false)
+                НОБ = GetRubSumByClient(party.rec.PartyID, TXOBJ_BASEG2+","+TXOBJ_BASEG3, date(1,1,Year), dat, null, null, null, null);
+
+                Sum5 =   NPTXGENTAXRATE_RESIDENT * MIN(GetRubSumByClient(party.rec.PartyID, TXOBJ_BASEG2, date(1,1,Year), dat, null, null, null, null), NPTX_LIMINCOME_MAX15)
+                       + NPTXGENTAXRATE_RESIDENT * MIN(GetRubSumByClient(party.rec.PartyID, TXOBJ_BASEG3, date(1,1,Year), dat, null, null, null, null), NPTX_LIMINCOME_MAX15) 
+                       - GetRubSumByClient(party.rec.PartyID, TXOBJ_PAIDGENERAL+","+TXOBJ_PAIDGENERAL_0+","+TXOBJ_PAIDMATERIAL, date(1,1,Year), dat, null, null, null, null);
+
+                Sum7 =   NPTXGENTAXRATE_RESIDENT_15 * MAX(GetRubSumByClient(party.rec.PartyID, TXOBJ_BASEG2, date(1,1,Year), dat, null, null, null, null) - NPTX_LIMINCOME_MAX15, 0) 
+                       + NPTXGENTAXRATE_RESIDENT_15 * MAX(GetRubSumByClient(party.rec.PartyID, TXOBJ_BASEG3, date(1,1,Year), dat, null, null, null, null) - NPTX_LIMINCOME_MAX15, 0) 
+                       - GetRubSumByClient(party.rec.PartyID, TXOBJ_PAIDGENERAL_15_2, date(1,1,Year), dat, null, null, null, null); 
+              else
+                НОБ = GetRubSumByClient(party.rec.PartyID, TXOBJ_BASEG5, date(1,1,Year), dat, null, null, null, null);
+
+                Sum5 =   NPTXGENTAXRATE_RESIDENT * MIN(GetRubSumByClient(party.rec.PartyID, TXOBJ_BASEG5, date(1,1,Year), dat, null, null, null, null), NPTX_LIMINCOME_MAX15)
+                       - GetRubSumByClient(party.rec.PartyID, TXOBJ_PAIDGENERAL_IIS, date(1,1,Year), dat, null, null, null, null);
+
+                Sum7 =   NPTXGENTAXRATE_RESIDENT_15 * MAX(GetRubSumByClient(party.rec.PartyID, TXOBJ_BASEG5, date(1,1,Year), dat, null, null, null, null) - NPTX_LIMINCOME_MAX15, 0) 
+                       - GetRubSumByClient(party.rec.PartyID, TXOBJ_PAIDGENERAL_15_IIS, date(1,1,Year), dat, null, null, null, null);
+              end;
+
+              var НОБпред = НОБ - НалоговаяБазаОбщРуб;
+
+              if(НОБпред > NPTX_LIMINCOME_MAX15)
+                НалоговаяБазаОбщРуб15 = НалоговаяБазаОбщРуб;
+                НалоговаяБазаОбщРуб = $0;
+
+                MainRate = 0;
+              else
+                if(НОБ > NPTX_LIMINCOME_MAX15)
+                  НалоговаяБазаОбщРуб   = NPTX_LIMINCOME_MAX15 - НОБпред;
+                  НалоговаяБазаОбщРуб15 = НОБ-NPTX_LIMINCOME_MAX15;
+                else
+                  НалоговаяБазаОбщРуб15 = 0;
+                end;
+          
+                //НалоговаяБазаОбщРуб = max(НОБ-NPTX_LIMINCOME_MAX15, 0);
+              end;
+              Sum1 = НалоговаяБазаОбщРуб;
+
+              if( (Sum5 + Sum7) > Sum1 )
+                Sum5 = NPTXGENTAXRATE_RESIDENT * Sum1;
+                Sum7 = 0;
+              end;
+
+              S5 = Sum5;
+              S7 = Sum7;
+          
+              if((S5 < 0) and (S7 > 0))
+                Sum5 = S5 + min(abs(S5), abs(S7));
+                Sum7 = S7 - min(abs(S5), abs(S7));
+              elif((S7 < 0) and (S5 > 0))
+                Sum5 = S5 - min(abs(S5), abs(S7));
+                Sum7 = S7 + min(abs(S5), abs(S7));
+              end;
+
+            else
+              Sum1 = НалоговаяБазаОбщРуб;
+              Sum2 = GetRubSumByClient(party.rec.PartyID, TXOBJ_PLUSG_1011, date(1,1,Year), dat, null, null, null, null);
+              Sum3 = GetRubSumByClient(party.rec.PartyID, TXOBJ_PAIDGENERAL, date(1,1,Year), dat, null, null, null, null);
+              Sum6 = GetRubSumByClient(party.rec.PartyID, TXOBJ_PAIDGENERAL_15_2, date(1,1,Year), dat, null, null, null, null); 
+
+              Sum4 = Sum1 + Sum2;
+
+              if(Sum4 > NPTX_LIMINCOME_MAX15)
+                if(Sum2 < NPTX_LIMINCOME_MAX15)
+                  НалоговаяБазаОбщРуб15 = Sum4 - NPTX_LIMINCOME_MAX15;
+                  НалоговаяБазаОбщРуб = NPTX_LIMINCOME_MAX15 - Sum2;
+                else
+                  НалоговаяБазаОбщРуб15 = НалоговаяБазаОбщРуб;
+                  НалоговаяБазаОбщРуб   = $0;
+                  MainRate = 0;
+                end;
+
+                Sum5 = NPTX_LIMINCOME_MAX15 * NPTXGENTAXRATE_RESIDENT - Sum3;
+                Sum7 = (Sum4 - NPTX_LIMINCOME_MAX15) * NPTXGENTAXRATE_RESIDENT_15 - Sum6;
+              else
+                Sum5 = Sum4 * NPTXGENTAXRATE_RESIDENT - Sum3;
+                Sum7 = 0;
+
+                НалоговаяБазаОбщРуб15 = $0;
+              end;
+            end;
+
+            СуммаНалогаОбщ   = round(Sum5,0);
+            СуммаНалогаОбщ15 = round(Sum7,0);
+
+            СуммаНалогаФЛР   = СуммаНалогаФЛР + СуммаНалогаОбщ;
+            СуммаНалогаФЛР15 = СуммаНалогаФЛР15 + СуммаНалогаОбщ15;
+
+          else  
+            Sum1 = НалоговаяБазаОбщРуб;
+            Sum2 = GetRubSumByClient(party.rec.PartyID, TXOBJ_PLUSG_1011, date(1,1,Year), dat, null, IIF(isIIS==true, 1, 0), null, null);
+            Sum3 = GetRubSumByClient(party.rec.PartyID, IIF(isIIS==true, TXOBJ_PAIDGENERAL_IIS, TXOBJ_PAIDGENERAL), date(1,1,Year), dat, null, IIF(isIIS==true, 1, 0), null, null);
+
+            Sum4 = Sum1 + Sum2;
+
+            if(ПолучитьЗначениеПримечанияНаДату(party.rec.PartyID, PARTY_NOTE_KIND_NPTX_RATE_NOTRES, dat, @MainRate) != 0) //если нет примечания
+              MainRate = NPTXGENTAXRATE_NOTRESIDENT;
+            else
+              MainRate = MainRate/100.0; //Т.к. в примечании целые проценты, а нам нужен коэффициент         
+            end;
+
+            Sum5 = Sum4 * MainRate;
+
+            СуммаНалогаОбщ = round(Sum5 - Sum3, 0);
+            СуммаНалогаОбщ15 = 0;
+
+            СуммаНалогаФЛН = СуммаНалогаФЛН + СуммаНалогаОбщ;
+          end;
+
+        elif((party.rec.LegalForm == PTLEGF_INST) and (IsNeresidentForNUTX(party.rec.PartyID, dat)))
+          if(TaxGroupNUTX == NUTAXGROUP_20)
+            MainRate = GetTaxRateNUTX(INCOME_KIND_PERC, dat, FactReceiverID);
+          elif(TaxGroupNUTX == NUTAXGROUP_15)
+            var IfMarket = FIIfMarketNUTX(fin.rec.FIID, dat);
+            if(IfMarket)
+              MainRate = GetTaxRateNUTX(INCOME_KIND_PRIVPERC, dat, FactReceiverID);
+            else
+              MainRate = GetTaxRateNUTX(INCOME_KIND_PERC, dat, FactReceiverID);
+            end;
+          end;
+
+/*DAN Проверка на налоговое освобождение */
+        var NUTX_query, NUTX_cmd, NUTX_DataSet;
+        NUTX_query = "SELECT taxe.T_HASCONFIRM,  taxe.t_note1 " +
+                     "  FROM DPTAXEXEMP_DBT taxe " +
+                     " WHERE taxe.T_PARTYID = ? AND ? BETWEEN taxe.T_STARTDATE AND taxe.T_ENDDATE " ;
+        NUTX_cmd = DL_RSDCommand(NUTX_query);
+        NUTX_cmd.AddParam(FactReceiverID);
+        NUTX_cmd.AddParam(dat);
+        NUTX_DataSet = NUTX_cmd.Execute();
+        if ((NUTX_DataSet.MoveNext) and (NUTX_DataSet.HASCONFIRM == SET_CHAR))
+          if(StrISNumber(NUTX_DataSet.Note1))  
+            MainRate = double(NUTX_DataSet.Note1) / 100;
+          else
+            MainRate = 0;
+          end;
+        end; 
+/*DAN*/
+
+          СуммаНалогаОбщ = round(НалоговаяБазаОбщРуб * MainRate, 0);
+          СуммаНалогаЮЛН = СуммаНалогаЮЛН + СуммаНалогаОбщ;
+        else
+          НалоговаяБазаОбщ      = $0;
+          НалоговаяБазаОбщРуб   = $0;
+          НалоговаяБазаОбщРуб15 = $0;
+          СуммаНалогаОбщ        = $0;
+        end;
+
+      
+        ОстатокСуммыНалогаОбщ        = СуммаНалогаОбщ;
+        ОстатокСуммыНалогаОбщ15      = СуммаНалогаОбщ15;
+        ОстатокНалоговаяБазаОбщРуб   = НалоговаяБазаОбщРуб;
+        ОстатокНалоговаяБазаОбщРуб15 = НалоговаяБазаОбщРуб15;
+      
+      end;
+
+      Rate = MainRate;
+      
+      if(ОстатокЦБ == DataSet.Amount)
+        СуммаКуп      = ОстатокСуммыКупона;
+        СуммаНалога   = ОстатокСуммыНалогаОбщ;
+        СуммаНалога15 = ОстатокСуммыНалогаОбщ15;
+
+        НалоговаяБазаРуб   = ОстатокНалоговаяБазаОбщРуб;
+        НалоговаяБазаРуб15 = ОстатокНалоговаяБазаОбщРуб15;
+
+      else
+        СуммаКуп      = round(СуммаКупонаОбщ / DataSet.TotalAmount * DataSet.Amount, 2);
+        СуммаНалога   = round(СуммаНалогаОбщ / DataSet.TotalAmount * DataSet.Amount, 0);
+        СуммаНалога15 = round(СуммаНалогаОбщ15 / DataSet.TotalAmount * DataSet.Amount, 0);
+
+        НалоговаяБазаРуб   = round(НалоговаяБазаОбщРуб / DataSet.TotalAmount * DataSet.Amount, 2);  
+        НалоговаяБазаРуб15 = round(НалоговаяБазаОбщРуб15 / DataSet.TotalAmount * DataSet.Amount, 2);
+      end;
+
+
+      ОстатокСуммыКупона           = ОстатокСуммыКупона      - СуммаКуп;
+      ОстатокСуммыНалогаОбщ        = ОстатокСуммыНалогаОбщ   - СуммаНалога;  
+      ОстатокСуммыНалогаОбщ15      = ОстатокСуммыНалогаОбщ15 - СуммаНалога15;
+
+      ОстатокНалоговаяБазаОбщРуб   = ОстатокНалоговаяБазаОбщРуб   - НалоговаяБазаРуб;     
+      ОстатокНалоговаяБазаОбщРуб15 = ОстатокНалоговаяБазаОбщРуб15 - НалоговаяБазаРуб15;
+
+      ОстатокЦБ = ОстатокЦБ - DataSet.Amount;
+    else
+      НалоговаяБаза = $0;
+      НалоговаяБазаРуб = $0;
+      НалоговаяБазаРуб15 = $0;
+
+      СуммаКуп = $0;
+      if(Number_Coupon != "")
+        СуммаКуп = СуммаКупона(fin.rec.FIID, int(DataSet.Amount), fiw.rec.DrawingDate);
+      end;
+    end;
+        
+    СуммаНом = $0;
+    if(IncNominal == true)
+      СуммаНом = round(Nominal*int(DataSet.Amount), 2);
+    end;
+
+    var sz = owntaxArr.size;
+    owntaxArr[sz] = TRecHandler("scowntax.tmp");
+
+    owntaxArr[sz].Clear();
+    owntaxArr[sz].rec.SHID           = DataSet.SHID;
+    owntaxArr[sz].rec.FactReceiverID = IIF(FactReceiverID <= 0, DataSet.Party, FactReceiverID);
+    owntaxArr[sz].rec.PaySum         = СуммаНом + СуммаКуп;
+    owntaxArr[sz].rec.PayCur         = fin.rec.FaceValueFI;
+    owntaxArr[sz].rec.TaxBaseSum     = НалоговаяБазаРуб;
+    owntaxArr[sz].rec.TaxBaseSum15   = НалоговаяБазаРуб15;
+    owntaxArr[sz].rec.TaxRate        = Rate * 100.0;
+    owntaxArr[sz].rec.TaxSum         = round(СуммаНалога,0);
+    owntaxArr[sz].rec.TaxSum15       = round(СуммаНалога15,0);
+    owntaxArr[sz].rec.NomSum         = СуммаНом;
+    owntaxArr[sz].rec.CoupSum        = СуммаКуп;
+
+    prevFactReceiverID = FactReceiverID;
+  end;
+   
+  if((not err) and (owntaxArr.size > 0))
+    onwtaxCache.AddRecordArray(owntaxArr);
+
+    if(not onwtaxCache.Insert())
+      err = 1;
+    end;
+  end;
+  
+  return err;
+end;
+
+macro ОЭБ_РассчитатьВыплатыПоПогашению(FD, dat:date)
+  var TaxSum = 1;
+  var rRqAcc = TRecHandler("dlrqacc.dbt");
+  var rSA    = TRecHandler("settacc.dbt");
+  var DlRq   = TRecHandler("dlrq.dbt");
+  var party  = TRecHandler("party.dbt");
+  var TaxReceiverID = -1, FactReceiverID = -1;
+  var err = 0;   
+  var СуммаНалогаЮЛН = $0, СуммаНалогаФЛН = $0, СуммаНалогаФЛР = $0, СуммаНалогаФЛР15 = $0;
+  var Rate = 0;
+  var cmd, query, DataSet;
+  
+  err = ОЭБ_ВычислитьВыплатыПоПогашению(FD.tick.rec.PFI, FD.tick.rec.Number_Coupon, dat, FD.dl_leg.rec.PayFIID, @СуммаНалогаЮЛН, @СуммаНалогаФЛН, @СуммаНалогаФЛР, IIF(IsRET_ISSUE(FD.Group), true, false), @СуммаНалогаФЛР15);
+
+  if((not err) and (FD.avrserv() != NULL) and (FD.avrserv().rec.TaxAgent == SET_CHAR))
+
+    if(ПолучитьСубъекта({OurBank}, party) == 0 )
+      TaxReceiverID = party.rec.TaxInstitution;
+    else
+      msgbox("Не найден субъект с идентификатором " + {OurBank});
+      err = 1;
+    end;
+
+    if((not err) and (TaxReceiverID == -1))
+      msgbox("Для банка не указана налоговая инспекция");
+      err = 1;
+    end;
+    
+    if((not err) and (СуммаНалогаЮЛН > 0))
+
+      rRqAcc.Clear();
+      if(ПолучитьПлатежныеРеквизитыСубъектаПоСделке(FD.tick.rec.BofficeKind, FD.tick.rec.DealID, TaxReceiverID, DLRQ_SUBKIND_CURRENCY, NATCUR, DLRQ_TYPE_TAX_ULN, rRqAcc) != 0) //нет подходящих платежных реквизитов
+        rSA.Clear();
+        if(SP_GetPartySETTACC(TaxReceiverID, 0, NATCUR, FIKIND_CURRENCY, PTSK_STOCKDL, rSA, FD.tick.rec.DealType, PM_PURP_TAXINCOME_NJ) == 0)
+          //создать новые платежные реквизиты
+          rRqAcc.rec.ID               = 0;     
+          rRqAcc.rec.DocKind          = FD.tick.rec.BofficeKind;     
+          rRqAcc.rec.DocID            = FD.tick.rec.DealID;     
+          rRqAcc.rec.SubKind          = DLRQ_SUBKIND_CURRENCY;     
+          rRqAcc.rec.Type             = DLRQ_TYPE_TAX_ULN;     
+          rRqAcc.rec.Party            = TaxReceiverID;     
+          rRqAcc.rec.FIID             = rSA.rec.FIID;                 
+          rRqAcc.rec.BankID           = rSA.rec.BankID;               
+          rRqAcc.rec.Chapter          = rSA.rec.Chapter;              
+          rRqAcc.rec.Account          = rSA.rec.Account;         
+          rRqAcc.rec.BankCodeKind     = rSA.rec.BankCodeKind;         
+          rRqAcc.rec.BankCode         = rSA.rec.BankCode;        
+          rRqAcc.rec.BankName         = rSA.rec.BankName;        
+          rRqAcc.rec.BankCorrID       = rSA.rec.BankCorrID;           
+          rRqAcc.rec.BankCorrCodeKind = rSA.rec.BankCorrCodeKind;     
+          rRqAcc.rec.BankCorrCode     = rSA.rec.BankCorrCode;    
+          rRqAcc.rec.BankCorrName     = rSA.rec.BankCorrName;    
+          rRqAcc.rec.CorrAcc          = rSA.rec.CorrAcc;         
+
+        else
+          msgbox("Не найдена СПИ по деньгам для субъекта с ID = "+TaxReceiverID);
+          err = 1;
+        end;
+      end;
+
+      if(not err)
+        DlRq.Clear();
+        DlRq.rec.DocKind  = FD.tick.rec.BofficeKind;
+        DlRq.rec.DocID    = FD.tick.rec.DealID;     
+        DlRq.rec.DealPart = 1;
+        DlRq.rec.Kind     = DLRQ_KIND_COMMIT;
+        DlRq.rec.SubKind  = DLRQ_SUBKIND_CURRENCY;
+        DlRq.rec.Type     = DLRQ_TYPE_TAX_ULN;
+        DlRq.rec.Amount   = СуммаНалогаЮЛН;
+        DlRq.rec.FIID     = NATCUR;
+        DlRq.rec.Party    = TaxReceiverID;
+        DlRq.rec.RqAccID  = rRqAcc.rec.ID;
+        DlRq.rec.PlaceID  = iif(rRqAcc.rec.BANKCORRID > 0, rRqAcc.rec.BANKCORRID, rRqAcc.rec.BANKID);
+        DlRq.rec.State    = DLRQ_STATE_PLAN;
+        DlRq.rec.PlanDate = FD.dl_leg.rec.Expiry;
+        DlRq.rec.FactDate = date(0,0,0);
+       
+        if( DL_CreateDLRQ(DlRq, dat, DLRQ_ACTION_CREATE, NULL, rRqAcc) != 0 )
+           msgbox( "Ошибка при создании ТО по налогу по сделке с ID = "+string(FD.tick.rec.DealID)+": "+GetErrMsg() );
+           err = 1;
+        end;
+      end;
+    end;
+
+    if((not err) and (СуммаНалогаФЛН > 0))
+
+      rRqAcc.Clear();
+      if(ПолучитьПлатежныеРеквизитыСубъектаПоСделке(FD.tick.rec.BofficeKind, FD.tick.rec.DealID, TaxReceiverID, DLRQ_SUBKIND_CURRENCY, NATCUR, DLRQ_TYPE_TAX_FLN, rRqAcc) != 0) //нет подходящих платежных реквизитов
+        rSA.Clear();
+        if(SP_GetPartySETTACC(TaxReceiverID, 0, NATCUR, FIKIND_CURRENCY, PTSK_STOCKDL, rSA, FD.tick.rec.DealType, PM_PURP_TAXINCOME_IND) == 0)
+          //создать новые платежные реквизиты
+          rRqAcc.rec.ID               = 0;     
+          rRqAcc.rec.DocKind          = FD.tick.rec.BofficeKind;     
+          rRqAcc.rec.DocID            = FD.tick.rec.DealID;     
+          rRqAcc.rec.SubKind          = DLRQ_SUBKIND_CURRENCY;     
+          rRqAcc.rec.Type             = DLRQ_TYPE_TAX_FLN;     
+          rRqAcc.rec.Party            = TaxReceiverID;     
+          rRqAcc.rec.FIID             = rSA.rec.FIID;                 
+          rRqAcc.rec.BankID           = rSA.rec.BankID;               
+          rRqAcc.rec.Chapter          = rSA.rec.Chapter;              
+          rRqAcc.rec.Account          = rSA.rec.Account;         
+          rRqAcc.rec.BankCodeKind     = rSA.rec.BankCodeKind;         
+          rRqAcc.rec.BankCode         = rSA.rec.BankCode;        
+          rRqAcc.rec.BankName         = rSA.rec.BankName;        
+          rRqAcc.rec.BankCorrID       = rSA.rec.BankCorrID;           
+          rRqAcc.rec.BankCorrCodeKind = rSA.rec.BankCorrCodeKind;     
+          rRqAcc.rec.BankCorrCode     = rSA.rec.BankCorrCode;    
+          rRqAcc.rec.BankCorrName     = rSA.rec.BankCorrName;    
+          rRqAcc.rec.CorrAcc          = rSA.rec.CorrAcc;         
+
+        else
+          msgbox("Не найдена СПИ по деньгам для субъекта с ID = "+TaxReceiverID);
+          err = 1;
+        end;
+      end;
+
+      if(not err)
+        DlRq.Clear();
+        DlRq.rec.DocKind  = FD.tick.rec.BofficeKind;
+        DlRq.rec.DocID    = FD.tick.rec.DealID;     
+        DlRq.rec.DealPart = 1;
+        DlRq.rec.Kind     = DLRQ_KIND_COMMIT;
+        DlRq.rec.SubKind  = DLRQ_SUBKIND_CURRENCY;
+        DlRq.rec.Type     = DLRQ_TYPE_TAX_FLN;
+        DlRq.rec.Amount   = СуммаНалогаФЛН;
+        DlRq.rec.FIID     = NATCUR;
+        DlRq.rec.Party    = TaxReceiverID;
+        DlRq.rec.RqAccID  = rRqAcc.rec.ID;
+        DlRq.rec.PlaceID  = iif(rRqAcc.rec.BANKCORRID > 0, rRqAcc.rec.BANKCORRID, rRqAcc.rec.BANKID);
+        DlRq.rec.State    = DLRQ_STATE_PLAN;
+        DlRq.rec.PlanDate = FD.dl_leg.rec.Expiry;
+        DlRq.rec.FactDate = date(0,0,0);
+       
+        if( DL_CreateDLRQ(DlRq, dat, DLRQ_ACTION_CREATE, NULL, rRqAcc) != 0 )
+           msgbox( "Ошибка при создании ТО по налогу по сделке с ID = "+string(FD.tick.rec.DealID)+": "+GetErrMsg() );
+           err = 1;
+        end;
+      end;
+
+    end;
+
+    if((not err) and (СуммаНалогаФЛР > 0))
+
+      rRqAcc.Clear();
+      if(ПолучитьПлатежныеРеквизитыСубъектаПоСделке(FD.tick.rec.BofficeKind, FD.tick.rec.DealID, TaxReceiverID, DLRQ_SUBKIND_CURRENCY, NATCUR, DLRQ_TYPE_TAX_FLR, rRqAcc) != 0) //нет подходящих платежных реквизитов
+        rSA.Clear();
+        if(SP_GetPartySETTACC(TaxReceiverID, 0, NATCUR, FIKIND_CURRENCY, PTSK_STOCKDL, rSA, FD.tick.rec.DealType, PM_PURP_TAXINCOME_IND) == 0)
+          //создать новые платежные реквизиты
+          rRqAcc.rec.ID               = 0;     
+          rRqAcc.rec.DocKind          = FD.tick.rec.BofficeKind;     
+          rRqAcc.rec.DocID            = FD.tick.rec.DealID;     
+          rRqAcc.rec.SubKind          = DLRQ_SUBKIND_CURRENCY;     
+          rRqAcc.rec.Type             = DLRQ_TYPE_TAX_FLR;     
+          rRqAcc.rec.Party            = TaxReceiverID;     
+          rRqAcc.rec.FIID             = rSA.rec.FIID;                 
+          rRqAcc.rec.BankID           = rSA.rec.BankID;               
+          rRqAcc.rec.Chapter          = rSA.rec.Chapter;              
+          rRqAcc.rec.Account          = rSA.rec.Account;         
+          rRqAcc.rec.BankCodeKind     = rSA.rec.BankCodeKind;         
+          rRqAcc.rec.BankCode         = rSA.rec.BankCode;        
+          rRqAcc.rec.BankName         = rSA.rec.BankName;        
+          rRqAcc.rec.BankCorrID       = rSA.rec.BankCorrID;           
+          rRqAcc.rec.BankCorrCodeKind = rSA.rec.BankCorrCodeKind;     
+          rRqAcc.rec.BankCorrCode     = rSA.rec.BankCorrCode;    
+          rRqAcc.rec.BankCorrName     = rSA.rec.BankCorrName;    
+          rRqAcc.rec.CorrAcc          = rSA.rec.CorrAcc;         
+
+        else
+          msgbox("Не найдена СПИ по деньгам для субъекта с ID = "+TaxReceiverID);
+          err = 1;
+        end;
+      end;
+
+      if(not err)
+        DlRq.Clear();
+        DlRq.rec.DocKind  = FD.tick.rec.BofficeKind;
+        DlRq.rec.DocID    = FD.tick.rec.DealID;     
+        DlRq.rec.DealPart = 1;
+        DlRq.rec.Kind     = DLRQ_KIND_COMMIT;
+        DlRq.rec.SubKind  = DLRQ_SUBKIND_CURRENCY;
+        DlRq.rec.Type     = DLRQ_TYPE_TAX_FLR;
+        DlRq.rec.Amount   = СуммаНалогаФЛР;
+        DlRq.rec.FIID     = NATCUR;
+        DlRq.rec.Party    = TaxReceiverID;
+        DlRq.rec.RqAccID  = rRqAcc.rec.ID;
+        DlRq.rec.PlaceID  = iif(rRqAcc.rec.BANKCORRID > 0, rRqAcc.rec.BANKCORRID, rRqAcc.rec.BANKID);
+        DlRq.rec.State    = DLRQ_STATE_PLAN;
+        DlRq.rec.PlanDate = FD.dl_leg.rec.Expiry;
+        DlRq.rec.FactDate = date(0,0,0);
+       
+        if( DL_CreateDLRQ(DlRq, dat, DLRQ_ACTION_CREATE, NULL, rRqAcc) != 0 )
+           msgbox( "Ошибка при создании ТО по налогу по сделке с ID = "+string(FD.tick.rec.DealID)+": "+GetErrMsg() );
+           err = 1;
+        end;
+      end;
+    end;
+
+    if((not err) and (СуммаНалогаФЛР15 > 0))
+
+      rRqAcc.Clear();
+      if(ПолучитьПлатежныеРеквизитыСубъектаПоСделке(FD.tick.rec.BofficeKind, FD.tick.rec.DealID, TaxReceiverID, DLRQ_SUBKIND_CURRENCY, NATCUR, DLRQ_TYPE_TAX_FLR_ADD, rRqAcc) != 0) //нет подходящих платежных реквизитов
+        rSA.Clear();
+        if(SP_GetPartySETTACC(TaxReceiverID, 0, NATCUR, FIKIND_CURRENCY, PTSK_STOCKDL, rSA, FD.tick.rec.DealType, PM_PURP_TAXINCOME_IND) == 0)
+          //создать новые платежные реквизиты
+          rRqAcc.rec.ID               = 0;     
+          rRqAcc.rec.DocKind          = FD.tick.rec.BofficeKind;     
+          rRqAcc.rec.DocID            = FD.tick.rec.DealID;     
+          rRqAcc.rec.SubKind          = DLRQ_SUBKIND_CURRENCY;     
+          rRqAcc.rec.Type             = DLRQ_TYPE_TAX_FLR_ADD;     
+          rRqAcc.rec.Party            = TaxReceiverID;     
+          rRqAcc.rec.FIID             = rSA.rec.FIID;                 
+          rRqAcc.rec.BankID           = rSA.rec.BankID;               
+          rRqAcc.rec.Chapter          = rSA.rec.Chapter;              
+          rRqAcc.rec.Account          = rSA.rec.Account;         
+          rRqAcc.rec.BankCodeKind     = rSA.rec.BankCodeKind;         
+          rRqAcc.rec.BankCode         = rSA.rec.BankCode;        
+          rRqAcc.rec.BankName         = rSA.rec.BankName;        
+          rRqAcc.rec.BankCorrID       = rSA.rec.BankCorrID;           
+          rRqAcc.rec.BankCorrCodeKind = rSA.rec.BankCorrCodeKind;     
+          rRqAcc.rec.BankCorrCode     = rSA.rec.BankCorrCode;    
+          rRqAcc.rec.BankCorrName     = rSA.rec.BankCorrName;    
+          rRqAcc.rec.CorrAcc          = rSA.rec.CorrAcc;         
+
+        else
+          msgbox("Не найдена налоговая СПИ для субъекта с ID = "+TaxReceiverID);
+          err = 1;
+        end;
+      end;
+
+      if(not err)
+        DlRq.Clear();
+        DlRq.rec.DocKind  = FD.tick.rec.BofficeKind;
+        DlRq.rec.DocID    = FD.tick.rec.DealID;     
+        DlRq.rec.DealPart = 1;
+        DlRq.rec.Kind     = DLRQ_KIND_COMMIT;
+        DlRq.rec.SubKind  = DLRQ_SUBKIND_CURRENCY;
+        DlRq.rec.Type     = DLRQ_TYPE_TAX_FLR_ADD;
+        DlRq.rec.Amount   = СуммаНалогаФЛР15;
+        DlRq.rec.FIID     = NATCUR;
+        DlRq.rec.Party    = TaxReceiverID;
+        DlRq.rec.RqAccID  = rRqAcc.rec.ID;
+        DlRq.rec.PlaceID  = iif(rRqAcc.rec.BANKCORRID > 0, rRqAcc.rec.BANKCORRID, rRqAcc.rec.BANKID);
+        DlRq.rec.State    = DLRQ_STATE_PLAN;
+        DlRq.rec.PlanDate = FD.dl_leg.rec.Expiry;
+        DlRq.rec.FactDate = date(0,0,0);
+       
+        if( DL_CreateDLRQ(DlRq, dat, DLRQ_ACTION_CREATE, NULL, rRqAcc) != 0 )
+           msgbox( "Ошибка при создании ТО по налогу по сделке с ID = "+string(FD.tick.rec.DealID)+": "+GetErrMsg() );
+           err = 1;
+        end;
+      end;
+    end;
+  end;
+
+  if((not err) and (FD.ExistRqPayIncome()))
+    var PayImcome = FD.GetRQ(DLRQ_TYPE_PAYINCOME).rec.Amount - СуммаНалогаЮЛН - СуммаНалогаФЛН - СуммаНалогаФЛР - СуммаНалогаФЛР15;
+      
+    FD.GetRQ(DLRQ_TYPE_PAYINCOME).rec.Amount = PayImcome;
+  end;
+
+  if(not err)
+    err = SC_SaveOwnTaxFromTMP();
+  end;
+
+  return err;
+end;
+
+macro ПолучитьКодКомиссииОЭБ_ПГКУП()
+  return "ПГ_КУП";
+end;
+
+macro ПолучитьКодКомиссииОЭБ_ПГВЫП()
+  return "ПГ_ВЫП";
+end;
+
+//Рассчитать комиссию платежному агенту при погашении ц/б или купона ОЭБ
+macro ОЭБ_РассчитатьКомиссиюПАПриПогашении(FD, CommCode:string, dat:date, Sum:@money, NDS:@money)
+  var err = 0, errMes = "";
+  var ArrComSums = TArray();
+  var query, cmd, DataSet;
+  var rRqAcc = TRecHandler("dlrqacc.dbt");
+  var rSA    = TRecHandler("settacc.dbt");
+  var dlcomis= TRecHandler("dlcomis.dbt");
+  var SfContrID = 0;
+
+  Sum = $0;
+  NDS = $0;
+
+  if((FD.avrserv() == NULL) or (FD.avrserv().rec.PartyContrP <= 0))
+    msgbox("В параметрах обслуживания выпуска ц/б не указан договор с платежным агентом");
+    return 1;
+  end;
+
+  if(FD.avrserv().rec.PartyP == {OurBank})
+    return 0;
+  end;
+  
+  SfContrID = FD.avrserv().rec.PartyContrP;
+
+
+  query =   " select contr.t_ContractorID, concom.t_ID as ConComID, concom.t_CommNumber, cm.t_FIID_COMM, cm.t_PayNDS, cm.t_ReceiverID "
+          + "   from dsfcontr_dbt contr, dsfconcom_dbt concom, dsfcomiss_dbt cm "
+          + "  where contr.t_ID = ? "
+          + "    and concom.t_ObjectType = " + OBJTYPE_SFCONTR
+          + "    and concom.t_ObjectID = contr.t_ID " 
+          + "    and concom.t_FeeType = " + SF_FEE_TYPE_SINGLE
+          + "    and (concom.t_DateBegin = "+GetSQLDate(date(0,0,0))+" or concom.t_DateBegin <= ?) "
+          + "    and cm.t_FeeType = concom.t_FeeType "
+          + "    and cm.t_Number = concom.t_CommNumber "
+          + "    and cm.t_Code = ? ";
+
+  cmd = DL_RSdCommand(query);
+
+  cmd.AddParam(SfContrID);
+  cmd.AddParam(dat);
+  cmd.AddParam(CommCode);
+
+  DataSet = cmd.Execute();
+  
+  if(DataSet.MoveNext())
+    if(SfCalcOprSfCom(SfContrID, DataSet.CommNumber, FD.tick, FD.tick.rec.BOfficeKind, $0, -1, NULL, NULL, Sum, NDS) == false)
+      Sum = $0;
+      NDS = $0;
+      msgbox( "Ошибка расчета сумм периодической комиссии с номером "+DataSet.CommNumber+".\n" + errMes) ;
+      err = 1;
+    end;
+
+    if((not err) and (Sum > 0))
+      rRqAcc.Clear();
+      if(ПолучитьПлатежныеРеквизитыСубъектаПоСделке(FD.tick.rec.BofficeKind, FD.tick.rec.DealID, DataSet.ReceiverID, DLRQ_SUBKIND_CURRENCY, DataSet.t_FIID_COMM, DLRQ_TYPE_COMISS, rRqAcc) != 0) //нет подходящих платежных реквизитов
+        rSA.Clear();
+        if(SP_GetPartySETTACC(DataSet.ReceiverID, 0, DataSet.FIID_COMM, FIKIND_CURRENCY, 0, rSA) == 0)
+          //создать новые платежные реквизиты
+          rRqAcc.rec.ID               = 0;     
+          rRqAcc.rec.DocKind          = FD.tick.rec.BofficeKind;     
+          rRqAcc.rec.DocID            = FD.tick.rec.DealID;     
+          rRqAcc.rec.SubKind          = DLRQ_SUBKIND_CURRENCY;     
+          rRqAcc.rec.Type             = DLRQ_TYPE_COMISS;     
+          rRqAcc.rec.Party            = DataSet.ReceiverID;     
+          rRqAcc.rec.FIID             = rSA.rec.FIID;                 
+          rRqAcc.rec.BankID           = rSA.rec.BankID;               
+          rRqAcc.rec.Chapter          = rSA.rec.Chapter;              
+          rRqAcc.rec.Account          = rSA.rec.Account;         
+          rRqAcc.rec.BankCodeKind     = rSA.rec.BankCodeKind;         
+          rRqAcc.rec.BankCode         = rSA.rec.BankCode;        
+          rRqAcc.rec.BankName         = rSA.rec.BankName;        
+          rRqAcc.rec.BankCorrID       = rSA.rec.BankCorrID;           
+          rRqAcc.rec.BankCorrCodeKind = rSA.rec.BankCorrCodeKind;     
+          rRqAcc.rec.BankCorrCode     = rSA.rec.BankCorrCode;    
+          rRqAcc.rec.BankCorrName     = rSA.rec.BankCorrName;    
+          rRqAcc.rec.CorrAcc          = rSA.rec.CorrAcc;         
+
+          if( DL_InsertDLRQACC(rRqAcc) )
+            msgbox("Ошибка вставки платежных реквизитов для комиссии с номером \""+DataSet.CommNumber+"\" по сделке с ID = "+string(FD.tick.rec.DealID)+": "+GetErrMsg());
+            err = 1;
+          end;
+        else
+          msgbox("Не найдена СПИ по деньгам для субъекта с ID = "+DataSet.ReceiverID);
+          err = 1;
+        end;
+      end;
+
+      if(not err)
+        dlcomis.Clear();
+        dlcomis.rec.DOCKIND     = FD.tick.rec.BofficeKind;
+        dlcomis.rec.DOCID       = FD.tick.rec.DealID;
+        dlcomis.rec.CONTRACT    = SfContrID;
+        dlcomis.rec.FEETYPE     = SF_FEE_TYPE_SINGLE;
+        dlcomis.rec.COMNUMBER   = DataSet.CommNumber;
+
+        if(DataSet.PayNDS == SF_NOT_ADD_TAX)
+          dlcomis.rec.SUM = Sum + NDS;
+        else 
+          dlcomis.rec.SUM = Sum; 
+        end;
+        
+        dlcomis.rec.NDS         = NDS;
+        dlcomis.rec.DATE        =
+        dlcomis.rec.PLANPAYDATE = 
+        dlcomis.rec.FACTPAYDATE = dat;
+        dlcomis.rec.INPUTMEDIUM = GetInputMedium(INPUTMEDIUM_CALC);
+
+        dlcomis.rec.IMMATERIAL  = UNSET_CHAR;
+                    
+        if( not OprInsertDLCOMIS( dlcomis ) )
+          msgbox(GetErrMsg());
+          err = 1;
+        end;
+      end;
+    end;
+  end;
+
+  return err;
+end;
+
+
+macro ОЭБ_НДРПриПогашКупона(FD, dat:date, ID_Operation:integer, ID_Step:integer)
+  var query, cmd, DataSet;
+  var err = 0;
+  var СуммаВыплаты = $0, СуммаВыплатыРуб = $0;
+  var СуммаНалога  = $0, СуммаНалога15 = $0;
+  var Circulate = 0, TaxGroupNPTX = 0, TaxGroupNUTX = 0;
+  var Kind = 0;
+  var TaxReceiverID = -1, FactReceiverID = -1, OwnerID = -1;
+  var ContractID = 0;
+  var IsIIS = false;
+  var party = TRecHandler("party.dbt");
+  var fin   = TBFile("fininstr.dbt");
+  var ErrNum = 0;
+  var TaxBaseSum35 = $0;
+  var TaxObj = TInsertTaxObject();
+
+  fin.Clear();
+  fin.rec.FIID = FD.tick.rec.PFI;
+  
+  if(not fin.GetEQ())
+    msgbox("Не найдена ц/б с идентификатором " + FD.tick.rec.PFI);
+    return 1;
+  end;
+
+  query =  " select NPTO.Market1date(?, ?) t_Circulate, "
+         + "        NPTO.GetPaperTaxGroupNPTX(?) t_TaxGroupNPTX, "
+         + "        RSI_NUTX.GetNUTaxGroup(?, ?) t_TaxGroupNUTX"
+         + "   from dual";
+
+  cmd = Dl_RSDCommand(query);
+
+  cmd.AddParam(FD.tick.rec.PFI);
+  cmd.AddParam(dat);
+  cmd.AddParam(FD.tick.rec.PFI);
+  cmd.AddParam(FD.tick.rec.PFI);
+  cmd.AddParam(dat);
+  
+  DataSet = cmd.Execute();
+  if(DataSet.moveNext())
+    Circulate    = int(DataSet.Circulate);
+    TaxGroupNPTX = int(DataSet.TaxGroupNPTX);
+    TaxGroupNUTX = int(DataSet.TaxGroupNUTX);
+
+    query =   " select sh.t_OwnerID, tx.t_FactReceiverID, tx.t_PaySum, tx.t_PayCur, tx.t_TaxSum, tx.t_TaxRate, tx.t_TaxBaseSum, tx.t_TaxBaseSum15, tx.t_TaxSum15, tx.t_CoupSum, "
+            + "        NVL((select sf.t_ID "
+            + "               from dsfcontr_dbt sf "
+            + "              where sf.t_ServKind = " + PTSK_STOCKDL
+            + "                and sf.t_PartyID = sh.t_OwnerID "
+            + "                and sf.t_DateBegin <= ? "
+            + "                and (sf.t_DateClose = "+GetSQLDate(date(0,0,0))+" or sf.t_DateClose >= ?) "
+            + "                and rsi_npto.CheckContrIIS(sf.t_ID) = 0 "
+            + "                and rownum = 1"
+            + "            ), 0) as NotIISSfContrID, "
+            + "        NVL((select sf.t_ID "
+            + "               from dsfcontr_dbt sf "
+            + "              where sf.t_ServKind = " + PTSK_STOCKDL
+            + "                and sf.t_PartyID = sh.t_OwnerID "
+            + "                and sf.t_DateBegin <= ? "
+            + "                and (sf.t_DateClose = "+GetSQLDate(date(0,0,0))+" or sf.t_DateClose >= ?) "
+            + "                and rsi_npto.CheckContrIIS(sf.t_ID) = 1 "
+            + "                and rownum = 1"
+            + "            ), 0) as IISSfContrID "
+            + "   from dscownlist_dbt ls, dscownhist_dbt sh, dscowntax_dbt tx "
+            + "  where ls.t_FIID = ? "
+            + "    and ls.t_Number_Coupon = ? "
+            + "    and sh.t_ListID = ls.t_ListID "
+            + "    and tx.t_SHID = sh.t_ID "
+            + "    and (tx.t_TaxSum > 0 or tx.t_TaxSum15 > 0) ";
+ 
+    cmd = DL_RSDCommand(query);
+
+    cmd.AddParam(dat);
+    cmd.AddParam(dat);
+    cmd.AddParam(dat);
+    cmd.AddParam(dat);
+    cmd.AddParam(FD.tick.rec.PFI);
+    cmd.AddParam(FD.tick.rec.Number_Coupon);
+
+    DataSet = cmd.Execute();
+
+    while((not err) and (DataSet.moveNext())) //для каждого владельца
+
+      OwnerID = DataSet.OwnerID;
+
+      if(ПолучитьСубъекта(OwnerID, party) != 0 )
+        msgbox("Не найден субъект с идентификатором " + OwnerID);
+        return 1;
+      end;
+
+      FactReceiverID = DataSet.FactReceiverID;
+
+      if(FactReceiverID == -1)
+        continue;
+      end;
+
+      if(ПолучитьСубъекта(FactReceiverID, party) != 0 )
+        msgbox("Не найден субъект с идентификатором " + FactReceiverID);
+        return 1;
+      end;
+
+      GetIsIIS(OwnerID, dat, @isIIS, @ContractID);
+
+      СуммаВыплаты = DataSet.CoupSum;
+      if(DataSet.PayCur != FD.dl_leg.rec.PayFIID)
+        if( not SmartConvertSum(СуммаВыплаты, СуммаВыплаты, dat, DataSet.PayCur, FD.dl_leg.rec.PayFIID, true))
+          return 1;
+        end;
+      end;
+      if(DataSet.PayCur != NATCUR)
+        if( not SmartConvertSum(СуммаВыплатыРуб, СуммаВыплаты, dat, DataSet.PayCur, NATCUR, true))
+          return 1;
+        end;
+      else
+        СуммаВыплатыРуб = СуммаВыплаты;
+      end;
+
+      СуммаВыплаты    = round(СуммаВыплаты, 2);
+      СуммаВыплатыРуб = round(СуммаВыплатыРуб, 2);
+
+      СуммаНалога   = DataSet.TaxSum;
+      СуммаНалога15 = DataSet.TaxSum15;
+
+      if(party.rec.LegalForm == PTLEGF_PERSN)
+
+        if(ContractID <= 0) //Для наших клиентов объекты сформировали ранее в операции расчета НОБ на шаге подготовки расчета
+          TaxObj.Add( 1
+                     ,dat                   // Дата НДР
+                     ,FactReceiverID        // Клиент
+                     ,TXOBJ_DIR_IN          // Направление
+                     ,2                     // Уровень
+                     ,""                    // Признак "Пользовательский"
+                     ,TXOBJ_PROCSEC_TS      // Вид НДР
+                     ,СуммаВыплаты          // Сумма дохода/расхода
+                     ,FD.dl_leg.rec.PayFIID // Валюта дохода/расхода
+                     ,TXOBJ_KIND1020        // Вид аналитики 1
+                     ,FD.tick.rec.DealID    // Аналитика 1
+                     ,0                     // Вид аналитики 2
+                     ,-1                    // Аналитика 2
+                     ,TXOBJ_KIND3010        // Вид аналитики 3
+                     ,FD.tick.rec.PFI       // Аналитика 3
+                     ,TXOBJ_KIND4010        // Вид аналитики 4
+                     ,Circulate             // Аналитика 4
+                     ,TXOBJ_KIND5010        // Вид аналитики 5
+                     ,TaxGroupNPTX          // Аналитика 5
+                     ,TXOBJ_KIND6020        // Вид аналитики 6
+                     ,ContractID            // Аналитика 6
+                     ,""                    // Комментарий
+                     ,ID_Operation          // ID операции
+                     ,ID_Step               // ID шага операции
+                     ,0
+                    );
+
+          if(not err)
+            Kind = IIF(IsIIS == true, TXOBJ_PLUSG_1011_IIS, TXOBJ_PLUSG_1011);
+            
+            TaxObj.Add( 1
+                       ,dat                   // Дата НДР
+                       ,FactReceiverID        // Клиент
+                       ,TXOBJ_DIR_IN          // Направление
+                       ,5                     // Уровень
+                       ,""                    // Признак "Пользовательский"
+                       ,Kind                  // Вид НДР
+                       ,СуммаВыплатыРуб       // Сумма дохода/расхода
+                       ,NATCUR                // Валюта дохода/расхода
+                       ,TXOBJ_KIND1020        // Вид аналитики 1
+                       ,FD.tick.rec.DealID    // Аналитика 1
+                       ,0                     // Вид аналитики 2
+                       ,-1                    // Аналитика 2
+                       ,TXOBJ_KIND3010        // Вид аналитики 3
+                       ,FD.tick.rec.PFI       // Аналитика 3
+                       ,TXOBJ_KIND4010        // Вид аналитики 4
+                       ,Circulate             // Аналитика 4
+                       ,TXOBJ_KIND5010        // Вид аналитики 5
+                       ,TaxGroupNPTX          // Аналитика 5
+                       ,IIF(ContractID > 0, TXOBJ_KIND6020, 0) // Вид аналитики 6
+                       ,ContractID            // Аналитика 6
+                       ,""                    // Комментарий
+                       ,ID_Operation          // ID операции
+                       ,ID_Step               // ID шага операции
+                       ,0
+                      );
+          end;
+          
+          if(not err)
+            Kind = IIF(IsIIS == true, TXOBJ_BASEGENERAL_IIS, TXOBJ_BASEGENERAL);
+            
+            TaxObj.Add( 1
+                       ,dat                   // Дата НДР
+                       ,FactReceiverID        // Клиент
+                       ,TXOBJ_DIR_IN          // Направление
+                       ,7                     // Уровень
+                       ,""                    // Признак "Пользовательский"
+                       ,Kind                  // Вид НДР
+                       ,СуммаВыплатыРуб       // Сумма дохода/расхода
+                       ,NATCUR                // Валюта дохода/расхода
+                       ,TXOBJ_KIND1020        // Вид аналитики 1
+                       ,FD.tick.rec.DealID    // Аналитика 1
+                       ,0                     // Вид аналитики 2
+                       ,-1                    // Аналитика 2
+                       ,TXOBJ_KIND3010        // Вид аналитики 3
+                       ,FD.tick.rec.PFI       // Аналитика 3
+                       ,TXOBJ_KIND4010        // Вид аналитики 4
+                       ,Circulate             // Аналитика 4
+                       ,TXOBJ_KIND5010        // Вид аналитики 5
+                       ,TaxGroupNPTX          // Аналитика 5
+                       ,IIF(ContractID > 0, TXOBJ_KIND6020, 0) // Вид аналитики 6
+                       ,ContractID            // Аналитика 6
+                       ,""                    // Комментарий
+                       ,ID_Operation          // ID операции
+                       ,ID_Step               // ID шага операции
+                       ,0
+                      );
+
+          end;
+
+          if(not err)
+            Kind = IIF(IsIIS == true, TXOBJ_BASEG5, TXOBJ_BASEG2);
+            
+            TaxObj.Add( 1
+                       ,dat                   // Дата НДР
+                       ,FactReceiverID        // Клиент
+                       ,TXOBJ_DIR_IN          // Направление
+                       ,7                     // Уровень
+                       ,""                    // Признак "Пользовательский"
+                       ,Kind                  // Вид НДР
+                       ,СуммаВыплатыРуб       // Сумма дохода/расхода
+                       ,NATCUR                // Валюта дохода/расхода
+                       ,TXOBJ_KIND1020        // Вид аналитики 1
+                       ,FD.tick.rec.DealID    // Аналитика 1
+                       ,0                     // Вид аналитики 2
+                       ,-1                    // Аналитика 2
+                       ,TXOBJ_KIND3010        // Вид аналитики 3
+                       ,FD.tick.rec.PFI       // Аналитика 3
+                       ,TXOBJ_KIND4010        // Вид аналитики 4
+                       ,Circulate             // Аналитика 4
+                       ,TXOBJ_KIND5010        // Вид аналитики 5
+                       ,TaxGroupNPTX          // Аналитика 5
+                       ,IIF(ContractID > 0, TXOBJ_KIND6020, 0) // Вид аналитики 6
+                       ,ContractID            // Аналитика 6
+                       ,""                    // Комментарий
+                       ,ID_Operation          // ID операции
+                       ,ID_Step               // ID шага операции
+                       ,0
+                      );
+
+          end;
+        end;
+          
+        if((not err) and (СуммаНалога > 0))
+            
+          Kind = IIF(IsIIS == true, TXOBJ_PAIDGENERAL_IIS, TXOBJ_PAIDGENERAL);
+            
+          TaxObj.Add( 1
+                     ,dat                   // Дата НДР
+                     ,FactReceiverID        // Клиент
+                     ,TXOBJ_DIR_OUT         // Направление
+                     ,8                     // Уровень
+                     ,""                    // Признак "Пользовательский"
+                     ,Kind                  // Вид НДР
+                     ,СуммаНалога           // Сумма дохода/расхода
+                     ,NATCUR                // Валюта дохода/расхода
+                     ,TXOBJ_KIND1020        // Вид аналитики 1
+                     ,FD.tick.rec.DealID    // Аналитика 1
+                     ,0                     // Вид аналитики 2
+                     ,-1                    // Аналитика 2
+                     ,TXOBJ_KIND3010        // Вид аналитики 3
+                     ,FD.tick.rec.PFI       // Аналитика 3
+                     ,TXOBJ_KIND4010        // Вид аналитики 4
+                     ,Circulate             // Аналитика 4
+                     ,TXOBJ_KIND5010        // Вид аналитики 5
+                     ,TaxGroupNPTX          // Аналитика 5
+                     ,IIF(ContractID > 0, TXOBJ_KIND6020, 0) // Вид аналитики 6
+                     ,ContractID            // Аналитика 6
+                     ,""                    // Комментарий
+                     ,ID_Operation          // ID операции
+                     ,ID_Step               // ID шага операции
+                     ,СуммаНалога
+                    );
+        end;
+
+        if((not err) and (СуммаНалога15 > 0))
+            
+          Kind = IIF(IsIIS == true, TXOBJ_PAIDGENERAL_15_IIS, TXOBJ_PAIDGENERAL_15);
+            
+          TaxObj.Add( 1
+                     ,dat                   // Дата НДР
+                     ,FactReceiverID        // Клиент
+                     ,TXOBJ_DIR_OUT         // Направление
+                     ,8                     // Уровень
+                     ,""                    // Признак "Пользовательский"
+                     ,Kind                  // Вид НДР
+                     ,СуммаНалога15         // Сумма дохода/расхода
+                     ,NATCUR                // Валюта дохода/расхода
+                     ,TXOBJ_KIND1020        // Вид аналитики 1
+                     ,FD.tick.rec.DealID    // Аналитика 1
+                     ,0                     // Вид аналитики 2
+                     ,-1                    // Аналитика 2
+                     ,TXOBJ_KIND3010        // Вид аналитики 3
+                     ,FD.tick.rec.PFI       // Аналитика 3
+                     ,TXOBJ_KIND4010        // Вид аналитики 4
+                     ,Circulate             // Аналитика 4
+                     ,TXOBJ_KIND5010        // Вид аналитики 5
+                     ,TaxGroupNPTX          // Аналитика 5
+                     ,IIF(ContractID > 0, TXOBJ_KIND6020, 0) // Вид аналитики 6
+                     ,ContractID            // Аналитика 6
+                     ,""                    // Комментарий
+                     ,ID_Operation          // ID операции
+                     ,ID_Step               // ID шага операции
+                     ,СуммаНалога15
+                    );
+
+          if((not err) and (IsIIS == false))
+            TaxObj.Add( 1
+                       ,dat                   // Дата НДР
+                       ,FactReceiverID        // Клиент
+                       ,TXOBJ_DIR_OUT         // Направление
+                       ,8                     // Уровень
+                       ,""                    // Признак "Пользовательский"
+                       ,TXOBJ_PAIDGENERAL_15_2 // Вид НДР
+                       ,СуммаНалога15         // Сумма дохода/расхода
+                       ,NATCUR                // Валюта дохода/расхода
+                       ,TXOBJ_KIND1020        // Вид аналитики 1
+                       ,FD.tick.rec.DealID    // Аналитика 1
+                       ,0                     // Вид аналитики 2
+                       ,-1                    // Аналитика 2
+                       ,TXOBJ_KIND3010        // Вид аналитики 3
+                       ,FD.tick.rec.PFI       // Аналитика 3
+                       ,TXOBJ_KIND4010        // Вид аналитики 4
+                       ,Circulate             // Аналитика 4
+                       ,TXOBJ_KIND5010        // Вид аналитики 5
+                       ,TaxGroupNPTX          // Аналитика 5
+                       ,IIF(ContractID > 0, TXOBJ_KIND6020, 0) // Вид аналитики 6
+                       ,ContractID            // Аналитика 6
+                       ,""                    // Комментарий
+                       ,ID_Operation          // ID операции
+                       ,ID_Step               // ID шага операции
+                       ,СуммаНалога15
+                      );
+
+          end;
+        end;
+
+
+      elif(party.rec.LegalForm == PTLEGF_INST)
+        if((not err) AND (not ErrNum))
+           err = DL_NUTX_InsertTaxObjectOnStep( dat                   // Дата НДР
+                                                 ,OwnerID               // Клиент
+                                                 ,FactReceiverID        // Фактический получатель дохода
+                                                 ,NUTXOBJ_DIR_IN        // Направление
+                                                 ,2                     // Уровень
+                                                 ,""                    // Признак "Пользовательский"
+                                                 ,NUTXOBJ_PLUS_11       // Вид НДР
+                                                 ,СуммаВыплаты          // Сумма дохода/расхода
+                                                 ,FD.dl_leg.rec.PayFIID // Валюта дохода/расхода
+                                                 ,TXOBJ_KIND1020        // Вид аналитики 1
+                                                 ,FD.tick.rec.DealID    // Аналитика 1
+                                                 ,0                     // Вид аналитики 2
+                                                 ,-1                    // Аналитика 2
+                                                 ,TXOBJ_KIND3010        // Вид аналитики 3
+                                                 ,FD.tick.rec.PFI       // Аналитика 3
+                                                 ,TXOBJ_KIND4010        // Вид аналитики 4
+                                                 ,Circulate             // Аналитика 4
+                                                 ,TXOBJ_KIND5010        // Вид аналитики 5
+                                                 ,TaxGroupNUTX          // Аналитика 5
+                                                 ,TXOBJ_KIND6020        // Вид аналитики 6
+                                                 ,ContractID            // Аналитика 6
+                                                 ,"" )                  // Комментарий
+                                                 ;
+           if(err)
+             if(err == LIC_MSG_DEMO_MODE_OFF)
+               ErrNum = LIC_MSG_DEMO_MODE_OFF;
+               err = 0;
+             else
+               err = 1;
+             end;
+           end;
+        end;
+        if( (not err) AND ( not ErrNum) )
+          var sum = round(СуммаВыплатыРуб * DataSet.TaxRate / 100.0, 2);
+
+          if(sum > 0)
+            if(0 != DL_NUTX_InsertTaxObjectOnStep( dat                   // Дата НДР
+                                                  ,OwnerID               // Клиент
+                                                  ,FactReceiverID        // Фактический получатель дохода
+                                                  ,NUTXOBJ_DIR_OUT       // Направление
+                                                  ,5                     // Уровень
+                                                  ,""                    // Признак "Пользовательский"
+                                                  ,NUTXOBJ_DUETAX        // Вид НДР
+                                                  ,sum                   // Сумма дохода/расхода
+                                                  ,NATCUR                // Валюта дохода/расхода
+                                                  ,TXOBJ_KIND1020        // Вид аналитики 1
+                                                  ,FD.tick.rec.DealID    // Аналитика 1
+                                                  ,0                     // Вид аналитики 2
+                                                  ,-1                    // Аналитика 2
+                                                  ,TXOBJ_KIND3010        // Вид аналитики 3
+                                                  ,FD.tick.rec.PFI       // Аналитика 3
+                                                  ,TXOBJ_KIND4010        // Вид аналитики 4
+                                                  ,Circulate             // Аналитика 4
+                                                  ,TXOBJ_KIND5010        // Вид аналитики 5
+                                                  ,TaxGroupNUTX          // Аналитика 5
+                                                  ,TXOBJ_KIND6020        // Вид аналитики 6
+                                                  ,ContractID            // Аналитика 6
+                                                  ,"" )                  // Комментарий
+             )
+               err = 1;
+            end;
+          end;
+        end;
+
+        if((not err) AND (not ErrNum))
+          if(0 != DL_NUTX_InsertTaxObjectOnStep( dat                   // Дата НДР
+                                                ,OwnerID               // Клиент
+                                                ,FactReceiverID        // Фактический получатель дохода
+                                                ,NUTXOBJ_DIR_OUT       // Направление
+                                                ,8                     // Уровень
+                                                ,""                    // Признак "Пользовательский"
+                                                ,NUTXOBJ_PAIDTAX       // Вид НДР
+                                                ,СуммаНалога           // Сумма дохода/расхода
+                                                ,NATCUR                // Валюта дохода/расхода
+                                                ,TXOBJ_KIND1020        // Вид аналитики 1
+                                                ,FD.tick.rec.DealID    // Аналитика 1
+                                                ,0                     // Вид аналитики 2
+                                                ,-1                    // Аналитика 2
+                                                ,TXOBJ_KIND3010        // Вид аналитики 3
+                                                ,FD.tick.rec.PFI       // Аналитика 3
+                                                ,TXOBJ_KIND4010        // Вид аналитики 4
+                                                ,Circulate             // Аналитика 4
+                                                ,TXOBJ_KIND5010        // Вид аналитики 5
+                                                ,TaxGroupNUTX          // Аналитика 5
+                                                ,TXOBJ_KIND6020        // Вид аналитики 6
+                                                ,ContractID            // Аналитика 6
+                                                ,"" )                  // Комментарий
+           )
+             err = 1;
+          end;
+        end;
+
+      end;
+
+
+    end;
+  end;
+
+  if(not err)
+    TaxObj.Save();
+
+    err = DL_NPTX_StartInsertTaxObject(ID_Operation, ID_Step);
+  end;
+
+  return err;
+end;
+
+macro ПолучитьОснованиеПроводкиПоКомиссииОЭБ_ПА(ID)
+    macro set_template(s, t, v)
+        var i = 1;
+        while (i <= strlen(s))
+            if (substr(s,i,strlen(t)) == t)
+                return substr(s,1,i-1) + v + substr(s, i + strlen(t));
+            end;
+            i = i + 1;
+        end;
+        return s;
+    end;
+
+    var dlcomis = TRecHandler("DLCOMIS.dbt");
+    var sfcomis = TRecHandler("SFCOMISS.dbt");
+
+    var RS = TRsbDataSet("SELECT * FROM DDLCOMIS_DBT DLCOMIS " +
+                         " WHERE T_ID = " + string(ID));
+    if (RS.MoveNext())
+        RS.GetRecord().CopyTo(dlcomis.rec);
+    else
+        return "";
+    end;
+
+    RS = TRsbDataSet("SELECT * FROM DSFCOMISS_DBT SFCM " +
+                     " WHERE SFCM.T_FEETYPE = " + DLCOMIS.rec.FEETYPE +
+                     " AND SFCM.T_NUMBER = " + DLCOMIS.rec.COMNUMBER);
+    if (RS.MoveNext())
+        RS.GetRecord().CopyTo(sfcomis.rec);
+    else
+        return "";
+    end;
+
+    var GroudStr = readNoteForObject(OBJTYPE_SFCOMISS, MakeObjectID(OBJTYPE_SFCOMISS, NULL, sfcomis), 1);
+
+    if (GroudStr == "")
+        if (sfcomis.rec.code == ПолучитьКодКомиссииОЭБ_ПГКУП())
+            GroudStr = "Оплата комиссии за выплату дохода по купону № *№ купона* неконв. проц. докум. обл. *банк* (№ гос.рег.*выпуск*)";
+        elif (sfcomis.rec.code == ПолучитьКодКомиссииОЭБ_ПГВЫП())
+            GroudStr = "Оплата комиссии за выплату номинала неконв. проц. докум. обл. *банк* (№ гос.рег.*выпуск*)";
+        end;
+    end;
+
+    var avr = "";
+    var bank_name = "";
+    var coupon = "";
+    var exp_date = zerodate;
+
+    RS = TRsbDataSet("select avr.T_LSIN av from DAVOIRISS_DBT avr, DDL_TICK_DBT tick where avr.T_FIID = tick.T_PFI and tick.T_BOFFICEKIND = " + DLCOMIS.rec.DOCKIND + " and tick.T_DEALID = " + DLCOMIS.rec.DOCID);
+    if (RS.MoveNext())
+        avr = rs.av;
+    end;
+
+    RS = TRsbDataSet("select pt.T_shortname name from DPARTY_DBT pt where pt.t_partyid = " + {OurBank});
+    if (RS.MoveNext())
+        bank_name = rs.name;
+    end;
+
+    RS = TRsbDataSet("select DDL_TICK_DBT.T_NUMBER_COUPON coupon from DDL_TICK_DBT where T_BOFFICEKIND = " + DLCOMIS.rec.DOCKIND + " AND T_DEALID = " + DLCOMIS.rec.DOCID);
+    if (RS.MoveNext())
+        coupon = rs.coupon;
+    end;
+
+    RS = TRsbDataSet("select leg.T_EXPIRY exp_date from DDL_LEG_DBT leg, DDL_TICK_DBT tick where tick.T_BOFFICEKIND = " + DLCOMIS.rec.DOCKIND + " and tick.T_DEALID = " + DLCOMIS.rec.DOCID + " AND  leg.T_DEALID = tick.T_DEALID and leg.T_LEGKIND = 0 and leg.T_LEGID = 0 ");
+    if (RS.MoveNext())
+        exp_date = rs.exp_date;
+    end;
+
+    GroudStr = set_template(GroudStr, "*выпуск*", avr);
+    GroudStr = set_template(GroudStr, "*банк*", bank_name);
+    GroudStr = set_template(GroudStr, "*№ купона*", coupon);
+    GroudStr = set_template(GroudStr, "*дата погашения*", exp_date);
+    
+    return GroudStr;
+end;

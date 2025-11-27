@@ -1,0 +1,4374 @@
+/*
+$Name:        cnvmsfo9.mac
+$Module:      Ценные бумаги
+$Description: Конвертация МСФО0 для данных БОЦБ
+*/
+
+import DealsInter, spserv, sp_class, sp_car, spreserv;
+
+private const AccDate  = date(8,1,2019); //Дата учета
+private const CalcDate = date(8,1,2019); //Дата расчета
+
+//Счет для учета финансового результата
+//Возможные значения: 706, 10801, 10901
+private const СчетДляУчетаФР = 706;
+
+//Метод расчета АС для РЕПО
+//Возможные значения: 0 - Авто; 1 - ЛМ; 2 - ЭПС
+private const МетодРасчетаАСДляРЕПО = 0;
+
+
+//Вариант учета отсроченной разницы
+//Возможные значения: 1 - за весь период; 2 - От даты расчета
+private const ОтсроченнаяРазница = 2;
+
+
+//Премия/дисконт  в ССПУ на дату перехода
+//Возможные значения: 0 - относим на счет вложений; 1 - замораживаем на счетах начислений
+private var ПремияДисконтВССПУ = 0;
+
+
+//Оценочный резерв в дату перехода
+//Возможные значения: true - Да; false - Нет
+private var ОценочныйРезервВДатуПерехода = true;
+
+
+//Списание существенных затрат при переводе бумаг из ППР и/или ПУДП в ССПУ_ЦБ
+//Возможные значения: true - Да; false - Нет
+private var СписаниеСущественныхЗатратПриПереводе = true;
+
+
+//класс с данными для межпортфельного перевода
+private class PortfolioTransferData(_ISIN:string, _FromPortfolio:integer, _ToPortfolio:integer)
+  var ISIN          = _ISIN;         
+  var FromPortfolio = _FromPortfolio;
+  var ToPortfolio   = _ToPortfolio;  
+end;
+
+//таблица межпортфельных переводов
+private var PortfolioTransferArr = TArray();
+
+//Константы новых портфелей, чтобы было понятно по названиям
+private const KINDPORT_SSSD = KINDPORT_SALE;   //СССД_ЦБ - это прежний ППР
+private const KINDPORT_SSPU = KINDPORT_TRADE;  //ССПУ_ЦБ - это прежний ТП
+private const KINDPORT_ASCB = KINDPORT_RETIRE; //АС_ЦБ - это прежний ПУДП
+
+//наполнение таблицы
+/*PortfolioTransferArr[PortfolioTransferArr.size] = PortfolioTransferData("000000000000042", KINDPORT_SALE,  KINDPORT_SSPU);
+PortfolioTransferArr[PortfolioTransferArr.size] = PortfolioTransferData("SU26207RMFS9",    KINDPORT_SALE,  KINDPORT_SSPU);
+PortfolioTransferArr[PortfolioTransferArr.size] = PortfolioTransferData("qwert",           KINDPORT_TRADE, KINDPORT_ASCB);
+PortfolioTransferArr[PortfolioTransferArr.size] = PortfolioTransferData("qwert",           KINDPORT_SALE,  KINDPORT_SSPU);
+PortfolioTransferArr[PortfolioTransferArr.size] = PortfolioTransferData("90908",           KINDPORT_SALE,  KINDPORT_SSPU);
+PortfolioTransferArr[PortfolioTransferArr.size] = PortfolioTransferData("o4_isin",         KINDPORT_ASCB,  KINDPORT_SALE);
+*/
+
+//Параметры для фиксации изменений по лотам. Настройки не требуют
+private var currIDOperation = -1;
+private var currIDStep = 0;
+private var currAction = 9999;
+
+private var currPart = "";
+
+macro cnv_msgbox(StrErr)
+  println(StrErr);
+end;
+
+macro ПолучитьКатегориюФР(Categ:string)
+  var CatFR = Categ;
+
+  if(СчетДляУчетаФР == 10801)
+    CatFR = "Нераспределенная прибыль";
+  elif(СчетДляУчетаФР == 10901)
+    CatFR = "Непокрытый убыток";
+  end;
+
+  return CatFR;
+end;
+
+PRIVATE MACRO GetCCY(FIID)
+  var cmd = DL_RSDCommand("select t_CCY from dfininstr_dbt where t_FIID = ?");
+  var ccy = "";
+
+  cmd.AddParam(FIID);
+
+  var DataSet = cmd.Execute();
+  if(DataSet.moveNext())
+    ccy = DataSet.CCY;
+  end;
+
+  return ccy;
+END;
+
+/* Проводка по категориям учета (в том числе и мультивалютная)
+   СчетДебет,СчетКредит - если тип V_STRING то категории, иначе record ACCOUNT*/
+MACRO МСФО9_ПроводкаПоКатегориямУчета( FD, СчетДебет, СчетКредит, ДатаВалютирования,
+                                 Chapter, FIID, СуммаОперации, docum,
+                                 Result_Carry, Kind_Oper,Numb_Document,Ground,
+                                 PaymentID, FIRolePayer, FIRoleReceiver,
+                                 СчетДебетFIID, СчетКредитFIID, FIID2, СуммаОперации2
+                                 )
+   var stat:bool = true, CуммаДебет = $0, СуммаКредит  = $0, 
+      СчетОВПДебет = "", СчетОВПКредит = "", СчетДоходов = "", СчетРасходов = "";
+
+   var tr, NoCarry:bool = false;
+   var PaymentObj = null;
+
+   record AccountPayer(account);
+   record AccountReceiver(account);
+
+   if ( FD != NULL )
+    if ((FD.tick != NULL) AND (Numb_Document == ""))
+       Numb_Document = FD.tick.rec.DealCode;
+    end;
+   end;
+
+   macro SayCarryError( error )
+     msgbox( error );
+     return false;
+   end;
+
+   if( (СуммаОперации == null) AND (СуммаОперации2 == null) )  
+     return SayCarryError( "В проводке не задана ни одна из сумм." );
+   end;
+     
+   /*оставить только копейки для первой суммы, если она задана*/
+   if( СуммаОперации != null )
+     if( Chapter != 5 ) /*количество ц/б может быть дробным*/
+        СуммаОперации = money( round( СуммаОперации, 2 ) );    
+     end;
+     if( СуммаОперации < $0 )  
+        return SayCarryError( "Сумма проводки < 0." );
+     end;
+   else  
+    СуммаОперации = $0;
+   end;
+   /*для второй суммы, если она задана*/
+   if( СуммаОперации2 != null )
+     if( Chapter != 5 ) /*количество ц/б может быть дробным*/
+        СуммаОперации2 = money( round( СуммаОперации2, 2 ) );
+     end;
+     if( СуммаОперации2 < $0 )  
+        return SayCarryError( "Вторая сумма проводки < 0." );
+     end;
+   else
+    СуммаОперации2 = $0;
+   end;
+
+   if( (СуммаОперации == $0) AND (СуммаОперации2 == $0) )  
+     return true;
+   end;
+
+   if( ValType(СчетДебет) == V_STRING ) /*задан через категорию*/
+    // if( /*(not FD.IsExistAccount( СчетДебет, null, true, FIRolePayer, AccountPayer, null, ДатаВалютирования, СчетДебетFIID)) and*/
+    //     (not FD.OpenAccount( СчетДебет, null, true, FIRolePayer, AccountPayer, ДатаВалютирования, СчетДебетFIID, null, null)) )
+         if( not FD.ReOpenAccount( СчетДебет, null, false, FIRolePayer, AccountPayer, ДатаВалютирования, СчетДебетFIID, null) )
+             return SayCarryError( "Ошибка при определении счета по категории "+СчетДебет+" в проводке.");
+         end;
+   //  end;
+   else
+     copy( AccountPayer, СчетДебет );
+   end;
+
+   if( ValType(СчетКредит) == V_STRING ) /*задан через категорию*/
+    // if( /*(not FD.IsExistAccount( СчетКредит, null, true, FIRoleReceiver, AccountReceiver, null, ДатаВалютирования, СчетКредитFIID)) and*/
+   //      (not FD.OpenAccount( СчетКредит, null, true, FIRoleReceiver, AccountReceiver, ДатаВалютирования, СчетКредитFIID, null, null)) )
+         if( not FD.ReOpenAccount(СчетКредит, null, false, FIRoleReceiver, AccountReceiver, ДатаВалютирования, СчетКредитFIID, null) )
+            return SayCarryError( "Ошибка при определении счета по категории "+СчетКредит+" в проводке." );
+         end;
+    // end;
+   else
+     copy( AccountReceiver, СчетКредит );
+   end;
+
+   if( AccountPayer.Code_Currency == AccountReceiver.Code_Currency)
+
+     /*задана только вторая сумма в валюте одного из счетов*/
+     if( (FIID == null) AND (FIID2 != null) )
+        FIID = FIID2;
+     elif( (FIID == null) AND (FIID2 == null) )
+        return SayCarryError("Не задана ни одна из валют проводки.");
+     end;
+
+     if( (FIID != AccountPayer.Code_Currency) AND
+         (FIID != AccountReceiver.Code_Currency) )
+        return SayCarryError( "В проводке не совпадают валюты счетов: " 
+                               + string(AccountPayer.Code_Currency) + " " + string( AccountReceiver.Code_Currency ) +
+                              "| и валюта документа: " + string(FIID) );
+     end;
+
+     if( СуммаОперации != $0 )
+        CуммаДебет = СуммаКредит = СуммаОперации;
+     elif( СуммаОперации2 != $0 )
+        CуммаДебет = СуммаКредит = СуммаОперации2;
+     end;
+     
+
+   else /* валюты разные - мультивалютная проводка */
+      
+     СуммаКредит = $0;
+     CуммаДебет  = $0;
+     
+     /*задана одна сумма в валюте одного из счетов*/
+     if( (FIID != null) AND (FIID2 == null) )
+        if( FIID == AccountPayer.Code_Currency )
+           CуммаДебет  = СуммаОперации;
+        else
+           СуммаКредит = СуммаОперации;
+        end;
+     /*задана только вторая сумма в валюте одного из счетов*/
+     elif( (FIID2 != null) AND (FIID == null) )
+        if( FIID2 == AccountPayer.Code_Currency )
+           CуммаДебет  = СуммаОперации2;
+        else
+           СуммаКредит = СуммаОперации2;
+        end;
+     /*заданы обе суммы в валютах счетов по которым выполняем проводку*/
+     elif( (FIID2 != null) AND (FIID != null) )                         
+       if( FIID == AccountPayer.Code_Currency ) 
+          CуммаДебет  = СуммаОперации;
+       elif( FIID2 == AccountPayer.Code_Currency ) 
+          CуммаДебет  = СуммаОперации2;
+       end;
+
+       if( FIID == AccountReceiver.Code_Currency ) 
+          СуммаКредит = СуммаОперации;
+       elif( FIID2 == AccountReceiver.Code_Currency ) 
+          СуммаКредит = СуммаОперации2;
+       end;
+     else
+        return SayCarryError("Не задана ни одна из валют проводки.");
+     end;
+
+     if( not CheckMultyCarrySum( AccountPayer.Code_Currency, AccountReceiver.Code_Currency,
+                                 CуммаДебет, СуммаКредит, ДатаВалютирования ) )
+        return SayCarryError("Ошибка при определении сумм мультивалютной проводки.");
+     end;
+  
+   end;
+
+   if( NoCarry == false )
+      /* ------ Выполнить проводку ----------------------------------------------*/
+      tr = RsbAccTransaction();
+              
+      if( tr == NULL )
+         return SayCarryError("Ошибка при создании проводки");
+      end;
+
+      tr.Chapter         = Chapter;
+      tr.Date_Carry      = ДатаВалютирования;
+      if( PaymentObj != null )
+         tr.Number_Pack  = PaymentObj.NumberPack;
+      end;
+      tr.Numb_Document   = Numb_Document;
+      tr.ResultCarry     = 1;
+      tr.Kind_Oper       = Kind_Oper;
+      tr.Ground          = "Конвертация. " + Ground;
+      tr.Department      = {OperDprt};
+      tr.Oper            = {oper};
+      tr.FIIDPayer       = AccountPayer.Code_Currency;
+      tr.FIIDReceiver    = AccountReceiver.Code_Currency;
+      tr.SumPayer        = CуммаДебет;
+      tr.SumReceiver     = СуммаКредит;
+      tr.AccountPayer    = AccountPayer.Account;
+      tr.AccountReceiver = AccountReceiver.Account;
+      tr.Shifr_Oper      = DL_GetShifrOper(Chapter, AccountPayer, AccountReceiver);
+      
+      tr.AddOFRSymbol(SC_GetOFRRecID(FD, AccountPayer, AccountReceiver, FIRolePayer, FIRoleReceiver, ДатаВалютирования));
+
+      tr.TypeDocument = "М"; //Перенос по МСФО-9
+
+      if( not tr.Carry() )
+         return SayCarryError("Ошибка при выполнении проводки \"" + Ground + "\"");
+      else
+         msgbox("   Выполнена проводка "+AccountPayer.Account+"<->"+AccountReceiver.Account+" \"" + Ground + "\" на сумму " + СуммаОперации + " " + GetCCY(FIID));
+      end;
+      /*-------------------------------------------------------------------------*/  
+
+   end;
+
+   if( not stat ) 
+      return SayCarryError("Ошибка при вставке документа проводки.");
+   end;
+
+   return stat;
+END;
+
+MACRO МСФО9_СохранитьСуммуКомиссии( DocKind:INTEGER, DocID:INTEGER, Kind:INTEGER, CommDate:DATE, Sum:MONEY, NDS:MONEY, Currency:INTEGER, Immaterial:BOOL, pMarket:integer, _FIID:integer ):BOOL
+  var query, cmd;
+
+  if(ValType(_FIID) == V_UNDEF)
+    _FIID = -1;
+  end;
+
+  query =   " DECLARE "
+          + " BEGIN "
+          + "   RSI_DLGR.SetDLSUM(?, "
+          + "                     ?, "
+          + "                     ?, "
+          + "                     ?, "
+          + "                     ?, "
+          + "                     ?, "
+          + "                     ?, "
+          + "                     0, "
+          + "                     ? "
+          + "                    ); "
+          + " END;";
+
+  cmd = RSDCommand(query);
+
+  cmd.addParam("", RSDBP_IN, DocKind);
+  cmd.addParam("", RSDBP_IN, DocID);
+  cmd.addParam("", RSDBP_IN, Kind);
+  cmd.addParam("", RSDBP_IN, Currency);
+  cmd.addParam("", RSDBP_IN, CommDate);
+  cmd.addParam("", RSDBP_IN, Sum);
+  cmd.addParam("", RSDBP_IN, NDS);
+  cmd.addParam("", RSDBP_IN, _FIID);
+
+  cmd.execute();
+
+  return true;
+END;
+
+private macro CloseAccount(Acc)
+  var err = 0;
+  var msg = "";
+
+  if( CB_CloseAccount(Acc.Chapter, Acc.Code_Currency, Acc.Account, AccDate, null) != 0 )
+     msg = GetErrMsg();
+     msgbox("Ошибка закрытия счета: "+msg+". Счет "+Acc.Account+" не закрыт.");
+     err = 1;
+  else
+     msgbox("   Счет "+Acc.Account+" успешно закрыт!");
+  end;
+
+  return err;
+end;
+
+
+macro ВыполнитьПроводкиВнебалансРЕПО()
+  var cmd, query, DataSet;
+  record СчетЗадолж("account");
+  var FD2;
+  var cnt = 0, i = 0;
+  var CatCred = "";
+  var Sum = $0;
+  var err = 0;
+  var msg = "";
+
+  query =   " select tk.t_DealID "
+          + "   from ddl_tick_dbt tk "
+          + "  where tk.t_BOfficeKind = " + DL_SECURITYDOC
+          + "    and tk.t_ClientID = -1 "
+          + "    and RSB_SECUR.IsREPO(rsb_secur.get_OperationGroup(rsb_secur.get_OperSysTypes(tk.t_DealType, tk.t_BofficeKind))) > 0 "
+          + "    and tk.t_DealStatus = " + DL_READIED
+          + "    and Exists(select 1 "
+          + "                 from ddlrq_dbt rq1 " 
+          + "                where rq1.t_DocKind = tk.t_BOfficeKind "
+          + "                  and rq1.t_DocID = tk.t_DealID "
+          + "                  and rq1.t_Type = " + DLRQ_TYPE_PAYMENT
+          + "                  and rq1.t_DealPart = 1 "
+          + "                  and rq1.t_State = " + DLRQ_STATE_EXEC
+          + "              ) "
+          + "    and Exists(select 1 "
+          + "                 from ddlrq_dbt rq2 " 
+          + "                where rq2.t_DocKind = tk.t_BOfficeKind "
+          + "                  and rq2.t_DocID = tk.t_DealID "
+          + "                  and rq2.t_Type = " + DLRQ_TYPE_PAYMENT
+          + "                  and rq2.t_DealPart = 2 "
+          + "                  and rq2.t_State = " + DLRQ_STATE_PLAN
+          + "              ) ";
+
+  cmd = DL_RSDCommand(query);
+
+  cnt = cmd.GetCount();
+  if(cnt > 0)
+    InitProgress(cnt, currPart+"Обработка сделок РЕПО", currPart+"Обработка сделок РЕПО");
+    
+    DataSet = cmd.Execute();
+    while((not err) and (DataSet.moveNext()))
+
+      msgbox("Обрабатывается сделка с DealID = " + DataSet.DealID);
+
+      FD2 = SPFirstDoc( LEG_KIND_DL_TICK_BACK, DataSet.DealID );
+
+      if(FD2.IsExistAccount( "Задолж.% (внебаланс)", null, true, null, СчетЗадолж, null, AccDate ))
+
+        Sum = abs(GetRestAccount(СчетЗадолж, AccDate));
+
+        if(Sum != $0)
+           if(not ПроводкаПоКатегориямУчета( FD2, 
+                  "ВнебалСчетКорресп", СчетЗадолж, /* КатегДеб , КатегКредит*/
+                  AccDate,                     /* Дата */
+                  3,                           /* Глава */
+                  СчетЗадолж.Code_Currency,    /* Валюта */
+                  Sum,                         /* Сумма  */
+                  NULL,                        /* Документ */
+                  INPCARRY,                    /* Result_Carry */
+                  " 1",                        /* Kind_Oper */
+                  "",                          /* Numb_Document */
+                  "Списание с внебаланса начисленных процентов",
+                  null,
+                  FIROLE_CA,
+                  null,
+                  NATCUR, СчетЗадолж.Code_Currency
+                 ) 
+             )
+               msg = GetErrMsg();
+               if(msg != "")
+                 msgbox(msg);
+               end;
+
+               return 1;
+           end;
+
+           CatCred = ПолучитьКатегориюФР("+%Пкр");
+
+           if(not ПроводкаПоКатегориямУчета( FD2, 
+                  "+% к погашению", CatCred,   /* КатегДеб , КатегКредит*/
+                  AccDate,                     /* Дата */
+                  1,                           /* Глава */
+                  СчетЗадолж.Code_Currency,    /* Валюта */
+                  Sum,                         /* Сумма  */
+                  NULL,                        /* Документ */
+                  INPCARRY,                    /* Result_Carry */
+                  " 1",                        /* Kind_Oper */
+                  "",                          /* Numb_Document */
+                  "Зачисление на баланс начисленных процентов",
+                  null,
+                  null,
+                  null,
+                  FD2.GetPayFIID(), NATCUR
+                 ) 
+             )
+               msg = GetErrMsg();
+               if(msg != "")
+                 msgbox(msg);
+               end;
+
+               return 1;
+           end;
+
+           err = CloseAccount(СчетЗадолж);
+        end;
+      end;
+
+      UseProgress(i = i + 1);
+    end;
+
+    RemProgress();
+  end;
+
+  return err;
+END;
+
+
+macro ВыполнитьУчетРЕПО()
+  var cmd, query, DataSet;
+  record СчетЗадолж("account");
+  var FD;
+  var cnt = 0, i = 0;
+  var CatCred = "", CatDeb = "";
+  var Sum = $0, AccountedDefDiff = $0;
+  var err = 0;
+  var msg = "";
+
+  //Формируем денежные лоты по сделкам РЕПО
+
+  query =  "DECLARE "
+         + "  v_TestAttrID NUMBER; "
+         + "  v_LotTmp DPMWRTSUM_TMP%ROWTYPE;"
+         + "  v_CalcDate DATE; "
+         + "  v_SumPerc NUMBER := 0;"
+         + "BEGIN "
+         + "  v_CalcDate := ?; "
+         + "  FOR one_tick IN ("
+         + "                    select tk.t_DealID, tk.t_BOfficeKind, "
+         + "                           rsb_secur.GetDealMarketTestAttrID(tk.t_BOfficeKind, tk.t_DealID) as TestAttrID, "
+         + "                           NVL(rsb_struct.getMoney(rsi_rsb_kernel.GetNote("+OBJTYPE_SECDEAL+", LPAD(tk.t_DealID, 34, '0'), 34 /*СС при переходе на МСФО*/, ?)), NULL) as FairValueRub "
+         + "                      from ddl_tick_dbt tk "
+         + "                     where tk.t_BOfficeKind = " + DL_SECURITYDOC
+         + "                       and tk.t_ClientID = -1 "
+         + "                       and RSB_SECUR.IsREPO(rsb_secur.get_OperationGroup(rsb_secur.get_OperSysTypes(tk.t_DealType, tk.t_BofficeKind))) > 0 "
+         + "                       and tk.t_DealStatus = " + DL_READIED
+         + "                       and Exists(select 1 "
+         + "                                    from ddlrq_dbt rq1 "
+         + "                                   where rq1.t_DocKind = tk.t_BOfficeKind "
+         + "                                     and rq1.t_DocID = tk.t_DealID "
+         + "                                     and rq1.t_Type = " + DLRQ_TYPE_PAYMENT
+         + "                                     and rq1.t_DealPart = 1 "
+         + "                                     and rq1.t_State = " + DLRQ_STATE_EXEC
+         + "                                 ) "
+         + "                       and Exists(select 1 "
+         + "                                    from ddlrq_dbt rq2 "
+         + "                                   where rq2.t_DocKind = tk.t_BOfficeKind "
+         + "                                     and rq2.t_DocID = tk.t_DealID "
+         + "                                     and rq2.t_Type = " + DLRQ_TYPE_PAYMENT
+         + "                                     and rq2.t_DealPart = 2 "
+         + "                                     and rq2.t_State = " + DLRQ_STATE_PLAN
+         + "                                 ) "
+         + "                   ) LOOP "
+         
+         + "     IF one_tick.TestAttrID = 0 THEN "
+         + "       v_TestAttrID := 1; /*Да*/"
+         + "     ELSE "
+         + "       v_TestAttrID := one_tick.TestAttrID; "
+         + "     END IF; "
+         + "             "
+         + "     IF v_TestAttrID = 2 AND one_tick.FairValueRub IS NULL THEN "
+         + "       ? := 'Не задана справедливая стоимость при переходе на МСФО для сделки РЕПО с ID = '|| TO_CHAR(one_tick.t_DealID); "
+         + "       EXIT; "
+         + "     END IF; "
+         + "             "
+         + "     RSB_PMWRTOFF.RSI_WRTCreateCurrParmREPO( one_tick.t_DealID, 0, -1, ?, v_TestAttrID, one_tick.FairValueRub); "
+
+
+         + "     v_SumPerc := 0; "
+         + "     FOR one_sum IN (SELECT RSI_RSB_FIInstr.ConvSum(t_Sum, t_Currency, "+NATCUR+", v_CalcDate, 1) as SumPerc "
+         + "                       FROM ddlsum_dbt "
+         + "                      WHERE t_DocKInd = one_tick.t_BOfficeKind "
+         + "                        AND t_DocID = one_tick.t_DealID "
+         + "                        AND t_Kind = " + DLSUM_KIND_SUM_TO_PERCENT
+         + "                     ORDER BY t_Date DESC"
+         + "                    ) "
+         + "     LOOP "
+         + "       v_SumPerc := one_sum.SumPerc;"
+         + "       EXIT;"
+         + "     END LOOP;"
+
+
+         + "     RSB_PMWRTOFF.RSI_WRTCalcDealParmREPO( ?, "
+         + "                                           v_CalcDate, "
+         + "                                           one_tick.t_DealID, "
+         + "                                           v_SumPerc "
+         + "                                         ); "
+
+         + "     SELECT * INTO v_LotTmp "
+         + "       FROM dpmwrtsum_tmp "
+         + "      WHERE ROWNUM = 1; " //На самом деле только одна запись и должна быть
+
+         + "     RSB_PMWRTOFF.RSI_WRTSaveLot( v_LotTmp.t_SumID, ?, ?, ?, ?); "
+
+         + "     UPDATE dpmwrtsum_dbt"
+         + "        SET t_CorrIntToEIR = v_LotTmp.t_CorrIntToEIR, t_CorrIntToEIRDate = v_CalcDate "
+         + "      WHERE t_SumID = v_LotTmp.t_SumID; ";
+
+         if(ОтсроченнаяРазница == 2) //От даты расчета
+
+           query = query  
+           + "     UPDATE dpmwrtsum_dbt"
+           + "        SET t_AccountedDefDiff = v_LotTmp.t_AccountedDefDiff, t_DefDiffDate = v_CalcDate "
+           + "      WHERE t_SumID = v_LotTmp.t_SumID; "
+         end;
+
+         query = query 
+         + "  END LOOP; "
+         + "END; ";
+   
+  cmd = RSDCommand(query);
+
+  cmd.addParam("", RSDBP_IN, CalcDate);
+
+  cmd.addParam("", RSDBP_IN, AccDate);
+  cmd.addParam("p_msg", RSDBP_OUT, V_STRING, 1000);
+  cmd.addParam("", RSDBP_IN, МетодРасчетаАСДляРЕПО);
+  cmd.addParam("", RSDBP_IN, AccDate);
+
+  cmd.addParam("", RSDBP_IN, currIDOperation);
+  cmd.addParam("", RSDBP_IN, currIDStep);
+  cmd.addParam("", RSDBP_IN, AccDate);
+  cmd.addParam("", RSDBP_IN, currAction);
+
+  cmd.execute();
+
+  msg = SQL_ConvTypeStr(cmd.value("p_msg"));
+
+  if(msg != "")
+    msgbox(msg);
+    return 1;
+  end;   
+
+  //Для всех сделок РЕПО, по которым есть денежные лоты (а они могли возникнуть только сейчас), формируем проводки 
+  query =   " select tk.t_DealID, "
+          + "        (select rq2.t_PlanDate "
+          + "           from ddlrq_dbt rq2 "
+          + "          where rq2.t_DocKind = tk.t_BOfficeKind "
+          + "            and rq2.t_DocID = tk.t_DealID "
+          + "            and rq2.t_Type = " + DLRQ_TYPE_PAYMENT
+          + "            and rq2.t_DealPart = 2 "
+          + "        ) as PlanDate2"
+          + "   from ddl_tick_dbt tk "
+          + "  where tk.t_BOfficeKind = " + DL_SECURITYDOC
+          + "    and tk.t_ClientID = -1 "
+          + "    and RSB_SECUR.IsREPO(rsb_secur.get_OperationGroup(rsb_secur.get_OperSysTypes(tk.t_DealType, tk.t_BofficeKind))) > 0 "
+          + "    and Exists(select 1 "
+          + "                 from ddlrq_dbt rq1, dpmwrtsum_dbt wrt "
+          + "                where rq1.t_DocKind = tk.t_BOfficeKind "
+          + "                  and rq1.t_DocID = tk.t_DealID "
+          + "                  and rq1.t_Type = " + DLRQ_TYPE_PAYMENT
+          + "                  and rq1.t_DealPart = 1 "
+          + "                  and rq1.t_State = " + DLRQ_STATE_EXEC
+          + "                  and wrt.t_DocKind = " + DLDOC_PAYMENT
+          + "                  and wrt.t_DocID = rq1.t_ID "
+          + "                  and wrt.t_Kind = " + PM_WRTSUM_KIND_RCURR
+          + "                  and wrt.t_ID_Operation = ? "
+          + "                  and wrt.t_ID_Step = ? "
+          + "              ) ";
+
+  cmd = DL_RSDCommand(query);
+  cmd.addParam(currIDOperation);
+  cmd.addParam(currIDStep);
+
+  cnt = cmd.GetCount();
+  if(cnt > 0)
+    InitProgress(cnt, currPart+"Учет РЕПО", currPart+"Учет РЕПО");
+    
+    DataSet = cmd.Execute();
+    while((not err) and (DataSet.moveNext()))
+
+      msgbox("Обрабатывается сделка с DealID = " + DataSet.DealID);
+
+      FD = SPFirstDoc( LEG_KIND_DL_TICK, DataSet.DealID );
+
+        
+      if( FD.pmwrtsum_curr().rec.CORRVALUE != 0 )
+        if(FD.pmwrtsum_curr().rec.CORRVALUE > 0) 
+        
+          if( IsSALE(FD.Group) )
+             CatDeb = "+Корр, ПРепо";
+             CatCred = ПолучитьКатегориюФР("+Дох, ПривлСр");
+          else
+             CatDeb = "+Корр, ОРепо";
+             CatCred = ПолучитьКатегориюФР("+Дох, РазмещСр");
+          end;
+        else
+          if( IsSALE(FD.Group) )
+             CatDeb = ПолучитьКатегориюФР("-Расх, ПривлСр");
+             CatCred = "-Корр, ПРепо";
+          else
+             CatDeb = ПолучитьКатегориюФР("-Расх, РазмещСр");
+             CatCred = "-Корр, ОРепо";
+          end;
+        end;
+
+        
+        if(not ПроводкаПоКатегориямУчета( FD, 
+               CatDeb, CatCred,             /* КатегДеб , КатегКредит*/
+               AccDate,                     /* Дата */
+               1,                           /* Глава */
+               NATCUR,                      /* Валюта */
+               abs(FD.pmwrtsum_curr().rec.CORRVALUE), /* Сумма  */
+               NULL,                        /* Документ */
+               INPCARRY,                    /* Result_Carry */
+               " 1",                        /* Kind_Oper */
+               "",                          /* Numb_Document */
+               "Корректировка СС"
+              ) 
+          )
+            msg = GetErrMsg();
+            if(msg != "")
+              msgbox(msg);
+            end;
+
+            return 1;
+        end;
+      end;
+        
+      if(FD.pmwrtsum_curr().rec.BEGDEFDIFF != 0)
+        if(FD.pmwrtsum_curr().rec.ACCOUNTEDDEFDIFF != 0) 
+
+          if(FD.pmwrtsum_curr().rec.ACCOUNTEDDEFDIFF > $0 )
+             if( IsSALE(FD.Group) )
+                CatDeb = "-КСт, ПривлСрАС";
+                CatCred = ПолучитьКатегориюФР("+Дох, ПривлСр");
+             else
+                CatDeb = "-КСт, РазмещСрАС";
+                CatCred = ПолучитьКатегориюФР("+Дох, РазмещСр");
+             end;
+          else
+             if( IsSALE(FD.Group) )
+                CatDeb = ПолучитьКатегориюФР("-Расх, ПривлСр");
+                CatCred = "+КСт, ПривлСрАС";
+             else
+                CatDeb = ПолучитьКатегориюФР("-Расх, РазмещСр");
+                CatCred = "+КСт, РазмещСрАС";
+             end;
+          end;
+
+          if(not ПроводкаПоКатегориямУчета( FD, 
+               CatDeb, CatCred,             /* КатегДеб , КатегКредит*/
+               AccDate,                     /* Дата */
+               1,                           /* Глава */
+               NATCUR,                      /* Валюта */
+               abs(FD.pmwrtsum_curr().rec.ACCOUNTEDDEFDIFF),       /* Сумма  */
+               NULL,                        /* Документ */
+               INPCARRY,                    /* Result_Carry */
+               " 1",                        /* Kind_Oper */
+               "",                          /* Numb_Document */
+               "Списание отсроченной разницы"
+              ) 
+          )
+              msg = GetErrMsg();
+              if(msg != "")
+                msgbox(msg);
+              end;
+
+              return 1;
+          end;
+
+        end;
+      end;
+
+      if( FD.pmwrtsum_curr().rec.CORRINTTOEIR != 0 )
+        if( FD.pmwrtsum_curr().rec.CORRINTTOEIR < $0 )
+           if(IsSALE(FD.Group))
+              CatDeb = ПолучитьКатегориюФР("-КСт, ПривлСрАС");
+              CatCred = "-Корр, ПРепо";
+           else
+              CatDeb = ПолучитьКатегориюФР("-КСт, РазмещСрАС");
+              CatCred = "-Корр, ОРепо";
+           end;
+        else
+           if(IsSALE(FD.Group))
+              CatDeb = "+Корр, ПРепо";
+              CatCred = ПолучитьКатегориюФР("+КСт, ПривлСрАС");
+           else
+              CatDeb = "+Корр, ОРепо";
+              CatCred = ПолучитьКатегориюФР("+КСт, РазмещСрАС");
+           end;
+        end;
+
+        if(not ПроводкаПоКатегориямУчета( FD, 
+             CatDeb, CatCred,             /* КатегДеб , КатегКредит*/
+             AccDate,                     /* Дата */
+             1,                           /* Глава */
+             NATCUR,                      /* Валюта */
+             abs(FD.pmwrtsum_curr().rec.CORRINTTOEIR),       /* Сумма  */
+             NULL,                        /* Документ */
+             INPCARRY,                    /* Result_Carry */
+             " 1",                        /* Kind_Oper */
+             "",                          /* Numb_Document */
+             "Корректировка % до ЭПС"
+            ) 
+        )
+            msg = GetErrMsg();
+            if(msg != "")
+              msgbox(msg);
+            end;
+
+            return 1;
+        end;
+      end;
+
+      UseProgress(i = i + 1);
+    end;
+
+    RemProgress();
+  end;
+
+  return err;
+end;
+
+CLASS (SPFirstDocDealReserv) MSFO9_SPFirstDocDealReserv( Deal, _KindReserv, _IsBack )
+
+    private macro GetCatCode(CatCode)
+      if((CatCode == "-КОР_РС,д/с%") OR (CatCode == "+КОР_РС,д/с%"))
+        return ПолучитьКатегориюФР(CatCode);
+      end;
+
+      return CatCode;
+    end;
+
+    MACRO ActualAccount( CatCode, FindAccount, NoErrMes, FIRole, AccBuf, ActionDate, FIID, Accounts, PairAcc )
+      return ActualAccount(GetCatCode(CatCode), FindAccount, NoErrMes, FIRole, AccBuf, ActionDate, FIID, Accounts, PairAcc );
+    END;
+
+    MACRO OpenAccount( CatCode, FindAccount, NoErrMes, FIRole, AccBuf, ActionDate, FIID, Accounts, McAccDoc, PairAcc, NumberForAcc )
+      return OpenAccount(GetCatCode(CatCode), FindAccount, NoErrMes, FIRole, AccBuf, ActionDate, FIID, Accounts, McAccDoc, PairAcc, NumberForAcc );
+    END;
+
+    MACRO ReOpenAccount( CatCode, FindAccount, NoErrMes, FIRole, AccBuf, ActionDate, FIID, Accounts, PairAcc )
+      return ReOpenAccount(GetCatCode(CatCode), FindAccount, NoErrMes, FIRole, AccBuf, ActionDate, FIID, Accounts, PairAcc );
+    END;
+
+    MACRO IsExistAccount( CatCode, FindAccount, NoErrMes, FIRole, AccBuf, PairAcc, ActionDate, FIID, Accounts )
+      return IsExistAccount(GetCatCode(CatCode), FindAccount, NoErrMes, FIRole, AccBuf, PairAcc, ActionDate, FIID, Accounts );
+    END;
+    
+    initSPFirstDocDealReserv( Deal, _KindReserv, _IsBack );
+END;
+
+macro ОценочныйРезервРЕПО()
+  var err = 0;
+  var query, cmd, DataSet;
+  var ReservObj = TRecHandler("dl_tick.dbt");
+  record dl_comm("dl_comm.dbt");
+  var ReservData;
+  var i = 0, cnt = 0, msg = "";
+  var FD = NULL;
+
+  if((ОценочныйРезервВДатуПерехода == false) or (СчетДляУчетаФР == 706))
+    msgbox("Обработка не требуется.");
+    return 0;
+  end;
+
+  query =   " select tk.t_DealID "
+          + "   from ddl_tick_dbt tk "
+          + "  where tk.t_BOfficeKind = " + DL_SECURITYDOC
+          + "    and tk.t_ClientID = -1 "
+          + "    and RSB_SECUR.IsREPO(rsb_secur.get_OperationGroup(rsb_secur.get_OperSysTypes(tk.t_DealType, tk.t_BofficeKind))) > 0 "
+          + "    and RSB_SECUR.IsBuy(rsb_secur.get_OperationGroup(rsb_secur.get_OperSysTypes(tk.t_DealType, tk.t_BofficeKind))) > 0 "
+          + "    and tk.t_DealStatus = " + DL_READIED
+          + "    and Exists(select 1 "
+          + "                 from ddlrq_dbt rq1 "
+          + "                where rq1.t_DocKind = tk.t_BOfficeKind "
+          + "                  and rq1.t_DocID = tk.t_DealID "
+          + "                  and rq1.t_Type = " + DLRQ_TYPE_PAYMENT
+          + "                  and rq1.t_DealPart = 1 "
+          + "                  and rq1.t_State = " + DLRQ_STATE_EXEC
+          + "              ) "
+          + "    and Exists(select 1 "
+          + "                 from ddlrq_dbt rq2 "
+          + "                where rq2.t_DocKind = tk.t_BOfficeKind "
+          + "                  and rq2.t_DocID = tk.t_DealID "
+          + "                  and rq2.t_Type = " + DLRQ_TYPE_PAYMENT
+          + "                  and rq2.t_DealPart = 2 "
+          + "                  and rq2.t_State IN (" +DLRQ_STATE_PLAN+","+DLRQ_STATE_OVERDUE+")"
+          + "              ) ";
+
+  cmd = DL_RSDCommand(query);
+
+  cnt = cmd.GetCount();
+  if(cnt > 0)
+    InitProgress(cnt, currPart+"Оценочный резерв РЕПО", currPart+"Оценочный резерв РЕПО");
+
+    DataSet = cmd.Execute();
+    while((not err) and (DataSet.moveNext()))
+
+      msgbox("Обрабатывается сделка с DealID = " + DataSet.DealID);
+
+      GetDealFileByID(DataSet.DealID, false, false, ReservObj);
+
+      FD = MSFO9_SPFirstDocDealReserv(ReservObj, KINDRES_REQ, true);
+
+      ClearRecord(dl_comm);
+
+      dl_comm.DocKind       = DL_RESERVEDOC;
+      dl_comm.OperationKind = KINDRES_REQ;
+      dl_comm.Division      = {OperDprt};
+      dl_comm.Oper          = {Oper};
+      dl_comm.CommDate      = CalcDate;
+      dl_comm.ClientID      = UnknownParty;
+      dl_comm.ContractID    = UnknownParty;
+      dl_comm.PartyID       = UnknownParty;
+      dl_comm.IssuerID      = UnknownParty;
+      dl_comm.Currency      = -1;
+      dl_comm.CreateReport  = UNSET_CHAR;
+      dl_comm.Flag5         = SET_CHAR; // Оценочный резерв
+      dl_comm.ContractID    = ReservObj.rec.DealID;
+      dl_comm.ContractKind  = ReservObj.rec.BofficeKind;
+      dl_comm.ClientID      = -1;
+      dl_comm.FIID          = -1;
+      dl_comm.IssuerID      = -1;
+
+      ReservData = CReservData( CalcDate, null, -1, -1, dl_comm, DL_SECURITYDOC, OBJTYPE_SECDEAL, FD, ReservObj, true );
+       
+      //if( SP_DealNeedReserv( KINDRES_REQ, ReservData.ScOprServDoc, ReservData.FD.tick ) )
+        if(SP_РасчитатьРезерв( ReservData ) == false)
+          msg = GetErrMsg();
+          if(msg != "")
+            msgbox(msg);
+          end;
+          err = 1;
+        end;
+      //else
+      //  msgbox("    Резервирование не требуется.");
+      //end;
+
+      UseProgress(i = i + 1);
+    end;
+
+    RemProgress();
+  end;
+
+  return err;
+end;
+
+
+macro ВыполнитьПроводкиВнебалансЦБ()
+  var err = 0, stat = 0;
+  var query, cmd, DataSet;
+  var cnt = 0, i = 0;
+  var SumNotCarryFI = $0;
+  var prevFIID = -1;
+  var CatCred = "";
+  var msg = "";
+  var FD = NULL;
+  var Bpp = false;
+  record AccBuff("account");
+
+  query =   " select NVL(SUM(lot.t_NotCarryInterest), 0) as SumNotCarryInterest, "
+          + "        NVL(SUM(lot.t_NotCarryDiscount), 0) as SumNotCarryDiscount, "
+          + "        lot.t_Portfolio, lot.t_FIID, lot.t_State "
+          + "   from dpmwrtsum_dbt lot "
+          + "  where lot.t_Amount > 0 "
+          + "    and lot.t_State IN ("+PM_WRTSUM_FORM+","+PM_WRTSUM_SALE_BPP+")"
+          + "    and (lot.t_NotCarryInterest > 0 or lot.t_NotCarryDiscount > 0) "
+          + "    and lot.t_Trust = CHR(0) " 
+          + "  group by lot.t_FIID, lot.t_Portfolio, lot.t_State"
+          + "  order by lot.t_FIID, lot.t_Portfolio, lot.t_State";
+
+  cmd = DL_RSDCommand(query);
+
+  cnt = cmd.GetCount();
+  if(cnt > 0)
+    InitProgress(cnt, currPart+"Обработка лотов", currPart+"Обработка лотов");
+    
+    DataSet = cmd.Execute();
+    stat = DataSet.moveNext();
+    while((not err) and (stat))
+
+      if(DataSet.Portfolio == KINDPORT_PROMISSORY) //ПДО
+        CatCred = "Нераспределенная прибыль";
+      else
+        CatCred = ПолучитьКатегориюФР("+%ДЦ/б");
+      end;
+
+      Bpp = false;
+      if(DataSet.State == PM_WRTSUM_SALE_BPP)
+        Bpp = true;
+      end;
+
+      msgbox("Обрабатывается ц/б с FIID = " + DataSet.FIID + ". Портфель = " + DataSet.Portfolio + ". Признак БПП = "+IIF(Bpp==true, "Да", "Нет"));
+
+      FD = SPFirstDocFI(DLDOC_ISSUE, DataSet.FIID, DataSet.FIID, DataSet.Portfolio, {OurBank}, null, null, null);
+
+      if(DataSet.SumNotCarryInterest > 0)
+
+        if(not ПроводкаПоКатегориямУчета( FD, 
+             "Начисл.ПДД, ц/б", CatCred,  /* КатегДеб , КатегКредит*/
+             AccDate,                     /* Дата */
+             1,                           /* Глава */
+             FD.fininstr.rec.FaceValueFI,              /* Валюта */
+             money(DataSet.SumNotCarryInterest),       /* Сумма  */
+             NULL,                        /* Документ */
+             INPCARRY,                    /* Result_Carry */
+             " 1",                        /* Kind_Oper */
+             "",                          /* Numb_Document */
+             "Перенос на доходы процентного дохода",
+             null,
+             GetFIRoleByPortfolio(DataSet.Portfolio, false, true, Bpp), GetFIRoleByPortfolio(DataSet.Portfolio),
+             FD.fininstr.rec.FaceValueFI, NATCUR
+            ) 
+        )
+            msg = GetErrMsg();
+            if(msg != "")
+              msgbox(msg);
+            end;
+
+            return 1;
+        end;
+
+        SumNotCarryFI = SumNotCarryFI + money(DataSet.SumNotCarryInterest);
+      end;
+
+
+      if(DataSet.SumNotCarryDiscount > 0)
+
+        if(not ПроводкаПоКатегориямУчета( FD, 
+             "Начисл.ПДД, ц/б", CatCred,  /* КатегДеб , КатегКредит*/
+             AccDate,                     /* Дата */
+             1,                           /* Глава */
+             FD.fininstr.rec.FaceValueFI,        /* Валюта */
+             money(DataSet.SumNotCarryDiscount), /* Сумма  */
+             NULL,                        /* Документ */
+             INPCARRY,                    /* Result_Carry */
+             " 1",                        /* Kind_Oper */
+             "",                          /* Numb_Document */
+             "Перенос на доходы дисконтного дохода",
+             null,
+             GetFIRoleByPortfolio(DataSet.Portfolio, true, false, Bpp), GetFIRoleByPortfolio(DataSet.Portfolio),
+             FD.fininstr.rec.FaceValueFI, NATCUR
+            ) 
+        )
+            msg = GetErrMsg();
+            if(msg != "")
+              msgbox(msg);
+            end;
+
+            return 1;
+        end;
+
+        SumNotCarryFI = SumNotCarryFI + money(DataSet.SumNotCarryDiscount);
+      end;
+
+      prevFIID = DataSet.FIID;
+
+      if(not err)
+        stat = DataSet.moveNext();
+
+        if((not stat) or (prevFIID != DataSet.FIID))
+
+          if(SumNotCarryFI > 0)
+
+            if(FD.IsExistAccount( "%Ндоход внебаланс, ц/б", null, true, null, AccBuff, MC_PAIRACCMODE_MANUAL, AccDate ))
+
+              if(abs(GetRestAccount(AccBuff, AccDate)) > 0)
+                if(not ПроводкаПоКатегориямУчета( FD, 
+                     "ВнебалСчетКорресп", AccBuff,  /* КатегДеб , КатегКредит*/
+                     AccDate,                     /* Дата */
+                     3,                           /* Глава */
+                     FD.fininstr.rec.FaceValueFI, /* Валюта */
+                     SumNotCarryFI,               /* Сумма  */
+                     NULL,                        /* Документ */
+                     INPCARRY,                    /* Result_Carry */
+                     " 1",                        /* Kind_Oper */
+                     "",                          /* Numb_Document */
+                     "Списание дохода с внебаланса",
+                     null,
+                     null, null,
+                     NATCUR, FD.fininstr.rec.FaceValueFI
+                    ) 
+                )
+                    msg = GetErrMsg();
+                    if(msg != "")
+                      msgbox(msg);
+                    end;
+                     
+                    return 1;
+                end;
+              end;
+
+              err = CloseAccount(AccBuff);
+            end;
+
+            SumNotCarryFI = 0;
+          end;
+        end;
+
+      end;
+
+      UseProgress(i = i + 1);
+    end;
+
+    if(not err)
+      
+      query =  "DECLARE "
+             + "BEGIN "
+             + "  FOR one_lot IN ("
+             + "                    select t_SumID "
+             + "                      from dpmwrtsum_dbt "
+             + "                     where t_Amount > 0 " 
+             + "                       and t_State IN ("+PM_WRTSUM_FORM+","+PM_WRTSUM_SALE_BPP+")"
+             + "                       and (t_NotCarryInterest > 0 or t_NotCarryDiscount > 0) "
+             + "                       and t_Trust = CHR(0) "
+             + "                   ) LOOP "
+             + "     RSB_PMWRTOFF.RSI_WRTSaveLot( one_lot.t_SumID, ?, ?, ?, ?); "
+             + "     "
+             + "     UPDATE dpmwrtsum_dbt"
+             + "        SET t_NotCarryInterest = 0, t_NotCarryDiscount = 0 "
+             + "      WHERE t_SumID = one_lot.t_SumID; "
+             + "             "
+             + "  END LOOP; "
+             + "END; ";
+       
+      cmd = RSDCommand(query);
+
+      cmd.addParam("", RSDBP_IN, currIDOperation);
+      cmd.addParam("", RSDBP_IN, currIDStep);
+      cmd.addParam("", RSDBP_IN, AccDate);
+      cmd.addParam("", RSDBP_IN, currAction);
+
+      cmd.execute();
+    end;
+
+    RemProgress();
+  end;
+
+  return err;
+end;
+
+
+private macro TransferRestAcc(FD, CatCode, OldPortfolio, NewPortfolio, isDiscount, isPercent, isBonus, isBPP)
+  record OldAcc("account");
+  record NewAcc("account");
+  record DebAcc("account");
+  record CredAcc("account");
+  var OldFiRole, NewFiRole;
+  var err = 0;
+  var sum = $0;
+  var msg = "";
+
+  if(ValType(isDiscount) == V_UNDEF)
+    isDiscount = false;
+  end;
+
+  if(ValType(isPercent) == V_UNDEF)
+    isPercent = false;
+  end;
+
+  if(ValType(isBonus) == V_UNDEF)
+    isBonus = false;
+  end;
+
+  if(ValType(isBPP) == V_UNDEF)
+    isBPP = false;
+  end;
+
+  if(isBonus == true)
+    OldFiRole = GetFIRoleByPortfolioBonus(OldPortfolio, isBPP);
+    NewFiRole = GetFIRoleByPortfolioBonus(NewPortfolio, isBPP);
+  else
+    OldFiRole = GetFIRoleByPortfolio(OldPortfolio, isDiscount, isPercent, isBPP);
+    NewFiRole = GetFIRoleByPortfolio(NewPortfolio, isDiscount, isPercent, isBPP);
+  end;
+  
+  if(FD.IsExistAccount(CatCode, null, true, OldFiRole, OldAcc, null, AccDate, FD.fininstr.rec.FaceValueFI))
+
+    sum = abs(GetRestAccount(OldAcc, AccDate));
+    if(sum > 0)
+       
+       if( not FD.ReOpenAccount(CatCode, null, false, NewFiRole, NewAcc, AccDate) )
+         msg = GetErrMsg();
+         if(msg != "")
+           msgbox(msg);
+         end;
+          
+         return 1;
+       end;
+
+       if(OldAcc.Account == NewAcc.Account)
+         msgbox("Одинаковые счета "+CatCode+" !");
+         return 0;
+       end;
+
+       if(OldAcc.Kind_Account == "А")
+         copy(DebAcc, NewAcc);
+         copy(CredAcc, OldAcc);
+       else
+         copy(DebAcc, OldAcc);
+         copy(CredAcc, NewAcc);
+       end;
+
+       if(not ПроводкаПоКатегориямУчета( FD, 
+            DebAcc, CredAcc,              /* КатегДеб , КатегКредит*/
+            AccDate,                     /* Дата */
+            1,                           /* Глава */
+            OldAcc.Code_Currency,        /* Валюта */
+            sum,                         /* Сумма  */
+            NULL,                        /* Документ */
+            INPCARRY,                    /* Result_Carry */
+            " 1",                        /* Kind_Oper */
+            "",                          /* Numb_Document */
+            "Перенос остатка " + CatCode,
+            null,
+            OldFiRole, 
+            NewFiRole,
+            OldAcc.Code_Currency, NewAcc.Code_Currency
+           ) 
+       )
+           msg = GetErrMsg();
+           if(msg != "")
+             msgbox(msg);
+           end;
+            
+           return 1;
+       end;
+     end;
+
+     err = CloseAccount(OldAcc);
+
+  end;
+
+  return err;
+end;
+
+private macro GetFIIDbyISIN(ISIN:string)
+  var query, cmd, DataSet;
+  var FIID = -1;
+
+  cmd = DL_RSDCommand("select t_FIID from davoiriss_dbt where t_ISIN = ?");
+
+  cmd.AddParam(ISIN);
+
+  DataSet = cmd.Execute();
+  if(DataSet.moveNext())
+    FIID = DataSet.FIID;
+  end;
+
+  return FIID;
+end;
+
+PRIVATE MACRO НачислитьРезерв( FD, ReservCat, ReservRole, Reserv:MONEY, CorrespCat:string )
+   var CatAcc = "", CatAccDbt = "", CatAccCred = "";
+   var DebRole = NULL, CredRole = NULL;
+
+   CatAcc = ПолучитьКатегориюФР(CorrespCat);
+
+   if( Reserv > 0 )
+      CatAccDbt  = CatAcc;
+      DebRole    = ReservRole;
+      
+      CatAccCred = ReservCat;
+      CredRole   = ReservRole;
+   else  
+      CatAccDbt  = ReservCat;
+      DebRole    = ReservRole;
+
+      CatAccCred = CatAcc;
+      CredRole   = ReservRole;
+   end;
+
+   if( not ПроводкаПоКатегориямУчета( FD, 
+                                      CatAccDbt, CatAccCred, /* Деб, КатегКредит*/
+                                      AccDate,               /* Дата */
+                                      1,                     /* Глава */
+                                      NATCUR,                /* Валюта */
+                                      ABS(Reserv),           /* Сумма */
+                                      null,                  /* Документ */
+                                      INPCARRY,              /* Result_Carry */
+                                      " 1",                  /* Kind_Oper */
+                                      "",                    /* Numb_Document */
+                                      "Оценочный резерв", /* Ground */
+                                      null,
+                                      DebRole, 
+                                      CredRole
+                                    )
+     )
+      return false;
+   end;
+
+   return true;
+END;
+
+PRIVATE MACRO InsertDL_VALUE(FIID:integer, Kind:integer, Dat:date, Sum:money, SumFI:integer)
+  var query, cmd;
+
+  query =   " DECLARE "
+          + "   v_ID NUMBER := 0; "
+          + "   v_FIID NUMBER; "
+          + "   v_Kind NUMBER; "
+          + "   v_Dat DATE; "
+          + "   v_Sum NUMBER; "
+          + "   v_SumFI NUMBER; "
+          + "   v_ID_Operation NUMBER; "
+          + "   v_ID_Step NUMBER;"
+          + " BEGIN "
+
+          + "   v_FIID         := ?; "
+          + "   v_Kind         := ?; "
+          + "   v_Dat          := ?; "
+          + "   v_Sum          := ?; "
+          + "   v_SumFI        := ?; "
+          + "   v_ID_Operation := ?; "
+          + "   v_ID_Step      := ?; "
+
+          + "   BEGIN "
+          + "     SELECT t_ID INTO v_ID "
+          + "       FROM ddl_value_dbt "
+          + "      WHERE t_DocKind = " + DLDOC_ISSUE
+          + "        AND t_DocID = v_FIID "
+          + "        AND t_Kind = v_Kind "
+          + "        AND t_Date = v_Dat "
+          + "        AND t_SumFIID = v_SumFI "
+          + "        AND t_ID_Operation = v_ID_Operation "
+          + "        AND t_ID_Step = v_ID_Step; "
+          
+          + "     EXCEPTION "
+          + "         WHEN OTHERS THEN v_ID := 0; "
+          + "   END; "
+
+          + "   IF v_ID > 0 THEN "
+          + "     UPDATE ddl_value_dbt "
+          + "        SET t_Sum = v_Sum "
+          + "      WHERE t_ID = v_ID;"
+          + "   ELSE"
+          + "     RSI_DLGR.RSI_InsertDL_VALUE("+DLDOC_ISSUE+", " 
+          + "                                 v_FIID, "
+          + "                                 v_Kind, "
+          + "                                 v_Dat, "
+          + "                                 v_Sum, "
+          + "                                 v_SumFI, "
+          + "                                 v_ID_Operation, "
+          + "                                 v_ID_Step, "
+          + "                                 0 "
+          + "                                ); "
+          + "   END IF;"
+          + " END;";
+
+  cmd = RSDCommand(query);
+
+  cmd.addParam("", RSDBP_IN, FIID);
+  cmd.addParam("", RSDBP_IN, Kind);
+  cmd.addParam("", RSDBP_IN, Dat);
+  cmd.addParam("", RSDBP_IN, Sum);
+  cmd.addParam("", RSDBP_IN, SumFI);
+  cmd.addParam("", RSDBP_IN, currIDOperation);
+  cmd.addParam("", RSDBP_IN, currIDStep);
+
+  cmd.Execute();
+
+  return 0;
+END;
+
+private macro SetOverRegistrValue(FD, FIID, ValueDate)
+  record Account(account);
+  var err = 0;
+
+  if( ПарностьСчетовПереоценки() )
+     if((not err) and (FD.ActualAccount("+Переоценка, ц/б ССПУ_ЦБ", null, true, FIROLE_BA_TP, Account, ValueDate, null, null, MC_PAIRACCMODE_MANUAL) != 0))
+       err = InsertDL_VALUE(FIID, DL_VALUE_KIND_PLUSTP, ValueDate, GetRestAccount(Account, ValueDate), Account.Code_Currency);
+     end;
+     
+     if((not err) and (FD.ActualAccount("-Переоценка, ц/б ССПУ_ЦБ", null, true, FIROLE_BA_TP, Account, ValueDate, null, null, MC_PAIRACCMODE_MANUAL) != 0))
+       err = InsertDL_VALUE(FIID, DL_VALUE_KIND_MINUSTP, ValueDate, GetRestAccount(Account, ValueDate), Account.Code_Currency);
+     end;
+    
+     if((not err) and (FD.ActualAccount("+Переоценка, ц/б СССД_ЦБ", null, true, FIROLE_BA_PPR, Account, ValueDate, null, null, MC_PAIRACCMODE_MANUAL) != 0))
+       err = InsertDL_VALUE(FIID, DL_VALUE_KIND_PLUSPPR, ValueDate, GetRestAccount(Account, ValueDate), Account.Code_Currency);
+     end;
+     
+     if((not err) and (FD.ActualAccount("-Переоценка, ц/б СССД_ЦБ", null, true, FIROLE_BA_PPR, Account, ValueDate, null, null, MC_PAIRACCMODE_MANUAL) != 0))
+       err = InsertDL_VALUE(FIID, DL_VALUE_KIND_MINUSPPR, ValueDate, GetRestAccount(Account, ValueDate), Account.Code_Currency);
+     end;
+    
+     if((not err) and (FD.ActualAccount("+ПО ДК 2014", null, true, FIROLE_BA_PPR, Account, ValueDate, null, null, MC_PAIRACCMODE_MANUAL) != 0))
+       err = InsertDL_VALUE(FIID, DL_VALUE_KIND_PLUSDK, ValueDate, GetRestAccount(Account, ValueDate), Account.Code_Currency);
+     end;
+     
+     if((not err) and (FD.ActualAccount("-ПО ДК 2014", null, true, FIROLE_BA_PPR, Account, ValueDate, null, null, MC_PAIRACCMODE_MANUAL) != 0))
+       err = InsertDL_VALUE(FIID, DL_VALUE_KIND_MINUSDK, ValueDate, GetRestAccount(Account, ValueDate), Account.Code_Currency);
+     end;
+  else
+     if((not err) and (FD.ActualAccount( "+Переоценка, ц/б", null, true, FIROLE_BA_TP, Account, ValueDate) != 0))
+       err = InsertDL_VALUE(FIID, DL_VALUE_KIND_PLUSTP, ValueDate, GetRestAccount(Account, ValueDate), Account.Code_Currency);
+     end;
+     
+     if((not err) and (FD.ActualAccount( "-Переоценка, ц/б", null, true, FIROLE_BA_TP, Account, ValueDate) != 0))
+       err = InsertDL_VALUE(FIID, DL_VALUE_KIND_MINUSTP, ValueDate, GetRestAccount(Account, ValueDate), Account.Code_Currency);
+     end;
+    
+     if((not err) and (FD.ActualAccount( "+Переоценка, ц/б", null, true, FIROLE_BA_PPR, Account, ValueDate) != 0))
+       err = InsertDL_VALUE(FIID, DL_VALUE_KIND_PLUSPPR, ValueDate, GetRestAccount(Account, ValueDate), Account.Code_Currency);
+     end;
+     
+     if((not err) and (FD.ActualAccount( "-Переоценка, ц/б", null, true, FIROLE_BA_PPR, Account, ValueDate) != 0))
+       err = InsertDL_VALUE(FIID, DL_VALUE_KIND_MINUSPPR, ValueDate, GetRestAccount(Account, ValueDate), Account.Code_Currency);
+     end;
+    
+     if((not err) and (FD.ActualAccount( "+ПО ДК", null, true, FIROLE_BA_PPR, Account, ValueDate) != 0))
+       err = InsertDL_VALUE(FIID, DL_VALUE_KIND_PLUSDK, ValueDate, GetRestAccount(Account, ValueDate), Account.Code_Currency);
+     end;
+     
+     if((not err) and (FD.ActualAccount( "-ПО ДК", null, true, FIROLE_BA_PPR, Account, ValueDate) != 0))
+       err = InsertDL_VALUE(FIID, DL_VALUE_KIND_MINUSDK, ValueDate, GetRestAccount(Account, ValueDate), Account.Code_Currency);
+     end;
+  end;
+
+  return err;
+end;
+
+macro ВыполнитьМежпортфельноеПеремещениеЦБ()
+  var err = 0;
+  var i = 0, j = 0, num = 0;
+  var query, cmd, DataSet;
+  var FIID = -1;
+  var SumOverAmount = 0;
+  var SumOverAmountAdd = 0;
+  var SumWrtOutlay = 0;
+  var МинусПереоценкаЦБ = "";
+  var ПлюсПереоценкаЦБ = ""; 
+  record acnt_ov_negative(account);
+  record acnt_ov_positive(account);
+  record OldAcc(account);
+  record NewAcc(account);
+  record ReservAcc(account);
+  record MinusAcc("account");
+  record PlusAcc("account");
+  var Sотр_ост = 0, Sпол_ост = 0;
+  var ArrCatDeb = TArray(), ArrCatCred = TArray(), ArrSum = TArray();
+  var Ground = "";
+  var FD = NULL;
+  var msg = "", cnt = 0;
+  var ReservRest = 0;
+  var FromPortfolioName = "", ToPortfolioName = "";
+  var CatCred = "";
+  var FiRoleCred = 0;
+
+  if(PortfolioTransferArr.size == 0)
+    return 0;
+  end;
+
+  while((not err) and (i < PortfolioTransferArr.size))
+
+    Ground = "";
+    ArrCatDeb.size = 0;
+    ArrCatCred.size = 0;
+    ArrSum.size = 0;
+
+    if(PortfolioTransferArr[i].FromPortfolio == KINDPORT_TRADE)
+      FromPortfolioName = "ТП";
+    elif(PortfolioTransferArr[i].FromPortfolio == KINDPORT_SALE)
+      FromPortfolioName = "ППР";
+    elif(PortfolioTransferArr[i].FromPortfolio == KINDPORT_RETIRE)
+      FromPortfolioName = "ПУДП";
+    else
+      msgbox("Недопустимый вид портфеля \"из\" = " + PortfolioTransferArr[i].FromPortfolio);
+      return 1;
+    end;
+
+    if(PortfolioTransferArr[i].ToPortfolio == KINDPORT_SSSD)
+      ToPortfolioName = "СССД_ЦБ";
+    elif(PortfolioTransferArr[i].ToPortfolio == KINDPORT_SSPU)
+      ToPortfolioName = "ССПУ_ЦБ";
+    elif(PortfolioTransferArr[i].ToPortfolio == KINDPORT_ASCB)
+      ToPortfolioName = "АС_ЦБ";
+    else
+      msgbox("Недопустимый вид портфеля \"в\" = " + PortfolioTransferArr[i].ToPortfolio);
+      return 1;
+    end;
+
+    if(PortfolioTransferArr[i].ISIN == "")
+      msgbox("Не задан ISIN ц/б при межпортфельном переводе");
+      return 1;
+    end;
+
+    FIID = GetFIIDbyISIN(PortfolioTransferArr[i].ISIN);
+    if(FIID == -1)
+      msgbox("Не найдена ц/б с ISIN = " + PortfolioTransferArr[i].ISIN);
+      return 1;
+    end;
+
+    msgbox("Перемещение ц/б с FIID = " + FIID + " из портфеля " + FromPortfolioName + " в портфель "+ToPortfolioName);
+
+    if(PortfolioTransferArr[i].FromPortfolio == PortfolioTransferArr[i].ToPortfolio)
+      msgbox("Указаны одинаковые портфели. Запись не будет обработана");
+      i = i + 1;
+      continue;
+    end;
+
+    query =   "DECLARE "
+            + "  v_SumOverAmount NUMBER := 0; "
+            + "  v_WrtOverAmount NUMBER := 0; "
+            + "  v_WrtReservAmount NUMBER := 0; "
+            + "  v_WrtIncomeReserv NUMBER := 0; "
+            + "  v_WrtOutlay       NUMBER := 0; "
+            + "  v_SumWrtOutlay    NUMBER := 0; "
+            + "BEGIN "
+            + "  FOR one_lot IN (select lot.t_SumID, lot.t_OverAmount, lot.t_ReservAmount, lot.t_IncomeReserv, lot.t_Outlay "
+            + "                    from dpmwrtsum_dbt lot"
+            + "                   where lot.t_Portfolio = ? "
+            + "                     and lot.t_Amount > 0 "
+            + "                     and lot.t_State = "+PM_WRTSUM_FORM
+            + "                     and lot.t_FIID = ? "
+            + "                     and lot.t_Trust = CHR(0) "
+            + "                 )"
+            + "  LOOP "
+
+            + "     v_WrtOverAmount   := 0; "
+            + "     v_WrtReservAmount := 0; "
+            + "     v_WrtIncomeReserv := 0; "
+            + "     v_WrtOutlay       := 0; "
+
+            + "     v_SumOverAmount   := v_SumOverAmount + one_lot.t_OverAmount; ";
+            
+
+            if((PortfolioTransferArr[i].FromPortfolio == KINDPORT_TRADE) OR (PortfolioTransferArr[i].FromPortfolio == KINDPORT_SALE))
+            
+              if(PortfolioTransferArr[i].ToPortfolio == KINDPORT_ASCB)
+                query = query
+                + "     v_WrtOverAmount := one_lot.t_OverAmount; ";
+              end;
+            end;
+
+            if(PortfolioTransferArr[i].FromPortfolio == KINDPORT_SALE)
+              
+              if(PortfolioTransferArr[i].ToPortfolio == KINDPORT_SSPU)
+                query = query
+                + "     v_WrtReservAmount := one_lot.t_ReservAmount; "
+                + "     v_WrtIncomeReserv := one_lot.t_IncomeReserv; ";
+              end;
+            end;
+
+            if(PortfolioTransferArr[i].FromPortfolio == KINDPORT_RETIRE)
+                query = query
+                + "     v_WrtReservAmount := one_lot.t_ReservAmount; "
+                + "     v_WrtIncomeReserv := one_lot.t_IncomeReserv; ";
+            end;
+
+            if(СписаниеСущественныхЗатратПриПереводе == true)
+              if((PortfolioTransferArr[i].FromPortfolio == KINDPORT_SALE) or (PortfolioTransferArr[i].FromPortfolio == KINDPORT_RETIRE))
+                if(PortfolioTransferArr[i].ToPortfolio == KINDPORT_SSPU)
+                  query = query
+                  + "  v_WrtOutlay    := one_lot.t_Outlay; "
+                  + "  v_SumWrtOutlay := v_SumWrtOutlay + v_WrtOutlay; ";
+                end;
+              end;
+            end;
+
+            query = query
+            + "     RSB_PMWRTOFF.RSI_WRTSaveLot( one_lot.t_SumID, ?, ?, ?, ?); "
+
+            + "     UPDATE dpmwrtsum_dbt"
+            + "        SET t_Portfolio = ?, "
+            + "            t_GroupID = RSB_PMWRTOFF.RSI_GetWrtoffGroupByPortfolio(?), "
+            + "            t_OverAmount = t_OverAmount - v_WrtOverAmount, "
+            + "            t_ReservAmount = t_ReservAmount - v_WrtReservAmount, "
+            + "            t_IncomeReserv = t_IncomeReserv - v_WrtIncomeReserv, "
+            + "            t_ReservDate = (CASE WHEN v_WrtReservAmount != 0 OR v_WrtIncomeReserv != 0 THEN ? ELSE t_ReservDate END), "
+            + "            t_Outlay = t_Outlay - v_WrtOutlay "
+            + "      WHERE t_SumID = one_lot.t_SumID; "
+
+            + "  END LOOP;"
+
+            + "  ? := v_SumOverAmount; "
+            + "  ? := v_SumWrtOutlay; "
+
+            + "END;";
+
+    cmd = RSDCommand(query);
+
+    cmd.addParam("", RSDBP_IN, PortfolioTransferArr[i].FromPortfolio);
+    cmd.addParam("", RSDBP_IN, FIID);
+
+    cmd.addParam("", RSDBP_IN, currIDOperation);
+    cmd.addParam("", RSDBP_IN, currIDStep);
+    cmd.addParam("", RSDBP_IN, AccDate);
+    cmd.addParam("", RSDBP_IN, currAction);
+
+    cmd.addParam("", RSDBP_IN, PortfolioTransferArr[i].ToPortfolio);
+    cmd.addParam("", RSDBP_IN, PortfolioTransferArr[i].ToPortfolio);
+    cmd.addParam("", RSDBP_IN, CalcDate);
+
+    cmd.addParam("p_SumOverAmount", RSDBP_OUT, V_MONEY);
+    cmd.addParam("p_SumWrtOutlay", RSDBP_OUT, V_MONEY);
+
+    cmd.execute();
+
+    SumOverAmount  = SQL_ConvTypeSum(cmd.value("p_SumOverAmount"));
+    SumWrtOutlay   = SQL_ConvTypeSum(cmd.value("p_SumWrtOutlay"));
+
+    FD = SPFirstDocFI(DLDOC_ISSUE, FIID, FIID, NULL, {OurBank}, null, null, null);
+
+    if((PortfolioTransferArr[i].FromPortfolio == KINDPORT_SALE) or (PortfolioTransferArr[i].FromPortfolio == KINDPORT_RETIRE))
+      if(PortfolioTransferArr[i].ToPortfolio == KINDPORT_SSPU)
+        if(SumWrtOutlay > 0)
+          if(not ПроводкаПоКатегориямУчета( FD, 
+                 ПолучитьКатегориюФР("-КВ, затраты, ц/б"), "Наш портфель ц/б", /* КатегДеб , КатегКредит*/
+                 AccDate,                     /* Дата */
+                 1,                           /* Глава */
+                 NATCUR,                      /* Валюта */
+                 SumWrtOutlay,                /* Сумма  */
+                 NULL,                        /* Документ */
+                 INPCARRY,                    /* Result_Carry */
+                 " 1",                        /* Kind_Oper */
+                 "",                          /* Numb_Document */
+                 "Списание затрат",
+                 null,
+                 GetFIRoleByPortfolio(PortfolioTransferArr[i].FromPortfolio),
+                 GetFIRoleByPortfolio(PortfolioTransferArr[i].FromPortfolio)
+                ) 
+            )
+              msg = GetErrMsg();
+              if(msg != "")
+                msgbox(msg);
+              end;
+               
+              return 1;
+          end;
+        end;
+      end;
+    end;
+
+    if(not err)  
+      err = TransferRestAcc(FD, "Наш портфель ц/б", PortfolioTransferArr[i].FromPortfolio, PortfolioTransferArr[i].ToPortfolio);
+    end;
+    if(not err)
+      err = TransferRestAcc(FD, "Уплаченный НКД", PortfolioTransferArr[i].FromPortfolio, PortfolioTransferArr[i].ToPortfolio);
+    end;
+    if(not err)
+      err = TransferRestAcc(FD, "Начисл.ПДД, ц/б", PortfolioTransferArr[i].FromPortfolio, PortfolioTransferArr[i].ToPortfolio, true, false, false, false);
+    end;
+    if(not err)
+      err = TransferRestAcc(FD, "Начисл.ПДД, ц/б", PortfolioTransferArr[i].FromPortfolio, PortfolioTransferArr[i].ToPortfolio, false, true, false, false);
+    end;
+    if(not err)
+      err = TransferRestAcc(FD, "Премия, ц/б", PortfolioTransferArr[i].FromPortfolio, PortfolioTransferArr[i].ToPortfolio, false, false, true, false);
+    end;
+
+
+    if(not err)
+
+//a.    Выпуск из ТП (ССПУ_ЦБ)
+      if(PortfolioTransferArr[i].FromPortfolio == KINDPORT_TRADE)
+
+        МинусПереоценкаЦБ = IIF(ПарностьСчетовПереоценки(), "-Переоценка, ц/б ССПУ_ЦБ", "-Переоценка, ц/б");
+        ПлюсПереоценкаЦБ  = IIF(ПарностьСчетовПереоценки(), "+Переоценка, ц/б ССПУ_ЦБ", "+Переоценка, ц/б");
+
+        Sотр_ост = 0; 
+        Sпол_ост = 0;
+
+        /*остаток на счете категории "-Переоценка"*/
+        if( FD.IsExistAccount( МинусПереоценкаЦБ, null, true, GetFIRoleByPortfolio(PortfolioTransferArr[i].FromPortfolio), acnt_ov_negative, MC_PAIRACCMODE_MANUAL, AccDate ))
+           Sотр_ост = ABS(GetRestAccount(acnt_ov_negative, CalcDate));
+        end;
+
+        /*остаток на счете категории "+Переоценка"*/
+        if( FD.IsExistAccount( ПлюсПереоценкаЦБ, null, true, GetFIRoleByPortfolio(PortfolioTransferArr[i].FromPortfolio), acnt_ov_positive, MC_PAIRACCMODE_MANUAL, AccDate ) )
+           Sпол_ост = ABS(GetRestAccount(acnt_ov_positive, CalcDate));
+        end;
+
+        //Списание переоценки
+        if(Sпол_ост > 0)
+          if(not ПроводкаПоКатегориямУчета( FD, 
+                 ПолучитьКатегориюФР("+МаржаП, ц/б"), ПлюсПереоценкаЦБ, /* КатегДеб , КатегКредит*/
+                 AccDate,                     /* Дата */
+                 1,                           /* Глава */
+                 NATCUR,                      /* Валюта */
+                 Sпол_ост,                    /* Сумма  */
+                 NULL,                        /* Документ */
+                 INPCARRY,                    /* Result_Carry */
+                 " 1",                        /* Kind_Oper */
+                 "",                          /* Numb_Document */
+                 "Списание положительной переоценки",
+                 null,
+                 null, 
+                 GetFIRoleByPortfolio(PortfolioTransferArr[i].FromPortfolio)
+                ) 
+            )
+              msg = GetErrMsg();
+              if(msg != "")
+                msgbox(msg);
+              end;
+               
+              return 1;
+          end;
+        end;
+
+        if(Sотр_ост > 0)
+          if(not ПроводкаПоКатегориямУчета( FD, 
+                 МинусПереоценкаЦБ, ПолучитьКатегориюФР("-МаржаП, ц/б"),/* КатегДеб , КатегКредит*/
+                 AccDate,                     /* Дата */
+                 1,                           /* Глава */
+                 NATCUR,                      /* Валюта */
+                 Sотр_ост,                    /* Сумма  */
+                 NULL,                        /* Документ */
+                 INPCARRY,                    /* Result_Carry */
+                 " 1",                        /* Kind_Oper */
+                 "",                          /* Numb_Document */
+                 "Списание отрицательной переоценки",
+                 null,
+                 GetFIRoleByPortfolio(PortfolioTransferArr[i].FromPortfolio)
+                ) 
+            )
+              msg = GetErrMsg();
+              if(msg != "")
+                msgbox(msg);
+              end;
+               
+              return 1;
+          end;
+        end;
+
+
+        if(PortfolioTransferArr[i].ToPortfolio == KINDPORT_ASCB)
+          //Рассчитать резерв уже в новом портфеле
+
+          query =   " DECLARE "
+                  + " BEGIN "
+                  + "   DELETE FROM DPMWRTLNK_TMP; "
+                  + "   DELETE FROM DPMWRTSUM_TMP; "
+
+                  + "   INSERT INTO DPMWRTLNK_TMP (T_ID, T_BUYID, T_AMOUNT) "
+                  + "      SELECT 0, LOT.T_SUMID, LOT.T_AMOUNT "
+                  + "        FROM DPMWRTSUM_DBT LOT "
+                  + "       WHERE LOT.T_PORTFOLIO = ? "
+                  + "         AND LOT.T_FIID = ? "
+                  + "         AND LOT.T_ID_OPERATION = ? "
+                  + "         AND LOT.T_ID_STEP = ? "
+                  + "         AND LOT.T_ACTION = ?; "
+
+                  + "   FOR one_dprt IN (SELECT DISTINCT LOT.T_DEPARTMENT "
+                  + "                      FROM DPMWRTSUM_DBT LOT, DPMWRTLNK_TMP LNK "
+                  + "                     WHERE LOT.T_SUMID = LNK.T_BUYID "
+                  + "                   )"
+                  + "   LOOP"
+                  + "     RSB_PMWRTOFF.RSI_WRTReservePortfolioLotsTMP(?, ?, one_dprt.t_Department, ?, "+PM_WRTSUM_FORM+", 1, 1);"
+                  + "   END LOOP;"
+
+                  + "   RSB_PMWRTOFF.RSI_WRTSaveReserveLots(?, ?, ?); "
+
+                  + " END; ";
+
+
+          cmd = RSDCommand(query);
+
+          cmd.addParam("", RSDBP_IN, PortfolioTransferArr[i].ToPortfolio);
+          cmd.addParam("", RSDBP_IN, FIID);
+          cmd.addParam("", RSDBP_IN, currIDOperation);
+          cmd.addParam("", RSDBP_IN, currIDStep);
+          cmd.addParam("", RSDBP_IN, currAction);
+
+          cmd.addParam("", RSDBP_IN, CalcDate);
+          cmd.addParam("", RSDBP_IN, FIID);
+          cmd.addParam("", RSDBP_IN, PortfolioTransferArr[i].ToPortfolio);
+
+          cmd.addParam("", RSDBP_IN, CalcDate);
+          cmd.addParam("", RSDBP_IN, currIDOperation);
+          cmd.addParam("", RSDBP_IN, currIDStep);
+
+          cmd.execute();
+
+          query =   " select * from dpmwrtsum_tmp";
+          cmd = DL_RSDCommand(query);
+
+          cnt = cmd.GetCount();
+          if(cnt > 0)
+            InitProgress(cnt, currPart+"Резерв АС_ЦБ", currPart+"Резерв АС_ЦБ");
+
+            j = 0;
+            DataSet = cmd.Execute();
+            while((not err) and (DataSet.moveNext()))
+
+              if(DataSet.ReservAmountAdd != 0)
+
+                if( not НачислитьРезерв(FD, "Резерв ц/б", FIROLE_BA_PUDP, money(DataSet.ReservAmountAdd), "-РС,ц/б") )
+                  msg = GetErrMsg();
+                  if(msg != "")
+                    msgbox(msg);
+                  end;
+                   
+                  return 1;
+                end;
+
+              end;
+
+              if(DataSet.IncomeReservAdd != 0)
+
+                if( not НачислитьРезерв(FD, "Резерв ц/б", FIROLE_PD_PUDP, money(DataSet.IncomeReservAdd), "-РС,ц/б") )
+                  msg = GetErrMsg();
+                  if(msg != "")
+                    msgbox(msg);
+                  end;
+                   
+                  return 1;
+                end;
+
+              end;
+
+              UseProgress(j = j + 1);
+            end;
+
+            RemProgress();
+          end;
+
+        elif(PortfolioTransferArr[i].ToPortfolio == KINDPORT_SSSD)
+          
+          if(SumOverAmount != 0)
+
+            if( FD.ActualAccount(IIF(ПарностьСчетовПереоценки(), "+Переоценка, ц/б СССД_ЦБ", "+Переоценка, ц/б"), null, true, GetFIRoleByPortfolio(PortfolioTransferArr[i].ToPortfolio), acnt_ov_positive, AccDate, null, null, MC_PAIRACCMODE_MANUAL) )
+              Sпол_ост = GetRestAccount( acnt_ov_positive, CalcDate );
+            end;
+
+            if( FD.ActualAccount(IIF(ПарностьСчетовПереоценки(), "-Переоценка, ц/б СССД_ЦБ", "-Переоценка, ц/б"), null, true, GetFIRoleByPortfolio(PortfolioTransferArr[i].ToPortfolio), acnt_ov_negative, AccDate, null, null, MC_PAIRACCMODE_MANUAL) )
+               Sотр_ост = GetRestAccount( acnt_ov_negative, CalcDate );
+            end;
+   
+            if (not ПарностьСчетовПереоценки())
+              if (SumOverAmount > $0)
+                Ground = "Положительная переоценка";
+                if (Sотр_ост == $0)
+                  ArrCatDeb[0] = "+Переоценка, ц/б";
+                  ArrCatCred[0] = "+ПО ДК";
+                  ArrSum[0] = SumOverAmount;
+                elif (SumOverAmount > Sотр_ост)
+                  ArrCatDeb[0] = "-Переоценка, ц/б";
+                  ArrCatCred[0] = "-ПО ДК";
+                  ArrSum[0] = Sотр_ост;
+                  ArrCatDeb[1] = "+Переоценка, ц/б";
+                  ArrCatCred[1] = "+ПО ДК";
+                  ArrSum[1] = SumOverAmount - Sотр_ост;
+                else
+                  ArrCatDeb[0] = "-Переоценка, ц/б";
+                  ArrCatCred[0] = "-ПО ДК";
+                  ArrSum[0] = SumOverAmount;
+                end;
+              elif (SumOverAmount < $0)
+                Ground = "Отрицательная переоценка";
+                if (Sпол_ост == $0)
+                  ArrCatDeb[0] = "-ПО ДК";
+                  ArrCatCred[0] = "-Переоценка, ц/б";
+                  ArrSum[0] = abs(SumOverAmount);
+                elif (SumOverAmount > Sпол_ост)
+                  ArrCatDeb[0] = "+ПО ДК";
+                  ArrCatCred[0] = "+Переоценка, ц/б";
+                  ArrSum[0] = Sпол_ост;
+                  ArrCatDeb[0] = "-ПО ДК";
+                  ArrCatCred[0] = "-Переоценка, ц/б";
+                  ArrSum[0] = abs(SumOverAmount - Sпол_ост);
+                else
+                  ArrCatDeb[0] = "+ПО ДК";
+                  ArrCatCred[0] = "+Переоценка, ц/б";
+                  ArrSum[0] = abs(SumOverAmount);
+                end;
+              end;
+            else
+              if( SumOverAmount > $0 )
+                Ground = "Положительная переоценка";
+                if( (Sпол_ост != $0) or ((Sпол_ост == $0) and (Sотр_ост == $0)) )
+                  ArrCatDeb[0]  = "+Переоценка, ц/б СССД_ЦБ";
+                  ArrCatCred[0] = "+ПО ДК 2014";
+                  ArrSum[0] = SumOverAmount;
+                end;
+                if( Sотр_ост != $0 )
+                  ArrCatDeb[1]  = "-Переоценка, ц/б СССД_ЦБ";
+                  ArrCatCred[1] = "-ПО ДК 2014";
+                  ArrSum[1] = SumOverAmount;
+                end;
+              elif( SumOverAmount < $0 )
+                Ground = "Отрицательная переоценка";
+                if( (Sотр_ост != $0) or ((Sпол_ост == $0) and (Sотр_ост == $0)) )
+                  ArrCatDeb[0]  = "-ПО ДК 2014";
+                  ArrCatCred[0] = "-Переоценка, ц/б СССД_ЦБ";
+                  ArrSum[0] = abs(SumOverAmount);
+                end;
+                if( Sпол_ост != $0 )
+                  ArrCatDeb[1]  = "+ПО ДК 2014";
+                  ArrCatCred[1] = "+Переоценка, ц/б СССД_ЦБ";
+                  ArrSum[1] = abs(SumOverAmount);
+                end;
+              end;
+            end;
+
+            j = 0;
+            while( j < ArrSum.Size )
+              if(not ПроводкаПоКатегориямУчета( FD, 
+                     ArrCatDeb[j], ArrCatCred[j], /* КатегДеб , КатегКредит*/
+                     AccDate,                     /* Дата */
+                     1,                           /* Глава */
+                     NATCUR,                      /* Валюта */
+                     ABS(ArrSum[j]),              /* Сумма  */
+                     NULL,                        /* Документ */
+                     INPCARRY,                    /* Result_Carry */
+                     " 1",                        /* Kind_Oper */
+                     "",                          /* Numb_Document */
+                     Ground,
+                     null,
+                     GetFIRoleByPortfolio(PortfolioTransferArr[i].ToPortfolio),
+                     GetFIRoleByPortfolio(PortfolioTransferArr[i].ToPortfolio)
+                    ) 
+                )
+                  msg = GetErrMsg();
+                  if(msg != "")
+                    msgbox(msg);
+                  end;
+                   
+                  return 1;
+              end;
+              
+              j = j + 1;
+            end;
+
+          end;
+
+        end;
+
+//b.  Выпуск из ППР (в том числе долевые без НОСС на 50709)
+      elif(PortfolioTransferArr[i].FromPortfolio == KINDPORT_SALE)
+
+        if(PortfolioTransferArr[i].ToPortfolio == KINDPORT_ASCB)
+
+          МинусПереоценкаЦБ = IIF(ПарностьСчетовПереоценки(), "-Переоценка, ц/б СССД_ЦБ", "-Переоценка, ц/б");
+          ПлюсПереоценкаЦБ  = IIF(ПарностьСчетовПереоценки(), "+Переоценка, ц/б СССД_ЦБ", "+Переоценка, ц/б");
+          var МинусПОДК:string = IIF(ПарностьСчетовПереоценки(), "-ПО ДК 2014", "-ПО ДК");
+          var ПлюсПОДК:string  = IIF(ПарностьСчетовПереоценки(), "+ПО ДК 2014", "+ПО ДК");
+
+          Sотр_ост = 0; 
+          Sпол_ост = 0;
+
+          /*остаток на счете категории "-Переоценка"*/
+          if( FD.IsExistAccount( МинусПереоценкаЦБ, null, true, GetFIRoleByPortfolio(PortfolioTransferArr[i].FromPortfolio), acnt_ov_negative, MC_PAIRACCMODE_MANUAL, AccDate ))
+             Sотр_ост = ABS(GetRestAccount(acnt_ov_negative, CalcDate));
+          end;
+
+          /*остаток на счете категории "+Переоценка"*/
+          if( FD.IsExistAccount( ПлюсПереоценкаЦБ, null, true, GetFIRoleByPortfolio(PortfolioTransferArr[i].FromPortfolio), acnt_ov_positive, MC_PAIRACCMODE_MANUAL, AccDate ) )
+             Sпол_ост = ABS(GetRestAccount(acnt_ov_positive, CalcDate));
+          end;
+
+          //Списание переоценки
+          if(Sпол_ост > 0)
+            if(not ПроводкаПоКатегориямУчета( FD, 
+                   ПлюсПОДК, ПлюсПереоценкаЦБ,  /* КатегДеб , КатегКредит*/
+                   AccDate,                     /* Дата */
+                   1,                           /* Глава */
+                   NATCUR,                      /* Валюта */
+                   Sпол_ост,                    /* Сумма  */
+                   NULL,                        /* Документ */
+                   INPCARRY,                    /* Result_Carry */
+                   " 1",                        /* Kind_Oper */
+                   "",                          /* Numb_Document */
+                   "Списание положительной переоценки",
+                   null,
+                   null, 
+                   GetFIRoleByPortfolio(PortfolioTransferArr[i].FromPortfolio)
+                  ) 
+              )
+                msg = GetErrMsg();
+                if(msg != "")
+                  msgbox(msg);
+                end;
+                 
+                return 1;
+            end;
+          end;
+
+          if(Sотр_ост > 0)
+            if(not ПроводкаПоКатегориямУчета( FD, 
+                   МинусПереоценкаЦБ, МинусПОДК,/* КатегДеб , КатегКредит*/
+                   AccDate,                     /* Дата */
+                   1,                           /* Глава */
+                   NATCUR,                      /* Валюта */
+                   Sотр_ост,                    /* Сумма  */
+                   NULL,                        /* Документ */
+                   INPCARRY,                    /* Result_Carry */
+                   " 1",                        /* Kind_Oper */
+                   "",                          /* Numb_Document */
+                   "Списание отрицательной переоценки",
+                   null,
+                   GetFIRoleByPortfolio(PortfolioTransferArr[i].FromPortfolio)
+                  ) 
+              )
+                msg = GetErrMsg();
+                if(msg != "")
+                  msgbox(msg);
+                end;
+                 
+                return 1;
+            end;
+          end;
+
+          //Перенос резерва
+          if(not err)
+            if(FD.IsExistAccount("Резерв ц/б", null, true, FIROLE_BA_PPR, OldAcc, null, AccDate))
+              ReservRest = ABS(GetRestAccount(ReservAcc, CalcDate));
+            
+              if( not FD.ReOpenAccount("Резерв ц/б", null, false, FIROLE_BA_PUDP, NewAcc, AccDate) )
+                msg = GetErrMsg();
+                if(msg != "")
+                  msgbox(msg);
+                end;
+                 
+                return 1;
+              end;
+              
+              if(not ПроводкаПоКатегориямУчета( FD, 
+                     OldAcc, NewAcc,        /* КатегДеб , КатегКредит*/
+                     AccDate,                     /* Дата */
+                     1,                           /* Глава */
+                     NATCUR,                      /* Валюта */
+                     ReservRest,             /* Сумма  */
+                     NULL,                        /* Документ */
+                     INPCARRY,                    /* Result_Carry */
+                     " 1",                        /* Kind_Oper */
+                     "",                          /* Numb_Document */
+                     "Перенос резерва"
+                    ) 
+                )
+                  msg = GetErrMsg();
+                  if(msg != "")
+                    msgbox(msg);
+                  end;
+                   
+                  return 1;
+              end;
+
+              err = CloseAccount(OldAcc);
+            end;
+          end;
+
+          if(not err)
+            if(FD.IsExistAccount("Резерв ц/б", null, true, FIROLE_PD_PPR, OldAcc, null, AccDate))
+              ReservRest = ABS(GetRestAccount(ReservAcc, CalcDate));
+            
+              if( not FD.ReOpenAccount("Резерв ц/б", null, false, FIROLE_PD_PUDP, NewAcc, AccDate) )
+                msg = GetErrMsg();
+                if(msg != "")
+                  msgbox(msg);
+                end;
+                 
+                return 1;
+              end;
+              
+              if(not ПроводкаПоКатегориямУчета( FD, 
+                     OldAcc, NewAcc,              /* КатегДеб, КатегКредит*/
+                     AccDate,                     /* Дата */
+                     1,                           /* Глава */
+                     NATCUR,                      /* Валюта */
+                     ReservRest,                  /* Сумма  */
+                     NULL,                        /* Документ */
+                     INPCARRY,                    /* Result_Carry */
+                     " 1",                        /* Kind_Oper */
+                     "",                          /* Numb_Document */
+                     "Перенос резерва по ПДД"
+                    ) 
+                )
+                  msg = GetErrMsg();
+                  if(msg != "")
+                    msgbox(msg);
+                  end;
+                   
+                  return 1;
+              end;
+
+              err = CloseAccount(OldAcc);
+            end;
+          end;
+
+
+        elif(PortfolioTransferArr[i].ToPortfolio == KINDPORT_SSPU)
+          var OverRest = 0;
+          //перенос переоценки
+          ClearRecord(OldAcc);
+
+          if(FD.IsExistAccount(IIF(ПарностьСчетовПереоценки(), "+Переоценка, ц/б СССД_ЦБ", "+Переоценка, ц/б"), null, true, GetFIRoleByPortfolio(PortfolioTransferArr[i].FromPortfolio), OldAcc, null, AccDate))
+            OverRest = ABS(GetRestAccount(OldAcc, CalcDate));
+            
+            if( not FD.ReOpenAccount(IIF(ПарностьСчетовПереоценки(), "+Переоценка, ц/б ССПУ_ЦБ", "+Переоценка, ц/б"), null, false, GetFIRoleByPortfolio(PortfolioTransferArr[i].ToPortfolio), NewAcc, AccDate) )
+              msg = GetErrMsg();
+              if(msg != "")
+                msgbox(msg);
+              end;
+               
+              return 1;
+            end;
+
+            if(not ПроводкаПоКатегориямУчета( FD, 
+                 NewAcc, OldAcc,              /* КатегДеб, КатегКредит*/
+                 AccDate,                     /* Дата */
+                 1,                           /* Глава */
+                 NATCUR,                      /* Валюта */
+                 OverRest,                    /* Сумма  */
+                 NULL,                        /* Документ */
+                 INPCARRY,                    /* Result_Carry */
+                 " 1",                        /* Kind_Oper */
+                 "",                          /* Numb_Document */
+                 "Перенос положительной переоценки"
+                ) 
+              )
+                msg = GetErrMsg();
+                if(msg != "")
+                  msgbox(msg);
+                end;
+                 
+                return 1;
+            end;
+
+            err = CloseAccount(OldAcc);
+          end;
+
+
+          if(not err)
+            ClearRecord(OldAcc);
+
+            if(FD.IsExistAccount(IIF(ПарностьСчетовПереоценки(), "-Переоценка, ц/б СССД_ЦБ", "-Переоценка, ц/б"), null, true, GetFIRoleByPortfolio(PortfolioTransferArr[i].FromPortfolio), OldAcc, null, AccDate))
+              OverRest = ABS(GetRestAccount(OldAcc, CalcDate));
+              
+              if( not FD.ReOpenAccount(IIF(ПарностьСчетовПереоценки(), "-Переоценка, ц/б ССПУ_ЦБ", "-Переоценка, ц/б"), null, false, GetFIRoleByPortfolio(PortfolioTransferArr[i].ToPortfolio), NewAcc, AccDate) )
+                msg = GetErrMsg();
+                if(msg != "")
+                  msgbox(msg);
+                end;
+                 
+                return 1;
+              end;
+
+              if(not ПроводкаПоКатегориямУчета( FD, 
+                   OldAcc, NewAcc,              /* КатегДеб, КатегКредит*/
+                   AccDate,                     /* Дата */
+                   1,                           /* Глава */
+                   NATCUR,                      /* Валюта */
+                   OverRest,                    /* Сумма  */
+                   NULL,                        /* Документ */
+                   INPCARRY,                    /* Result_Carry */
+                   " 1",                        /* Kind_Oper */
+                   "",                          /* Numb_Document */
+                   "Перенос отрицательной переоценки"
+                  ) 
+                )
+                  msg = GetErrMsg();
+                  if(msg != "")
+                    msgbox(msg);
+                  end;
+                   
+                  return 1;
+              end;
+
+              err = CloseAccount(OldAcc);
+            end;
+          end;
+
+          //урегулирование переоценки
+          if(not err)
+            var MinusOverRest = 0;
+            var PlusOverRest = 0;
+            var MinRest = 0;
+            
+            if(FD.IsExistAccount(IIF(ПарностьСчетовПереоценки(), "-Переоценка, ц/б ССПУ_ЦБ", "-Переоценка, ц/б"), null, true, GetFIRoleByPortfolio(PortfolioTransferArr[i].ToPortfolio), MinusAcc, null, AccDate))
+               MinusOverRest = ABS(GetRestAccount(MinusAcc, CalcDate));
+            end;
+
+            if(FD.IsExistAccount(IIF(ПарностьСчетовПереоценки(), "+Переоценка, ц/б ССПУ_ЦБ", "+Переоценка, ц/б"), null, true, GetFIRoleByPortfolio(PortfolioTransferArr[i].ToPortfolio), PlusAcc, null, AccDate))
+               PlusOverRest = ABS(GetRestAccount(PlusAcc, CalcDate));
+            end;
+
+            if((MinusOverRest != 0) and (PlusOverRest != 0))
+              MinRest = MIN(MinusOverRest, PlusOverRest);
+              
+              if(not ПроводкаПоКатегориямУчета( FD, 
+                     MinusAcc, PlusAcc,           /* КатегДеб , КатегКредит*/
+                     AccDate,                     /* Дата */
+                     1,                           /* Глава */
+                     NATCUR,                      /* Валюта */
+                     MinRest,                     /* Сумма  */
+                     NULL,                        /* Документ */
+                     INPCARRY,                    /* Result_Carry */
+                     " 1",                        /* Kind_Oper */
+                     "",                          /* Numb_Document */
+                     "Урегулирование счетов переоценки"
+                    ) 
+                )
+                  msg = GetErrMsg();
+                  if(msg != "")
+                    msgbox(msg);
+                  end;
+                   
+                  return 1;
+              end;
+
+            end;
+
+          end;
+
+          if(not err)
+            МинусПОДК = IIF(ПарностьСчетовПереоценки(), "-ПО ДК 2014", "-ПО ДК");
+            ПлюсПОДК  = IIF(ПарностьСчетовПереоценки(), "+ПО ДК 2014", "+ПО ДК");
+
+            var ОстМинусПОДК = 0;
+            var ОстПлюсПОДК = 0;
+
+            /*остаток на счете категории "-Переоценка"*/
+            if( FD.IsExistAccount( МинусПОДК, null, true, GetFIRoleByPortfolio(PortfolioTransferArr[i].FromPortfolio), acnt_ov_negative, MC_PAIRACCMODE_MANUAL, AccDate ))
+               ОстМинусПОДК = ABS(GetRestAccount(acnt_ov_negative, CalcDate));
+            end;
+
+            /*остаток на счете категории "+Переоценка"*/
+            if( FD.IsExistAccount( ПлюсПОДК, null, true, GetFIRoleByPortfolio(PortfolioTransferArr[i].FromPortfolio), acnt_ov_positive, MC_PAIRACCMODE_MANUAL, AccDate ) )
+               ОстПлюсПОДК = ABS(GetRestAccount(acnt_ov_positive, CalcDate));
+            end;
+
+            if(ОстМинусПОДК != 0)
+              if(not ПроводкаПоКатегориямУчета( FD, 
+                     ПолучитьКатегориюФР("-Маржа, ц/б"), acnt_ov_negative, /* КатегДеб , КатегКредит*/
+                     AccDate,                     /* Дата */
+                     1,                           /* Глава */
+                     NATCUR,                      /* Валюта */
+                     abs(ОстМинусПОДК),           /* Сумма  */
+                     NULL,                        /* Документ */
+                     INPCARRY,                    /* Result_Carry */
+                     " 1",                        /* Kind_Oper */
+                     "",                          /* Numb_Document */
+                     "Перенос остатка " + МинусПОДК,
+                     null,
+                     GetFIRoleByPortfolio(PortfolioTransferArr[i].FromPortfolio),
+                     GetFIRoleByPortfolio(PortfolioTransferArr[i].FromPortfolio)
+                    ) 
+                )
+                  msg = GetErrMsg();
+                  if(msg != "")
+                    msgbox(msg);
+                  end;
+                   
+                  return 1;
+              end;
+
+              err = CloseAccount(acnt_ov_negative);
+            end;
+
+            if((not err) and (ОстПлюсПОДК != 0))
+              if(not ПроводкаПоКатегориямУчета( FD, 
+                     acnt_ov_positive, ПолучитьКатегориюФР("+Маржа, ц/б"), /* КатегДеб , КатегКредит*/
+                     AccDate,                     /* Дата */
+                     1,                           /* Глава */
+                     NATCUR,                      /* Валюта */
+                     ОстПлюсПОДК,                 /* Сумма  */
+                     NULL,                        /* Документ */
+                     INPCARRY,                    /* Result_Carry */
+                     " 1",                        /* Kind_Oper */
+                     "",                          /* Numb_Document */
+                     "Перенос остатка " + ПлюсПОДК,
+                     null,
+                     GetFIRoleByPortfolio(PortfolioTransferArr[i].FromPortfolio),
+                     GetFIRoleByPortfolio(PortfolioTransferArr[i].FromPortfolio)
+                    ) 
+                )
+                  msg = GetErrMsg();
+                  if(msg != "")
+                    msgbox(msg);
+                  end;
+                   
+                  return 1;
+              end;
+
+              err = CloseAccount(acnt_ov_positive);
+            end;
+
+          end;
+
+          //Списать резерв
+          if(not err)
+            if(FD.IsExistAccount("Резерв ц/б", null, true, FIROLE_BA_PPR, ReservAcc, null, AccDate))
+              ReservRest = ABS(GetRestAccount(ReservAcc, CalcDate));
+
+              if(FI_IsBond(FIID))
+                CatCred = ПолучитьКатегориюФР("+РС,ц/б");
+                FiRoleCred = FIROLE_BA_PPR;
+              else
+                CatCred = ПолучитьКатегориюФР("+РС, д/с");
+                FiRoleCred = FIROLE_BA;
+              end;
+
+              if(not ПроводкаПоКатегориямУчета( FD, 
+                     ReservAcc, CatCred,          /* КатегДеб , КатегКредит*/
+                     AccDate,                     /* Дата */
+                     1,                           /* Глава */
+                     NATCUR,                      /* Валюта */
+                     ReservRest,                  /* Сумма  */
+                     NULL,                        /* Документ */
+                     INPCARRY,                    /* Result_Carry */
+                     " 1",                        /* Kind_Oper */
+                     "",                          /* Numb_Document */
+                     "Списание резерва",
+                     null,
+                     null,
+                     FiRoleCred
+                    ) 
+                )
+                  msg = GetErrMsg();
+                  if(msg != "")
+                    msgbox(msg);
+                  end;
+                   
+                  return 1;
+              end;
+
+              err = CloseAccount(ReservAcc);
+            end;
+          end;
+
+          if(not err)
+            if(FD.IsExistAccount("Резерв ц/б", null, true, FIROLE_PD_PPR, ReservAcc, null, AccDate))
+              ReservRest = ABS(GetRestAccount(ReservAcc, CalcDate));
+            
+              if(FI_IsBond(FIID))
+                CatCred = ПолучитьКатегориюФР("+РС,ц/б");
+                FiRoleCred = FIROLE_PD_PPR;
+              else
+                CatCred = ПолучитьКатегориюФР("+РС, д/с");
+                FiRoleCred = FIROLE_BA;
+              end;
+
+
+              if(not ПроводкаПоКатегориямУчета( FD, 
+                     ReservAcc, ПолучитьКатегориюФР(CatCred), /* КатегДеб, КатегКредит*/
+                     AccDate,                     /* Дата */
+                     1,                           /* Глава */
+                     NATCUR,                      /* Валюта */
+                     ReservRest,                  /* Сумма  */
+                     NULL,                        /* Документ */
+                     INPCARRY,                    /* Result_Carry */
+                     " 1",                        /* Kind_Oper */
+                     "",                          /* Numb_Document */
+                     "Списание резерва по ПДД",
+                     null,
+                     null,
+                     FiRoleCred
+                    ) 
+                )
+                  msg = GetErrMsg();
+                  if(msg != "")
+                    msgbox(msg);
+                  end;
+                   
+                  return 1;
+              end;
+
+              err = CloseAccount(ReservAcc);
+            end;
+          end;
+
+        end;
+
+//c.    Выпуск из ПУДП (АС_ЦБ)
+      elif(PortfolioTransferArr[i].FromPortfolio == KINDPORT_RETIRE)
+
+        //Списать резерв
+        if(FD.IsExistAccount("Резерв ц/б", null, true, FIROLE_BA_PUDP, ReservAcc, null, AccDate))
+          ReservRest = ABS(GetRestAccount(ReservAcc, CalcDate));
+        
+          if(not ПроводкаПоКатегориямУчета( FD, 
+                 ReservAcc, ПолучитьКатегориюФР("+РС,ц/б"), /* КатегДеб , КатегКредит*/
+                 AccDate,                     /* Дата */
+                 1,                           /* Глава */
+                 NATCUR,                      /* Валюта */
+                 ReservRest,                  /* Сумма  */
+                 NULL,                        /* Документ */
+                 INPCARRY,                    /* Result_Carry */
+                 " 1",                        /* Kind_Oper */
+                 "",                          /* Numb_Document */
+                 "Списание резерва",
+                 null,
+                 null,
+                 FIROLE_BA_PUDP
+                ) 
+            )
+              msg = GetErrMsg();
+              if(msg != "")
+                msgbox(msg);
+              end;
+               
+              return 1;
+          end;
+
+          err = CloseAccount(ReservAcc);
+        end;
+
+        if(not err)
+          if(FD.IsExistAccount("Резерв ц/б", null, true, FIROLE_PD_PUDP, ReservAcc, null, AccDate))
+            ReservRest = ABS(GetRestAccount(ReservAcc, CalcDate));
+          
+            if(not ПроводкаПоКатегориямУчета( FD, 
+                   ReservAcc, ПолучитьКатегориюФР("+РС,ц/б"), /* КатегДеб, КатегКредит*/
+                   AccDate,                     /* Дата */
+                   1,                           /* Глава */
+                   NATCUR,                      /* Валюта */
+                   ReservRest,                  /* Сумма  */
+                   NULL,                        /* Документ */
+                   INPCARRY,                    /* Result_Carry */
+                   " 1",                        /* Kind_Oper */
+                   "",                          /* Numb_Document */
+                   "Списание резерва по ПДД",
+                   null,
+                   null,
+                   FIROLE_PD_PUDP
+                  ) 
+              )
+                msg = GetErrMsg();
+                if(msg != "")
+                  msgbox(msg);
+                end;
+                 
+                return 1;
+            end;
+
+            err = CloseAccount(ReservAcc);
+          end;
+        end;
+
+        if((PortfolioTransferArr[i].ToPortfolio == KINDPORT_SSPU) OR (PortfolioTransferArr[i].ToPortfolio == KINDPORT_SSSD))
+          //Рассчитать переоценку уже в новом портфеле
+
+          query =   " DECLARE "
+                  + " BEGIN "
+                  + "   DELETE FROM DPMWRTLNK_TMP; "
+                  + "   DELETE FROM DPMWRTSUM_TMP; "
+
+                  + "   INSERT INTO DPMWRTLNK_TMP (T_ID, T_BUYID, T_AMOUNT) "
+                  + "      SELECT 0, LOT.T_SUMID, LOT.T_AMOUNT "
+                  + "        FROM DPMWRTSUM_DBT LOT "
+                  + "       WHERE LOT.T_PORTFOLIO = ? "
+                  + "         AND LOT.T_FIID = ? "
+                  + "         AND LOT.T_ID_OPERATION = ? "
+                  + "         AND LOT.T_ID_STEP = ? "
+                  + "         AND LOT.T_ACTION = ?; "
+
+                  + "   FOR one_dprt IN (SELECT DISTINCT LOT.T_DEPARTMENT "
+                  + "                      FROM DPMWRTSUM_DBT LOT, DPMWRTLNK_TMP LNK "
+                  + "                     WHERE LOT.T_SUMID = LNK.T_BUYID "
+                  + "                   )"
+                  + "   LOOP"
+                  + "     RSB_PMWRTOFF.RSI_WRTOvervalueLotsTMP(?, ?, one_dprt.t_Department, 1);"
+                  + "   END LOOP;"
+
+                  + "   RSB_PMWRTOFF.RSI_WRTSaveOvervalueLots(?, ?, ?); "
+
+                  + " END; ";
+
+
+          cmd = RSDCommand(query);
+
+          cmd.addParam("", RSDBP_IN, PortfolioTransferArr[i].ToPortfolio);
+          cmd.addParam("", RSDBP_IN, FIID);
+          cmd.addParam("", RSDBP_IN, currIDOperation);
+          cmd.addParam("", RSDBP_IN, currIDStep);
+          cmd.addParam("", RSDBP_IN, currAction);
+
+          cmd.addParam("", RSDBP_IN, CalcDate);
+          cmd.addParam("", RSDBP_IN, FIID);
+
+          cmd.addParam("", RSDBP_IN, CalcDate);
+          cmd.addParam("", RSDBP_IN, currIDOperation);
+          cmd.addParam("", RSDBP_IN, currIDStep);
+
+          cmd.execute();
+
+          query =   " select NVL(SUM(t_OverAmountAdd), 0) as SumOverAmountAdd from dpmwrtsum_tmp";
+          cmd = DL_RSDCommand(query);
+
+          cnt = cmd.GetCount();
+          if(cnt > 0)
+            InitProgress(cnt, currPart+"Переоценка ПУДП -> ССПУ_ЦБ/СССД_ЦБ", currPart+"Переоценка ПУДП -> ССПУ_ЦБ/СССД_ЦБ");
+
+            num = 0;
+            DataSet = cmd.Execute();
+            while((not err) and (DataSet.moveNext()))
+
+              SumOverAmountAdd = money(DataSet.SumOverAmountAdd);
+
+              if(SumOverAmountAdd != 0)
+
+                if(PortfolioTransferArr[i].ToPortfolio == KINDPORT_SSPU)
+                  if( FD.ActualAccount(IIF(ПарностьСчетовПереоценки(), "+Переоценка, ц/б ССПУ_ЦБ", "+Переоценка, ц/б"), null, true, GetFIRoleByPortfolio(PortfolioTransferArr[i].ToPortfolio), acnt_ov_positive, AccDate, null, null, MC_PAIRACCMODE_MANUAL) )
+                    Sпол_ост = GetRestAccount( acnt_ov_positive, CalcDate );
+                  end;
+
+                  if( FD.ActualAccount(IIF(ПарностьСчетовПереоценки(), "-Переоценка, ц/б ССПУ_ЦБ", "-Переоценка, ц/б"), null, true, GetFIRoleByPortfolio(PortfolioTransferArr[i].ToPortfolio), acnt_ov_negative, AccDate, null, null, MC_PAIRACCMODE_MANUAL) )
+                     Sотр_ост = GetRestAccount( acnt_ov_negative, CalcDate );
+                  end;
+                  
+                  if (not ПарностьСчетовПереоценки())
+                    if (SumOverAmountAdd > $0)
+                      Ground = "Положительная переоценка";
+                      if (Sотр_ост == $0)
+                        ArrCatDeb[0] = "+Переоценка, ц/б";
+                        ArrCatCred[0] = ПолучитьКатегориюФР("+МаржаП, ц/б");
+                        ArrSum[0] = SumOverAmountAdd;
+                      elif (SumOverAmountAdd > Sотр_ост)
+                        ArrCatDeb[0] = "-Переоценка, ц/б";
+                        ArrCatCred[0] = ПолучитьКатегориюФР("+МаржаП, ц/б");
+                        ArrSum[0] = Sотр_ост;
+                        ArrCatDeb[1] = "+Переоценка, ц/б";
+                        ArrCatCred[1] = ПолучитьКатегориюФР("+МаржаП, ц/б");
+                        ArrSum[1] = SumOverAmountAdd - Sотр_ост;
+                      else
+                        ArrCatDeb[0] = "-Переоценка, ц/б";
+                        ArrCatCred[0] = ПолучитьКатегориюФР("+МаржаП, ц/б");
+                        ArrSum[0] = SumOverAmountAdd;
+                      end;
+                    elif (SumOverAmountAdd < $0)
+                      Ground = "Отрицательная переоценка";
+                      if (Sпол_ост == $0)
+                        ArrCatDeb[0] = ПолучитьКатегориюФР("-МаржаП, ц/б");
+                        ArrCatCred[0] = "-Переоценка, ц/б";
+                        ArrSum[0] = abs(SumOverAmountAdd);
+                      elif (SumOverAmountAdd > Sпол_ост)
+                        ArrCatDeb[0] = ПолучитьКатегориюФР("-МаржаП, ц/б");
+                        ArrCatCred[0] = "+Переоценка, ц/б";
+                        ArrSum[0] = Sпол_ост;
+                        ArrCatDeb[1] = ПолучитьКатегориюФР("-МаржаП, ц/б");
+                        ArrCatCred[1] = "-Переоценка, ц/б";
+                        ArrSum[1] = abs(SumOverAmountAdd - Sпол_ост);
+                      else
+                        ArrCatDeb[0] = ПолучитьКатегориюФР("-МаржаП, ц/б");
+                        ArrCatCred[0] = "+Переоценка, ц/б";
+                        ArrSum[0] = abs(SumOverAmountAdd);
+                      end;
+                    end;
+                  else
+                    if (SumOverAmountAdd > $0)
+                      Ground = "Положительная переоценка";
+                      if (Sотр_ост == $0)
+                        ArrCatDeb[0] = "+Переоценка, ц/б ССПУ_ЦБ";
+                        ArrCatCred[0] = ПолучитьКатегориюФР("+МаржаП, ц/б");
+                        ArrSum[0] = SumOverAmountAdd;
+                      elif (SumOverAmountAdd > Sотр_ост)
+                        ArrCatDeb[0] = "-Переоценка, ц/б ССПУ_ЦБ";
+                        ArrCatCred[0] = ПолучитьКатегориюФР("+МаржаП, ц/б");
+                        ArrSum[0] = Sотр_ост;
+                        ArrCatDeb[1] = "+Переоценка, ц/б ССПУ_ЦБ";
+                        ArrCatCred[1] = ПолучитьКатегориюФР("+МаржаП, ц/б");
+                        ArrSum[1] = SumOverAmountAdd - Sотр_ост;
+                      else
+                        ArrCatDeb[0] = "-Переоценка, ц/б ССПУ_ЦБ";
+                        ArrCatCred[0] = ПолучитьКатегориюФР("+МаржаП, ц/б");
+                        ArrSum[0] = SumOverAmountAdd;
+                      end;
+                    elif (SumOverAmountAdd < $0)
+                      Ground = "Отрицательная переоценка";
+                      if (Sпол_ост == $0)
+                        ArrCatDeb[0] = ПолучитьКатегориюФР("-МаржаП, ц/б");
+                        ArrCatCred[0] = "-Переоценка, ц/б ССПУ_ЦБ";
+                        ArrSum[0] = abs(SumOverAmountAdd);
+                      elif (SumOverAmountAdd > Sпол_ост)
+                        ArrCatDeb[0] = ПолучитьКатегориюФР("-МаржаП, ц/б");
+                        ArrCatCred[0] = "+Переоценка, ц/б ССПУ_ЦБ";
+                        ArrSum[0] = Sпол_ост;
+                        ArrCatDeb[1] = ПолучитьКатегориюФР("-МаржаП, ц/б");
+                        ArrCatCred[1] = "-Переоценка, ц/б ССПУ_ЦБ";
+                        ArrSum[1] = abs(SumOverAmountAdd - Sпол_ост);
+                      else
+                        ArrCatDeb[0] = ПолучитьКатегориюФР("-МаржаП, ц/б");
+                        ArrCatCred[0] = "+Переоценка, ц/б ССПУ_ЦБ";
+                        ArrSum[0] = abs(SumOverAmountAdd);
+                      end;
+                    end;
+                  end;
+                else //SSSD
+
+                  if( FD.ActualAccount(IIF(ПарностьСчетовПереоценки(), "+Переоценка, ц/б СССД_ЦБ", "+Переоценка, ц/б"), null, true, GetFIRoleByPortfolio(PortfolioTransferArr[i].ToPortfolio), acnt_ov_positive, AccDate, null, null, MC_PAIRACCMODE_MANUAL) )
+                    Sпол_ост = GetRestAccount( acnt_ov_positive, CalcDate );
+                  end;
+
+                  if( FD.ActualAccount(IIF(ПарностьСчетовПереоценки(), "-Переоценка, ц/б СССД_ЦБ", "-Переоценка, ц/б"), null, true, GetFIRoleByPortfolio(PortfolioTransferArr[i].ToPortfolio), acnt_ov_negative, AccDate, null, null, MC_PAIRACCMODE_MANUAL) )
+                     Sотр_ост = GetRestAccount( acnt_ov_negative, CalcDate );
+                  end;
+         
+                  if (not ПарностьСчетовПереоценки())
+                    if (SumOverAmountAdd > $0)
+                      Ground = "Положительная переоценка";
+                      if (Sотр_ост == $0)
+                        ArrCatDeb[0] = "+Переоценка, ц/б";
+                        ArrCatCred[0] = "+ПО ДК";
+                        ArrSum[0] = SumOverAmountAdd;
+                      elif (SumOverAmountAdd > Sотр_ост)
+                        ArrCatDeb[0] = "-Переоценка, ц/б";
+                        ArrCatCred[0] = "-ПО ДК";
+                        ArrSum[0] = Sотр_ост;
+                        ArrCatDeb[1] = "+Переоценка, ц/б";
+                        ArrCatCred[1] = "+ПО ДК";
+                        ArrSum[1] = SumOverAmountAdd - Sотр_ост;
+                      else
+                        ArrCatDeb[0] = "-Переоценка, ц/б";
+                        ArrCatCred[0] = "-ПО ДК";
+                        ArrSum[0] = SumOverAmountAdd;
+                      end;
+                    elif (SumOverAmountAdd < $0)
+                      Ground = "Отрицательная переоценка";
+                      if (Sпол_ост == $0)
+                        ArrCatDeb[0] = "-ПО ДК";
+                        ArrCatCred[0] = "-Переоценка, ц/б";
+                        ArrSum[0] = abs(SumOverAmountAdd);
+                      elif (SumOverAmountAdd > Sпол_ост)
+                        ArrCatDeb[0] = "+ПО ДК";
+                        ArrCatCred[0] = "+Переоценка, ц/б";
+                        ArrSum[0] = Sпол_ост;
+                        ArrCatDeb[0] = "-ПО ДК";
+                        ArrCatCred[0] = "-Переоценка, ц/б";
+                        ArrSum[0] = abs(SumOverAmountAdd - Sпол_ост);
+                      else
+                        ArrCatDeb[0] = "+ПО ДК";
+                        ArrCatCred[0] = "+Переоценка, ц/б";
+                        ArrSum[0] = abs(SumOverAmountAdd);
+                      end;
+                    end;
+                  else
+                    if( SumOverAmountAdd > $0 )
+                      Ground = "Положительная переоценка";
+                      if( (Sпол_ост != $0) or ((Sпол_ост == $0) and (Sотр_ост == $0)) )
+                        ArrCatDeb[0]  = "+Переоценка, ц/б СССД_ЦБ";
+                        ArrCatCred[0] = "+ПО ДК 2014";
+                        ArrSum[0] = SumOverAmountAdd;
+                      end;
+                      if( Sотр_ост != $0 )
+                        ArrCatDeb[1]  = "-Переоценка, ц/б СССД_ЦБ";
+                        ArrCatCred[1] = "-ПО ДК 2014";
+                        ArrSum[1] = SumOverAmountAdd;
+                      end;
+                    elif( SumOverAmountAdd < $0 )
+                      Ground = "Отрицательная переоценка";
+                      if( (Sотр_ост != $0) or ((Sпол_ост == $0) and (Sотр_ост == $0)) )
+                        ArrCatDeb[0]  = "-ПО ДК 2014";
+                        ArrCatCred[0] = "-Переоценка, ц/б СССД_ЦБ";
+                        ArrSum[0] = abs(SumOverAmountAdd);
+                      end;
+                      if( Sпол_ост != $0 )
+                        ArrCatDeb[1]  = "+ПО ДК 2014";
+                        ArrCatCred[1] = "+Переоценка, ц/б СССД_ЦБ";
+                        ArrSum[1] = abs(SumOverAmountAdd);
+                      end;
+                    end;
+                  end;
+
+                end;
+
+                j = 0;
+                while( j < ArrSum.Size )
+                  if(not ПроводкаПоКатегориямУчета( FD, 
+                         ArrCatDeb[j], ArrCatCred[j], /* КатегДеб , КатегКредит*/
+                         AccDate,                     /* Дата */
+                         1,                           /* Глава */
+                         NATCUR,                      /* Валюта */
+                         ABS(ArrSum[j]),              /* Сумма  */
+                         NULL,                        /* Документ */
+                         INPCARRY,                    /* Result_Carry */
+                         " 1",                        /* Kind_Oper */
+                         "",                          /* Numb_Document */
+                         Ground,
+                         null,
+                         GetFIRoleByPortfolio(PortfolioTransferArr[i].ToPortfolio),
+                         GetFIRoleByPortfolio(PortfolioTransferArr[i].ToPortfolio)
+                        ) 
+                    )
+                      msg = GetErrMsg();
+                      if(msg != "")
+                        msgbox(msg);
+                      end;
+                       
+                      return 1;
+                  end;
+
+                  j = j + 1;
+                end;
+
+              end;
+
+              UseProgress(num = num + 1);
+            end;
+
+            RemProgress();
+          end;
+        end;
+
+      end;
+    end;
+
+    if(not err)
+      err = SetOverRegistrValue(FD, FIID, CalcDate);
+    end;
+
+    i = i + 1;
+  end;
+
+  return err;
+end;
+
+macro ВыполнитьПереносСчетовППР50709()
+  var err = 0;
+  var ExcludeISIN = "";
+  var i = 0;
+  var query, cmd, DataSet;
+  var q, cmd1, ds;
+  var cnt = 0;
+  var FD = NULL;
+  var FIRole = GetFIRoleByPortfolio(KINDPORT_SALE);
+  record OldAcc("account");
+  record NewAcc("account");
+  record mcaccdoc("mcaccdoc");
+  var sum = 0;
+  var msg = "";
+
+  query =   " select fin.t_FIID "
+          + "   from dfininstr_dbt fin "
+          + "  where fin.t_FI_Kind = " + FIKIND_AVOIRISS
+          + "    and RSI_RSB_FIInstr.FI_AvrKindsGetRoot(fin.t_FI_Kind, fin.t_AvoirKind ) != " + AVOIRISSKIND_BOND
+          + "    and Exists (select 1 "
+          + "                  from dpmwrtsum_dbt lot "
+          + "                 where lot.t_FIID = fin.t_FIID "
+          + "                   and lot.t_Amount > 0 " 
+          + "                   and lot.t_State = "+PM_WRTSUM_FORM
+          + "                   and lot.t_Portfolio = " + KINDPORT_SALE
+          + "                   and lot.t_Trust = CHR(0) "
+          + "               )";
+          
+
+  cmd = DL_RSDCommand(query);
+
+  cnt = cmd.GetCount();
+  if(cnt > 0)
+    InitProgress(cnt, currPart+"Обработка лотов", currPart+"Обработка лотов");
+
+    i = 0;
+    DataSet = cmd.Execute();
+    while((not err) and (DataSet.moveNext()))
+      
+      FD = SPFirstDocFI(DLDOC_ISSUE, DataSet.FIID, DataSet.FIID, KINDPORT_SALE, {OurBank}, null, null, null);
+      
+      ClearRecord(OldAcc);
+
+      if(not FD.IsExistAccount("Наш портфель ц/б", null, true, /*FIRole*/0, OldAcc, null, AccDate, FD.fininstr.rec.FaceValueFI))
+        //счета нет. Попробуем найти общесистемный (если открывали вручную при зачислении ц/б)
+        q =   " select accdoc.t_Account, accdoc.t_Currency, accdoc.t_Chapter "
+            + "   from dmcaccdoc_dbt accdoc, dmccateg_dbt cat "
+            + "  where cat.t_Code = 'Наш портфель ц/б' "
+            + "    and cat.t_LevelType = 1 "
+            + "    and accdoc.t_CatID = cat.t_ID "
+            + "    and accdoc.t_IsCommon = 'X' "
+            + "    and accdoc.t_FIID = ? ";
+
+        cmd1 = DL_RSDCommand(q);
+
+        cmd1.AddParam(DataSet.FIID);
+
+        ds = cmd1.Execute();
+        if(ds.moveNext())
+          if( GetAccount( ds.Chapter, ds.Currency, ds.Account, OldAcc, true ) == false )
+            msgbox( "Не найден счет <"+ds.Account+">");
+            return 1;
+          end;
+        end;
+
+      end;
+
+      if((OldAcc.AccountID > 0) and (substr(OldAcc.Account, 1, 5) == "50709"))
+
+        msgbox("Обрабатывается ц/б с FIID = " + DataSet.FIID );
+
+        sum = abs(GetRestAccount(OldAcc, AccDate));
+        if(sum > 0)
+           
+           if( not FD.ReOpenAccount("Наш портфель ц/б", null, false, FIROLE_BA_PPR_TSS_YES, NewAcc, AccDate) )
+             msg = GetErrMsg();
+             if(msg != "")
+               msgbox(msg);
+             end;
+              
+             return 1;
+           end;
+
+           if(OldAcc.Account == NewAcc.Account)
+             msgbox("Одинаковые счета!");
+             i = i + 1;
+             continue;
+           end;
+
+           if(not ПроводкаПоКатегориямУчета( FD, 
+                NewAcc, OldAcc,              /* КатегДеб , КатегКредит*/
+                AccDate,                     /* Дата */
+                1,                           /* Глава */
+                OldAcc.Code_Currency,        /* Валюта */
+                sum,                         /* Сумма  */
+                NULL,                        /* Документ */
+                INPCARRY,                    /* Result_Carry */
+                " 1",                        /* Kind_Oper */
+                "",                          /* Numb_Document */
+                "Перенос остатка",
+                null,
+                FIRole, 
+                FIRole,
+                OldAcc.Code_Currency, NewAcc.Code_Currency
+               ) 
+           )
+               msg = GetErrMsg();
+               if(msg != "")
+                 msgbox(msg);
+               end;
+                
+               return 1;
+           end;
+         end;
+
+         err = CloseAccount(OldAcc);
+      end;
+
+      UseProgress(i = i + 1);
+    end;
+
+    RemProgress();
+  end;
+
+  return err;
+end;
+
+
+macro ВыполнитьПереносСчетовПУДП()
+  var err = 0;
+  var ExcludeISIN = "";
+  var i = 0;
+  var query, cmd, DataSet;
+  var cnt = 0;
+  var FD = NULL;
+
+  if(PortfolioTransferArr.size != 0)
+    while(i < PortfolioTransferArr.size)
+
+      if((PortfolioTransferArr[i].FromPortfolio == KINDPORT_RETIRE) and (PortfolioTransferArr[i].ToPortfolio != KINDPORT_ASCB))
+        if(ExcludeISIN != "")
+          ExcludeISIN = ExcludeISIN + ",";
+        end;
+
+        ExcludeISIN = ExcludeISIN + "'"+PortfolioTransferArr[i].ISIN+"'";
+      end;
+
+      i = i + 1;
+    end;
+  end;
+
+  query =   " select avr.t_FIID "
+          + "   from davoiriss_dbt avr "
+          + "  where Exists (select 1 "
+          + "                  from dpmwrtsum_dbt lot "
+          + "                 where lot.t_FIID = avr.t_FIID "
+          + "                   and lot.t_Amount > 0 " 
+          + "                   and lot.t_State IN ("+PM_WRTSUM_FORM+","+PM_WRTSUM_SALE_BPP+")"
+          + "                   and lot.t_Portfolio = " + KINDPORT_RETIRE
+          + "                   and lot.t_Trust = CHR(0) "
+          + "               )";
+
+  if(ExcludeISIN != "")
+    query = query + " and avr.t_ISIN not in ("+ExcludeISIN+")";
+  end;
+
+  cmd = DL_RSDCommand(query);
+
+  cnt = cmd.GetCount();
+  if(cnt > 0)
+  
+    InitProgress(cnt, currPart+"Обработка лотов", currPart+"Обработка лотов");
+
+    i = 0;
+    DataSet = cmd.Execute();
+    while((not err) and (DataSet.moveNext()))
+
+      msgbox("Обрабатывается ц/б с FIID = " + DataSet.FIID );
+
+      FD = SPFirstDocFI(DLDOC_ISSUE, DataSet.FIID, DataSet.FIID, KINDPORT_RETIRE, {OurBank}, null, null, null);
+      
+      err = TransferRestAcc(FD, "Наш портфель ц/б", KINDPORT_RETIRE, KINDPORT_ASCB);
+      if(not err)
+        err = TransferRestAcc(FD, "Уплаченный НКД", KINDPORT_RETIRE, KINDPORT_ASCB);
+      end;
+      if(not err)
+        err = TransferRestAcc(FD, "Начисл.ПДД, ц/б", KINDPORT_RETIRE, KINDPORT_ASCB, true, false, false, false);
+        if(not err)
+          err = TransferRestAcc(FD, "Начисл.ПДД, ц/б", KINDPORT_RETIRE, KINDPORT_ASCB, true, false, false, true);
+        end;
+      end;
+      if(not err)
+        err = TransferRestAcc(FD, "Начисл.ПДД, ц/б", KINDPORT_RETIRE, KINDPORT_ASCB, false, true, false, false);
+        if(not err)
+          err = TransferRestAcc(FD, "Начисл.ПДД, ц/б", KINDPORT_RETIRE, KINDPORT_ASCB, false, true, false, true);
+        end;
+      end;
+      if(not err)
+        err = TransferRestAcc(FD, "Премия, ц/б", KINDPORT_RETIRE, KINDPORT_ASCB, false, false, true, false);
+        if(not err)
+          err = TransferRestAcc(FD, "Премия, ц/б", KINDPORT_RETIRE, KINDPORT_ASCB, false, false, true, true);
+        end;
+      end;
+
+      UseProgress(i = i + 1);
+    end;
+
+    RemProgress();
+  end;
+
+  if(not err)
+    query =   " select DISTINCT lot.t_FIID, (SELECT T_DEALID FROM DPMWRTSUM_DBT WHERE t_SumID = lot.t_Parent) as DealID "
+            + "   from dpmwrtsum_dbt lot, davoiriss_dbt avr "
+            + "  where lot.t_FIID = avr.t_FIID "
+            + "    and lot.t_Amount > 0 " 
+            + "    and lot.t_State = "+PM_WRTSUM_SALE_BPP
+            + "    and lot.t_Portfolio = " + KINDPORT_RETIRE
+            + "    and lot.t_Trust = CHR(0) ";
+
+    if(ExcludeISIN != "")
+      query = query + " and avr.t_ISIN not in ("+ExcludeISIN+")";
+    end;
+
+    cmd = DL_RSDCommand(query);
+
+    cnt = cmd.GetCount();
+    if(cnt > 0)
+    
+      InitProgress(cnt, currPart+"Обработка лотов БПП", currPart+"Обработка лотов БПП");
+
+      i = 0;
+      DataSet = cmd.Execute();
+      while((not err) and (DataSet.moveNext()))
+
+        msgbox("Обрабатывается сделка T_DEALID = " + int(DataSet.DealID) );
+
+        FD = SPFirstDoc( LEG_KIND_DL_TICK, int(DataSet.DealID) );
+        
+        err = TransferRestAcc(FD, "Ц/б, БПП", KINDPORT_RETIRE, KINDPORT_ASCB);
+        if(not err)
+          err = TransferRestAcc(FD, "Уплаченный НКД, БПП", KINDPORT_RETIRE, KINDPORT_ASCB);
+        end;
+
+        UseProgress(i = i + 1);
+      end;
+
+      RemProgress();
+    end;
+  end;
+
+  return err;
+end;
+
+macro ВыполнитьСписаниеРезервовППР()
+  var query, cmd, DataSet;
+  var err = 0;
+  var cnt = 0, FD = NULL;
+  var i = 0;
+  record ReservAcc("account");
+  var FIRole, FIRolePDD, CodePC;
+  var CatCred = "", FiRoleCred;
+  var msg = "";
+  var SumReservAmount = 0;
+
+  query =   " select NVL(SUM(lot.t_ReservAmount), 0) as SumReservAmount, "
+          + "        NVL(SUM(lot.t_IncomeReserv), 0) as SumIncomeReserv, "
+          + "        lot.t_FIID "
+          + "   from dpmwrtsum_dbt lot "
+          + "  where lot.t_Amount > 0 " 
+          + "    and lot.t_State IN ("+PM_WRTSUM_FORM+","+PM_WRTSUM_SALE_BPP+")"
+          + "    and lot.t_Portfolio = " + KINDPORT_SSSD
+          + "    and (lot.t_ReservAmount > 0 or lot.t_IncomeReserv > 0) "
+          + "    and lot.t_Trust = CHR(0) "
+          + "  group by lot.t_FIID";
+
+  cmd = DL_RSDCommand(query);        
+
+  cnt = cmd.GetCount();
+  if(cnt > 0)
+    InitProgress(cnt, currPart+"Списание резервов ППР", currPart+"Списание резервов ППР");
+
+    FIRole     = FIROLE_BA_PPR;
+    FIRolePDD  = FIROLE_PD_PPR;
+
+    DataSet = cmd.Execute();
+    while((not err) and (DataSet.moveNext()))
+
+      msgbox("Обрабатывается ц/б с FIID = " + DataSet.FIID );
+
+      if(FI_IsBond(DataSet.FIID))
+        CatCred = ПолучитьКатегориюФР("+РС,ц/б");
+        FiRoleCred = FIRole;
+      else
+        CatCred = ПолучитьКатегориюФР("+РС, д/с");
+        FiRoleCred = FIROLE_BA;
+      end;
+
+      FD = SPFirstDocFI(DLDOC_ISSUE, DataSet.FIID, DataSet.FIID, KINDPORT_SSSD, {OurBank}, null, null, null);
+
+      if(FD.IsExistAccount("Резерв ц/б", null, true, FIRole, ReservAcc, null, AccDate))
+        SumReservAmount = abs(GetRestAccount(ReservAcc, AccDate));
+
+        if(SumReservAmount > 0)
+
+          if( not ПроводкаПоКатегориямУчета( FD, 
+                                             ReservAcc, CatCred,      /* Деб, КатегКредит */
+                                             AccDate,                 /* Дата */
+                                             1,                       /* Глава */
+                                             NATCUR,                  /* Валюта */
+                                             SumReservAmount,         /* Сумма */
+                                             NULL,                    /* Документ */
+                                             INPCARRY,                /* Result_Carry */
+                                             " 1",                    /* Kind_Oper */
+                                             "",                      /* Numb_Document */
+                                             "Списание резерва",  /* Ground */
+                                             null,
+                                             FIRole, FiRoleCred
+                                           )
+            )
+              msg = GetErrMsg();
+              if(msg != "")
+                msgbox(msg);
+              end;
+               
+              return 1;
+          end;
+        end;
+
+        if(CloseAccount(ReservAcc) != 0)
+          return 1;
+        end;
+      end;
+
+
+      if(FD.IsExistAccount("Резерв ц/б", null, true, FIRolePDD, ReservAcc, null, AccDate))
+        SumReservAmount = abs(GetRestAccount(ReservAcc, AccDate));
+
+        if(SumReservAmount > 0)
+          if( not ПроводкаПоКатегориямУчета( FD, 
+                                             ReservAcc, CatCred,      /* Деб, КатегКредит */
+                                             AccDate,                 /* Дата */
+                                             1,                       /* Глава */
+                                             NATCUR,                  /* Валюта */
+                                             SumReservAmount,         /* Сумма */
+                                             NULL,                    /* Документ */
+                                             INPCARRY,                /* Result_Carry */
+                                             " 1",                    /* Kind_Oper */
+                                             "",                      /* Numb_Document */
+                                             "Списание резерва по ПДД",  /* Ground */
+                                             null,
+                                             FIRolePDD, FiRoleCred
+                                           )
+            )
+              msg = GetErrMsg();
+              if(msg != "")
+                msgbox(msg);
+              end;
+               
+              return 1;
+          end;
+        end;
+
+        if( CloseAccount(ReservAcc) != 0 )
+           return 1;
+        end; 
+      end;
+
+      UseProgress(i = i + 1);
+    end;
+
+    if(not err)
+      
+      query =  "DECLARE "
+             + "BEGIN "
+             + "  FOR one_lot IN ("
+             + "                    select t_SumID "
+             + "                      from dpmwrtsum_dbt "
+             + "                     where t_Amount > 0 " 
+             + "                       and t_State IN ("+PM_WRTSUM_FORM+","+PM_WRTSUM_SALE_BPP+")"
+             + "                       and t_Portfolio = " + KINDPORT_SSSD
+             + "                       and (t_ReservAmount > 0 or t_IncomeReserv > 0) "
+             + "                       and t_Trust = CHR(0) "
+             + "                   ) LOOP "
+             + "     RSB_PMWRTOFF.RSI_WRTSaveLot( one_lot.t_SumID, ?, ?, ?, ?); "
+             + "     "
+             + "     UPDATE dpmwrtsum_dbt"
+             + "        SET t_ReservAmount = 0, t_IncomeReserv = 0, t_ReservDate = ? "
+             + "      WHERE t_SumID = one_lot.t_SumID; "
+             + "             "
+             + "  END LOOP; "
+             + "END; ";
+       
+      cmd = RSDCommand(query);
+
+      cmd.addParam("", RSDBP_IN, currIDOperation);
+      cmd.addParam("", RSDBP_IN, currIDStep);
+      cmd.addParam("", RSDBP_IN, AccDate);
+      cmd.addParam("", RSDBP_IN, currAction);
+      cmd.addParam("", RSDBP_IN, AccDate);
+
+      cmd.execute();
+    end;
+
+    RemProgress();
+  end;
+
+  return err;
+end;
+
+
+macro ВыполнитьОбработкуВалютныхДолевыхЦБ()
+  var err = 0, i = 0, cnt = 0;
+  var query, cmd, DataSet;
+  var FiRole;
+  record OldAcc("account");
+  record NewAcc("account");
+  var FD = NULL;
+  var msg = "";
+  var sum = $0;
+
+  query =   " select distinct lot.t_FIID, lot.t_Portfolio "
+          + "   from dpmwrtsum_dbt lot, dfininstr_dbt fin "
+          + "  where fin.t_FIID = lot.t_FIID "
+          + "    and fin.t_FaceValueFI != " + NATCUR
+          + "    and fin.t_FI_Kind = " + FIKIND_AVOIRISS
+          + "    and lot.t_Amount > 0 " 
+          + "    and lot.t_State IN ("+PM_WRTSUM_FORM+")"
+          + "    and lot.t_Portfolio != " + KINDPORT_CONTR
+          + "    and lot.t_Trust = CHR(0) "
+          + "    and RSB_FIInstr.FI_AvrKindsEQ(fin.t_FI_Kind, "+AVOIRISSKIND_BOND+", fin.t_AvoirKind) = 0 "
+          + "  order by lot.t_FIID, lot.t_Portfolio ";
+
+  cmd = DL_RSDCommand(query);        
+
+  cnt = cmd.GetCount();
+  if(cnt > 0)
+    InitProgress(cnt, currPart+"Обработка валютных долевых ЦБ", currPart+"Обработка валютных долевых ЦБ");
+
+    DataSet = cmd.Execute();
+    while((not err) and (DataSet.moveNext()))
+
+      FD = SPFirstDocFI(DLDOC_ISSUE, DataSet.FIID, DataSet.FIID, DataSet.Portfolio, {OurBank}, null, null, null);
+
+      FiRole = GetFIRoleByPortfolio(DataSet.Portfolio);
+  
+      if(FD.IsExistAccount("Наш портфель ц/б", null, true, FiRole, OldAcc, null, AccDate, FD.fininstr.rec.FaceValueFI))
+        
+         msgbox("Обрабатывается ц/б с FIID = " + DataSet.FIID + ". Портфель = " + DataSet.Portfolio );
+
+         if( not FD.ReOpenAccount("Наш портфель ц/б", null, false, FiRole, NewAcc, AccDate) )
+           msg = GetErrMsg();
+           if(msg != "")
+             msgbox(msg);
+           end;
+            
+           return 1;
+         end;
+
+         if(OldAcc.Account == NewAcc.Account)
+           msgbox("Одинаковые счета!");
+           i = i + 1;
+           continue;
+         end;
+
+         sum = abs(GetRestAccount(OldAcc, AccDate));
+         if(sum != 0)
+           if(not ПроводкаПоКатегориямУчета( FD, 
+                NewAcc, OldAcc,              /* КатегДеб , КатегКредит*/
+                AccDate,                     /* Дата */
+                1,                           /* Глава */
+                OldAcc.Code_Currency,        /* Валюта */
+                sum,                         /* Сумма  */
+                NULL,                        /* Документ */
+                INPCARRY,                    /* Result_Carry */
+                " 1",                        /* Kind_Oper */
+                "",                          /* Numb_Document */
+                "Перенос остатка Наш портфель ц/б",
+                null,
+                FiRole, 
+                FiRole,
+                OldAcc.Code_Currency, NewAcc.Code_Currency
+               ) 
+           )
+               msg = GetErrMsg();
+               if(msg != "")
+                 msgbox(msg);
+               end;
+                
+               return 1;
+           end;
+         
+         end;
+
+         if( CloseAccount(OldAcc) != 0 )
+            return 1;
+         end;
+      end;
+
+
+      UseProgress(i = i + 1);
+    end;
+
+    if(not err)
+      
+      query =  "DECLARE "
+             + "BEGIN "
+             + "  FOR one_lot IN ("
+             + "                    select lot.t_SumID "
+             + "                      from dpmwrtsum_dbt lot "
+             + "                     where lot.t_Amount > 0 " 
+             + "                       and lot.t_State IN ("+PM_WRTSUM_FORM+","+PM_WRTSUM_SALE_BPP+")"
+             + "                       and lot.t_Portfolio != " + KINDPORT_CONTR
+             + "                       and lot.t_Trust = CHR(0) "
+             + "                       and Exists(select 1 "
+             + "                                    from dfininstr_dbt fin "
+             + "                                   where fin.t_FIID = lot.t_FIID "
+             + "                                     and fin.t_FI_Kind = " + FIKIND_AVOIRISS
+             + "                                     and fin.t_FaceValueFI != " + NATCUR
+             + "                                     and RSB_FIInstr.FI_AvrKindsEQ(fin.t_FI_Kind, "+AVOIRISSKIND_BOND+", fin.t_AvoirKind) = 0 "
+             + "                                 )"
+             + "                   ) LOOP "
+             + "     RSB_PMWRTOFF.RSI_WRTSaveLot( one_lot.t_SumID, ?, ?, ?, ?); "
+             + "     "
+             + "     UPDATE dpmwrtsum_dbt"
+             + "        SET t_BegDate = ? "
+             + "      WHERE t_SumID = one_lot.t_SumID; "
+             + "             "
+             + "  END LOOP; "
+             + "END; ";
+       
+      cmd = RSDCommand(query);
+
+      cmd.addParam("", RSDBP_IN, currIDOperation);
+      cmd.addParam("", RSDBP_IN, currIDStep);
+      cmd.addParam("", RSDBP_IN, AccDate);
+      cmd.addParam("", RSDBP_IN, currAction);
+      cmd.addParam("", RSDBP_IN, CalcDate);
+
+      cmd.execute();
+    end;
+
+    RemProgress();
+  end;
+
+  return err;
+end;
+
+
+private macro GetModeIncomeSSPU():integer
+   var ErrCode, RegPath = "SECUR\\МСФО\\НАЧИСЛЕНИЕ ПДД ПО ДО В ССПУ";
+   var Mode = -1;
+
+   GetRegistryValue( RegPath, V_INTEGER, Mode, ErrCode );
+
+   if( ErrCode != 0 )
+      MsgBox( "Ошибка при получении значения настройки \"" + RegPath + "\"");
+   end;
+
+   return Mode;
+end;
+
+macro ВыполнитьОбработкуПремииДисконтаВССПУ()
+  var query, cmd, DataSet, cmd1;
+  var err = 0;
+  var i = 0, cnt = 0;
+  record DiscountAcc("account");
+  record BonusAcc("account");
+  var sum = $0, rest = $0, FD = NULL;
+  var msg = "";
+
+  if((ПремияДисконтВССПУ != 0) or (GetModeIncomeSSPU() != 0))
+    msgbox("Обработка не требуется.");
+    return 0;
+  end; 
+
+  query =   " select NVL(SUM(lot.t_Bonus), 0) as SumBonus, "
+          + "        NVL(SUM(lot.t_DiscountIncome), 0) as SumDiscountIncome, "
+          + "        lot.t_FIID "
+          + "   from dpmwrtsum_dbt lot "
+          + "  where lot.t_Amount > 0 "
+          + "    and lot.t_State IN ("+PM_WRTSUM_FORM+") "
+          + "    and lot.t_Portfolio = " + KINDPORT_SSPU
+          + "    and lot.t_Trust = CHR(0) "
+          + "    and (lot.t_Bonus > 0 or lot.t_DiscountIncome > 0) "
+          + "  group by lot.t_FIID ";
+
+  cmd = DL_RSDCommand(query);        
+
+  cnt = cmd.GetCount();
+  if(cnt > 0)
+    InitProgress(cnt, currPart+"Обработка премии/дисконта в ССПУ", currPart+"Обработка премии/дисконта в ССПУ");
+
+    DataSet = cmd.Execute();
+    while((not err) and (DataSet.moveNext()))
+
+      msgbox("Обрабатывается ц/б с FIID = " + DataSet.FIID);
+
+      FD = SPFirstDocFI(DLDOC_ISSUE, DataSet.FIID, DataSet.FIID, KINDPORT_SSPU, {OurBank}, null, null, null);
+
+      if(money(DataSet.SumDiscountIncome) != $0)
+
+        if(FD.IsExistAccount("Начисл.ПДД, ц/б", null, true, GetFIRoleByPortfolio(KINDPORT_SSPU, true), DiscountAcc, null, AccDate, FD.fininstr.rec.FaceValueFI))
+
+          sum = abs(GetRestAccount(DiscountAcc, AccDate));
+
+          if(sum != 0)
+            if(not ПроводкаПоКатегориямУчета( FD, 
+                 "Наш портфель ц/б", DiscountAcc, /* КатегДеб , КатегКредит*/
+                 AccDate,                     /* Дата */
+                 1,                           /* Глава */
+                 FD.fininstr.rec.FaceValueFI, /* Валюта */
+                 sum,                         /* Сумма  */
+                 NULL,                        /* Документ */
+                 INPCARRY,                    /* Result_Carry */
+                 " 1",                        /* Kind_Oper */
+                 "",                          /* Numb_Document */
+                 "Перенос дисконта",
+                 null,
+                 GetFIRoleByPortfolio(KINDPORT_SSPU), 
+                 GetFIRoleByPortfolio(KINDPORT_SSPU, true)
+                ) 
+            )
+                msg = GetErrMsg();
+                if(msg != "")
+                  msgbox(msg);
+                end;
+                 
+                return 1;
+            end;
+          end;
+        else
+          msgbox("Не найден счет учета дисконта для ц/б с идентификатором " + DataSet.FIID + ". Сумма начисленного дисконта на лоте " + money(DataSet.SumDiscountIncome));
+          //пока это ошибкой, приводящей к прерыванию, не считаем
+        end;
+      end;
+
+
+      if(money(DataSet.SumBonus) != $0)
+
+        if(FD.IsExistAccount("Премия, ц/б", null, true, GetFIRoleByPortfolioBonus(KINDPORT_SSPU), BonusAcc, null, AccDate, FD.fininstr.rec.FaceValueFI))
+
+          sum = abs(GetRestAccount(BonusAcc, AccDate));
+
+          if(sum != 0)
+            if(not ПроводкаПоКатегориямУчета( FD, 
+                 "Наш портфель ц/б", BonusAcc, /* КатегДеб , КатегКредит*/
+                 AccDate,                     /* Дата */
+                 1,                           /* Глава */
+                 FD.fininstr.rec.FaceValueFI, /* Валюта */
+                 sum,                         /* Сумма  */
+                 NULL,                        /* Документ */
+                 INPCARRY,                    /* Result_Carry */
+                 " 1",                        /* Kind_Oper */
+                 "",                          /* Numb_Document */
+                 "Перенос премии",
+                 null,
+                 GetFIRoleByPortfolio(KINDPORT_SSPU), 
+                 GetFIRoleByPortfolioBonus(KINDPORT_SSPU)
+                ) 
+            )
+                msg = GetErrMsg();
+                if(msg != "")
+                  msgbox(msg);
+                end;
+                 
+                return 1;
+            end;
+          end;
+        else
+          msgbox("Не найден счет премии для ц/б с идентификатором " + DataSet.FIID + ". Сумма начисленной премии на лоте " + money(DataSet.SumBonus));
+          //пока это ошибкой, приводящей к прерыванию, не считаем
+        end;
+      end;
+
+
+      if(not err)
+        query =  "DECLARE "
+               + "BEGIN "
+               + "  FOR one_lot IN ("
+               + "                    select lot.t_SumID "
+               + "                      from dpmwrtsum_dbt lot "
+               + "                     where lot.t_Amount > 0 " 
+               + "                       and lot.t_State IN ("+PM_WRTSUM_FORM+")"
+               + "                       and lot.t_Portfolio = " + KINDPORT_SSPU
+               + "                       and lot.t_Trust = CHR(0) "
+               + "                       and lot.t_FIID = ? "
+               + "                       and lot.t_DiscountIncome > 0 "
+               + "                   ) LOOP "
+               + "     RSB_PMWRTOFF.RSI_WRTSaveLot( one_lot.t_SumID, ?, ?, ?, ?); "
+               + "     "
+               + "     UPDATE dpmwrtsum_dbt"
+               + "        SET t_Cost = t_Cost + t_DiscountIncome, t_BalanceCost = t_BalanceCost + t_DiscountIncome, t_DiscountIncome = 0, t_DiscountDate = ? "
+               + "      WHERE t_SumID = one_lot.t_SumID; "
+               + "             "
+               + "  END LOOP; "
+               + "END; ";
+         
+        cmd1 = RSDCommand(query);
+
+        cmd1.addParam("", RSDBP_IN, DataSet.FIID);
+        cmd1.addParam("", RSDBP_IN, currIDOperation);
+        cmd1.addParam("", RSDBP_IN, currIDStep);
+        cmd1.addParam("", RSDBP_IN, AccDate);
+        cmd1.addParam("", RSDBP_IN, currAction);
+        cmd1.addParam("", RSDBP_IN, CalcDate);
+
+        cmd1.execute();
+        
+
+
+        query =  "DECLARE "
+               + "BEGIN "
+               + "  FOR one_lot IN ("
+               + "                    select lot.t_SumID "
+               + "                      from dpmwrtsum_dbt lot "
+               + "                     where lot.t_Amount > 0 " 
+               + "                       and lot.t_State IN ("+PM_WRTSUM_FORM+")"
+               + "                       and lot.t_Portfolio = " + KINDPORT_SSPU
+               + "                       and lot.t_Trust = CHR(0) "
+               + "                       and lot.t_FIID = ? "
+               + "                       and lot.t_Bonus > 0 "
+               + "                   ) LOOP "
+               + "     RSB_PMWRTOFF.RSI_WRTSaveLot( one_lot.t_SumID, ?, ?, ?, ?); "
+               + "     "
+               + "     UPDATE dpmwrtsum_dbt"
+               + "        SET t_Cost = t_Cost + t_BegBonus - t_Bonus, t_BalanceCost = t_BalanceCost + t_BegBonus - t_Bonus, t_Bonus = 0, t_BonusDate = ? "
+               + "      WHERE t_SumID = one_lot.t_SumID; "
+               + "             "
+               + "  END LOOP; "
+               + "END; ";
+         
+        cmd1 = RSDCommand(query);
+
+        cmd1.addParam("", RSDBP_IN, DataSet.FIID);
+        cmd1.addParam("", RSDBP_IN, currIDOperation);
+        cmd1.addParam("", RSDBP_IN, currIDStep);
+        cmd1.addParam("", RSDBP_IN, AccDate);
+        cmd1.addParam("", RSDBP_IN, currAction);
+        cmd1.addParam("", RSDBP_IN, CalcDate);
+
+        cmd1.execute();
+
+      end;
+
+      UseProgress(i = i + 1);
+    end;
+
+    RemProgress();
+  else
+    msgbox("Нет данных, подлежащих обработке.");
+  end;
+
+  return err;
+end;
+
+macro ВыполнитьОбработкуЛотов()
+  var err = 0, cnt = 0;
+  var query, cmd, DataSet, cmd1;
+  var msg = "", msg_e = "";
+  var i = 0;
+  var FD = NULL;
+  var CatDeb = "", CatCred = "";
+
+
+  query =  "DECLARE "
+         + "  v_CalcDate     DATE;"
+         + "  v_FairValue    NUMBER; "
+         + "  v_FairValueRub NUMBER; "
+         + "  v_CostRub      NUMBER; "
+         + "  v_FVCourseType NUMBER := 0; "
+         + "  v_msg VARCHAR2(1000) := CHR(1); "
+         + "  v_err NUMBER := 0; "
+         + "  v_SignDeviationFP BOOLEAN; "
+         + "  v_SignDeviationAC BOOLEAN; "
+         + "  v_RateKind      NUMBER; "
+         + "  v_RateVal       NUMBER; "
+         + "  v_DeltaRub      NUMBER; "
+         + "  v_AmortCalcKind NUMBER; "
+         + "  v_DrawingDate   DATE; "
+         + "  v_Termless      CHAR;"
+         + "  v_AmortCost     NUMBER := 0; "
+         + "  v_TotalAmortCost NUMBER := 0; "
+         + "  v_RestAmortCost NUMBER := 0; "
+         + "  v_CorrValue     NUMBER := 0; "
+         + "  v_BegDefDiff    NUMBER := 0; "
+         + "  v_SumID NUMBER := 0; "
+         + "  v_AccountedDefDiff NUMBER := 0;"
+         + "  v_EffectInterestRate NUMBER := 0;"
+         + "  v_prevDealID NUMBER := 0; "
+         + "  v_TotalAmount NUMBER := 0; " 
+         + "  v_RestAmount NUMBER := 0; "
+         + "  v_TotalCostRub NUMBER := 0; "
+         + "  v_RestCostRub NUMBER := 0; "
+         + "  v_TotalFairValue NUMBER := 0; "
+         + "  v_TotalFairValueRub NUMBER := 0; "
+         + "  v_RestFairValue NUMBER := 0; "
+         + "  v_RestFairValueRub NUMBER := 0;"
+
+         + "BEGIN "
+         + "  v_CalcDate := ?; "
+         + "  FOR one_lot IN ("
+         + "                    select lot.t_SumID, lot.t_Amount, lot.t_Sum, lot.t_FIID, lot.t_Date, lot.t_Currency, lot.t_Portfolio, "
+         + "                           lot.t_CorrIntToEIRDate, lot.t_InterestIncome, lot.t_DiscountIncome, lot.t_Bonus, lot.t_WrtOutlay, "
+         + "                           fin.t_FaceValueFI, tk.t_DealID, tk.t_BOfficeKind, leg.t_TotalCost, "
+         + "                           leg.t_Principal, "
+         + "                           (select MIN(l.t_Date) from dpmwrtsum_dbt l where l.t_DealID = lot.t_DealID) as FirstLotDate, "
+         + "                           (select l.t_Portfolio from dpmwrtsum_dbt l "
+         + "                             where l.t_DealID = lot.t_DealID and l.t_Source = 0 and l.t_Parent = 0 and l.t_Trust = CHR(0) and l.t_FIID = lot.t_FIID "
+         + "                               and l.t_SumID = (select MIN(l1.t_SumID) from dpmwrtsum_dbt l1 "
+         + "                                                 where l1.t_DealID = l.t_DealID and l1.t_Source = 0 and l1.t_Parent = 0 and l1.t_Trust = CHR(0) and l1.t_FIID = l.t_FIID)"
+         + "                           ) as FirstPortfolio "
+         + "                      from dpmwrtsum_dbt lot, dfininstr_dbt fin, ddl_tick_dbt tk, ddl_leg_dbt leg "
+         + "                     where lot.t_Amount > 0 " 
+         + "                       and lot.t_State IN ("+PM_WRTSUM_FORM+", "+PM_WRTSUM_SALE_BPP+")"
+         + "                       and lot.t_Portfolio IN ("+KINDPORT_ASCB+","+KINDPORT_SSSD+","+KINDPORT_SSPU+")"
+         + "                       and lot.t_Trust = CHR(0) "
+         + "                       and fin.t_FIID = lot.t_FIID "
+         + "                       and fin.t_FI_Kind = " + FIKIND_AVOIRISS
+         + "                       and tk.t_DealID = lot.t_DealID "
+         + "                       and RSB_SECUR.IsREPO(rsb_secur.get_OperationGroup(rsb_secur.get_OperSysTypes(tk.t_DealType, tk.t_BofficeKind))) = 0 "
+         + "                       and leg.t_DealID = tk.t_DealID "
+         + "                       and leg.t_LegKind = 0 "
+         + "                       and leg.t_LegID = 0 "
+         + "                       order by lot.t_DealID, lot.t_Amount "
+         + "                   ) LOOP "
+
+         + "     v_SumID := one_lot.T_SUMID; "
+         + "     v_AccountedDefDiff := 0; "
+         + "     v_DeltaRub := 0;"
+         + "     v_AmortCost:= 0; "
+         
+         + "     IF v_prevDealID != one_lot.t_DealID THEN "
+         
+         + "       v_TotalAmortCost := 0; "
+         + "       v_RestAmortCost  := 0; "
+         + "       v_SignDeviationFP := FALSE; "
+         + "       v_SignDeviationAC := FALSE; "
+         
+         + "       v_TotalAmount  := one_lot.t_Principal; "
+         + "       v_RestAmount   := v_TotalAmount; "
+         + "       v_TotalCostRub := RSI_RSB_FIInstr.ConvSum(one_lot.T_TotalCost, one_lot.T_CURRENCY, "+NATCUR+", one_lot.FirstLotDate, 1); "
+         + "       v_RestCostRub  := v_TotalCostRub;"
+
+         + "       v_FVCourseType := Rsb_Common.GetRegIntValue('SECUR\\ВИД КУРСА СПРАВЕДЛ. СТОИМОСТЬ', 0); "
+         + "       IF v_FVCourseType IS NULL or v_FVCourseType <= 0 THEN "
+         + "         v_msg := 'Не задано значение настройки SECUR\\ВИД КУРСА СПРАВЕДЛ. СТОИМОСТЬ';"
+         + "         v_err := 1;"
+         + "       END IF; "
+
+         + "       IF v_err = 0 THEN "
+         + "         v_TotalFairValue := v_TotalAmount * NVL(RSB_Secur.SC_ConvSumTypeRep(1, one_lot.T_FIID, one_lot.t_FaceValueFI, one_lot.t_FaceValueFI, v_FVCourseType, one_lot.FirstLotDate), 0); "
+         + "         IF v_TotalFairValue = 0 THEN "
+         + "           v_msg := 'Не задана справедливая стоимость для ц/б с идентификатором '||TO_CHAR(one_lot.T_FIID)||' на дату '||TO_CHAR(one_lot.FirstLotDate);"
+         + "           v_err := 1;"
+         + "         END IF;"
+         + "       END IF; "
+
+         + "       IF v_err = 0 THEN "
+         + "         v_TotalFairValueRub := v_TotalAmount * NVL(RSB_Secur.SC_ConvSumTypeRep(1, one_lot.T_FIID, "+NATCUR+", "+NATCUR+", v_FVCourseType, one_lot.FirstLotDate), 0); "
+         
+         + "         v_RestFairValue := v_TotalFairValue; "
+         + "         v_RestFairValueRub := v_TotalFairValueRub; "
+
+         + "         IF RSB_SECUR.GetEssentialDev( "
+         + "                RSB_SECUR.LEVELESSENTIAL_FACTPRICE, "
+         + "                one_lot.FirstPortfolio, "
+         + "                one_lot.FirstLotDate, "
+         + "                v_TotalCostRub, "
+         + "                v_TotalFairValueRub, "
+         + "                0, "
+         + "                0, "
+         + "                0, "
+         + "                v_SignDeviationFP, "
+         + "                v_RateKind,      "
+         + "                v_RateVal       "
+         + "               ) <> 0 THEN "
+         + "            v_msg := 'Ошибка: неверные параметры при вызове ф-ции проверки на существенность отклонения. Ц/б с идентификатором '||TO_CHAR(one_lot.T_FIID); "
+         + "            v_err := 1; "
+         + "         END IF; "
+
+         + "       END IF;"
+
+         + "       IF v_err = 0 THEN "
+         + "         v_AmortCalcKind := RSB_SECUR.AMORTCALCKIND_LM; "
+      
+         + "         IF one_lot.FirstPortfolio = "+KINDPORT_ASCB+"/*АС_ЦБ*/ THEN "
+         + "           IF RSB_SECUR.GetEssentialDev( "
+         + "                   RSB_SECUR.LEVELESSENTIAL_AC,  "
+         + "                   one_lot.FirstPortfolio,  "
+         + "                   one_lot.FirstLotDate,  "
+         + "                   0, "
+         + "                   0, "
+         + "                   0, "
+         + "                   one_lot.t_BOfficeKind, "
+         + "                   one_lot.t_DealID, "
+         + "                   v_SignDeviationAC, "
+         + "                   v_RateKind,      "
+         + "                   v_RateVal        "
+         + "                  ) <> 0 THEN "
+         + "               v_msg := 'Ошибка: неверные параметры при вызове ф-ции проверки на существенность отклонения. Ц/б с идентификатором '||TO_CHAR(one_lot.T_FIID); "
+         + "               v_err := 1; "
+         + "           END IF; "
+          
+         + "           IF v_err = 0 THEN "
+         + "             v_AmortCalcKind := RSB_SECUR.AMORTCALCKIND_EPS/*ЭПС*/; "
+          
+         + "             IF v_SignDeviationAC = FALSE THEN "
+         + "                SELECT t_Termless INTO v_Termless FROM DAVOIRISS_DBT WHERE T_FIID = one_lot.T_FIID; "
+         + "                v_DrawingDate := RSI_RSB_FIInstr.FI_GetNominalDrawingDate(one_lot.T_FIID, v_Termless); "
+
+         + "                IF v_DrawingDate <> TO_DATE('01.01.0001', 'DD.MM.YYYY') AND "
+         + "                   ADD_MONTHS(one_lot.FirstLotDate, 12) > v_DrawingDate AND "
+         + "                   RSB_PMWRTOFF.EPSAvrLessThanYear() = RSB_PMWRTOFF.EPSAVRLESSTHANYEAR_NO THEN "
+         + "                   v_AmortCalcKind := RSB_SECUR.AMORTCALCKIND_LM /*ЛМ*/; "
+
+         + "                ELSIF RSB_PMWRTOFF.EPSAvrNSignDevACEPSACLM() = RSB_PMWRTOFF.EPSAVRNSIGNDEVACEPSACLM_NO THEN "
+         + "                   v_AmortCalcKind := RSB_SECUR.AMORTCALCKIND_LM /*ЛМ*/; "
+         + "                END IF; "
+         + "             END IF; "
+
+         + "             IF v_AmortCalcKind = RSB_SECUR.AMORTCALCKIND_EPS/*ЭПС*/ THEN"
+         + "               v_TotalAmortCost := RSB_SECUR.CalcAS_EPS(RSB_SECUR.CALCKIND_AVR, one_lot.T_DEALID, 0, one_lot.FirstLotDate, v_EffectInterestRate); "
+         + "             ELSE "
+         + "               v_TotalAmortCost := RSB_SECUR.CalcAS_Line(RSB_SECUR.CALCKIND_AVR, one_lot.T_DEALID, 0, one_lot.FirstLotDate); "
+         + "             END IF; "
+
+         + "             v_RestAmortCost := v_TotalAmortCost; "
+
+         + "           END IF; "
+         + "         ELSIF one_lot.FirstPortfolio = "+KINDPORT_SSPU+" AND Rsb_Common.GetRegIntValue('SECUR\\МСФО\\ЭПС ДЛЯ ЦБ В ССПУ_ЦБ', 0) = 1 THEN "
+         + "           v_AmortCalcKind := RSB_SECUR.AMORTCALCKIND_EPS/*ЭПС*/; "
+         + "         ELSIF one_lot.FirstPortfolio = "+KINDPORT_SSSD+" AND Rsb_Common.GetRegIntValue('SECUR\\МСФО\\ЭПС ДЛЯ ЦБ В СССД_ЦБ', 0) = 1 THEN "
+         + "           v_AmortCalcKind := RSB_SECUR.AMORTCALCKIND_EPS/*ЭПС*/; "
+         + "         END IF; "
+         + "       END IF; "
+
+         + "       IF v_err = 0 THEN "
+         + "         v_EffectInterestRate := 0; "
+         + "         IF v_AmortCalcKind = RSB_SECUR.AMORTCALCKIND_EPS THEN"
+         + "           v_EffectInterestRate := RSB_SECUR.CalcEPS(RSB_SECUR.CALCKIND_AVR, one_lot.t_DealID, 0, one_lot.t_Date); "
+         + "           IF v_EffectInterestRate IS NULL OR v_EffectInterestRate = -1 THEN "
+         + "             v_EffectInterestRate := 0; "
+         + "           END IF;"
+         + "         END IF;"
+         + "       END IF;"
+
+         + "     END IF;"
+
+         + "     IF v_err = 0 THEN "
+         + "       IF v_RestAmount <= 0 THEN "
+         + "         v_msg := 'Неверное количество ц/б';"
+         + "         v_err := 1;"
+         + "       END IF; "
+         + "     END IF;"
+         
+         + "     IF v_err = 0 THEN "
+         + "       IF v_RestAmount = one_lot.T_AMOUNT THEN "
+         + "         v_CostRub      := v_RestCostRub; "
+         + "         v_FairValueRub := v_RestFairValueRub; "
+         + "         v_FairValue    := v_RestFairValue;"
+         + "         v_AmortCost    := v_RestAmortCost; "
+         + "       ELSE "
+         + "         v_CostRub      := ROUND(v_TotalCostRub * one_lot.T_AMOUNT / v_TotalAmount, 2); "
+         + "         v_FairValueRub := ROUND(v_TotalFairValueRub * one_lot.T_AMOUNT / v_TotalAmount, 2);"
+         + "         v_FairValue    := ROUND(v_TotalFairValue * one_lot.T_AMOUNT / v_TotalAmount, 2);"
+         + "         v_AmortCost    := ROUND(v_TotalAmortCost * one_lot.T_AMOUNT / v_TotalAmount, 2);"
+         + "       END IF;"
+         
+         + "       IF v_SignDeviationFP = TRUE THEN "
+         + "          v_DeltaRub := v_FairValueRub - v_CostRub; "
+         + "       ELSE "
+         + "          v_DeltaRub := 0; "
+         + "       END IF; "
+         
+         + "     END IF; "
+
+         + "     IF v_err = 0 THEN"
+
+         + "        v_CorrValue := 0; "
+         + "        v_BegDefDiff := 0; "
+         + "        IF RSB_PMWRTOFF.WRTNeedChargeIncome(one_lot.t_FIID) = 1 THEN "
+         + "          IF RSB_PMWRTOFF.RSI_AvoirAttrObsBaseData(one_lot.t_FIID) = 1 THEN "
+         + "            v_BegDefDiff := v_DeltaRub; "
+         + "          ELSE "
+         + "            v_CorrValue := v_DeltaRub; "
+         + "          END IF; "
+         + "        ELSE "
+         + "          IF RSB_PMWRTOFF.RSI_AvoirAttrObsBaseData(one_lot.t_FIID) = 1 THEN "
+         + "            v_CorrValue := v_DeltaRub; "
+         + "          END IF; "
+         + "        END IF; ";
+
+
+  if(ОтсроченнаяРазница == 2) //От даты расчета
+    query = query
+           + " IF v_err = 0 and v_BegDefDiff <> 0 THEN "
+           + "   v_AccountedDefDiff := RSB_PMWRTOFF.WRTCalcDefDiff(v_CalcDate, "
+           + "                                                    one_lot.t_Date, "
+           + "                                                    one_lot.t_FIID, "
+           + "                                                    one_lot.t_Amount, "
+           + "                                                    TO_DATE('01.01.0001','DD.MM.YYYY'), " 
+           + "                                                    0, "
+           + "                                                    v_BegDefDiff "
+           + "                                                    ); "
+           + " END IF; ";
+  end;
+
+  query = query 
+         + "        IF v_err = 0 THEN"
+         + "           RSB_PMWRTOFF.RSI_WRTSaveLot( one_lot.t_SumID, ?, ?, ?, ?); "
+
+         + "           UPDATE dpmwrtsum_dbt"
+         + "              SET T_EFFECTINTERESTRATE = v_EffectInterestRate, "
+         + "                  T_FAIRVALUE = v_FairValue, "
+         + "                  T_AMORTCOST = v_AMORTCOST, "
+         + "                  T_AMORTCOSTDATE = one_lot.t_Date, "
+         + "                  T_CORRVALUE = v_CorrValue, "
+         + "                  T_CORRDATE = (CASE WHEN v_CorrValue <> 0 THEN one_lot.t_Date ELSE T_CORRDATE END), "
+         + "                  T_ACCFI = RSB_PMWRTOFF.WRTDetermineAccFI(one_lot.t_FIID), "
+         + "                  T_AMORTCALCKIND = v_AmortCalcKind, "
+         + "                  T_BEGDEFDIFF = v_BegDefDiff, "
+         + "                  T_ACCOUNTEDDEFDIFF = ROUND(v_AccountedDefDiff, 2), "
+         + "                  T_DEFDIFFDATE = (CASE WHEN v_AccountedDefDiff <> 0 THEN v_CalcDate ELSE T_DEFDIFFDATE END) "
+         + "            WHERE T_SUMID = one_lot.t_SumID; "
+
+         + "           v_RestAmount  := v_RestAmount - one_lot.t_Amount; "
+         + "           v_RestCostRub := v_RestCostRub - v_CostRub; "
+         + "           v_RestFairValueRub := v_RestFairValueRub - v_FairValueRub; "
+         + "           v_RestFairValue := v_RestFairValue - v_FairValue; "
+         + "           v_RestAmortCost := v_RestAmortCost - v_AmortCost; "
+
+         + "        END IF;"
+         + "      END IF;"
+
+         + "      ? := v_msg; "
+         + "      IF v_err <> 0 THEN "
+         + "        EXIT;"
+         + "      END IF; "
+
+         + "    v_prevDealID := one_lot.t_DealID; "
+
+         + "  END LOOP; "
+
+         + "  EXCEPTION "
+         + "     WHEN OTHERS THEN ? := 'Исключение при обработке лота с идентификатором '||TO_CHAR(v_SumID); "
+
+         + "END; ";
+
+   
+  cmd = RSDCommand(query);
+
+
+  cmd.addParam("", RSDBP_IN,  CalcDate);
+
+
+  cmd.addParam("", RSDBP_IN, currIDOperation);
+  cmd.addParam("", RSDBP_IN, currIDStep);
+  cmd.addParam("", RSDBP_IN, AccDate);
+  cmd.addParam("", RSDBP_IN, currAction);
+  cmd.addParam("p_msg", RSDBP_OUT, V_STRING, 1000);
+  cmd.addParam("p_msg_e", RSDBP_OUT, V_STRING, 1000);
+
+  InitProgress(-1, currPart+"Обработка лотов", currPart+"Обработка лотов");
+
+  cmd.execute();
+
+  RemProgress();
+
+  msg = SQL_ConvTypeStr(cmd.value("p_msg"));
+  msg_e = SQL_ConvTypeStr(cmd.value("p_msg_e"));
+
+  if(msg != "")
+    msgbox(msg);
+    return 1;
+  end;
+
+  if(msg_e != "")
+    msgbox(msg_e);
+    return 1;
+  end;
+
+  query =   " select lot.t_SumID, lot.t_DealID, lot.t_Amount, lot.t_FIID,  "
+          + "        (select MIN(l.t_Date) from dpmwrtsum_dbt l where l.t_DealID = lot.t_DealID) as FirstLotDate, "
+          + "        NVL((select MAX(fw.t_DrawingDate) "
+          + "           from dfiwarnts_dbt fw "
+          + "          where fw.t_FIID = lot.t_FIID "
+          + "            and fw.t_IsPartial = CHR(0) "
+          + "            and fw.t_DrawingDate <= ? "
+          + "            and fw.t_SpIsClosed = 'X'"
+          + "        ), "+GetSQLDate(date(0,0,0))+") as FwDrawingDate," 
+          + "        fin.t_FaceValueFI "
+          + "   from dpmwrtsum_dbt lot, dfininstr_dbt fin "
+          + "  where lot.t_AmortCalcKind = 2 /*ЭПС*/ "
+          + "    and lot.t_ID_Operation = ? "
+          + "    and lot.t_ID_Step = ? "
+          + "    and lot.t_Action = ? "
+          + "    and lot.t_CorrIntToEIR = 0 "
+          + "    and lot.t_Amount > 0 "
+          + "    and fin.t_FIID = lot.t_FIID";
+
+  cmd = DL_RSDCommand(query);
+
+  cmd.AddParam(CalcDate);
+  cmd.AddParam(currIDOperation);
+  cmd.AddParam(currIDStep);
+  cmd.AddParam(currAction);        
+
+  cnt = cmd.GetCount();
+  if(cnt > 0)
+    InitProgress(cnt, currPart+"Корректировка % до ЭПС для лотов", currPart+"Корректировка % до ЭПС для лотов");
+    i = 0;
+    DataSet = cmd.Execute();
+    while((not err) and (DataSet.moveNext()))
+
+      query =   "DECLARE "
+              + "  v_CalcDate     DATE;"
+              + "  v_CorrIntToEIRAdd NUMBER := 0;"
+              + "  v_lot DPMWRTSUM_DBT%ROWTYPE; "
+              + "  v_SumID NUMBER; "
+
+              + "  v_BegDate DATE; "
+              + "  v_EndDate DATE; "
+              + "  v_sum NUMBER := 0;"
+              + "  v_Amount NUMBER;"
+
+              + "BEGIN "
+              + "  v_CalcDate := ?; "
+              + "  v_SumID := ?; "
+
+              + "  v_BegDate := ?; "
+              + "  v_EndDate := ?; "
+
+
+              + "  SELECT * INTO v_lot FROM DPMWRTSUM_DBT WHERE t_SumID = v_SumID; " 
+
+              + "  FOR one_fw IN (select t_DrawingDate, t_FirstDate, t_FIID "
+              + "                   from dfiwarnts_dbt "
+              + "                  where t_FIID = v_lot.t_FIID "
+              + "                    and t_DrawingDate >= v_BegDate "
+              + "                    and t_FirstDate <= v_EndDate "
+              + "                    and t_SpIsClosed = 'X' "
+              + "                    and t_IsPartial = CHR(0) "
+              + "                ) "
+              + "  LOOP "
+
+              + "    IF v_BegDate > one_fw.t_FirstDate THEN"
+              + "      v_sum := v_sum + RSI_RSB_FIInstr.FI_CalcIncomeValue(one_fw.t_FIID, one_fw.t_DrawingDate, v_lot.t_Amount, 1) - RSI_RSB_FIInstr.FI_CalcIncomeValue(one_fw.t_FIID, v_BegDate, v_lot.t_Amount, 1);"
+              + "    ELSIF v_EndDate < one_fw.t_DrawingDate THEN "
+              + "      v_sum := v_sum + RSI_RSB_FIInstr.FI_CalcIncomeValue(one_fw.t_FIID, v_EndDate, v_lot.t_Amount, 1); "  
+              + "    ELSE "
+              + "      v_sum := v_sum + RSI_RSB_FIInstr.FI_CalcIncomeValue(one_fw.t_FIID, one_fw.t_DrawingDate, v_lot.t_Amount, 1); "  
+              + "    END IF;"
+
+              + "  END LOOP; "
+
+
+              + "  v_CorrIntToEIRAdd := RSB_SECUR.CalcCorrectPersentEPS(RSB_SECUR.CALCKIND_AVR, "
+              + "                                                       v_lot.t_DealID, "
+              + "                                                       v_lot.t_SumID, "
+              + "                                                       v_CalcDate, "
+              + "                                                       v_lot.T_DATE, "
+              + "                                                       v_sum + v_lot.T_INTERESTINCOME, "
+              + "                                                       v_lot.T_BONUS, "
+              + "                                                       v_lot.T_DISCOUNTINCOME, "
+              + "                                                       v_lot.T_WRTOUTLAY, "
+              + "                                                       v_lot.T_FAIRVALUE, "
+              + "                                                       v_lot.T_EFFECTINTERESTRATE); "
+
+              + "  IF v_CorrIntToEIRAdd IS NULL THEN "
+              + "    v_CorrIntToEIRAdd := 0; "
+              + "  END IF;"
+              
+              + "  v_CorrIntToEIRAdd := RSI_RSB_FIInstr.ConvSum(v_CorrIntToEIRAdd, ?, "+NATCUR+", v_CalcDate, 1);"
+              + "  v_CorrIntToEIRAdd := ROUND(v_CorrIntToEIRAdd, 2);"
+
+              + "  RSB_PMWRTOFF.RSI_WRTSaveLot( v_lot.t_SumID, ?, ?, ?, ?); "
+
+              + "  UPDATE dpmwrtsum_dbt"
+              + "     SET T_CORRINTTOEIR = ROUND(v_CorrIntToEIRAdd, 2), "
+              + "         T_CORRINTTOEIRDATE = v_CalcDate"
+              + "   WHERE T_SUMID = v_lot.t_SumID; "
+
+              + "  EXCEPTION "
+              + "     WHEN OTHERS THEN ? := 'Исключение при расчете корректировки % до ЭПС для лота с идентификатором '||TO_CHAR(v_SumID); "
+
+              + "END; ";
+
+      cmd1 = RSDCommand(query);
+
+      cmd1.addParam("", RSDBP_IN,  CalcDate);
+      cmd1.addParam("", RSDBP_IN,  DataSet.SumID);
+
+      cmd1.addParam("", RSDBP_IN, date(DataSet.FirstLotDate));
+      cmd1.addParam("", RSDBP_IN, date(DataSet.FwDrawingDate));
+
+      cmd1.addParam("", RSDBP_IN,  DataSet.FaceValueFI);
+
+      cmd1.addParam("", RSDBP_IN, currIDOperation);
+      cmd1.addParam("", RSDBP_IN, currIDStep);
+      cmd1.addParam("", RSDBP_IN, AccDate);
+      cmd1.addParam("", RSDBP_IN, currAction);
+
+      cmd1.addParam("p_msg_e", RSDBP_OUT, V_STRING, 1000);
+
+      cmd1.execute();
+
+      msg_e = SQL_ConvTypeStr(cmd1.value("p_msg_e"));
+
+      if(msg_e != "")
+        msgbox(msg_e);
+        return 1;
+      end;
+
+      UseProgress(i = i + 1);
+
+    end;
+
+    RemProgress();
+  end;
+
+
+  //Отсроченная разница
+  if(СчетДляУчетаФР == 706)
+    query =   " select NVL(SUM(lot.t_AccountedDefDiff), 0) as AccountedDefDiff, "
+            + "        lot.t_FIID, lot.t_Portfolio "
+            + "   from dpmwrtsum_dbt lot "
+            + "  where lot.t_ID_Operation = ? " 
+            + "    and lot.t_ID_Step = ? " 
+            + "    and lot.t_Amount > 0 "
+            + "    and lot.t_AccountedDefDiff <> 0 "
+            + "  group by lot.t_FIID, lot.t_Portfolio ";
+
+    cmd = DL_RSDCommand(query);
+
+    cmd.AddParam(currIDOperation);
+    cmd.AddParam(currIDStep);
+
+    cnt = cmd.GetCount();
+    if(cnt > 0)
+      InitProgress(cnt, currPart+"Доначисление отсроченной разницы", currPart+"Доначисление отсроченной разницы");
+
+      DataSet = cmd.Execute();
+      while((not err) and (DataSet.moveNext()))
+
+        msgbox("Обрабатывается ц/б с FIID = " + DataSet.FIID + ". Портфель = " + DataSet.Portfolio );
+
+        FD = SPFirstDocFI(DLDOC_ISSUE, DataSet.FIID, DataSet.FIID, DataSet.Portfolio, {OurBank}, null, null, null);
+
+        if (money(DataSet.AccountedDefDiff) > 0)
+           CatDeb = "-КорЭПС_%, ц/б";
+           CatCred = "+Маржа, ц/б";
+        else
+           CatDeb = "-Маржа, ц/б";
+           CatCred = "+КорЭПС_%, ц/б";
+        end;
+        
+        if(not ПроводкаПоКатегориямУчета( FD, 
+             CatDeb, CatCred,             /* КатегДеб , КатегКредит*/
+             AccDate,                     /* Дата */
+             1,                           /* Глава */
+             NATCUR,                      /* Валюта */
+             abs(money(DataSet.AccountedDefDiff)), /* Сумма  */
+             NULL,                        /* Документ */
+             INPCARRY,                    /* Result_Carry */
+             " 1",                        /* Kind_Oper */
+             "",                          /* Numb_Document */
+             "Доначисление отроченной разницы",
+             null,
+             GetFIRoleByPortfolio(DataSet.Portfolio), 
+             GetFIRoleByPortfolio(DataSet.Portfolio)
+            ) 
+        )
+            msg = GetErrMsg();
+            if(msg != "")
+              msgbox(msg);
+            end;
+             
+            return 1;
+        end;
+
+
+        UseProgress(i = i + 1);
+      end;
+
+      RemProgress();
+    end;
+  end;
+
+
+  //Корректировка СС
+  query =   " select NVL(SUM(lot.t_CorrValue), 0) as SumCorrValue, "
+          + "        lot.t_FIID, lot.t_Portfolio "
+          + "   from dpmwrtsum_dbt lot, dpmwrtbc_dbt bc "
+          + "  where lot.t_ID_Operation = ? " 
+          + "    and lot.t_ID_Step = ? " 
+          + "    and lot.t_Amount > 0 "
+          + "    and lot.t_CorrValue != 0 "
+          + "    and bc.t_SumID = lot.t_SumID "
+          + "    and bc.t_Instance = lot.t_Instance - 1 "
+          + "    and bc.t_CorrValue = 0 "
+          + "  group by lot.t_FIID, lot.t_Portfolio ";
+
+  cmd = DL_RSDCommand(query);
+
+  cmd.AddParam(currIDOperation);
+  cmd.AddParam(currIDStep);
+
+  cnt = cmd.GetCount();
+  if(cnt > 0)
+    InitProgress(cnt, currPart+"Отражение корректировки СС", currPart+"Отражение корректировки СС");
+
+    i = 0;
+    DataSet = cmd.Execute();
+    while((not err) and (DataSet.moveNext()))
+      
+      if(money(DataSet.SumCorrValue) != 0)
+
+        msgbox("Обрабатывается ц/б с FIID = " + DataSet.FIID + ". Портфель = " + DataSet.Portfolio );
+
+        FD = SPFirstDocFI(DLDOC_ISSUE, DataSet.FIID, DataSet.FIID, DataSet.Portfolio, {OurBank}, null, null, null);
+
+        if(money(DataSet.SumCorrValue) > 0)
+          CatDeb  = "+Корректировка, ц/б";
+          CatCred = ПолучитьКатегориюФР("+Маржа, ц/б");
+        else
+          CatDeb  = ПолучитьКатегориюФР("-Маржа, ц/б");
+          CatCred = "-Корректировка, ц/б";
+        end;
+        
+        if(not ПроводкаПоКатегориямУчета( FD, 
+             CatDeb, CatCred,             /* КатегДеб , КатегКредит*/
+             AccDate,                     /* Дата */
+             1,                           /* Глава */
+             NATCUR,                      /* Валюта */
+             abs(money(DataSet.SumCorrValue)), /* Сумма  */
+             NULL,                        /* Документ */
+             INPCARRY,                    /* Result_Carry */
+             " 1",                        /* Kind_Oper */
+             "",                          /* Numb_Document */
+             "Корректировка СС",
+             null,
+             GetFIRoleByPortfolio(DataSet.Portfolio), 
+             GetFIRoleByPortfolio(DataSet.Portfolio)
+            ) 
+        )
+            msg = GetErrMsg();
+            if(msg != "")
+              msgbox(msg);
+            end;
+             
+            return 1;
+        end;
+
+      end;
+      
+      UseProgress(i = i + 1);
+    end;
+    RemProgress();
+  end;
+
+  //Корректировка % до ЭПС 
+  query =   " select NVL(SUM(lot.t_CorrIntToEIR), 0) as SumCorrIntToEIR, "
+          + "        lot.t_FIID, lot.t_Portfolio "
+          + "   from dpmwrtsum_dbt lot, dpmwrtbc_dbt bc "
+          + "  where lot.t_ID_Operation = ? "
+          + "    and lot.t_ID_Step = ? " 
+          + "    and lot.t_Amount > 0 "
+          + "    and lot.t_CorrIntToEIR != 0 "
+          + "    and bc.t_SumID = lot.t_SumID "
+          + "    and bc.t_Instance = lot.t_Instance - 1 "
+          + "    and bc.t_CorrIntToEIR = 0 "
+          + "  group by lot.t_FIID, lot.t_Portfolio ";
+
+  cmd = DL_RSDCommand(query);
+
+  cmd.AddParam(currIDOperation);
+  cmd.AddParam(currIDStep);
+
+  cnt = cmd.GetCount();
+  if(cnt > 0)
+    InitProgress(cnt, currPart+"Корректировка % до ЭПС", currPart+"Корректировка % до ЭПС");
+
+    i = 0;
+    DataSet = cmd.Execute();
+    while((not err) and (DataSet.moveNext()))
+      
+      if(money(DataSet.SumCorrIntToEIR) != 0)
+
+        msgbox("Обрабатывается ц/б с FIID = " + DataSet.FIID + ". Портфель = " + DataSet.Portfolio );
+
+        FD = SPFirstDocFI(DLDOC_ISSUE, DataSet.FIID, DataSet.FIID, DataSet.Portfolio, {OurBank}, null, null, null);
+
+        if(money(DataSet.SumCorrIntToEIR) > 0)
+          CatDeb  = "+Корректировка, ц/б";
+          CatCred = ПолучитьКатегориюФР("+КорЭПС_%, ц/б");
+        else
+          CatDeb  = ПолучитьКатегориюФР("-КорЭПС_%, ц/б");
+          CatCred = "-Корректировка, ц/б";
+        end;
+        
+        if(not ПроводкаПоКатегориямУчета( FD, 
+             CatDeb, CatCred,             /* КатегДеб , КатегКредит*/
+             AccDate,                     /* Дата */
+             1,                           /* Глава */
+             NATCUR,                      /* Валюта */
+             abs(money(DataSet.SumCorrIntToEIR)), /* Сумма  */
+             NULL,                        /* Документ */
+             INPCARRY,                    /* Result_Carry */
+             " 1",                        /* Kind_Oper */
+             "",                          /* Numb_Document */
+             "Корректировка % до ЭСП",
+             null,
+             GetFIRoleByPortfolio(DataSet.Portfolio), 
+             GetFIRoleByPortfolio(DataSet.Portfolio)
+            ) 
+        )
+            msg = GetErrMsg();
+            if(msg != "")
+              msgbox(msg);
+            end;
+             
+            return 1;
+        end;
+
+      end;
+      
+      UseProgress(i = i + 1);
+    end;
+    RemProgress();
+  end;
+
+
+  return err;
+end;
+
+
+macro ВыполнитьНачислениеОценочногоРезерва()
+  var err = 0;
+  var cmd, query, DataSet;
+  var i = 0, cnt = 0;
+  var FD = NULL;
+  var msg = "";
+
+  if((ОценочныйРезервВДатуПерехода == false) or (СчетДляУчетаФР == 706))
+    msgbox("Обработка не требуется.");
+    return 0;
+  end;
+
+  SQL_Execute("DELETE FROM DPMWRTSUM_TMP", "", false ); 
+
+  query =  "DECLARE "
+         + "BEGIN "
+         + "  FOR one_rec IN ("
+         + "                    select lot.t_FIID, lot.t_Department "
+         + "                      from dpmwrtsum_dbt lot, dfininstr_dbt fin "
+         + "                     where lot.t_Amount > 0 " 
+         + "                       and lot.t_State IN ("+PM_WRTSUM_FORM+", "+PM_WRTSUM_SALE_BPP+")"
+         + "                       and lot.t_Trust = CHR(0) "
+         + "                       and fin.t_FIID = lot.t_FIID "
+         + "                       and fin.t_FI_Kind = " + FIKIND_AVOIRISS
+         + "                     group by lot.t_FIID, lot.t_Department "
+         + "                   ) LOOP "
+         + "     RSB_PMWRTOFF.RSI_WRTEstReserveLotsTMP(?, one_rec.t_FIID, one_rec.t_Department); "
+         + "  END LOOP; "
+         + "  RSB_PMWRTOFF.RSI_WRTSaveReserveLots(?, ?, ?); "
+         + "END; ";
+   
+  cmd = RSDCommand(query);
+
+  cmd.addParam("", RSDBP_IN, CalcDate);
+  cmd.addParam("", RSDBP_IN, CalcDate);
+  cmd.addParam("", RSDBP_IN, currIDOperation);
+  cmd.addParam("", RSDBP_IN, currIDStep);
+
+  cmd.execute();
+
+  query =   " select NVL(SUM(lot.t_EstReserve), 0) as SumEstReserve, "
+          + "        NVL(SUM(lot.t_CorrEstReserve), 0) as SumCorrEstReserve,"
+          + "        lot.t_FIID, lot.t_Portfolio "
+          + "   from dpmwrtsum_dbt lot "
+          + "  where lot.t_ID_Operation = ? "
+          + "    and lot.t_ID_Step = ? " 
+          + "    and (lot.t_EstReserve <> 0 or lot.t_CorrEstReserve <> 0) "
+          + "  group by lot.t_FIID, lot.t_Portfolio ";
+
+  cmd = DL_RSDCommand(query);
+
+  cmd.AddParam(currIDOperation);
+  cmd.AddParam(currIDStep);
+
+  cnt = cmd.GetCount();
+  if(cnt > 0)
+    InitProgress(cnt, currPart+"Формирование оценочного резерва", currPart+"Формирование оценочного резерва");
+
+    DataSet = cmd.Execute();
+    while((not err) and (DataSet.moveNext()))
+
+      msgbox("Обрабатывается ц/б с FIID = " + DataSet.FIID + ". Портфель = " + DataSet.Portfolio );
+
+      FD = SPFirstDocFI(DLDOC_ISSUE, DataSet.FIID, DataSet.FIID, DataSet.Portfolio, {OurBank}, null, null, null);
+      
+      if( (DataSet.Portfolio == KINDPORT_SSSD) and (money(DataSet.SumEstReserve) != 0))
+         if( not НачислитьРезерв(FD, "Оценочный резерв, СССД_ЦБ", GetFIRoleByPortfolio( DataSet.Portfolio), money(DataSet.SumEstReserve), "") )
+           msg = GetErrMsg();
+           if(msg != "")
+             msgbox(msg);
+           end;
+            
+           return 1;
+         end;
+      end;
+
+      if( ((DataSet.Portfolio == KINDPORT_ASCB) or (DataSet.Portfolio == KINDPORT_PROMISSORY)) and (money(DataSet.SumCorrEstReserve) != 0))
+         var Acc = "", Role;
+         if(money(DataSet.SumCorrEstReserve) > 0)
+            Acc = "-Кор_Резерв, ЦБ";
+         else
+            Acc = "+Кор_Резерв, ЦБ";
+         end;
+
+         if(DataSet.Portfolio == KINDPORT_RETIRE)
+            Role = FIROLE_BA_PUDP;
+         else
+            Role = FIROLE_BAINPROMISSORY;
+         end;
+        
+         if( not НачислитьРезерв(FD, Acc, Role, money(DataSet.SumCorrEstReserve), "") )
+           msg = GetErrMsg();
+           if(msg != "")
+             msgbox(msg);
+           end;
+            
+           return 1;
+         end;
+      end;
+
+      UseProgress(i = i + 1);
+    end;
+
+    RemProgress();
+  end;
+
+  return err;
+end;
+
+macro StartTrans(part:string, msg:string)
+  msgbox(part+msg);
+  RslDefCon.BeginTrans();
+
+  currIDStep = currIDStep - 1;
+  currPart = part;
+end;
+
+macro EndTrans(err)
+  if(err)
+    RslDefCon.RollbackTrans();
+    msgbox("При выполнении возникли ошибки!");
+  else
+    RslDefCon.CommitTrans();
+    //RslDefCon.RollbackTrans();
+    msgbox("Выполнено успешно");
+  end;
+
+  msgbox("");
+end;
+
+
+macro StartExec()
+  var err = 0;
+
+  ReplaceMacro( "msgbox", "cnv_msgbox" );
+
+  msgbox("Начало конвертации");
+
+
+  if((СчетДляУчетаФР != 706) and (СчетДляУчетаФР != 10801) and (СчетДляУчетаФР != 10901))
+    msgbox("Не реализована обработка значения "+СчетДляУчетаФР+" для параметра \"СчетДляУчетаФР\"");
+    err = 1;
+  end;
+
+  if(not err)
+    if((ОтсроченнаяРазница != 1) and (ОтсроченнаяРазница != 2))
+      msgbox("Не реализована обработка значения "+ОтсроченнаяРазница+" для параметра \"ОтсроченнаяРазница\"");
+      err = 1;
+    end;
+  end;
+
+  if(not err)
+
+    msgbox("1. Обработка денежных параметров РЕПО");
+   
+      StartTrans("  1.1. ", "Обработка внебалансовых счетов");
+        err = ВыполнитьПроводкиВнебалансРЕПО();
+      EndTrans(err); 
+
+    if(not err)
+      StartTrans("  1.2. ", "Действия по сделкам РЕПО");
+        err = ВыполнитьУчетРЕПО();
+      EndTrans(err);
+    end; 
+
+    if(not err)
+      StartTrans("  1.3. ", "Оценочный резерв по сделкам РЕПО");
+        err = ОценочныйРезервРЕПО();
+      EndTrans(err);
+    end; 
+
+  end; 
+
+
+  if(not err)
+    msgbox("2. Вложения в ценные бумаги");
+     
+      StartTrans("  2.1. ", "Обработка внебалансовых счетов");
+        err = ВыполнитьПроводкиВнебалансЦБ();
+      EndTrans(err);  
+
+      if(not err)
+        StartTrans("  2.2. ", "Межпортфельное перемещение");
+          err = ВыполнитьМежпортфельноеПеремещениеЦБ();
+        EndTrans(err);
+      end;
+ 
+      if(not err)
+        StartTrans("  2.3. ", "Перенос счетов ППР 50709");
+          err = ВыполнитьПереносСчетовППР50709();
+        EndTrans(err);
+      end;
+
+      if(not err)
+        StartTrans("  2.4. ", "Перенос счетов ПУДП");
+          err = ВыполнитьПереносСчетовПУДП();
+        EndTrans(err);
+      end; 
+
+      if(not err)
+        StartTrans("  2.5. ", "Списание резервов ППР");
+          err = ВыполнитьСписаниеРезервовППР();
+        EndTrans(err);
+      end; 
+
+      if(not err)
+        StartTrans("  2.6. ", "Обработка валютных долевых ЦБ");
+          err = ВыполнитьОбработкуВалютныхДолевыхЦБ();
+        EndTrans(err);
+      end;  
+
+      if(not err)
+        StartTrans("  2.7. ", "Обработка премии/дисконта в ССПУ");
+          err = ВыполнитьОбработкуПремииДисконтаВССПУ();
+        EndTrans(err);
+      end; 
+
+      if(not err)
+        StartTrans("  2.8. ", "Обработка лотов");
+          err = ВыполнитьОбработкуЛотов();
+        EndTrans(err);
+      end; 
+      
+      if(not err)
+        StartTrans("  2.9. ", "Оценочный резерв");
+          err = ВыполнитьНачислениеОценочногоРезерва();
+        EndTrans(err);
+      end;  
+  end;
+
+  if(not err)
+    msgbox("Конвертация успешно завершена");
+  else
+    msgbox("#################################################################################");
+    msgbox("ВНИМАНИЕ!!!");
+    msgbox("При конвертации возникли ошибки. \nПосле устранения причин ошибок повторную конвертацию следует выполнять, начиная с проблемного блока. \nВсе предыдущие успешно выполненные блоки следует закомментировать в макросе.");
+    msgbox("#################################################################################");
+  end;
+
+  ReplaceMacro( "msgbox", NULL );
+
+OnError( err );
+  var j;
+  var err_text = "", delim = "";
+  
+  if(RslDefCon.IsInTrans)
+    RslDefCon.RollbackTrans();
+  end;
+  
+
+  if (IsEqClass ("TrslError", err))
+    err_text=err.Message;
+    if(IsEqClass ("TDbError", err.err))
+      err_text=err_text+":|"+err.err.Stat+"-"+err.err.Oper+"-"+err.err.Table+"-"+err.err.Message;
+    elif (isEqClass("TRsdError", err.err))
+
+      j = 0;
+      while(j < err.err.environment.ErrorCount)
+         err_text = err_text + delim  + err.err.environment.error(j).descr;
+         delim = "\n";
+         j = j + 1;
+      end;
+    end;
+  end;
+
+  if(err_text == "")
+    err_text=err.module+ " "+err.line+" "+err.message;
+  end;
+
+  msgbox(err_text);
+
+  return 1;
+end;
+
+ReplaceMacro("СохранитьСуммуКомиссии", "МСФО9_СохранитьСуммуКомиссии");
+ReplaceMacro("ПроводкаПоКатегориямУчета", "МСФО9_ПроводкаПоКатегориямУчета");
+ReplaceMacro("msgbox", "cnv_msgbox");
+
+StartExec();
+
+ReplaceMacro("msgbox", NULL );
+ReplaceMacro("ПроводкаПоКатегориямУчета", NULL);
+ReplaceMacro("СохранитьСуммуКомиссии", NULL);
+  

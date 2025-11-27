@@ -1,0 +1,888 @@
+/**
+ @file      677_load_reqs.mac
+ @brief     скроллинг загруженных заявок по Указу 677
+
+ #menu 
+  - БО ЦБ\Сделки\Заявки Указ 677
+
+ # tag
+ - code_type:GUI
+
+ # changelog
+ |date       |autor          |tasks                                           |note
+ |-----------|---------------|------------------------------------------------|-------------------------------------------------------------
+ |17.10.2024 |Велигжанин А.В.|DEF-74155                                       |Доработка getSqlDlContrID(), поиск по t_depoPart (для ИИС)
+ |16.10.2024 |Велигжанин А.В.|DEF-74155                                       |Доработка getSqlDlContrID(), условие с t_dateclose
+ |04.10.2024 |Велигжанин А.В.|BOSS-5467_BOSS-5628                             |Работа с t_state
+ |04.10.2024 |Велигжанин А.В.|BOSS-5467_BOSS-5619                             |Обновление остатков RefreshRest()
+ |03.10.2024 |Велигжанин А.В.|BOSS-5467_BOSS-5593                             |Заполнение t_DlContrID и других полей при загрузке файла
+ |03.10.2024 |Зыков М.В.     |BOSS-5467_BOSS-5561                             |Реализация функционала "Сформировать файл корректировок по всем записям"
+ |02.10.2024 |Велигжанин А.В.|BOSS-5467_BOSS-5554                             |Доработка ProccessFiles(), "Обработать файлы"
+ |02.10.2024 |Велигжанин А.В.|BOSS-5467_BOSS-5538                             |Пользовательское меню в скролинге
+ |01.10.2024 |Велигжанин А.В.|BOSS-5467_BOSS-5523                             |Скролинг Scroll677Reqs()
+ |01.10.2024 |Велигжанин А.В.|BOSS-5467_BOSS-5508                             |Создание 
+
+*/
+IMPORT BankInter, RSD, RCW, oralib, likepy, rsexts, "677_limout.mac";
+import "usr_open_files.mac";
+
+VAR x_ExitCode: integer = 0;
+
+// BOSS-5467_BOSS-5628
+const ERR_STATE  = "E";   
+const DEF_STATE  = " ";  // пробел  
+
+/**
+  @brief    True, если полученная ячейка содержит значение
+  @param[in]   val         значение ячейки
+*/
+PRIVATE MACRO NotNull ( val )
+    if ( val == NULL ) return false; end;
+    if ( ValType (val) == 26 ) return false; end;
+    return true;
+END;
+
+private class c_logger(p_objectName:string)
+  private var objectName = p_objectName;
+
+  macro Debug(text:string)
+    var query = "begin "
+              + "  it_log.log_handle(p_object => :obj, "
+              + "                    p_msg    => :msg, "
+              + "                    p_msg_type => it_log.c_msg_type__debug); "
+              + "end;";
+
+    ExecSql(query, MakeArray(SqlParam("obj", objectName),
+                             SqlParam("msg", text)));
+  end;
+
+  macro Error(text:string)
+    var query = "begin "
+              + "  it_log.log_error(p_object => :obj, "
+              + "                   p_msg    => :msg); "
+              + "end;";
+
+    ExecSql(query, MakeArray(SqlParam("obj", objectName),
+                             SqlParam("msg", text)));
+  end;
+end;
+
+private var logger:c_logger = c_logger("677_load_reqs.mac");
+
+/* @brief Класс для проверки, есть ли файл в usr_req677_dbt.
+ */
+private class c_file_manager(_fileName:string)
+  private var fullFileName:string;
+  private var fileName:string;
+  private var extName:string;
+  private var dirName:string;
+  private var idFile:integer;
+
+  private macro GetID():integer
+    var row = ExecSqlselect("select r.t_id from usr_req677_dbt r where r.t_filename = :1", MakeArray(SqlParam("1", fileName+extName)));
+    if (row.MoveNext())
+      return row.value("t_id");
+    end;
+    return 0;
+  end;
+
+  private macro Construct(_fileName:string)
+    fullFileName = _fileName;
+    splitFile(fullFileName, fileName, extName);
+    dirName = substr(fullFileName, 1, index(fullFileName, fileName) - 1);
+    idFile = GetID();
+  end;
+
+  macro ID():integer
+    return idFile;
+  end;
+
+  Construct(_fileName);
+end;
+
+/**
+  @brief    Функция добавления колонки в массив для скролинга
+*/
+PRIVATE MACRO AddColumn( ar:@TArray, ind, fld, head, width, fldType, DecPoint )
+ ar.value( ind * 6 + 0 ) = fld; //FieldName
+ ar.value( ind * 6 + 1 ) = head; //Header
+ ar.value( ind * 6 + 2 ) = width; //Null //Width
+ ar.value( ind * 6 + 3 ) = fldType; //fldType //2 = FBT
+ ar.value( ind * 6 + 4 ) = DecPoint; //Null //DecPoint
+ ar.value( ind * 6 + 5 ) = 0; //reserve
+END;
+
+
+/* @brief номера колонок в файле
+ */
+private class c_columns()
+  var _CFTID:integer;
+  var _ISIN:integer;
+  var _ISSUER:integer;
+  var _SECBRIEF:integer;
+  var _DEPOACC:integer;
+  var _DEPOPART:integer;
+  var _STORAGE:integer;
+  var _REST:integer;
+  var _DATE:integer;
+  var _TIME:integer;
+
+  macro setPosition(columnName:string, position:integer)
+    if (columnName == "CFTID")		_CFTID = position;      return;		end;
+    if (columnName == "ISIN")      	_ISIN = position;      	return;		end;
+    if (columnName == "ISSUER")      	_ISSUER = position;  	return;		end;
+    if (columnName == "SECBRIEF")      	_SECBRIEF = position;  	return;		end;
+    if (columnName == "DEPOACC")      	_DEPOACC = position;  	return;		end;
+    if (columnName == "СЧЕТДЕПО")      	_DEPOACC = position;  	return;		end;
+    if (columnName == "DEPOPART")      	_DEPOPART = position;  	return;		end;
+    if (columnName == "РАЗДЕЛ")      	_DEPOPART = position;  	return;		end;
+    if (columnName == "STORAGE")      	_STORAGE = position;  	return;		end;
+    if (columnName == "МЕСТО ХРАНЕНИЯ")	_STORAGE = position;  	return;		end;
+    if (columnName == "МЕСТО_ХРАНЕНИЯ")	_STORAGE = position;  	return;		end;
+    if (columnName == "REST")      	_REST = position;  	return;		end;
+    if (columnName == "ОСТАТОК")      	_REST = position;  	return;		end;
+    if (columnName == "DATE")      	_DATE = position;  	return;		end;
+    if (columnName == "TIME")      	_TIME = position;  	return;		end;
+  end;
+
+  macro CFTID
+    return _CFTID;
+  end;
+
+  macro ISIN
+    return _ISIN;
+  end;
+
+  macro ISSUER
+    return _ISSUER;
+  end;
+
+  macro SECBRIEF
+    return _SECBRIEF;
+  end;
+
+  macro DEPOACC
+    return _DEPOACC;
+  end;
+
+  macro DEPOPART
+    return _DEPOPART;
+  end;
+
+  macro STORAGE
+    return _STORAGE;
+  end;
+
+  macro REST
+    return _REST;
+  end;
+
+  macro mDATE
+    return _DATE;
+  end;
+
+  macro mTIME
+    return _TIME;
+  end;
+
+  macro GetEmptyColumns():string
+    var res:string = "";
+    if (not NotNull(_CFTID)) 			res = res + "_CFTID;";			end;
+    if (not NotNull(_ISIN)) 			res = res + "_ISIN;";			end;
+    if (not NotNull(_ISSUER)) 			res = res + "_ISSUER;";			end;
+    if (not NotNull(_SECBRIEF)) 		res = res + "_SECBRIEF;";		end;
+    if (not NotNull(_DEPOACC)) 			res = res + "_DEPOACC;";		end;
+    if (not NotNull(_DEPOPART)) 		res = res + "_DEPOPART;";		end;
+    if (not NotNull(_STORAGE)) 			res = res + "_STORAGE;";		end;
+    if (not NotNull(_DATE)) 			res = res + "_DATE;";			end;
+    if (not NotNull(_TIME)) 			res = res + "_TIME;";			end;
+
+    return res;
+  end;
+
+  macro Check():bool
+    return (GetEmptyColumns == "")
+  end;
+
+end;
+
+private var columns = c_columns();
+
+/**
+  @brief    Парсинг колонок и корректировка позиции обязательного поля
+  p_file - сам файл
+*/
+PRIVATE MACRO ParseColumns( p_file)
+  Var col = 0;
+
+  while ( p_file(col) != "" )
+    columns.setPosition(StrUpr(p_file(col)), col);
+    col = col + 1;
+  end;
+END;
+
+/**
+  @brief    Запрос для вставки записи в usr_req677_dbt
+*/
+private macro getQueryInsert:string
+  return 
+    "INSERT INTO usr_req677_dbt r ("
+    + " r.t_id, r.t_filename, r.t_cftid, r.t_isin, r.t_issuer "
+    + " , r.t_secbrief, r.t_depoacc, r.t_depopart, r.t_storage, r.t_rest "
+    + " , r.t_date, r.t_time, r.t_dlcontrID, r.t_state, r.t_comment, r.t_ekk "
+    + " , r.t_outexrest, r.t_exrest "
+    + " ) VALUES (" 
+    + " 0, :t_filename, :t_cftid, :t_isin, :t_issuer "
+    + " , :t_secbrief, :t_depoacc, :t_depopart, :t_storage, :t_rest "
+    + " , :t_date, :t_time, :t_dlcontrID, :t_state, :t_comment, :t_ekk "
+    + " , :t_outexrest, :t_exrest "
+    + " )"
+  ;
+end;
+
+/**
+  @brief    Запрос для определения DlContrID
+*/
+private macro getSqlDlContrID:string
+  return 
+    "SELECT d.t_dlcontrID FROM "
+    + " (SELECT :p_CftID AS t_cftID, :p_DepoAcc AS t_depoAcc, :p_DepoPart AS t_DepoPart FROM dual) prm "
+    + " , dobjcode_dbt o, dsfcontr_dbt s, ddlcontr_dbt d "
+    + " left join dnotetext_dbt n101 on N101.T_NOTEKIND = 101 and N101.T_OBJECTTYPE = 207 and lpad(d.t_dlcontrid,34,'0') = N101.T_DOCUMENTID "
+    + " left join dnotetext_dbt n104 on  N104.T_NOTEKIND = 104 and N104.T_OBJECTTYPE = 207 and lpad(d.t_dlcontrid,34,'0') = N104.T_DOCUMENTID "
+    + " WHERE o.t_code = prm.t_cftID and o.t_state = 0 and o.t_objecttype = 3 and o.t_codekind = 101 "
+    + " AND s.t_partyid = o.t_objectid AND s.t_dateclose = to_date('01010001','ddmmyyyy') AND d.t_sfcontrid = s.t_id "
+    + " AND (( replace(rsb_struct.getstring(n101.t_text),chr(0)) = prm.t_depoAcc) "
+    + "        or (replace(rsb_struct.getstring(n104.t_text),chr(0)) = prm.t_depoAcc) ) "
+    + " and case when instr(prm.t_depoPart,'-3636-') > 0 then chr(0) "
+    + "          when instr(prm.t_depoPart,'-6336-') > 0 then chr(88) else chr(0) end = d.t_iis "
+  ;
+end;
+
+/**
+  @brief    Определение идентификатора ДБО клиента
+*/
+private macro GetDlContrID( p_CftID :string, p_DepoAcc :string, p_DepoPart :string ) : integer
+  var row = ExecSqlselect( getSqlDlContrID, MakeArray(
+            SqlParam("p_CftID", p_CftID)
+            , SqlParam("p_DepoAcc", p_DepoAcc)
+            , SqlParam("p_DepoPart", p_DepoPart)
+  ));
+  if (row.MoveNext())
+    return row.value("t_dlcontrID");
+  end;
+  return 0;
+onError(erru)  
+  return 0;
+end;
+
+/**
+  @brief    Запрос для определения ЕКК клиента
+*/
+private macro getSqlEkk:string
+  return 
+    "SELECT r.t_code FROM ddlobjcode_dbt r "
+    + " WHERE r.t_objecttype = 207 and r.t_objectid = :p_DlContrID "
+    + " and r.t_codekind = 1 and r.t_bankclosedate = to_date('01010001','ddmmyyyy') "
+  ;
+end;
+
+/**
+  @brief    Определение ЕКК клиента
+*/
+private macro GetEkk( p_DlContrID :integer ) : string
+  var row = ExecSqlselect( getSqlEkk, MakeArray(
+            SqlParam("p_DlContrID", p_DlContrID)
+  ));
+  if (row.MoveNext())
+    return row.value("t_code");
+  end;
+  return StrFor(0);
+end;
+
+/**
+  @brief    Запрос для определения остатка
+*/
+private macro getSqlRest:string
+  return 
+    "SELECT nvl(sum(wrt.t_amount),0) AS sumWrt "
+    + " FROM ddlcontrmp_dbt m, dsfcontr_dbt s, davoiriss_dbt a, dpmwrtcl_Dbt wrt "
+    + " WHERE m.t_dlcontrid = :p_DlContrID and s.t_servkind = 1 and s.t_servkindsub = :p_servkindsub and S.T_DATECLOSE = to_date('01010001','ddmmyyyy') "
+    + " and s.t_id = m.t_sfcontrid "
+    + " and a.t_isin = :p_Isin "
+    + " and wrt.t_party = s.t_partyid and wrt.t_contract = s.t_id and wrt.t_fiid = a.t_fiid and wrt.t_enddate = to_date('31129999','ddmmyyyy') "
+  ;
+end;
+
+/**
+  @brief    Определение остатка
+*/
+private macro GetRest( p_DlContrID :integer, p_Isin :string, p_ServKindSub: integer ) : numeric
+  var row = ExecSqlselect( getSqlRest, MakeArray(
+            SqlParam("p_DlContrID", p_DlContrID)
+            , SqlParam("p_ServKindSub", p_ServKindSub)
+            , SqlParam("p_Isin", p_Isin)
+  ));
+  if (row.MoveNext())
+    return row.value("sumWrt");
+  end;
+  return $0.0;
+onError(erru)  
+  return $0.0;
+end;
+
+/**
+  @brief    Запрос для PartyID по ДБО
+*/
+private macro getSqlPartyID:string
+  return 
+    "SELECT MIN(s.t_partyid) AS t_partyid "
+    + " FROM dsfcontr_dbt s JOIN ddlcontrmp_dbt m ON m.t_sfcontrid = s.t_id "
+    + " WHERE s.t_servkind = 1 AND s.t_servkindsub = 8 and  m.t_dlcontrid = :p_dlcontrid "
+  ;
+end;
+
+/**
+  @brief    Определение PartyID по ДБО
+*/
+private macro GetPartyID( p_DlContrID :integer ) : integer
+  var row = ExecSqlselect( getSqlPartyID, MakeArray(
+            SqlParam("p_DlContrID", p_DlContrID)
+  ));
+  if (row.MoveNext())
+    return row.value("t_partyid");
+  end;
+  return 0;
+onError(erru)  
+  return 0;
+end;
+
+
+/**
+  @brief    Запрос для определения перевода
+*/
+private macro getSqlMove:string
+  return 
+    "SELECT 1 AS a "
+    + " FROM    ddl_tick_Dbt t1 "
+    + " JOIN    ddl_leg_Dbt l1 ON t1.t_dealid = l1.t_dealid AND l1.t_legkind = 0 AND l1.t_legid = 0 "
+    + " WHERE     t1.t_bofficekind = 127 "
+    + " AND t1.t_dealtype = 2010 AND t1.t_dealstatus = 20 and t1.t_dealdate > trunc(sysdate) - 100 "
+    + " AND t1.t_clientid = :p_PartyID "
+    + " AND t1.t_pfi = (select a.t_fiid from davoiriss_dbt a where a.t_isin = :p_isin) "
+    + " AND t1.t_clientcontrid IN ( "
+    + "     SELECT s.t_id FROM dsfcontr_dbt s JOIN ddlcontrmp_dbt m ON m.t_sfcontrid = s.t_id "
+    + "     WHERE s.t_servkind = 1 AND s.t_servkindsub = 8 and  m.t_dlcontrid = :p_dlcontrid "
+    + " AND EXISTS "
+    + " ( SELECT 1 FROM ddl_tick_Dbt t2   join ddl_leg_dbt l2 ON t2.t_dealid = l2.t_dealid AND l2.t_legkind = 0 AND l2.t_legid  = 0 "
+    + " WHERE t2.t_bofficekind = 127 "
+    + " AND t2.t_dealtype = 2011 AND t2.t_dealstatus = 20 AND l2.t_principal = l1.t_principal "
+    + " AND t1.t_pfi = t2.t_pfi AND t1.t_clientid = t2.t_clientid "
+    + " AND t2.t_clientcontrid IN ( "
+    + " SELECT s.t_id FROM dsfcontr_dbt s join ddlcontrmp_dbt m ON m.t_sfcontrid = s.t_id "
+    + " WHERE s.t_servkind = 1 AND s.t_servkindsub = 9 and  m.t_dlcontrid = :p_dlcontrid1) "
+    + " )) "
+  ;
+end;
+
+/* @brief открытие, проверка и чтение файла.
+*/
+private macro ReadFile( p_DirName:string, p_FileName:string, p_OkCount:@integer, p_ErrCount:@integer )
+  var x_Sql;
+  var c_file = c_txt_file();
+  var errstr:string;
+  var count:integer = 0;
+  var x_queryInsert:string = getQueryInsert();
+  // BOSS-5467_BOSS-5593
+  var x_CftID :string;
+  var x_DepoAcc :string;
+  var x_DepoPart :string;
+  var x_DlContrID :integer;
+  var x_Isin :string;
+  var x_State :string;
+  var x_Cmnt :string;
+  var x_Ekk :string;
+  var x_OutExRest: numeric = $0.0;
+  var x_ExRest: numeric = $0.0;
+
+  file workFile () txt;
+  SetDelim(";");
+
+  if (not c_file.OpenFile(workFile, null, false, true, p_DirName+p_FileName, "rsansi", @errStr))
+    Println (errStr);
+    return false;
+  end;
+
+  next(workFile); //header
+  ParseColumns(workFile);
+
+  if (not columns.Check())
+    Println ("Не заданы колонки в файле: " + columns.GetEmptyColumns());
+    return false;
+  end;
+
+  while (next(workFile))
+    x_CftID = workFile(columns.CFTID);
+    x_DepoAcc = workFile(columns.DEPOACC);
+    x_DepoPart = workFile(columns.DEPOPART);
+    x_Isin = workFile(columns.ISIN);
+    x_DlContrID = GetDlContrID(x_CftID, x_DepoAcc, x_DepoPart);
+    x_State = DEF_STATE;
+    x_Cmnt = StrFor (0);
+    x_Ekk = StrFor (0);
+    x_OutExRest = $0.0;
+    x_ExRest = $0.0;
+    if( x_DlContrID == 0 ) 
+      x_State = ERR_STATE;
+      x_Cmnt = "Не найден ДБО";
+    else
+      x_Ekk = GetEkk(x_DlContrID);
+      x_OutExRest = GetRest( x_DlContrID, x_Isin, 9 );
+      x_ExRest = GetRest( x_DlContrID, x_Isin, 8 );
+    end;
+    x_Sql = ExecSql(x_queryInsert, MakeArray(
+                    SqlParam("t_filename",            	p_FileName)
+                    , SqlParam("t_cftid", 		x_CftID)
+                    , SqlParam("t_isin", 		x_Isin)
+                    , SqlParam("t_issuer", 		workFile(columns.ISSUER))
+                    , SqlParam("t_secbrief", 		workFile(columns.SECBRIEF))
+                    , SqlParam("t_depoacc", 		x_DepoAcc)
+                    , SqlParam("t_depopart", 		x_DepoPart)
+                    , SqlParam("t_storage", 		workFile(columns.STORAGE))
+                    , SqlParam("t_rest", 		workFile(columns.REST))
+                    , SqlParam("t_date", 		workFile(columns.mDATE))
+                    , SqlParam("t_time", 		workFile(columns.mTIME))
+                    , SqlParam("t_dlcontrID", 		x_DlContrID)
+                    , SqlParam("t_state", 		x_State)
+                    , SqlParam("t_comment", 		x_Cmnt)
+                    , SqlParam("t_ekk", 		x_Ekk)
+                    , SqlParam("t_outexrest", 		x_OutExRest)
+                    , SqlParam("t_exrest", 		x_ExRest)
+    ));
+    if (x_Sql == null)
+      p_ErrCount = p_ErrCount + 1;
+      logger.Error("Error. row: " + workFile.str);
+    else
+      p_OkCount = p_OkCount + 1;
+    end;
+    if (x_State == ERR_STATE)
+      p_ErrCount = p_ErrCount + 1;
+    end;
+  end; // while
+
+  close(workFile);
+
+  return true;
+
+onError(errObj)
+  close(workFile);
+  println("Unexpected error. rownum: " + count + ". row: " + workFile.str + ". Text: " + errObj.Message);
+  return false;
+end;
+
+
+/**
+  @brief    Обработка одного файла
+*/
+PRIVATE macro ProcessOneFile( p_DirName, p_FileName )
+
+  var 
+    itFileManager :c_file_manager
+    , x_OkCount :integer = 0
+    , x_ErrCount :integer = 0
+  ;
+
+  logger.Debug("Обработка файла " + p_FileName);
+
+  itFileManager = c_file_manager(p_FileName);
+  if (itFileManager.ID() != 0)
+    Println ("Файл " + p_FileName + " был загружен ранее");
+    return false;
+  end;
+
+  ReadFile(p_DirName, p_FileName, @x_OkCount, @x_ErrCount);
+
+  Println (
+    "Загружен файл " + p_FileName 
+    + ": Количество загруженных строк " + string(x_OkCount)
+    + ".  Количество ошибок: " + string(x_ErrCount)
+  );
+  
+
+END;
+
+
+/**
+  @brief    обработка файлов с формированием протокола
+*/
+PRIVATE macro RepProccessFiles()
+
+  const IMP677_DIR  = "РСХБ\\ДИРЕКТОРИИ\\IMPORT_677_REQ"; // BOSS-5467_BOSS-5492
+
+  Var 
+    errCode: Integer
+    , PathIn: String
+    , fName: String
+    , err:string
+  ;
+
+  //в реестр настроек добавлять можно без экранирования слешей
+  GetRegistryValue(IMP677_DIR, V_STRING, PathIn, errCode);
+
+  if ( ErrCode != 0 )
+    Println ("Нет настройки '" + IMP677_DIR + "'");
+    return FALSE;
+  end;
+
+  var dl = tDirList(PathIn + "\\EurobondsRUS*.csv", "fd"), i;
+
+  if(dl.Count == 0)
+     Println ("Нет файлов " + PathIn + "\\EurobondsRUS*.csv");
+  else 
+    dl.Sort(0, true);
+    i = 0;
+    while(i < dl.Count)
+      if (index(StrLwr(dl.Name(i)), "eurobondsrus") != 0)
+        ProcessOneFile(PathIn, dl.Name(i));
+      end;
+      i = i + 1;
+    end;
+  end;
+
+  return TRUE;
+END;
+
+
+/**
+  @brief    Обработать файлы
+*/
+PRIVATE macro ProccessFiles()
+
+  if (MsgBoxEx("Выполнить обработку файлов с заявками?", MB_YES + MB_NO, IND_YES) != IND_YES)
+    return;
+  end;
+  
+  SetOutPut(gettxtfilename("677_load_reqs_"+StrSubst(string(date()),".","")+StrSubst(string(time()),":","")),false);
+
+  var stat = RepProccessFiles(); // обработка файлов с формированием протокола
+
+  ViewFile(SetOutPut(null, true));
+  SetOutPut(null, true)
+END;
+
+private macro iif(val, retval, retval2)
+ if (Val)
+    return retval;
+ else
+    return retval2;
+ end;
+end;
+
+
+/**
+  @brief    Сформировать корректировки
+*/
+macro CreateCorrect( CorrectType:integer ) // 1- все 0- новые 
+  var err = false, errTxt="", sql, cmd, DataSet,cmd2, DataSet2,cmd3, DataSet3, cnt=0,pz=1;
+   
+  sql = " delete  DDL_LIMITADJUST_DBT la where la.t_id_step = -99  " ;   
+  cmd = RSDCommand(sql);
+  cmd.execute();
+  DataSet = null;
+  cmd = null ; 
+  sql = "select count(*) over() cnt, t_id,t.t_dlcontrid,t.t_isin, t.t_exrest, t.t_rest from USR_REQ677_DBT t where t.t_state in (chr(0),chr(32)"+iif((CorrectType==1),",chr(88),'F'","")+") and t.t_exrest > 0 " ;   
+  cmd = RsdCommand(sql);
+  cmd.Execute();
+  DataSet = TRsbDataSet(cmd);
+  while (DataSet.movenext)
+    if (cnt == 0)
+      cnt = int(DataSet.cnt);
+      InitProgress(cnt,"Формирование корректировок лимитов","Формирование корректировок лимитов");
+    end;
+    err = false; errTxt="" ;
+    sql = " select mp.t_sfcontrid from ddlcontrmp_dbt mp join dsfcontr_dbt sfc on mp.t_sfcontrid = sfc.t_id "+
+        " where mp.t_dlcontrid = ? and sfc.t_servkind = 1 and sfc.t_servkindsub = 8 and mp.t_marketid = 2 "+
+             " and (sfc.t_DateClose = TO_DATE('01.01.0001', 'DD.MM.YYYY') or sfc.t_DateClose >= trunc(sysdate)) ";
+    cmd2 = RsdCommand(sql);
+    cmd2.AddParam("",RSDBP_IN,int(DataSet.dlcontrid));
+    cmd2.Execute();
+    DataSet2 = TRsbDataSet(cmd2);
+    if (DataSet2.movenext)
+      sql = " select t_fiid from davoiriss_dbt av  where av.t_isin =  ? ";
+      cmd3 = RsdCommand(sql);
+      cmd3.AddParam("",RSDBP_IN,DataSet.isin);
+      cmd3.Execute();
+      DataSet3 = TRsbDataSet(cmd3);
+      if (DataSet3.movenext)
+        err = not ( InsertLimitAdjust677(int(DataSet2.sfcontrid), "0", -min(DataSet.rest,DataSet.exrest), int(DataSet3.fiid), date(), -int(DataSet.id),null, @errTxt)
+                and InsertLimitAdjust677(int(DataSet2.sfcontrid), "1", -min(DataSet.rest,DataSet.exrest), int(DataSet3.fiid), date(), -int(DataSet.id),null, @errTxt)
+                and InsertLimitAdjust677(int(DataSet2.sfcontrid), "2", -min(DataSet.rest,DataSet.exrest), int(DataSet3.fiid), date(), -int(DataSet.id),null, @errTxt)
+                and InsertLimitAdjust677(int(DataSet2.sfcontrid), "365",-min(DataSet.rest,DataSet.exrest), int(DataSet3.fiid), date(), -int(DataSet.id),null, @errTxt)) ;
+      else
+        errTxt = "Не найдет идентификатор ЦБ ";
+        err = true;
+      end;
+    else
+      errTxt="Не найдет идентификатор субдоговора фондового рынка на московской бирже";
+      err = true;
+    end;
+    DataSet2 = null;
+    cmd2 = null ; 
+    DataSet3 = null;
+    cmd3 = null ; 
+    sql = "update USR_REQ677_DBT t set t.t_state = ? , t.t_comment = ?, t.t_updatesysdate = sysdate where  t.t_id = ? ";
+    cmd2 = RsdCommand(sql);
+    cmd2.AddParam("",RSDBP_IN,iif(err,"F","X"));
+    cmd2.AddParam("",RSDBP_IN,iif(err,errTxt,""));
+    cmd2.AddParam("",RSDBP_IN,int(DataSet.id));
+    cmd2.Execute();
+    UseProgress(pz);
+    pz=pz+1;
+  end;
+  DataSet = null;
+  cmd = null ; 
+  if (cnt > 0)
+    RemProgress ;
+    LimitCorOutInternal(date());
+  else
+    msgbox("Нет данных для выгрузки");
+  end;
+end;
+
+/**
+  @brief    Сформировать файл корректировок по всем записям
+*/
+macro CreateAllCorrects()
+  if (MsgBoxEx("Сформировать файл корректировок по всем записям с остатком на биржевом рынке?", MB_YES + MB_NO, IND_YES) != IND_YES)
+    return;
+  end;
+   CreateCorrect(1);
+END;
+
+/**
+  @brief    Сформировать файл корректировок по новым записям
+*/
+PRIVATE macro CreateNewCorrects()
+  if (MsgBoxEx("Сформировать файл корректировок по новым записям с остатком на биржевом рынке?", MB_YES + MB_NO, IND_YES) != IND_YES)
+    return;
+  end;
+   CreateCorrect(0);
+END;
+
+/**
+  @brief    Возвращает true, если по ДБО и бумаге был перевод
+*/
+PRIVATE macro GetMoveInfo( p_DealDate : date, p_DlContrID : integer, p_Isin : string ) :bool
+  var x_PartyID = GetPartyID(p_DlContrID);
+  var row = ExecSqlselect( getSqlMove, MakeArray(
+            SqlParam("p_PartyID", x_PartyID)
+            , SqlParam("p_Isin", p_Isin)
+            , SqlParam("p_DlContrID", p_DlContrID)
+            , SqlParam("p_DlContrID1", p_DlContrID)
+  ));
+  if (row.MoveNext())
+    return true;
+  end;
+  RETURN false;
+onError(errObj)
+  RETURN false;
+END;
+
+/**
+  @brief    BOSS-5467_BOSS-5619 Обновить остатки и информацию о переводах
+*/
+PRIVATE macro RefreshRest()
+
+  var err = false, errTxt="", sql, cmd, DataSet,cmd2, DataSet2,cmd3, DataSet3, cnt=0,pz=1;
+  var x_DlContrID :integer, x_ID :integer;
+  var x_Isin :string;
+  var x_OutExRest: numeric = $0.0;
+  var x_ExRest: numeric = $0.0;
+  var x_State :string;
+  var x_Cmnt :string;
+  var x_DateReq :date;
+   
+  sql = "SELECT "
+        + " count(*) over() cnt, r.t_id, NVL(r.t_dlcontrid,0) AS t_dlcontrid, NVL(r.t_isin, chr(0)) AS t_isin"
+        + " , NVL(r.t_state,'*') AS t_state, NVL(r.t_comment,'*') AS t_cmnt, NVL(r.t_date, sysdate) AS t_date "
+        + " FROM usr_req677_dbt r "
+        + " WHERE NVL(r.t_state,'*') != 'E' "
+  ;   
+  cmd = RsdCommand(sql);
+  cmd.Execute();
+  DataSet = TRsbDataSet(cmd);
+  while (DataSet.movenext)
+    if (cnt == 0)
+      cnt = int(DataSet.cnt);
+      InitProgress(cnt,"Обновление остатков","Обновление остатков");
+    end;
+    x_ID = int(DataSet.id); 
+    x_DlContrID = int(DataSet.dlcontrid); 
+    x_Isin = DataSet.isin;
+    x_State = DataSet.state;
+    x_DateReq = date(DataSet.date);
+    x_OutExRest = $0.0;
+    x_ExRest = $0.0;
+    x_Cmnt = DataSet.cmnt;
+    if( x_State == "*" ) 
+      x_State = DEF_STATE;
+    end;
+    if( x_Cmnt == "*" ) 
+      x_Cmnt = DEF_STATE;
+    end;
+    if( (x_DlContrID > 0) AND (x_Isin != StrFor(0)) ) 
+      x_OutExRest = GetRest( x_DlContrID, x_Isin, 9 );
+      x_ExRest = GetRest( x_DlContrID, x_Isin, 8 );
+      if( GetMoveInfo(x_DateReq, x_DlContrID, x_Isin) ) 
+        x_State = "I";
+        x_Cmnt = "Выполнен перевод";
+      end;
+    end;
+    sql = "UPDATE usr_req677_dbt r "
+          + " SET r.t_state = ?, r.t_comment = ?, r.t_outexrest = ?, r.t_exrest = ? "
+          + " WHERE  r.t_id = ? "
+    ;
+    cmd2 = RsdCommand(sql);
+    cmd2.AddParam("", RSDBP_IN, x_State);
+    cmd2.AddParam("", RSDBP_IN, x_Cmnt);
+    cmd2.AddParam("", RSDBP_IN, x_OutExRest);
+    cmd2.AddParam("", RSDBP_IN, x_ExRest);
+    cmd2.AddParam("", RSDBP_IN, x_ID);
+    cmd2.Execute();
+    UseProgress(pz);
+    pz=pz+1;
+  end;
+  DataSet = null;
+  cmd = null ; 
+  if (cnt > 0)
+    RemProgress ;
+  end;
+
+END;
+
+/**
+  @brief    Отображение меню
+*/
+PRIVATE macro ShowMenu()
+  var resultChoice;
+  array a;
+  a(0) = "Обработать файлы";
+  a(1) = "Сформировать файл корректировок по всем записям";
+  a(2) = "Сформировать файл корректировок по новым записям";
+  a(3) = "Обновить остатки и информацию о переводах";
+  resultChoice = Menu(a, NULL, NULL, 4, 6);
+  if(resultChoice == 0)
+     ProccessFiles(); 
+  elif(resultChoice == 1)
+     CreateAllCorrects();
+  elif(resultChoice == 2)
+     CreateNewCorrects();
+  elif(resultChoice == 3)
+     RefreshRest();
+  end;
+end;
+
+/**
+  @brief    Отображение скролинга загруженных заявок по Указу 677
+
+*/
+PRIVATE MACRO  Scroll677Reqs
+ 
+  var x_Query :string = ""
+      , x_DataSet :RsdRecordset
+      , x_Cmd
+      , x_Columns = TArray()
+      ;
+
+  macro EventHandler( rsd, cmd, id, key)
+   if( (cmd == DLG_KEY) and (key == 27 ) ) //Esc
+      x_ExitCode = 27;
+      return CM_SELECT;
+   elif( (cmd == DLG_KEY) and (key == 13 ) )  // Enter
+      ShowMenu();
+      return CM_SELECT;
+   end; 
+  end; // EventHandler
+
+
+  // BOSS-5467_BOSS-5619 Обновить остатки и информацию о переводах
+  RefreshRest();
+
+  x_Query = " SELECT r.t_id, r.t_filename"
+          + "   , to_char(r.t_createsysdate, 'dd-mm-yyyy hh24:mi:ss') AS t_createsysdate "
+          + "   , r.t_cftID, r.t_isin, r.t_issuer " 
+          + "   , r.t_secBrief, r.t_depoAcc, r.t_depoPart, r.t_storage, r.t_rest, r.t_date, r.t_time "
+          + "   , r.t_dlcontrID, r.t_ekk, r.t_outexrest, r.t_exrest, r.t_state, r.t_comment " 
+          + "   , to_char(r.t_updatesysdate, 'dd-mm-yyyy hh24:mi:ss') AS t_updatesysdate " 
+          + " FROM usr_req677_dbt r ORDER BY r.t_id "
+  ;
+
+  AddColumn(@x_Columns, 0, "t_id", "ID", 10, V_INTEGER );
+  AddColumn(@x_Columns, 1, "t_filename", "Имя файла", 20, V_STRING );
+  AddColumn(@x_Columns, 2, "t_createsysdate", "Загружено", 20, V_DATE );
+  AddColumn(@x_Columns, 3, "t_cftID", "Код ЦФТ", 10, V_STRING );
+  AddColumn(@x_Columns, 4, "t_isin", "ISIN", 10, V_STRING );
+  AddColumn(@x_Columns, 5, "t_issuer", "Эмитент", 10, V_STRING );
+  AddColumn(@x_Columns, 6, "t_secBrief", "Наименование ФИ", 20, V_STRING );
+  AddColumn(@x_Columns, 7, "t_depoAcc", "Счет Депо", 10, V_STRING );
+  AddColumn(@x_Columns, 8, "t_depoPart", "Раздел Депо", 10, V_STRING );
+  AddColumn(@x_Columns, 9, "t_storage", "Место хранения", 20, V_STRING );
+  AddColumn(@x_Columns, 10, "t_rest", "Остаток", 10, V_STRING );
+  AddColumn(@x_Columns, 11, "t_date", "Дата заявки", 10, V_STRING );
+  AddColumn(@x_Columns, 12, "t_time", "Время заявки", 10, V_STRING );
+  AddColumn(@x_Columns, 13, "t_dlcontrID", "ДБО ID", 10, V_STRING );
+  AddColumn(@x_Columns, 14, "t_ekk", "ЕКК", 10, V_STRING );
+  AddColumn(@x_Columns, 15, "t_outexrest", "Остаток внебирж.", 20, V_STRING );
+  AddColumn(@x_Columns, 16, "t_exrest", "Остаток бирж.", 20, V_STRING );
+  AddColumn(@x_Columns, 17, "t_state", "Статус", 10, V_STRING );
+  AddColumn(@x_Columns, 18, "t_comment", "Комментарий", 10, V_STRING );
+  AddColumn(@x_Columns, 19, "t_updatesysdate", "Обновлено", 20, V_DATE );
+
+  x_Cmd = RsdCommand(x_Query);
+  x_DataSet = RSDRecordSet( x_Cmd, RSDVAL_CLIENT, RSDVAL_STATIC );
+  RunScroll( x_DataSet, 20, x_Columns, "Scroll677Reqs", @EventHandler, "Заявки Указ 677", "~Esc~ Выход ~Enter~ Выбор действия", true, 0, 1 );
+
+  return TRUE;
+onError(erru)  
+  return false;
+END;
+
+/**
+  @brief    Функция проверки рубильника
+  @param[in]   p_RelayName - наименование настройки
+*/
+PRIVATE MACRO  GetRelay ( p_RelayName: STRING )
+  var ErrCode, FlagValue:bool;
+
+  GetRegistryValue( p_RelayName, V_BOOL, FlagValue, ErrCode );
+  if ( ErrCode != 0 )
+     FlagValue = false;
+  end;
+
+  return FlagValue;
+onError(erru)  
+  return false;
+END;
+
+/**
+  @brief    проверка рубильника
+*/
+PRIVATE MACRO CheckRelay
+  var x_RelayName: STRING = "РСХБ\\БРОКЕРСКОЕ ОБСЛУЖИВАНИЕ\\677_УКАЗ";
+  var x_RelayFlag: BOOL = GetRelay( x_RelayName );
+  if(not x_RelayFlag)
+    msgbox("Нет настройки \n'" + x_RelayName + "'\n или ее значение = 'NO'");
+  else
+    x_ExitCode = 0;
+    while( x_ExitCode != 27 )
+      Scroll677Reqs();
+    end;
+  end;
+end;
+
+
+/**
+  @brief    Начинаем с проверки рубильника
+*/
+CheckRelay();
+Exit(1);

@@ -1,0 +1,897 @@
+/*
+$Name:             selinpay.mac
+$Module:           Кредитование
+$Description:      Входящие платежи
+*/
+import SbCrdInter, LoansFind, total, CTInter, PaymInter, cryptdlm, FIInter, likepy, oralib;
+
+PRIVATE VAR
+    f_stcrd  = TBfile("set_tcr.tmp",  "W", 0),
+    f_igtd   = TBfile("igtmpdoc.tmp", "W", 0),
+    f_pm     = TBfile("pmpaym.dbt",   "R", 11),
+    f_rmprop = TBfile("pmrmprop.dbt", "R", 0),
+    f_crd    = TBfile("credit_c.dbt", "R", 0),
+    f_duty   = TBfile("duty_crd.dbt", "R", 1);
+
+PRIVATE VAR stat  : bool = false,
+            regim : bool = false;
+
+PRIVATE const BO_RS_LOANS       = 1,
+              DLDOC_BANKPAYMENT = 16,
+              CASH_BOF_INCORDER = 430,
+              CASH_BOF_OUTORDER = 440;
+
+VAR SetFlag   : string;
+
+PRIVATE RECORD rec_duty ("duty_crd.dbt", "loans.def");
+PRIVATE CONST  PS_PAYORDER = 201;
+
+PRIVATE MACRO GetOprDocumentID(DocKind, PmDocID)
+   VAR OperDocID :string  = "",
+       DocIDLen  :integer = 0,
+       strDocID  :string  = string(PmDocID),
+       strDocID_l:integer = strlen(strDocID);
+
+   // "Платеж банка"
+   IF ((f_pm.rec.DocKind == DLDOC_BANKPAYMENT) OR
+       (f_pm.rec.DocKind == CASH_BOF_INCORDER) OR
+       (f_pm.rec.DocKind == CASH_BOF_OUTORDER) OR
+       (f_pm.rec.DocKind == PS_PAYORDER))
+      DocIDLen = 12;
+   END;
+
+   IF (DocIDLen >= strDocID_l)
+      OperDocID = MkStr("0", DocIDLen);
+      StrSet(OperDocID, DocIDLen - strDocID_l + 1, strDocID);
+   END;
+
+   RETURN OperDocID;
+END;
+
+PRIVATE MACRO GetOprBOCode(DocKind, PmDocID)
+   VAR DocumentID = GetOprDocumentID(f_pm.rec.DocKind, PmDocID);
+   VAR BOCode = 0;
+   VAR query = "", query_1 = "", query_2 = "";
+
+   query   = string("T_DocKind = " + f_pm.rec.DocKind + " AND T_DocumentID = " + DocumentID);
+   query_2 = "SELECT MAX(T_ID_OPERATION) FROM DOPROPER_DBT WHERE " + query;
+   query_1 = "SELECT T_BOCode FROM DOPROPER_DBT WHERE T_ID_OPERATION = (" + query_2 + ")";
+
+   BOCode = LnSelectValue(query_1, V_INTEGER);
+
+   RETURN BOCode;
+END;
+
+// определяет доступ по группам пользователей #99446 12.04.07
+PRIVATE MACRO CheckGroupAndFNCash (CreditNumber: integer)
+   VAR Access: integer = 0;
+
+   Access = LnSelectValue ("SELECT 1 FROM DCREDIT_C_DBT WHERE "      +
+                                 " T_CREDITNUMBER = " + CreditNumber +
+      " AND LoansUserFilter.CheckGroupAndFNCash ( " +
+          " T_GROUPNUM, "+
+          " T_FNCASH, "  +
+          {Oper}         + ", " +
+          {GroupOperF}   + ", " +
+          {GroupOperL}   + ", '" +
+          StrFor({cTypePerson})  + "') <> 0 " +
+      " AND T_FNCASH = " + {OperDprt}, V_INTEGER);
+  
+   RETURN Access;
+END;
+
+PRIVATE MACRO CheckCurCode (CreditNumber: integer, CurCode: integer)
+   VAR Access: integer = 0;
+
+   Access = LnSelectValue ("SELECT 1 FROM DCREDIT_C_DBT WHERE "      +
+                                 " T_CREDITNUMBER = " + CreditNumber +
+                             " AND T_CURCODE = "      + CurCode, V_INTEGER);
+
+   RETURN Access;
+END;
+
+// Получить ранее сквитованную сумму платежа по погашению в валюте платежа
+PRIVATE MACRO GetSumQuitDuty (
+   // id входящего платежа (dpmpaym_dbt.t_PaymentID)
+   IncPayID : integer
+)
+   VAR RSDcmd = RsdCommand (RslDefCon, "BEGIN ? := RSO_LOANS_UPLOAD.GetSumQuitDuty (?); END;");
+
+   RSDcmd.addParam ("retval", RSDBP_RETVAL, V_NUMERIC);
+   RSDcmd.addParam ("IncPayID", RSDBP_IN); RSDcmd.value ("IncPayID") = IncPayID;
+
+   RSDcmd.execute();
+
+   RETURN RSDcmd.Value(0);
+
+   OnError
+      RETURN $0;
+END;
+
+// Получить ранее сквитованную сумму платежа по выдаче в валюте платежа
+PRIVATE MACRO GetSumQuitPay (
+   // id входящего платежа (dpmpaym_dbt.t_PaymentID)
+   IncPayID : integer
+)
+   VAR RSDcmd = RsdCommand (RslDefCon, "BEGIN ? := RSO_LOANS_UPLOAD.GetSumQuitPay (?); END;");
+
+   RSDcmd.addParam ("retval", RSDBP_RETVAL, V_NUMERIC);
+   RSDcmd.addParam ("IncPayID", RSDBP_IN); RSDcmd.value ("IncPayID") = IncPayID;
+
+   RSDcmd.execute();
+
+   RETURN RSDcmd.Value(0);
+
+   OnError
+      RETURN $0;
+END;
+
+//устанавливает вид операции для договора и СО
+PRIVATE MACRO SetTypeOp(PaymID:integer, TypeOp:integer)
+
+   VAR RSDcmd = null;
+ 
+   IF (TypeOp > 0)
+      RSDcmd = RsdCommand (RslDefCon, "UPDATE DTMPKD_TMP SET t_OpType = ? WHERE t_PaymentID = ?");
+      RSDcmd.addParam ("TypeOp", RSDBP_IN); RSDcmd.value ("TypeOp") = TypeOp;
+      RSDcmd.addParam ("PaymID", RSDBP_IN); RSDcmd.value ("PaymID") = PaymID;
+  
+      RSDcmd.execute ();
+  
+      RSDcmd = null;
+    
+      RSDcmd = RsdCommand (RslDefCon, "UPDATE DTMPCO_TMP SET t_OpType = ? WHERE t_PaymentID = ?");
+      RSDcmd.addParam ("TypeOp", RSDBP_IN); RSDcmd.value ("TypeOp") = TypeOp;
+      RSDcmd.addParam ("PaymID", RSDBP_IN); RSDcmd.value ("PaymID") = PaymID;
+  
+      RSDcmd.execute ();
+   END;
+END;
+
+PRIVATE MACRO SetSysTypeOp(CreditAcc: string, DebetAcc : string, CurCode :integer, rs:string, ObjT:integer, TypeOp:integer)
+   VAR r_sql;
+   VAR CreditNumber: integer = 0,
+       Count       : integer = 0;
+
+   IF (ValType(TypeOp) == V_UNDEF) TypeOp = 0; END;
+   /* Погашение единой суммой */
+   IF (f_pm.rec.ToBackOffice == "Ц")
+       f_igtd.rec.PayTypeID = LPM_ALLPAY;
+       SetTypeOp(f_igtd.rec.PaymentID, TypeOp);
+       RETURN;
+   END;
+
+   /* Платежные Требования */
+   IF (f_pm.rec.DocKind == PS_PAYORDER)
+
+      /* Найдем документ по погашению */
+      CreditNumber = LnSelectValue("SELECT T_CREDITNUMBER_REF FROM DDOC_DUTY_DBT WHERE T_PAYMENTID_REF = "+f_pm.rec.PaymentID, V_INTEGER);
+
+      IF (CreditNumber)
+
+         f_crd.rec.CreditNumber = CreditNumber;
+         f_igtd.rec.PayTypeID   = LPM_ALLPAY;
+         IF (f_crd.GetEQ() AND (f_crd.rec.CreditNumber == CreditNumber))
+            IF (f_crd.rec.CurCode != 0)
+               ConvSum(f_igtd.rec.Amount, f_igtd.rec.Amount, {curdate}, f_crd.rec.CurCode);
+            END;
+
+            /* Операций быть не должно !!! */
+            Count = LnSelectValue("SELECT COUNT(*) FROM DDOC_DUTY_DBT WHERE "+
+                                      " T_PAYMENTID_REF   = "+f_pm.rec.PaymentID+
+                                  " AND T_CREDOPERID_REF <> 0", V_INTEGER);
+
+            IF (Count != 0)
+               f_igtd.rec.IsSelect = "";
+            END;
+            SetTypeOp(f_igtd.rec.PaymentID, TypeOp);
+         END;
+         RETURN;
+      END;
+   END;
+   r_sql = LnGetRecordset("SELECT * FROM DSB_ACC_DBT WHERE T_CHAPTER = 'А' AND T_CurCodeODB = "+CurCode+" AND T_ODBAccount = '"+CreditAcc+"'");
+   CreditAcc = "";
+   IF (r_sql.MoveNext())
+      CreditAcc = StrFor(r_sql.Value("T_SYSTYPE", NULL, V_INTEGER));
+   END;
+   r_sql = LnGetRecordset("SELECT * FROM DSB_ACC_DBT WHERE T_CHAPTER = 'А' AND T_CurCodeODB = "+CurCode+" AND T_ODBAccount = '"+DebetAcc+"'");
+   DebetAcc = "";
+   IF (r_sql.MoveNext())
+      DebetAcc = StrFor(r_sql.Value("T_SYSTYPE", NULL, V_INTEGER));
+   END;
+   
+   IF ((DebetAcc == "") AND (CreditAcc == ""))
+      f_igtd.rec.IsSelect  = "";
+      RETURN;
+   END;
+
+   IF ((DebetAcc  == "1") OR (CreditAcc == "1"))
+      RETURN;
+   END;
+   
+   // назначение платежа по договору гарантии
+   IF (ObjT == LO_GUARANTEE)
+       // Оплата гарантии
+       IF ((DebetAcc == "С") AND (CreditAcc == ""))
+          f_igtd.rec.PayTypeID = LPM_GUARPAYM;
+          SetTypeOp(f_igtd.rec.PaymentID, TypeOp);
+          RETURN;
+       END;
+
+       // Погашение гарантии
+       IF ((CreditAcc == "С") AND (DebetAcc == ""))
+          f_igtd.rec.PayTypeID = LPM_GUARDUTY;
+          SetTypeOp(f_igtd.rec.PaymentID, TypeOp);
+          RETURN;
+       END;
+       
+       // Списание гарантии с внебаланса
+       IF (CreditAcc == "Т")
+          IF (CreditNumber == 0)
+            CreditNumber = LnSelectValue("SELECT T_CREDITNUMBER_REF FROM DDOC_DUTY_DBT WHERE T_PAYMENTID_REF = "+f_pm.rec.PaymentID, V_INTEGER);
+          END;
+
+          Count = 0;
+          /*
+            счет должен быть указан с списке счетов других подсистем по ДГ
+            Тип счета должен  быть "К/счет"
+            в настройках операции "Снятие контргарантии с учета" должен быть указан "К/счет"
+          */
+          Count = LnSelectValue("SELECT COUNT (*) FROM digcrdacc_dbt iacc, dtype_op_dbt top "+
+                                " WHERE iacc.t_creditnumber = "+CreditNumber+" AND iacc.t_typeaccid = 9 "+
+                                " AND top.t_typeopernumber = 153 AND top.t_typeaccid = 9");
+          IF (Count != 0)
+             f_igtd.rec.PayTypeID = LPM_GUARWRITEOFF;
+             SetTypeOp(f_igtd.rec.PaymentID, TypeOp);
+             RETURN;
+          END;
+       END;
+              
+   END;
+
+   /* Погашение единой суммой */
+   IF ((CreditAcc == "Т") AND
+       ((DebetAcc == "") OR
+        ((DebetAcc != "П") AND (RS == "")) OR
+        ((DebetAcc == "Р") AND (RS != ""))))
+      f_igtd.rec.PayTypeID = LPM_ALLPAY;
+      SetTypeOp(f_igtd.rec.PaymentID, TypeOp);
+      f_duty.rec.DutyID = 0;
+      RETURN;
+   END;
+
+   /* Выдача       */
+   IF ((DebetAcc == "С") AND
+       ((CreditAcc == "") OR
+        ((CreditAcc != "С") AND (RS == "")) OR
+        ((CreditAcc != "Т") AND (RS != ""))))
+      f_igtd.rec.PayTypeID = LPM_PAY;
+      SetTypeOp(f_igtd.rec.PaymentID, TypeOp);
+      RETURN;
+   END;
+
+   /* Погашение ОД */
+   IF ((CreditAcc == "С") AND
+       ((DebetAcc == "") OR
+        ((DebetAcc != "С") AND (RS == "")) OR
+         ((DebetAcc != "Т") AND (RS != ""))))
+      f_igtd.rec.PayTypeID = LPM_CRD;
+      SetTypeOp(f_igtd.rec.PaymentID, TypeOp);
+      RETURN;
+   END;
+
+   /* Погашение процентов */
+   IF (((CreditAcc == "П") OR (CreditAcc == "Б")) AND
+       ((DebetAcc  == "")  OR
+        ((DebetAcc != "П") AND (RS == "")) OR
+         ((DebetAcc != "Т") and (RS != ""))))
+      f_igtd.rec.PayTypeID = LPM_PERC;
+      SetTypeOp(f_igtd.rec.PaymentID, TypeOp);
+      RETURN;
+   END;
+
+   /* Просроченные платежи */
+   IF ((CreditAcc == "З") AND
+       ((DebetAcc == "") OR
+        ((DebetAcc != "З") AND (RS == "")) OR
+         ((DebetAcc != "Т") AND (RS != ""))))
+      f_igtd.rec.PayTypeID = LPM_EXPCRD;
+      SetTypeOp(f_igtd.rec.PaymentID, TypeOp);
+      RETURN;
+   END;
+
+   /* Просроченные % */
+   IF ((CreditAcc == "Ч") AND
+       ((DebetAcc == "") OR
+        ((DebetAcc != "Ч") AND (RS == "")) OR
+        ((DebetAcc != "Т") AND (RS != ""))))
+      f_igtd.rec.PayTypeID = LPM_EXPPERC;
+      SetTypeOp(f_igtd.rec.PaymentID, TypeOp);
+      RETURN;
+   END;
+
+   /* Штрафы */
+   IF ((CreditAcc == "Ш") AND
+       ((DebetAcc  == "") OR
+        ((DebetAcc != "Ш") AND (RS == "")) OR
+        ((DebetAcc == "Т") AND (RS != ""))))
+      f_igtd.rec.PayTypeID = LPM_FAIL;
+      SetTypeOp(f_igtd.rec.PaymentID, TypeOp);
+      RETURN;
+   END;
+
+   f_igtd.rec.IsSelect  = "";
+END;
+
+MACRO strreversfind(str:string, c:string)
+   VAR i:integer;
+   i = StrLen(str);
+   WHILE (i>0)
+     IF (SubStr(str,i,1) == c)
+        RETURN i;
+     END;
+     i = i - 1;
+   END;
+   RETURN 0;
+END;
+
+MACRO AddCrdContr(ground: string, rs:string, ObjT:integer, TypeOp:integer); // вытаскивает из основания документа номер КД
+   VAR mask     = TArray;
+   VAR words    = TArray;
+   VAR grounds  = TArray;
+   VAR word     = TArray;
+   VAR masknum  : integer = 0;
+   VAR wordsnum : integer = 0;
+   VAR wordnum  : integer = 0;
+   VAR groundnum: integer = 0;
+   VAR demline  : integer = 0;
+   VAR symbpos  : integer = 0;
+   VAR Err      : integer = 0;
+   VAR count    : integer = 0;
+   VAR IsFind   : bool    = false;
+   VAR number   : string  = "";
+   VAR query    : string  = "";
+   VAR rs1;
+
+   GetRegistryValue("RS-LOANS\\НАЗНАЧЕНИЕ_ВХОД_ПЛАТЕЖА\\НОМЕР_КД_ПОСЛЕ_МАСКИ",V_STRING, mask[0], Err);
+   GetRegistryValue("RS-LOANS\\НАЗНАЧЕНИЕ_ВХОД_ПЛАТЕЖА\\НОМЕР_СО_ПОСЛЕ_МАСКИ",V_STRING, mask[1], Err);
+   GetRegistryValue("RS-LOANS\\НАЗНАЧЕНИЕ_ВХОД_ПЛАТЕЖА\\НОМЕР_СЧЕТА_ССУДЫ"   ,V_STRING, mask[2], Err);
+   GetRegistryValue("RS-LOANS\\НАЗНАЧЕНИЕ_ВХОД_ПЛАТЕЖА\\НОМЕР_ДОГОВОРА"      ,V_STRING, mask[3], Err);
+   GetRegistryValue("RS-LOANS\\НАЗНАЧЕНИЕ_ВХОД_ПЛАТЕЖА\\НОМЕР_ДГ_ПОСЛЕ_МАСКИ",V_STRING, mask[4], Err);
+
+   IF (ValType(ObjT)   == V_UNDEF) ObjT   = 0; END;
+   IF (ValType(TypeOp) == V_UNDEF) TypeOp = 0; END;
+
+   grounds = filter( split( StrUpr(ground), " " ) );
+
+   IF (grounds.size > 0)
+      IF (ObjT == LO_GUARANTEE) masknum = 4; END; //!!!!!!для договора гарантии учитывать только настройку "НОМЕР_ДГ_ПОСЛЕ_МАСКИ"
+      WHILE ((not IsFind) and (masknum < mask.size)) // цикл по типам масок
+         wordsnum = 0;
+         words = filter( split( StrUpr(mask[masknum]), "," ) );
+         WHILE ((not IsFind) and (wordsnum < words.size))
+            word = filter( split( StrUpr(words[wordsnum]), " " ) );
+            FOR (groundnum, 0, grounds.size - 1)
+               IF (not CompareStrWithMasks(StrUpr(trim(word[0])), StrUpr(trim(grounds[groundnum])))) // первое слово маски совпало с одним из слов в основании
+                  wordnum = 0;
+                  IsFind = true;
+                  WHILE ((IsFind) and (wordnum < word.size))    // проверим совпадет ли полная последовательность слов
+                     IF (CompareStrWithMasks(StrUpr(trim(word[wordnum])), StrUpr(trim(grounds[groundnum+wordnum]))))
+                        IsFind = false;        // неа, не совпадает полная последовательность
+                     END;
+                     wordnum = wordnum + 1;
+                  END;
+                  IF (IsFind) // полная последовательнасть слов совпала с последовательностью в маске
+                     wordnum = groundnum + wordnum - 1;    // индекс последнего слова маски
+                     break;    // выходим из цикла поиска последнего слова маски в граунде довольные   
+                  END;
+               END;
+            END;
+            wordsnum = wordsnum + 1;
+         END;
+         masknum = masknum + 1;
+      END;
+   ELSE
+      IsFind = false;
+   END;
+ 
+   IF (IsFind == false)
+      masknum = 0;
+   END;
+ 
+   IsFind = false;
+   IF (masknum == 1)   // соответствие маске 1
+      FOR (groundnum, wordnum+1, grounds.size - 1)
+         IF ((grounds[groundnum] == "№") OR
+            (grounds.size < groundnum) OR
+            (ValType(grounds[groundnum]) == V_UNDEF))
+            continue;
+         END;
+         words = filter( split( StrUpr(grounds[groundnum]), "," ) );
+         FOR (wordsnum, 0, words.size - 1)
+            number = LnSelectValue("select t_creditnumber from dcredit_c_dbt where Upper(t_uscreditnumber) = '" + words[wordsnum] + "'", V_INTEGER);
+            IF ((number > 0) and (CheckGroupAndFNCash (number) > 0))
+
+               IF (CheckCurCode(number, f_pm.rec.fiid) == 0)
+                  MsgBox("Платеж № ", f_rmprop.rec.Number,",\n счет плательщика ", f_pm.rec.PayerAccount, ",\n счет получателя ", f_pm.rec.ReceiverAccount, ",\n сумма ", f_pm.rec.Amount, ",\n валюта ", FindExtCode(f_pm.rec.FIID), ",\n основание ", ground,"\n Валюта входящего платежа не совпадает с валютой договора. Платеж не может быть обработан\n");
+                  RETURN;
+               END;
+
+               demline = LnSelectValue("select t_duty from dparmdemandline_dbt where t_objecttypeid = 1 and t_objectnumber = " + number, V_INTEGER);
+               IsFind = true;
+               query = "";
+               IF (regim)
+                  query = "INSERT INTO DTMPKD_TMP (T_DATA, T_PAYMENTID, T_SUMQUIT, T_ISSELECT, T_CREDITNUMBER_REF) " +
+                          " VALUES('00', "+f_pm.rec.PaymentID+", 0, 'X', " + number + ")";
+                  LnGetRecordset(query);
+ 
+                  IF (demline != 1)
+                     query = "";                             
+                     query = string("INSERT INTO DTMPCO_TMP (T_DATA, T_SUMQUIT, T_ISSELECT, T_PaymentID,          T_CreditNumber_Ref, T_DutyID) ");
+                     query = query + string("SELECT '00', 0, 'X', " + f_pm.rec.PaymentID + ", T_CreditNumber_Ref, T_DutyID " +
+                                            "FROM DDUTY_CRD_DBT WHERE T_DUTYSTATE = 'О' AND T_DutyType = 0 AND T_CREDITNUMBER_REF = " +  number);
+                     LnGetRecordset(query);
+                  END;
+               ELSE
+                  query = "INSERT INTO DTMPKD_TMP (T_DATA, T_PAYMENTID, T_SUMQUIT, T_ISSELECT, T_CREDITNUMBER_REF) " +
+                          " VALUES('00', "+f_pm.rec.PaymentID+", 0, chr(0), " + number + ")";
+                  LnGetRecordset(query);
+ 
+                  IF (demline != 1)
+                     query = "";                             
+                     query = string("INSERT INTO DTMPCO_TMP (T_DATA, T_SUMQUIT, T_ISSELECT, T_PaymentID, T_CreditNumber_Ref, T_DutyID) ");
+                     query = query + string("SELECT '00', 0, CHR(0), " + f_pm.rec.PaymentID + ", T_CreditNumber_Ref, T_DutyID " +
+                                            "FROM DDUTY_CRD_DBT WHERE T_DUTYSTATE = 'О' AND T_DutyType = 0 AND T_CREDITNUMBER_REF = " +  number);
+                     LnGetRecordset(query);
+                  END;
+               END;
+            ELSE
+               number = 0;
+            END;
+         END;
+      END;
+      IF (IsFind == false)        
+         MsgBox("Платеж № ", f_rmprop.rec.Number,",\n счет плательщика ", f_pm.rec.PayerAccount, ",\n счет получателя ", f_pm.rec.ReceiverAccount, ",\n сумма ", f_pm.rec.Amount, ",\n валюта ", FindExtCode(f_pm.rec.FIID), ",\n основание ", ground,"\n Не найден КД, указанный в основании документа\n");
+      END;
+   ELIF (masknum == 2)   // соответствие маске 2
+      FOR (groundnum, wordnum+1, grounds.size - 1)
+         IF ((grounds[groundnum] == "№") OR          
+            (grounds.size < groundnum) OR           
+            (ValType(grounds[groundnum]) == V_UNDEF))                                        
+            continue;
+         END;
+         words = filter( split( StrUpr(grounds[groundnum]), "," ) );
+         FOR (wordsnum, 0, words.size - 1)
+            symbpos = StrReversFind(words[wordsnum], "/");
+            number = LnSelectValue("select t_creditnumber from dcredit_c_dbt where Upper(t_uscreditnumber) = '" + SubStr(words[wordsnum], 1, symbpos - 1) + "'", V_INTEGER);
+            IF ((number > 0) and (CheckGroupAndFNCash (number) > 0))
+
+               IF (CheckCurCode(number, f_pm.rec.fiid) == 0)
+                  MsgBox("Платеж № ", f_rmprop.rec.Number,",\n счет плательщика ", f_pm.rec.PayerAccount, ",\n счет получателя ", f_pm.rec.ReceiverAccount, ",\n сумма ", f_pm.rec.Amount, ",\n валюта ", FindExtCode(f_pm.rec.FIID), ",\n основание ", ground, "\n Валюта входящего платежа не совпадает с валютой договора. Платеж не может быть обработан\n");
+                  RETURN;
+               END;
+
+               demline = LnSelectValue("select t_duty from dparmdemandline_dbt where t_objecttypeid = 1 and t_objectnumber = " + number, V_INTEGER);
+               IsFind = true;
+ 
+               IF (regim)
+                   LnGetRecordset("INSERT INTO DTMPKD_TMP (T_DATA, T_PAYMENTID, T_SUMQUIT, T_ISSELECT, T_CREDITNUMBER_REF) " + 
+                                  "VALUES('00', "+f_pm.rec.PaymentID+", 0, 'X', " + number + ")");
+ 
+                   IF (demline != 1)
+                      query = "";
+                      query = string("INSERT INTO DTMPCO_TMP (T_DATA, T_SUMQUIT, T_ISSELECT, T_PaymentID, T_CreditNumber_Ref, T_DutyID) ");
+                      query = query + string("SELECT '00', 0, 'X', "+  f_pm.rec.PaymentID+", T_CreditNumber_Ref, T_DutyID FROM DDUTY_CRD_DBT WHERE T_DUTYSTATE = 'О' AND T_DutyType = 0 AND T_CREDITNUMBER_REF = " +  number + " AND t_usernumber = " + SubStr(words[wordsnum], symbpos + 1, StrLen(words[wordsnum])));
+                      LnGetRecordset(query);
+                   END;
+               ELSE 
+                   LnGetRecordset("INSERT INTO DTMPKD_TMP (T_DATA, T_PAYMENTID, T_SUMQUIT, T_ISSELECT, T_CREDITNUMBER_REF) " + 
+                                  "VALUES('00', "+f_pm.rec.PaymentID+", 0, CHR(0), " + number + ")");
+ 
+                   IF (demline != 1)
+                      query = string("INSERT INTO DTMPCO_TMP (T_DATA, T_SUMQUIT, T_ISSELECT, T_PaymentID, T_CreditNumber_Ref, T_DutyID) ");
+                      query = query + string("SELECT '00', 0, CHR(0), "+  f_pm.rec.PaymentID+", T_CreditNumber_Ref, T_DutyID FROM DDUTY_CRD_DBT WHERE T_DUTYSTATE = 'О' AND T_DutyType = 0 AND T_CREDITNUMBER_REF = " +  number + " AND t_usernumber = " + SubStr(words[wordsnum], symbpos + 1, StrLen(words[wordsnum])));
+                      LnGetRecordset(query);
+                   END;
+               END;
+            ELSE
+               number = 0;
+            END;
+         END;
+      END;
+      IF (IsFind == false)
+         MsgBox("Платеж № ", f_rmprop.rec.Number,",\n счет плательщика ", f_pm.rec.PayerAccount, ",\n счет получателя ", f_pm.rec.ReceiverAccount, ",\n сумма ", f_pm.rec.Amount, ",\n валюта ", FindExtCode(f_pm.rec.FIID), ",\n основание ", ground, "\n Не найдено СО, указанное в основании документа\n");
+      END;
+   ELIF (masknum == 3)   // соответствие маске 3
+      FOR (groundnum, wordnum, grounds.size - 1)
+         IF ((grounds[groundnum] == "№") OR          
+            (grounds.size < groundnum) OR           
+            (ValType(grounds[groundnum]) == V_UNDEF))                                        
+            continue;
+         END;
+         words = filter( split( StrUpr(grounds[groundnum]), "," ) );
+         FOR (wordsnum, 0, words.size - 1)
+            rs1 = LnGetRecordset("select t_objectid, t_objectnumber from dacc_crd_dbt a, dsb_acc_dbt s where s.t_accountid = a.t_accid and s.t_odbaccount = '" + words[wordsnum] + "'", V_INTEGER);
+            IF (rs1 and rs1.movenext())
+               IF (rs1.Value("t_objectid", NULL, V_INTEGER) == LO_CREDIT)
+                  number = rs1.Value("t_objectnumber", NULL, V_INTEGER);
+               ELIF (rs1.Value("t_objectid", NULL, V_INTEGER) == LO_DUTY)
+                  number = LnSelectValue("select t_creditnumber_ref from dduty_crd_dbt where t_dutyid = " + rs1.Value("t_objectnumber", NULL, V_INTEGER), V_INTEGER);
+               ELSE
+                  number = 0;
+               END;
+            END;
+            IF ((number > 0) and (CheckGroupAndFNCash (number) > 0))
+
+               IF (CheckCurCode(number, f_pm.rec.fiid) == 0)
+                  MsgBox("Платеж № ", f_rmprop.rec.Number,",\n счет плательщика ", f_pm.rec.PayerAccount, ",\n счет получателя ", f_pm.rec.ReceiverAccount, ",\n сумма ", f_pm.rec.Amount, ",\n валюта ", FindExtCode(f_pm.rec.FIID), ",\n основание ", ground,"\n Валюта входящего платежа не совпадает с валютой договора. Платеж не может быть обработан\n");
+                  RETURN;
+               END;
+
+               demline = LnSelectValue("select t_duty from dparmdemandline_dbt where t_objecttypeid = 1 and t_objectnumber = " + number, V_INTEGER);
+               IsFind = true;
+               LnGetRecordset("INSERT INTO DTMPKD_TMP (T_DATA, T_PAYMENTID, T_SUMQUIT, T_ISSELECT, T_CREDITNUMBER_REF) VALUES('00', "+f_pm.rec.PaymentID+", 0, CHR(0), " + number + ")");
+               IF (demline != 1)
+                  IF (rs1.Value("t_objectid", NULL, V_INTEGER) == LO_DUTY) // счет по СО: привяжем только то СО, по которому счет
+                     query = string("INSERT INTO DTMPCO_TMP (T_DATA, T_SUMQUIT, T_ISSELECT, T_PaymentID,          T_CreditNumber_Ref, T_DutyID) ");
+                     query = query + string("VALUES( '00',    0,         CHR(0), "+  f_pm.rec.PaymentID+", " + number +", " + rs1.Value("t_objectnumber", NULL, V_INTEGER) + ")");
+                  ELSE  // счет по КД: привяжем все СО по КД
+                     query = string("INSERT INTO DTMPCO_TMP (T_DATA, T_SUMQUIT, T_ISSELECT, T_PaymentID,          T_CreditNumber_Ref, T_DutyID) ");
+                     query = query + string("SELECT '00',    0,         CHR(0), "+  f_pm.rec.PaymentID+", T_CreditNumber_Ref, T_DutyID FROM DDUTY_CRD_DBT WHERE T_DUTYSTATE = 'О' AND T_DutyType = 0 AND T_CREDITNUMBER_REF = " +  number);
+                  END;
+                  LnGetRecordset(query);
+               END;
+            ELSE
+               number = 0;
+            END;
+         END;
+      END;
+      IF (IsFind == false)
+         MsgBox("Платеж № ", f_rmprop.rec.Number,",\n счет плательщика ", f_pm.rec.PayerAccount, ",\n счет получателя ", f_pm.rec.ReceiverAccount, ",\n сумма ", f_pm.rec.Amount, ",\n валюта ", FindExtCode(f_pm.rec.FIID), ",\n основание ", ground,"\n Не найден счет, указанный в основании документа\n");
+      END;
+   ELIF (masknum == 4)   // соответствие маске 4
+      FOR (groundnum, wordnum, grounds.size - 1)
+         words = filter( split( StrUpr(grounds[groundnum]), "," ) );
+         FOR (wordsnum, 0, words.size - 1)
+            IF ((grounds.size < groundnum) OR (ValType(grounds[groundnum]) == V_UNDEF))
+                continue;
+            END;
+            number = LnSelectValue("select t_creditnumber from dcredit_c_dbt where Upper(t_uscreditnumber) = '" + words[wordsnum] + "'", V_INTEGER);
+            IF ((number > 0) and (CheckGroupAndFNCash (number) > 0))
+
+               IF (CheckCurCode(number, f_pm.rec.fiid) == 0)
+                  MsgBox("Платеж № ", f_rmprop.rec.Number,",\n счет плательщика ", f_pm.rec.PayerAccount, ",\n счет получателя ", f_pm.rec.ReceiverAccount, ",\n сумма ", f_pm.rec.Amount, ",\n валюта ", FindExtCode(f_pm.rec.FIID), ",\n основание ", ground,"\n Валюта входящего платежа не совпадает с валютой договора. Платеж не может быть обработан\n");
+                  RETURN; 
+               END;
+
+               demline = LnSelectValue("select t_duty from dparmdemandline_dbt where t_objecttypeid = 1 and t_objectnumber = " + number, V_INTEGER);
+               IsFind = true;
+               LnGetRecordset("INSERT INTO DTMPKD_TMP (T_DATA, T_PAYMENTID, T_SUMQUIT, T_ISSELECT, T_CREDITNUMBER_REF) VALUES('00', "+f_pm.rec.PaymentID+", 0, CHR(0), " + number + ")");
+ 
+               IF (demline != 1)
+                  query = string("INSERT INTO DTMPCO_TMP (T_DATA, T_SUMQUIT, T_ISSELECT, T_PaymentID,          T_CreditNumber_Ref, T_DutyID) ");
+                  query = query + string("SELECT '00',    0,         CHR(0), "+  f_pm.rec.PaymentID+", T_CreditNumber_Ref, T_DutyID FROM DDUTY_CRD_DBT WHERE T_DUTYSTATE = 'О' AND T_DutyType = 0 AND T_CREDITNUMBER_REF = " +  number);
+                  LnGetRecordset(query);
+               END;
+            ELSE
+               number = 0;
+            END;
+         END;
+      END;
+      IF (IsFind == false)
+         MsgBox("Платеж № ", f_rmprop.rec.Number,",\n счет плательщика ", f_pm.rec.PayerAccount, ",\n счет получателя ", f_pm.rec.ReceiverAccount, ",\n сумма ", f_pm.rec.Amount, ",\n валюта ", FindExtCode(f_pm.rec.FIID), ",\n основание ", ground,"\n Не найден КД, указанный в основании документа\n");
+      END;
+   ELIF (masknum == 5)  //соответствие настройке "НОМЕР_ДГ_ПОСЛЕ_МАСКИ"
+      FOR (groundnum, wordnum+1, grounds.size - 1)
+         IF ((grounds[groundnum] == "№") OR
+            (grounds.size < groundnum) OR
+            (ValType(grounds[groundnum]) == V_UNDEF))
+            continue;
+         END;
+         words = filter( split( StrUpr(grounds[groundnum]), "," ) );
+         FOR (wordsnum, 0, words.size - 1)
+            number = LnSelectValue("select t_creditnumber from dcredit_c_dbt where Upper(t_uscreditnumber) = '" + words[wordsnum] + "'", V_INTEGER);
+            IF ((number > 0) and (CheckGroupAndFNCash (number) > 0))
+
+               IF (CheckCurCode(number, f_pm.rec.fiid) == 0)
+                  MsgBox("Платеж № ", f_rmprop.rec.Number,",\n счет плательщика ", f_pm.rec.PayerAccount, ",\n счет получателя ", f_pm.rec.ReceiverAccount, ",\n сумма ", f_pm.rec.Amount, ",\n валюта ", FindExtCode(f_pm.rec.FIID), ",\n основание ", ground,"\n Валюта входящего платежа не совпадает с валютой договора. Платеж не может быть обработан\n");
+                  RETURN; 
+               END;
+
+               IsFind = true;
+               query = "";
+               IF (regim)
+                   query = "INSERT INTO DTMPKD_TMP (T_DATA, T_PAYMENTID, T_SUMQUIT, T_ISSELECT, T_CREDITNUMBER_REF) " +
+                           " VALUES('00', "+f_pm.rec.PaymentID+", 0, 'X', " + number +")";
+                   LnGetRecordset(query);        
+               ELSE
+                   query = "INSERT INTO DTMPKD_TMP (T_DATA, T_PAYMENTID, T_SUMQUIT, T_ISSELECT, T_CREDITNUMBER_REF) " +
+                           " VALUES('00', "+f_pm.rec.PaymentID+", 0, chr(0), " + number + ")";
+                   LnGetRecordset(query);
+               END;
+            ELSE
+               number = 0;
+            END;
+         END;
+      END;
+      IF (IsFind == false)        
+         MsgBox("Платеж № ", f_rmprop.rec.Number,",\n счет плательщика ", f_pm.rec.PayerAccount, ",\n счет получателя ", f_pm.rec.ReceiverAccount, ",\n сумма ", f_pm.rec.Amount, ",\n валюта ", FindExtCode(f_pm.rec.FIID), ",\n основание ", ground,"\n Не найден ДГ, указанный в основании документа\n");
+      END;
+   ELSE                // основание не подошло ни под одну из масок
+      MsgBox("Платеж № ", f_rmprop.rec.Number,",\n счет плательщика ", f_pm.rec.PayerAccount, ",\n счет получателя ", f_pm.rec.ReceiverAccount, ",\n сумма ", f_pm.rec.Amount, ",\n валюта ", FindExtCode(f_pm.rec.FIID), ",\n основание ", ground,"\n Основание документа не соответствует ни одной маске \n",masknum);
+   END;
+
+   IF (IsFind)    
+      IF (number > 0)
+         //в основной скроллинг должны отобраться договора, у которых вид кредита совпдает с выбранным
+         count = LnSelectValue("SELECT COUNT(*) FROM dcredit_c_dbt crd, dset_tcr_tmp tc " +
+                               " WHERE crd.t_CreditTypeID_Ref = tc.t_CreditTypeID_Ref " +
+                                 " AND tc.t_SetFlag = 'X' "+
+                                 " AND crd.t_CreditNumber = " + number , V_INTEGER);
+      END;
+      IF (count > 0)    
+         f_igtd.rec.IsSelect  = "X";
+         SetSysTypeOp(f_pm.rec.ReceiverAccount, f_pm.rec.PayerAccount, f_pm.rec.PayFIID, rs, ObjT,TypeOp)
+      END;
+   END;
+END;
+
+MACRO Update_Fields()
+   //необходима, поскольку при вставке SQL запросом часть полей инициализиреутся NULL
+   LnGetRecordSet("UPDATE DTMPKD_TMP SET T_DATA = '00000000000000000000000000000000000000000000000000000000'");
+   LnGetRecordSet("UPDATE DTMPCO_TMP SET T_DATA = '00000000000000000000000000000000000000000000000000000000'");
+
+   LnGetRecordSet("UPDATE DTMPKD_TMP SET T_FLAG     = CHR(0) WHERE T_FLAG     IS NULL");
+   LnGetRecordSet("UPDATE DTMPKD_TMP SET T_ISSELECT = 'X'");
+   LnGetRecordSet("UPDATE DTMPKD_TMP SET T_OPTYPE   = 0      WHERE T_OPTYPE   IS NULL");
+   LnGetRecordSet("UPDATE DTMPKD_TMP SET T_SUMQUIT  = 0      WHERE T_SUMQUIT  IS NULL");
+
+   LnGetRecordSet("UPDATE DTMPCO_TMP SET T_ISSELECT = CHR(0) WHERE T_ISSELECT IS NULL");
+   LnGetRecordSet("UPDATE DTMPCO_TMP SET T_OPTYPE   = 0 WHERE T_OPTYPE  IS NULL");
+   LnGetRecordSet("UPDATE DTMPCO_TMP SET T_SUMQUIT  = 0 WHERE T_SUMQUIT IS NULL");
+
+   LnGetRecordSet("UPDATE DTMPCO_TMP SET T_OPDATE  = TO_DATE('01-01-0001','dd-mm-yyyy') ");
+   LnGetRecordSet("UPDATE DTMPKD_TMP SET T_OPDATE  = TO_DATE('01-01-0001','dd-mm-yyyy') ");
+
+   IF (regim) // Автоматический режим.Установим для отобранных документов флаг "Принять квитовку"
+      LnGetRecordSet("UPDATE DIGTMPDOC_TMP SET T_IsAccept = 'X' WHERE T_ISSELECT = 'X'");
+   END;
+
+   VAR cmd = RsdCommand(RslDefCon, "BEGIN RSO_LOANS_UPLOAD.SelectInPay; END;");
+   cmd.Execute();
+END;
+
+MACRO SelectInPay(PayDate:date, CreditNumber:integer, sto:integer, r:string, ObjT:integer, TypeOp:integer)
+   VAR n        : integer =  0,
+       flag     : bool    = true,
+       str_count: string  = "";
+//       Sum      : money   = $0;
+   VAR count = -1;
+   VAR CryptoAPI = RsCryptoAPI();
+
+   f_stcrd.ReWind();
+   WHILE (f_stcrd.Next() and flag)
+      SetFlag = f_stcrd.rec.SetFlag;
+      IF (SetFlag == "X")
+         flag = false;
+      END;
+   END;
+
+   LnGetRecordset("DELETE FROM DIGTMPDOC_TMP");
+   LnGetRecordSet("DELETE FROM DTMPCO_TMP");
+   LnGetRecordSet("DELETE FROM DTMPKD_TMP");
+
+   str_count = string("SELECT COUNT(*) FROM DPMPAYM_DBT WHERE (T_IsFactPaym = 'X' OR T_ToBackOffice = 'Ц') AND t_ValueDate = " + SQLDate(PayDate));
+   count = LnSelectValue(str_count, V_INTEGER);
+
+   InitProgress(count, "Обработка входящих платежей");
+
+   f_pm.AddFilter ("(T_IsFactPaym = 'X' OR T_ToBackOffice = 'Ц') AND t_ValueDate = " + SQLDate(PayDate));
+   f_pm.rec.ValueDate = PayDate;
+   stat = f_pm.GetGE;
+   WHILE (stat and (f_pm.rec.ValueDate == PayDate))
+      n = n + 1;
+      UseProgress(n);
+      flag    = true;
+
+      IF (flag and (f_pm.rec.PaymStatus == PM_FINISHED) AND
+           (
+             (f_pm.rec.DocKind == CASH_BOF_INCORDER) OR
+             (f_pm.rec.DocKind == CASH_BOF_OUTORDER) OR
+             (f_pm.rec.DocKind == DLDOC_BANKPAYMENT) OR
+             (f_pm.rec.DocKind == PS_PAYORDER)
+           )
+           AND
+             (GetOprBOCode(f_pm.rec.DocKind, f_pm.rec.DocumentID) == BO_RS_LOANS)
+         )
+
+         IF (f_pm.rec.DocKind != PS_PAYORDER)
+            // Документ выгружался из RS-Loans - загружать не будем
+            flag = false;
+         END;
+      END;
+/*    IF (flag)
+          Paym = RsbPayment(f_pm.rec.PaymentID);
+          IF (CryptoAPI.ExecCryptoAction("RS-Loans|ОТПК|Прием_платежей_из_ББ_и_РКО",Paym))
+          ELSE
+              flag = false;
+          END;
+      END;
+*/
+      IF (FLAG AND  (
+                    (f_pm.rec.PaymStatus == PM_READY_TO_SEND)  OR
+                    (f_pm.rec.PaymStatus == PM_KVITWAIT)       OR
+                    (f_pm.rec.PaymStatus == PM_KVITPROCESSING) OR
+                    (f_pm.rec.PaymStatus == PM_FINISHED)))
+
+         f_igtd.Clear();
+         f_igtd.rec.PaymentID     = f_pm.rec.PaymentID;
+         f_igtd.rec.Date_work     = PayDate;
+         f_igtd.rec.SumDone       = $0;
+         f_igtd.rec.Amount        = f_pm.rec.Amount;
+         f_igtd.rec.CurCode       = f_pm.rec.FIID;
+         f_igtd.rec.DebetAccount  = f_pm.rec.PayerAccount;
+         f_igtd.rec.CreditAccount = f_pm.rec.ReceiverAccount;
+
+         f_rmprop.rec.PaymentID = f_pm.rec.PaymentID;
+         IF (f_rmprop.getEQ())
+            f_igtd.rec.Ground = f_rmprop.rec.Ground;
+         END;
+
+         f_igtd.rec.Amount = f_igtd.rec.Amount - (GetSumQuitPay (f_pm.rec.PaymentID) + GetSumQuitDuty (f_pm.rec.PaymentID));
+         
+         IF (f_igtd.rec.Amount > $0)
+            AddCrdContr (f_igtd.rec.ground, r, ObjT, TypeOp);
+         END;
+
+         IF (f_igtd.rec.PayTypeID == LPM_PAY)
+            IF ((sto != 0) and (sto != CS_PAY))
+               f_igtd.rec.IsSelect = "";
+            END;
+         ELIF (f_igtd.rec.PayTypeID == LPM_GUARPAYM)
+            IF ((sto != 0) and (sto != CS_GUARPAYM))
+               f_igtd.rec.IsSelect = "";
+            END;
+         ELIF (f_igtd.rec.PayTypeID == LPM_GUARDUTY)
+            IF ((sto != 0) and (sto != CS_GUARDUTY))
+               f_igtd.rec.IsSelect = "";
+            END;
+         ELIF (f_igtd.rec.PayTypeID == LPM_GUARWRITEOFF)
+            IF ((sto != 0) and (sto != CS_GUARWRITEOFF))
+               f_igtd.rec.IsSelect = "";
+            END;
+         ELSE
+            IF ((sto != 0) and (sto != CS_DUTY))
+               f_igtd.rec.IsSelect = "";
+            END;
+         END;
+
+         IF (f_igtd.rec.Amount > $0)
+            f_igtd.insert();
+         END;
+      END;
+
+      stat = f_pm.Next();
+   END;
+   f_pm.DropFilter;
+   RemProgress;
+   Update_Fields();   
+   
+   IF (f_igtd.NRecords() == 0)
+      IF (regim)
+         RETURN 1;
+      ELSE
+          MsgBox("Не отобрано ни одного документа!");
+         RETURN 1;
+      END;
+   ELSE
+      RETURN 0;
+   END;
+END;
+
+MACRO Auto_Kvitovka (fillial:integer, data:date)
+   VAR flag     : bool    = true;
+   regim = true;
+
+   LnGetRecordset ("DELETE FROM DIGTMPDOC_TMP");
+   LnGetRecordSet ("DELETE FROM DTMPCO_TMP");
+   LnGetRecordSet ("DELETE FROM DTMPKD_TMP");
+
+   f_pm.AddFilter ("T_DEPARTMENT = " + fillial + " and (T_IsFactPaym = 'X' OR T_ToBackOffice = 'Ц')" + 
+                   " AND (t_BOProcessKind = 0  OR T_BOPROCESSKIND IS NULL )  AND  t_ValueDate = " + SQLDate(data));
+   f_pm.rec.ValueDate = data;
+   stat = f_pm.GetGE;
+   WHILE (stat and (f_pm.rec.ValueDate == data))
+      flag    = true;
+      IF (flag and (f_pm.rec.PaymStatus == PM_FINISHED) AND
+           (
+             (f_pm.rec.DocKind == CASH_BOF_INCORDER) OR       // Объявление на взнос наличными в ББ
+             (f_pm.rec.DocKind == CASH_BOF_OUTORDER) OR       // Чек в ББ
+             (f_pm.rec.DocKind == DLDOC_BANKPAYMENT) OR       // Платеж банка
+             (f_pm.rec.DocKind == PS_PAYORDER)                // Рублевый платежный документ клиента
+           )
+           AND
+             (GetOprBOCode(f_pm.rec.DocKind, f_pm.rec.DocumentID) == BO_RS_LOANS)
+         )
+         IF ((f_pm.rec.DocKind != PS_PAYORDER ) OR (f_pm.rec.DocKind != DLDOC_BANKPAYMENT)) // Документ выгружался из RS-Loans - загружать не будем
+            flag = false;
+         END;
+      END;
+      IF (FLAG AND  (
+                    (f_pm.rec.PaymStatus == PM_READY_TO_SEND)  OR
+                    (f_pm.rec.PaymStatus == PM_KVITWAIT)       OR
+                    (f_pm.rec.PaymStatus == PM_KVITPROCESSING) OR
+                    (f_pm.rec.PaymStatus == PM_FINISHED)))
+
+         f_igtd.Clear ();
+         f_igtd.rec.PaymentID     = f_pm.rec.PaymentID;
+         f_igtd.rec.Date_work     = data;
+         f_igtd.rec.SumDone       = $0;
+         f_igtd.rec.Amount        = f_pm.rec.Amount;
+         f_igtd.rec.CurCode       = f_pm.rec.FIID;
+         f_igtd.rec.DebetAccount  = f_pm.rec.PayerAccount;
+         f_igtd.rec.CreditAccount = f_pm.rec.ReceiverAccount;
+
+         f_rmprop.rec.PaymentID = f_pm.rec.PaymentID;
+         IF (f_rmprop.getEQ())
+            f_igtd.rec.Ground = f_rmprop.rec.Ground;
+         END;
+
+         f_igtd.rec.Amount = f_igtd.rec.Amount - (GetSumQuitPay (f_pm.rec.PaymentID) + GetSumQuitDuty (f_pm.rec.PaymentID));
+
+         IF (f_igtd.rec.Amount > $0)
+            AddCrdContr (f_igtd.rec.ground);
+            f_igtd.insert();
+         END;
+      END;
+      stat = f_pm.Next();
+   END;
+   f_pm.DropFilter;
+   Update_Fields();
+   IF (f_igtd.NRecords() == 0)
+      IF (regim)
+          RETURN 1;
+      ELSE
+         MsgBox("Не отобрано ни одного документа!");
+         RETURN 1;
+      END;
+   ELSE
+      RETURN 0;
+   END;
+END;
+
+// прием входящих платежей (для подсистемы депозиты юр лиц)
+MACRO SelectIncomingPay (
+   OpDate : date,
+   OpSyst : integer,
+   OpType : integer
+)
+   VAR RSDcmd;
+   
+   RSDcmd = RsdCommand (RslDefCon, "BEGIN RSO_LOANS_UPLOAD.SelectIncomingPay (?, ?, ?); END;");
+
+   RSDcmd.addParam ("OpDate", RSDBP_IN); RSDcmd.value ("OpDate") = OpDate;
+   RSDcmd.addParam ("OpSyst", RSDBP_IN); RSDcmd.value ("OpSyst") = OpSyst;
+   RSDcmd.addParam ("OpType", RSDBP_IN); RSDcmd.value ("OpType") = OpType;
+
+   RSDcmd.execute ();
+END;
+
+// прием входящих платежей (для цессии)
+MACRO CessIncomingPay (
+   CesK   : integer,
+   OpDate : date,
+   OpSyst : integer,
+   OpType : integer
+)
+   VAR RSDcmd = null;
+
+   RSDcmd = RsdCommand (RslDefCon, "BEGIN RSO_LOANS_UPLOAD.CesIncPay (?,?,?,?); END;");
+
+   RSDcmd.addParam ("CesK",   RSDBP_IN); RSDcmd.value ("CesK")   = CesK;
+   RSDcmd.addParam ("OpDate", RSDBP_IN); RSDcmd.value ("OpDate") = OpDate;
+   RSDcmd.addParam ("OpSyst", RSDBP_IN); RSDcmd.value ("OpSyst") = OpSyst;
+   RSDcmd.addParam ("OpType", RSDBP_IN); RSDcmd.value ("OpType") = OpType;
+
+   RSDcmd.execute ();
+END;

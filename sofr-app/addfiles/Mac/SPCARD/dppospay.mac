@@ -1,0 +1,547 @@
+/* Оплата длительного поручения по карте и авторизация через POS */
+import deprintr, rcw, rsd, rsexts, commclnt;
+
+private var {oper};
+private var {curdate};
+private var terminal;
+private var client_list;
+
+record planpay("dplanpay.dbt","sbbank.def");
+record maindoc("pay_doc.dbt","sbbank.def");
+record pay_doc("pay_doc.dbt","sbbank.def");
+record depdoc ("sbdepdoc.dbt","sbbank.def");
+record params("op_parm.rec");
+file PmntProp ("RTPaymentProp.dbt") key 0 write;
+
+/* Строка в формате: cardNumber + "=" + String( yy:0:2 ) + String( mm:0:2 ) */
+macro GetTrack2( _cardNumber, _cardMaturDate )
+  var str = "";
+  var dat, month, year;
+
+  DateSplit(date(_cardMaturDate), dat, month, year);
+
+  year = year - int(year/100) * 100;
+  if( year < 10 )
+    str = "0" + string(year);
+  else
+    str = string(year);
+  end;
+
+  if( month < 10 )
+    str = str + "0" + string(month);
+  else
+    str = str + string(month);
+  end;
+
+  str = _cardNumber + "=" + str;
+  return str; 
+end;
+
+/* разделение ФИО на Ф, И, О */
+macro GetFIO(fio, name1, name2, name3)
+  var i;
+
+  name1 = Trim(fio);
+  name2 = "";
+  name3 = "";
+
+  i = Index(name1, " ");
+  if (i > 0)
+    name2 = Trim(SubStr(name1, i + 1));
+    name1 = SubStr(name1, 1, i - 1);
+  end;
+
+  i = Index(name2, " ");
+  if (i > 0)
+    name3 = Trim(SubStr(name2, i + 1));
+    name2 = SubStr(name2, 1, i - 1);
+  end;
+
+  setparm(1, name1);
+  setparm(2, name2);
+  setparm(3, name3);
+end;
+
+/* ФИО операциониста */
+macro GetOperName(oper)
+  file opr (person, "bank.def") key 0;
+  var fio = "";
+  var name1, name2, name3;
+  
+  opr.Oper = oper;
+  if (getEQ(opr))
+    GetFIO(opr.Name, name1, name2, name3);
+    fio = name1;
+    if (name2 != "")
+      fio = fio + " " + SubStr(name2, 1, 1) + ".";
+    end;
+    if (name3 != "")
+      fio = fio + " " + SubStr(name3, 1, 1) + ".";
+    end;
+  end;
+  if (fio == "")
+    fio = string(oper);
+  end;
+  return fio;
+end;
+
+/* Поиск карточки */
+macro GetCardNumber( _fncash, _cardRef, _cardNumber, _cardMaturDate )
+  var cmd, rs;
+  var ret = false;
+
+  _cardNumber = "";
+  _cardMaturDate = date(0,0,0);
+  cmd = RsdCommand("SELECT t_CardNumber, t_CardMaturityDate FROM dsccard_dbt WHERE t_FNcash=? AND t_CardRef=?");
+  cmd.addParam("FNcash",  RsdBp_in, _fncash);
+  cmd.addParam("CardRef", RsdBp_in, _cardRef);
+  cmd.execute;
+  rs = RsdRecordset(cmd);
+  if( rs.moveNext )
+    _cardNumber = rs.value(0);
+    _cardMaturDate = rs.value(1);
+    ret = true;
+  end;
+
+  SetParm(2, _cardNumber);
+  SetParm(3, _cardMaturDate);
+  return ret;
+end;
+
+/* Поиск операции для вида вклада */
+macro fDepOperation( _isCur, _typeAccount, _op )
+  var cmdOp, rsOp;
+  var ret = false;
+
+  cmdOp = RsdCommand("SELECT COUNT(*) FROM dsb_typop_dbt WHERE t_isCur=? AND t_Kind=? AND t_NumOpert=?");
+  cmdOp.addParam("isCur",    RsdBp_in, _isCur);
+  cmdOp.addParam("Kind",     RsdBp_in, _typeAccount);
+  cmdOp.addParam("NumOpert", RsdBp_in, _op);
+  cmdOp.execute;
+  rsOp = RsdRecordset(cmdOp);
+
+  if( (rsOp.moveNext) and (rsOp.value(0) > 0) )
+    ret = true;
+  end;
+
+  return ret;
+end;
+
+/* ISO код валюты */
+macro GetCurrISO(cod_curr)
+  file currency("currency.dbt") key 0;
+  var iso_curr = 0;
+
+  ClearRecord(currency);
+  currency.Code_Currency = cod_curr;
+  if (GetEQ(currency))
+    iso_curr = Int(currency.ExternalCode);
+  end;
+
+  if (iso_curr == 810)
+    iso_curr = 643;
+  end;
+  return iso_curr;
+end;
+
+/* код валюты */
+macro GetCurrCode(iso_curr)
+  file currency("currency.dbt") key 1;
+  var code = 0;
+
+  ClearRecord(currency);
+  currency.ExternalCode = string(iso_curr:3:o);
+  if (GetEQ(currency))
+    code = currency.Code_Currency;
+  end;
+
+  return code;
+end;
+
+/* дополнение строки нулями */
+macro FillZero( ID, needLength )
+  var str = string(ID);
+
+  while( strlen(str) < needLength )
+    str = "0" + str;
+  end;
+  return str;
+end;
+
+/* Создание документа прочей операции */
+macro CreatePayDoc( _groupOp, _numOp, _applType, _sum, _payGround, _clientAddress )
+  var ret = false;
+
+  ClearRecord(pay_doc);
+  pay_doc.iApplicationKind = 200;
+  pay_doc.ApplicationKey = FormApplicationKey(200);
+  pay_doc.FNCash = planpay.FNCash;
+  pay_doc.IsCur = planpay.IsCur;
+  pay_doc.GroupOpert = _groupOp;
+  pay_doc.NumOpert = _numOp;
+  pay_doc.ApplType = _applType;
+  pay_doc.Oper  = {oper};
+  pay_doc.InSum = money(_sum);
+  pay_doc.CodCur = planpay.Code_currency;
+  pay_doc.vidDoc = StrFor(1);          /* Безналичный документ */
+  pay_doc.Date_Document = {curdate};
+  pay_doc.CodClient = planpay.CodClientMake;
+  pay_doc.KKMOpNumber = planpay.Ref;   /* Ссылка на ДП */
+  pay_doc.Flags = 4;                   /* Признак операции по ДП */
+
+  pay_doc.ClientLastName   = client_list.CurRec.rec.Name1;
+  pay_doc.ClientFirstName  = client_list.CurRec.rec.Name2;
+  pay_doc.ClientSecondName = client_list.CurRec.rec.Name3;
+  pay_doc.PersIDType       = client_list.CurRec.rec.paperKind;
+  pay_doc.PassportSer      = client_list.CurRec.rec.paperSeries;
+  pay_doc.PassportNumb     = client_list.CurRec.rec.paperNumber;
+  pay_doc.PassportIssuer   = client_list.CurRec.rec.paperIssuer;
+  pay_doc.PassportDate     = client_list.CurRec.rec.paperIssuedDate;
+  pay_doc.FlagRez          = client_list.CurRec.rec.NotResident;
+  pay_doc.ClientAddress    = _clientAddress;
+
+  PaySetGround( pay_doc );
+  if( pay_doc.Ground == "" )
+    pay_doc.Ground = _payGround;
+  end;
+
+  /* Вставка документа в список документов проводки */
+  ret = InsertPayDocToGDDList(pay_doc);
+  return ret;
+end;
+
+/* Создание корреспондирующего документа для перевода средств */
+macro CreateCorrDoc( _stat, _sum, _docGround )
+  var cmd, rs;
+  var ret = true;
+
+  cmd = RsdCommand("SELECT * FROM ddepositr_dbt WHERE t_FNcash=? AND t_Account=?");
+  cmd.addParam("FNcash",  RsdBp_in, planpay.FNcash);
+  cmd.addParam("Account", RsdBp_in, planpay.Account_Receiver);
+  cmd.execute;
+  rs = RsdRecordset(cmd);
+
+  if( rs.moveNext )
+    if( rs.value("t_Open_Close") )
+      ret = false;
+      _stat = 613; /* Счет получателя закрыт или удален из списка вкладчиков */
+
+    elif( rs.value("t_Open_Date") > {curdate} )
+      ret = false;
+      _stat = 1656; /* Дата документа меньше даты открытия счета получателя */
+
+    elif( (not fDepOperation(rs.value("t_IsCur"), rs.value("t_Type_Account"), 65)) or
+          (not fDepOperation(rs.value("t_IsCur"), rs.value("t_Type_Account"), 71)) )
+      ret = false;
+      _stat = 4700; /* Введенная операция для данного вида вклада не определена */
+    end;
+
+  else
+    ret = false;
+    _stat = 615; /* Невозможно определить счет корреспондента */
+  end;
+
+  if( ret )
+    ClearRecord(depdoc);
+    depdoc.iApplicationKind = 1;
+    depdoc.ApplicationKey = FormApplicationKey(1);
+    depdoc.TypeOper = 71;               /* Зачисление средств */
+    depdoc.ApplType = 50;               /* Перевод с пл.карты */
+    depdoc.TypeComplexOper = 65;        /* Переводом вклада */
+    depdoc.InSum = money(_sum);
+    depdoc.Referenc = rs.value("t_Referenc");
+    depdoc.IsCur = rs.value("t_IsCur");
+    depdoc.FNCash = planpay.FNcash;
+    depdoc.Account = planpay.Account_Receiver;
+    depdoc.Oper = {oper};
+    depdoc.Type_Account = rs.value("t_Type_Account");
+    depdoc.Code_Currency = rs.value("t_Code_Currency");
+    depdoc.CodClient = rs.value("t_CodClient");
+    depdoc.YesSbook = "X";
+    depdoc.Date_Document = {curdate};
+    depdoc.DepDate_Document = depdoc.Date_Document;
+    depdoc.KindOp = 5;
+    depdoc.Ground = _docGround;
+    /* Вставка документа в список документов проводки */
+    ret = InsertDocToGDDList(depdoc);
+  end;
+
+  SetParm(0, _stat);
+
+  return ret;
+end;
+
+/***************************************/
+/* выполнение оплаты ДП с авторизацией */
+/***************************************/
+private macro Execute_AuthPlanPay( _stat, sum )
+  var ok = true, stat = 0;
+  var GDDList_created = false;
+  var operation;
+  var cardNumber = "", cardMaturDate = "", track2 = "";
+  var clientAddress, applType = 0, docGround = "";
+  var userAttrs, varUserAttrs;
+  var comm_Summa = $0, comm_Type="", comm_NumOpert;
+  var OpAmount = sum;
+  var oldBatchMode;
+
+  if( GetCardNumber(planpay.FNcash, planpay.CardRef, cardNumber, cardMaturDate) )
+    track2 = GetTrack2(cardNumber, cardMaturDate);
+  else
+    ok = false;
+    stat = 2607; /* Нет такой карточки */
+  end;
+
+  if( ok )
+    client_list = TClientList;
+    if( client_list.getRecord( planpay.CodClientMake ) )
+      clientAddress = commclnt_Получить_Поле_Address_Фактического_Адреса(client_list);
+    else
+      ok = false;
+      stat = 4661; /* Клиент не определен в базе клиентов */
+    end;
+  end;
+
+  /* Создание списка документов */
+  if( ok )
+    stat = CreateGDDList();
+    if( stat == 0 )
+      GDDList_created = true;
+    elif (stat == 1) // GDDList уже есть
+      stat = 0;
+    else
+      ok = false;
+    end;
+  end;
+
+  /* Главный документ на сумму поручения */
+  if( ok )
+    if( (planpay.TypeOper == 64) or                                        /* Списание по ком.платежу */
+        ((planpay.TypeOper == 63) and (planpay.CodClient_Receiver <= 0)) ) /* Списание по поруч. */
+      applType = 3;                                                        /* В организац. БК */
+
+    elif( planpay.TypeOper == 65 )                                         /* Переводом вклада */
+      applType = 4;                                                        /* Ф/л в фил. БК */
+
+    elif( (planpay.TypeOper == 66) or                                      /* В "свой" филиал */
+          (planpay.TypeOper == 67) or                                      /* В "чужой" филиал */
+          ((planpay.TypeOper == 63) and (planpay.CodClient_Receiver > 0)) )/* Списание по поруч. */
+      applType = 5;                                                        /* Ф/л в др.фил.БК */
+    end;
+
+    docGround = "Перевод по карте " + cardNumber;
+    ok = CreatePayDoc(41, 26, applType, sum, docGround, clientAddress);
+    Copy(maindoc, pay_doc);
+  end;
+
+  /* Инициализация связки документов */
+  if( ok )
+    ClearRecord(params);
+    params.ApplicationKind = pay_doc.iApplicationKind;
+    params.ApplicationKey = pay_doc.ApplicationKey;
+    params.ObjectRef = FillZero(pay_doc.GroupOpert, 8);
+    params.ClientCode = pay_doc.CodClient;
+    params.Operation = pay_doc.NumOpert;
+    params.Subop = pay_doc.ApplType;
+    params.Date = pay_doc.Date_Document;
+    params.CodCur = pay_doc.CodCur;
+    ok = InterDesk_InitDocBunch(params.ApplicationKind, params.ApplicationKey, params);
+  end;
+
+  /* Реквизиты платежа для гл. докумнта */
+  if( ok )
+    PmntProp.DocApplicationKind = planpay.iApplicationKind;
+    PmntProp.DocApplicationKey  = planpay.ApplicationKey;
+    if( GetEQ(PmntProp) )
+      PmntProp.DocApplicationKind = pay_doc.iApplicationKind;
+      PmntProp.DocApplicationKey  = pay_doc.ApplicationKey;
+      ok = Insert(PmntProp);
+    end;
+  end;
+
+  /* Для ДП по оп. Переводом вклада */
+  if( ok and (planpay.TypeOper == 65) )
+    docGround = "Зачисление переводом по карте " + cardNumber;
+    ok = CreateCorrDoc(stat, sum, docGround);
+  end;
+
+  /* Определить, требуется ли взятие платы за поручение */
+  if( ok )
+    ClearRecord(depdoc);
+    depdoc.Referenc         = planpay.Reference;
+    depdoc.Type_Account     = planpay.Type_Account;
+    depdoc.Date_Document    = {curdate};
+    depdoc.DepDate_Document = depdoc.Date_Document;
+    depdoc.appltype         = planpay.appltype;
+    depdoc.TypeOper         = planpay.TypeOper;
+    depdoc.TypeComplexOper  = depdoc.TypeOper;
+    depdoc.OutSum           = money(sum);
+    depdoc.CodClient        = planpay.CodClient;
+    oldBatchMode = setbatchmode(true);
+    stat = GetCommissionOnOper(depdoc,money(sum)/*$0L*/,1,comm_Summa,comm_Type,comm_NumOpert);
+    setbatchmode(oldBatchMode);
+    if( stat != 0 )
+      ok = false;
+    end;
+  end;
+
+  /* Документ на плату */
+  if( ok and (comm_Summa > $0) )
+    OpAmount = OpAmount + comm_Summa;
+
+    docGround = "Плата за безналичный перевод c карты " + cardNumber;
+    ok = CreatePayDoc(21, 44, 0, comm_Summa, docGround, clientAddress);
+  end;
+
+  /* Авторизация и проводка операции */
+  if( ok )
+    operation = terminal.createOperation(4005); /* Безналичный перевод при отсутствии карты клиента */
+    operation.inParams.amount       = Int(double(OpAmount * 100));
+    operation.inParams.currency     = GetCurrISO(planpay.Code_Currency);
+    operation.inParams.receiverCard = cardNumber;
+    operation.inParams.track2       = track2;
+    ok = operation.execute;
+    
+    if( ok ) /* Авторизация прошла успешно */
+      userAttrs = getDocUserAttrPool();
+      varUserAttrs = userAttrs.overlayRecord("rt_paym.rrn", userAttrs.FldOffset("Payment"), true);
+      userAttrs.clear;
+      userAttrs.rec.Branch           = planpay.FNcash;
+      userAttrs.rec.iApplicationKind = params.ApplicationKind;
+      userAttrs.rec.ApplicationKey   = params.ApplicationKey;
+      userAttrs.rec.AttrID           = "RRN";
+      varUserAttrs.clear;
+      varUserAttrs.rec.RRN        = operation.outParams.authCode;
+      varUserAttrs.rec.CardNumber = cardNumber;
+      varUserAttrs.rec.AuthCurr   = GetCurrCode(operation.outParams.currency);
+      varUserAttrs.rec.AuthSum    = Money(operation.outParams.amount) / 100;
+      varUserAttrs.rec.CardMaturityDate = cardMaturDate;
+      ok = userAttrs.insert(varUserAttrs.recSize);
+
+      /* Проводка списка документов */
+      if( ok )
+        stat = CarryGDDList();
+        if( stat != 0 )
+          ok = false;
+        end;
+      end;
+
+      /* Откат авторизации */
+      if( not ok )
+        operation = terminal.createOperation(4003);
+        operation.inParams..authCode          = varUserAttrs.rec.RRN;
+        operation.inParams.amount       = Int(double(OpAmount * 100));
+        operation.inParams.currency     = GetCurrISO(planpay.Code_Currency);
+        operation.inParams.receiverCard = cardNumber;
+        operation.inParams.track2       = track2;
+        if( not operation.execute )
+          stat = 2614; /* Невозможно отменить авторизацию POS-терминала!!! */
+        end;
+      end;
+
+    else
+      stat = 2613; /* Не выполнена авторизация через POS-терминал */
+    end;
+  end;
+
+  InterDesk_EndDocBunch();
+  if( GDDList_created )
+    DeleteGDDList();
+  end;
+
+  SetParm(0, stat);
+
+  return ok;
+end;
+
+/***************************************/
+/*  запуск оплаты ДП с авторизацией    */
+/***************************************/
+macro AuthPlanPay( PlanPayRec, PlanPaySum, PayDocRec )
+  var ok = true, stat = 0;
+
+  setbuff(planpay,PlanPayRec);
+  terminal = CreateObject("rtposcom", "TPosTerminal", null, false);
+  ok = terminal.setUserName(GetOperName({oper}));
+
+  if( ok )
+    ok = Execute_AuthPlanPay( stat, PlanPaySum );
+  end;
+
+  if ((not ok) and (terminal.lastError != 0))
+    stat = 2615; /* Ошибка при работе с POS-терминалом */
+  end;
+
+  if( ok )
+    SetParm(2, maindoc);
+  end;
+
+  return stat;
+
+  OnError(err)
+    return 2615; /* Ошибка при работе с POS-терминалом */
+end;
+
+/***************************************/
+/*     запуск авторизации для ДП       */
+/***************************************/
+macro Authorization( PlanPayRec, DepDocRec )
+  var ok = true, stat = 0;
+  var operation;
+  var cardNumber = "", track2 = "", cardMaturDate;
+  var userAttrs, varUserAttrs;
+  
+  setbuff(planpay,PlanPayRec);
+  setbuff(depdoc,DepDocRec);
+  terminal = CreateObject("rtposcom", "TPosTerminal", null, false);
+  ok = terminal.setUserName(GetOperName({oper}));
+
+  if( ok )
+    ok = GetCardNumber(planpay.FNcash, planpay.CardRef, cardNumber, cardMaturDate);
+    if( ok )
+      track2 = GetTrack2(cardNumber, cardMaturDate);
+    else
+      stat = 2607; /* Нет такой карточки */
+    end;
+  end;
+
+  /* Авторизация */
+  if( ok )
+    operation = terminal.createOperation(4013); /* Погашение кредита */
+    operation.inParams.amount       = Int(double(depdoc.OutSum * 100));
+    operation.inParams.currency     = GetCurrISO(depdoc.Code_Currency);
+    operation.inParams.receiverCard = cardNumber;
+    operation.inParams.track2       = track2;
+    ok = operation.execute;
+    
+    if( ok ) /* Авторизация прошла успешно */
+      userAttrs = getDocUserAttrPool();
+      varUserAttrs = userAttrs.overlayRecord("rt_paym.rrn", userAttrs.FldOffset("Payment"), true);
+      userAttrs.clear;
+      userAttrs.rec.Branch           = depdoc.FNcash;
+      userAttrs.rec.iApplicationKind = depdoc.iApplicationKind;
+      userAttrs.rec.ApplicationKey   = depdoc.ApplicationKey;
+      userAttrs.rec.AttrID           = "RRN";
+      varUserAttrs.clear;
+      varUserAttrs.rec.RRN        = operation.outParams.authCode;
+      varUserAttrs.rec.CardNumber = cardNumber;
+      varUserAttrs.rec.AuthCurr   = GetCurrCode(operation.outParams.currency);
+      varUserAttrs.rec.AuthSum    = Money(operation.outParams.amount) / 100;
+      varUserAttrs.rec.CardMaturityDate = cardMaturDate;
+      ok = userAttrs.insert(varUserAttrs.recSize);
+    else
+      stat = 2613; /* Не выполнена авторизация через POS-терминал */
+    end;
+  end;
+
+  if ((not ok) and (terminal.lastError != 0))
+    stat = 2615; /* Ошибка при работе с POS-терминалом */
+  end;
+
+  return stat;
+
+  OnError(err)
+    return 2615; /* Ошибка при работе с POS-терминалом */
+end;
+
+end;

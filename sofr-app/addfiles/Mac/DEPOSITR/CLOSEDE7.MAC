@@ -1,0 +1,706 @@
+/*
+$Name:           CLOSEDE7.mac
+$Module:         RETAIL
+$Description:    макрос закрытия счета для вида вклада "Юбилейный"
+*/
+
+/***************************************************************************\
+| CLOSEDE7.MAC - макрос закрытия счета для вида вклада "Юбилейный"          |
+|                                                     Зубов В.Ю. 11-12-97   |
+\***************************************************************************/
+import denomin, deprintr, getpcli2, IsSrvDoc, alg_vars, sqlconv, PmPropUtil;
+
+record FINISH_SBDEPDOC ("sbdepdoc.1"  );
+file   fff             ("sbdepdoc.dbt");
+private var doc = TDepFile( "sbdepdoc.dbt", "w" );
+record tmpDoc          ("sbdepdoc.1"  );
+file   dr              ("depositr.dbt") write;
+file   sb_apltp        (pc_apltp      ) key 0;
+private var pcalg = TBFile( "pc_alg.dbt", "r", 0 );
+private var pcestim = TBFile( "pcestim.dbt", "w", 0 );
+record save_SBDEPDOC   (sbdepdoc      );
+record save_DEPOSITOR  (depositr      );
+
+const ACCOUTN_HEIR = 2;     /* Наследник - выдачи */
+const ACCOUTN_HEIR_PAY = 7; /* Наследник - выплаты */
+
+const ОТКАТ_С_РЕЗУЛЬТАТОМ = -777; /* Откат с получением процентов */
+
+const OnlyInputSum_Commission  = 1;
+const OnlyInsertDoc_Commission = 2;
+
+var IsFirst   = TRUE;
+var Результат = 0;
+var ErrMsg    = "";
+
+var SummaComm = $0L;
+var TypeComm  = "";
+var NumOpert  = 0;
+
+ALG_RESULT = OK_RES; /* Заранее инициализируем код возврата */
+
+
+/**************************************************************************\
+|                                                                          |
+\**************************************************************************/
+/* Возвращает TRUE, если в расчет %% необходимо включать день расхода */
+macro DebitDayIncluded( bdate, IsInclude)
+/* В качестве признака будем ориентироваться на правую границу 
+   соответсвующего алгоритма по виду вклада по альтернативным условиям */
+
+  /* Ищем вид вклада по альтернативным условиям */
+  sb_apltp.IsCur    = ALG_DEPOSITOR.IsCur;
+  sb_apltp.TypeRec  = 1003;
+  sb_apltp.Type     = ALG_DEPOSITOR.Type_Account;
+  sb_apltp.ApplType = 2002; /* по альтернативным условиям */
+  sb_apltp.ApType   = "";
+  if (NOT GetEQ(sb_apltp))
+    return FALSE;
+  end;
+
+  /* Ищем алгоритм расчета */
+  pcalg.Clear;
+  pcalg.addFilter( "T_FlagCur = " + String( ALG_DEPOSITOR.IsCur ) + " and " +
+                   "T_Referenc = " + GetSQLString( sb_apltp.ApType ) + " and " +
+                   "T_ObjectType = 1003"                                        );
+  pcalg.rec.FlagCur    = ALG_DEPOSITOR.IsCur;
+  pcalg.rec.Referenc   = sb_apltp.ApType;
+  pcalg.rec.ObjectType = 1003;
+  pcalg.rec.BegDate    = bdate;
+  if ((NOT pcalg.GetLE                            ) OR 
+      (pcalg.rec.FlagCur    != ALG_DEPOSITOR.IsCur) OR
+      (pcalg.rec.Referenc   != sb_apltp.ApType    ) OR 
+      (pcalg.rec.ObjectType != 1003               )   )
+    pcalg.dropFilter;
+    return FALSE;
+  end;
+  pcalg.dropFilter;
+
+  if ((pcalg.rec.RangeAlg == 2) OR  /* левую исключать, правую включать */
+      (pcalg.rec.RangeAlg == 3) OR  /* левую исключать, правую включать + первый день */
+      (pcalg.rec.RangeAlg == 4)   ) /* левую включать, правую исключать + последний день */
+    SetParm(1,TRUE);
+  else
+    SetParm(1,FALSE);
+  end;
+
+  return TRUE;
+
+end;
+
+
+/**************************************************************************\
+|                                                                          |
+\**************************************************************************/
+macro  ClearLimit
+
+  KeyNum(dr,8);
+  dr.Referenc = ALG_DEPOSITOR.Referenc;
+  if ((GetGE(dr)                            ) AND
+      (dr.Referenc == ALG_DEPOSITOR.Referenc)    )
+    dr.Limit = $0L;
+    Update(dr);
+  else
+    ErrMsg = "Cчет не найден";
+    Результат = -1;
+  end;
+
+end;
+
+
+/**************************************************************************\
+|           Поиск последнего документа по накопленным процентам            |
+\**************************************************************************/
+macro GetLastPcEstim
+
+  var stat;
+  var findLast = false;
+
+  pcestim.addFilter( "T_Referenc = " + String( ALG_DEPOSITOR.Referenc ) );
+  pcestim.Clear;
+  pcestim.rec.Referenc   = ALG_DEPOSITOR.Referenc;
+  pcestim.rec.DateOperat = Date( 31, 12, 9999 );
+  pcestim.rec.NumDayDoc  = 32000;
+  stat = pcestim.GetLE;
+  while ( stat )
+    if ( pcestim.rec.Referenc != ALG_DEPOSITOR.Referenc )
+      stat = false;
+    else
+      if ( pcestim.rec.Action < 2 )
+        findLast = true;
+        stat = false;
+      else
+        stat = pcestim.Prev;
+      end;
+    end;
+  end;
+  pcestim.dropFilter;
+
+  return findLast;
+  
+end;
+
+
+/**************************************************************************\
+|                                                                          |
+\**************************************************************************/
+macro CloseDep
+
+  var
+    NullDate  = Date(0,0,0),
+    LimitDate = Date(0,0,0),
+/*    EndCalcDate = {curdate},*/
+    EndCalcDate = ALG_SBDEPDOC.DepDate_Document,
+    VeryBigDate = Date(31,12,2999),
+    found,
+    Summa, OutSumma, PercSum1, PercSum2, PercSum3, Summa1, DateT, saveDate,
+    CorSumOut = $0L, TmpSum = $0L,
+    С_Панелью, UseMaxDate, NoPrint, findOper,
+    Operation,
+    NeedInclude,
+    st, stat;
+
+  /* Вычисляем дату, с которой пересчитывать проценты */
+  if (ALG_DEPOSITOR.Prol_DateDep != NullDate)
+    LimitDate = ALG_DEPOSITOR.Prol_DateDep - 1;
+  else
+    LimitDate = ALG_DEPOSITOR.Start_DateDep;
+  end;
+  /* VZ 18.02.99 Добавлен учет новых условий по вкладам - включение дня
+     расходной операции (письмо №02-536 от "01" февраля 1999г) */
+  if (NOT DebitDayIncluded(LimitDate,NeedInclude))
+    Результат = -1;
+    ErrMsg = "Ошибка при определении вида учета дня совершения расх. операций";
+    return;
+  end;
+  if (NeedInclude)
+    EndCalcDate = EndCalcDate + 1;
+  end;
+
+  /* Ручками начисляем %% по Довостребования, списываем сумму процентов, */
+  /* причисленных в результате капитализаций в текущем сроке */
+  /* Вычитаем сумму отчисленного налога */
+  Summa1 = $0L;
+  doc.KeyNum = 1;
+  doc.addFilter( "T_Referenc = " + String( ALG_DEPOSITOR.Referenc ) + " and " +
+                 "T_TypeOper = " + String( Списание_Простое )                  );
+  doc.Clear;
+  doc.rec.Referenc         = ALG_DEPOSITOR.Referenc;
+  doc.rec.TypeOper         = Списание_Простое;
+  doc.rec.DepDate_Document = LimitDate;
+  found = doc.GetEQ;
+  while ( found                                           AND
+         (doc.rec.Referenc         == ALG_DEPOSITOR.Referenc) AND
+         (doc.rec.TypeOper         == Списание_Простое      ) AND
+         (doc.rec.DepDate_Document == LimitDate             )    )
+    if (IsServDoc(doc.rec) AND (doc.rec.ApplType == Налог_Нерезидентов))
+      Summa1 = doc.rec.OutSum;
+      found = FALSE;
+    else
+      found = doc.Next;
+    end;
+  end;
+  doc.dropFilter;
+
+  /* На остаток вклада на LimitDate  и на приходно-расходные операции, */
+  /* кроме причисления %% начисляем %% по довостребования(PercSum1).*/
+  Summa = $0L;
+  PercSum1 = $0L;
+
+  doc.KeyNum = 2;
+  doc.addFilter( "T_Referenc = " + String( ALG_DEPOSITOR.Referenc ) );
+  doc.Clear;
+  doc.rec.Referenc         = ALG_DEPOSITOR.Referenc;
+  doc.rec.DepDate_Document = LimitDate;
+  findOper = FALSE;
+  found = doc.GetLE;
+
+  while ( found                                           AND
+         (doc.rec.Referenc         == ALG_DEPOSITOR.Referenc) AND
+         (doc.rec.DepDate_Document == LimitDate             )    )
+    if (((doc.rec.TypeComplexOper == Открытие_Наличными   ) OR
+         (doc.rec.TypeComplexOper == Открытие_Безналичными) OR
+         (doc.rec.TypeOper        == Открытие_Безналичными) OR
+         (doc.rec.TypeComplexOper == Открытие_Переводом   ) OR
+         (doc.rec.TypeComplexOper == Пролонгация_Депозитов) OR
+       /* VZ 24.11.97 Для конвертера и для неисправленной программы */
+         (doc.rec.TypeOper == Зачисление_Процентов        )   ) AND
+          IsServDoc(doc.rec)                                        )
+
+      saveDate = doc.rec.DepDate_Document;
+
+      Результат = Проценты_На_Операцию(ALG_DEPOSITOR.Account,ALG_DEPOSITOR.Type_Account,
+                                       ALG_DEPOSITOR.Code_Currency,doc.rec.Rest - Summa1,Summa,
+                                       doc.rec.DepDate_Document + 1,endCalcDate,2002,0);
+
+      if (Результат != 0)
+        ErrMsg = " 1.Ошибка при расчете %% = " + String(Результат);
+        doc.dropFilter;
+        return;
+      end;
+
+      PercSum1 = PercSum1 + Summa;
+      found    = FALSE;
+      findOper = TRUE;
+    else
+      found = doc.Prev;
+    end;
+  end;
+  doc.dropFilter;
+
+  if (NOT findOper)
+    ErrMsg = "1.Не найдена необходимая операция за " + String(LimitDate);
+    return;
+  end;
+
+  /* Продолжаем поиск */
+  doc.addFilter( "T_Referenc = " + String( ALG_DEPOSITOR.Referenc ) );
+  while ( doc.Next                                            AND
+         (doc.rec.Referenc         == ALG_DEPOSITOR.Referenc) AND
+         (doc.rec.DepDate_Document <= {curdate}             )    )
+    if (  IsServDoc(doc.rec)                                    AND
+        ((doc.rec.Author           == StrFor(ACCOUTN_HEIR    )) OR
+         (doc.rec.Author           == StrFor(ACCOUTN_HEIR_PAY)) OR
+         (doc.rec.DepDate_Document <  {curdate}               )   ) AND
+         /* Прокидываем операцию причисление %% */
+        ( doc.rec.TypeOper != Зачисление_Процентов                ) AND
+        ( doc.rec.TypeOper != Переплата_Процентов                 ) AND
+        ( doc.rec.TypeOper != Недоплата_Процентов                 ) AND
+        ( doc.rec.TypeOper != Пролонгация_Депозитов               ) AND
+         /* пропускаем записи об отчислении налога на нерезидентов*/
+         NOT ((doc.rec.TypeOper == Списание_Простое  ) AND
+              (doc.rec.ApplType == Налог_Нерезидентов)    )             )
+      if (doc.rec.InSum != $0L)
+        Результат = Проценты_На_Операцию(ALG_DEPOSITOR.Account,ALG_DEPOSITOR.Type_Account,
+                                         ALG_DEPOSITOR.Code_Currency,doc.rec.InSum,Summa,
+                                         doc.rec.DepDate_Document + 1,endCalcDate,2002,0      );
+
+        if (Результат != 0)
+          ErrMsg = "1.Ошибка при расчете %% = " + String(Результат);
+          doc.dropFilter;
+          return;
+        end;
+        PercSum1 = PercSum1 + Summa;
+      end;
+
+      if (doc.rec.OutSum != $0L)
+        if ((doc.rec.Author == StrFor(ACCOUTN_HEIR    )) OR
+            (doc.rec.Author == StrFor(ACCOUTN_HEIR_PAY))   )
+          DateT = saveDate;
+          TmpSum = doc.rec.OutSum - CorSumOut;
+        else
+          DateT = doc.rec.DepDate_Document;
+          TmpSum = doc.rec.OutSum;
+        end;
+        Результат = Проценты_На_Операцию(ALG_DEPOSITOR.Account,ALG_DEPOSITOR.Type_Account,
+                                         ALG_DEPOSITOR.Code_Currency,TmpSum,Summa,
+                                         DateT + 1,endCalcDate,2002,0                     );
+
+        if (Результат != 0)
+          ErrMsg = "1.Ошибка при расчете %% = " + String(Результат);
+          doc.dropFilter;
+          return;
+        end;
+
+        PercSum1 = PercSum1 - Summa;        
+      end;
+      CorSumOut = 0;
+    elif ((doc.rec.TypeOper == Зачисление_Процентов        ) AND
+          (IsServDoc(doc.rec)                              ) AND
+          (doc.rec.TypeComplexOper != Зачисление_Процентов ) OR
+          (doc.rec.TypeComplexOper != Пролонгация_Депозитов)    )
+      CorSumOut = doc.rec.InSum;
+    end;
+  end;
+  doc.dropFilter;
+
+  /* Обнуляем лимит по вкладу */
+  ClearLimit();
+
+  /* Суммируются проценты, причисленные при проведении капитализации и при */
+  /* выплате %%(PercSum2) */
+  Summa = $0L;
+  PercSum2 = $0L;
+  Array NeedOperCode;
+  var   NumOper = 0;
+
+  NeedOperCode(0) = Зачисление_Процентов;
+  NeedOperCode(1) = Переплата_Процентов;
+  NeedOperCode(2) = Недоплата_Процентов;
+  while (NumOper < Asize(NeedOperCode))
+    doc.KeyNum = 1;
+    doc.addFilter( "T_Referenc = " + String( ALG_DEPOSITOR.Referenc ) + " and " +
+                   "T_TypeOper = " + String( NeedOperCode( NumOper ) )           );
+    doc.Clear;
+    doc.rec.Referenc         = ALG_DEPOSITOR.Referenc;
+    doc.rec.TypeOper         = NeedOperCode( NumOper );
+    doc.rec.DepDate_Document = LimitDate + 1; /* Пролонгация не учитывается */
+    if (doc.GetGE)
+      found = True;
+      while( found                                   AND
+            (doc.rec.Referenc == ALG_DEPOSITOR.Referenc) AND
+            (doc.rec.TypeOper == NeedOperCode(NumOper) ) AND
+            (doc.rec.DepDate_Document <= {curdate}     )    )
+        if (  IsServDoc(doc.rec)                                   AND
+            ((doc.rec.TypeComplexOper == Зачисление_Процентов ) OR
+             (doc.rec.TypeComplexOper == Пролонгация_Депозитов) OR
+             (doc.rec.TypeComplexOper == NeedOperCode(NumOper))   )   )
+          PercSum2 = PercSum2 + Den(doc.rec.InSum,doc.rec.DepDate_Document) - Den(doc.rec.OutSum,doc.rec.DepDate_Document);
+        end;
+        if ( not doc.Next)
+          found = FALSE;
+        end;
+      end;
+    end;
+
+    doc.dropFilter;
+
+    NumOper = NumOper + 1;
+
+  end;
+
+  /* Вычисляем сумму отчисленого налога на нерезидентов */
+  PercSum3 = $0L;
+  doc.KeyNum = 1;
+  doc.addFilter( "T_Referenc = " + String( ALG_DEPOSITOR.Referenc ) + " and " +
+                 "T_TypeOper = " + String( Списание_Простое )                  );
+  doc.rec.Referenc         = ALG_DEPOSITOR.Referenc;
+  doc.rec.TypeOper         = Списание_Простое;
+  doc.rec.DepDate_Document = LimitDate + 1; /* Пролонгация не учитывается */
+  if (doc.GetGE)
+    found = TRUE;
+    while( found                                   AND
+          (doc.rec.Referenc == ALG_DEPOSITOR.Referenc) AND
+          (doc.rec.TypeOper == Списание_Простое      ) AND
+          (doc.rec.ApplType == Налог_Нерезидентов    ) AND
+          (doc.rec.DepDate_Document <= {curdate}     )    )
+      if (IsServDoc(doc.rec))
+        PercSum3 = PercSum3 + doc.rec.OutSum;
+      end;
+      if ( not doc.Next )
+        found = FALSE;
+      end;
+    end;
+  end;
+  doc.dropFilter;
+
+  if ((PercSum3 != 0) AND (PercSum2 != 0))
+    PercSum2 = PercSum2 - PercSum3;
+  end;
+
+  /* Отчисляем PercSum2 */
+  if (PercSum2 != 0)
+    ClearRecord(tmpDoc);
+    tmpDoc.Referenc         = ALG_SBDEPDOC.Referenc;
+    tmpDoc.IsCur            = ALG_SBDEPDOC.IsCur;
+    tmpDoc.FNCash           = ALG_SBDEPDOC.FNCash;
+    tmpDoc.RealFNCash       = ALG_SBDEPDOC.RealFNCash;
+    tmpDoc.Account          = ALG_DEPOSITOR.Account;
+    tmpDoc.Oper             = {oper};
+    tmpDoc.Type_Account     = ALG_SBDEPDOC.Type_Account;
+    tmpDoc.Code_Currency    = ALG_SBDEPDOC.Code_Currency;
+    tmpDoc.CodClient        = ALG_SBDEPDOC.CodClient;
+    tmpDoc.YesSbook         = "X";
+    tmpDoc.Date_Document    = ALG_SBDEPDOC.Date_Document;
+    tmpDoc.DepDate_Document = ALG_SBDEPDOC.DepDate_Document;
+    tmpDoc.Author           = ALG_SBDEPDOC.Author;
+    tmpDoc.InSum            = -PercSum2;
+    tmpDoc.TypeComplexOper  = ALG_PARAM.NumOpert;
+
+    С_Панелью  = 0;
+    UseMaxDate = 1;
+    NoPrint    = 1;
+
+    Результат = Выполнить_Операцию(ALG_DEPOSITOR.Account,ALG_DEPOSITOR.Type_Account,
+                                   ALG_DEPOSITOR.Code_Currency,Зачисление_Процентов,
+                                   tmpDoc,С_Панелью,UseMaxDate,NoPrint,ALG_PARAM.NumOpert );
+
+    if (Результат != 0)
+      ErrMsg = "3.Ошибка при отчислении PercSum2 = " + String(Результат);
+      return;
+    end;
+  end;
+
+  /* Переводим на альтернативные условия */
+  Результат = moveAccountIntoAnotherState(Перевод_В_Альт_Сост,ALG_DEPOSITOR.Referenc,
+                                          LimitDate,VeryBigDate                      );
+
+  if (Результат != 0)
+    ErrMsg = "5. Ошибка при переводе в альт.состояние " + String(Результат);
+    return;
+  end;
+
+  /* Заполняем pcestim иначе программа путается */
+  if ( GetLastPcEstim( ) )
+    pcestim.GetPos;
+    pcestim.GetDirect;
+    pcestim.rec.SummaProgn = PercSum1;
+    pcestim.rec.SummaCalc  = PercSum1;
+    if ( not pcestim.Update )
+      ErrMsg = "10. Ошибка при заполнении накопленных процентов";
+      return;
+    end;
+  end;
+
+  /* Причисляем PercSum1 */
+  if (PercSum1 != 0)
+    ClearRecord(tmpDoc);
+    tmpDoc.Referenc         = ALG_SBDEPDOC.Referenc;
+    tmpDoc.IsCur            = ALG_SBDEPDOC.IsCur;
+    tmpDoc.FNCash           = ALG_SBDEPDOC.FNCash;
+    tmpDoc.RealFNCash       = ALG_SBDEPDOC.RealFNCash;
+    tmpDoc.Account          = ALG_DEPOSITOR.Account;
+    tmpDoc.Oper             = {oper};
+    tmpDoc.Type_Account     = ALG_SBDEPDOC.Type_Account;
+    tmpDoc.Code_Currency    = ALG_SBDEPDOC.Code_Currency;
+    tmpDoc.CodClient        = ALG_SBDEPDOC.CodClient;
+    tmpDoc.YesSbook         = "X";
+    tmpDoc.Date_Document    = ALG_SBDEPDOC.Date_Document;
+    tmpDoc.DepDate_Document = ALG_SBDEPDOC.DepDate_Document;
+    tmpDoc.Author           = ALG_SBDEPDOC.Author;
+    tmpDoc.InSum            = PercSum1;
+    tmpDoc.TypeComplexOper  = ALG_PARAM.NumOpert;
+
+    С_Панелью  = 0;
+    UseMaxDate = 1;
+    NoPrint    = 1;
+
+    Результат = Выполнить_Операцию(ALG_DEPOSITOR.Account,ALG_DEPOSITOR.Type_Account,
+                                   ALG_DEPOSITOR.Code_Currency,Зачисление_Процентов,
+                                   tmpDoc,С_Панелью,UseMaxDate,NoPrint,ALG_PARAM.NumOpert );
+
+    if (Результат != 0)
+      ErrMsg = "4.Ошибка при зачислении PercSum1 = " + String(Результат);
+      return;
+    end;
+  end;
+
+  /* 6. Списываем весь остаток */
+  KeyNum(dr,8);
+  dr.Referenc = ALG_DEPOSITOR.Referenc;
+  if (NOT GetEQ(dr))
+    ErrMsg = "Не найдена запись по счету";
+    Результат = -1;
+    return;
+  end;
+  Copy(ALG_DEPOSITOR,dr);
+  ALG_DEPOSITOR.End_DateDep = NullDate;
+
+  if ((ALG_DEPOSITOR.Sum_Rest != 0) OR (StrFor(GetProgramID) == "П"))
+    ClearRecord(tmpDoc);
+    tmpDoc.Referenc         = ALG_SBDEPDOC.Referenc;
+    tmpDoc.IsCur            = ALG_SBDEPDOC.IsCur;
+    tmpDoc.FNCash           = ALG_SBDEPDOC.FNCash;
+    tmpDoc.RealFNCash       = ALG_SBDEPDOC.RealFNCash;
+    tmpDoc.Account          = ALG_DEPOSITOR.Account;
+    tmpDoc.Oper             = {oper};
+    tmpDoc.Type_Account     = ALG_SBDEPDOC.Type_Account;
+    tmpDoc.Code_Currency    = ALG_SBDEPDOC.Code_Currency;
+    tmpDoc.CodClient        = ALG_SBDEPDOC.CodClient;
+    tmpDoc.YesSbook         = "X";
+    tmpDoc.Date_Document    = ALG_SBDEPDOC.Date_Document;
+    tmpDoc.DepDate_Document = ALG_SBDEPDOC.DepDate_Document;
+    tmpDoc.Author           = ALG_SBDEPDOC.Author;
+    tmpDoc.OutSum           = GetLastFCDocRest(ALG_DEPOSITOR.Referenc,{curdate});
+    tmpDoc.TypeComplexOper  = ALG_PARAM.NumOpert;
+    tmpDoc.ApplType         = FINISH_SBDEPDOC.ApplType;
+    //tmpDoc.Account_Receiver = FINISH_SBDEPDOC.Account_Receiver;
+    //tmpDoc.CodeCur_Receiver = FINISH_SBDEPDOC.CodeCur_Receiver;
+    //tmpDoc.MFO_Receiver     = FINISH_SBDEPDOC.MFO_Receiver;
+    //tmpDoc.CorAcc_Receiver  = FINISH_SBDEPDOC.CorAcc_Receiver;
+    tmpDoc.IsControl        = StrFor(1); /* Признак главного документа */
+    tmpDoc.PercTrnRest      = FINISH_SBDEPDOC.PercTrnRest;
+    tmpDoc.PercTrnAlt       = FINISH_SBDEPDOC.PercTrnAlt;
+    tmpDoc.CurrencyBought   = FINISH_SBDEPDOC.CurrencyBought;
+    tmpDoc.SummaTaxRub      = FINISH_SBDEPDOC.SummaTaxRub;
+
+    if ((FINISH_SBDEPDOC.TypeOper != 0                 ) AND
+        (FINISH_SBDEPDOC.TypeOper != ALG_PARAM.NumOpert)    )
+      Operation = FINISH_SBDEPDOC.TypeOper;
+    elif (ALG_PARAM.NumOpert == Закрытие_Наличными)
+      Operation = Расход;
+    else
+      Operation = Списание_По_Раз_Поруч;
+    end;
+
+    tmpDoc.TypeOper = Operation;
+
+    if (Operation == Безналичная_Конверсия)
+      /* Пересчет суммы с учетом подоходного налога */
+      if (tmpDoc.SummaTaxRub != 0)
+        tmpDoc.OutSum = tmpDoc.OutSum - tmpDoc.SummaTaxRub;
+      end;
+      /* Пересчет конвертируемой суммы с учетом процентов */
+      if (tmpDoc.PercTrnRest != 0)
+        tmpDoc.CurrencyBought = tmpDoc.OutSum / tmpDoc.PercTrnRest;
+      end;
+    end;
+
+    if (IsFirst)
+      Результат = ОТКАТ_С_РЕЗУЛЬТАТОМ;
+      InterDesk_EndDocBunch();
+      return;
+    elif (SummaComm > 0)
+      Результат = GetCommissionOnOper(tmpDoc,tmpDoc.OutSum,OnlyInsertDoc_Commission,SummaComm,TypeComm,NumOpert,ALG_PARAM.NumOpert);
+      if (Результат != 0)
+        ErrMsg = "Ошибка при вставке документа на комиссию " + String(Результат);
+        return;
+      end;
+    end;
+    
+    С_Панелью  = 0;
+    UseMaxDate = 1;
+    NoPrint    = 1;
+
+    ClearRecord(ALG_OPERPRM);
+    ALG_OPERPRM.Account           = ALG_DEPOSITOR.Account;
+    ALG_OPERPRM.Type_Account      = ALG_DEPOSITOR.Type_Account;
+    ALG_OPERPRM.Code_Currency     = ALG_DEPOSITOR.Code_Currency;
+    ALG_OPERPRM.Type_Oper         = Operation;
+    ALG_OPERPRM.Show_Panel        = С_Панелью;
+    ALG_OPERPRM.UseMaxDate        = UseMaxDate;
+    ALG_OPERPRM.NoPrint           = NoPrint;
+    ALG_OPERPRM.NonCashCommission = ALG_PARAM.prmI;
+    ALG_OPERPRM.TypeComplexOper   = ALG_PARAM.NumOpert;
+    ALG_OPERPRM.DocumentAuthor    = CodeFor(tmpDoc.Author);
+    if (Operation == Списание_Переводом)
+      ALG_OPERPRM.CorrAcc         = PMNT_PROP_REC_BUF.Account;
+      ALG_OPERPRM.CorrType        = PMNT_PROP_REC_BUF.CorrAccount;
+    end;
+
+    Результат = Выполнение_Операции(ALG_OPERPRM,tmpDoc);
+
+    if (Результат != 0)
+     ErrMsg = "6. Ошибка при расходе " + String(Результат);
+     return;
+    end;
+
+  else
+    if (IsFirst)
+      ClearRecord(tmpDoc);
+      Результат = ОТКАТ_С_РЕЗУЛЬТАТОМ;
+      InterDesk_EndDocBunch();
+      return;
+    end;
+  end;
+
+  /* Наводим марафет - чистим грязь в полях процентов */
+  doc.KeyNum = 6;
+  doc.addFilter( "T_Referenc = " + String( ALG_DEPOSITOR.Referenc ) );
+  doc.rec.Referenc      = ALG_DEPOSITOR.Referenc;
+  doc.rec.Date_Document = {curdate};
+  doc.rec.NumDayDoc     = 0;
+  st = doc.GetGE;
+  stat = TRUE;
+  while (st AND stat AND (doc.rec.Referenc == ALG_DEPOSITOR.Referenc))
+    doc.rec.PercOprSum = $0L;
+    doc.rec.PercRest   = $0L;
+    stat = doc.Update;
+    st = doc.Next;
+  end;
+  doc.dropFilter;
+  
+  ALG_RESULT = END_RES; /* Все Ok */
+
+  if ((ALG_PARAM.prmC == "X") and (Результат == 0))
+    ALG_PARAM.prmD = PercSum1;
+    Результат = ОТКАТ_С_РЕЗУЛЬТАТОМ;
+  end;
+
+  return;
+
+end;
+
+
+/**************************************************************************\
+|                                                                          |
+\**************************************************************************/
+macro TrnProc
+
+  CloseDep();
+
+  if (Результат != 0)
+    if (Результат == ОТКАТ_С_РЕЗУЛЬТАТОМ)
+      ;
+    else
+      ALG_RESULT = ERR_RES;
+    end;
+    AbortTrn();
+  end;
+
+end;
+
+
+/**************************************************************************\
+|                                                                          |
+\**************************************************************************/
+
+  LoopInTrn(TRUE);
+
+  ClearRecord(tmpDoc);
+
+  Copy(save_DEPOSITOR,ALG_DEPOSITOR);
+  Copy(save_SBDEPDOC,ALG_SBDEPDOC);
+  Copy(fff,ALG_SBDEPDOC);
+  SetRecordAddr(FINISH_SBDEPDOC,fff,0,0,true);
+
+  /* Нужно взять комиссию - для этого предварительно определим сумму расхода */
+  IsFirst = TRUE;
+  if ((ALG_PARAM.prmI2 >   0 ) AND 
+      (ALG_PARAM.prmC  != "X")    )
+    if ((StrFor(GetProgramID) == "П") AND (ALG_PARAM.prmI > 0))
+      ;
+    else
+      if (NOT ProcessTrn(1,"TrnProc",sb_apltp))
+        if (Результат != ОТКАТ_С_РЕЗУЛЬТАТОМ)
+          ALG_RESULT = ERR_RES;
+          Результат = 4714;
+        end;
+      end;
+      Copy(ALG_DEPOSITOR,save_DEPOSITOR);
+      Copy(ALG_SBDEPDOC,save_SBDEPDOC);
+      Copy(fff,ALG_SBDEPDOC);
+      SetRecordAddr(FINISH_SBDEPDOC,fff,0,0,true);
+    end;
+  end;
+
+  /* Проведем собственно операцию закрытия счета */
+  IsFirst = FALSE;
+  if (ALG_RESULT != ERR_RES)
+    Результат = 0;
+    if ((ALG_PARAM.prmI2 >   0 ) AND 
+        (ALG_PARAM.prmC  != "X") AND
+        (tmpDoc.OutSum   >   0 )    )
+      if ((StrFor(GetProgramID) == "П") AND (ALG_PARAM.prmI > 0))
+        ;
+      else
+        Результат = GetCommissionOnOper(tmpDoc,tmpDoc.OutSum,OnlyInputSum_Commission,SummaComm,TypeComm,NumOpert);
+        if (Результат == 2)
+          MsgBox("Отказались от проведения операции");
+          ALG_RESULT = ERR_RES;
+        elif (Результат != 0)
+          ErrMsg = "Ошибка при взятии комиссии = " + String(Результат);
+          ALG_RESULT = ERR_RES;
+        end;
+      end;
+    end;
+    if (Результат == 0)
+      if (NOT ProcessTrn(1,"TrnProc",sb_apltp))
+        if (Результат != ОТКАТ_С_РЕЗУЛЬТАТОМ)
+          ALG_RESULT = ERR_RES;
+          Результат = 4714;
+        end;
+      end;
+    end;
+  end;
+
+  if ((ALG_PARAM.prmC == "X") AND (Результат == ОТКАТ_С_РЕЗУЛЬТАТОМ))
+    ALG_RESULT = END_RES;
+    ALG_UPDATE = 0;
+  end;
+
+  if ((ErrMsg != "") AND (NOT InFCGroupOpRun()))
+    MsgBox(ErrMsg);
+  end;
+
+end;

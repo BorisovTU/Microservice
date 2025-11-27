@@ -1,0 +1,282 @@
+import DealsInter, CTInter, FIInter, PTInter, 
+      globals, cb_sql, oralib, likepy, dldlngfun, lim_utils, dlquery, dlcontrfunc,
+      sp_car, "or_rep_h.mac";
+
+
+PRIVATE CONST IS_REAL = true; //выполнение с реальным воздействием на БД, или запуск только для отчёта
+PRIVATE CONST SHOW_EXCEL = true; //отображать протокол в Excel, или просто вывести в таблице в текстовом файле
+
+PRIVATE CONST DEFDATE = date(15,12,2023);
+
+PRIVATE CONST StrHeader =
+"┌───────────────────────────┬───────────────────────────┬────────────────────────┬────────────────────┬──────────────────────────┬─────────────────────────────┐\n"+
+"│       Старый Счет         │       Новый счет          │  Имя категории учета   │  Остаток на счете  │  Остаток по СПБ по лоту  │ Результат создания проводки │\n"+
+"├───────────────────────────┼───────────────────────────┼────────────────────────┼────────────────────┼──────────────────────────┼─────────────────────────────┤";
+
+private macro SetCommonFlagAndDisDateToMcAccDoc(mcaccid, flag, disDate)
+  ExecSQL("UPDATE dmcaccdoc_dbt SET t_iscommon = ?, t_disablingdate = ? WHERE t_id = ?",
+          makeArray(SQLParam("flag", IIF(flag,SET_CHAR,UNSET_CHAR)), SQLParam("disDate", disDate), SQLParam("mcaccid", mcaccid)), true);
+end;
+
+private macro Get560CategQuery(opDate)
+  var query =
+    " SELECT s.t_id, "
+   +"        a.t_id as t_accdocid, "
+   +"        s.t_partyid, "
+   +"        a.t_currency, "
+   +"        s.t_number, "
+   +"        a.t_account, "
+   +"        rsb_account.restall (a.t_account, "
+   +"                             a.t_chapter, "
+   +"                             a.t_currency, "
+   +"                             "+GetSQLDate(opDate)+") "
+   +"           AS rest, "
+   +"          NVL ( "
+   +"             (SELECT T_AMOUNT "
+   +"                FROM DPMWRTCL_DBT lot "
+   +"               WHERE     lot.T_PARTY = s.t_partyid "
+   +"                     AND lot.T_CONTRACT = s.t_id "
+   +"                     AND lot.T_FIID = a.T_CURRENCY "
+   +"                     AND lot.T_DEPARTMENT = A.T_DEPARTMENTID "
+   +"                     AND lot.T_BEGDATE <= "+GetSQLDate(opDate)+" "
+   +"                     AND lot.T_ENDDATE >= "+GetSQLDate(opDate)+"), "
+   +"             0) "
+   +"             AS lotRest "
+   +"   FROM dmcaccdoc_dbt a, dsfcontr_dbt s, ddlcontrmp_dbt m "
+   +"  WHERE     a.t_catid = 364 "
+   +"        AND a.t_iscommon = CHR (88) "
+   +"        AND a.t_clientcontrid = s.t_id "
+   +"        AND a.t_owner = s.t_partyid "
+   +"        AND s.t_dateclose = TO_DATE ('01010001', 'ddmmyyyy') "
+   +"        AND a.t_disablingdate = TO_DATE ('01010001', 'ddmmyyyy') "
+   +"        AND s.t_id = m.t_sfcontrid "
+   +"        AND m.t_marketid = 151337 "
+   +"        /*FETCH NEXT 10 ROWS ONLY */";
+  return query;
+end;
+
+private macro Get580CategQuery(opDate, sfContrId, clientId, currency, partyid)
+  var query =
+    " SELECT a.*,  "
+   +"        rsb_account.restall (a.t_account, "
+   +"                             a.t_chapter, "
+   +"                             a.t_currency, "
+   +"                             "+GetSQLDate(opDate)+") AS rest,"
+   +"          NVL ( "
+   +"             (SELECT T_AMOUNT "
+   +"                FROM DPMWRTCL_DBT lot "
+   +"               WHERE     lot.T_PARTY = " + partyid
+   +"                     AND lot.T_CONTRACT = " + sfContrId
+   +"                     AND lot.T_FIID = " + currency
+   +"                     AND lot.T_DEPARTMENT = A.T_DEPARTMENTID "
+   +"                     AND lot.T_BEGDATE <= "+GetSQLDate(opDate)+" "
+   +"                     AND lot.T_ENDDATE >= "+GetSQLDate(opDate)+"), "
+   +"             0) "
+   +"             AS lotRest "
+   +"   FROM dmcaccdoc_dbt a "
+   +"  WHERE     a.t_catid = 368 "
+   +"        AND a.t_iscommon = CHR (88) "
+   +"        AND a.t_clientcontrid = " + string(sfContrId)
+   +"        AND a.t_owner = " + string(clientId)
+   +"        AND a.t_currency = " + string(currency)
+   +"        AND a.t_disablingdate = TO_DATE ('01010001', 'ddmmyyyy') ";
+  return query;
+end;
+
+private macro ExecuteWork()
+  var BackOutAccount560 = false, ChangeOpenDate560  = false;
+  var RealOpenMode;
+  MC_GetAccountOpenParms( "ЦБ Клиента, ВУ", @BackOutAccount560, @ChangeOpenDate560 );
+  var BackOutAccount580 = false, ChangeOpenDate580  = false;
+  MC_GetAccountOpenParms( "ЦБ, Расч. с клиентом, ВУ", @BackOutAccount580, @ChangeOpenDate580 );
+
+  var mcaccdoc = TBFile("mcaccdoc.dbt" );
+  var mcaccdoc2 = TBFile("mcaccdoc.dbt" );
+
+  var opDate = DEFDATE;
+  if (not getDate(opDate,"Введите дату переноса счетов:"))
+    return;
+  end;
+
+  if(RslDefCon.IsInTrans)
+    RslDefCon.RollbackTrans();
+  end;
+  RslDefCon.BeginTrans();
+
+  var cmd = DL_RSDCommand(Get560CategQuery(opDate));
+  var count = cmd.GetCount();
+  var ds = cmd.Execute();
+
+  var counter = 0;
+
+  var Rep = CMakeReport(StrHeader);
+
+  if (count > 0)
+    InitProgress(count, "Поиск счетов СПБ по ВУ", "Поиск счетов СПБ по ВУ");
+    while (ds.MoveNext())
+      UseProgress((counter = counter + 1));
+
+      var cmd2 = DL_RSDCommand(Get580CategQuery(opDate, ds.Id, ds.PartyId, ds.Currency, ds.PartyId));
+      var ds2 = cmd2.Execute();
+
+      if (ds2.MoveNext())
+        var carryResult560 = 0;
+        var carryResult560Text = "Не требуется";
+        var newAccount560 = ""; 
+        var oldAccount560 = ""; 
+        var newAccount560Rec = TRecHandler("account.dbt");
+        var oldAccount560Rec = TRecHandler("account.dbt");
+
+        var carryResult580 = 0;
+        var carryResult580Text = "Не требуется";
+        var newAccount580 = ""; 
+        var oldAccount580 = ""; 
+        var newAccount580Rec = TRecHandler("account.dbt");
+        var oldAccount580Rec = TRecHandler("account.dbt");
+
+        mcaccdoc.rec.Id = ds.AccDocId;
+        mcaccdoc.GetEQ();
+        oldAccount560 = MC_FindAndOpenCommonAcc( "ЦБ Клиента, ВУ",
+                                                 opDate,
+                                                 MC_OPENACC_RECREATE,
+                                                 mcaccdoc.rec.TemplNum,
+                                                 mcaccdoc,
+                                                 mcaccdoc.rec.PeriodID,
+                                                 ds.Currency,
+                                                 NULL,
+                                                 mcaccdoc.rec.DepartmentID,
+                                                 oldAccount560Rec,
+                                                 RealOpenMode,
+                                                 null,
+                                                 MC_PAIRACCMODE_MANUAL,
+                                                 BackOutAccount560,
+                                                 ChangeOpenDate560 
+                                               );
+        SetCommonFlagAndDisDateToMcAccDoc(ds.AccDocId, false, opDate);
+        newAccount560 = MC_FindAndOpenCommonAcc( "ЦБ Клиента, ВУ",
+                                                 opDate,
+                                                 MC_OPENACC_RECREATE,
+                                                 mcaccdoc.rec.TemplNum,
+                                                 mcaccdoc,
+                                                 mcaccdoc.rec.PeriodID,
+                                                 ds.Currency,
+                                                 NULL,
+                                                 mcaccdoc.rec.DepartmentID,
+                                                 newAccount560Rec,
+                                                 RealOpenMode,
+                                                 null,
+                                                 MC_PAIRACCMODE_MANUAL,
+                                                 BackOutAccount560,
+                                                 ChangeOpenDate560 
+                                               );
+
+        mcaccdoc2.rec.Id = ds2.Id;
+        mcaccdoc2.GetEQ();
+
+        oldAccount580 = MC_FindAndOpenCommonAcc( "ЦБ, Расч. с клиентом, ВУ",
+                                                 opDate,
+                                                 MC_OPENACC_RECREATE,
+                                                 mcaccdoc2.rec.TemplNum,
+                                                 mcaccdoc2,
+                                                 mcaccdoc2.rec.PeriodID,
+                                                 ds.Currency,
+                                                 NULL,
+                                                 mcaccdoc2.rec.DepartmentID,
+                                                 oldAccount580Rec,
+                                                 RealOpenMode,
+                                                 null,
+                                                 MC_PAIRACCMODE_MANUAL,
+                                                 BackOutAccount580,
+                                                 ChangeOpenDate580 
+                                               );
+        SetCommonFlagAndDisDateToMcAccDoc(ds2.Id, false, opDate);
+        newAccount580 = MC_FindAndOpenCommonAcc( "ЦБ, Расч. с клиентом, ВУ",
+                                                 opDate,
+                                                 MC_OPENACC_RECREATE,
+                                                 mcaccdoc2.rec.TemplNum,
+                                                 mcaccdoc2,
+                                                 mcaccdoc2.rec.PeriodID,
+                                                 ds.Currency,
+                                                 NULL,
+                                                 mcaccdoc2.rec.DepartmentID,
+                                                 newAccount580Rec,
+                                                 RealOpenMode,
+                                                 null,
+                                                 MC_PAIRACCMODE_MANUAL,
+                                                 BackOutAccount580,
+                                                 ChangeOpenDate580 
+                                               );
+        if ((ABS(ds2.rest) > $0) and (ABS(ds2.lotrest) > $0))
+          if (ABS(ds2.lotrest) > ABS(ds2.rest))
+            carryResult580Text = "Сумма лота больше остатка";
+          else
+            carryResult580 = ПроводкаПоКатегориямУчета( NULL, oldAccount580Rec, newAccount580Rec, opDate,
+                                                        oldAccount580Rec.rec.Chapter, ds.Currency, ABS(ds2.lotrest), NULL,
+                                                        INPCARRY, "","", "Перенос остатка по договору " + ds.Number,
+                                                        0, null, null, ds.Currency, ds.Currency, null, null, null, null, true);
+            if (carryResult580)
+              carryResult580Text = "Создана";
+            else
+              carryResult580Text = "Ошибка создания";
+            end;
+          end;
+        end;
+        if ((ABS(ds.rest) > $0) and (ABS(ds.lotrest) > $0))
+          if (ABS(ds.lotrest) > ABS(ds.rest))
+            carryResult580Text = "Сумма лота больше остатка";
+          else
+            carryResult560 = ПроводкаПоКатегориямУчета( NULL, newAccount560Rec, oldAccount560Rec, opDate,
+                                                        oldAccount560Rec.rec.Chapter, ds.Currency, ABS(ds.lotrest), NULL,
+                                                        INPCARRY, "","", "Перенос остатка по договору " + ds.Number,
+                                                        0, null, null, ds.Currency, ds.Currency, null, null, null, null, true);
+            if (carryResult560)
+              carryResult560Text = "Создана";
+            else
+              carryResult560Text = "Ошибка создания";
+            end;
+          end;
+        end;
+        Rep.AddPrintCell(oldAccount560Rec.rec.Account);
+        Rep.AddPrintCell(newAccount560Rec.rec.Account);
+        Rep.AddPrintCell("ЦБ Клиента, ВУ");
+        Rep.AddPrintCell(ds.rest);
+        Rep.AddPrintCell(ds.lotrest);
+        Rep.AddPrintCell(carryResult560Text);
+        Rep.AddStr();
+        Rep.AddPrintCell(oldAccount580Rec.rec.Account);
+        Rep.AddPrintCell(newAccount580Rec.rec.Account);
+        Rep.AddPrintCell("ЦБ, Расч. с клиентом, ВУ");
+        Rep.AddPrintCell(ds2.rest);
+        Rep.AddPrintCell(ds2.lotrest);
+        Rep.AddPrintCell(carryResult580Text);
+        Rep.AddStr();
+      end;
+    end;
+    RemProgress();
+  end;
+
+  if (IS_REAL)
+    RslDefCon.CommitTrans();
+  else 
+    RslDefCon.RollbackTrans();
+  end;
+
+  if(Rep.IsDataExist())
+     if (SHOW_EXCEL)
+       /* Печатаем отчет в Excel */
+       Rep.PrintWinRep(1, "Sheet"); 
+       /* Делаем окно с Excel активным */
+       Rep.ShowWinRep();   
+     else
+       Rep.PrintRep();
+     end;
+  end;
+
+OnError(err)
+  MsgBox(GetFullErrorMessage(err));
+  if(RslDefCon.IsInTrans)
+    RslDefCon.RollbackTrans();
+  end;
+end;
+
+ExecuteWork();

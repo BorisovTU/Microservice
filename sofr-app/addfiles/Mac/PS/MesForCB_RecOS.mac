@@ -1,0 +1,304 @@
+/*
+  $Name:        MesForCB_RecOS.mac
+  $Module:      РКО
+  $Description: Блок Rec для сообщения в ЦБ об остатках на счетах
+*/
+//-----------------------------------------------------------------------------
+//          Автоматизированная банковская система RS-Bank               
+//                 Copyright (c) R-Style Software Lab
+//
+// Подсистема   : РКО
+//
+// Описание     : Блок Rec для сообщения в ЦБ об остатках на счетах
+//
+// Программист  : Чукина Т.А.
+//
+// Создан       : 16.10.2015
+//
+//-----------------------------------------------------------------------------
+
+import "MesForCB_lib.mac", "pm_common.mac", FIInter;
+
+private macro GetRestAccExternSystem
+  ( ExtSystRegName : string,
+    Account : string,
+    Code_Currency : integer,
+    Department : integer,
+    ClientID : integer,
+    OnDate : date,
+    AccRestKind : integer
+
+  ) : money
+
+  var RegPath : string = GetRegPathMesCbExtSyst(ExtSystRegName, "ХП_Остаток");
+  var RestSP : string = Bnk_GetRegistryValue(RegPath, V_STRING, "");
+  if(not RestSP)
+    RunError("Не задана хранимая процедура получения остатка по счету п/с " + ExtSystRegName);
+  end;
+
+  var params : TArray = makeArray
+    ( SQLParam("Account", Account),
+      SQLParam("Code_Currency", GetISO_Number(Code_Currency)),
+      SQLParam("Department", Department),
+      SQLParam("ClientID", ClientID),
+      SQLParam("OnDate", OnDate),
+      SQLParam("AccRestKind", AccRestKind)
+    );
+
+  var Rest : money = execStoredFunc( RestSP, V_MONEY, params );
+
+  return Rest;
+end;
+
+class (TXmlNodesAdd) TBlockRecOS(p_nodeRec : object, p_xml : object)
+  InitTXmlNodesAdd(p_nodeRec, p_xml);
+
+  private macro Fill_RestAndRestC
+  ( rs : RsdRecordset, 
+    RecDate : date, 
+    IsGK : bool,
+    Kind_Account : string,
+    AccRestKind : integer
+  )
+    var ElemName : string = "";
+    var RestDate : date = date(0, 0, 0);
+    var ExistsSuchRest : bool = true;
+
+    if(AccRestKind == ACCREST_KIND_IN)
+      ElemName = "IN";
+      RestDate = RecDate - 1;
+    elif(AccRestKind == ACCREST_KIND_OUT)
+      ElemName = "OUT";
+      RestDate = RecDate;
+    else
+      RunError("Ошибка программирования: неверное значение параметра AccRestKind (тип остатка)");
+    end;
+
+    if(Kind_Account == "А")
+      ElemName = ElemName + "DT";
+
+      // Если счет ACCOUNT - пассивный, то элемент отсутствует в сообщении
+      if( rs.value("t_Kind_Account") == "П" )
+        ExistsSuchRest = false;
+      end;
+    elif(Kind_Account == "П")
+      ElemName = ElemName + "KT";
+
+      // Если счет ACCOUNT - активный, то элемент отсутствует в сообщении
+      if( rs.value("t_Kind_Account") == "А" )
+        ExistsSuchRest = false;
+      end;
+    else
+      RunError("Ошибка программирования: неверное значение параметра Kind_Account");
+    end;
+
+    var Sum : money = $0;
+
+    var Account : string = rs.value("t_Account"), 
+        FIID : integer = rs.value("t_Code_Currency"),
+        Chapter : integer = CHAPT1;
+
+    if(ExistsSuchRest)
+      if(IsGK)
+        Sum = ПолучитьОстатокНаДату( Account, Chapter, FIID, RestDate );
+      else
+        Sum = GetRestAccExternSystem
+          ( rs.value("t_RegBranchBO"),
+            rs.value("t_Account"),
+            rs.value("t_Code_Currency"),
+            rs.value("t_Department"),
+            rs.value("t_ClientID"),
+            RecDate,
+            AccRestKind
+          );
+      end;
+    end;
+
+    var SumC : money = $0;
+    if(FIID != NATCUR)
+      SumC = Sum;
+      if( not ConvSumCross( Sum, SumC, RecDate, FIID, NATCUR ) )
+        RunError("Ошибка конвертации суммы из валюты с ID=" + FIID + 
+                 " в валюту с ID=" + NATCUR + " за дату " + RecDate);
+      end;
+    end;
+
+    if( rs.value("t_Kind_Account") == "А" )
+      Sum = -Sum;
+      SumC = -SumC;
+    end;
+
+    AddText(ElemName, Sum);
+
+    if(FIID != NATCUR)
+      AddText(ElemName + "C", SumC);
+    end;
+  end;
+
+  private macro GetTurnGK
+  ( Account : string, 
+    RecDate : date, 
+    DebetCredit : integer,
+    Sum : @money,
+    SumC : @money
+  )
+    var ColNameSumC : string = IfThenElse(DebetCredit == PRT_Debet, "t_Sum_Payer", "t_Sum_Receiver"),
+        ColNameAcc : string = IfThenElse(DebetCredit == PRT_Debet, "t_Account_Payer", "t_Account_Receiver");
+
+    var rs : RsdRecordset = execSQLselectPrm
+      ( "select Nvl( Sum(t_Sum_NatCur), 0 ) as t_Sum, "
+        "       Nvl( Sum(" + ColNameSumC + "), 0 ) as t_SumC "
+        "  from dacctrn_dbt "
+        " where " + ColNameAcc + " = :Account "
+        "   and t_Date_Carry = :RecDate "
+        "   and " + ColNameSumC + " <> 0 ",
+        SQLParam("Account", Account),
+        SQLParam("RecDate", RecDate)
+      );
+
+    if(rs and rs.moveNext())
+      Sum = rs.value("t_Sum");
+      SumC = rs.value("t_SumC");
+    else
+      Sum = $0;
+      SumC = $0;
+    end;
+  end;
+
+  private macro GetTurnBO
+  ( RecRs : RsdRecordset, 
+    RecDate : date, 
+    DebetCredit : integer,
+    Sum : @money,
+    SumC : @money
+  )
+    var ExtSystRegName : string = RecRs.value("t_RegBranchBO");
+    var RegPath : string = GetRegPathMesCbExtSyst(ExtSystRegName, "VIEW_ОПЕРАЦИИ");
+    var ViewOperations : string = Bnk_GetRegistryValue(RegPath, V_STRING, "");
+    if(not ViewOperations)
+      RunError("Не задан источник данных по операциям подсистемы " + ExtSystRegName);
+    end;
+
+    var rs : RsdRecordset = execSQLselectPrm
+      ( "select Nvl( Sum(t_AmountNatCur), 0 ) as t_Sum, "
+        "       Nvl( Sum(t_Amount), 0 ) as t_SumC "
+        "  from " + ViewOperations +
+        " where t_ClientAcc = :Account "
+        "   and t_AccCurr = :CurrCode "
+        "   and t_Department = :Department "
+        "   and t_OperDate = :RecDate "
+        "   and t_DK = :DK ",
+        SQLParam( "Account", RecRs.value("t_Account") ),
+        SQLParam( "CurrCode", GetISO_Number(RecRs.value("t_Code_Currency")) ),
+        SQLParam( "Department", RecRs.value("t_Department") ),
+        SQLParam( "RecDate", RecDate ),
+        SQLParam( "DK", IfThenElse(DebetCredit == PRT_Debet, "D", "K") )
+      );
+
+    if(rs and rs.moveNext())
+      Sum = rs.value("t_Sum");
+      SumC = rs.value("t_SumC");
+    else
+      Sum = $0;
+      SumC = $0;
+    end;
+  end;
+
+  private macro Fill_TurnAndTurnC
+  ( rs : RsdRecordset, 
+    RecDate : date, 
+    IsGK : bool,
+    DebetCredit : integer
+  )
+    var ElemName : string = "OB";
+    if(DebetCredit == PRT_Debet)
+      ElemName = ElemName + "DT";
+    else
+      ElemName = ElemName + "KT";
+    end;
+
+    var Sum : money = $0, SumC : money = $0;
+    if(IsGK)
+      GetTurnGK(rs.value("t_Account"), RecDate, DebetCredit, @Sum, @SumC);
+    else
+      GetTurnBO(rs, RecDate, DebetCredit, @Sum, @SumC);
+    end;
+
+    AddText(ElemName, Sum);
+
+    if( rs.value("t_Code_Currency") != NATCUR )
+      AddText(ElemName + "C", SumC);
+    end;
+  end;
+
+  macro Fill(rs : RsdRecordset, RecDate : date)
+    var RegBranchBO : string = rs.value("t_RegBranchBO");
+
+    var IsBO : bool = false;
+    if(RegBranchBO)
+      IsBO = true;
+    end;
+
+    AddText( "DATA", DDpMMpYYYY(RecDate) );
+    AddText( "ACCOUNT", rs.value("t_Account") );
+    // INDT, INDTC
+    Fill_RestAndRestC(rs, RecDate, not IsBO, "А", ACCREST_KIND_IN);
+    // INKT, INKTC
+    Fill_RestAndRestC(rs, RecDate, not IsBO, "П", ACCREST_KIND_IN);
+    // OBDT, OBDTC
+    Fill_TurnAndTurnC(rs, RecDate, not IsBO, PRT_Debet);
+    // OBKT, OBKTC
+    Fill_TurnAndTurnC(rs, RecDate, not IsBO, PRT_Credit);
+    // OUTDT, OUTDTC
+    Fill_RestAndRestC(rs, RecDate, not IsBO, "А", ACCREST_KIND_OUT);
+    // OUTKT, OUTKTC
+    Fill_RestAndRestC(rs, RecDate, not IsBO, "П", ACCREST_KIND_OUT);
+  end;
+
+  macro Fill2(RecDate : date, Info : TRecInfoOS)
+    var INDT : money = $0, INKT : money = $0, INDTC : money = $0, INKTC : money = $0, 
+        OUTDT : money = $0, OUTKT : money = $0, OUTDTC : money = $0, OUTKTC : money = $0;
+    if(Info.AccKind != "П")
+      INDT = -Info.InRest;
+      INDTC = -Info.InRestC;
+      OUTDT = -Info.OutRest;
+      OUTDTC = -Info.OutRestC;
+    end;
+    if(Info.AccKind != "А")
+      INKT = Info.InRest;
+      INKTC = Info.InRestC;
+      OUTKT = Info.OutRest;
+      OUTKTC = Info.OutRestC;
+    end;
+
+    AddText( "DATA", StrNormalization( DDpMMpYYYY(RecDate) ) );
+    AddText( "ACCOUNT", StrNormalization( Info.Account ) );
+
+    AddText( "INDT", StrNormalization( INDT ) );
+    if(Info.AccFIID != NATCUR)
+      AddText( "INDTC", StrNormalization( INDTC ) );
+    end;
+    AddText( "INKT", StrNormalization( INKT ) );
+    if(Info.AccFIID != NATCUR)
+      AddText( "INKTC", StrNormalization( INKTC ) );
+    end;
+
+    AddText( "OBDT", StrNormalization( Info.ObDt ) );
+    if(Info.AccFIID != NATCUR)
+      AddText( "OBDTC", StrNormalization( Info.ObDtC ) );
+    end;
+    AddText( "OBKT", StrNormalization( Info.ObKt ) );
+    if(Info.AccFIID != NATCUR)
+      AddText( "OBKTC", StrNormalization( Info.ObKtC ) );
+    end;
+
+    AddText( "OUTDT", StrNormalization( OUTDT ) );
+    if(Info.AccFIID != NATCUR)
+      AddText( "OUTDTC", StrNormalization( OUTDTC ) );
+    end;
+    AddText( "OUTKT", StrNormalization( OUTKT ) );
+    if(Info.AccFIID != NATCUR)
+      AddText( "OUTKTC", StrNormalization( OUTKTC ) );
+    end;
+  end;
+end;

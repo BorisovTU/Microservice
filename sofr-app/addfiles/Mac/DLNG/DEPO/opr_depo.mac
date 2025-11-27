@@ -1,0 +1,2794 @@
+/*
+$Name: opr_depo.mac
+$Module: Депозитарий
+$Description: Работа со счетами ДЕПО в операциях.
+*/
+
+Import DPInter, makenum, dpainpdf, dp_util, deposerv, "dlcarry.inc", "dpimp.mac", "dlqinvfun.mac", "dlquery.mac";
+import RsbDataSet;
+
+const SYS_ANL_AINPACCOUNTING = 2; /* Аналитика "Учет Актива в Пассиве" */
+const CHAPT5 = 5; /*  Глава л/с ДЕПО */
+const SIDEBALANCE_ACTIVE   = 1; /* активный */
+const SIDEBALANCE_PASSIVE  = 2; /* пассивный */
+
+/* Виды операций */
+const KINDOPER_NOTDEFINED = 0;
+const KINDOPER_ENROLMENT  = 1; /* Зачисление */
+const KINDOPER_WRITINGOFF = 2; /* Списание */
+const KINDOPER_TRANSFER   = 3; /* Перевод */
+const KINDOPER_MOVEMENT   = 4; /* Перемещение (смена места хранения) */
+
+private const OBJTYPE_DEPODRAFT = 104;
+
+/* Статусы ИК */
+const IS_CS_ALLSTATUS            = -2;    /* Неопределен         */
+const IS_CS_NOTDEFINED           = -1;    /* Отложенная          */
+const IS_CS_ARRIVE               = 0;     /* Зачисленная         */
+const IS_CS_LEFT                 = 32000; /* Списана             */
+
+/* виды номеров ИК */
+const IS_CERTNUMBER_EMPTY = 0;  /* пустая строка */
+const IS_CERTNUMBER_NUMBER = 1; /* строка цифр */
+const IS_CERTNUMBER_STRING = 2; /* алфафитно-цифровая строка */
+
+//виды дат инвентарных операций депо
+const DATE_FIRST = 0; //дата начала операции
+const DATE_VALUE = 1; //дата валютирования
+
+/* параметры для передачи данных для отказанных поручений */
+const DPRejectParm = "DPRejectParm"; /* название глобальной переменной, хранящией данные отказа */
+
+private const bal_acc_active = "А",
+              bal_acc_passive = "П";
+
+const DLDOC_CONNECTDPGRREP = 898; // Присоединить запись о получателе отчета об исполнении
+const DLDOC_DPEXTSPGR = 4711; // Исходящий документ для депозитарного поручения
+const DLDOC_DPALLEXTSPGR = 4734; // Все исходящие документы для депозитарного поручения
+
+/* Класс для обработки ошибок в макросах операций */
+class CDPError
+
+  var DPErrorMsg = ""; /* строка для записи ошибки */
+
+  macro SetErr( err_mes )
+    DPErrorMsg = err_mes;
+  end;
+
+  macro GetErr
+    var err_mes = DPErrorMsg;
+    DPErrorMsg = "";
+    return err_mes;
+  end;
+
+end;
+
+class InsSubDocData(_AnaliticsID, _Account, _SubAccountCode, _subdoc)
+  var AnaliticsID    = _AnaliticsID;   
+  var Account        = _Account;       
+  var SubAccountCode = _SubAccountCode;
+  var subdoc = TRecHandler("accsubdc");
+
+  Copy(subdoc, _subdoc);
+end;
+
+class DPSubAccData(_Pm_paym, _spdraft, _IsPayer, _Corschem, _DraftAllParms)
+  var    Pm_paym = TRecHandler( "pmpaym" );
+  var    spdraft  = _spdraft;
+  var    IsPayer  = _IsPayer;
+  var    Corschem = _Corschem;
+  var    DraftAllParms = _DraftAllParms;
+  var    arrSubAccDoc = TArray();
+
+  Copy(Pm_paym, _Pm_paym);
+
+  MACRO AddSubDoc(AnaliticsID, Account, SubAccountCode, subdoc)
+    arrSubAccDoc[arrSubAccDoc.size] = InsSubDocData(AnaliticsID, Account, SubAccountCode, subdoc);
+  END;
+
+end;
+
+MACRO DP_GetSQLDate( _date )
+    if ( _date!=date(0,0,0) )
+        return string( "TO_DATE( '",_date,"', 'DD.MM.YYYY' )" );
+    else
+        return "TO_DATE('01-01-0001', 'DD-MM-YYYY')";
+    end;
+end;
+
+var DPError = CDPError; /* Глобальный обработчик ошибок */
+
+/* Аналог оператора ?: в си. */
+macro DP_IIF( condition, value_true, value_false )
+   if( condition )
+      return value_true;
+   else
+      return value_false;
+   end;
+end;
+
+/*
+Получение значения настройки "Название схемы Payments"
+*/
+macro GetPaymentsScheme( PaymentsScheme )
+  var err;
+  var PaymentsSchemeTmp;
+
+  GetRegistryValue( "DEPO\\PAYMENTS_SCHEME", V_STRING, PaymentsScheme, err );
+  if( NOT err )
+    SetParm( 0, PaymentsSchemeTmp );
+  else
+    SetParm( 0, "" );
+    DPError.SetErr("Ошибка поиска настройки \"Название схемы Payments\"");
+  end;
+
+  return err;
+end;
+
+/*
+Получение значения настройки "Транспортная система обработки сообщений"
+*/
+macro GetTransport( Transport )
+  var err;
+  var TransportTmp;
+
+  GetRegistryValue( "DEPO\\TRANSPORT", V_INTEGER, TransportTmp, err );
+  if( NOT err )
+    SetParm( 0, TransportTmp );
+  else
+    SetParm( 0, 0 );
+    DPError.SetErr("Ошибка поиска настройки \"Транспортная система обработки сообщений\"");
+  end;
+
+  return err;
+end;
+
+macro GetDealID(DraftID)
+  var query, Select, Stat = 0;
+  query = "begin\n ? :=RSB_DEPO.GetDealID(?);\n end;";
+  Select = RSDCommand( query );
+  Select.AddParam("p_Stat", RSDBP_OUT, V_INTEGER );
+  Select.AddParam("p_DraftID", RSDBP_IN, DraftID );
+  Select.Execute();
+  Stat = SQL_ConvTypeInteger(Select.value("p_Stat"));
+  return Stat;
+end;
+
+/* Получить параметры подтверждения RS-Payments */
+macro GetConfirmParams(DraftKind, DraftID, ConfNumber:@variant, FactValueDate:@variant, InstrStatus:@variant)
+  var query, Select, Transport, Stat;
+  var TypeIN; // нужен в для заполнения таблицы в сишнике
+  query = "begin\n ? := RSP_SECURITY.GetConfirmParams(?,?,?,?,?,?);\n end; ";
+
+  Select = RSDCommand( query );
+
+  Select.AddParam("p_Stat", RSDBP_OUT, V_INTEGER );
+
+  Select.AddParam("p_DraftKind", RSDBP_IN, DraftKind );
+  Select.AddParam("p_DraftID", RSDBP_IN, DraftID );
+
+  Select.AddParam("p_Number", RSDBP_OUT, V_STRING );
+  Select.AddParam("p_Date", RSDBP_OUT, V_DATE );
+  Select.AddParam("p_TypeIN", RSDBP_OUT, V_STRING );
+  Select.AddParam("p_Status", RSDBP_OUT, V_INTEGER );
+
+  Select.Execute();
+
+  ConfNumber    = SQL_ConvTypeStr(Select.value("p_Number"));
+  FactValueDate = SQL_ConvTypeDate(Select.value("p_Date"));
+  TypeIN        = SQL_ConvTypeStr(Select.value("p_TypeIN"));
+  InstrStatus   = SQL_ConvTypeInteger(Select.value("p_Status"));
+
+  return SQL_ConvTypeInteger(Select.value("p_Stat"));
+end;
+
+/* найти сообщение по поручению */
+macro FindDpMessageByDraft( DraftID, DraftKind )
+  var DataSet, query, Select, Transport, stat;
+
+  if(DraftKind == NULL)
+    DraftKind = RSPMDK_INVDRAFT;
+  end;
+
+  if(GetTransport(Transport))
+    return false;
+  else
+    if((Transport == DPTRANSP_MBR) AND (DraftKind == RSPMDK_INVDRAFT)) // С МБР работают только инвентарные
+      query  =   " select t_MessageID from ddpmsginf_dbt "
+               + " where t_DraftID = ? ";
+
+      Select = RSDCommand( query );
+
+      Select.AddParam("", RSDBP_IN, DraftID );
+      Select.Execute();
+      DataSet = TRsbDataSet(Select);
+      if( DataSet.MoveNext() )
+        return true;
+      end;
+
+      return false;
+    else
+      stat = GetConfirmParams(DraftKind, DraftID);
+      if( (stat == 0) OR (stat == 2) ) // Подтверждение найдено или отсутствует (но исходящее сообщение все равно имеется)
+        return true;
+      else
+        return false;
+      end;
+    end;
+  end;
+end;
+
+macro GetDpMessageByDraft( DraftID )
+  var DataSet, query, Select;
+
+  query  =   " select t_MessageID from ddpmsginf_dbt "
+           + " where t_DraftID = ? ";
+
+  Select = RSDCommand( query );
+
+  Select.AddParam("", RSDBP_IN, DraftID );
+  Select.Execute();
+  DataSet = TRsbDataSet(Select);
+  if( DataSet.MoveNext() )
+    return DataSet.MessageID;
+  end;
+
+  return 0;
+end;
+
+/*найти отчет из другого филиала в документах-приложениях поручения*/
+macro IsReportFromParentDprt( DraftID, SPgroundID, RejectNote )
+  var DataSet, query, Select;
+  const DP_NOTFINDREPORT = 0;
+  const DP_INFREPORT_PREPARE = 300; //отчет об исполнении инв. операции
+  const DP_INFREPORT_REJECT  = 301; //уведомление об отказе в исполнении
+
+  query =   " select spgr.t_Kind, spgr.t_Comment, spgr.t_SPgroundID "
+          + " from dspdraft_dbt draft, dspgrdoc_dbt doc, dspground_dbt spgr"
+          + " where draft.t_AutoKey = ? "
+          + "   and doc.t_SourceDocKind = draft.t_Kind "
+          + "   and doc.t_SourceDocID   = draft.t_AutoKey "
+          + "   and spgr.t_SPgroundID   = doc.t_SPgroundID "
+          + "   and ( spgr.t_Kind = " + DP_INFREPORT_PREPARE + " or spgr.t_Kind = " + DP_INFREPORT_REJECT + " ) "
+          + "   and spgr.t_Parent > 0 ";
+
+  Select = RSDCommand( query );
+
+  Select.AddParam("", RSDBP_IN, DraftID );
+  Select.Execute();
+  DataSet = TRsbDataSet(Select);
+  if( DataSet.MoveNext() )
+    SetParm(1, DataSet.SPgroundID);
+    SetParm(2, DataSet.Comment);
+    return DataSet.Kind;
+  end;
+
+  return DP_NOTFINDREPORT;
+end;
+
+/* найти сообщение по поручению */
+macro FindDpMessageKvitByDraft( DraftID )
+  var DataSet, query, Select;
+
+  query  =   " select t_State from ddpmsginf_dbt "
+           + " where t_DraftID = ? ";
+
+  Select = RSDCommand( query );
+
+  Select.AddParam("", RSDBP_IN, DraftID );
+  Select.Execute();
+  DataSet = TRsbDataSet(Select);
+  if( DataSet.MoveNext() )
+     return DataSet.State;
+  end;
+
+  return 0;
+end;
+
+macro DP_RestSubAcc( AccAnaliticsID, SubAccountID, carryDate )
+  var DataSet, Select;
+  var query;
+  var Rest = 0;
+
+  query = "select NVL(rsi_rsb_account.restsa(?,?,?,1), 0) as Rest from dual";
+
+  Select = DL_RSDCommand( query );
+  Select.AddParam(AccAnaliticsID );
+  Select.AddParam(SubAccountID );
+  Select.AddParam(carryDate );
+  DataSet = Select.Execute();
+
+  if( DataSet.moveNext() )
+    Rest = DataSet.Rest;
+  else
+    Rest = 0;
+  end;
+
+  return Rest;
+end;
+
+/*
+Получение значения настройки "Автоматически регистрировать отказы"
+*/
+macro GetAutoRejected( AutoRejected )
+  var err;
+  var AutoRejectedTmp;
+
+  GetRegistryValue( "DEPO\\AUTOREJECTED", V_BOOL, AutoRejectedTmp, err );
+  if( NOT err )
+    SetParm( 0, AutoRejectedTmp );
+  else
+    SetParm( 0, FALSE );
+    DPError.SetErr("Ошибка поиска настройки \"Автоматически регистрировать отказы\"");
+  end;
+
+  return err;
+end;
+
+/* Обработка ошибочной ситуации на шаге инв. операции.
+   Выводится сообщение об ошибке и вопрос помещать ли поручение в отказанные.
+   В случае положительного ответа - вызывается C_RSL для ввода основания отказа и
+   возвращается, что все ОК - операция продолжится.
+   В случае отрицательного - просто возвращается ошибочный статус - операция прерывается.
+*/
+macro RejectDepoDraftYesNo( draft, TypeOp, err_mes )
+  var stat = 0, user_message, rej_prm;
+  Array Text;
+  Array Button;
+  Button(0) = "Прервать выполнение";
+  Button(1) = "Регистрировать";
+
+  if( ( ValType(err_mes) == V_STRING ) AND ( err_mes != "" ) )
+    user_message = "Ошибка: " + err_mes;
+  else
+    user_message = DPError.GetErr();
+    if( user_message == "" )
+      user_message = "Ошибка при обработке поручения депо";
+    end;
+  end;
+
+  Text(0) = user_message + "|Зарегистрировать отказ?";
+  if(  ConfWin(Text,Button) )
+    stat = GetRejectNoteDR(draft, TypeOp, user_message, rej_prm);
+    if(stat == DP_REJECTDRAFT_OK)
+      /* заменяем последующие шаги шагами из цепочки "перемещение в отказ" */
+      if( SetGlobalParameter(DPRejectParm, rej_prm) )
+        if( not Opr_InsertBranch("R", OPRBR_REMOVE) ) /*вставляемая цепочка заменяет неисполненные шаги*/
+          msgbox("Ошибка при вставке цепочки");
+          stat = 1;
+        end;
+      else
+        msgbox("Ошибка записи дополнительных параметров");
+        stat = 1;
+      end;
+    elif(stat == DP_REJECTDRAFT_BTRERR)
+      msgbox("Ошибка менеджера записей!");
+    elif(stat == DP_REJECTDRAFT_WRONG_PARAMS)
+      msgbox( "Функции формирования отказа обработки поручения переданы неверные параметры" );
+    elif(stat == DP_REJECTDRAFT_ESC)
+/*       msgbox("Прерывание пользователя");*/
+       ;
+    end;
+  else
+    if(isOprMultiExec())  //при массовом режиме выводим ошибку в протокол msgbox'ом
+      msgbox(user_message);
+    end;
+    stat = 1; /* Остановить выполнение операции, т.к. все равно ошибка */
+  end;
+
+  return stat;
+end;
+
+macro DP_CheckRejectedDepoDraft( draft, r_pmpaym, err )
+  var stat = 0;
+  var error = 0;
+  record r_spdraft( spdraft );
+
+  SetBuff( r_spdraft, draft );
+
+  if((r_spdraft.LateDeliveryDate!=date(0,0,0)) and (r_spdraft.SettlementDate!=date(0,0,0)))
+    if( r_spdraft.LateDeliveryDate < r_pmpaym.ValueDate )
+      error = RejectDepoDraftYesNo( draft, DP_SPDRAFT_OPERATION, "Период расчётов уже завершен." );
+      stat = 1;
+    elif( r_spdraft.SettlementDate > r_pmpaym.ValueDate )
+      msgbox("Период расчётов еще не наступил.");
+      stat = 1;
+      error = 1;
+    end;
+  end;
+
+  if(not stat)
+    if(r_pmpaym.FIID <= 0)
+      error = RejectDepoDraftYesNo( draft, DP_SPDRAFT_OPERATION, "В поручении не задана ценная бумага." );
+      stat = 1;
+    end;
+  end;
+
+  SetParm(2, error);
+
+  return stat;
+end;
+
+macro RejectGlobopAcc(RegisterID, DepoRoot, err_mes)
+  var stat = 0, user_message, rej_prm;
+  var query, DataSet;
+  var AutoRejected;
+  Array Text;
+  Array Button;
+  var ReglineID:integer = 0;
+  Button(0) = "Прервать выполнение";
+  Button(1) = "Регистрировать";
+
+  GetAutoRejected( AutoRejected );
+
+  if( ( ValType(err_mes) == V_STRING ) AND ( err_mes != "" ) )
+    user_message = "Ошибка: " + err_mes;
+  else
+    user_message = DPError.GetErr();
+    if( user_message == "" )
+      user_message = "Ошибка при обработке строки реестра";
+    end;
+  end;
+
+  //примечание вешаем на максимальный ReglineID для счета
+  query =   " select max(lin.t_ReglineID) as ReglineID from ddpreglin_dbt lin, ddepoacnt_dbt acnt "
+          + "  where lin.t_RegisterID = " + RegisterID
+          + "    and acnt.t_AutoKey = lin.t_HolderAccID "
+          + "    and acnt.t_Root = " + DepoRoot;
+  DataSet = TRsbDataSet(query);
+
+  if( DataSet.moveNext() )
+    ReglineID = DataSet.ReglineID;
+    Text(0) = user_message + "|Зарегистрировать отказ?";
+    if((AutoRejected) or ( (not AutoRejected) and ( ConfWin(Text,Button) ) ))
+      stat = GetRejectNoteDR(ReglineID:integer, DP_CORPOP_REGLIN, user_message, rej_prm);
+      if(stat == DP_REJECTDRAFT_OK)
+        /* заменяем последующие шаги шагами из цепочки "перемещение в отказ" */
+        if( SetGlobalParameter(DPRejectParm, rej_prm) )
+          if( not Opr_InsertBranch("J", OPRBR_REMOVE) ) /*вставляемая цепочка заменяет неисполненные шаги*/
+            msgbox("Ошибка при вставке цепочки");
+            stat = 1;
+          end;
+        else
+          msgbox("Ошибка записи дополнительных параметров");
+          stat = 1;
+        end;
+      elif(stat == DP_REJECTDRAFT_BTRERR)
+        msgbox("Ошибка менеджера записей!");
+      elif(stat == DP_REJECTDRAFT_WRONG_PARAMS)
+        msgbox( "Функции формирования отказа обработки поручения переданы неверные параметры" );
+      elif(stat == DP_REJECTDRAFT_ESC)
+  /*       msgbox("Прерывание пользователя");*/
+        stat = 1;
+      end;
+    else
+      stat = 1; /* Остановить выполнение операции, т.к. все равно ошибка */
+    end;
+  else
+    stat = 1;
+  end;
+
+  return stat;
+end;
+
+private macro GetSpgrRec(SPgroundID, spgr)
+  var cmd = DL_RSDCommand("select * from dspground_dbt where t_SPgroundID = ?");
+  cmd.AddParam(SPgroundID);
+
+  var DataSet = cmd.Execute();
+  if(DataSet.moveNext())
+    DataSet.GetRecord().CopyTo( spgr.rec );
+  end;
+end;
+
+class DP_DraftAllParms(_spdraft, _spgr, _paym, _rmprop, _debet, _credit, _ID_Operation, _ID_Step)
+  private var m_spdraft = TRecHandler("spdraft.dbt");
+  private var m_spgr    = TRecHandler("spground.dbt");
+  private var m_paym    = TRecHandler("pmpaym.dbt");
+  private var m_debet   = TRecHandler("pmprop.dbt");
+  private var m_credit  = TRecHandler("pmprop.dbt");
+  private var m_rmprop  = TRecHandler("pmrmprop.dbt");
+  private var m_ID_Operation, m_ID_Step;
+
+  copy(m_spdraft, _spdraft);
+  copy(m_paym,    _paym);
+  copy(m_debet,   _debet);
+  copy(m_credit,  _credit);
+  copy(m_rmprop,  _rmprop);
+
+  if(ValType(_spgr) == V_UNDEF)
+    GetSpgrRec(m_spdraft.rec.SPgroundID, m_spgr);
+  else
+    copy(m_spgr,    _spgr);
+  end;
+
+  m_ID_Operation = _ID_Operation;
+  m_ID_Step      = _ID_Step;
+
+  macro ID_Operation()
+    return m_ID_Operation;
+  end;
+
+  macro ID_Step()
+    return m_ID_Step;
+  end;
+
+  macro paym()
+    return m_paym;
+  end;
+
+  macro debet()
+    return m_debet;
+  end;
+
+  macro credit()
+    return m_credit;
+  end;
+
+  macro rmprop()
+    return m_rmprop;
+  end;
+
+  macro spdraft()
+    return m_spdraft;
+  end;
+
+  macro spgr()
+    return m_spgr;
+  end;
+
+end;
+
+/* Выбор лицевого счета по счету ДЕПО.
+   В случае отсутствия л/с открывает новый счет (для зачисления).
+   В случае привязки к одному разделу счета ДЕПО более одного л/с при списании
+   предлагает скроллинг (если не испольщуется режим пакетной обработки).
+*/
+macro InputAccountByDepoAcc( AutoKey, IsPayer, spdraft, TypeOp, err, AddParm, isOverdraft, DraftAllParms )
+  var Acc, BriefCode = "", err_text = "";
+  file DepoAcnt( depoacnt ) key 0;
+
+  DepoAcnt.AutoKey = AutoKey;
+  if( GetEQ( DepoAcnt ) == true )
+     BriefCode = DepoAcnt.BriefCode;
+  end;
+
+  if(ValType(IsOverdraft) == V_UNDEF)
+    IsOverdraft = false;
+  end;
+
+  if(ValType(DraftAllParms) != V_UNDEF)
+    if(   ( ValType(AddParm) == V_INTEGER )
+       OR ( ValType(AddParm) == V_GENOBJ ) )
+      Acc = GetAccountByDepoAcc(AutoKey, IsPayer, NULL, TypeOp, err, AddParm, isOverdraft, DraftAllParms.spdraft, DraftAllParms.spgr, DraftAllParms.paym, DraftAllParms.rmprop, DraftAllParms.debet, DraftAllParms.credit );
+    else
+      Acc = GetAccountByDepoAcc(AutoKey, IsPayer, NULL, TypeOp, err, NULL, isOverdraft, DraftAllParms.spdraft, DraftAllParms.spgr, DraftAllParms.paym, DraftAllParms.rmprop, DraftAllParms.debet, DraftAllParms.credit );
+    end;
+  else
+    if(   ( ValType(AddParm) == V_INTEGER )
+       OR ( ValType(AddParm) == V_GENOBJ ) )
+      Acc = GetAccountByDepoAcc(AutoKey, IsPayer, spdraft, TypeOp, err, AddParm, isOverdraft );
+    else
+      Acc = GetAccountByDepoAcc(AutoKey, IsPayer, spdraft, TypeOp, err, NULL, isOverdraft );
+    end;
+  end;
+  if( NOT strlen(Acc) or (err))
+    if(err == DP_GETACC_BTRERR)
+      err_text = "Ошибка менеджера записей!";
+    elif(err == DP_GETACC_WRONG_PARAMS )
+      err_text = "Функции поиска переданы неверные параметры";
+    elif(err == DP_GETACC_NODPAC )
+      err_text = "Счет/раздел " + BriefCode + " счета депо не найден";
+    elif(err == DP_GETACC_DIFFACCONCARDS )
+      err_text = "Счета на карточках сертификатов не совпадают";
+    elif(err == DP_GETACC_ACCNOTEXIST )
+      err_text = "Не найден лицевой счет, указанный в инвентарной карточке";
+    elif(err == DP_GETACC_WRONGACC )
+      err_text = "Найденный л/с не подходит для данных валюты, главы, признака закрытого хранения";
+    elif(err == DP_GETACC_NOPARTY )
+      err_text = "Не найден владелец счета";
+    elif(err == DP_GETACC_MANYACC)
+      err_text = "Массовое действие|Невозможно вывести список счетов";
+    elif(err == DP_GETACC_ESC)
+/*       err_text = "Прерывание пользователя";*/
+       ;
+    elif(err == DP_GETACC_DPACNOTTERM)
+      err_text = "Счет/раздел " + BriefCode + " не является терминальным";
+    elif(err == DP_GETACC_STOREMODE_DIFFERS)
+      err_text = "Режим хранения на разделе счета ДЕПО " + BriefCode + " не совпадает с указанным в поручении";
+    elif(err == DP_GETACC_BLOCK_DIFFERS)
+      err_text = "Блокировка на разделе счета ДЕПО " + BriefCode + " не совпадает с указанной в поручении";
+    elif(err == DP_GETACC_WRONGBLOCK)
+      err_text = "В поручении указана некорректная блокировка по счету отправителя/получателя";
+    elif(err == DP_GETACC_WRTOFF_ACCNOTEXIST)
+      err_text = "На разделе счета ДЕПО " + BriefCode + " не найден лицевой счет списания";
+    elif(err == DP_GETACC_ACC_CLOSED)
+       err_text = "Лицевой счет закрыт";
+    elif(err == DP_GETACC_WRONG_PARTIT)
+       err_text = "Лицевой счет принадлежит другому разделу";
+    elif(err == DP_GETACC_ACCNEWER)
+       err_text = "Лицевой счет не открыт на дату проводки";
+    elif(err == DP_GETACC_WRONGACCCERT)
+       err_text = "В инвентарной карточке указан некорректный лицевой счет";
+    elif(err == DP_GETACC_WRONG_PARTITCERT)
+       err_text = "Инвентарная карточка зачислена на лицевой счет другого раздела";
+    elif(err == DP_GETACC_WRONGBLOCKCERT)
+       err_text = "Блокировка на лицевом счете, указанном в инвентарной карточке, не совпадает с указанной в поручении";
+    elif(err == DP_GETACC_DEPOACCNEWER)
+       err_text = "Раздел счета депо " + BriefCode + " не открыт на дату проводки";
+    elif(err == DP_GETACC_DEPOACC_CLOSED)
+       err_text = "Раздел счета депо " + BriefCode + " закрыт";
+    elif(err == DP_GETACC_ACCAMBIGUITY)
+       err_text = "На разделе " + BriefCode + " более одного лицевого счета неоднозначность выбора";
+    elif(err == DP_GETACC_REC_ACCNOTEXIST)
+       err_text = "Не найден лицевой счет зачисления";
+    elif(err == DP_GETACC_NOXID)
+       err_text = "Функции поиска не передан номер инвентарной карточки";
+    elif(err == DP_GETACC_WRONGISSUERCERT)
+       err_text = "Эмитент на лицевом счете не совпадает с  эмитентом ценных бумаг на инвентарной карточке";
+    elif(err == DP_GETACC_WRONGISSUER)
+       err_text = "Эмитент по поручению не определен";
+    elif(err == DP_GETACC_NOACCISSUER)
+       err_text = "Эмитент на лицевом счете не найден";
+    else
+       err_text = "Ошибка поиска лицевого счета для счета депо " + BriefCode;
+    end;
+
+    if(err != DP_GETACC_ESC )
+      DPError.SetErr(err_text);
+    end;
+    SetParm(4, err);
+  else
+    SetParm(4, 0);
+  end;
+
+  return Acc;
+end;
+
+/* Выбор терминального раздела по счету/разделу счета ДЕПО.
+   В случае отсутствия - открывает новый раздел (для зачисления или овердрафта).
+*/
+macro InputDepoPartByDepoAcc( IsPayer, DpNode, spdraft, err, SPGroundID, DocKind, DocumentID, TypeOp, IsOverdraft, DraftAllParms )
+  var DPAcntID, BriefCode = "", err_text = "";
+  var XID;
+
+  file DepoAcnt( depoacnt ) key 0;
+  var spground = NULL; 
+
+  DepoAcnt.AutoKey = DpNode;
+  if( GetEQ( DepoAcnt ) == true )
+     BriefCode = DepoAcnt.BriefCode;
+  end;
+
+  if( SPGroundID )
+    spground = TBFile( "spground.dbt", "R", 0 );
+    spground.rec.SPgroundID    = SPGroundID;
+  else
+    spground = TBFile( "spground.dbt", "R", 6 );
+    spground.rec.SourceDocKind = DocKind;
+    spground.rec.SourceDocID   = DocumentID;
+    spground.rec.Direction     = 1;
+    spground.rec.Department    = {OperDprt};
+    spground.rec.Division      = DP_SelfDivision;
+  end;
+
+  if(spground.GetEQ())
+    XID = string(spground.rec.XLD);
+  else
+    XID = "";
+  end;
+
+  if(ValType(IsOverdraft) == V_UNDEF)
+    IsOverdraft = false;
+  end;
+  
+  if(ValType(DraftAllParms) != V_UNDEF)
+    DPAcntID = GetDepoPartition( IsPayer, NULL, TypeOp, err, 0, IsOverdraft, DpNode, DraftAllParms.spdraft, DraftAllParms.spgr, DraftAllParms.paym, DraftAllParms.rmprop, DraftAllParms.debet, DraftAllParms.credit );
+  else
+    DPAcntID = GetDepoPartition( IsPayer, spdraft, TypeOp, err, 0, IsOverdraft, DpNode );
+  end;
+  if( DPAcntID == 0 )
+    if(err == DP_GETDPAC_BTRERR)
+      err_text = "Ошибка менеджера записей!";
+    elif(err == DP_GETDPAC_WRONG_PARAMS )
+      err_text = "Функции поиска переданы неверные параметры";
+    elif(err == DP_GETDPAC_NODPAC )
+      err_text = "Счет/раздел " + BriefCode + " счета депо не найден";
+    elif(err == DP_GETDPAC_KINDACCOP_DIFFERS )
+      err_text = "Переданный вид операции, отличается от определенного функцией";
+    elif(err == DP_GETDPAC_WRONG_SA_ATTR )
+      err_text = "В поручении указан раздел " + BriefCode + " с недопустимыми характеристиками";
+    elif(err == DP_GETDPAC_WRONG_DPAC_STATUS )
+      err_text = "Недопустимый статус раздела счета депо " + BriefCode;
+    elif(err == DP_GETDPAC_NOT_ENOUGH_DT_SEL )
+      err_text = "В поручении №"+XID+" недостаточно данных для выбора раздела";
+    elif(err == DP_GETDPAC_NODPAC_FORWRTOFF)
+      err_text = "Не найден раздел " + BriefCode + " счета депо списания";
+    elif(err == DP_GETDPAC_NODPAC_OPERATOR)
+      err_text = "Не найден раздел оператора счета";
+    elif(err == DP_GETACC_DPACNEWER)
+      err_text = "Раздел " + BriefCode + " не был открыт на дату проводки";
+    elif(err == DP_GETDPAC_NOT_ENOUGH_DT_CR)
+      err_text = "В поручении недостаточно данных для создания раздела";
+    elif(err == DP_GETDPAC_DEPONOOPEN)
+      err_text = "Счет не открыт";
+    elif(err == DP_GETDPAC_NOKORRECTDATE)
+      err_text = "Дата создания счета больше даты операции";
+    elif(err == DP_GETDPAC_NOKORRECTSTATUS)
+      err_text = "Недопустимый статус счета депо";
+    elif(err == DP_GETDPAC_EXISTSOPERPARTATVL)
+      err_text = "На счете "+BriefCode+" уже имеется раздел для указанного оператора";
+    else
+      err_text = "Ошибка поиска раздела счета для счета депо";
+    end;
+
+    DPError.SetErr(err_text);
+    SetParm(3, err);
+  else
+    SetParm(3, 0);
+  end;
+
+  return DPAcntID;
+end;
+
+/************************************************************************/
+/* поиск счета\раздела депо определенного владельца, вида, типа и режима*/
+/************************************************************************/
+MACRO FindDepoAccByType( Owner, Kind, Type, Buff_DepoAcnt )
+   file DepoAcnt( depoacnt ) key 3;
+
+   MACRO CheckDepoAccByType( Owner, Kind)
+      if( (DepoAcnt.Owner != Owner) OR (DepoAcnt.Kind != Kind) )
+         return false;
+      else
+         return true;
+      end;
+   END;
+
+   DepoAcnt.Owner = Owner;
+   DepoAcnt.Kind  = Kind;
+
+   if( GetEQ( DepoAcnt ) == true )
+      if( DepoAcnt.Type == Type )
+         Copy( Buff_DepoAcnt, DepoAcnt );
+         return true;
+      else
+        while( (next(DepoAcnt) == true) AND (CheckDepoAccByType( Owner, Kind ) == true) )
+           if( DepoAcnt.Type == Type )
+              Copy( Buff_DepoAcnt, DepoAcnt );
+              return true;
+           end;
+        end;
+      end;
+   end;
+   return false;
+END;
+
+MACRO GetCorschemByAccount( Account, FIID )
+  FILE Corschem( corschem ) key 3;
+
+  Corschem.FIID    = FIID;
+  Corschem.Account = Account;
+  Corschem.Department = {OperDprt};
+
+  if( GetEQ( Corschem ) == true )
+     return Corschem.Number;
+  else
+     Corschem.Account = Account;
+     Corschem.FIID    = -1;
+     Corschem.Department = {OperDprt};
+     if( GetEQ( Corschem ) == true  )
+        return Corschem.Number;
+     end;
+  end;
+  return 0;
+END;
+
+/*********************************************************************************************/
+/*получение номера корсхемы, номера и ID корсчета заданного типа для заданного корреспондента*/
+/*********************************************************************************************/
+MACRO GetNumberCorschem( CustAgentID, TypeCustAcoount, FIID, CustAccountID, CustAccount )
+     var loop = true, Number = 0;
+     FILE   DepoAcc3( depoacnt ) key 3; /* Owner + Kind */
+
+     DepoAcc3.Owner = CustAgentID;
+     DepoAcc3.Kind  = 0;
+
+     if( (GetGE( DepoAcc3 ) == true) and (DepoAcc3.Owner == CustAgentID) )
+         while( loop == true )
+            if( DepoAcc3.Owner == CustAgentID )
+               if( DepoAcc3.Type == TypeCustAcoount )
+                     Number = GetCorschemByAccount( DepoAcc3.BriefCode, FIID );
+                     if( Number > 0)
+                        SetParm( 2, DepoAcc3.AutoKey );
+                        SetParm( 3, DepoAcc3.BriefCode );
+                        return Number;
+                     end;
+               end;
+               loop = Next( DepoAcc3 );
+
+            else
+               loop = false;
+
+            end;
+         end;
+     end;
+     return 0;
+END;
+
+/*
+Получение записи о транзитном счете невыясненных по настройке
+*/
+macro GetTransitAccount( DepoAc )
+  var dpacID, err;
+  FILE dpac( depoacnt );
+
+  GetRegistryValue( "DEPO\\ENROLOPRTRANSACC", V_INTEGER, dpacID, err );
+
+  if(NOT err)
+    dpac.AutoKey = dpacID;
+    if(GetEQ(dpac))
+      Copy( DepoAc, dpac );
+      return 0;
+    else
+      DPError.SetErr("Не найден транзитный счет ДЕПО с ID: ", dpacID, ". Необходимо указать транзитный счет зачисления в настройке депозитария");
+    end;
+  else
+    DPError.SetErr("Ошибка поиска настройки \"Транзитный счет по умолчанию\"");
+  end;
+  return 1;
+end;
+
+/*
+Получение значения настройки "Учет актива в пассиве"
+*/
+var AinPEnabledTmp = NULL;
+macro GetAinPAccState( AinPEnabled )
+  var err = 0;
+  
+  if(AinPEnabledTmp == NULL)
+    GetRegistryValue( "DEPO\\AINPACCOUNTING", V_BOOL, AinPEnabledTmp, err );
+  end;
+  if( NOT err )
+    SetParm( 0, AinPEnabledTmp );
+  else
+    SetParm( 0, FALSE );
+    DPError.SetErr("Ошибка поиска настройки \"Учет актива в пассиве\"");
+  end;
+
+  return err;
+end;
+
+/*
+Получение значения настройки "Повторное зачисление списанных ИК"
+*/
+macro GetSecondEnrolWrCertState( SecondEnrolWrCertEnabled )
+  var err;
+  var SecondEnrolWrCertEnabledTmp;
+
+  GetRegistryValue( "DEPO\\SECOND_ENROLMENT_WRITTEN_CERTIF", V_BOOL, SecondEnrolWrCertEnabledTmp, err );
+  if( NOT err )
+    SetParm( 0, SecondEnrolWrCertEnabledTmp );
+  else
+    SetParm( 0, FALSE );
+    DPError.SetErr("Ошибка поиска настройки \"Повторное зачисление списанных ИК\"");
+  end;
+
+  return err;
+end;
+
+/*
+Получение значения настройки "Автоматически отправлять инструкции"
+*/
+macro GetAutoSendMessState( AutoSendMessEnabled )
+  var err;
+  var AutoSendMessEnabledTmp;
+
+  GetRegistryValue( "DEPO\\AUTOSENDMESS", V_BOOL, AutoSendMessEnabledTmp, err );
+  if( NOT err )
+    SetParm( 0, AutoSendMessEnabledTmp );
+  else
+    SetParm( 0, FALSE );
+    DPError.SetErr("Ошибка поиска настройки \"Автоматически отправлять инструкции\"");
+  end;
+
+  return err;
+end;
+
+/* Преобразует строку вида  "DD.MM.YYYY" в дату */
+macro StrToDate( StrDate )
+  var DD, MM, YYYY;
+
+  DD   = Int( SubStr(StrDate, 1, 2) );
+  MM   = Int( SubStr(StrDate, 4, 2) );
+  YYYY = Int( SubStr(StrDate, 7, 4) );
+
+  return Date(DD, MM, YYYY);
+end;
+
+/*
+Получение значения настройки "Учет актива в пассиве"
+*/
+var AinPDateTmp = NULL;
+macro GetAinPAccDate( AinPDate )
+  var err = 0;
+  
+  if(AinPDateTmp == NULL)
+    GetRegistryValue( "DEPO\\AINPENABLEDATE", V_STRING, AinPDateTmp, err );
+  end;
+  if( NOT err )
+    SetParm( 0, StrToDate(AinPDateTmp) );
+  else
+    SetParm( 0, FALSE );
+    DPError.SetErr("Ошибка поиска настройки \"Дата включения режима учет актива в пассиве\"");
+  end;
+
+  return err;
+end;
+
+private macro DP_GetSubAccID(IsMassMode:bool, AccNum, FIID, SubAccCode)
+  var SubAccID = 0;
+  
+  if(IsMassMode)
+    var cmd, query, DataSet;
+    
+
+    query =   " select accsub.t_SubAccountID "
+            + "   from daccvanl_dbt vanl, daccsub_dbt accsub "
+            + "  where vanl.t_FIID = ? "
+            + "    and vanl.t_Chapter = " + CHAPT5
+            + "    and vanl.t_Account = ? "
+            + "    and vanl.t_AnaliticsID = " + SYS_ANL_AINPACCOUNTING
+            + "    and accsub.t_AccAnaliticsID = vanl.t_AccAnaliticsID "
+            + "    and accsub.t_SubAccountCode = ? ";
+
+    cmd = DL_RSDCommand(query);
+
+    cmd.AddParam(FIID);
+    cmd.AddParam(AccNum);
+    cmd.AddParam(SubAccCode);
+    
+    DataSet = cmd.Execute();
+    if(DataSet.moveNext())
+      SubAccID = DataSet.SubAccountID;
+    end;
+  else
+    SubAccID = GetSubAccID( SYS_ANL_AINPACCOUNTING, AccNum, FIID, CHAPT5, SubAccCode );
+  end;
+
+  return SubAccID;
+end;
+
+/* Открытие субсчета на л/с депо, если такового не существует */
+macro OpenSubAccIfNotExist( IsMassMode:bool, AccNum, FIID, SubAccCode )
+  var tmpSubAccID;
+  RECORD SubAcc( accsub );/*запись табл. субсчетов*/
+
+  /* Если субсчета еще нет - откроем */
+  tmpSubAccID = DP_GetSubAccID( IsMassMode, AccNum, FIID, SubAccCode );
+  if( tmpSubAccID == 0 )
+    ClearRecord(SubAcc);
+
+    SubAcc.SubAccountCode = SubAccCode;
+    SubAcc.SpecialType    = ACCSUB_SPECTYPE_NONE;
+    SubAcc.Status         = ACCSUB_STATE_OPENED;
+
+    if(IsMassMode)
+      if( InsertSubAccount( SYS_ANL_AINPACCOUNTING, AccNum, FIID, CHAPT5, 0, SubAcc, false ) != 0)
+        DPError.SetErr("Ошибка при открытии субсчета " + SubAccCode);
+        return 1;
+      end;
+    else
+      if( not Opr_InsertAccSub( SYS_ANL_AINPACCOUNTING, AccNum, FIID, CHAPT5, 0, SubAcc ) )
+        DPError.SetErr("Ошибка при открытии субсчета " + SubAccCode);
+        return 1;
+      end;
+    end;
+  end;
+
+  return 0;
+end;
+
+macro CheckWrtOffSubAcc( PassiveAccount, AccAnaliticsID, SubAccountID, ActiveAccount, FIID, Amount, carryDate, IsActive )
+  FILE f_accsub(accsub);
+  FILE f_accvanl(accvanl);
+
+  var Account = PassiveAccount;
+   
+  if( SubAccountID == 0 )
+
+    KeyNum(f_accvanl, 1);
+    f_accvanl.FIID        = FIID;
+    f_accvanl.Chapter     = CHAPT5;
+    f_accvanl.Account     = PassiveAccount;
+    f_accvanl.AnaliticsID = SYS_ANL_AINPACCOUNTING;
+
+    if( NOT GetEQ(f_accvanl) )
+      DPError.SetErr("Не найдена аналитика счета списания");
+      return 1;
+    end;
+
+    f_accsub.AccAnaliticsID = f_accvanl.AccAnaliticsID;
+    f_accsub.SubAccountCode = ActiveAccount;
+    KeyNum(f_accsub, 2);
+    if( NOT GetEQ(f_accsub) )
+      DPError.SetErr("Не найден субсчет места хранения с кодом " + ActiveAccount + " для л/с " + PassiveAccount );
+      return 1;
+    end;
+  else
+    KeyNum(f_accsub, 0);
+    f_accsub.AccAnaliticsID = AccAnaliticsID;
+    f_accsub.SubAccountID   = SubAccountID;
+
+    if( GetEQ(f_accsub) )
+      if( NOT IsActive)
+        SetParm(3, f_accsub.SubAccountCode);
+      else
+        if( f_accsub.SubAccountCode != ActiveAccount )
+          DPError.SetErr("Л/с списания в отложенной проводке не совпадает с л/с списания в основной проводке");
+          return 1;
+        end;
+      end;
+
+      KeyNum(f_accvanl, 0);
+      f_accvanl.AccAnaliticsID = AccAnaliticsID;
+      if( GetEQ(f_accvanl) )
+        if( NOT IsActive )
+          if(f_accvanl.Account != PassiveAccount )
+            DPError.SetErr("Л/с списания в отложенной проводке не совпадает с л/с списания в основной проводке");
+            return 1;
+          end;
+        else
+          SetParm(0, f_accvanl.Account);
+          Account = f_accvanl.Account;
+        end;
+      else
+        DPError.SetErr("Не найдена аналитика счета списания AccAnaliticsID = ", AccAnaliticsID );
+        return 1;
+      end;
+    else
+      DPError.SetErr("Не найден субсчет места хранения AccAnaliticsID = ", AccAnaliticsID, " SubAccountID = ", SubAccountID );
+      return 1;
+    end;
+  end;
+
+  if( (not DP_CheckOverdraftAccount(Account, FIID, CHAPT5)) and (DP_RestSubAcc( f_accsub.AccAnaliticsID, f_accsub.SubAccountID, carryDate ) < Amount) )
+    DPError.SetErr("Недостаточно ц/б на субсчете места хранения");
+    return 1;
+  end;
+
+  return 0;
+end;
+
+/* Макрос проводки по субсчетам при операции списания (Дб.П - Кр.А) */
+macro ExecuteSubAccWritingOFF( IsMassMode:bool, AccTrnID, Account, SubAccountCode, FIID, Amount, carryDate, PaymentID, SubAccData:DPSubAccData )
+
+  RECORD subdoc( accsubdc ); /* технические проводки по субсчетам */
+  var checkSubAcc = true;
+  var AccAnaliticsID = 0;
+
+  if(DP_CheckOverdraftAccount(Account, FIID, CHAPT5))
+    if( OpenSubAccIfNotExist( IsMassMode, Account, FIID, SubAccountCode ) != 0 )
+      return 1;
+    else
+      checkSubAcc = false; // проверять не будем
+    end;
+  end;
+
+  //if( PaymentID > 0 )
+    if(checkSubAcc and CheckWrtOffSubAcc( Account, 0, 0, SubAccountCode, FIID, Amount, carryDate, FALSE ))
+      return 1;
+    end;
+  //end;
+
+  ClearRecord( subdoc );
+
+  subdoc.AccTrnID    = AccTrnID;
+  subdoc.Sum         = Amount;
+  subdoc.DebetCredit = ACSDCL_DEBET;
+  subdoc.Status      = ACSDC_FACT;
+  subdoc.Date_Carry  = carryDate;
+  subdoc.PaymentID   = PaymentID;
+
+  if(IsMassMode)
+    subdoc.SubAccountPayerID = DP_GetSubAccID( IsMassMode, Account, FIID, SubAccountCode );
+
+    if(SubAccData != NULL)
+      SubAccData.AddSubDoc(SYS_ANL_AINPACCOUNTING, Account, SubAccountCode, subdoc);
+    end;
+  else
+  
+    if( not Opr_InsertAccSubDocument( null,
+                                     SYS_ANL_AINPACCOUNTING,
+                                     Account,
+                                     FIID,
+                                     CHAPT5,
+                                     SubAccountCode,
+                                     "",
+                                     subdoc ) != 0 )
+      DPError.SetErr("Ошибка при вставке технической проводки");
+      return 1;
+    end; 
+  end;
+  
+  return 0;
+end;
+
+macro CarryDeferSubCarryWrtOff( IsMassMode:bool, subdoc, AccTrnID, Account, FIID, carryDate, IsDefer, PaymentID, ID_Operation, ID_Step, SubAccData:DPSubAccData)
+  var tmp_SubAccountCode;
+
+  if(IsDefer)
+    if( subdoc.rec.Status != ACSDC_POST )
+      DPError.SetErr("Попытка повторного выполнения проводки по субсчетам");
+      return 1;
+    end;
+  end;
+
+  if( CheckWrtOffSubAcc( Account, subdoc.rec.AccAnaliticsID, subdoc.rec.SubAccountPayerID, tmp_SubAccountCode, FIID, subdoc.rec.Sum, carryDate, FALSE )  )
+    return 1;
+  end;
+
+  if(IsDefer)
+    if(IsMassMode)
+      if(SubAccData != NULL)
+        SubAccData.AddSubDoc(NULL, NULL, NULL, subdoc);
+      end;
+    else
+      subdoc.rec.Status = ACSDC_FACT;
+      subdoc.rec.AccTrnID = AccTrnID;
+
+      if( NOT Opr_UpdateAccSubDocument( subdoc, null, null, null, ID_Operation, ID_Step ) )
+        DPError.SetErr("Ошибка при обновлении технической проводки");
+        return 1;
+      end;
+    end;
+  else
+    if( ExecuteSubAccWritingOFF( IsMassMode, AccTrnID, Account, tmp_SubAccountCode, FIID, subdoc.rec.Sum, carryDate, PaymentID, SubAccData ) )
+      return 1;
+    end;
+  end;
+
+  return 0;
+end;
+
+/* Макрос проводки по субсчетам при операции зачисления (Дб.А - Кр.П) */
+macro ExecuteSubAccEnrolment( IsMassMode:bool, AccTrnID, SubAccountCode, Account, FIID, Amount, carryDate, PaymentID, SubAccData:DPSubAccData )
+
+  RECORD subdoc( accsubdc ); /* технические проводки по субсчетам */
+  
+  if( OpenSubAccIfNotExist( IsMassMode, Account, FIID, SubAccountCode ) != 0 )
+    return 1;
+  end;
+
+  ClearRecord( subdoc );
+
+  subdoc.AccTrnID    = AccTrnID;
+  subdoc.Sum         = Amount;
+  subdoc.DebetCredit = ACSDCL_CREDIT;
+  subdoc.Status      = ACSDC_FACT;
+  subdoc.Date_Carry  = carryDate;
+  subdoc.PaymentID   = PaymentID;
+
+  if(IsMassMode)
+    subdoc.SubAccountReceiverID = DP_GetSubAccID( IsMassMode, Account, FIID, SubAccountCode );
+
+    if(SubAccData != NULL)
+      SubAccData.AddSubDoc(SYS_ANL_AINPACCOUNTING, Account, SubAccountCode, subdoc);
+    end;
+
+  else
+    if(not Opr_InsertAccSubDocument( null,
+                                     SYS_ANL_AINPACCOUNTING,
+                                     Account,
+                                     FIID,
+                                     CHAPT5,
+                                     "",
+                                     SubAccountCode,
+                                     subdoc ) != 0 )
+      DPError.SetErr("Ошибка при вставке технической проводки");
+      return 1;
+    end;
+  end;
+
+  return 0;
+end;
+
+macro CarrySecondSubCarryTransfer( IsMassMode:bool, subdoc, AccTrnID, ReceiverAccount, FIID, carryDate, PaymentID, SubAccData:DPSubAccData )
+
+  FILE f_accsub(accsub);
+
+  f_accsub.AccAnaliticsID = subdoc.rec.AccAnaliticsID;
+  f_accsub.SubAccountID   = subdoc.rec.SubAccountPayerID;
+
+  if( GetEQ(f_accsub) )
+    if( ExecuteSubAccEnrolment( IsMassMode, AccTrnID, f_accsub.SubAccountCode, ReceiverAccount, FIID, subdoc.rec.Sum, carryDate, PaymentID, SubAccData ) )
+      return 1;
+    end;
+  else
+    DPError.SetErr("Не найден субсчет AccAnaliticsID = ", subdoc.rec.AccAnaliticsID, " SubAccountID = ", subdoc.rec.SubAccountPayerID );
+    return 1;
+  end;
+
+  return 0;
+end;
+
+class DPSUBDC()
+  var AccAnaliticsID;
+  var SubAccountID;
+  var Account;
+  var Rest;
+  var Sum;
+
+  macro Init( accsub, carryDate, IsActive )
+
+    FILE f_accvanl(accvanl);
+
+    AccAnaliticsID = accsub.rec.AccAnaliticsID;
+    SubAccountID   = accsub.rec.SubAccountID;
+    if( NOT IsActive )
+      Account        = accsub.rec.SubAccountCode;
+    else
+      f_accvanl.AccAnaliticsID = AccAnaliticsID;
+      if( GetEQ(f_accvanl) )
+        Account        = f_accvanl.Account;
+      else
+        DPError.SetErr("Не найдена аналитика счета списания AccAnaliticsID = ", AccAnaliticsID );
+        return 1;
+      end;
+    end;
+
+    Rest           = DP_RestSubAcc( accsub.rec.AccAnaliticsID, accsub.rec.SubAccountID, carryDate );
+    Sum            = $0;
+    return 0;
+  end;
+
+end;
+
+macro SumSubRest(Arr)
+  var i = 0;
+  var Sum = 0;
+
+  while( i < Arr.Size )
+    Sum = Sum + Arr(i).Rest;
+    i = i + 1;
+  end;
+  return Sum;
+end;
+
+macro MakeDefaultSum(Arr, Amount)
+  var i = 0;
+  record dpsubdc("dpsubdc.dbt");
+  var RestSum;
+
+  RestSum = Amount;
+  while( ( i < Arr.Size) AND (RestSum >= $0 ) )
+    ClearRecord(dpsubdc);
+    dpsubdc.AccAnaliticsID = Arr(i).AccAnaliticsID;
+    dpsubdc.SubAccountID   = Arr(i).SubAccountID;
+    dpsubdc.Account        = Arr(i).Account;
+    dpsubdc.NameAccount    = "";
+    dpsubdc.Rest           = Arr(i).Rest;
+    dpsubdc.Sum            = Arr(i).Sum;
+
+    Arr(i).Sum = DefineAinPDefaultSum( RestSum, dpsubdc );
+    RestSum = RestSum - Arr(i).Sum;
+    i = i + 1;
+  end;
+end;
+
+//проверить, сформирвоано ли поручение в операции передачи в пул/возврата из пула
+MACRO ПоручениеПоИзменениюПула(DraftID)
+  var query, cmd;
+  var flag = false, cnt = 0;
+
+  query =   " select 1"
+          + "   from dspdrprop_dbt prop, ddlgrdeal_dbt grdeal "
+          + "  where prop.t_DraftID = ? "
+          + "    and prop.t_PaymentID = prop.t_DocumentID "
+          + "    and prop.t_DocumentKind = " + DL_DLGRDEAL
+          + "    and grdeal.t_ID = prop.t_DocumentID "
+          + "    and grdeal.t_DocKind = " + DL_SCINOUTPOOL;
+
+  cmd = DL_RSDCommand(query);
+  cmd.AddParam(DraftID);
+
+  cnt = cmd.GetCount();
+  if(cnt > 0)
+    flag = true;
+  end;
+
+  return flag;
+END;
+
+//по поручению на перемещение определить пассивный счет, с которого будет выполняться перевод для операции передачи в пул/возврата из пула
+//ищем поручение наперевод, связанное с поручение на перемещение
+//если оно не найдено, то перевод не требуется - это значит, что в разноске будет счет из настройки DEPO\\NSD\\NSD_OWN_ACC
+MACRO ПолучитьПассивныйСчетПоИзменениюПула(MoveDraftID/*ID поручения на перемещение*/)
+  var query, cmd, DataSet;
+  var AcntID = 0;
+
+  if(ПоручениеПоИзменениюПула(MoveDraftID))
+
+    query =   " select acnt_p.t_AutoKey "
+            + "   from dspdrprop_dbt prop_mv, dspdrprop_dbt prop_tr, ddlgrdeal_dbt grdeal, dspdrmove_dbt drmove_tr, "
+            + "        dpmpaym_dbt pm, ddepoacnt_dbt acnt_p, ddepoacnt_dbt acnt_r "
+            + "  where prop_mv.t_DraftID = ? "
+            + "    and prop_mv.t_PaymentID = prop_mv.t_DocumentID "
+            + "    and prop_mv.t_DocumentKind = " + DL_DLGRDEAL
+            + "    and grdeal.t_ID = prop_mv.t_DocumentID "
+            + "    and grdeal.t_DocKind = " + DL_SCINOUTPOOL
+            + "    and prop_tr.t_PaymentID = prop_mv.t_PaymentID "
+            + "    and prop_tr.t_DocumentID = prop_mv.t_DocumentID "
+            + "    and prop_tr.t_DocumentKind = prop_mv.t_DocumentKind "
+            + "    and drmove_tr.t_DraftID = prop_tr.t_DraftID "
+            + "    and pm.t_PaymentID = drmove_tr.t_PaymentID "
+            + "    and acnt_p.t_AutoKey = pm.t_PayerDpNode "
+            + "    and acnt_p.t_Kind = " + SIDEBALANCE_PASSIVE
+            + "    and acnt_r.t_AutoKey = pm.t_ReceiverDpNode "
+            + "    and acnt_r.t_Kind = " + SIDEBALANCE_PASSIVE;
+
+    cmd = DL_RSDCommand(query);
+    cmd.AddParam(MoveDraftID);
+    DataSet = cmd.Execute();
+
+    if(DataSet.moveNext())
+      AcntID = DataSet.AutoKey;
+    else
+      //перевода нет - берем из настройки
+      var err = 0;
+      GetRegistryValue("DEPO\\NSD\\NSD_OWN_ACC", V_INTEGER, AcntID, err);
+      if(err)
+        msgbox("Ошибка при получении значения настройки DEPO\\NSD\\NSD_OWN_ACC" );
+      end;
+    end;
+  end;
+
+  return AcntID;
+END;
+
+//по поручению на перевод определить активный счет, на который выполнено перемещени для операции передачи в пул/возврата из пула
+//ищем поручение на перемещение, связанное с поручение на перевод
+//если оно не найдено, то это ошибка - перевод без перемещения быть не может
+MACRO ПолучитьСчётНовогоМестаХраненияПоИзменениюПула(TransferDraftID/*ID поручения на перевод*/)
+  var query, cmd, DataSet;
+  var AcntID = 0;
+
+  if(ПоручениеПоИзменениюПула(TransferDraftID))
+    query =   " select acnt_p.t_AutoKey "
+            + "   from dspdrprop_dbt prop_mv, dspdrprop_dbt prop_tr, ddlgrdeal_dbt grdeal, dspdrmove_dbt drmove_mv, "
+            + "        dpmpaym_dbt pm, ddepoacnt_dbt acnt_p, ddepoacnt_dbt acnt_r "
+            + "  where prop_tr.t_DraftID = ? "
+            + "    and prop_tr.t_PaymentID = prop_mv.t_DocumentID "
+            + "    and prop_tr.t_DocumentKind = " + DL_DLGRDEAL
+            + "    and grdeal.t_ID = prop_tr.t_DocumentID "
+            + "    and grdeal.t_DocKind = " + DL_SCINOUTPOOL
+            + "    and prop_mv.t_PaymentID = prop_tr.t_PaymentID "
+            + "    and prop_mv.t_DocumentID = prop_tr.t_DocumentID "
+            + "    and prop_mv.t_DocumentKind = prop_tr.t_DocumentKind "
+            + "    and drmove_mv.t_DraftID = prop_mv.t_DraftID "
+            + "    and pm.t_PaymentID = drmove_mv.t_PaymentID "
+            + "    and acnt_p.t_AutoKey = pm.t_PayerDpNode "
+            + "    and acnt_p.t_Kind = " + SIDEBALANCE_ACTIVE
+            + "    and acnt_r.t_AutoKey = pm.t_ReceiverDpNode "
+            + "    and acnt_r.t_Kind = " + SIDEBALANCE_ACTIVE;
+
+    cmd = DL_RSDCommand(query);
+    cmd.AddParam(TransferDraftID);
+    DataSet = cmd.Execute();
+
+    if(DataSet.moveNext())
+      AcntID = DataSet.AutoKey;
+    end;
+  end;
+
+  return AcntID;
+END;
+
+macro IsTerminalPart(DepoPartID)
+  var query, cmd, DataSet;
+  var IsTerminal = false;
+
+  if(DepoPartID > 0)
+    query = " select rsb_depo.IsTerminalAcntNode(?) as IsTerminal from dual";
+    
+    cmd = DL_RSDCommand(query);
+    cmd.AddParam(DepoPartID);
+    
+    DataSet = cmd.Execute();
+    if((DataSet.moveNext()) and (DataSet.IsTerminal != 0))
+      IsTerminal = true;
+    end;
+  end;
+
+  return IsTerminal;
+end;
+
+macro DP_GetCorAcc(Corschem, FIID)
+  var query, cmd, DataSet;
+  var AcntNodeID = 0;
+
+  query = " select rsb_depo.GetAcntNodeFromCorschem(?, ?) as AcntNodeID from dual";
+  
+  cmd = DL_RSDCommand(query);
+  cmd.AddParam(Corschem);
+  cmd.AddParam(FIID);
+  
+  DataSet = cmd.Execute();
+  if(DataSet.moveNext())
+    AcntNodeID = int(DataSet.AcntNodeID);
+  end;
+
+  return AcntNodeID;
+end;
+
+macro GetAccountByPart(FIID, DepoPartID, DateCarry, IsOverdraft)
+  var query, cmd, DataSet;
+  var Account = "";
+  
+  query =   " select acc.t_Account "
+          + "   from daccount_dbt acc "
+          + "  where acc.t_Code_Currency = ? "
+          + "    and acc.t_Chapter = " + CHAPT5
+          + "    and acc.t_Open_Close = CHR(0) "
+          + "    and acc.t_Open_Date <= ? "
+          + "    and acc.t_DepoAcc = ? ";
+
+  if((ValType(IsOverdraft) == V_BOOL) and (IsOverdraft == true))
+    query = query + " and instr(acc.t_Type_Account, 'Ф') != 0 "; //Безлимитный
+  end;
+
+  cmd = DL_RSDCommand(query);
+
+  cmd.AddParam(FIID);
+  cmd.AddParam(DateCarry);
+  cmd.AddParam(DepoPartID);
+
+  DataSet = cmd.Execute();
+  if(DataSet.moveNext())
+    Account = DataSet.Account;
+    if(DataSet.moveNext())
+      Account = "";
+    end;
+  end;
+
+  return Account;
+end;
+
+/* Макрос проводки по субсчетам при операции перевода (Дб.П - Кр.П) */
+macro ExecuteSubAccTransfer( IsMassMode:bool, AccTrnID, PayerAccount, ReceiverAccount, FIID, Amount, carryDate, PaymentID, SubAccData:DPSubAccData )
+  var TotalSum = $0;
+  var Arr = TArray;
+  var Add:DPSUBDC;
+  var i, stat;
+  var cmd, query, DataSet;
+  var ID_Operation = NULL, ID_Step = NULL;
+
+  var accsub = TRecHandler( "accsub.dbt" );
+  var f_subdoc = TBFile("accsubdc.dbt");
+  FILE f_accvanl( accvanl ) key 1;
+  record spdraft_buf("spdraft.dbt");
+  RECORD subdoc( accsubdc ); /* технические проводки по субсчетам */
+
+  var isOverdraft = DP_CheckOverdraftAccount(PayerAccount, FIID, CHAPT5);
+  var CorrAccDpNode = 0, CorrAccount = "";
+
+  f_subdoc.AddFilter( " t_PaymentID = " + PaymentID + " and t_Status = " + ACSDC_POST);
+
+  stat = f_subdoc.next();
+  if( stat and (PaymentID != 0)) /* Если записи есть - было позиционирование */
+    while( stat )
+
+      ID_Operation = NULL; 
+      ID_Step = NULL;
+
+      if((IsMassMode) and (ValType(SubAccData.DraftAllParms) != V_UNDEF))
+        ID_Operation = SubAccData.DraftAllParms.ID_Operation();
+        ID_Step      = SubAccData.DraftAllParms.ID_Step();
+      end;
+
+      if( CarryDeferSubCarryWrtOff(IsMassMode, f_subdoc, AccTrnID, PayerAccount, FIID, carryDate, TRUE, PaymentID, ID_Operation, ID_Step, SubAccData ) )
+        return 1;
+      end;
+      if( CarrySecondSubCarryTransfer(IsMassMode, f_subdoc, AccTrnID, ReceiverAccount, FIID, carryDate, PaymentID, SubAccData) )
+        return 1;
+      else
+        TotalSum = TotalSum + f_subdoc.rec.Sum;
+      end;
+      stat = f_subdoc.Next();
+    end;
+    if( TotalSum != Amount )
+      DPError.SetErr("Сумма технических проводок не совпадает с суммой, указанной в поручении");
+      return 1;
+    end;
+  elif((isOverdraft) and (SubAccData != NULL))
+
+    //Найдем код субсчета
+
+    //если работает через транзитный счет, то надо на корсчете найти терминальный раздел (должен уже существовать - введен вручную или открыт на предыдущих шагах) и л/с
+    if( SubAccData.Corschem != -1 )
+      if(ValType(SubAccData.DraftAllParms) != V_UNDEF)
+        copy(spdraft_buf, SubAccData.DraftAllParms.spdraft);
+      else
+        SetBuff( spdraft_buf, SubAccData.spdraft );
+      end;
+
+      var AcntNodeID = DP_GetCorAcc(SubAccData.Corschem, FIID);
+
+      if(AcntNodeID > 0)
+        if(IsTerminalPart(AcntNodeID))
+          CorrAccDpNode = AcntNodeID;
+        else
+          CorrAccDpNode = InputDepoPartByDepoAcc( SubAccData.IsPayer, AcntNodeID, SubAccData.spdraft, stat, spdraft_buf.SPgroundID, SubAccData.Pm_paym.rec.DocKind, SubAccData.Pm_paym.rec.DocumentID, DP_SPDRAFT_OPERATION, false, SubAccData.DraftAllParms );
+        end;
+        if(not (CorrAccDpNode > 0))
+          DPError.SetErr("Не найден раздел корреспондентского счета депо");
+          return 1;
+        else
+          CorrAccount = GetAccountByPart(FIID, CorrAccDpNode, carryDate);
+          if(CorrAccount == "")
+            CorrAccount = InputAccountByDepoAcc( CorrAccDpNode, SubAccData.IsPayer, SubAccData.spdraft, DP_SPDRAFT_OPERATION, stat, NULL, false, SubAccData.DraftAllParms );
+          end;
+          if(CorrAccount == "")
+            DPError.SetErr("Не найден подходящий лицевой счет на корреспондентском счете депо");
+            return 1;
+          end;
+        end;
+      end;
+
+      if(ExecuteSubAccWritingOFF( IsMassMode, AccTrnID, PayerAccount, CorrAccount, FIID, Amount, carryDate, PaymentID, SubAccData ))
+        return 1;
+      end;
+
+      if(ExecuteSubAccEnrolment( IsMassMode, AccTrnID, CorrAccount, ReceiverAccount, FIID, Amount, carryDate, PaymentID, SubAccData ))
+        return 1;
+      end;
+
+    end;
+  else
+
+    if(SubAccData != NULL)
+      SetBuff( spdraft_buf, SubAccData.spdraft );
+    end;
+
+    f_accvanl.FIID        = FIID;
+    f_accvanl.Chapter     = CHAPT5;
+    f_accvanl.Account     = PayerAccount;
+    f_accvanl.AnaliticsID = SYS_ANL_AINPACCOUNTING;
+    if( GetEQ(f_accvanl) )
+
+      cmd = DL_RSDCommand();
+
+      query =   " select accsub.* "
+              + "   from daccsub_dbt accsub "
+              + "  where accsub.t_AccAnaliticsID = ? "
+              + "    and accsub.t_SpecialType = 0 ";
+      cmd.AddParam(f_accvanl.AccAnaliticsID);
+
+      if(ПоручениеПоИзменениюПула(spdraft_buf.AutoKey) == true)
+        var AcntID = ПолучитьСчётНовогоМестаХраненияПоИзменениюПула(spdraft_buf.AutoKey);
+
+        query = query + " and Exists (select 1 "
+                      + "               from daccount_dbt acc"
+                      + "              where acc.t_Account = accsub.t_SubAccountCode "
+                      + "                and acc.t_Code_Currency = ? "
+                      + "                and acc.t_Chapter = ? "
+                      + "                and acc.t_DepoAcc IN (select acnt.t_AutoKey "
+                      + "                                        from ddepoacnt_dbt acnt "
+                      + "                                       start with acnt.t_AutoKey = ? "
+                      + "                                      connect by prior acnt.t_AutoKey = acnt.t_Superior"
+                      + "                                     )"
+                      + "            )";
+
+        cmd.AddParam(FIID);
+        cmd.AddParam(CHAPT5);
+        cmd.AddParam(AcntID);
+      end;
+
+      DataSet = cmd.Execute(query);
+
+      Arr.Size = 0;
+      while( DataSet.moveNext() )
+        DataSet.GetRecord().CopyTo( accsub.rec );
+
+        Add = DPSUBDC;
+        if( Add.Init( accsub, carryDate, FALSE ) )
+          return 1;
+        end;
+        Arr( Arr.Size ) = Add;
+      end;
+      if(Arr.Size == 0)
+        DPError.SetErr("Не найдено ни одного субсчета списания");
+        return 1;
+      end;
+      if( SumSubRest(Arr) < Amount )
+        DPError.SetErr("Сумма остатков на субсчетах счета списания меньше суммы, указанной в поручении");
+        return 1;
+      end;
+      TArray_QSort(Arr, "Rest", -1, "Account", 1 );
+      MakeDefaultSum(Arr, Amount);
+      i = 0;
+      while(i < Arr.Size)
+        ID_Operation = NULL; 
+        ID_Step = NULL;
+
+        if((IsMassMode) and (ValType(SubAccData.DraftAllParms) != V_UNDEF))
+          ID_Operation = SubAccData.DraftAllParms.ID_Operation();
+          ID_Step = SubAccData.DraftAllParms.ID_Step();
+        end;
+        
+        if( Arr(i).Sum > $0 )
+          ClearRecord(f_subdoc);
+          f_subdoc.rec.AccTrnID          = AccTrnID;
+          f_subdoc.rec.AccAnaliticsID    = Arr(i).AccAnaliticsID;
+          f_subdoc.rec.SubAccountPayerID = Arr(i).SubAccountID;
+          f_subdoc.rec.Date_Carry        = carryDate;
+          f_subdoc.rec.Sum               = Arr(i).Sum;
+          f_subdoc.rec.Status            = ACSDC_FACT;
+
+          if( CarryDeferSubCarryWrtOff(IsMassMode, f_subdoc, AccTrnID, PayerAccount, FIID, carryDate, FALSE, PaymentID, ID_Operation, ID_Step, SubAccData ) )
+            return 1;
+          end;
+          if( CarrySecondSubCarryTransfer(IsMassMode, f_subdoc, AccTrnID, ReceiverAccount, FIID, carryDate, PaymentID, SubAccData) )
+            return 1;
+          end;
+        end;
+
+        i = i + 1;
+      end;
+    else
+      DPError.SetErr("Не найдена аналитика счета списания");
+      return 1;
+    end;
+  end;
+
+  return 0;
+end;
+
+macro DP_AddToGrRep(Desc:Integer, Party:Integer, SourceDocKind:Integer, SourceDocID:Integer, DeliveryKind:Integer, AutoSendReport:Bool)
+  var err = 0;
+  var query = "", cmd = null, set = null;
+
+  query = " SELECT "
+            + " 1 "
+        + " FROM "
+            + " DUAL "
+        + " WHERE "
+            + " EXISTS (SELECT "
+                        + " 1 "
+                    + " FROM "
+                        + " ddpgrrep_dbt dpgrrep "
+                    + " WHERE "
+                        + " dpgrrep.t_SourceDocKind = ? "
+                    + " AND dpgrrep.t_SourceDocID = ? "
+                    + " AND dpgrrep.t_Recipient = ?) ";
+
+  cmd = RsdCommand(query);
+  cmd.AddParam("", RSDBP_IN, SourceDocKind);
+  cmd.AddParam("", RSDBP_IN, SourceDocID);
+  cmd.AddParam("", RSDBP_IN, Party);
+  cmd.NullConversion = true;
+  cmd.Execute();
+
+  set = RsdRecordset(cmd);
+  if(not set.MoveNext())
+    err = DP_AddDPGRREP(Desc, Party, SourceDocKind, SourceDocID, DeliveryKind, AutoSendReport);
+  end;
+
+  return err;
+end;
+
+private macro AddOwnerToGrRep(spdraft, AccAnaliticsID)
+  var err = 0;
+  var query = "", cmd = null, set = null;
+  record r_spdraft(spdraft);
+
+  SetBuff(r_spdraft, spdraft);
+
+  query = " SELECT "
+            + " account.t_Client "
+        + " FROM "
+            + " daccount_dbt account "
+           + " ,daccvanl_dbt accvanl "
+        + " WHERE "
+            + " account.t_Chapter = accvanl.t_Chapter "
+        + " AND account.t_Account = accvanl.t_Account "
+        + " AND account.t_Code_Currency = accvanl.t_FIID "
+        + " AND NOT EXISTS (SELECT "
+                            + " 1 "
+                        + " FROM "
+                            + " ddpgrrep_dbt dpgrrep "
+                        + " WHERE "
+                            + " dpgrrep.t_SourceDocKind = ? "
+                        + " AND dpgrrep.t_SourceDocID = ? "
+                        + " AND dpgrrep.t_Recipient = account.t_Client) "
+        + " AND accvanl.t_AccAnaliticsID = ? "
+        + " AND accvanl.t_AnaliticsID = " + SYS_ANL_AINPACCOUNTING + " "
+        + " AND accvanl.t_Chapter = " + CHAPT5 + " ";
+
+  cmd = RsdCommand(query);
+
+  cmd.AddParam("", RSDBP_IN, r_spdraft.Kind);
+  cmd.AddParam("", RSDBP_IN, r_spdraft.AutoKey);
+  cmd.AddParam("", RSDBP_IN, AccAnaliticsID);
+  cmd.NullConversion = true;
+  cmd.Execute();
+
+  set = RsdRecordset(cmd);
+
+  while((err == 0) and set.MoveNext())
+    err = DP_AddDPGRREP(r_spdraft.SPGroundID, set.Value("t_Client"), r_spdraft.Kind, r_spdraft.AutoKey, CodeFor("E"), false);
+  end;
+
+  return err;
+end;
+
+macro CarryDeferSubCarryMov(IsMassMode:bool, AccTrnID, subdoc, PayerAccount, ReceiverAccount, FIID, carryDate, IsDefer, PaymentID, ID_Operation, ID_Step, SubAccData:DPSubAccData )
+  var tmp_PassiveAccount;
+
+  if(IsDefer)
+    if( subdoc.rec.Status != ACSDC_POST )
+      DPError.SetErr("Попытка повторного выполнения проводки по субсчетам");
+      return 1;
+    end;
+  end;
+  
+  if( CheckWrtOffSubAcc( tmp_PassiveAccount, subdoc.rec.AccAnaliticsID, subdoc.rec.SubAccountPayerID, ReceiverAccount, FIID, subdoc.rec.Sum, carryDate, TRUE )  )
+    return 1;
+  end;
+
+  if( OpenSubAccIfNotExist( IsMassMode, tmp_PassiveAccount, FIID, PayerAccount ) != 0 )
+    return 1;
+  end;
+
+  if( IsDefer )
+
+    if(IsMassMode)
+      var query, cmd, DataSet;
+
+      query = "select t_SubAccountID from daccsub_dbt where t_AccAnaliticsID = ? and t_SubAccountCode = ? ";
+      cmd = DL_RSDCommand(query);
+      cmd.AddParam(subdoc.rec.AccAnaliticsID);
+      cmd.AddParam(PayerAccount);
+
+      DataSet = cmd.Execute();
+      if(DataSet.moveNext())
+        subdoc.rec.SubAccountReceiverID = DataSet.SubAccountID;
+        
+        if(SubAccData != NULL)
+          SubAccData.AddSubDoc(NULL, NULL, NULL, subdoc);
+        end;
+      end;
+    else
+      subdoc.rec.Status = ACSDC_FACT;
+
+      if( NOT Opr_UpdateAccSubDocument( subdoc, NULL, NULL, PayerAccount, ID_Operation, ID_Step ) )
+        DPError.SetErr("Ошибка при обновлении технической проводки");
+        return 1;
+      end;
+    end;
+  else
+    subdoc.rec.DebetCredit          = -1;
+    subdoc.rec.Status               = ACSDC_FACT;
+    subdoc.rec.Date_Carry           = carryDate;
+    subdoc.rec.PaymentID            = PaymentID;
+
+    if(IsMassMode)
+      subdoc.rec.SubAccountPayerID    = DP_GetSubAccID( IsMassMode, tmp_PassiveAccount, FIID, ReceiverAccount );
+      subdoc.rec.SubAccountReceiverID = DP_GetSubAccID( IsMassMode, tmp_PassiveAccount, FIID, PayerAccount );
+
+      if(SubAccData != NULL)
+        SubAccData.AddSubDoc(SYS_ANL_AINPACCOUNTING, tmp_PassiveAccount, ReceiverAccount, subdoc);
+      end;
+
+    else
+      if( not Opr_InsertAccSubDocument( NULL,
+                                       SYS_ANL_AINPACCOUNTING,
+                                       tmp_PassiveAccount,
+                                       FIID,
+                                       CHAPT5,
+                                       ReceiverAccount,
+                                       PayerAccount,
+                                       subdoc ) != 0 )
+        DPError.SetErr("Ошибка при вставке технической проводки");
+        return 1;
+      end;
+    end;
+  end;
+
+  if(AddOwnerToGrRep(SubAccData.spdraft, subdoc.rec.AccAnaliticsID) != 0)
+    return 1;
+  end;
+
+  return 0;
+end;
+
+/* Макрос проводки по субсчетам при операции перемещения (Дб.А - Кр.А) */
+macro ExecuteSubAccMovement( IsMassMode:bool, AccTrnID, PayerAccount, ReceiverAccount, FIID, Amount, carryDate, PaymentID, SubAccData:DPSubAccData )
+  var TotalSum = $0;
+  var Arr = TArray;
+  var Add:DPSUBDC;
+  var i, stat;
+  var cmd, query, DataSet;
+  var ID_Operation = NULL; 
+  var ID_Step = NULL;
+
+  var accsub = TRecHandler("accsub.dbt");
+  var ds;
+  var f_subdoc = TBFile("accsubdc.dbt");
+  FILE f_accvanl( accvanl ) key 1;
+  record spdraft_buf("spdraft.dbt");
+  var AcntID = 0;
+  
+  f_subdoc.AddFilter( " t_PaymentID = " + PaymentID+ " and t_Status = " + ACSDC_POST );
+
+  stat = f_subdoc.next();
+  if( stat ) /* Если записи есть - было позиционирование */
+    while( stat )
+      
+      ID_Operation = NULL; 
+      ID_Step = NULL;
+
+      if((IsMassMode) and (ValType(SubAccData.DraftAllParms) != V_UNDEF))
+        ID_Operation = SubAccData.DraftAllParms.ID_Operation();
+        ID_Step = SubAccData.DraftAllParms.ID_Step();
+      end;
+
+      if( CarryDeferSubCarryMov(IsMassMode, AccTrnID, f_subdoc, PayerAccount, ReceiverAccount, FIID, carryDate, TRUE, PaymentID, ID_Operation, ID_Step, SubAccData ) )
+        return 1;
+      else
+        TotalSum = TotalSum + f_subdoc.rec.Sum;
+      end;
+      stat = f_subdoc.Next();
+    end;
+    if( TotalSum != Amount )
+      DPError.SetErr("Сумма технических проводок не совпадает с суммой, указанной в поручении");
+      return 1;
+    end;
+  else
+    SetBuff( spdraft_buf, SubAccData.spdraft );
+
+    AcntID = ПолучитьПассивныйСчетПоИзменениюПула(spdraft_buf.AutoKey);
+
+    Arr.Size = 0;
+
+    cmd = DL_RSDCommand();
+    query =   " select accsub.* "
+            + "   from daccsub_dbt accsub"
+            + "  where accsub.t_AnaliticsID = " + SYS_ANL_AINPACCOUNTING
+            + "    and accsub.t_SubAccountCode = ? "
+            + "    and accsub.t_SpecialType = 0 ";
+    cmd.AddParam(ReceiverAccount);
+
+    if(AcntID > 0)
+      query = query + " and Exists(select 1 from daccvanl_dbt vanl, daccount_dbt acc "
+                    + "             where vanl.t_AccAnaliticsID = accsub.t_AccAnaliticsID "
+                    + "               and acc.t_Account = vanl.t_Account "
+                    + "               and acc.t_Code_Currency = vanl.t_FIID "
+                    + "               and acc.t_Chapter = vanl.t_Chapter "
+                    + "               and acc.t_DepoAcc IN (select acnt.t_AutoKey "
+                    + "                                       from ddepoacnt_dbt acnt "
+                    + "                                      start with acnt.t_AutoKey = ? "
+                    + "                                     connect by prior acnt.t_AutoKey = acnt.t_Superior"
+                    + "                                    )"
+                    + "           )";
+
+      cmd.AddParam(AcntID);
+    end;
+
+    DataSet = cmd.Execute(query);
+
+    while( DataSet.moveNext() )
+      DataSet.GetRecord().CopyTo( accsub.rec );
+
+      Add = DPSUBDC;
+      if( Add.Init( accsub, carryDate, TRUE ) )
+        return 1;
+      end;
+      Arr( Arr.Size ) = Add;
+    end;
+    if(Arr.Size == 0)
+      DPError.SetErr("Не найдено ни одного субсчета списания");
+      return 1;
+    end;
+    if( SumSubRest(Arr) < Amount )
+      DPError.SetErr("Сумма остатков на субсчетах счета списания меньше суммы, указанной в поручении");
+      return 1;
+    end;
+    TArray_QSort(Arr, "Rest", -1, "Account", 1 );
+    MakeDefaultSum(Arr, Amount);
+    i = 0;
+    while(i < Arr.Size)
+      ID_Operation = NULL; 
+      ID_Step = NULL;
+
+      if((IsMassMode) and (ValType(SubAccData.DraftAllParms) != V_UNDEF))
+        ID_Operation = SubAccData.DraftAllParms.ID_Operation();
+        ID_Step = SubAccData.DraftAllParms.ID_Step();
+      end;
+      
+      if( Arr(i).Sum > $0 )
+        ClearRecord(f_subdoc);
+        f_subdoc.rec.AccAnaliticsID    = Arr(i).AccAnaliticsID;
+        f_subdoc.rec.SubAccountPayerID = Arr(i).SubAccountID;
+        f_subdoc.rec.Date_Carry        = carryDate;
+        f_subdoc.rec.Sum               = Arr(i).Sum;
+        f_subdoc.rec.Status            = ACSDC_FACT;
+
+        if( CarryDeferSubCarryMov(IsMassMode, AccTrnID, f_subdoc, PayerAccount, ReceiverAccount, FIID, carryDate, FALSE, PaymentID, ID_Operation, ID_Step, SubAccData ) )
+          return 1;
+        end;
+      end;
+
+      i = i + 1;
+    end;
+  end;
+
+  return 0;
+end;
+
+macro FindDEPOACNT( Autokey, Buff_DepoAcnt )
+   file DepoAcnt( depoacnt );
+
+   DepoAcnt.Autokey = Autokey;
+   if( GetEQ(DepoAcnt) )
+     Copy( Buff_DepoAcnt, DepoAcnt );
+     return 0;
+   else
+     return 1;
+   end;
+end;
+
+macro DefineKindOperation( DwNodeID, BnNodeID )
+  var cmd, DataSet;
+  var KindOperation = KINDOPER_NOTDEFINED;
+
+  cmd = DL_RSDCommand("select rsb_depo.DefineKindOperation(?, ?) as KindOperation from dual");
+
+  cmd.AddParam(DwNodeID);
+  cmd.AddParam(BnNodeID);
+
+  DataSet = cmd.Execute();
+  if(DataSet.moveNext())
+    KindOperation = int(DataSet.KindOperation);
+  end;
+
+  return KindOperation;
+end;
+
+macro DefineKindOperationByAcc(PayerAccount, ReceiverAccount, FIID)
+  var query, AccP, AccR;
+
+  query =   " select t_Kind_Account from daccount_dbt "
+          + "  where t_Account = '"+PayerAccount+"' "
+          + "    and t_Code_Currency = " + FIID
+          + "    and t_Chapter = " + CHAPT5
+          + "    and t_Department = " + {operdprt};
+  AccP = TRsbDataSet(query);
+  if(not AccP.moveNext())
+    DPError.SetErr("Не найден лицевой счет плательщика ", PayerAccount );
+    return KINDOPER_NOTDEFINED;
+  end;
+
+  query =   " select t_Kind_Account from daccount_dbt "
+          + "  where t_Account = '"+ReceiverAccount+"' "
+          + "    and t_Code_Currency = " + FIID
+          + "    and t_Chapter = " + CHAPT5
+          + "    and t_Department = " + {operdprt};
+
+  AccR = TRsbDataSet(query);
+  if(not AccR.moveNext())
+    DPError.SetErr("Не найден лицевой счет получателя ", ReceiverAccount );
+    return KINDOPER_NOTDEFINED;
+  end;
+
+  /* Определяем вид операции
+     А->П - Зачисление
+     П->А - Списание
+     П->П - Перевод
+     А->А - Перемещение (смена места хранения)
+  */
+
+  if(   ( AccP.Kind_Account == bal_acc_active  ) AND ( AccR.Kind_Account == bal_acc_passive ) ) /* А->П - Зачисление */
+    return KINDOPER_ENROLMENT;
+  elif( ( AccP.Kind_Account == bal_acc_passive ) AND ( AccR.Kind_Account == bal_acc_active  ) ) /* П->А - Списание */
+    return KINDOPER_WRITINGOFF;
+  elif( ( AccP.Kind_Account == bal_acc_passive ) AND ( AccR.Kind_Account == bal_acc_passive ) ) /* П->П - Перевод */
+    return KINDOPER_TRANSFER;
+  elif( ( AccP.Kind_Account == bal_acc_active  ) AND ( AccR.Kind_Account == bal_acc_active  ) ) /* А->А - Перемещение (смена места хранения) */
+    return KINDOPER_MOVEMENT;
+  end;
+end;
+
+/* Макрос выполнения проводок по субсчетам. По переданным ID счетов депо определяет вид операции,
+исходя из которого и выполняет проводки по субсчетам переданных л/с */
+macro ExecuteSubAccCarry( IsMassMode:bool, AccTrnID, DwNodeID, BnNodeID, PayerAccount, ReceiverAccount, FIID, Amount, carryDate, PaymentID, SubAccData:DPSubAccData )
+  var stat, AinPDate, KindOperation;
+   
+  if( GetAinPAccDate( AinPDate ) != 0 )
+      return 1;
+  end;
+
+  if( carryDate < AinPDate )
+    DPError.SetErr("Дата проводки меньше даты включения режима учета актива в пассиве" );
+    return 1;
+  end;
+
+  KindOperation = DefineKindOperation( DwNodeID, BnNodeID );
+  if( KindOperation == KINDOPER_NOTDEFINED )
+    return 1;
+  end;
+
+  if( KindOperation == KINDOPER_ENROLMENT ) /* А->П - Зачисление */
+    stat = ExecuteSubAccEnrolment( IsMassMode, AccTrnID, PayerAccount, ReceiverAccount, FIID, Amount, carryDate, PaymentID, SubAccData );
+  elif( KindOperation == KINDOPER_WRITINGOFF ) /* П->А - Списание */
+    stat = ExecuteSubAccWritingOFF( IsMassMode, AccTrnID, PayerAccount, ReceiverAccount, FIID, Amount, carryDate, PaymentID, SubAccData );
+  elif( KindOperation == KINDOPER_TRANSFER ) /* П->П - Перевод */
+    stat = ExecuteSubAccTransfer( IsMassMode, AccTrnID, PayerAccount, ReceiverAccount, FIID, Amount, carryDate, PaymentID, SubAccData );
+  elif( KindOperation == KINDOPER_MOVEMENT ) /* А->А - Перемещение (смена места хранения) */
+    stat = ExecuteSubAccMovement( IsMassMode, AccTrnID, PayerAccount, ReceiverAccount, FIID, Amount, carryDate, PaymentID, SubAccData );
+  end;
+
+  return stat;
+end;
+
+/* *********************************************************************** */
+/*                            Закрытое Хранение                            */
+/* *********************************************************************** */
+
+class CCarryPrm( DebAccount_, KredAccount_, Amount_ )
+
+  var DebAccount = DebAccount_,
+      KredAccount = KredAccount_,
+      Amount = Amount_;
+
+end;
+
+macro AddCarryPrm( CarryPrms, DebAccount, KredAccount, Amount )
+  var NewItem;
+  var i;
+
+  i = 0;
+  while( ( i >=0 ) AND ( i < CarryPrms.Size ) )
+
+    if( ( CarryPrms[i].DebAccount == DebAccount ) AND ( CarryPrms[i].KredAccount == KredAccount ) )
+      CarryPrms[i].Amount = CarryPrms[i].Amount + Amount;
+      i = -2; /* Запись нашли, обновили - выходим */
+    end;
+
+    i = i + 1;
+  end;
+
+  if( i >= 0 ) /* Ничего не нашли - добавим новую запись */
+   NewItem = CCarryPrm( DebAccount, KredAccount, Amount );
+   CarryPrms[CarryPrms.Size] = NewItem;
+  end;
+
+end;
+
+macro CheckInvCardByID( InvCardID, KindOperation, SecondEnrolWrCertEnabled )
+  var ic = TBFile("invcard.dbt");
+  var stat = true;
+
+  if( InvCardID )
+    ic.rec.InvCardID = InvCardID;
+    if( ic.GetEQ() )
+      if( ( ( KINDOPER_ENROLMENT != KindOperation ) AND (INVCARD_STATUS_INCUSTODY != ic.rec.Status ) ) OR
+          ( ( KINDOPER_ENROLMENT == KindOperation ) AND (INVCARD_STATUS_PLAN != ic.rec.Status ) AND
+            ( ( NOT SecondEnrolWrCertEnabled ) OR (INVCARD_STATUS_WRITEOFF != ic.rec.Status) )
+          ) )
+        stat = false;
+      end;
+    else
+      stat = false;
+    end;
+  end;
+
+  return stat;
+end;
+
+/* Функция формирования проводок ЗХ */
+macro ExecuteIndoorStorageCarry( spdraft, PaymentID, DwNodeID, BnNodeID, FIID, carryDate, ground, batchTrn )
+  var CarryPrms = TArray; /* параметры проводок Д, К, Сумма */
+  var SecondEnrolWrCertEnabled, KindOperation;
+  var bstat, err = 0;
+  var i, j;
+  var Xid = "", PayerFaceAccount = "", ReceiverFaceAccount = "";
+  var cmd, DataSet;
+  var invlist = TRecHandler("invlist");
+  var cnt = 0;
+  var ID_Operation = NULL, ID_Step = NULL;
+
+  KindOperation = DefineKindOperation( DwNodeID, BnNodeID );
+  if( KindOperation == KINDOPER_NOTDEFINED )
+    err = 1;
+  end;
+
+  if( (NOT err) AND ( GetSecondEnrolWrCertState( SecondEnrolWrCertEnabled ) != 0 ) )
+    err = 1;
+  end;
+
+  if(not err)
+    if(ValType(batchTrn) != V_UNDEF)
+      ID_Operation = batchTrn.GetID_Operation(); 
+      ID_Step = batchTrn.GetID_Step();
+    end;
+
+    cmd = DL_RSDCommand("select * from dinvlist_dbt where t_PaymentID = ?");
+    cmd.AddParam(PaymentID);
+
+    cnt = cmd.GetCount();
+    if(cnt)
+      InitProgress( cnt, "Подготовка и проверка данных по закрытому хранению...", "Подготовка и проверка данных по закрытому хранению" );
+
+      i = 0;
+      DataSet = cmd.Execute();
+      while((not err) and DataSet.moveNext())
+        DataSet.GetRecord().CopyTo(invlist.rec);
+
+        if(CheckInvCardByID( invlist.rec.InvCardID, KindOperation, SecondEnrolWrCertEnabled ) == false) /* Проверка наличия и соответствия статуса ИК */
+          DPError.SetErr( "Не найдена подходящая инвентарная карточка для строки описи с ID = " + String(invlist.rec.InvListID) );
+          err = 1;
+        else
+          if(ValType(batchTrn) != V_UNDEF)
+            PayerFaceAccount = InputAccountByDepoAcc( DwNodeID, DP_OPRACC_PAYER, NULL, DP_SPDRAFT_OPERATION, err, invlist.rec.InvCardID, false, batchTrn.DraftAllParms() );
+          else
+            PayerFaceAccount = InputAccountByDepoAcc( DwNodeID, DP_OPRACC_PAYER, spdraft, DP_SPDRAFT_OPERATION, err, invlist.rec.InvCardID );
+          end;
+          if( PayerFaceAccount == "" ) /* Была ошибка */
+            if(err == DP_GETACC_ESC) /* прерывание пользователя */
+              return err;
+            end;
+            err = 1;
+          end;
+
+          if( NOT err )
+            if(ValType(batchTrn) != V_UNDEF)
+              ReceiverFaceAccount = InputAccountByDepoAcc( BnNodeID, DP_OPRACC_RECEIVER, NULL, DP_SPDRAFT_OPERATION, err, invlist.rec.InvCardID, false, batchTrn.DraftAllParms() );
+            else
+              ReceiverFaceAccount = InputAccountByDepoAcc( BnNodeID, DP_OPRACC_RECEIVER, spdraft, DP_SPDRAFT_OPERATION, err, invlist.rec.InvCardID );
+            end;
+            if( ReceiverFaceAccount == "" ) /* Была ошибка */
+              if(err == DP_GETACC_ESC) /* прерывание пользователя */
+                return err;
+              end;
+              err = 1;
+            end;
+          end;
+           
+          if(NOT err)
+            if( NOT DP_CarryINVLIST( invlist, PayerFaceAccount, ReceiverFaceAccount, carryDate, ID_Operation, ID_Step ) )
+              DPError.SetErr( "Невозможно обновить строку описи с ID = " + String(invlist.rec.InvListID) );
+              err = 1;
+            else
+              AddCarryPrm( CarryPrms, PayerFaceAccount, ReceiverFaceAccount, DP_GetInvCardAmount(invlist.rec.InvCardID) );
+            end;
+          end;
+        end;
+
+        UseProgress(i = i + 1);
+      end;
+
+      RemProgress();
+      
+      /* Выполняем проводки */
+      if(NOT err)
+        i = 0;
+        while( (NOT err) AND ( i < CarryPrms.Size ) )
+          if(ValType(batchTrn) != V_UNDEF)
+             if(batchTrn.AddOneAccTrnByPaym(carryDate, CarryPrms[i].DebAccount, CarryPrms[i].KredAccount, ground) != 0)
+               DPError.SetErr( "Ошибка при вставке проводки закрытого хранения" );
+               err = 1;
+             end;
+          else
+            if( DocCarry( true,                     /* счета проводки - валюта (false - валюта с покрытием)*/
+                          5,                        /*Глава*/
+                          FIID,                     /*Валюта*/
+                          CarryPrms[i].DebAccount,  /*Плательшик*/
+                          CarryPrms[i].KredAccount, /*Получатель*/
+                          CarryPrms[i].Amount,      /*сколько*/
+                          carryDate,                /*дата*/
+                          0,                        /*Результат проводки*/
+                          ground,
+                          PaymentID,
+                          PMMET_ID,
+                          NULL,
+                          18                        // Шифр операции
+                        )
+              )
+              DPError.SetErr( "Ошибка при вставке проводки закрытого хранения" );
+              err = 1;
+            end;
+          end;
+
+          i = i + 1;
+        end;
+      end;
+
+    end;
+  end;
+
+  return err;
+end;
+
+//Функция возвращает строку запроса для выборки счетов в ГО на шагах
+macro GetGlobopQuery(RegisterID)
+  var query = "";
+
+  query =   " select acnt.t_Root from ddepoacnt_dbt acnt, ddpreglin_dbt lin"
+          + " where acnt.t_AutoKey = lin.t_HolderAccID "
+          + "   and lin.t_RegisterID = " + RegisterID
+          + "   and lin.t_Type = " + DP_REGLINETYPE_DEPOACC
+          + "   and lin.t_State = 0 ";
+
+  return query;
+end;
+
+macro GetCountAccGlobop(RegisterID)
+  var query = "";
+  var DataSet, Select;
+  var Count = 0;
+
+  query =   " select count(acnt.t_Root) as cnt from ddepoacnt_dbt acnt, ddpreglin_dbt lin"
+          + " where acnt.t_AutoKey = lin.t_HolderAccID "
+          + "   and lin.t_RegisterID = ? "
+          + "   and lin.t_Type = " + DP_REGLINETYPE_DEPOACC
+          + "   and lin.t_State = 0 ";
+
+  Select = RSDCommand( query );
+
+  Select.AddParam("", RSDBP_IN, RegisterID );
+  Select.Execute();
+  DataSet = TRsbDataSet(Select);
+  if( DataSet.moveNext() )
+    Count = DataSet.cnt;
+  end;
+
+  return Count;
+end;
+
+//Получить номер статуса операции
+macro GetGlobopOprState(DocKind)
+  var State = 0;
+
+  if( DocKind == DP_DEPOPER_CONVERT )
+    State = DEPOGLOBOP_STATEKIND_CONVERT;
+  elif( DocKind == DP_DEPOPER_REPAY )
+    State = DEPOGLOBOP_STATEKIND_REPAY;
+  elif( DocKind == DP_DEPOPER_BONEMISS )
+    State = DEPOGLOBOP_STATEKIND_BONEMISS;
+  end;
+
+  return State;
+end;
+
+//Проверить остатки на счете списания при выключенной проверки "Учет актива в пассиве"
+//Требуется для регистрации отказа до выполнения проводок, чтобы избежать попыток списать больше, чем есть
+//(хотя механизм проводок всё-равно не позволит это сделать, но тогда не сможем установить отказ)
+//
+macro CheckAcRestWriteOff(errmsg:@variant, PayerAccount, PayerDpNode, ReceiverAccount, ReceiverDpNode, FIID, CarryDate, CarrySumm)
+  var AinPEnabled = false;
+  var AcRest = 0.0;
+  var KindOperation = 0;
+
+  errmsg = "";
+
+  macro GetRestAc(_Account, _FIID, _CarryDate)
+    var query, DataSet, Rest = 0.0;
+    query =   " select rsb_account.restac( t_Account, t_Code_Currency, ?, t_Chapter, null ) as RestAc "
+            + "  from daccount_dbt "
+            + "  where t_Account = ? "
+            + "    and t_Code_Currency = ? "
+            + "    and t_Chapter = " + CHAPT5
+            + "    and t_Department = ?";
+    
+    var cmd = DL_RSDCommand(query);
+    cmd.AddParam(_CarryDate);
+    cmd.AddParam(_Account);
+    cmd.AddParam(_FIID);
+    cmd.AddParam({operdprt});
+
+    DataSet = cmd.Execute();
+    if((DataSet.moveNext()) and (ValType(DataSet.RestAc) != V_UNDEF))
+      Rest = abs(DataSet.RestAc);
+    end;
+
+    return Rest;
+  end;
+
+  if( (GetAinPAccState( AinPEnabled ) != 0) or (not AinPEnabled)) //не ведется "учет актива в пассиве"
+    KindOperation = DefineKindOperation( PayerDpNode, ReceiverDpNode );
+
+    if( (KindOperation == KINDOPER_WRITINGOFF) or // П->А - Списание
+        ( KindOperation == KINDOPER_TRANSFER ) )  // П->П - Перевод
+
+      AcRest = GetRestAc(PayerAccount, FIID, CarryDate);
+      if( AcRest < CarrySumm )
+        errmsg = "На лицевом счете "+PayerAccount+" на "+CarryDate+" недостаточно средств";
+        return 0;
+      end;
+    end;
+    if( (KindOperation == KINDOPER_WRITINGOFF) or // П->А - Списание
+        ( KindOperation == KINDOPER_MOVEMENT ) )   // А->А - Перемещение (смена места хранения)
+      AcRest = GetRestAc(ReceiverAccount, FIID, CarryDate);
+      if( AcRest < CarrySumm )
+        errmsg = "На лицевом счете "+ReceiverAccount+" на "+CarryDate+" недостаточно средств";
+        return 0;
+      end;
+    end;
+  end;
+
+  return 1;
+end;
+
+PRIVATE MACRO СоздатьСообщение(TypeError:integer, PartyID:integer, AvoirKind:integer):string
+
+   var ErrMsg:string = "";
+   var PartyName:string = "", AvrKindName:string = "";
+   record Party("party");
+   file avrk(avrkinds);
+
+   if( ПолучитьСубъекта(PartyID, Party) == 0 )
+      PartyName = Party.Name;
+   end;
+
+   if(TypeError == DL_QINVTYPE_ERROR_1)
+      ErrMsg = PartyName + " не признан квалифицированным инвестором.";
+   elif(TypeError == DL_QINVTYPE_ERROR_2)
+      ClearRecord(avrk);
+      avrk.FI_Kind = FIKIND_AVOIRISS;
+      avrk.AvoirKind = AvoirKind;
+      if(GetEQ(avrk))
+        AvrKindName = avrk.Name;
+      end;
+      ErrMsg = PartyName + " не признан квалифицированным инвестором в отношении вида ц\б " + AvrKindName + ".";
+   end;
+
+   return ErrMsg;
+END;
+
+// Проверить, является ли тип по назначению переданного счета одним из списка
+PRIVATE MACRO CheckTypebyPurpose(DPNodeID)
+  var query, Select, DataSet;
+
+  // Получим тип по назначению для счета переданного узла
+  query = " select dptype.t_Type " +
+          "   from ddepoacnt_dbt dpac, ddepoacnt_dbt root, ddepoac_dbt dptype " +
+          "  where dpac.t_AutoKey = ? /*1*/ " +
+          "    and root.t_AutoKey = dpac.t_Root " +
+          "    and dptype.t_ID = root.t_Type ";
+
+  Select = RSDCommand( query );
+
+  Select.AddParam("DPNodeID", RSDBP_IN, DPNodeID );  /*1*/
+  Select.Execute();
+  DataSet = TRsbDataSet(Select);
+  if(DataSet.moveNext())
+    // Если тип по назначению равен "Доверительного управляющего" или "Счет номинального держателя" или "Счет залогодержателя"
+    if((DataSet.Type == OBJTYPE_DEPOKINDTYPE_ISSUER) OR
+       (DataSet.Type == OBJTYPE_DEPOKINDTYPE_NOMINALKEEPER) OR
+       (DataSet.Type == OBJTYPE_DEPOKINDTYPE_MONEYKEEPER)
+      )
+      return true;
+    end;
+  end;
+  return false;
+END;
+
+// Получить дату регистрации поручения
+PRIVATE MACRO GetRegisterDate(SPGroundID)
+  var query, Select, DataSet;
+
+  // Получим тип по назначению для счета переданного узла
+  query = " select spgr.t_RegistrDate " +
+          "   from dspground_dbt spgr " +
+          "  where spgr.t_SPGroundID  = ? /*1*/ ";
+
+  Select = RSDCommand( query );
+
+  Select.AddParam("SPGroundID", RSDBP_IN, SPGroundID );  /*1*/
+  Select.Execute();
+  DataSet = TRsbDataSet(Select);
+  if(DataSet.moveNext())
+    return date(DataSet.RegistrDate);
+  end;
+  return date(0,0,0);
+END;
+
+//Проверяется корректность выполнения операции с выпусками ц\б, предназначенными только для КИ
+MACRO ДП_ПроверитьПринадлежностьКИ(spdraft, FIID, PartyID, DPNodeID):integer
+
+  file avoiriss(avoiriss);
+  file fin(fininstr);
+  record Party("party");
+  var RetVal = 0;
+  var AttrID;
+  var PartyName = "";
+  var AvrKindName = "";
+  Array Text;
+  Array Button;
+  var but, ind = 0;
+  record r_spdraft( spdraft );
+  var rej_prm;
+  var query, Select, DataSet;
+ 
+  SetBuff( r_spdraft, spdraft );
+
+  if(PartyID == {OurBank}) //наш банк не проверяем
+    return 0;
+  end;
+
+  query = " select count(1) as cnt" +
+          " from dspdrprop_dbt drpr " +
+          " where drpr.t_DraftID = ? /*1*/ ";
+
+  Select = RSDCommand( query );
+
+  Select.AddParam("DraftID", RSDBP_IN, r_spdraft.AutoKey );  /*1*/
+  Select.Execute();
+  DataSet = TRsbDataSet(Select);
+  if((DataSet.moveNext()) and (DataSet.cnt > 0))
+    //Реализуемые проверки должны выполняться только для поручений, которые не импортированы
+    return 0;
+  end;
+
+  if(CheckTypebyPurpose(DPNodeID)) // если тип по назначению относится к перечню - не проверяем
+    return 0;
+  end;
+
+  ClearRecord(fin);
+  ClearRecord(avoiriss);
+  avoiriss.FIID = FIID;
+  fin.FIID = FIID;
+  if((GetEQ(avoiriss)) and (GetEQ(fin)))
+    if( (GetMainObjAttr( null, OBJTYPE_AVOIRISS, UniID(avoiriss, OBJTYPE_AVOIRISS), OBJGROUP_ACCESSORYQI, AttrID)) and (AttrID == OBJATTR_ACCESSORYQI_ONLY/*Только для КИ*/) )
+
+      var ErrMsg:string = "";
+      var Form = DL_QIOper_Panel();
+      var QIOperFormData:DL_QIOperData;
+      var TypeErrorParty = DL_QINVTYPE_ERROR_0;
+
+      if(PartyID > 0)
+        TypeErrorParty = DL_CheckQIParty(PartyID, fin.AvoirKind, GetRegisterDate(r_spdraft.SPGroundID));
+      end;
+
+      if(TypeErrorParty != DL_QINVTYPE_ERROR_0)
+        ErrMsg = СоздатьСообщение(TypeErrorParty, PartyID, fin.AvoirKind);
+      end;
+
+      if(TypeErrorParty != DL_QINVTYPE_ERROR_0)
+        if(IsOprMultiExec() == true)
+          MsgBox( ErrMsg ); /*что бы нормальное сообщение в логе было*/
+          RetVal = 1;
+        else
+          Button(0) = "Регистрировать отказ";
+          Button(1) = "Прервать выполнение";
+          Button(2) = "Продолжить";
+
+          Text(ind) = ErrMsg;
+          but = ConfWin(Text,Button);
+          if( but == 0 )
+            RetVal = GetRejectNoteDR(spdraft, DP_SPDRAFT_OPERATION, ErrMsg, rej_prm);
+            if(RetVal == DP_REJECTDRAFT_OK)
+              if( SetGlobalParameter(DPRejectParm, rej_prm) )
+                if( not Opr_InsertBranch("R", OPRBR_REMOVE) ) /*вставляемая цепочка заменяет неисполненные шаги*/
+                  msgbox("Ошибка при вставке цепочки");
+                  RetVal = 1;
+                end;
+              else
+                msgbox("Ошибка записи дополнительных параметров");
+                RetVal = 1;
+              end;
+            elif(RetVal == DP_REJECTDRAFT_BTRERR)
+              msgbox("Ошибка менеджера записей!");
+            elif(RetVal == DP_REJECTDRAFT_WRONG_PARAMS)
+              msgbox( "Функции формирования отказа обработки поручения переданы неверные параметры" );
+            elif(RetVal == DP_REJECTDRAFT_ESC)
+        /*       msgbox("Прерывание пользователя");*/
+               ;
+            end;
+          elif( but == 1 )
+            RetVal = 1;
+          elif(but == 2)
+            if(Form.Run())
+              QIOperFormData = Form.ReturnFormFields();
+              addNoteForObject( OBJTYPE_DEPODRAFT, r_spdraft.AutoKey, 4,
+                                DP_IIF(QIOperFormData.Reason != "Иное", QIOperFormData.Reason, QIOperFormData.OtherReason), r_spdraft.Date );
+            else
+              RetVal = 1;
+            end;
+          end;
+        end;
+      end;
+    end;
+  end;
+
+  return RetVal;
+END;
+
+//Выполнить подтверждение инвентарной операции
+MACRO ExecConfirmSpdraft(r_spdraft, paym, valdate)
+  var pmobj;
+  Array Text;
+  Array Button;
+  var but, ind = 0;
+  var FactValueDate, FirstDate;
+  var err = 0;
+
+  if((valdate == NULL) OR (valdate == date(0,0,0)))
+    FactValueDate = {curdate};
+    if( not getdate(FactValueDate, "Укажите фактическую дату валютирования") )
+      err = DEPOS_ERROR_FIRST;
+    else
+      if(FactValueDate != paym.ValueDate)
+
+        Text(ind) = "Плановая дата валютирования не совпадает с фактической";
+        Button(0) = "Провести плановой";
+        Button(1) = "Провести фактической";
+        Button(2) = "Прервать выполнение";
+
+        but = ConfWin(Text,Button);
+        if( but == 0 )
+          FactValueDate = paym.ValueDate;
+        elif( but == 1 )
+          pmobj = RsbPayment( paym.PaymentID );
+          pmobj.ValueDate = FactValueDate;
+        elif( but == 2 )
+          err = DEPOS_ERROR_FIRST;
+        end;
+      end;
+    end;
+  else
+    FactValueDate = valdate;
+  end;
+
+  if(not err)
+    GetOprDate( DATE_FIRST, FirstDate );
+    if(FactValueDate > FirstDate)
+      DefineOprDate( DATE_VALUE, FactValueDate );
+    else
+      DefineOprDate( DATE_VALUE, FirstDate );
+    end;
+  end;
+
+  return err;
+END;
+
+//проверить полномочие субъекта на узле счета на указанную дату по ц/б
+MACRO ПроверитьПолномочиеПоУзлу(AcntID:integer,   //ID узла счета депо
+                                PartyID:integer,  //ID проверяемого субъекта
+                                AuthKind:integer, //Проверяемое полномочие
+                                FIID:integer,     //ID ц/б
+                                CheckDate:date,   //Дата проверки
+                                Product:integer,  //Содержание транзакции
+                                ErrStr:@string
+                               )
+
+  var query, cmd, cmd1, acap;
+  var acnt = TBFile("depoacnt.dbt");
+  var pt = TBFile("party.dbt");
+  var fin = TBFile("fininstr.dbt");
+  var llv = TBFile("llvalues.dbt");
+  var can = true;
+  var FromDate, ToDate;
+
+  ErrStr = "";
+
+  acnt.Clear();
+  acnt.rec.AutoKey = AcntID;
+  if(not acnt.GetEQ())
+    ErrStr = "Проверка полномочий. Счет депо с ID = " + AcntID + " не найден";
+    return can;
+  end;
+
+  if(acnt.rec.Kind == SIDEBALANCE_ACTIVE)
+    return can;
+  end;
+
+  if(acnt.rec.Owner == PartyID)
+    return can;
+  end;
+
+  pt.Clear();
+  pt.rec.PartyID = PartyID;
+  if(not pt.GetEQ())
+    ErrStr = "Проверка полномочий. Субъект с ID = " + PartyID + " не найден";
+    return can;
+  end;
+
+  fin.Clear();
+  fin.rec.FIID = FIID;
+  if(not fin.GetEQ())
+    ErrStr = "Проверка полномочий. Ценная бумага с ID = " + FIID + " не найдена";
+    return can;
+  end;
+
+  llv.Clear();
+  llv.rec.List = OBJTYPE_DEPOAUTHORITY;
+  llv.rec.Element = AuthKind;
+  if(not llv.GetEQ())
+    ErrStr = "Проверка полномочий. Запись с номером = " + AuthKind + " не найдена в справочнике полномочий " + string(OBJTYPE_DEPOAUTHORITY);
+    return can;
+  end;
+
+  if(Product > 0)
+    //Если инициатором является наш банк (текущий филиал либо любое вышестоящее подразделение для многофилиального банка)
+    //и указанный в поручении вид транзакции входит в классификатор <Не проверять полномочия нашего банка как УЛ>, то проверки полномочий не выполняются
+    query =   " select (case when (select count(1) "
+            + "                      from dllclsval_dbt cls "
+            + "                     where cls.t_Classificator = "+LLCLASS_NOCHECKOURBANK_ACAP
+            + "                       and cls.t_Element = ?) > 0 then 1 else 0 end) NoCheck "
+            + "   from ddp_dep_dbt dp "
+            + "  where dp.t_PartyID = ? "
+            + "    and (dp.t_Code = ? or dp.t_Code IN (select dp2.t_Code "
+            + "                                          from ddp_dep_dbt dp2 "
+            + "                                        start with dp2.t_Code = ? "
+            + "                                        connect by PRIOR dp2.t_ParentCode = dp2.t_Code)) ";
+
+    cmd = DL_RSDCommand(query);
+    cmd.AddParam(Product);
+    cmd.AddParam(PartyID);
+    cmd.AddParam({OperDprt});
+    cmd.AddParam({OperDprt});
+
+    var DataSet = cmd.Execute();
+    if((DataSet.moveNext()) and (DataSet.NoCheck == 1))
+      return can;
+    end;
+  end;
+
+  query =   " select acap.*, "
+          + "        NVL((select 1 "
+          + "               from ddpacapau_dbt acapau "
+          + "              where acapau.t_APID = acap.t_APID "
+          + "                and acapau.t_AuthKind = ? /*1*/"
+          + "                and acapau.t_AUNodeID IN (select acnt.t_AutoKey "
+          + "                                            from ddepoacnt_dbt acnt "
+          + "                                           start with acnt.t_AutoKey = ? /*2*/ "
+          + "                                           connect by acnt.t_AutoKey = prior acnt.t_Superior "
+          + "                                         ) "
+          + "                and ROWNUM = 1 "
+          + "            ), 0 ) as ExistAuthKind, "
+          + "        NVL((select 1 "
+          + "               from ddpacapfi_dbt acapfi "
+          + "              where acapfi.t_APID = acap.t_APID "
+          + "                and (   acapfi.t_FIID = ? /*3*/"
+          + "                     or (RSB_FIInstr.FI_AvrKindsEQ("+FIKIND_AVOIRISS+", acapfi.t_AvoirKind, ? /*4*/) = 1 and acapfi.t_Issuer = ? /*5*/ and acapfi.t_FIID = -1)"
+          + "                     or (acapfi.t_AvoirKind = 0 and acapfi.t_Issuer = ? /*6*/ and acapfi.t_FIID = -1) "
+          + "                     or (RSB_FIInstr.FI_AvrKindsEQ("+FIKIND_AVOIRISS+", acapfi.t_AvoirKind, ? /*7*/) = 1 and acapfi.t_Issuer = -1 and acapfi.t_FIID = -1)"
+          + "                    ) "
+          + "                and ROWNUM = 1"
+          + "            ), 0 ) as ExistFI "
+          + "   from ddpacap_dbt acap "
+          + "  where acap.t_APNodeID = ? /*8*/"
+          + "    and acap.t_APartyID = ? /*9*/"
+          + "  order by acap.t_FromDate asc";
+
+  cmd = DL_RSDCommand(query);
+  cmd.AddParam(AuthKind);             /*1*/
+  cmd.AddParam(AcntID);               /*2*/
+  cmd.AddParam(FIID);                 /*3*/
+  cmd.AddParam(fin.rec.AvoirKind);    /*4*/
+  cmd.AddParam(fin.rec.Issuer);       /*5*/
+  cmd.AddParam(fin.rec.Issuer);       /*6*/
+  cmd.AddParam(fin.rec.AvoirKind);    /*7*/
+  cmd.AddParam(acnt.rec.Root);        /*8*/
+  cmd.AddParam(PartyID);              /*9*/
+  acap = cmd.Execute();
+  while(acap.moveNext()) //если нужного УЛ нет вообще, то ничего не проверяем
+    FromDate = date(acap.FromDate);
+    ToDate = date(acap.ToDate);
+    //1. Подбираем УЛ, действующего на проверяемую дату
+    if((CheckDate < FromDate) or ((ToDate != date(0,0,0)) and (CheckDate > ToDate)))
+      can = false;
+      ErrStr = "Субъект "+pt.rec.ShortName+" не является уполномоченным лицом на узле депо "+acnt.rec.BriefCode+" на дату "+string(CheckDate:f);
+    else
+      //2. Проверяем наличие полномочия
+      if(acap.ExistAuthKind == 0)
+        can = false;
+        ErrStr = "Для субъекта "+pt.rec.ShortName+" полномочие "+llv.rec.Name+" на узле депо "+acnt.rec.BriefCode+" не определено";
+      else
+        //3. Проверить возможность осуществления действий по ц/б
+        if((acap.IsAllFI == UNSET_CHAR) and (acap.ExistFI == 0))
+          can = false;
+          ErrStr = "Для субъекта "+pt.rec.ShortName+" не разрешена работа с ц/б "+fin.rec.FI_Code;
+        else
+          can = true;
+          ErrStr = "";
+          break;
+        end;
+      end;
+    end;
+  end;
+
+  return can;
+END;
+
+//добавить всех залогодержателей в качестве получателей отчета от исполнении
+macro DP_AddAllMortgageeToGrRep(AcntID:integer, spdraft)
+  var query, cmd, DataSet;
+  record r_spdraft( spdraft );
+  var RegistrDate = date(0,0,0);
+  var err = 0;
+
+  SetBuff( r_spdraft, spdraft );
+
+  RegistrDate = GetRegisterDate(r_spdraft.SPGroundID);
+
+  query =   " select distinct acap.t_APartyID "
+          + "   from ddepoacnt_dbt part, ddpacap_dbt acap, ddpacapau_dbt acapau "
+          + "  where part.t_AutoKey = ? "
+          + "    and acap.t_ApNodeID = part.t_Root "
+          + "    and acap.t_APartyID <> ? "
+          + "    and acap.t_APartyID NOT IN (select grrep.t_Recipient "
+          + "                                  from ddpgrrep_dbt grrep "
+          + "                                 where grrep.t_SourceDocKind = ? "
+          + "                                   and grrep.t_SourceDocID = ?)"
+          + "    and acap.t_Role = " + DEPOACAPROLE_MORTGAGEE + " "
+          + "    and acap.t_FromDate <= ? "
+          + "    and (acap.t_ToDate >= ? "
+          + "      or acap.t_ToDate = " + GetSQLDate(ZeroDate) + ") "
+          + "    and acapau.t_APID = acap.t_APID "
+          + "    and acapau.t_AuNodeID = part.t_AutoKey "
+          + "    and acapau.t_AuthKind = " + OBJTYPE_DEPOAUTHORITY_GETINFO + " ";
+
+  cmd = DL_RSDCommand(query);
+
+  cmd.addParam(AcntID);
+  cmd.addParam(r_spdraft.Initiator);
+  cmd.addParam(r_spdraft.Kind);
+  cmd.addParam(r_spdraft.AutoKey);
+  cmd.addParam(RegistrDate);
+  cmd.addParam(RegistrDate);
+
+  DataSet = cmd.Execute();
+  while((err == 0) and DataSet.moveNext())
+    err = DP_AddDPGRREP(r_spdraft.SPGroundID, DataSet.APartyID, r_spdraft.Kind, r_spdraft.AutoKey, CodeFor("E"), false);
+  end;
+
+  return err;
+end;
+
+macro RegExtGroundToGrRep(spdraft)
+  record r_spdraft( spdraft );
+  var cmd;
+  var err = 0;
+
+  SetBuff( r_spdraft, spdraft );
+
+  cmd = DL_RSDCommand(  " select t_ID "
+                      + "   from ddpgrrep_dbt "
+                      + "  where t_SourceDocKind = ? "
+                      + "    and t_SourceDocID = ? "
+                     );
+
+  cmd.AddParam(r_spdraft.Kind);
+  cmd.AddParam(r_spdraft.AutoKey);
+
+  var dpgrrep = cmd.Execute(); 
+
+  while((not err) and (dpgrrep.moveNext()))
+
+    //для каждого получателя отчета формировать исходящий документ
+    if(DP_RegExtGroundToGrRep(dpgrrep.ID))
+      DPError.SetErr("Ошибка вставки исходящего документа для получателя отчета");
+      err = 1;
+    end;
+  end;
+
+  return err;
+end;
+
+macro RegAllExtGroundToGrRep(spdraft)
+  var err = 0;
+  record r_spdraft( spdraft );
+
+  SetBuff( r_spdraft, spdraft );
+
+  if(DP_RegAllExtGroundToGrRep(r_spdraft.AutoKey))
+    DPError.SetErr("Ошибка вставки исходящего документа для получателя отчета");
+    err = 1;
+  end;
+
+  return err;
+end;
+

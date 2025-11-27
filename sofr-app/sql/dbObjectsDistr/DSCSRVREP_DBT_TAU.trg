@@ -1,0 +1,13 @@
+CREATE OR REPLACE TRIGGER DSCSRVREP_DBT_TAU 
+  AFTER UPDATE ON DSCSRVREP_DBT FOR EACH ROW
+DECLARE
+BEGIN
+   if( :new.T_REPSTATUS = 0 and :old.T_REPSTATUS != 0 )then
+
+      delete from DDL_LOG_DBT
+       where T_DOCKIND = :new.T_DOCKIND
+         and T_DOCID = :new.T_ID;
+
+   end if;
+END DSCSRVREP_DBT_TAU;
+/

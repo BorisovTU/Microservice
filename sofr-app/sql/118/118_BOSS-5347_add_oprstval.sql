@@ -1,0 +1,6 @@
+/*Добавить значение статуса*/
+BEGIN
+   INSERT INTO DOPRSTVAL_DBT(T_STATUSKINDID,T_NUMVALUE,T_NAME,T_ELIMINATED)
+   VALUES(46052,12,'Пересчет НДР35',CHR(0));
+END;
+/

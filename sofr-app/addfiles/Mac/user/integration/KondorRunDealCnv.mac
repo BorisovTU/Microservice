@@ -1,0 +1,627 @@
+import rsd;
+import "ws_msg_transform_sec.mac";
+import DVInter, "dlcnst.inc";
+import bnk_common;
+import "secinter.mac";
+import "cblogger2.mac";
+import "StorageInfo.mac";
+import "logger.mac";
+import "txttable.mac";
+import rsberror, KondorObjects;
+import "dvnop_imports.mac";
+
+const KONDORDEAL_STATUS_OPERATION_NOT_EXECUTED = 4256;
+const KONDORDEAL_TASKID = 1005;                    // Конвейер "Исполнение сделок Кондор"
+const KONDORDEAL_CONVEYERID = 1005;
+const KONDORDEAL_OPERATIONID = 1005;
+
+const OPENDVNDEAL_TASKID = 1006;                   // Конвейер "Исполнение открытых внебиржевых сделок"
+const OPENDVNDEAL_CONVEYERID = 1006;
+const OPENDVNDEAL_OPERATIONID = 1006;
+
+private const INSERTALL_ROWS_LIMIT = 100;
+private const KONDORDEAL_LOGID = "ExecKondorDealsCnv";
+
+/**
+@brief Класс параметров для передачи в конвейер
+*/
+class KondorDealsCnvParams()
+  var conveyerID: Integer = 0;
+end;
+
+/**
+@brief Функция получения запроса для выборки сделок для исполнения в автоматическом режиме
+@return String Запрос в текстовом виде
+*/
+macro KondorDealsGetQuery(): String
+  var sql_str;
+  var hour, min, sec;
+   
+  TimeSplit(Time(), hour, min, sec);
+
+  sql_str =  
+      "select * from ddvndeal_dbt d where d.t_state = 0 and d.t_kind != 12730 "+ // DEF-70262 исключены сделки с типом операции 12730
+      " and exists (select 1 from dobjatcor_dbt cat "+
+      "     where cat.t_objecttype = decode(d.t_dockind,199, 145, 148) and t_groupid = 102 and t_attrid = 1 ) "+
+      " and (  (d.t_contractor = :nkc and d.t_sector = 'X' and d.t_marketkind = 2) "+
+      "     or  "+
+      "    (upper(d.t_comment) like '%NTPRO%')       "+
+      "     or "+
+      "    (exists  (select 1 from dobjatcor_dbt cat  "+
+      "               where cat.t_object = lpad(d.t_id,34,'0') "+
+      "                 and cat.t_objecttype = decode(d.t_dockind,199, 145, 148) "+
+      "                 and t_groupid = decode(d.t_dockind,199, :groupid_145, :groupid_148)  "+
+      "                 and (t_attrid =  decode(d.t_dockind,199, :attrid_145, :attrid_148) or t_attrid =  decode(d.t_dockind,199, :attrid_145_D2, :attrid_148_D2))   )) "+
+      " ) and not exists (select 1 from dsfcontr_dbt t where t.t_id = d.t_clientcontr and t.t_servkind = 21) "; // Сделки по валютной брокерке не трогать bpv
+
+  if (hour < 10) // Чтобы ранние сделки (заключенные от 0 часов до 10 утра)  не переходили в Открытые, а Оставались в Отложенных до 10 утра PNV 534714
+    sql_str = sql_str + "and t_time >= to_date ('01.01.0001 10:00:00', 'DD.MM.YYYY HH24:MI:SS') ";
+  end;   
+
+  // Включили в выборку открытые сделки, проведение которых пока невозможно из-за преждевремменного исполнения шага. 2020-03-26 Cherednichenko
+  sql_str = sql_str +
+      " union " +
+      " select d.* " +
+      " from ddvndeal_dbt d, doprstep_dbt step, doproper_dbt op " +
+      " where d.t_state = 1 and d.t_kind != 12730 " +
+      "    and op.t_documentid = lpad(d.t_id, 34, 0) " +
+      "    and step.t_id_operation = op.t_id_operation " +
+      "    and step.t_kind_operation = d.t_kind "+
+      "    and not exists " +
+      "        (select * " +
+      "            from doprstep_dbt stp " +
+      "            where stp.t_id_operation = op.t_id_operation " +
+      "            and stp.t_kind_operation = d.t_kind " +
+      "            and (stp.t_isexecute = 'X' or stp.t_isexecute = 'W' or stp.t_isexecute = CHR(0))) ";
+
+    // Добавлены открытые сделки у которых по каким-то причинам не выполнена постановка на внебаланс которая всегда должна быть в дату заключения PNV i-support 534036
+  sql_str = sql_str +
+     " union " +
+     " select d.*  " +
+     "  from ddvndeal_dbt d, doprstep_dbt step, doproper_dbt op, DOPROSTEP_DBT st " +
+     "  where d.t_state = 1 and d.t_kind != 12730 " +
+     "     and op.t_documentid = lpad(d.t_id, 34, 0) " +
+     "     and step.t_id_operation = op.t_id_operation " +
+     "     and step.t_kind_operation = d.t_kind " +
+     "     and d.T_PERIODCLS > 0 " +
+     "     and d.T_CLIENT = -1 " +
+     "     and step.T_PLAN_DATE = d.T_DATE " +
+     "     and step.t_isexecute = 'R' " +
+     "     and st.T_BLOCKID = step.T_BLOCKID  " +
+     "     and st.T_NUMBER_STEP = step.T_NUMBER_STEP " +
+     "     and st.T_NAME in( 'Постановка на внебаланс', 'Признание ПФИ') " ;
+  
+  return sql_str;
+end;
+
+/**
+@brief Процедура заполнения параметров в RSDCommand для запроса из KondorDealsGetQuery
+@param[in] cmd Объект RSDCommand
+*/
+macro KondorDealsAddParams(cmd: RSDCommand)
+  var ID_NKC = 1181;
+  var groupid_145 = 3, groupid_148 = 5, attrid_145 = 3,    attrid_148 = 3;
+                                    var attrid_145_D2 = 5, attrid_148_D2 = 5;
+
+  cmd.AddParam("nkc", RSDBP_IN, ID_NKC);
+  cmd.AddParam("groupid_145", RSDBP_IN, groupid_145);
+  cmd.AddParam("groupid_148", RSDBP_IN, groupid_148);
+  cmd.AddParam("attrid_145", RSDBP_IN, attrid_145);
+  cmd.AddParam("attrid_148", RSDBP_IN, attrid_148);
+  cmd.AddParam("attrid_145_D2", RSDBP_IN, attrid_145_D2);
+  cmd.AddParam("attrid_148_D2", RSDBP_IN, attrid_148_D2);
+end;
+
+/**
+@brief Проверить сделку на возможность исполнения
+@param[in] DealID ID сделки
+@param[in] DocKind Тип сделки
+@return true в случае, если сделку можно исполнить
+*/
+private macro CheckKondorDealRunConditions(DealID, DocKind): Bool
+  var IsAttr_RSHB_Dealing: Bool;
+  var ObjCat;
+  
+  macro CheckErrPINotes(DealID)
+    var typeObj;
+    var Note_303 = "";
+    Var Note_304 = "";
+
+    var v_sql = ("select t_dockind from ddvndeal_dbt where t_id =  ?");
+    var v_cmd = RSDCommand(v_sql);
+        v_cmd.AddParam("ID", rsdbp_in, DealID);
+    var v_rs = RSDRecordset(v_cmd, rsdval_client, rsdval_static);
+
+    if (v_rs.moveNext())
+      if(v_rs.value("t_dockind") == 199)
+        TypeObj = 145;
+      else
+        TypeObj = 148;
+      end;
+    end;
+
+    Note_303 = ReadNoteForObject(TypeObj,string(DealID:o:34),303 );
+    Note_304 = ReadNoteForObject(TypeObj,string(DealID:o:34),304 );
+
+    if ((Note_303 == "") and (Note_304 == ""))
+      return True;
+    end;
+    return False;
+  end;
+  
+  private macro IsSetIdentPI(DealID)
+    var sql, cmd, rs;
+    sql = String( 
+               "select paym.t_paymentid from ddvndeal_dbt dvndeal, dpmpaym_dbt paym, dpmprop_dbt pmprop, dcorschem_dbt corsch   \n"
+              ,"where dvndeal.t_id = :DealID   \n"
+              ,"  and paym.t_dockind = dvndeal.t_dockind   \n"
+              ,"  and paym.t_documentid = dvndeal.t_id   \n"
+              ,"  and pmprop.t_paymentid = paym.t_paymentid   \n"
+              ,"  and corsch.t_number = pmprop.t_corschem   \n"
+              ,"  and pmprop.t_issender = chr(88)   \n"
+              ,"  and pmprop.t_spi_ident != chr(1)   \n");
+    cmd = RSDCommand(sql);
+    cmd.AddParam("DealID", rsdbp_in, DealID);
+    rs = RSDRecordset(cmd, rsdval_client, rsdval_static);
+    if (rs.movenext())
+      return 1;
+    end;
+    return 0;
+  end;
+  
+  IsAttr_RSHB_Dealing = False;
+  
+  if (DocKind == 199)
+    ObjCat = RsbObjCategories(145, String(DealID:o:34));
+    IsAttr_RSHB_Dealing = ObjCat.IsAttrPresense(3, 5, null, null, null, {curdate});
+  else
+    ObjCat = RsbObjCategories(148, String(DealID:o:34));
+    IsAttr_RSHB_Dealing = ObjCat.IsAttrPresense(5, 5, null, null, null, {curdate});
+  end;
+  
+  return ((not IsAttr_RSHB_Dealing) or 
+          ((IsAttr_RSHB_Dealing) and (IsSetIdentPI(DealID)) and (CheckErrPINotes(DealID))));
+end;
+
+/**
+@brief Функция исполнения одной сделки
+@param[in] dealID ID сделки
+@param[in] docKind Тип сделки
+@param[in] isCheckEnable Признак необходимости выполнения проверки CheckKondorDealRunConditions
+@param[out] errMessage Текст ошибки
+@return V_Integer Код ошибки
+*/
+macro ExecOneKondorDeal(dealID: Integer, docKind: Integer, isCheckEnable: Bool, errMessage: @String): Integer
+  var stat: Integer = 0;
+  
+  errMessage = "";
+  
+  if (isCheckEnable and (CheckKondorDealRunConditions(dealID, docKind) == false))
+    stat = KONDORDEAL_STATUS_OPERATION_NOT_EXECUTED; // Операция не выполнена
+  end;
+  
+  if (stat == 0)
+    stat = DV_ExecDeal(dealID, false);
+  end;
+  
+  if (stat != 0)
+    errMessage = GetErrMsg();
+    
+    if (StrLen(errMessage) == 0)
+      errMessage = GetErrMsgEx(stat, "Описание кода ошибки не найдено");
+    end;
+  end;
+  
+  return stat;
+  
+OnError(err)
+  stat = err.Code;
+  errMessage = GetFullErrMsg(err);
+  
+  return stat;
+end;
+
+/**
+@brief Функция отбора сделок и распределение по пачкам для выполения в конвейере
+@param[in] _taskID ID задачи
+@param[in] _execID ID запуска
+@param[in] _conveyerID ID конвейера
+@param[in] _packetSize Размер пачки для обработки
+@param[in] _Params Объект с параметрами
+@return Количество пачек для исполнения
+*/
+macro SelectKondorDealsCnv(_taskID: Integer, _execID: Integer, _conveyerID: Integer, _packetSize: Integer, _Params): Integer
+  if (_packetSize == 0)
+    _packetSize = 1000;
+  end;
+
+  // Вставим сделки для обработки
+  // для OPENDVNDEAL_CONVEYERID пачки сформированы в SelectKondorDealsCnvByDealsInfoArray
+  if (_Params.conveyerID == KONDORDEAL_CONVEYERID)
+    var query = "INSERT INTO dCnvDoc_dbt (t_taskID, t_execID, t_convTypeID, t_packID, t_objectType, t_objectID) " +
+                "SELECT :taskID, :execID, :conveyerID, CEIL(ROWNUM/:packetSize), q.t_docKind, q.t_id " +
+                "FROM (" + KondorDealsGetQuery() + ") q";
+                            
+    var insertDealsCmd = RSDCommand(query);
+  
+    insertDealsCmd.AddParam("taskID", RSDBP_IN, _taskID);
+    insertDealsCmd.AddParam("execID", RSDBP_IN, _execID);
+    insertDealsCmd.AddParam("conveyerID", RSDBP_IN, _conveyerID);
+    insertDealsCmd.AddParam("packetSize", RSDBP_IN, _packetSize);
+    
+    KondorDealsAddParams(insertDealsCmd);
+    
+    insertDealsCmd.Execute();
+    insertDealsCmd.Close();
+  end;
+  
+  // Вернем количество пачек
+  var cnt: Integer = 0;
+
+  var dataSet = TRsbDataSet("SELECT NVL(MAX(t_PackID), 0) as cnt " +
+                              "FROM dCnvDoc_dbt " +
+                             "WHERE t_ExecID = " + _execID);
+  if (dataSet.MoveNext())
+    cnt = SQL_ConvTypeInteger(dataSet.cnt);
+  end;
+  
+  return cnt;
+end;
+
+/**
+@brief Функция распределения по пачкам сделок переданных в массиве dealsInfoArray для выполения в конвейере
+@param[in] _taskID ID задачи
+@param[in] _execID ID запуска
+@param[in] _conveyerID ID конвейера
+@param[in] _packetSize Размер пачки для обработки
+@param[in] dealsInfoArray TArray с информацие о сделках
+@return Количество пачек для исполнения
+
+Информация в dealsInfoArray приходит в виде: [ID сделки 1, Тип сделки 1, ID сделки 2, Тип сделки 2, ... и т.д.]
+*/
+private macro SelectKondorDealsCnvByDealsInfoArray(_taskID: Integer, _execID: Integer, _conveyerID: Integer, _packetSize: Integer, dealsInfoArray: TArray)
+  if (_packetSize == 0)
+    _packetSize = 1000;
+  end;
+  
+  var i: Integer = 0;
+  var isNeedProcessing: Bool = (i < dealsInfoArray.size);
+  var insertAllRowsCount: Integer = 0;
+  var totalRowsCount: Integer = 0;
+  var insertQuery: String = "";
+  
+  while (isNeedProcessing)
+    insertQuery = insertQuery + "INTO dCnvDoc_dbt (t_taskID, t_execID, t_convTypeID, t_packID, t_objectType, t_objectID) " +
+                                          "VALUES (" + _taskID + ", " + _execID + ", " +
+                                                       _conveyerID + ", " + (totalRowsCount/_packetSize + 1) + ", " + 
+                                                       dealsInfoArray.Value(i + 1) + ", " + dealsInfoArray.Value(i) + ") ";
+    
+    totalRowsCount = totalRowsCount + 1;
+    insertAllRowsCount = insertAllRowsCount + 1;
+    i = i + 2;
+    if (i >= dealsInfoArray.size)
+      isNeedProcessing = false;
+    end;
+
+    if (((not isNeedProcessing) or (insertAllRowsCount >= INSERTALL_ROWS_LIMIT)) and (insertAllRowsCount > 0))
+      insertQuery = "INSERT ALL " + insertQuery + " SELECT 1 FROM DUAL";
+      var insertAllCmd = RSDCommand(insertQuery);
+      insertAllCmd.Execute();
+      insertAllCmd.Close();
+
+      insertAllRowsCount = 0;
+      insertQuery = "";
+    end;
+  end;
+end;
+
+/**
+@brief Процедура обновления статуса пачки сделок во время конвейерной обработки
+@param[in] _execID ID запуска
+@param[in] _convTypeID ID типа конвейера
+@param[in] _packID ID пачки документов, для которой устанавливается статус
+@param[in] _errCode Код ошибки обработки пачки
+@param[in] _errMsg Сообщение об ошибке
+*/
+private macro ChangeCnvPackStatus(_execID: Integer, _convTypeID: Integer, _packID: Integer, _errCode: Integer, _errMsg: String)
+  var query = "UPDATE dcnvpack_dbt " +
+                 "SET t_State = t_State + 1, " +
+                     "t_Error = :errCode, " +
+                     "t_ErrMsg = :errMsg " +
+               "WHERE t_ExecID = :execID " +
+                 "AND t_ConvTypeID = :convTypeID " +
+                 "AND t_PackID = :packID ";
+  var cmd = RSDCommand(query);
+  
+  cmd.AddParam("errCode", RSDBP_IN, _errCode);
+  cmd.AddParam("errMsg", RSDBP_IN, _errMsg);
+  cmd.AddParam("execID", RSDBP_IN, _execID);
+  cmd.AddParam("convTypeID", RSDBP_IN, _convTypeID);
+  cmd.AddParam("packID", RSDBP_IN, _packID);
+  
+  cmd.Execute();
+  cmd.Close();
+end;
+
+/**
+@brief Функция исполнения пачки сделок в конвейерной обработке
+@param[in] _taskID ID задачи
+@param[in] _execID ID запуска
+@param[in] _conveyerID ID конвейера
+@param[in] _operationID ID операции
+@param[in] _packetID ID пачки документов для обработки
+@param[in] _Params Объект с параметрами
+@return Код первой ошибки
+*/
+macro ExecKondorDealsCnvOld(_taskID: Integer, _execID: Integer, _conveyerID: Integer, _operationID: Integer, _packetID: Integer, _Params)
+  const MAX_ERROR_LENGTH = 2000;
+  
+  var statTotal: Integer = 0;
+  var errMessageTotal: String = "";
+  var stat: Integer = 0;
+  var errMessage: String = "";
+  var itLog = NewLogger(c_logger.IT_LOG_TYPE, KONDORDEAL_LOGID + "(" + _execID + ")");
+  var isRunConditionCheckEnable: Bool = (_Params.conveyerID == KONDORDEAL_CONVEYERID); // При запуске конвейера из ФИССиКО-Сделки-Открытые (OPENDVNDEAL_CONVEYERID) проверка сделки отключена
+
+  var query = "SELECT cnvDoc.t_ObjectID as t_ID, cnvDoc.t_objectType as t_docKind, " +
+                     "NVL(ndeal.t_code, '<сделка не найдена>') t_code " +
+                "FROM dCnvDoc_dbt cnvDoc " +
+                "LEFT JOIN dDvNdeal_dbt ndeal ON cnvDoc.t_objectID = ndeal.t_ID " +
+               "WHERE cnvDoc.t_ExecID = :execID " +
+                 "AND cnvDoc.t_ConvTypeID = :convID " +
+                 "AND cnvDoc.t_PackID = :packID";
+  var dealsInfoCmd = RSDCommand(query);
+  
+  dealsInfoCmd.AddParam("execID", RSDBP_IN, _execID);
+  dealsInfoCmd.AddParam("convID", RSDBP_IN, _conveyerID);
+  dealsInfoCmd.AddParam("packID", RSDBP_IN, _packetID);
+  
+  var dataSet = RSDRecordSet(dealsInfoCmd);
+
+  while (dataSet.MoveNext())
+    stat = ExecOneKondorDeal(dataSet.Value("t_ID"), dataSet.Value("t_docKind"), isRunConditionCheckEnable, @errMessage);
+    
+    if (stat != 0)
+      itLog.Error(dataSet.Value("t_code") + "||" + dataSet.Value("t_ID") + "||" + stat + "||" + errMessage);
+      
+      if (statTotal == 0)
+        statTotal = stat;
+      end;
+      
+      if (StrLen(errMessageTotal) < MAX_ERROR_LENGTH)
+        errMessageTotal = errMessageTotal + "\n" + String(dataSet.Value("t_ID")) + ", " + String(stat);
+      end;
+    end;
+  end;
+  
+  if (StrLen(errMessageTotal) > 0)
+    errMessageTotal = "ID сделки, Ошибка" + errMessageTotal;
+    
+    if (StrLen(errMessageTotal > MAX_ERROR_LENGTH))
+      errMessageTotal = SubStr(errMessageTotal, 1, MAX_ERROR_LENGTH - 3) + "...";
+    end;
+  end;
+  
+  ChangeCnvPackStatus(_execID, _conveyerID, _packetID, statTotal, errMessageTotal);
+  
+  return statTotal;
+end;
+
+/**
+@brief Функция исполнения пачки сделок в конвейерной обработке
+@param[in] _taskID ID задачи
+@param[in] _execID ID запуска
+@param[in] _conveyerID ID конвейера
+@param[in] _operationID ID операции
+@param[in] _packetID ID пачки документов для обработки
+@param[in] _Params Объект с параметрами
+@return Код первой ошибки
+*/
+macro ExecKondorDealsCnv(_taskID: Integer, _execID: Integer, _conveyerID: Integer, _operationID: Integer, _packetID: Integer, _Params)
+  var profObj = StartStopProfiling(true);
+  const MAX_ERROR_LENGTH = 2000;
+  
+  var statTotal: Integer = 0;
+  var errMessageTotal: String = "";
+  var stat: Integer = 0;
+  var itLog = NewLogger(c_logger.IT_LOG_TYPE, KONDORDEAL_LOGID + "(" + _execID + ")");
+  var isRunConditionCheckEnable: Bool = (_Params.conveyerID == KONDORDEAL_CONVEYERID); // При запуске конвейера из ФИССиКО-Сделки-Открытые (OPENDVNDEAL_CONVEYERID) проверка сделки отключена
+
+  var query = "SELECT cnvDoc.t_ObjectID as t_ID, cnvDoc.t_objectType as t_docKind, " +
+                     "NVL(ndeal.t_code, '<сделка не найдена>') t_code " +
+                "FROM dCnvDoc_dbt cnvDoc " +
+                "LEFT JOIN dDvNdeal_dbt ndeal ON cnvDoc.t_objectID = ndeal.t_ID " +
+               "WHERE cnvDoc.t_ExecID = :execID " +
+                 "AND cnvDoc.t_ConvTypeID = :convID " +
+                 "AND cnvDoc.t_PackID = :packID";
+  var dealsInfoCmd = RSDCommand(query);
+  
+  dealsInfoCmd.AddParam("execID", RSDBP_IN, _execID);
+  dealsInfoCmd.AddParam("convID", RSDBP_IN, _conveyerID);
+  dealsInfoCmd.AddParam("packID", RSDBP_IN, _packetID);
+  
+  var dataSet = RSDRecordSet(dealsInfoCmd);
+
+  var prepArray = TArray();
+  
+  var dealList = TArray();
+  while (dataSet.MoveNext())
+    var dlId = Int(dataSet.Value("t_ID"));
+    var dlKnd = Int(dataSet.Value("t_docKind"));
+    if (isRunConditionCheckEnable and (CheckKondorDealRunConditions(dlId, dlKnd) == false))
+      prepArray[prepArray.size] = MakeExecDealAnswer(dlId,KONDORDEAL_STATUS_OPERATION_NOT_EXECUTED,"Операция не выполнена");
+    else
+      dealList[dealList.size] = dlId;
+    end;
+  end;
+
+  var resultArray = joinArrays(prepArray, DV_NewExecDealForCnv(dealList,"Описание кода ошибки не найдено"));
+  var curErrObj = null;
+  for (curErrObj, resultArray)
+    if (curErrObj.stat != 0)
+      itLog.Error(curErrObj.dealid + "||" + curErrObj.stat + "||" + curErrObj.msg);
+      
+      if (statTotal == 0)
+        statTotal = curErrObj.stat;
+      end;
+      
+      if (StrLen(errMessageTotal) < MAX_ERROR_LENGTH)
+        errMessageTotal = errMessageTotal + "\n" + String(curErrObj.dealid) + ", " + String(curErrObj.stat);
+      end;
+    end;
+  end;
+  
+  if (StrLen(errMessageTotal) > 0)
+    errMessageTotal = "ID сделки, Ошибка" + errMessageTotal;
+    
+    if (StrLen(errMessageTotal > MAX_ERROR_LENGTH))
+      errMessageTotal = SubStr(errMessageTotal, 1, MAX_ERROR_LENGTH - 3) + "...";
+    end;
+  end;
+  
+  ChangeCnvPackStatus(_execID, _conveyerID, _packetID, statTotal, errMessageTotal);
+  
+  return statTotal;
+end;
+
+/**
+@brief Процедура записи в лог массива строк
+@param[in] log Объект класса CTxtLogger
+@param[in] stringsArray Массив строк
+*/
+private macro LogStringsArray(log: CTxtLogger, stringsArray: TArray)
+  var  i = 0;
+  
+  while (i < stringsArray.size)
+    log.Info(stringsArray.Value(i));
+    i = i + 1;
+  end;
+end;
+
+/**
+@brief Процедура записи в лог ошибок выполнения сделок
+@param[in] log Объект класса CTxtLogger
+@param[in] logID ID лога
+*/
+private macro LogConveyerDealsExecutionErrorInfo(log: CTxtLogger, logID: String)
+  var logDataCmd = RSDCommand("SELECT itlog.msg " +
+                                "FROM itt_log itlog " +
+                               "WHERE itlog.create_sysdate > TRUNC(SYSDATE) - 1 " +
+                                 "AND itlog.object_name = UPPER(:logID) ");
+  logDataCmd.AddParam("logID", RSDBP_IN, logID);
+  var dataSet = RSDRecordSet(logDataCmd);
+  var isContinue: Bool = dataSet.MoveNext();
+  
+  if (isContinue)
+    var txtTable = CTxtTable(MakeArray(26, 12, 6, 100));
+    txtTable.SetAligns(MakeArray(ALIGN_CENTER, ALIGN_CENTER, ALIGN_CENTER, ALIGN_CENTER));
+
+    log.Info("  - ошибки обработки сделок:");
+    log.Info(txtTable.Header());
+    LogStringsArray(log, txtTable.GetFormattedData(MakeArray("Код операции", "ID операции", "№ ошибки", "Сообщение")));
+    log.Info(txtTable.Separator());
+    txtTable.SetAligns(MakeArray(ALIGN_LEFT, ALIGN_RIGHT, ALIGN_RIGHT, ALIGN_LEFT));
+    txtTable.SetWordSplit(false);
+    
+    while (isContinue)
+      LogStringsArray(log, txtTable.GetFormattedData(StringSplit(dataSet.Value("msg"), "||", true, "неизв.")));
+      isContinue = dataSet.MoveNext();
+    end;
+    
+    log.Info(txtTable.Footer());
+  else
+    log.Info("  - ошибки обработки сделок: не найдены");
+  end;
+end;
+
+/**
+@brief Процедура записи в лог ошибок исполнения пачек
+@param[in] log Объект класса CTxtLogger
+@param[in] logID ID лога
+*/
+private macro LogConveyerPacksExecutionErrorInfo(log: CTxtLogger, execID: Integer)
+  var logDataCmd = RSDCommand("SELECT cnvpack.* " +
+                                "FROM dCnvPack_dbt cnvpack " +
+                               "WHERE cnvpack.t_execid = :execID " +
+                                 "AND cnvpack.t_error != 0 ");
+  logDataCmd.AddParam("execID", RSDBP_IN, execID);
+  var dataSet = RSDRecordSet(logDataCmd);
+  var isContinue: Bool = dataSet.MoveNext();
+  
+  if (isContinue)
+    var txtTable = CTxtTable(MakeArray(6, 6, 100));
+    txtTable.SetAligns(MakeArray(ALIGN_CENTER, ALIGN_CENTER, ALIGN_CENTER));
+
+    log.Info("  - ошибки обработки пачек конвейера:");
+    log.Info(txtTable.Header());
+    LogStringsArray(log, txtTable.GetFormattedData(MakeArray("№ пачки", "Код ошибки", "Сообщение")));
+    log.Info(txtTable.Separator());
+    txtTable.SetAligns(MakeArray(ALIGN_RIGHT, ALIGN_RIGHT, ALIGN_LEFT));
+    txtTable.SetMultiline(false);
+    
+    while (isContinue)
+      LogStringsArray(log, txtTable.GetFormattedData(MakeArray(String(dataSet.Value("t_packID")), String(dataSet.Value("t_error")), String(dataSet.Value("t_errMsg")))));
+      isContinue = dataSet.MoveNext();
+    end;
+    
+    log.Info(txtTable.Footer());
+  end;
+end;
+
+/**
+@brief Функция ковейерой обработки сделок, переданных в массиве 
+@param[in] dealsInfoArray Массив информации о сделках в виде (id сделки, тип сделки)
+@return Код ошибки
+*/
+macro RunKondorDealsConveyerByDealsInfoArray(dealsInfoArray)
+  var stat: Integer = 0;
+  var storageInfo = CStorageInfo("RunNDealConveyer");
+  var log = CTxtLogger(storageInfo.FilePath(TXTTAG, TXTTAG));
+  var useConveyer = (Bnk_GetRegistryValue("РСХБ\\БРОКЕРСКОЕ ОБСЛУЖИВАНИЕ\\ИМПОРТ СДЕЛОК ИЗ АСУДР-КОНДОР\\ИСПОЛНЯТЬ СДЕЛКИ В КОНВЕЙЕРЕ", V_BOOL, false) and
+                     SecurUseConveyer(OPENDVNDEAL_CONVEYERID, OPENDVNDEAL_OPERATIONID));
+  
+  log.Info("Конвейерная обработка сделок\n");
+  
+  if (not useConveyer)
+    log.Error("Выполнение прервано: конвейер отключен");
+    stat = 1;
+  end;
+  
+  if (stat == 0)
+    var params = KondorDealsCnvParams();
+    params.conveyerID = OPENDVNDEAL_CONVEYERID;
+
+    var cnv = RsbConveyerExec(OPENDVNDEAL_TASKID);
+    cnv.AddParamsForConveyer(OPENDVNDEAL_CONVEYERID, params, 0);
+    cnv.AddParamsForOperation(OPENDVNDEAL_CONVEYERID, OPENDVNDEAL_OPERATIONID, params, "", 0);
+    cnv.ShowPanelMonitoring(1);
+    
+    log.Info("  - отбор сделок для конвейера");
+    SelectKondorDealsCnvByDealsInfoArray(cnv.TaskID, cnv.ExecID, OPENDVNDEAL_CONVEYERID, cnv.GetPacketSizeForConveyer(OPENDVNDEAL_CONVEYERID), dealsInfoArray);
+    
+    log.Info("  - старт конвейерной обработки (вариант запуска - " + OPENDVNDEAL_TASKID + "; id запуска - " + cnv.ExecID + ")\n");
+    cnv.Run();
+
+    log.Info("Обработка завершена");
+    log.UseTimestamp(false);
+    
+    log.Info("  - всего сделок: " + String(dealsInfoArray.size / 2));
+    LogConveyerDealsExecutionErrorInfo(log, KONDORDEAL_LOGID + "(" + cnv.ExecID + ")");
+    LogConveyerPacksExecutionErrorInfo(log, cnv.ExecID);
+  end;
+    
+  log.Close();
+  
+  ViewFile(storageInfo.FilePath(TXTTAG, TXTTAG));
+  
+  return stat;
+  
+OnError(err)
+  stat = err.Code;
+  log.Error("Выполнение прервано, ошибка обработки:\n" + GetFullErrMsg(err));
+  log.Close();
+  
+  ViewFile(storageInfo.FilePath(TXTTAG, TXTTAG));
+  
+  return stat;
+end;

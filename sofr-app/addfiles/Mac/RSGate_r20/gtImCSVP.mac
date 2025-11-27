@@ -1,0 +1,1412 @@
+/*
+$Name:        gtImCSVP.mac
+$Module:      Шлюз Securities
+$Description: импорт CSV-файлов с рынка FORTS Московской биржи (через Payments)
+*/
+
+import Календарь, "gtdlfun.mac", "gtmktrep.mac", "GTRrate.mac";
+
+private const SOURCE_CODE:string = "SRC-31";
+private const IsRSHB = 1;
+
+//Поля панели
+private const PNFLD_IMPDATE           = 0,
+              PNFLD_BEGDATE           = 1,
+              PNFLD_ENDDATE           = 2,
+              PNFLD_FILE_FUTURES      = 3,
+              PNFLD_FILE_OPTION       = 4,
+              PNFLD_FILE_POS          = 5,
+              PNFLD_FILE_DEALS        = 6,
+              PNFLD_FILE_ITOG         = 7,
+              PNFLD_FILE_REQUEST      = 8,
+              PNFLD_FILE_COMS         = 9,
+              PNFLD_COM_CODE          = 10,
+              PNFLD_FILE_MON          = 11,
+              PNFLD_FILE_STD_FUTURES  = 12,
+              PNFLD_FILE_STD_OPTION   = 13,
+              PNFLD_ORDER_NUM         = 14;
+
+private var ErrMes:string = "", Com_Num:string = "", Synonim:string = "", ReportFileName:string = "";
+private var SeanceID:integer = 0, RECORDID_MarketReport:integer = 0, RECORDID_CalcReport:integer = 0;
+private var PrintOnlyErr:bool = false;
+private var CalcDate:date = date(0,0,0);
+private record pp(IMP_CSVP, "rgate.lbr") dialog;
+private var RGLog = NULL;
+PRIVATE VAR Progress = TProgressBar;
+//Количество загруженных записей репликации
+PRIVATE VAR NumImportDeals = 0, NumImportDealsTotal = 0,
+            NumImportPos = 0,   NumImportPosTotal = 0,
+            NumImportReq = 0,   NumImportReqTotal = 0,
+            NumImportMon = 0,   NumImportMonTotal = 0,
+            NumImportCom = 0,   NumImportComTotal = 0,
+            NumImportPFI = 0,   NumImportPFITotal = 0,
+            NumImportRate = 0,  NumImportRateTotal = 0;
+
+//Прочие параметры передаваемые в ХП строкой
+private macro GetStorPrPrmStr(Pan:variant) :string
+  return "MMVB_Code=" + MICEX_CODE +
+         ";MarketReportNumber=" + Pan.order_num +
+         ";IsRSHB=" + IsRSHB;
+end;
+
+macro FileDateInName(date_val)
+   var day, month, year;
+   DateSplit(date_val,day,month,year);
+
+   year = year - 1900;
+
+   if( year >= 100 )
+      year = year - 100;
+   end;
+
+   return RGDLFUN_LZ(day,2) + RGDLFUN_LZ(month,2) + RGDLFUN_LZ(year,2);
+end;
+
+macro GetFileName( synonim, Table, FilesName:@string, ErrMes:@string ):integer //Получаем названия файлов, загруженных из Payments
+  var cmd, ds;
+
+  cmd = RSDCommand( " SELECT REQUIS.FILE_NAME file_name from "+synonim+".MB_REQUISITES REQUIS WHERE REQUIS.ID_MB_REQUISITES IN (SELECT DISTINCT t.T_ID_MB_REQUISITES FROM " +Table+ " t ) " );
+  ds = TRsbDataSet(cmd);
+  while(ds.MoveNext)
+    FilesName = FilesName + ds.file_name + " \n"
+  end;
+  return 0;
+
+OnError(ErObj)
+  ErrMes = "Модуль: " + string(ErObj.Module) + "\nСтрока: " + string(ErObj.Line) + "\nКод ошибки: " + string(ErObj.Code) + "\n" + ErObj.Message + "\n";
+  return 1;
+end;
+
+macro GetCalcReportDate( synonim, Table, CalcDate:@date, ErrMes:@string, imp_date:date ):integer //Получаем дату для отчёт апо операции расчётов
+  var cmd, ds;
+  cmd = RSDCommand( " SELECT min(PA.TRADE_DATE) TRADE_DATE from "+synonim+".PROCESSING_ACTUAL PA WHERE PA.ID_MB_REQUISITES IN (SELECT DISTINCT t.T_ID_MB_REQUISITES FROM " +Table+ " t ) " );
+  ds = TRsbDataSet(cmd);
+  if(ds.MoveNext)
+     CalcDate = ds.trade_date;
+  else
+     CalcDate = imp_date;  
+  end;
+  return 0;
+
+OnError(ErObj)
+  ErrMes = "Модуль: " + string(ErObj.Module) + "\nСтрока: " + string(ErObj.Line) + "\nКод ошибки: " + string(ErObj.Code) + "\n" + ErObj.Message + "\n";
+  return 1;
+end;
+
+macro CheckFileUpload(synonim:string, filetype:string, beg_date:date, end_date:date, ErrMes:@string):integer //Проверяем наличие загруженных в Payments файлов
+  var cmd, ds;
+
+  cmd = RSDCommand(" SELECT 1 FROM " + synonim + ".PROCESSING_ACTUAL WHERE FILE_TYPE = ? AND TRADE_DATE BETWEEN ? AND ? ");
+  cmd.addParam("", RSDBP_IN, filetype);
+  cmd.addParam("", RSDBP_IN, beg_date);
+  cmd.addParam("", RSDBP_IN, end_date);
+  ds = TRsbDataSet(cmd);
+  if(not ds.MoveNext)
+    ErrMes = "Нет загруженных в Payments файлов вида "+filetype;
+    return 1;
+  end;
+  return 0;
+OnError(ErObj)
+  ErrMes = "Модуль: " + string(ErObj.Module) + "\nСтрока: " + string(ErObj.Line) + "\nКод ошибки: " + string(ErObj.Code) + "\n" + ErObj.Message + "\n";
+  return 1;
+end;
+
+private macro ImportDeal( Futures:string, Option:string, Pan ) // Загрузка сделок из файлов f04.csv и o04.csv
+
+  var FilesName:string = "", PmTableName:string = "";
+  var cmd:DL_RSDCommand = NULL, cmdSP:RSDCommand = NULL;
+  var NameDate = FileDateInName(Pan.imp_date);
+  var NRec:integer = 0, stat:integer = 0, DVKind:integer = 0;
+  var isFutures:bool = IIF(Futures == SET_CHAR, true, false);
+  var isOption:bool = IIF(Option == SET_CHAR, true, false);
+  var isErr:bool = false, isSkip:bool = false;
+  var hour, min, sec;
+  var OldOutPut;
+  NumImportDeals = 0; NumImportDealsTotal = 0;
+  
+  while (isFutures or isOption)
+     if(isFutures)
+        DVKind = DERIVATIVE_FUTURES;
+        isFutures = false;
+     elif(isOption)
+        DVKind = DERIVATIVE_OPTION;
+        isOption = false;
+     else
+        break;
+     end;
+     PmTableName = IIF(DVKind == DERIVATIVE_FUTURES, "f04", "o04");
+
+     RGLog.Message("ЗАГРУЗКА СДЕЛОК ИЗ "+PmTableName); 
+
+     isSkip = false;
+     stat = CheckFileUpload(Synonim, PmTableName, pan.beg_date, pan.end_date, @ErrMes);
+     if(stat)
+        RGLog.Message("ПРЕДУПРЕЖДЕНИЕ: Внимание! "+ErrMes, null, LOAD_WARNING); //С введением обработки выходных дней, файлов может и не быть
+        stat = 0; ErrMes = ""; 
+        isSkip = true;
+     end;
+
+     if(not isSkip)
+        if (not stat)
+           Progress.Init( 2, "Выполняется очистка данных", "Очистка данных"  );
+           OldOutPut = SetOutput( ReportFileName, TRUE );
+           println( "Начало очистки таблицы для записей "+PmTableName+" " + time() );
+           cmdSP = RSDCommand("BEGIN ? := RSB_GTIM_CSV.DelFO04(?, ?); END;");
+           cmdSP.addParam("stat", RSDBP_OUT, V_INTEGER);
+           cmdSP.addParam("", RSDBP_IN, SeanceID);
+           cmdSP.addParam("", RSDBP_IN, SOURCE_CODE);
+           cmdSP.Execute();
+           stat = Int(cmdSP.value("stat"));
+           Message("Очистка таблицы для записей "+PmTableName);
+           Progress.Use();
+           println( "Конец очистки таблицы для записей "+PmTableName+" " + time() );
+           SetOutput( OldOutPut, TRUE );
+           Progress.Use();
+           Progress.Remove();
+        end;
+   
+        Progress.Init(3, "Выполняется обработка данных", "Обработка данных"  );
+        if( not stat )
+           OldOutPut = SetOutput( ReportFileName, TRUE );
+           println( "Начало заполнения таблицы из "+PmTableName+" " + time() );
+           if (DVKind == DERIVATIVE_FUTURES)
+              cmdSP = RSDCommand("BEGIN ? := RSB_GTIM_CSV.FillFromF04(?, ?, ?, ?, ?); END;");
+           else
+              cmdSP = RSDCommand("BEGIN ? := RSB_GTIM_CSV.FillFromO04(?, ?, ?, ?, ?); END;");
+           end;
+           cmdSP.addParam("stat", RSDBP_OUT, V_INTEGER);
+           cmdSP.addParam("", RSDBP_IN, SeanceID);
+           cmdSP.addParam("", RSDBP_IN, SOURCE_CODE);
+           cmdSP.addParam("", RSDBP_IN, Synonim);
+           cmdSP.addParam("", RSDBP_IN, pan.beg_date);
+           cmdSP.addParam("", RSDBP_IN, pan.end_date);
+           cmdSP.Execute();
+           stat = Int(cmdSP.value("stat"));
+           Message("Заполнение таблицы из "+PmTableName);
+           Progress.Use();
+           println( "Конец заполнения таблицы из "+PmTableName+" " + time() );
+           SetOutput( OldOutPut, TRUE );
+   
+           Message("Обработка данных из "+PmTableName);
+           //нужно, чтобы показать в индикаторе кол-во обрабатываемых записей
+           cmd = DL_RSDCommand("SELECT 1 FROM D_FO04_TMP t");
+           NRec = cmd.GetCount();
+           NumImportDeals = NumImportDeals + NRec; 
+   
+           FilesName = "";
+           if( not stat )
+             stat = GetFileName( Synonim, "D_FO04_TMP", @FilesName, @ErrMes);
+           end;
+           if( not stat )
+             stat = GetCalcReportDate( Synonim, "D_FO04_TMP", @CalcDate, @ErrMes, Pan.imp_date);
+           end;
+   
+           if( (NRec > 0) and (not stat) )
+              OldOutPut = SetOutput( ReportFileName, TRUE );
+              Message("Обновление данных для сделок: коды и объекты");
+              println("Начало обновления кодов и объектов для записей " +PmTableName+" " + time());
+              cmdSP = RSDCommand("BEGIN ? := RSB_GTIM_CSV.UpdateObjCodeFO04(?, ?, ?, ?); END;");
+              cmdSP.addParam("stat", RSDBP_OUT, V_INTEGER);
+              cmdSP.addParam("", RSDBP_IN, SeanceID);
+              cmdSP.addParam("", RSDBP_IN, SOURCE_CODE);
+              cmdSP.addParam("", RSDBP_IN, DVKind);
+              cmdSP.addParam("", RSDBP_IN, GetStorPrPrmStr(Pan)); //прочие параметры
+              cmdSP.Execute();
+              stat = Int(cmdSP.value("stat"));
+              Progress.Use();
+              println("Конец обновления кодов и объектов для записей " +PmTableName+" " + time());
+              SetOutput( OldOutPut, TRUE );
+           end;      
+   
+           if( (NRec > 0) and (not stat) )
+              RGLog.Message("Используются файлы: \n" + FilesName);
+              OldOutPut = SetOutput( ReportFileName, TRUE );
+              println( "Начало обработки данных из "+PmTableName+" " + time() );
+              if(GetDialogFlag())
+                 InitProgress(NRec, "Загрузка внешнего файла сделок", "ОБРАБОТКА ВХОДНЫХ ДАННЫХ ИЗ "+PmTableName);
+              end;
+   
+              cmdSP = RSDCommand("BEGIN ? := RSB_GTIM_CSV.CreateReplRecByTmp_FO04(?, ?, ?, ?, ?, ?, ?); END;");
+              cmdSP.addParam("stat", RSDBP_OUT, V_INTEGER);
+              cmdSP.addParam("", RSDBP_IN, SeanceID);
+              cmdSP.addParam("", RSDBP_IN, Pan.imp_date);
+              cmdSP.addParam("", RSDBP_IN, SOURCE_CODE);
+              cmdSP.addParam("", RSDBP_IN, DVKind);
+              cmdSP.addParam("", RSDBP_IN, Time());
+              cmdSP.addParam("", RSDBP_IN, CalcDate);
+              cmdSP.addParam("", RSDBP_IN, GetStorPrPrmStr(Pan)); //прочие параметры
+              cmdSP.Execute();
+              stat = Int(cmdSP.value("stat"));
+   
+              if(GetDialogFlag())
+                 RemProgress();
+              end;           
+              println( "Конец обработки данных из "+PmTableName+" " + time() );
+              SetOutput( OldOutPut, TRUE );
+           end;
+        end;
+        if( (NRec > 0) and (not stat) )
+           OldOutPut = SetOutput( ReportFileName, TRUE );
+           println( "Начало обновления таблицы в Payments для записей " +PmTableName+" " + time() );
+           Message("Обновление данных в Payments");
+           if (DVKind == DERIVATIVE_FUTURES)
+              cmdSP = RSDCommand("BEGIN ? := RSB_GTIM_CSV.UpdateF04_PM(?, ?, ?); END;");
+           else
+              cmdSP = RSDCommand("BEGIN ? := RSB_GTIM_CSV.UpdateO04_PM(?, ?, ?); END;");
+           end;
+           cmdSP.addParam("stat", RSDBP_OUT, V_INTEGER);
+           cmdSP.addParam("", RSDBP_IN, SeanceID);
+           cmdSP.addParam("", RSDBP_IN, SOURCE_CODE);
+           cmdSP.addParam("", RSDBP_IN, Synonim);
+           cmdSP.Execute();
+           stat = Int(cmdSP.value("stat"));
+           println( "Конец обновления таблицы в Payments для записей " +PmTableName+" " + time() );
+           SetOutput( OldOutPut, TRUE );
+           Progress.Use();
+        end;
+        Progress.Remove();
+        if(ErrMes != "")
+           RGLog.Error("Внимание! "+ErrMes);
+           ErrMes = "";
+        elif (NRec == 0)
+           RGLog.Message("Нет данных для загрузки.");
+        end;
+     end;
+     isErr = (isErr or(stat != 0));
+  end;
+
+  if( (NumImportDeals == 0) and (isErr) )  
+     RGLog.GetAndAddReceiveStorPrLog(RG_MARKETREPORT);
+     RGLog.GetAndAddReceiveStorPrLog(RG_KINDOBJ_DVCALCREP);
+     RGLog.GetAndAddReceiveStorPrLog(RG_KINDOBJ_DVDL);
+  else
+     Progress.Init( 2, "Выполняется заполнение протокола", "Заполнение протокола"  );
+     /*загрузить в лог информацию о загруженных ЗР*/
+     Message("Заполнение протокола");
+     RGLog.GetAndAddReceiveLoadRecs(RG_MARKETREPORT, "Документ-подтверждение \"Отчет биржи\" успешно загружен\n", null, true, null, @RECORDID_MarketReport, PrintOnlyErr);
+     RGLog.GetAndAddReceiveStorPrLog(RG_MARKETREPORT);
+     RGLog.GetAndAddReceiveLoadRecs(RG_KINDOBJ_DVCALCREP, "Документ-подтверждение \"Отчет биржи\" по операции расчетов за дату"+CalcDate+" успешно загружен\n", null, true, null, @RECORDID_CalcReport, PrintOnlyErr);
+     RGLog.GetAndAddReceiveStorPrLog(RG_KINDOBJ_DVCALCREP);
+     RGLog.GetAndAddReceiveLoadRecsMass(RG_KINDOBJ_DVDL,"Сделка \"","\" уcпешно загружена в шлюз", @NumImportDealsTotal, PrintOnlyErr);
+     RGLog.GetAndAddReceiveStorPrLog(RG_KINDOBJ_DVDL);
+     Progress.Use();
+     /* сообщаем о результатах загрузки */
+     RGLog.Message("Всего обработано сделок из Шлюза Payments - " + string(NumImportDeals) + "\nиз них успешно - " + string(NumImportDealsTotal) + "\nошибочно - " + string(NumImportDeals - NumImportDealsTotal));
+     Progress.Use();
+     Progress.Remove();
+  end;
+
+  OnError(ErObj)
+  if(GetDialogFlag())
+    RemProgress(); RemProgress();
+  end;
+  MsgBox("Модуль: " + string(ErObj.Module) + "\nСтрока: " + string(ErObj.Line) + "\nКод ошибки: " + string(ErObj.Code) + "\n" + ErObj.Message);
+  RunError;
+end;
+
+private macro ImportPosition( Futures:string, Option:string, Pan ) // Загрузка итогов по позициям из файлов fpos.csv и opos.csv
+
+  var FilesName:string = "", PmTableName:string = "";
+  var cmd:DL_RSDCommand = NULL, cmdSP:RSDCommand = NULL;
+  var NameDate = FileDateInName(Pan.imp_date);
+  var NRec:integer = 0, stat:integer = 0, DVKind:integer = 0;
+  var isFutures:bool = IIF(Futures == SET_CHAR, true, false);
+  var isOption:bool = IIF(Option == SET_CHAR, true, false);
+  var isErr:bool = false, isSkip:bool = false;
+  var hour, min, sec;
+  var OldOutPut;
+  NumImportPos = 0; NumImportPosTotal = 0;
+
+  while (isFutures or isOption)
+     if(isFutures)
+        DVKind = DERIVATIVE_FUTURES;
+        isFutures = false;
+     elif(isOption)
+        DVKind = DERIVATIVE_OPTION;
+        isOption = false;
+     else
+        break;
+     end;
+     PmTableName = IIF(DVKind == DERIVATIVE_FUTURES, "fpos", "opos"); 
+
+     RGLog.Message("ЗАГРУЗКА ИТОГОВ ПО ПОЗИЦИЯМ ИЗ "+PmTableName);
+
+     isSkip = false;
+     stat = CheckFileUpload(Synonim, PmTableName, pan.beg_date, pan.end_date, @ErrMes);
+     if(stat)
+        RGLog.Message("ПРЕДУПРЕЖДЕНИЕ: Внимание! "+ErrMes, null, LOAD_WARNING); //С введением обработки выходных дней, файлов может и не быть
+        stat = 0; ErrMes = ""; 
+        isSkip = true;
+     end;
+
+     if(not isSkip)
+        if (not stat)
+           Progress.Init( 2, "Выполняется очистка данных", "Очистка данных"  );
+           OldOutPut = SetOutput( ReportFileName, TRUE );
+           println( "Начало очистки таблицы для записей "+PmTableName+" " + time() );
+           cmdSP = RSDCommand("BEGIN ? := RSB_GTIM_CSV.DelFOPOS(?, ?); END;");
+           cmdSP.addParam("stat", RSDBP_OUT, V_INTEGER);
+           cmdSP.addParam("", RSDBP_IN, SeanceID);
+           cmdSP.addParam("", RSDBP_IN, SOURCE_CODE);
+           cmdSP.Execute();
+           stat = Int(cmdSP.value("stat"));
+           Message("Очистка таблицы для записей "+PmTableName);
+           Progress.Use();
+           println( "Конец очистки таблицы для записей "+PmTableName+" " + time() );
+           SetOutput( OldOutPut, TRUE );
+           Progress.Use();
+           Progress.Remove();
+        end;
+     
+        Progress.Init( 3, "Выполняется обработка данных", "Обработка данных"  );
+        if( not stat )
+           OldOutPut = SetOutput( ReportFileName, TRUE );
+           println( "Начало заполнения таблицы из "+PmTableName+" " + time() );
+           if (DVKind == DERIVATIVE_FUTURES)
+              cmdSP = RSDCommand("BEGIN ? := RSB_GTIM_CSV.FillFromFPOS(?, ?, ?, ?, ?); END;");
+           else
+              cmdSP = RSDCommand("BEGIN ? := RSB_GTIM_CSV.FillFromOPOS(?, ?, ?, ?, ?); END;");
+           end;
+           cmdSP.addParam("stat", RSDBP_OUT, V_INTEGER);
+           cmdSP.addParam("", RSDBP_IN, SeanceID);
+           cmdSP.addParam("", RSDBP_IN, SOURCE_CODE);
+           cmdSP.addParam("", RSDBP_IN, Synonim);
+           cmdSP.addParam("", RSDBP_IN, pan.beg_date);
+           cmdSP.addParam("", RSDBP_IN, pan.end_date);
+           cmdSP.Execute();
+           stat = Int(cmdSP.value("stat"));
+           Message("Заполнение таблицы из "+PmTableName);
+           Progress.Use();
+           println( "Конец заполнения таблицы из "+PmTableName+" " + time() );
+           SetOutput( OldOutPut, TRUE );
+     
+           Message("Обработка данных из "+PmTableName);
+           //нужно, чтобы показать в индикаторе кол-во обрабатываемых записей
+           cmd = DL_RSDCommand("SELECT 1 FROM D_FOPOS_TMP t");
+           NRec = cmd.GetCount();
+           NumImportPos = NumImportPos + NRec;
+     
+           FilesName = "";
+           if( not stat )
+             stat = GetFileName( Synonim, "D_FOPOS_TMP", @FilesName, @ErrMes);
+           end;
+     
+           if( (NRec > 0) and (not stat) )
+              OldOutPut = SetOutput( ReportFileName, TRUE );
+              Message("Обновление данных для позиций: коды и объекты");
+              println("Начало обновления кодов и объектов для записей " +PmTableName+" " + time());
+              cmdSP = RSDCommand("BEGIN ? := RSB_GTIM_CSV.UpdateObjCodeFOPOS(?, ?, ?, ?); END;");
+              cmdSP.addParam("stat", RSDBP_OUT, V_INTEGER);
+              cmdSP.addParam("", RSDBP_IN, SeanceID);
+              cmdSP.addParam("", RSDBP_IN, SOURCE_CODE);
+              cmdSP.addParam("", RSDBP_IN, DVKind);
+              cmdSP.addParam("", RSDBP_IN, GetStorPrPrmStr(Pan)); //прочие параметры
+              cmdSP.Execute();
+              stat = Int(cmdSP.value("stat"));
+              Progress.Use();
+              println("Конец обновления кодов и объектов для записей " +PmTableName+" " + time());
+              SetOutput( OldOutPut, TRUE );
+           end;
+     
+           if( (NRec > 0) and (not stat) )
+              RGLog.Message("Используются файлы: \n" + FilesName);
+              OldOutPut = SetOutput( ReportFileName, TRUE );
+              println( "Начало обработки данных из "+PmTableName+" " + time() );
+              if(GetDialogFlag())
+                 InitProgress(NRec, "Загрузка внешнего файла итогов по позициям", "ОБРАБОТКА ВХОДНЫХ ДАННЫХ ИЗ "+PmTableName);
+              end;
+     
+              cmdSP = RSDCommand("BEGIN ? := RSB_GTIM_CSV.CreateReplRecByTmp_FOPOS(?, ?, ?, ?, ?); END;");
+              cmdSP.addParam("stat", RSDBP_OUT, V_INTEGER);
+              cmdSP.addParam("", RSDBP_IN, SeanceID);
+              cmdSP.addParam("", RSDBP_IN, Pan.imp_date);
+              cmdSP.addParam("", RSDBP_IN, SOURCE_CODE);
+              cmdSP.addParam("", RSDBP_IN, DVKind);
+              cmdSP.addParam("", RSDBP_IN, GetStorPrPrmStr(Pan)); //прочие параметры
+              cmdSP.Execute();
+              stat = Int(cmdSP.value("stat"));
+     
+              if(GetDialogFlag())
+                 RemProgress();
+              end;
+              println( "Конец обработки данных из "+PmTableName+" " + time() );
+              SetOutput( OldOutPut, TRUE ); 
+           end;
+        end;
+        if( (NRec > 0) and (not stat) )
+           OldOutPut = SetOutput( ReportFileName, TRUE );
+           println( "Начало обновления таблицы в Payments для записей " +PmTableName+" " + time() );
+           Message("Обновление данных в Payments");
+           if (DVKind == DERIVATIVE_FUTURES)
+              cmdSP = RSDCommand("BEGIN ? := RSB_GTIM_CSV.UpdateFPOS_PM(?, ?, ?); END;");
+           else
+              cmdSP = RSDCommand("BEGIN ? := RSB_GTIM_CSV.UpdateOPOS_PM(?, ?, ?); END;");
+           end;
+           cmdSP.addParam("stat", RSDBP_OUT, V_INTEGER);
+           cmdSP.addParam("", RSDBP_IN, SeanceID);
+           cmdSP.addParam("", RSDBP_IN, SOURCE_CODE);
+           cmdSP.addParam("", RSDBP_IN, Synonim);
+           cmdSP.Execute();
+           stat = Int(cmdSP.value("stat"));
+           println( "Конец обновления таблицы в Payments для записей " +PmTableName+" " + time() );
+           SetOutput( OldOutPut, TRUE );
+           Progress.Use();
+        end; 
+        Progress.Remove();                                   
+        if(ErrMes != "")
+           RGLog.Error("Внимание! "+ErrMes);
+           ErrMes = "";
+        elif (NRec == 0)
+           RGLog.Message("Нет данных для загрузки.");
+        end;
+     end;
+     isErr = ( isErr or (stat != 0) );                                   
+  end;
+
+  if( (NumImportPos == 0) and (isErr) )   
+     RGLog.GetAndAddReceiveStorPrLog(RG_KINDOBJ_DVTRN);
+  else
+     Progress.Init( 2, "Выполняется заполнение протокола", "Заполнение протокола"  );
+     /*загрузить в лог информацию о загруженных ЗР*/
+     Message("Заполнение протокола");
+     RGLog.GetAndAddReceiveLoadRecsMass(RG_KINDOBJ_DVTRN,"Итоги дня по позиции ПИ с кодом \"","\" уcпешно загружены в шлюз", @NumImportPosTotal, PrintOnlyErr);
+     RGLog.GetAndAddReceiveStorPrLog(RG_KINDOBJ_DVTRN);
+     Progress.Use();
+     /* сообщаем о результатах загрузки */
+     RGLog.Message("Всего обработано итогов по позиции из Шлюза Payments - " + string(NumImportPos) + "\nиз них успешно - " + string(NumImportPosTotal) + "\nошибочно - " + string(NumImportPos - NumImportPosTotal));
+     Progress.Use();
+     Progress.Remove();
+  end;
+
+OnError(ErObj)
+  if(GetDialogFlag())
+    RemProgress(); RemProgress();
+  end;
+  MsgBox("Модуль: " + string(ErObj.Module) + "\nСтрока: " + string(ErObj.Line) + "\nКод ошибки: " + string(ErObj.Code) + "\n" + ErObj.Message);
+  RunError;
+end;
+
+private macro ImportRequest( Futures:string, Option:string, Pan ) // Загрузка заявок из файлов fordlog.csv и oordlog.csv
+
+  var FilesName:string = "", PmTableName:string = "";
+  var cmd:DL_RSDCommand = NULL, cmdSP:RSDCommand = NULL;
+  var NameDate = FileDateInName(Pan.imp_date);
+  var NRec:integer = 0, stat:integer = 0, DVKind:integer = 0;
+  var isFutures:bool = IIF(Futures == SET_CHAR, true, false);
+  var isOption:bool = IIF(Option == SET_CHAR, true, false);
+  var isErr:bool = false, isSkip:bool = false;
+  var hour, min, sec;
+  var OldOutPut;
+  NumImportReq = 0; NumImportReqTotal = 0;
+
+  while (isFutures or isOption)
+     if(isFutures)
+        DVKind = DERIVATIVE_FUTURES;
+        isFutures = false;
+     elif(isOption)
+        DVKind = DERIVATIVE_OPTION;
+        isOption = false;
+     else
+        break;
+     end;
+     PmTableName = IIF(DVKind == DERIVATIVE_FUTURES, "fordlog", "oordlog"); 
+
+     RGLog.Message("ЗАГРУЗКА ИНФОРМАЦИИ ПО ЗАЯВКАМ НА СДЕЛКИ ИЗ "+PmTableName);
+
+     isSkip = false;
+     stat = CheckFileUpload(Synonim, PmTableName, pan.beg_date, pan.end_date, @ErrMes);
+     if(stat)
+        RGLog.Message("ПРЕДУПРЕЖДЕНИЕ: Внимание! "+ErrMes, null, LOAD_WARNING); //С введением обработки выходных дней, фапйлов может и не быть
+        stat = 0; ErrMes = ""; 
+        isSkip = true;
+     end;
+
+     if(not isSkip)
+        if (not stat)
+           Progress.Init( 2, "Выполняется очистка данных", "Очистка данных"  );
+           OldOutPut = SetOutput( ReportFileName, TRUE );
+           println( "Начало очистки таблицы для записей "+PmTableName+" " + time() );
+           cmdSP = RSDCommand("BEGIN ? := RSB_GTIM_CSV.DelFOORDLOG(?, ?); END;");
+           cmdSP.addParam("stat", RSDBP_OUT, V_INTEGER);
+           cmdSP.addParam("", RSDBP_IN, SeanceID);
+           cmdSP.addParam("", RSDBP_IN, SOURCE_CODE);
+           cmdSP.Execute();
+           stat = Int(cmdSP.value("stat"));
+           Message("Очистка таблицы для записей "+PmTableName);
+           Progress.Use();
+           println( "Конец очистки таблицы для записей "+PmTableName+" " + time() );
+           SetOutput( OldOutPut, TRUE );
+           Progress.Use();
+           Progress.Remove();
+        end;
+    
+        Progress.Init( 3, "Выполняется обработка данных", "Обработка данных"  );
+        if( not stat )
+           OldOutPut = SetOutput( ReportFileName, TRUE );
+           println( "Начало заполнения таблицы из "+PmTableName+" " + time() );
+           if (DVKind == DERIVATIVE_FUTURES)
+              cmdSP = RSDCommand("BEGIN ? := RSB_GTIM_CSV.FillFromFORDLOG(?, ?, ?, ?, ?); END;");
+           else
+              cmdSP = RSDCommand("BEGIN ? := RSB_GTIM_CSV.FillFromOORDLOG(?, ?, ?, ?, ?); END;");
+           end;
+           cmdSP.addParam("stat", RSDBP_OUT, V_INTEGER);
+           cmdSP.addParam("", RSDBP_IN, SeanceID);
+           cmdSP.addParam("", RSDBP_IN, SOURCE_CODE);
+           cmdSP.addParam("", RSDBP_IN, Synonim);
+           cmdSP.addParam("", RSDBP_IN, pan.beg_date);
+           cmdSP.addParam("", RSDBP_IN, pan.end_date);
+           cmdSP.Execute();
+           stat = Int(cmdSP.value("stat"));
+           Message("Заполнение таблицы из "+PmTableName);
+           Progress.Use();
+           println( "Конец заполнения таблицы из "+PmTableName+" " + time() );
+           SetOutput( OldOutPut, TRUE );
+    
+           Message("Обработка данных из "+PmTableName);
+           //нужно, чтобы показать в индикаторе кол-во обрабатываемых записей
+           cmd = DL_RSDCommand("SELECT 1 FROM D_FOORDLOG_TMP t");
+           NRec = cmd.GetCount();
+           NumImportReq = NumImportReq + NRec;
+    
+           FilesName = "";
+           if( not stat )
+             stat = GetFileName( Synonim, "D_FOORDLOG_TMP", @FilesName, @ErrMes);
+           end;
+    
+           if( (NRec > 0) and (not stat) )
+              OldOutPut = SetOutput( ReportFileName, TRUE );
+              Message("Обновление данных для заявок: коды и объекты");
+              println("Начало обновления кодов и объектов для записей " +PmTableName+" " + time());
+              cmdSP = RSDCommand("BEGIN ? := RSB_GTIM_CSV.UpdateObjCodeFOORDLOG(?, ?, ?, ?); END;");
+              cmdSP.addParam("stat", RSDBP_OUT, V_INTEGER);
+              cmdSP.addParam("", RSDBP_IN, SeanceID);
+              cmdSP.addParam("", RSDBP_IN, SOURCE_CODE);
+              cmdSP.addParam("", RSDBP_IN, DVKind);
+              cmdSP.addParam("", RSDBP_IN, GetStorPrPrmStr(Pan)); //прочие параметры
+              cmdSP.Execute();
+              stat = Int(cmdSP.value("stat"));
+              Progress.Use();
+              println("Конец обновления кодов и объектов для записей " +PmTableName+" " + time());
+              SetOutput( OldOutPut, TRUE );
+           end;
+    
+           if( (NRec > 0) and (not stat) )
+              RGLog.Message("Используются файлы: \n" + FilesName);
+              OldOutPut = SetOutput( ReportFileName, TRUE );
+              println( "Начало обработки данных из "+PmTableName+" " + time() );
+              if(GetDialogFlag())
+                 InitProgress(NRec, "Загрузка внешнего файла заявок", "ОБРАБОТКА ВХОДНЫХ ДАННЫХ ИЗ "+PmTableName);
+              end;
+    
+              cmdSP = RSDCommand("BEGIN ? := RSB_GTIM_CSV.CreateReplRecByTmp_FOORDLOG(?, ?, ?, ?, ?); END;");
+              cmdSP.addParam("stat", RSDBP_OUT, V_INTEGER);
+              cmdSP.addParam("", RSDBP_IN, SeanceID);
+              cmdSP.addParam("", RSDBP_IN, Pan.imp_date);
+              cmdSP.addParam("", RSDBP_IN, SOURCE_CODE);
+              cmdSP.addParam("", RSDBP_IN, DVKind);
+              cmdSP.addParam("", RSDBP_IN, GetStorPrPrmStr(Pan)); //прочие параметры
+              cmdSP.Execute();
+              stat = Int(cmdSP.value("stat"));
+    
+              if(GetDialogFlag())
+                 RemProgress();
+              end;
+              println( "Конец обработки данных из "+PmTableName+" " + time() );
+              SetOutput( OldOutPut, TRUE ); 
+           end;
+        end;
+        if( (NRec > 0) and (not stat) )
+           OldOutPut = SetOutput( ReportFileName, TRUE );
+           println( "Начало обновления таблицы в Payments для записей " +PmTableName+" " + time() );
+           Message("Обновление данных в Payments");
+           if (DVKind == DERIVATIVE_FUTURES)
+              cmdSP = RSDCommand("BEGIN ? := RSB_GTIM_CSV.UpdateFORDLOG_PM(?, ?, ?); END;");
+           else
+              cmdSP = RSDCommand("BEGIN ? := RSB_GTIM_CSV.UpdateOORDLOG_PM(?, ?, ?); END;");
+           end;
+           cmdSP.addParam("stat", RSDBP_OUT, V_INTEGER);
+           cmdSP.addParam("", RSDBP_IN, SeanceID);
+           cmdSP.addParam("", RSDBP_IN, SOURCE_CODE);
+           cmdSP.addParam("", RSDBP_IN, Synonim);
+           cmdSP.Execute();
+           stat = Int(cmdSP.value("stat"));
+           println( "Конец обновления таблицы в Payments для записей " +PmTableName+" " + time() );
+           SetOutput( OldOutPut, TRUE );
+           Progress.Use();
+        end;
+        Progress.Remove();                                    
+        if(ErrMes != "")
+           RGLog.Error("Внимание! "+ErrMes);
+           ErrMes = "";
+        elif (NRec == 0)
+           RGLog.Message("Нет данных для загрузки.");
+        end;
+     end;
+     isErr = ( isErr or (stat != 0) );                                       
+  end;
+
+  if( (NumImportReq == 0) and (isErr) )   
+     RGLog.GetAndAddReceiveStorPrLog(RG_DVREQ);
+  else
+     Progress.Init( 2, "Выполняется заполнение протокола", "Заполнение протокола"  );
+     /*загрузить в лог информацию о загруженных ЗР*/
+     Message("Заполнение протокола");
+     RGLog.GetAndAddReceiveLoadRecsMass(RG_DVREQ,"Клиентское поручение № \"","\" уcпешно загружено в шлюз", @NumImportReqTotal, PrintOnlyErr);
+     RGLog.GetAndAddReceiveStorPrLog(RG_DVREQ);
+     Progress.Use();
+     /* сообщаем о результатах загрузки */
+     RGLog.Message("Всего обработано заявок из Шлюза Payments - " + string(NumImportReq) + "\nиз них успешно - " + string(NumImportReqTotal) + "\nошибочно - " + string(NumImportReq - NumImportReqTotal));
+     Progress.Use();
+     Progress.Remove();
+  end; 
+                                  
+OnError(ErObj)
+  if(GetDialogFlag())
+    RemProgress(); RemProgress();
+  end;
+  MsgBox("Модуль: " + string(ErObj.Module) + "\nСтрока: " + string(ErObj.Line) + "\nКод ошибки: " + string(ErObj.Code) + "\n" + ErObj.Message);
+  RunError;
+end;
+
+private macro ImportPFI( Futures:string, Option:string, Pan, isPFI:integer /*Признак загрузки ПИ*/ ) // Загрузка информации итогов из файлов f07.csv и o07.csv
+
+  var FilesName:string = "", PmTableName:string = "";
+  var cmd:DL_RSDCommand = NULL, cmdSP:RSDCommand = NULL;
+  var NameDate = FileDateInName(Pan.imp_date);
+  var NRec:integer = 0, stat:integer = 0, DVKind:integer = 0;
+  var isFutures:bool = IIF(Futures == SET_CHAR, true, false);
+  var isOption:bool = IIF(Option == SET_CHAR, true, false);
+  var isErr:bool = false, isSkip:bool = false;
+  var hour, min, sec; 
+  var OldOutPut;
+  NumImportPFI = 0; NumImportPFITotal = 0;
+  NumImportRate = 0; NumImportRateTotal = 0;
+
+  while (isFutures or isOption)
+     if(isFutures)
+        DVKind = DERIVATIVE_FUTURES;
+        isFutures = false;
+     elif(isOption)
+        DVKind = DERIVATIVE_OPTION;
+        isOption = false;
+     else
+        break;
+     end;
+     PmTableName = IIF(DVKind == DERIVATIVE_FUTURES, "f07", "o07"); 
+
+     if (isPFI)
+        RGLog.Message("ЗАГРУЗКА ИНФОРМАЦИИ ПО ПРОИЗВОДНЫМ ИНСТРУМЕНТАМ ИЗ "+PmTableName);
+     else
+        RGLog.Message("ЗАГРУЗКА ИНФОРМАЦИИ ПО КУРСАМ ПРОИЗВОДНЫХ ИНСТРУМЕНТОВ ИЗ "+PmTableName);
+     end;
+
+     stat = CheckFileUpload(Synonim, PmTableName, pan.beg_date, pan.end_date, @ErrMes);
+     if(stat)
+        RGLog.Message("ПРЕДУПРЕЖДЕНИЕ: Внимание! "+ErrMes, null, LOAD_WARNING); //С введением обработки выходных дней, фапйлов может и не быть
+        stat = 0; ErrMes = ""; 
+        isSkip = true;
+     end;
+     if(not isSkip)
+        if(not stat)
+           Progress.Init( 2, "Выполняется очистка данных", "Очистка данных"  );
+           OldOutPut = SetOutput( ReportFileName, TRUE );
+           println( "Начало очистки таблицы для записей "+PmTableName+" " + time() );
+           cmdSP = RSDCommand("BEGIN ? := RSB_GTIM_CSV.DelFO07(?, ?, ?); END;");
+           cmdSP.addParam("stat", RSDBP_OUT, V_INTEGER);
+           cmdSP.addParam("", RSDBP_IN, SeanceID);
+           cmdSP.addParam("", RSDBP_IN, SOURCE_CODE);
+           cmdSP.addParam("", RSDBP_IN, isPFI);
+           cmdSP.Execute();
+           stat = Int(cmdSP.value("stat"));
+           Message("Очистка таблицы для записей "+PmTableName);
+           Progress.Use();
+           println( "Конец очистки таблицы для записей "+PmTableName+" " + time() );
+           SetOutput( OldOutPut, TRUE );
+           Progress.Use();
+           Progress.Remove();   
+        end; 
+
+        Progress.Init( 3, "Выполняется обработка данных", "Обработка данных"  ); 
+        if( not stat )
+           OldOutPut = SetOutput( ReportFileName, TRUE );
+           println( "Начало заполнения таблицы из "+PmTableName+" " + time() );
+           if (DVKind == DERIVATIVE_FUTURES)
+              cmdSP = RSDCommand("BEGIN ? := RSB_GTIM_CSV.FillFromF07(?, ?, ?, ?, ?, ?); END;");
+           else
+              cmdSP = RSDCommand("BEGIN ? := RSB_GTIM_CSV.FillFromO07(?, ?, ?, ?, ?, ?); END;");
+           end;
+           cmdSP.addParam("stat", RSDBP_OUT, V_INTEGER);
+           cmdSP.addParam("", RSDBP_IN, SeanceID);
+           cmdSP.addParam("", RSDBP_IN, SOURCE_CODE);
+           cmdSP.addParam("", RSDBP_IN, Synonim);
+           cmdSP.addParam("", RSDBP_IN, pan.beg_date);
+           cmdSP.addParam("", RSDBP_IN, pan.end_date);
+           cmdSP.addParam("", RSDBP_IN, isPFI);
+           cmdSP.Execute();
+           stat = Int(cmdSP.value("stat"));
+           Message("Заполнение таблицы из "+PmTableName);
+           Progress.Use();
+           println( "Конец заполнения таблицы из "+PmTableName+" " + time() );
+           SetOutput( OldOutPut, TRUE );
+
+           if( not stat )
+              OldOutPut = SetOutput( ReportFileName, TRUE );
+              Message("Обновление данных для производных инструментов: коды и объекты");
+              println("Начало обновления кодов и объектов для записей " +PmTableName+" " + time());
+              cmdSP = RSDCommand("BEGIN ? := RSB_GTIM_CSV.UpdateObjCodeFO07(?, ?, ?, ?, ?); END;");          
+              cmdSP.addParam("stat", RSDBP_OUT, V_INTEGER);
+              cmdSP.addParam("", RSDBP_IN, SeanceID);
+              cmdSP.addParam("", RSDBP_IN, SOURCE_CODE);
+              cmdSP.addParam("", RSDBP_IN, DVKind);
+              cmdSP.addParam("", RSDBP_IN, isPFI);
+              cmdSP.addParam("", RSDBP_IN, GetStorPrPrmStr(Pan)); //прочие параметры
+              cmdSP.Execute();
+              stat = Int(cmdSP.value("stat"));
+              Progress.Use();
+              println("Конец обновления кодов и объектов для записей " +PmTableName+" " + time());
+              SetOutput( OldOutPut, TRUE );
+           end;
+
+           Message("Обработка данных из "+PmTableName);
+           //нужно, чтобы показать в индикаторе кол-во обрабатываемых записей
+           cmd = DL_RSDCommand("SELECT 1 FROM D_FO07_TMP t");
+           NRec = cmd.GetCount();
+           if (isPFI)
+              NumImportPFI = NumImportPFI + NRec;
+           else
+              if (DVKind == DERIVATIVE_FUTURES) 
+                 cmdSP = RSDCommand("SELECT SUM( DECODE(t.t_Low, 0, 0, 1) + DECODE(t.t_High, 0, 0, 1) + DECODE(t.t_Tick_Price, 0, 0, 1) + DECODE(t.t_Settl, 0, 0, 1) + DECODE(t.t_Close, 0, 0, 1) + " +
+                                    "            CASE WHEN t.t_FI_Kind = "+FIKIND_ARTICLE+" THEN DECODE(t.t_Settl, 0, 0, 1) WHEN t.t_FI_Kind = 0 THEN 0 ELSE DECODE(t.t_Settl_RUR, 0, 0, 1) END " +
+                                    "          ) CNT " +
+                                    "  FROM D_FO07_TMP t");
+              else
+                 cmdSP = RSDCommand("SELECT SUM( DECODE(t.t_Low, 0, 0, 1) + DECODE(t.t_High, 0, 0, 1) + DECODE(t.t_Tick_Price, 0, 0, 1) + DECODE(t.t_TheorPrice, 0, 0, 1) + DECODE(t.t_Close, 0, 0, 1) " +
+                                    "          ) CNT " +
+                                    "  FROM D_FO07_TMP t");
+              end;
+              var rs = TRsbDataSet(cmdSP);
+              if(rs.moveNext())
+                 NumImportRate = NumImportRate + SQL_ConvTypeInteger(rs.cnt);
+              end;
+           end;
+        
+           FilesName = "";
+           if( not stat )
+             stat = GetFileName( Synonim, "D_FO07_TMP", @FilesName, @ErrMes);
+           end; 
+
+           if( (NRec > 0) and (not stat) )
+              RGLog.Message("Используются файлы: \n" + FilesName);
+              OldOutPut = SetOutput( ReportFileName, TRUE );
+              println( "Начало обработки данных из "+PmTableName+" " + time() );
+              if(GetDialogFlag())
+                 InitProgress(NRec, "Загрузка внешнего файла ПИ", "ОБРАБОТКА ВХОДНЫХ ДАННЫХ ИЗ "+PmTableName);
+              end;
+
+              cmdSP = RSDCommand("BEGIN ? := RSB_GTIM_CSV.CreateReplRecByTmp_FO07(?, ?, ?, ?, ?, ?); END;");
+              cmdSP.addParam("stat", RSDBP_OUT, V_INTEGER);
+              cmdSP.addParam("", RSDBP_IN, SeanceID);
+              cmdSP.addParam("", RSDBP_IN, Pan.imp_date);
+              cmdSP.addParam("", RSDBP_IN, SOURCE_CODE);
+              cmdSP.addParam("", RSDBP_IN, DVKind);
+              cmdSP.addParam("", RSDBP_IN, isPFI);
+              cmdSP.addParam("", RSDBP_IN, GetStorPrPrmStr(Pan)); //прочие параметры
+              cmdSP.Execute();
+              stat = Int(cmdSP.value("stat"));
+
+              if(GetDialogFlag())
+                 RemProgress();
+              end;
+              println( "Конец обработки данных из "+PmTableName+" " + time() );
+              SetOutput( OldOutPut, TRUE ); 
+           end;
+        end;
+        if( (NRec > 0) and (not stat) )
+           OldOutPut = SetOutput( ReportFileName, TRUE );
+           println( "Начало обновления таблицы в Payments для записей " +PmTableName+" " + time() );
+           Message("Обновление данных в Payments");
+           if (DVKind == DERIVATIVE_FUTURES)
+              cmdSP = RSDCommand("BEGIN ? := RSB_GTIM_CSV.UpdateF07_PM(?, ?, ?, ?); END;");
+           else
+              cmdSP = RSDCommand("BEGIN ? := RSB_GTIM_CSV.UpdateO07_PM(?, ?, ?, ?); END;");
+           end;
+           cmdSP.addParam("stat", RSDBP_OUT, V_INTEGER);
+           cmdSP.addParam("", RSDBP_IN, SeanceID);
+           cmdSP.addParam("", RSDBP_IN, SOURCE_CODE);
+           cmdSP.addParam("", RSDBP_IN, Synonim);
+           cmdSP.addParam("", RSDBP_IN, isPFI);
+           cmdSP.Execute();
+           stat = Int(cmdSP.value("stat"));
+           println( "Конец обновления таблицы в Payments для записей " +PmTableName+" " + time() );
+           SetOutput( OldOutPut, TRUE );
+           Progress.Use();
+        end;
+        Progress.Remove();                                  
+        if(ErrMes != "")
+           RGLog.Error("Внимание! "+ErrMes);
+           ErrMes = "";
+        elif (NRec == 0)
+           RGLog.Message("Нет данных для загрузки.");
+        end;
+        isErr = ( isErr or (stat != 0) );
+     end;                                      
+  end;
+  if( (((NumImportPFI == 0) and (isPFI)) or ((NumImportRate == 0) and (not isPFI))) and (isErr) ) 
+     RGLog.GetAndAddReceiveStorPrLog(IIF(isPFI, RG_PFI, RG_RATE));
+  else
+     Progress.Init( 2, "Выполняется заполнение протокола", "Заполнение протокола"  );
+     /*загрузить в лог информацию о загруженных ЗР*/
+     Message("Заполнение протокола");
+     if (isPFI)
+        RGLog.GetAndAddReceiveLoadRecsMass(RG_PFI,"Спецификация ПИ с кодом \"","\" уcпешно загружена в шлюз", @NumImportPFITotal, PrintOnlyErr);
+     else
+        RGLog.GetAndAddReceiveLoadRecsMass(RG_RATE,"Котировка с кодом \"","\" уcпешно загружена в шлюз", @NumImportRateTotal, PrintOnlyErr);
+     end;
+     RGLog.GetAndAddReceiveStorPrLog(IIF(isPFI, RG_PFI, RG_RATE));     
+     Progress.Use();
+     /* сообщаем о результатах загрузки */
+     if (isPFI)
+        RGLog.Message("Всего обработано спецификаций ПИ из Шлюза Payments - " + string(NumImportPFI) + "\nиз них успешно - " + string(NumImportPFITotal) + "\nошибочно - " + string(NumImportPFI - NumImportPFITotal));
+     else
+        RGLog.Message("Всего обработано курсов для ПИ из Шлюза Payments - " + string(NumImportRate) + "\nиз них успешно - " + string(NumImportRateTotal) + "\nошибочно - " + string(NumImportRate - NumImportRateTotal));
+     end;
+     
+     Progress.Use();
+     Progress.Remove();
+  end; 
+
+OnError(ErObj)
+  if(GetDialogFlag())
+    RemProgress(); RemProgress();
+  end;
+  MsgBox("Модуль: " + string(ErObj.Module) + "\nСтрока: " + string(ErObj.Line) + "\nКод ошибки: " + string(ErObj.Code) + "\n" + ErObj.Message);
+  RunError;
+end;
+
+private macro ImportCom( Pan ) // Загрузка комиссий и сборов из файлов pay.csv
+
+  var FilesName:string = "";
+  var cmd:DL_RSDCommand = NULL, cmdSP:RSDCommand = NULL;
+  var NameDate = FileDateInName(Pan.imp_date);
+  var NRec:integer = 0, stat:integer = 0;
+  var hour, min, sec;
+  var OldOutPut;
+  NumImportCom = 0; NumImportComTotal = 0;
+  var TmpNumImportComTotal:integer = 0;
+
+  RGLog.Message("ЗАГРУЗКА КОМИССИЙ И СБОРОВ ИЗ PAY");
+
+  stat = 0;
+  if(CheckFileUpload(Synonim, "pay", pan.beg_date, pan.end_date, @ErrMes))
+     RGLog.Message("ПРЕДУПРЕЖДЕНИЕ: Внимание! "+ErrMes, null, LOAD_WARNING); //Предупреждение загрузки об отсутствии файлов
+     ErrMes = "";
+  else
+     Progress.Init(2, "Выполняется очистка данных", "Очистка данных");
+     OldOutPut = SetOutput(ReportFileName, TRUE);
+     println("Начало очистки таблицы для записей PAY " + time());
+     cmdSP = RSDCommand("BEGIN ? := RSB_GTIM_CSV.DelPAY(?, ?); END;");
+     cmdSP.addParam("stat", RSDBP_OUT, V_INTEGER);
+     cmdSP.addParam("", RSDBP_IN, SeanceID);
+     cmdSP.addParam("", RSDBP_IN, SOURCE_CODE);
+     cmdSP.Execute();
+     stat = Int(cmdSP.value("stat"));
+     Message("Очистка таблицы для записей PAY");
+     Progress.Use();
+     println("Конец очистки таблицы для записей PAY " + time());
+     SetOutput(OldOutPut, TRUE);
+     Progress.Use();
+     Progress.Remove();
+   
+     Progress.Init(3, "Выполняется обработка данных", "Обработка данных");
+     if(not stat)
+        OldOutPut = SetOutput( ReportFileName, TRUE );
+        println("Начало заполнения таблицы из PAY " + time());
+        cmdSP = RSDCommand("BEGIN ? := RSB_GTIM_CSV.FillFromPAY(?, ?, ?, ?, ?); END;");
+        cmdSP.addParam("stat", RSDBP_OUT, V_INTEGER);
+        cmdSP.addParam("", RSDBP_IN, SeanceID);
+        cmdSP.addParam("", RSDBP_IN, SOURCE_CODE);
+        cmdSP.addParam("", RSDBP_IN, Synonim);
+        cmdSP.addParam("", RSDBP_IN, pan.beg_date);
+        cmdSP.addParam("", RSDBP_IN, pan.end_date);
+        cmdSP.Execute();
+        stat = Int(cmdSP.value("stat"));
+        Message("Заполнение таблицы из PAY");
+        Progress.Use();
+        println("Конец заполнения таблицы из PAY " + time());
+        SetOutput(OldOutPut, TRUE);
+   
+        Message("Обработка данных из PAY");
+        //нужно, чтобы показать в индикаторе кол-во обрабатываемых записей
+        cmd = DL_RSDCommand("SELECT 1 FROM D_PAY_TMP t");
+        NRec = cmd.GetCount();
+        NumImportCom = NRec;
+   
+        if(not stat)
+           stat = GetFileName(Synonim, "D_PAY_TMP", @FilesName, @ErrMes);
+        end;
+   
+        if((NRec > 0) and (not stat))
+           OldOutPut = SetOutput(ReportFileName, TRUE);
+           Message("Обновление данных для комиссий, сборов: объекты");
+           println("Начало обновления объектов для записей PAY " + time());
+           cmdSP = RSDCommand("BEGIN ? := RSB_GTIM_CSV.UpdateObjPAY(?, ?); END;");
+           cmdSP.addParam("stat", RSDBP_OUT, V_INTEGER);
+           cmdSP.addParam("", RSDBP_IN, SeanceID);
+           cmdSP.addParam("", RSDBP_IN, SOURCE_CODE);
+           cmdSP.Execute();
+           Progress.Use();
+           println("Конец обновления объектов для записей PAY " + time());
+           SetOutput(OldOutPut, TRUE);
+        end;
+   
+        if((NRec > 0) and (not stat))
+           RGLog.Message("Используются файлы: \n" + FilesName);
+           OldOutPut = SetOutput(ReportFileName, TRUE);
+           println("Начало обработки данных из PAY " + time());
+           if(GetDialogFlag())
+              InitProgress(NRec, "Загрузка внешнего файла комиссий, сборов", "ОБРАБОТКА ВХОДНЫХ ДАННЫХ ИЗ PAY");
+           end;
+   
+           cmdSP = RSDCommand("BEGIN ? := RSB_GTIM_CSV.CreateReplRecByTmp_PAY(?, ?); END;");
+           cmdSP.addParam("stat", RSDBP_OUT, V_INTEGER);
+           cmdSP.addParam("", RSDBP_IN, SeanceID);
+           cmdSP.addParam("", RSDBP_IN, SOURCE_CODE);
+           cmdSP.Execute();
+           stat = Int(cmdSP.value("stat"));
+   
+           if(GetDialogFlag())
+              RemProgress();
+           end;
+           println("Конец обработки данных из PAY " + time());
+           SetOutput(OldOutPut, TRUE); 
+        end;
+     end;
+   
+     if((NRec > 0) and (not stat))
+        OldOutPut = SetOutput(ReportFileName, TRUE);
+        println("Начало обновления таблицы в Payments для записей PAY " + time());
+        Message("Обновление данных в Payments");
+        cmdSP = RSDCommand("BEGIN ? := RSB_GTIM_CSV.UpdatePAY_PM(?, ?, ?); END;");
+        cmdSP.addParam("stat", RSDBP_OUT, V_INTEGER);
+        cmdSP.addParam("", RSDBP_IN, SeanceID);
+        cmdSP.addParam("", RSDBP_IN, SOURCE_CODE);
+        cmdSP.addParam("", RSDBP_IN, Synonim);
+        cmdSP.Execute();
+        stat = Int(cmdSP.value("stat"));
+        println("Конец обновления таблицы в Payments для записей PAY " + time());
+        SetOutput(OldOutPut, TRUE);
+        Progress.Use();
+     end; 
+     Progress.Remove();
+
+     if(stat and (ErrMes != ""))
+        RGLog.Error("Внимание! "+ErrMes);      
+     elif(stat)
+        RGLog.GetAndAddReceiveStorPrLog(RG_DEFCOMM); 
+        RGLog.GetAndAddReceiveStorPrLog(RG_MONEYMOTION); 
+     elif(NumImportCom == 0)
+        RGLog.Message("Нет данных для загрузки.");
+     else
+        Progress.Init(2, "Выполняется заполнение протокола", "Заполнение протокола");
+        /*загрузить в лог информацию о загруженных ЗР*/
+        Message("Заполнение протокола");
+        RGLog.GetAndAddReceiveLoadRecsMass(RG_DEFCOMM, "Комиссия с кодом \"", "\" уcпешно загружена в шлюз", @NumImportComTotal, PrintOnlyErr);
+        RGLog.GetAndAddReceiveStorPrLog(RG_DEFCOMM); 
+        RGLog.GetAndAddReceiveLoadRecsMass(RG_MONEYMOTION, "Перевод с кодом \"", "\" уcпешно загружен в шлюз", @TmpNumImportComTotal, PrintOnlyErr);
+        RGLog.GetAndAddReceiveStorPrLog(RG_MONEYMOTION); 
+        NumImportComTotal = NumImportComTotal + TmpNumImportComTotal;
+        Progress.Use();
+        /* сообщаем о результатах загрузки */
+        RGLog.Message("Всего обработано комиссий, сборов из Шлюза Payments - " + string(NumImportCom) + "\nиз них успешно - " + string(NumImportComTotal) + "\nошибочно - " + string(NumImportCom - NumImportComTotal));
+        Progress.Use();
+        Progress.Remove();
+     end;
+  end;
+
+OnError(ErObj)
+  if(GetDialogFlag())
+    RemProgress(); RemProgress();
+  end;
+  MsgBox("Модуль: " + string(ErObj.Module) + "\nСтрока: " + string(ErObj.Line) + "\nКод ошибки: " + string(ErObj.Code) + "\n" + ErObj.Message);
+  RunError;
+end;
+
+private macro ImportMon( Pan ) // Загрузка информации о договорах обслуживания из файлов mon.csv
+  var FilesName:string = "";
+  var cmd:DL_RSDCommand = NULL, cmdSP:RSDCommand = NULL;
+  var NRec:integer = 0, stat:integer = 0;
+  var hour, min, sec;
+  var OldOutPut;
+  NumImportMon = 0; NumImportMonTotal = 0;
+
+  RGLog.Message("ЗАГРУЗКА ИНФОРМАЦИИ О ДОГОВОРАХ ОБСЛУЖИВАНИЯ ИЗ MON");
+
+  if(CheckFileUpload(Synonim, "mon", pan.beg_date, pan.end_date, @ErrMes))
+     RGLog.Message("ПРЕДУПРЕЖДЕНИЕ: Внимание! "+ErrMes, null, LOAD_WARNING); //Предупреждение загрузки об отсутствии файлов
+     ErrMes = "";
+     if(not stat)
+        Progress.Init(2, "Выполняется очистка данных", "Очистка данных");
+     OldOutPut = SetOutput( ReportFileName, TRUE );
+        println("Начало очистки таблицы для записей MON " + time());
+        cmdSP = RSDCommand("BEGIN ? := RSB_GTIM_CSV.DelMON(?, ?); END;");
+        cmdSP.addParam("stat", RSDBP_OUT, V_INTEGER);
+        cmdSP.addParam("", RSDBP_IN, SeanceID);
+        cmdSP.addParam("", RSDBP_IN, SOURCE_CODE);
+        cmdSP.Execute();
+        stat = Int(cmdSP.value("stat"));
+        Message("Очистка таблицы для записей MON");
+        Progress.Use();
+        println("Конец очистки таблицы для записей MON " + time());
+        SetOutput(OldOutPut, TRUE);
+        Progress.Use();
+        Progress.Remove();
+     end;
+
+     Progress.Init(3, "Выполняется обработка данных", "Обработка данных");
+     if(not stat)
+        OldOutPut = SetOutput( ReportFileName, TRUE );
+        println("Начало заполнения таблицы из MON " + time());
+        cmdSP = RSDCommand("BEGIN ? := RSB_GTIM_CSV.FillFromMON(?, ?, ?, ?, ?); END;");
+        cmdSP.addParam("stat", RSDBP_OUT, V_INTEGER);
+        cmdSP.addParam("", RSDBP_IN, SeanceID);
+        cmdSP.addParam("", RSDBP_IN, SOURCE_CODE);
+        cmdSP.addParam("", RSDBP_IN, Synonim);
+        cmdSP.addParam("", RSDBP_IN, pan.beg_date);
+        cmdSP.addParam("", RSDBP_IN, pan.end_date);
+        cmdSP.Execute();
+        stat = Int(cmdSP.value("stat"));
+        Message("Заполнение таблицы из MON");
+        Progress.Use();
+        println("Конец заполнения таблицы из MON " + time());
+        SetOutput(OldOutPut, TRUE);
+
+        Message("Обработка данных из MON");
+        //нужно, чтобы показать в индикаторе кол-во обрабатываемых записей
+        cmd = DL_RSDCommand("SELECT 1 FROM D_MON_TMP t");
+        NRec = cmd.GetCount();
+        NumImportMon = NRec;
+
+        if(not stat)
+           stat = GetFileName(Synonim, "D_MON_TMP", @FilesName, @ErrMes);
+        end;
+
+        if((NRec > 0) and (not stat))
+           OldOutPut = SetOutput(ReportFileName, TRUE);
+           Message("Обновление данных для информации о договорах обслуживания: объекты");
+           println("Начало обновления объектов для записей MON " + time());
+           cmdSP = RSDCommand("BEGIN ? := RSB_GTIM_CSV.UpdateObjMON(?, ?); END;");
+           cmdSP.addParam("stat", RSDBP_OUT, V_INTEGER);
+           cmdSP.addParam("", RSDBP_IN, SeanceID);
+           cmdSP.addParam("", RSDBP_IN, SOURCE_CODE);
+           cmdSP.Execute();
+           Progress.Use();
+           println("Конец обновления объектов для записей MON " + time());
+           SetOutput(OldOutPut, TRUE);
+        end;
+
+        if((NRec > 0) and (not stat))
+           RGLog.Message("Используются файлы: \n" + FilesName);
+           OldOutPut = SetOutput(ReportFileName, TRUE);
+           println("Начало обработки данных из MON " + time());
+           if(GetDialogFlag())
+              InitProgress(NRec, "Загрузка внешнего файла информации по договорам обслуживания", "ОБРАБОТКА ВХОДНЫХ ДАННЫХ ИЗ MON");
+           end;
+
+           cmdSP = RSDCommand("BEGIN ? := RSB_GTIM_CSV.CreateReplRecByTmp_MON(?, ?); END;");
+           cmdSP.addParam("stat", RSDBP_OUT, V_INTEGER);
+           cmdSP.addParam("", RSDBP_IN, SeanceID);
+           cmdSP.addParam("", RSDBP_IN, SOURCE_CODE);
+           cmdSP.Execute();
+           stat = Int(cmdSP.value("stat"));
+
+           if(GetDialogFlag())
+              RemProgress();
+           end;
+           println("Конец обработки данных из MON " + time());
+           SetOutput(OldOutPut, TRUE); 
+        end;
+     end;
+
+     if((NRec > 0) and (not stat))
+        OldOutPut = SetOutput(ReportFileName, TRUE);
+        println("Начало обновления таблицы в Payments для записей MON " + time());
+        Message("Обновление данных в Payments");
+        cmdSP = RSDCommand("BEGIN ? := RSB_GTIM_CSV.UpdateMON_PM(?, ?, ?); END;");
+        cmdSP.addParam("stat", RSDBP_OUT, V_INTEGER);
+        cmdSP.addParam("", RSDBP_IN, SeanceID);
+        cmdSP.addParam("", RSDBP_IN, SOURCE_CODE);
+        cmdSP.addParam("", RSDBP_IN, Synonim);
+        cmdSP.Execute();
+        stat = Int(cmdSP.value("stat"));
+        println("Конец обновления таблицы в Payments для записей MON " + time());
+        SetOutput(OldOutPut, TRUE);
+        Progress.Use();
+     end; 
+     Progress.Remove();                                   
+
+     if(stat and (ErrMes != ""))
+        RGLog.Error("Внимание! "+ErrMes);      
+     elif( stat )
+        RGLog.GetAndAddReceiveStorPrLog(RG_MON);
+     elif(NumImportMon == 0)
+        RGLog.Message("Нет данных для загрузки.");
+     else
+        Progress.Init(2, "Выполняется заполнение протокола", "Заполнение протокола");
+        /*загрузить в лог информацию о загруженных ЗР*/
+        Message("Заполнение протокола");
+        RGLog.GetAndAddReceiveLoadRecsMass(RG_MON, "Информация о договоре обслуживания клиента с кодом \"", "\" уcпешно загружена в шлюз", @NumImportMonTotal, PrintOnlyErr);
+        RGLog.GetAndAddReceiveStorPrLog(RG_MON);
+        Progress.Use();
+        /* сообщаем о результатах загрузки */
+        RGLog.Message("Всего обработано информации о договорах обслуживания из Шлюза Payments - " + string(NumImportMon) + "\nиз них успешно - " + string(NumImportMonTotal) + "\nошибочно - " + string(NumImportMon - NumImportMonTotal));
+        Progress.Use();
+        Progress.Remove();
+     end;
+  end;
+OnError(ErObj)
+  if(GetDialogFlag())
+    RemProgress(); RemProgress();
+  end;
+  MsgBox("Модуль: " + string(ErObj.Module) + "\nСтрока: " + string(ErObj.Line) + "\nКод ошибки: " + string(ErObj.Code) + "\n" + ErObj.Message);
+  RunError;
+end;
+
+private macro CheckPanel( Pan ):bool
+
+  if( Pan.imp_date == date(0,0,0) )
+     MsgBox("Не задана дата импорта");
+     return false;
+  end;
+
+  if( Pan.beg_date == date(0,0,0) )
+     MsgBox("Не задана дата начала периода");
+     return false;
+  end;
+
+  if( Pan.end_date == date(0,0,0) )
+     MsgBox("Не задана дата окончания периода");
+     return false;
+  end;
+
+  if( Pan.end_date < Pan.beg_date )
+     MsgBox("Дата окончания периода не может быть меньше даты начала периода");
+     return false;
+  end;
+
+  if( Pan.imp_date < Pan.end_date )
+     MsgBox("Дата окончания периода не может быть больше даты импорта");
+     return false;
+  end;
+
+  if( (Pan.order_num == "") and ((Pan.file_pos == SET_CHAR) or (Pan.file_deals == SET_CHAR) or (Pan.file_itog == SET_CHAR)) )
+     MsgBox("Не задан номер отчета биржи");
+     return false;
+  end;
+
+  if( (Pan.futures == "") and (Pan.option == "") and (Pan.file_coms != SET_CHAR) and (Pan.file_mon != SET_CHAR) )
+     MsgBox("Не выбран ни один из видов операций");
+     return false;
+  end;
+
+  if( (Pan.file_pos == UNSET_CHAR) and (Pan.file_deals == UNSET_CHAR) and (Pan.file_itog == UNSET_CHAR) and (Pan.file_request == UNSET_CHAR) and (Pan.file_coms == UNSET_CHAR)  and (Pan.file_mon == UNSET_CHAR) )
+     MsgBox("Не выбран ни один из видов загрузочных файлов");
+     return false;
+  end;
+
+  if( (Pan.file_coms == SET_CHAR) and (Pan.com_code == "") )
+     MsgBox("Не выбран код разовой комиссии, которая будет использоваться при загрузке данных о комиссиях и сборах");
+     return false;
+  end;
+
+  return true;
+end;
+
+private macro СледующийНомерОтчетаБиржи()
+   var sql,rs;
+   sql = " SELECT to_char(COUNT(*)+1) cnt FROM ddvoper_dbt t WHERE t.t_dockind = 194 AND t.t_operkind = 12600" ;
+
+   rs = TRsbDataSet(sql);
+     if(rs.moveNext())
+      return rs.cnt;
+   else
+      return "1";
+   end;
+end; 
+
+private macro RunInitItog( Pan )
+  Pan.imp_date      = {curdate};
+  Pan.beg_date      = {curdate};
+  Pan.end_date      = {curdate};
+  Pan.futures       = SET_CHAR;
+  Pan.option        = SET_CHAR;
+  Pan.file_pos      = SET_CHAR;
+  Pan.file_deals    = SET_CHAR;
+  Pan.file_itog     = SET_CHAR;
+  Pan.file_request  = SET_CHAR;
+  Pan.file_coms     = SET_CHAR; 
+  Pan.com_code      = "МскБиржСбор";
+  Pan.file_mon      = SET_CHAR;
+  Pan.impNewFutures = SET_CHAR;
+  Pan.impNewOption  = SET_CHAR;
+  Pan.order_num     = СледующийНомерОтчетаБиржи();
+  Com_Num = 1001;//TEG номер комиссии
+end;
+
+private macro RunImportCSV( Pan )
+
+  var RetVal = CM_SAVE;
+
+  RGLog = GTDL_Log(SeanceID);
+
+  if( CheckPanel(Pan) == false )
+     RetVal = CM_IGNORE;
+  end;
+
+  if( RetVal != CM_IGNORE )
+     Synonim = GetShemePathGATE();
+     if(Synonim == "")
+       if(GetDialogFlag())
+           MsgBox ("Не найдена схема Payments");
+       else
+           RGLog.Error("Внимание! Не найдена схема Payments");
+       end;
+       RetVal = CM_IGNORE;
+     end;
+
+     var hour, min, sec;
+     var NameDate = FileDateInName(Pan.imp_date);
+
+     TimeSplit( Time(), hour, min, sec); 
+     ReportFileName = GetTxtFileName( "gtImCSVP_" + NameDate + hour + min + sec);
+
+     PrintOnlyErr = ВыводитьВПротоколТолькоОшибки(@ErrMes);
+     if( ErrMes != "" )
+        RGLog.Error("Внимание! "+ErrMes);      
+     end;
+
+     if( Pan.file_itog == SET_CHAR )
+        if((Pan.impNewFutures == SET_CHAR) OR (Pan.impNewOption == SET_CHAR))
+           ImportPFI( Pan.impNewFutures, Pan.impNewOption, Pan, 1);
+        end;  
+        ImportPFI( Pan.futures, Pan.option, Pan, 0 );
+     end;
+     if (Pan.file_deals == SET_CHAR)
+        ImportDeal( Pan.futures, Pan.option, Pan )
+     end;
+     if (Pan.file_pos == SET_CHAR)
+        ImportPosition( Pan.futures, Pan.option, Pan )
+     end;
+     if( Pan.file_request == SET_CHAR )
+        ImportRequest( Pan.futures, Pan.option, Pan )
+     end;
+     if( Pan.file_coms == SET_CHAR )
+        ImportCom( Pan ); 
+     end;
+     if( Pan.file_mon  == SET_CHAR ) 
+        ImportMon( Pan ); 
+     end;
+  end;
+
+  RGLog.Save();
+
+  return RetVal;
+end;
+
+/*листалка комиссий*/                         
+PRIVATE MACRO RG_ListSfComiss( Pan:@variant, FeeType:integer, ServiceKind:integer, Com_Num:@string ):BOOL
+  VAR Choice = DL_Scroll("SELECT com1.t_code t_code, com1.t_name t_name, COM1.T_NUMBER T_NUMBER, com1.t_datebegin t_datebegin, com1.t_dateend t_dateend, level "
+                        +"  FROM dsfcomiss_dbt com1 " 
+                        +" WHERE com1.T_FEETYPE = "+string(SF_FEE_TYPE_PERIOD)+" and com1.t_servicekind = "+string(PTSK_DV)
+                        +"   and not EXISTS (SELECT 1 "
+                        +"                     FROM dsfconcom_dbt concom1 "
+                        +"                    WHERE com1.t_feetype = concom1.t_feetype "
+                        +"                      AND com1.t_number = concom1.t_commnumber "
+                        +"                      AND concom1.t_ObjectType = "+string(OBJTYPE_SFPLAN)
+                        +"                      AND concom1.t_SfPlanID = 0 "
+                        +"                      AND (concom1.t_DateBegin = to_date('01.01.0001','DD.MM.YYYY') " 
+                        +"                           OR ( concom1.t_DateBegin <= "+GetSQLDate(Pan.beg_date)
+                        +"                               AND (concom1.t_DateEnd = to_date('01.01.0001','DD.MM.YYYY') OR concom1.t_DateEnd > "+GetSQLDate(Pan.beg_date)+") "
+                        +"                              ) "
+                        +"                          ) "
+                        +"                  ) " 
+                        +"   START WITH com1.t_ParentComissID = 0 CONNECT BY PRIOR com1.t_ComissID = com1.t_ParentComissID ORDER SIBLINGS BY com1.t_Code ",
+                         "Комиссия", -1/*X*/, 15/*Y*/,
+                         "t_Code","Код","t_Name","Наименование","t_Number","Номер",
+                         "t_DateBegin","Дата нач.","t_DateEnd","Дата оконч."
+                        );
+  if( Choice != NULL )
+     Com_Num     = Choice.Value("t_Number");
+     Pan.com_code = Choice.Value("t_Code"); 
+  end;
+  return (Choice != NULL);
+END;
+
+private macro ProcessPanel( Pn, Cmd, ID, Key )
+
+  if( Cmd == DLG_INIT )
+     RunInitItog(Pn);
+     UpdateFields(Pn);
+  elif( Cmd == DLG_KEY )
+     if( (key == 317) AND (ID == PNFLD_IMPDATE) ) /* F3 */
+        Pn.imp_date = GetDateByCalendar(Pn.imp_date);
+        UpdateFields(Pn);
+     elif( (key == 317) AND (ID == PNFLD_BEGDATE) ) /* F3 */
+        Pn.beg_date = GetDateByCalendar(Pn.beg_date);
+        UpdateFields(Pn);
+     elif( (key == 317) AND (ID == PNFLD_ENDDATE) ) /* F3 */
+        Pn.end_date = GetDateByCalendar(Pn.end_date);
+        UpdateFields(Pn);
+     elif( (key == 317) AND (ID == PNFLD_COM_CODE) ) /* F3 */
+        RG_ListSfComiss( Pn, SF_FEE_TYPE_ONCE, PTSK_DV, @Com_Num );
+        UpdateFields(Pn);
+     elif( Key == 316 )
+        return RunImportCSV(Pn);
+     elif( (Key == 13) or (Key == 323) )
+        return CM_IGNORE;
+     elif( Key == 32 ) /* Пробел */
+        if( (ID == PNFLD_FILE_FUTURES) OR (ID == PNFLD_FILE_OPTION) OR (ID == PNFLD_FILE_POS) OR (ID == PNFLD_FILE_DEALS) OR (ID == PNFLD_FILE_ITOG) OR (ID == PNFLD_FILE_REQUEST) OR (ID == PNFLD_FILE_COMS) OR (ID == PNFLD_FILE_MON) OR (ID == PNFLD_FILE_STD_FUTURES) OR (ID == PNFLD_FILE_STD_OPTION) )
+           if ( Pn(ID) == SET_CHAR ) Pn(ID) = UNSET_CHAR; 
+           else                      Pn(ID) = SET_CHAR;
+           end;
+           if( ID == PNFLD_FILE_COMS )
+              if( Pn(ID) != SET_CHAR )
+                 DisableFields( Pn, PNFLD_COM_CODE );
+              else
+                 EnableFields( Pn, PNFLD_COM_CODE );
+              end;
+           end;
+           UpdateFields(Pn);
+        end;
+     end;
+  end;
+
+  return CM_DEFAULT;
+end;
+
+macro Process( SeanceID, Parms )
+end;
+
+macro Receive( _SeanceID:integer, Parm:variant )
+  SeanceID = _SeanceID;
+  
+  if( IsShedulerRunning() )
+     RunInitItog(pp);
+     AutoSetParm(pp, Parm);                     // пар-ры из панели источника
+     AutoSetParm(pp, GetShedulerCommandLine()); // пар-ры из задания планировщика
+     RunImportCSV(pp);
+  else
+     var autoproc;
+     if( (GetParm(2, autoproc)) and (valtype(autoproc) == V_BOOL) and (autoproc) )
+        RunInitItog(pp);
+        AutoSetParm(pp, Parm);
+        RunImportCSV(pp);
+     else
+        RunDialog(pp, "ProcessPanel");
+     end;
+  end;
+
+  return 0;
+end;
+
+macro Deliver( SeanceID, Parm )
+end;

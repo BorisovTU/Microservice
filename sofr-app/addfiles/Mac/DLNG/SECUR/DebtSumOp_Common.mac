@@ -1,0 +1,929 @@
+/**                                                                                                             
+ @file  DebtSumOp_Common.mac                                                                                           
+ @brief Прослойка для сервисных операции Автоматического выноса задолженности на просрочку и Автоматического списания задолженности                                                                         
+                                                                                                                
+ #tag                                                                                                          
+ - functional_block:СО                                                                             
+ - code_type:GUI 
+ - code_type:API                                                                                                                                                                                               
+                                                                                                                
+ # changeLog                                                                                                    
+ |date       |author         |tasks               |note                                                         
+ |-----------|---------------|--------------------|-------------------------------------------------------------
+ |2025.03.31 |Жиц М.В.       |BOSS-2183           |Создание макроса прослойки                                                                                                                                                 
+*/ 
+
+import SecInter, spRepFun, dl_car, "bnk_common.mac";
+
+CONST CHUNK_SIZE = 32000; //Размер буфера для записи в Clob
+
+/*Виды сообщений в протоколе*/
+CONST ISSUE_ERROR   = 1, /*ошибка*/
+      ISSUE_WARNING = 2; /*предупреждение*/ 
+
+/*Типы задолженности по брокерскому обслуживанию*/
+CONST DEBT_FIX_COM       = 1, /*Минимальная брокерская комиссия*/
+      DEBT_INVEST_COM    = 2, /*Комиссия брокера в рамках услуги инвестиционного консультирования*/
+      DEBT_DEAL_COM_2022 = 3, /*Просроченная брокерская комиссия по сделкам 2022 года*/
+      DEBT_DEAL_COM_2023 = 4, /*Просроченная брокерская комиссия по сделкам 2023 года*/
+      DEBT_EXPIRED       = 5; /*Прочая просроченная задолженность*/
+
+CONST COMMISS_BROKER_FIX    = "БрокерФикс", 
+      COMMISS_INVEST_ADVISE = "ИнвестСоветник";
+
+/*Статусы записи в реестре*/
+CONST DEBTREESTR_STATE_ACTIVE  = 1, /*активна*/
+      DEBTREESTR_STATE_REMOVED = 2; /*удалена*/
+
+/*Виды дат шагов*/
+CONST SFDEF_PERIOD_OPRDATE_COMISSOVERDUE = 1; /*Вынос на просрочку*/
+
+/*Виды первичных документов*/
+CONST SFDOC_DEF_PERIOD = 51; /*Удержанная периодическая комиссия*/        
+
+/**
+ @brief Класс параметров записи реестра прочей задолженности
+ @param[in] _DebtID идентификатор общей задолженности из реестра задолженности
+*/                    
+CLASS ExpiredDebtReestrParams(_DebtID:integer)
+  var DebtID = _DebtID;
+  var ClientID:integer = -1,         //Идентификатор клиента
+      DlContrID:integer = -1,        //Идентификатор ДБО
+      SfContrID:integer = -1,        //Идентификатор субдоговора
+      DebtDate:date = date(0,0,0),   //Дата возникновения задолженности
+      DebtSum:money = $0.0,          //Сумма задолженности
+      DebtCurrency:integer = NATCUR, //Валюта задолженности
+      DebtAccID:integer = 0,         //Идентификатор счета клиента по прочей задолженности
+      Debt458AccID:integer = 0,      //Идентификатор счета клиента по учету просроченной задолженности
+      State:integer = DEBTREESTR_STATE_ACTIVE; //Статус задолженности
+
+  /**
+   @brief Инициализация параметров записи в случае редактирования/просмотра существующей задолженности
+  */                    
+  PRIVATE MACRO InitParams()
+    var cmd, DataSet;
+
+    if(ValType(DebtID) == V_UNDEF)
+      DebtID = 0;
+      return;
+    end;
+
+    cmd = DL_RSDCommand("SELECT * FROM ddl_debtreestr_dbt WHERE t_ID = ? ");
+    cmd.AddParam(DebtID);
+
+    DataSet = cmd.Execute();
+    if(DataSet.moveNext())
+      ClientID = DataSet.ClientID;
+      DlContrID = DataSet.DlContrID;
+      SfContrID = DataSet.SfContrID;
+      DebtDate = DataSet.DebtDate;
+      DebtSum = DataSet.DebtSum;
+      DebtCurrency = DataSet.DebtCurrency;
+      DebtAccID = DataSet.DebtAccID;
+      Debt458AccID = DataSet.Debt458AccID;
+      State = DataSet.State;
+    end;
+  END;
+
+  /**
+   @brief Дозаполнение оставшихся параметров к вставке (ID клиента и ДБО)
+  */                    
+  MACRO FillInsertableParams()
+    var cmd, DataSet;
+
+    cmd = DL_RSDCommand("SELECT sf.t_PartyID, mp.t_DlContrID " + 
+                        "  FROM dsfcontr_dbt sf, ddlcontrmp_dbt mp " +
+                        " WHERE sf.t_ID = ? " + 
+                        "   AND mp.t_SfContrID = sf.t_ID "
+                       );
+    cmd.AddParam(SfContrID);
+
+    DataSet = cmd.Execute();
+    if(DataSet.moveNext())
+      ClientID = DataSet.PartyID;
+      DlContrID = DataSet.DlContrID;
+    end;
+  END;
+
+  /**
+   @brief Дозаполнение счетов задолженности
+  */                    
+  MACRO FillDebtAccounts()
+    var cmd, DataSet;
+
+    cmd = DL_RSDCommand("SELECT NVL((SELECT /*+ ordered use_nl(mc) index(mc DMCACCDOC_DBT_IDXC)*/ DISTINCT acc.t_AccountID " +
+                        "              FROM dmcaccdoc_dbt mc, daccount_dbt acc " +
+                        "             WHERE mc.t_CatID = (SELECT cat.t_ID FROM dmccateg_dbt cat WHERE cat.t_LevelType = 1 AND cat.t_Code = 'ДС клиента, ц/б') " +
+                        "               AND mc.t_Owner = sf.t_PartyID " +
+                        "               AND mc.t_ClientContrID = sf.t_ID " +
+                        "               AND acc.t_Account = mc.t_Account " +
+                        "               AND acc.t_Chapter = mc.t_Chapter " +
+                        "               AND acc.t_Code_Currency = ? " +
+                        "               AND acc.t_Code_Currency = mc.t_Currency " +
+                        "               AND acc.t_Open_Date <= ? " +
+                        "               AND (acc.t_Close_Date = TO_DATE('01.01.0001', 'DD.MM.YYYY') OR acc.t_Close_Date >= ?) " +
+                        "               AND (mc.t_DisablingDate = TO_DATE('01.01.0001', 'DD.MM.YYYY') OR mc.t_DisablingDate >= ?) " +
+                        "           ), 0) DebtAccID, " + 
+                        "       NVL((SELECT /*+ ordered use_nl(mc) index(mc DMCACCDOC_DBT_IDXC)*/ DISTINCT acc.t_AccountID " +
+                        "              FROM dmcaccdoc_dbt mc, daccount_dbt acc " +
+                        "             WHERE mc.t_CatID = (SELECT cat.t_ID FROM dmccateg_dbt cat WHERE cat.t_LevelType = 1 AND cat.t_Code = 'Треб. с н.с. брок') " +
+                        "               AND mc.t_IsCommon = 'X' " + 
+                        "               AND mc.t_Owner = sf.t_PartyID " +
+                        "               AND mc.t_ClientContrID = sf.t_ID " +
+                        "               AND acc.t_Account = mc.t_Account " +
+                        "               AND acc.t_Chapter = mc.t_Chapter " +
+                        "               AND acc.t_Code_Currency = ? " +
+                        "               AND acc.t_Code_Currency = mc.t_Currency " +
+                        "               AND acc.t_Close_Date = TO_DATE('01.01.0001', 'DD.MM.YYYY') " +
+                        "               AND mc.t_DisablingDate = TO_DATE('01.01.0001', 'DD.MM.YYYY') " +
+                        "           ), 0) Debt458AccID " + 
+                        "  FROM dsfcontr_dbt sf " +
+                        " WHERE sf.t_ID = ? " 
+                       );
+    cmd.AddParam(DebtCurrency);
+    cmd.AddParam(DebtDate);
+    cmd.AddParam(DebtDate);
+    cmd.AddParam(DebtDate);
+    cmd.AddParam(DebtCurrency);
+    cmd.AddParam(SfContrID);
+
+    DataSet = cmd.Execute();
+    if(DataSet.moveNext())
+      DebtAccID = DataSet.DebtAccID;
+      Debt458AccID = DataSet.Debt458AccID;
+    end;
+  END;
+
+  InitParams();
+END;
+ 
+/**
+ @brief Получение номера ДБО
+ @param[in]  DlContrID  идентификатор ДБО 
+ @return номер ДБО
+*/
+MACRO GetDLContrNumber(DlContrID:integer):string
+  var cmd, DataSet; 
+
+  cmd = DL_RSDCommand("SELECT sf.t_Number " +
+                      "  FROM ddlcontr_dbt dl, dsfcontr_dbt sf " +
+                      " WHERE sf.t_ID = dl.t_SfContrID " +
+                      "   AND dl.t_DlContrID = ? "); 
+  cmd.addParam(DlContrID);
+  
+  DataSet = cmd.Execute(); 
+  if(DataSet.moveNext())
+    return DataSet.Number;
+  end;
+
+  return "";
+END;
+
+/**
+ @brief Получение номера субдоговора
+ @param[in]  SfContrID  идентификатор субдоговора
+ @return номер субдоговора
+*/
+MACRO GetSfContrNumber(SfContrID:integer):string
+  var cmd, DataSet; 
+
+  cmd = DL_RSDCommand("SELECT sf.t_Number, sf.t_DateConc " +
+                      "  FROM dsfcontr_dbt sf " +
+                      " WHERE sf.t_ID = ? "); 
+  cmd.addParam(SfContrID);
+  
+  DataSet = cmd.Execute(); 
+  if(DataSet.moveNext())
+    return DataSet.Number;
+  end;
+
+  return "";
+END;
+
+/**
+ @brief Добавление записи об ошибке в лог 
+ @param[in]  DlContrID идентификатор ДБО 
+ @param[in]  ErrText   текст сообщения 
+*/
+MACRO AddErrorToLog(DlContrID:integer, ErrText:string)
+  var cmd;
+  cmd = RSDCommand("BEGIN RSB_DEBTSUM.AddToLog(:p_Type, :p_DlContrID, :p_Text); END;"); 
+  cmd.addParam("", RSDBP_IN, ISSUE_ERROR);
+  cmd.addParam("", RSDBP_IN, DlContrID);
+  cmd.addParam("", RSDBP_IN, ErrText);
+
+  cmd.execute();
+END;
+
+/**
+ @brief Получим номер комиссии по коду
+ @param[in] ComCode код комиссии
+ @return номер комиссии
+*/                    
+MACRO GetDebtCommissNumber(ComCode:string):integer
+  var cmd;
+  cmd = RSDCommand("BEGIN ? := RSB_DEBTSUM.GetCommissNumber(:p_ComCode); END;");
+  cmd.addParam("Number", RSDBP_OUT, V_INTEGER); 
+  cmd.addParam("", RSDBP_IN, ComCode);
+  cmd.execute();
+
+  return cmd.value("Number");
+END;
+
+/**
+ @brief Получение последнего календарного дня в месяце
+ @param[in] dt обрабатываемая дата
+ @return последний календарный день в месяце
+*/
+MACRO LastDateInMonth(dt:date):date
+  var day, month, year;
+  DateSplit(dt, null, month, year);
+  if(InList(month, 1, 3, 5, 7, 8, 10, 12))
+    day = 31;
+  elif(InList(month, 4, 6, 9, 11))
+    day = 30;
+  elif(month == 2)
+    if(mod(year, 4) == 0) 
+      day = 29;
+    else
+      day = 28;
+    end;
+  end;
+  return date(day, month, year);
+END;
+
+/**
+ @brief Получение идентификатора счёта (если FD.OpenAccount открывает новый счет, а не подтягивает существующий, то AccountID в структуру не заполнится)
+ @param[in] Acc структура счета в формате record
+ @return идентификатор счета 
+*/                    
+MACRO GetAccountID(Acc):integer
+  var cmd, DataSet;
+
+  if(Acc.AccountID > 0)
+    return Acc.AccountID;
+  else
+    cmd = DL_RSDCommand("SELECT t_AccountID " +
+                        "  FROM daccount_dbt " +
+                        " WHERE t_Account = ? " +
+                        "   AND t_Code_Currency = ? " +
+                        "   AND t_Chapter = ? "
+                       ); 
+    cmd.AddParam(Acc.Account);
+    cmd.AddParam(Acc.Code_Currency);
+    cmd.AddParam(Acc.Chapter);
+
+    DataSet = cmd.Execute();
+    if(DataSet.moveNext())
+      return DataSet.AccountID;
+    end;
+  end;
+
+  return 0;
+END;
+
+/**
+ @brief Создание расчетной операции ВУ
+ @param[in]  accTrn структура проводки ВУ
+ @param[in]  FD     первичный документ субдоговора
+ @param[in]  ВидРО  вид расчетной операции ВУ
+ @return true, если создание операции прошло успешно; false, если создание операции прошло с ошибками
+*/
+PRIVATE MACRO РасчетнаяОперацияВУ(accTrn:RsbAccTransaction, FD, ВидРО):bool
+  var DlInAcc = TBfile("dlinacc.dbt", "rw");
+  record InnAcc(DlInAcc);
+
+  if( GetIdentProgram() == CodeFor("S") )
+     InnAcc.Boffice = OBJTYPE_BACKOFFICE_SP;
+  elif( GetIdentProgram() == CodeFor("Ю") )
+     InnAcc.Boffice = OBJTYPE_BACKOFFICE_DV;
+  elif( GetIdentProgram() == CodeFor("J") )
+     InnAcc.Boffice = OBJTYPE_BACKOFFICE_MM;
+  elif( GetIdentProgram() == CodeFor("V") )
+     InnAcc.Boffice = OBJTYPE_BACKOFFICE_FOREX;
+  elif( GetIdentProgram() == CodeFor("А") )
+     InnAcc.Boffice = OBJTYPE_BACKOFFICE_TRUST;
+  elif( GetIdentProgram() == CodeFor("N") )
+     InnAcc.Boffice = OBJTYPE_BACKOFFICE_VA;
+  end;
+
+  InnAcc.OperType   = ВидРО;
+  InnAcc.DocumentID = FD.ID;
+
+  InnAcc.AccTrnID   = accTrn.AccTrnID;
+  InnAcc.Date       = accTrn.Date_Carry;
+  InnAcc.Chapter    = accTrn.Chapter;
+  InnAcc.DebAcc     = accTrn.AccountPayer;
+  InnAcc.KredAcc    = accTrn.AccountReceiver;
+
+  if(accTrn.Chapter == 22)
+    InnAcc.FIKind   = FIKIND_AVOIRISS;
+  else
+    InnAcc.FIKind   = FIKIND_CURRENCY;
+  end;
+
+  InnAcc.FIID       = accTrn.FIIDPayer;
+  InnAcc.Sum        = accTrn.SumPayer;
+  InnAcc.Department = {OperDprt};
+  InnAcc.Oper       = accTrn.Oper;
+
+  if(StrUpr(GenClassName(FD)) == StrUpr("TS_ReqAssetFD"))
+    InnAcc.DealKind = FD.Request.Kind;
+  elif(StrUpr(GenClassName(FD)) == StrUpr("TS_CALCORCB_FD"))
+    InnAcc.DealKind = FD.CalcORCB().rec.DocKind;
+  else
+    InnAcc.DealKind = FD.Kind;
+  end;
+
+  InnAcc.DocumentKind = FD.Kind;
+
+  FD.ВУ_СкорректироватьРесчетнуюОперацию(ВидРО, InnAcc);
+
+  copy(DlInAcc, InnAcc);
+  if(not DlInAcc.Insert())
+    return false;
+  end;
+
+  return true; 
+end;
+
+/**
+ @brief Создание проводки отражения прочих требований (овердрафта) по брокерским счетам в БУ и ВУ
+ @param[in]  FD              первичный документ субдоговора
+ @param[in]  AccountPayer    структура счета плательщика в формате record
+ @param[in]  AccountReceiver структура счета получателя в формате record
+ @param[in]  DateCarry       дата проводки
+ @param[in]  Chapter         глава проводки
+ @param[in]  FIID            валюта проводки
+ @param[in]  Sum             сумма проводки
+ @param[in]  Ground          основание проводки
+ @param[in]  Oper            идентификатор операциониста
+ @param[in]  NumbDocument    номер проводки
+ @param[in]  IsInnerCarry    признак проводки ВУ
+ @param[in]  ВидРО           вид расчетной операции ВУ
+ @param[in]  IsNotUnload     признак не выгружать в ЦФТ
+ @return идентификатор созданной проводки 
+*/
+MACRO CreateCarryByExpired(FD:variant, AccountPayer:variant, AccountReceiver:variant, 
+                           DateCarry:date, Chapter:integer, FIID:integer, Sum:money,
+                           Ground:string, Oper:integer, NumbDocument:string, 
+                           IsInnerCarry:bool, ВидРО:integer, IsNotUnload:bool):integer
+  if(ValType(IsNotUnload) == V_UNDEF)
+    IsNotUnload = false;
+  end;
+
+  var tr = RsbAccTransaction();
+  if(tr == null)
+    RunError("Ошибка при формировании проводки");
+  end;
+
+  //Ролевая модель. Определяем конечного операциониста для проводки
+  var retvalGetMO = GetMainOperInGroup(FD.Kind);
+  if(retvalGetMO > 0)
+    tr.Oper = retvalGetMO;
+  else
+    tr.Oper = Oper;
+  end;
+
+  tr.Chapter         = Chapter;
+  tr.Date_Carry      = DateCarry;
+  tr.Number_Pack     = 10/*БОЦБ*/;
+  tr.Numb_Document   = NumbDocument;
+  tr.ResultCarry     = 1;
+  tr.Kind_Oper       = " 1";
+  tr.Ground          = Ground;
+  tr.Department      = {OperDprt};
+  tr.FIIDPayer       = FIID;
+  tr.FIIDReceiver    = FIID;
+  tr.AccountPayer    = AccountPayer.Account;
+  tr.AccountReceiver = AccountReceiver.Account;
+  tr.SumPayer        = ABS(Sum);
+  tr.SumReceiver     = ABS(Sum);
+  tr.Shifr_Oper      = DL_GetShifrOper(Chapter, AccountPayer, AccountReceiver);
+  if(IsNotUnload) 
+    tr.UserField2    = "1"; //Не выгружать проводку
+  end;
+
+  if(not tr.Carry())
+    RunError("Ошибка при выполнении проводки с "+AccountPayer.Account+" на "+AccountReceiver.Account);
+  end;
+
+  if(IsInnerCarry)
+    if(not РасчетнаяОперацияВУ(tr, FD, ВидРО))
+      RunError("Ошибка при вставке расчетной операции внутреннего учета");
+    end;
+  end;
+
+  return tr.AccTrnID;
+END;
+
+/**
+ @brief Открытие счета задолженности 458* по субдоговору (всем биржевым субдоговорам, если речь про ДБО ЕДП и счет принадлежит биржевому субдоговору)
+ @param[in]     FD       первичный документ субдоговора
+ @param[in]     OpenDate дата открытия счета
+ @param[in]     DebtCurr валюта счета
+ @param[in/out] AccBuf   структура счета задолженности в формате record
+ @return статус работы процедуры: true - без ошибок, false - с ошибками в процессе работы 
+*/
+MACRO OpenDebtAccount(FD:variant, OpenDate:date, DebtCurr:integer, AccBuf:variant):bool
+  var cmd, DataSet; 
+
+  if(FD.IsEDP())
+    cmd = DL_RSDCommand("SELECT sf.t_ID " +
+                        "  FROM ddlcontrmp_dbt mp1, ddlcontrmp_dbt mp, dsfcontr_dbt sf " +
+                        " WHERE mp1.t_SfContrID = ? " +
+                        "   AND mp.t_DlContrID = mp1.t_DlContrID " +
+                        "   AND sf.t_ID = mp.t_SfContrID " +
+                        "   AND sf.t_ServKindSub <> 9 " +
+                        "   AND sf.t_DateClose = TO_DATE('01.01.0001', 'DD.MM.YYYY') ");
+    cmd.AddParam(FD.GetSubContr().rec.ID);
+    
+    DataSet = cmd.Execute();
+    while(DataSet.moveNext())
+      var SubContrFD = DL_SubContrFD(DataSet.ID);
+
+      if(not SubContrFD.OpenAccount("Треб. с н.с. брок", NULL, true, AccBuf, OpenDate, DebtCurr))
+        return false;
+      end;
+    end;
+  else
+    if(not FD.OpenAccount("Треб. с н.с. брок", NULL, true, AccBuf, OpenDate, DebtCurr))
+      return false;
+    end;
+  end;
+
+  return true;
+
+onError(erru)  
+  return false;
+END; 
+
+/**
+ @brief Проверка корректности параметров операции 
+ @param[in]  ProcDate дата процедуры
+ @param[out] errmsg   сообщение об ошибке/предупреждении
+ @return true, если проверки успешно пройдены и можно продолжать выполнение
+ @return false, если проверки не пройдены и дальнейшее выполнение должно быть остановлено
+*/
+MACRO CheckDebtSumParams(ProcDate:date, errmsg:@string):bool
+  var cmd, DataSet;
+
+  //Проверяем, что дата запуска процедуры является последним обрабатываемым днем в системе
+  cmd = DL_RSDCommand("SELECT MAX(t_OperDate) MaxOperDate " +
+                      "  FROM dprocess_u_dbt " +
+                      " WHERE t_Type = 1 " + /*фондовый рынок ММВБ*/ 
+                      "   AND t_SubType = 702 " + /*Расчет Лимитов Фондовый рынок и ЕДП*/
+                      "   AND t_Status <> 0 "
+                     );
+  DataSet = cmd.Execute(); 
+  if(DataSet.moveNext())
+    if(ProcDate != DataSet.MaxOperDate)
+      errmsg = "Дата операции не соответствует последнему обработанному дню в системе. Выполнение невозможно";
+      return false;
+    end;
+  end;
+
+  return true;
+
+onError(erru)  
+  errmsg = "Ошибка при проверке корректности параметров операции: " + erru.message + " (модуль " + erru.module + ", строка " + erru.line + ")";
+  return false;
+END;
+
+/**
+ @brief Проверка наличия активной задолженности по субдоговору за дату 
+ @param[in]  SfContrID     идентификатор субдоговора                      
+ @param[in]  DebtDate      дата возникновения задолженности
+ @param[in]  DebtCurrency  валюта задолженности
+ @param[out] ReestrDebtID  идентификатор существующей задолженности из реестра задолженности
+ @param[out] ReestrDebtSum сумма существующей задолженности 
+ @return true, если задолженность уже существует
+ @return false, если задолженность с такими параметрами не найдена
+*/
+MACRO IsExistsDebtIntoReestr(SfContrID:integer, DebtDate:date, DebtCurrency:integer, ReestrDebtID:@integer, ReestrDebtSum:@money):bool
+  var cmd, DataSet, cmd_ins;
+
+  cmd = DL_RSDCommand("SELECT t_ID, t_DebtSum " +
+                      "  FROM ddl_debtreestr_dbt " +
+                      " WHERE t_SfContrID = ? " +  
+                      "   AND t_DebtDate = ? " + 
+                      "   AND t_DebtCurrency = ? " + 
+                      "   AND t_DebtType = " + DEBT_EXPIRED +
+                      "   AND t_State = " + DEBTREESTR_STATE_ACTIVE
+                     );
+  cmd.AddParam(SfContrID);
+  cmd.AddParam(DebtDate);
+  cmd.AddParam(DebtCurrency);
+
+  DataSet = cmd.Execute(); 
+  if(DataSet.moveNext())
+    ReestrDebtID = DataSet.ID;
+    ReestrDebtSum = DataSet.DebtSum;
+    return true;
+  end;
+  
+  return false;
+END;
+
+/**
+ @brief Обновление записи в реестре прочей задолженности с сохранением истории изменений. Должно вызываться из транзакции
+ @param[in]  DebtID       идентификатор задолженности из реестра задолженности 
+ @param[in]  OpID         идентификатор задолженности из операции выноса на просрочку/списания задолженности (при вызове из панели равен -1) 
+ @param[in]  DebtDate     дата возникновения задолженности
+ @param[in]  DebtSum      сумма задолженности
+ @param[in]  DebtCurrency валюта задолженности
+ @param[in]  Oper         операционист
+ @param[in]  ChangeDate   дата последнего изменения
+ @param[out] errmsg       сообщение об ошибке
+ @return true, если запись успешно обновлена в БД
+ @return false, если в процессе сохранения записи произошли ошибки
+*/
+MACRO UpdateDebtIntoReestr(DebtID:integer, OpID:integer, DebtDate:date, DebtSum:money, DebtCurrency:integer, Oper:integer, ChangeDate:date, errmsg:@string):bool
+  var cmd_ins, cmd_upd;
+
+  cmd_ins = RSDCommand(" INSERT INTO ddl_debtreestrhist_dbt " +
+                       "        (t_DebtID, t_DebtDate, t_DebtSum, t_DebtCurrency, " +
+                       "         t_Instance, t_State, t_Oper, t_SysDate, " + 
+                       "         t_ChangeDate, t_OpID) " + 
+                       " SELECT t_ID, t_DebtDate, t_DebtSum, t_DebtCurrency, " +
+                       "        t_Instance, t_State, t_Oper, t_SysDate, " + 
+                       "        t_ChangeDate, t_OpID " + 
+                       "   FROM ddl_debtreestr_dbt " +
+                       "  WHERE t_ID = ? "
+                      );
+  cmd_ins.addParam("", RSDBP_IN, DebtID);    
+  cmd_ins.execute();
+  
+  cmd_upd = RSDCommand(" UPDATE ddl_debtreestr_dbt " +
+                       "    SET t_DebtDate = ?, " +
+                       "        t_DebtSum = ?, " +
+                       "        t_DebtCurrency = ?, " +
+                       "        t_Instance = t_Instance + 1, " +
+                       "        t_Oper = ?, " + 
+                       "        t_OpID = ?, " + 
+                       "        t_ChangeDate = ?, " +
+                       "        t_SysDate = SYSDATE " +
+                       "  WHERE t_ID = ? "
+                      );
+  cmd_upd.addParam("", RSDBP_IN, DebtDate);    
+  cmd_upd.addParam("", RSDBP_IN, DebtSum);  
+  cmd_upd.addParam("", RSDBP_IN, DebtCurrency);      
+  cmd_upd.addParam("", RSDBP_IN, Oper);    
+  cmd_upd.addParam("", RSDBP_IN, OpID);
+  cmd_upd.addParam("", RSDBP_IN, ChangeDate);        
+  cmd_upd.addParam("", RSDBP_IN, DebtID);    
+  cmd_upd.execute();
+
+  return true;
+
+onError(erru) 
+  errmsg = "Ошибка при обновлении записи в реестре прочей задолженности: " + erru.message + " (модуль " + erru.module + ", строка " + erru.line + ")";
+  return false;
+END;
+
+/**
+ @brief Создание записи в реестре прочей задолженности 
+ @param[in]  OpID         идентификатор задолженности из операции выноса задолженности на просрочку (при вызове из панели/импорта равен -1) 
+ @param[in]  ClientID     идентификатор клиента
+ @param[in]  DlContrID    идентификатор ДБО
+ @param[in]  SfContrID    идентификатор субдоговора                      
+ @param[in]  DebtDate     дата возникновения задолженности
+ @param[in]  DebtSum      сумма задолженности
+ @param[in]  DebtCurrency валюта задолженности
+ @param[in]  DebtAccID    идентификатор счета клиента по прочей задолженности
+ @param[in]  Debt458AccID идентификатор счета клиента по учету просроченной задолженности
+ @param[in]  Oper         операционист
+ @param[in]  ChangeDate   дата последнего изменения
+ @param[out] errmsg       сообщение об ошибке
+ @return true, если запись успешно вставлена в БД
+ @return false, если в процессе сохранения записи произошли ошибки
+*/
+MACRO InsertDebtIntoReestr(OpID:integer, ClientID:integer, DlContrID:integer, SfContrID:integer, DebtDate:date, DebtSum:money, DebtCurrency:integer, DebtAccID:integer, Debt458AccID:integer, Oper:integer, ChangeDate:date, errmsg:@string):bool
+  var cmd_ins;
+
+  cmd_ins = RSDCommand(" INSERT INTO ddl_debtreestr_dbt " +
+                       "        (t_OpID, t_ClientID, t_DlContrID, t_SfContrID, " +
+                       "         t_DebtDate, t_DebtSum, t_DebtCurrency, t_DebtType, " +
+                       "         t_DebtAccID, t_Debt458AccID, t_Instance, t_State, " +
+                       "         t_ChangeDate, t_Oper) " + 
+                       " VALUES (?, ?, ?, ?, " +
+                       "         ?, ?, ?, ?, " +
+                       "         ?, ?, ?, ?, " +
+                       "         ?, ?) "
+                      );
+  cmd_ins.addParam("", RSDBP_IN, OpID);  
+  cmd_ins.addParam("", RSDBP_IN, ClientID); 
+  cmd_ins.addParam("", RSDBP_IN, DlContrID); 
+  cmd_ins.addParam("", RSDBP_IN, SfContrID);  
+
+  cmd_ins.addParam("", RSDBP_IN, DebtDate);  
+  cmd_ins.addParam("", RSDBP_IN, DebtSum); 
+  cmd_ins.addParam("", RSDBP_IN, DebtCurrency);  
+  cmd_ins.addParam("", RSDBP_IN, DEBT_EXPIRED);
+  
+  cmd_ins.addParam("", RSDBP_IN, DebtAccID);  
+  cmd_ins.addParam("", RSDBP_IN, Debt458AccID);  
+  cmd_ins.addParam("", RSDBP_IN, 0); 
+  cmd_ins.addParam("", RSDBP_IN, DEBTREESTR_STATE_ACTIVE);
+
+  cmd_ins.addParam("", RSDBP_IN, ChangeDate); 
+  cmd_ins.addParam("", RSDBP_IN, Oper);         
+
+  cmd_ins.execute();
+
+  return true;
+
+onError(erru)  
+  errmsg = "Ошибка при создании записи в реестре прочей задолженности: " + erru.message + " (модуль " + erru.module + ", строка " + erru.line + ")";
+  return false;
+END;
+
+/**
+ @brief Установка даты шага операции 
+ @param[in]  DocKind      вид первичного документа 
+ @param[in]  ID_Operation идентификатор экземпляра операции
+ @param[in]  NumberDate   номер вида даты операции
+ @param[in]  OperDate     дата операции                      
+ @param[out] errmsg       сообщение об ошибке
+ @return true, если запись успешно вставлена в БД
+ @return false, если в процессе сохранения записи произошли ошибки
+*/
+MACRO InsertOperDate(DocKind:integer, ID_Operation:integer, NumberDate:integer, OperDate:date, errmsg:@string):bool
+  var query, cmd, DataSet;
+  var DateKindID:integer = DL_GetDateKindIdByKindNumb(NumberDate, DocKind);
+
+  if((ValType(DateKindID) != V_UNDEF) and (DateKindID >= 0))
+    query = DL_RSDCommand("SELECT 1 " +
+                          "  FROM doprdates_dbt " +
+                          " WHERE t_ID_Operation = ? " +  
+                          "   AND t_DateKindID = ? ");
+    query.AddParam(ID_Operation);
+    query.AddParam(DateKindID);
+  
+    DataSet = query.Execute(); 
+    if(DataSet.moveNext())
+      cmd = RSDCommand("UPDATE doprdates_dbt " +
+                       "   SET t_Date = ? " +
+                       " WHERE t_ID_Operation = ? " +
+                       "   AND t_DateKindID = ? ");
+    
+      cmd.addParam("", RSDBP_IN, IIF(OperDate == NULL, Date(0,0,0), OperDate));
+      cmd.addParam("", RSDBP_IN, ID_Operation);
+      cmd.addParam("", RSDBP_IN, DateKindID);
+      cmd.execute();  
+    else
+      cmd = RSDCommand("INSERT INTO doprdates_dbt ( "+
+                       "    t_ID_Operation,     " +
+                       "    t_DateKindID,       " +
+                       "    t_Date              " +
+                       ") VALUES(?, ?, ?)");  
+      cmd.addParam("", RSDBP_IN, ID_Operation);
+      cmd.addParam("", RSDBP_IN, DateKindID);
+      cmd.addParam("", RSDBP_IN, IIF(OperDate == NULL, Date(0,0,0), OperDate));
+      cmd.execute();
+    end;
+   
+    return true;
+  else
+    errmsg = "Ошибка при установке даты операции (InsertOperDate): Не удалось получить идентификатор вида даты операции";
+    return false;
+  end;
+
+onError(erru)  
+  errmsg = "Ошибка при установке даты операции (InsertOperDate): " + erru.message + " (модуль " + erru.module + ", строка " + erru.line + ")";
+  return false;
+END;
+
+/**
+ @brief Получение статуса последнего шага данного вида 
+ @param[in] ID_Operation идентификатор экземпляра операции
+ @param[in] Symbol       символ шага
+ @return символьный статус последнего шага, если таких шагов не найдено, то NULL
+*/
+MACRO GetStepExecuteStateIdByBatch(ID_Operation:integer, Symbol:string)
+  var cmd, DataSet;
+
+  cmd = DL_RSDCommand("SELECT st.t_isexecute " +
+                      "  FROM doprstep_dbt st " +
+                      " WHERE st.t_id_operation = ? " +
+                      "   AND st.t_id_step = (SELECT MAX(st1.t_id_step) " +
+                      "                         FROM doprstep_dbt st1 " +
+                      "                        WHERE st1.t_id_operation = ? " +
+                      "                          AND st1.t_symbol = ?) "
+                     );
+  cmd.addParam(ID_Operation);                                                           
+  cmd.addParam(ID_Operation); 
+  cmd.addParam(Symbol);                                                                                                                     
+  DataSet = cmd.Execute(); 
+
+  if(DataSet.moveNext())
+    return DataSet.IsExecute;
+  end;
+
+  return NULL;
+END;
+
+/**
+ @brief Удаление последнего шага данного вида с актуализацией последущих шагов
+ @param[in] ID_Operation идентификатор экземпляра операции
+ @param[in] Symbol       символ шага
+ @return true, если шаг успешно удален или не существует
+ @return false, если в процессе удаления шага произошли ошибки
+*/
+MACRO DeleteStepByBatch(ID_Operation:integer, Symbol:string):bool
+  var cmd, DataSet;
+  var cmd_upd, cmd_del;
+
+  cmd = DL_RSDCommand("SELECT st.t_previous_step, st.t_id_step " +
+                      "  FROM doprstep_dbt st " +
+                      " WHERE st.t_id_operation = ? " +
+                      "   AND st.t_id_step = (SELECT MAX(st1.t_id_step) " +
+                      "                         FROM doprstep_dbt st1 " +
+                      "                        WHERE st1.t_id_operation = ? " +
+                      "                          AND st1.t_symbol = ?) "
+                     );
+  cmd.addParam(ID_Operation);                                                           
+  cmd.addParam(ID_Operation); 
+  cmd.addParam(Symbol);                                                                                                                     
+  DataSet = cmd.Execute(); 
+
+  if(DataSet.moveNext())
+    RslDefCon.BeginTrans();
+
+    cmd_upd = RSDCommand(" UPDATE doprstep_dbt " +
+                         "    SET t_isexecute = ?, " +
+                         "        t_previous_step = ? " +
+                         "  WHERE t_id_operation = ? " +
+                         "    AND t_id_step > ? " +
+                         "    AND t_isexecute = chr(0) "
+                        );
+    cmd_upd.addParam("", RSDBP_IN, "R");    
+    cmd_upd.addParam("", RSDBP_IN, DataSet.Previous_Step);  
+    cmd_upd.addParam("", RSDBP_IN, ID_Operation);      
+    cmd_upd.addParam("", RSDBP_IN, DataSet.ID_Step);    
+    cmd_upd.execute();
+
+    cmd_del = RSDCommand(" DELETE FROM doprstep_dbt " +
+                         "  WHERE t_id_operation = ? " +
+                         "    AND t_id_step = ? "
+                        );
+    cmd_del.addParam("", RSDBP_IN, ID_Operation);      
+    cmd_del.addParam("", RSDBP_IN, DataSet.ID_Step);    
+    cmd_del.execute();
+
+    RslDefCon.CommitTrans();
+  end;
+
+  return true;
+
+onError(erru) 
+  if(RslDefCon.IsInTrans)
+    RslDefCon.RollbackTrans();
+  end;
+  return false;
+END;
+
+/**
+ @brief Оплата задолженности по комиссии БрокерФикс/ИнвестСоветник
+ @param[in]  ProcDate     дата процедуры
+ @param[in]  DebtType     тип задолженности 
+ @param[in]  DebtSourceID идентификатор источника задолженности (ID комиссии) 
+ @param[in]  DebtDate     дата возникновения задолженности 
+ @param[in]  DebtSfContr  идентификатор субдоговора 
+ @param[in]  Oper         операционист
+ @param[out] ErrText      текст ошибки
+ @param[out] SrvDocID     идентификатор сервисной операции оплаты  
+ @return номер ошибки
+*/                    
+MACRO WrtOffDebtSumByFixOrInvestCom(ProcDate:date, DebtType:integer, DebtSourceID:integer, DebtDate:date, DebtSfContr:integer, Oper:integer, ErrText:@string, SrvDocID:@integer):integer
+  var cmd, DataSet;
+  var stat:integer = 0;
+  var SrvDocDate:date;
+  var CommissName:string = "";
+
+  SrvDocID = -1;
+  ErrText = "";
+
+  record srvdoc(sfsrvdoc);
+  ClearRecord(srvdoc);
+ 
+  var curOnly = false;  //Признак отбора счетов только в иностранной валюте
+  var dep     = "0000"; //Код филиала, по которому запускается процедура взимания периодической комиссии
+  var fi      = "810";  //Код ФИ
+  var account = "*";    //Маска лицевых счетов, по которым требуется выполнить процедуру взимания периодической комиссии
+  var RepFileName = "";
+
+  if(DebtType == DEBT_FIX_COM)
+    SrvDocDate = LastDateInMonth(DebtDate);
+    CommissName = COMMISS_BROKER_FIX;
+  else
+    SrvDocDate = DebtDate;
+    CommissName = COMMISS_INVEST_ADVISE;
+  end;
+
+  srvdoc.ServKind = 1; 
+  srvdoc.Kind = 2/*SFSRVDOC_KIND_PAY*/; 
+  srvdoc.DocKind = 3012/*SFSRVDOC_SECUR*/; 
+  srvdoc.CommNumber = GetDebtCommissNumber(CommissName); 
+  srvdoc.DatePeriodEnd = SrvDocDate;
+  srvdoc.DatePay = ProcDate; 
+  srvdoc.SfContrID = DebtSfContr;
+  srvdoc.Oper = Oper; 
+  srvdoc.IsCalcOnePeriod = SET_CHAR;
+ 
+  stat = CreateSfSrvDoc(srvdoc, curOnly, dep, fi, account);
+
+  if(stat != 0)
+    ErrText = "Ошибка при создании сервисной операции оплаты комиссии "+CommissName+" за "+string(SrvDocDate:f)+". "+GetErrMsg();
+  else  
+    SrvDocID = srvdoc.ID;  
+    stat = RunSfSrvDoc(SrvDocID, RepFileName);
+    if(stat != 0)
+      ErrText = "Ошибка при выполнении сервисной операции оплаты комиссии "+CommissName+" за "+string(SrvDocDate:f)+" (ID = "+string(SrvDocID)+"). "+GetErrMsg();
+    else
+      cmd = DL_RSDCommand("SELECT * FROM dsfrepacc_tmp WHERE t_ErrorCode > 0 AND t_SfDefComID = ? ");
+      cmd.addParam(DebtSourceID);
+
+      DataSet = cmd.Execute(); 
+      if(DataSet.MoveNext())
+        ErrText = "Ошибка при выполнении сервисной операции оплаты комиссии "+CommissName+" за "+string(SrvDocDate:f)+" (ID = "+string(SrvDocID)+"). "+DataSet.Comment;
+        stat = 1;
+      else
+        //На всякий случай проверим статус шага и наличие проводок
+        cmd = DL_RSDCommand(" SELECT 1 " +
+                            "   FROM doproper_dbt oper, doprstep_dbt step, doprdocs_dbt docs, dacctrn_dbt trn " +
+                            "  WHERE oper.t_DocKind = " + SFDOC_DEF_PERIOD +
+                            "    AND oper.t_DocumentID = LPAD(TO_CHAR(?), 34, '0') " +
+                            "    AND step.t_ID_Operation = oper.t_ID_Operation " +
+                            "    AND step.t_IsExecute = 'X' " + 
+                            "    AND step.t_Symbol = 'О' " + 
+                            "    AND docs.t_ID_Operation = oper.t_ID_Operation " + 
+                            "    AND docs.t_ID_Step = step.t_ID_Step " +
+                            "    AND trn.t_AccTrnID = docs.t_AccTrnID ");
+        cmd.addParam(DebtSourceID);                                                           
+        DataSet = cmd.Execute(); 
+
+        if(not DataSet.moveNext())
+          ErrText = "Неизвестная ошибка при выполнении сервисной операции оплаты комиссии "+CommissName+" за "+string(SrvDocDate:f)+" (ID = "+string(SrvDocID)+"). Не удалось сформировать проводки по оплате ";
+          stat = 1;
+        end;
+      end;      
+    end;
+  end;
+
+  return stat;
+
+onError(erru)  
+  ErrText = "Ошибка при оплате задолженности: " + erru.message + " (модуль " + erru.module + ", строка " + erru.line + ")";
+  return 1;
+END;
+
+/**
+ @brief Инициация выгрузки задолженностей в ЦФТ: 
+        первичная, тогда DlContrID и DebtCurr заполняются -1 и не влияют на отбор
+        или следующей по порядку задолженности по договору / оставшейся части текущей задолженности 
+ @param[in] DlContrID идентификатор ДБО
+ @param[in] DebtCurr  валюта задолженности
+*/
+MACRO SendDebtListToCFT(DlContrID:integer, DebtCurr:integer)
+  var cmd;
+  cmd = RSDCommand("BEGIN IT_CFT.SendDebtListToCFT(:p_DlContr, :p_CurrencyId); END;"); 
+  cmd.addParam("", RSDBP_IN, DlContrID);
+  cmd.addParam("", RSDBP_IN, DebtCurr);
+
+  cmd.execute();
+END;
+
+/**
+ @brief Проверка, что текущее время меньше времени окончания отправки в ЦФТ задолженностей 
+ @param[out] errmsg   сообщение об ошибке/предупреждении
+ @return true, если проверка успешно пройдена и можно продолжать выполнение
+ @return false, если проверка не пройдена и дальнейшее выполнение должно быть остановлено
+*/
+MACRO CheckCFTWorkTime(errmsg:@string):bool
+  var stat:integer = 0;
+  var Path:string = "РСХБ\\ИНТЕГРАЦИЯ С ЦФТ\\ОКОНЧАНИЕ ПЕРИОДА РАБОТЫ";
+  var EndTimeStr:string = "";
+  var EndTime:time;
+
+  GetRegistryValue(Path, V_STRING, EndTimeStr, stat);
+  if(stat)
+    errmsg = "Ошибка при получении значения настройки \"" + Path + "\"";
+    return false;
+  elif((strlen(EndTimeStr) != 4) or (IsDigitalNumber(EndTimeStr) != 0))
+    errmsg = "Задан некорректный формат времени окончания отправки в ЦФТ задолженностей: " + EndTimeStr;
+    return false;
+  end;
+
+  EndTime = Time(int(SubStr(EndTimeStr,1,2)), int(SubStr(EndTimeStr,3,2)), 0);
+  if(Time() >= EndTime)
+    errmsg = "Текущее системное время больше времени окончания отправки в ЦФТ задолженностей. Выполнение невозможно";
+    return false;
+  end;
+
+  return true;
+
+onError(erru)  
+  errmsg = "Ошибка при проверке времени окончания отправки в ЦФТ задолженностей, проверьте правильность заполнения настройки \"РСХБ\\ИНТЕГРАЦИЯ С ЦФТ\\ОКОНЧАНИЕ ПЕРИОДА РАБОТЫ\"";
+  return false;
+END;

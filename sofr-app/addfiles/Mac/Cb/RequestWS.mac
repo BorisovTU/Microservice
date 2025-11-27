@@ -1,0 +1,793 @@
+/*
+$Name: RequestWS.mac
+$Module: Ядро ГКБО
+$Description: Функция передать запрос в Web Sphere
+*/
+
+import BankInter, RSD ;
+import "QueueWSClass.mac", "QueueWSLib.mac", "serviceaction.mac", "commonutil.mac", "email_notifyfun.mac", "MessageWs.mac" ;
+import "uws_exchng_log.mac";           /* Функционал логирования */
+
+private const UOL_WEB_SPHERE = 1495;
+
+/*
+@brief функция для вставки во временную таблицу отправляемых xml в ответе на сервис GetBrokerContractInfo
+@param[in] encode кодировка вставляемой xml
+@param[in] message xml
+*/
+                 
+private macro LogOnOff(encode,message)
+  var errCode: Integer;
+  var OnOff = false,cmd,rs;
+
+  const GetBrokerReg ="РСХБ\\ИНТЕГРАЦИЯ\\ВКЛЮЧИТЬ_ЛОГИ_GETBROKERCONTRACT";  
+
+  GetRegistryValue(GetBrokerReg, V_BOOL, OnOff, errCode);
+
+  if(errCode!=0)
+    OnOff = false;
+  end;
+
+  if(OnOff)
+    cmd = RSDCommand( "insert into getbroker_tmp (t_encoding,t_message) values(:Encoding,:xml)" );
+    cmd.addParam( "Encoding", RSDBP_IN, encode );
+    cmd.addParam( "xml", RSDBP_IN, message );
+    cmd.Execute();
+  end;
+
+end;
+
+private macro CryptXmlCheckBufferSignWS_JCP(xml, err)
+
+   var cmd = RsdCommand("select t_keyinformation from dkeyinfows_dbt where t_iskeyactive = 'X' order by t_id desc");
+   var pp = RsdRecordSet(cmd);
+
+   cmd.execute();
+   if( pp.moveNext())
+      var jvm = createObject( "rsjvm", "TJavaHost" );
+      var hcp = jvm.CreateJavaObject( "ru.softlab.hmac.HmacCP" );
+      hcp.setEncryptedKey(pp.value("t_keyinformation"));
+      var res = hcp.verify(xml);
+      return res;
+   else
+      RunError("Ошибка: нет активных ключей.");
+   end;
+
+OnError(error)
+   err = error;
+
+end;
+
+/*private macro CryptXmlRequestToWS_JCP(xmltxt, error)
+   var cmd = RsdCommand("select t_keyinformation from dkeyinfows_dbt where t_iskeyactive = 'X' order by t_id desc");
+   var pp = RsdRecordSet(cmd);
+
+   cmd.execute();
+   if( pp.moveNext())
+
+      var hcp = jvm.CreateJavaObject( "ru.softlab.hmac.HmacCP" );
+      hcp.setEncryptedKey(pp.value("t_keyinformation"));
+      hcp.setSigner("SOFR");
+
+      var b64req = "";
+      //EncodeBase64(OemToUtf8(xmltxt), b64req);
+      EncodeBase64(xmltxt, b64req);
+      var res64 = hcp.injectHMACBase64(b64req);
+      var tmp = "";
+      DecodeBase64(res64 , tmp);
+      
+      //var res = Utf8ToOem(tmp);
+      var res = tmp;
+      //var res = hcp.injectHMAC(xmltxt);
+      println(res);
+      return res;
+   else
+      RunError("Ошибка: нет активных ключей.");
+   end;
+OnError(err)
+   error = err;
+
+end;*/
+
+
+
+// получение sql-ошибки. 
+// использовать в onError(e) так:  RunError(e.message + getFullCmdErrorText(cmd));
+private macro getFullCmdErrorText(_cmd:RSDCommand)
+   var cmd = _cmd;
+   var err_str = "", i = 0;
+
+   while( i < cmd.connection.environment.ErrorCount)
+      err_str = err_str + cmd.connection.environment.Error(i).Descr + " ";
+      i = i+1;
+   end;
+
+   return trim(err_str);
+end;
+
+
+private macro InsQueueRequestToWS(QueueID, ReqIDTrEn, ReqIDMes, XMLTrEn, AuxCorrelationID, DataTypeWS_IP) /* 20181229 - kva - добавил 5 параметр для сохранения в dqueue_log_dbt для исходящих сообщений */
+  var stat = 0;
+  var OutId = 0;
+  var Expiration = GetWaitingSynWS();
+
+  var cmd;
+  cmd = RSDCommand( "{ ? = CALL RSI_RSB_WEB_SPHERE.InsRequestToWS(?, ?, ?, ?, ?, ? )  }" );
+
+  cmd.addParam( "retv", RSDBP_OUT, V_INTEGER );
+  cmd.addParam( "", RSDBP_IN, QueueID   );
+  cmd.addParam( "", RSDBP_IN, ReqIDTrEn );
+  cmd.addParam( "", RSDBP_IN, ReqIDMes  );
+  //cmd.addParam( "", RSDBP_IN, JMSCorrelationID      );
+  cmd.addParam( "", RSDBP_IN, AuxCorrelationID ); /* 20181229 - kva - передаем 5 параметр для сохранения в dqueue_log_dbt для исходящих сообщений */
+  //cmd.addParam( "", RSDBP_IN, XMLTrEn   );
+
+  //maa010219-иначе ломается МЦ
+//  if (DataTypeWS_IP == "SendRSHBBag")
+    cmd.addParam( "", RSDBP_IN, XMLTrEn+" "); 
+//  else
+//    cmd.addParam( "", RSDBP_IN, utf8tooem(XMLTrEn)   ); 
+//  end;
+  cmd.addParam( "", RSDBP_IN, Expiration );
+
+  cmd.execute();
+
+  if (cmd.value("retv") != 0)
+    stat = cmd.value("retv");
+  end;
+
+  if(stat == 0)
+    return true;
+  else
+    return false;
+  end;
+onerror(e)
+   RunError(e.message + getFullCmdErrorText(cmd));
+end;
+
+
+
+private macro GetAnswerSyncInAQ(Correlation:string, ReqIDTrEnAns:string, QueueIDIn:@integer, JMSMessageIDAns:@string, JMSCorrelationIDAns:@string, XMLTrEnAns:@string, p_synch_timeout)
+  var stat = 0;
+  var OutId = 0;
+  var cmd, rs;
+
+  var Wait         = GetWaitingSynWS();
+  /* 20191029 kva: добавляем обработку входного параметра (таймаут синхронного взаимодействия) - begin */
+  if(ValType(p_synch_timeout) != V_UNDEF)
+    Wait = p_synch_timeout; /* Если значение передано, то используем его */
+  end;
+  /* 20191029 kva: добавляем обработку входного параметра (таймаут синхронного взаимодействия) - end */
+//  var ReqIDTrEnAns = CreateGUID();
+  var XrLogID = 0;
+
+  QueueIDIn = 0;
+  JMSMessageIDAns = "";
+  JMSCorrelationIDAns = "";
+  XMLTrEnAns = "";
+
+  //  FUNCTION GetAnswerSyncInAQ(p_Correlation IN VARCHAR2, p_Wait IN NUMBER, p_ReqIDTrEnAns IN NUMBER, p_QueueIDIn OUT NUMBER, p_JMSMessageIDAns OUT VARCHAR2, p_JMSCorrelationIDAns OUT VARCHAR2, p_XrLogID OUT NUMBER) RETURN INTEGER
+  cmd = RSDCommand( "{ ? = CALL RSI_RSB_WEB_SPHERE.GetAnswerSyncInAQ(?, ?, ?, ?, ?, ?, ? )  }" );
+
+  cmd.addParam( "retv", RSDBP_OUT, V_INTEGER );
+  cmd.addParam( "", RSDBP_IN, Correlation   );
+  cmd.addParam( "", RSDBP_IN, Wait );
+  cmd.addParam( "", RSDBP_IN, ReqIDTrEnAns );
+
+  cmd.addParam( "QueueIDIn", RSDBP_OUT, V_INTEGER );
+  cmd.addParam( "JMSMessageIDAns", RSDBP_OUT, V_STRING );
+  cmd.addParam( "JMSCorrelationIDAns", RSDBP_OUT, V_STRING );
+  cmd.addParam( "XrLogID", RSDBP_OUT, V_INTEGER ); 
+
+  cmd.execute();
+
+  stat = cmd.value("retv");
+
+  // DEF-51976 Попробуем получить ответ другим способом
+  if(stat == 0)
+  else
+     cmd = RSDCommand( "{ ? = CALL RSI_RSB_WEB_SPHERE.TryGetSyncAnswer(?, ?, ?, ?, ?, ?)  }" );
+
+     cmd.addParam( "retv", RSDBP_OUT, V_INTEGER );
+     cmd.addParam( "", RSDBP_IN, Correlation   );
+     cmd.addParam( "", RSDBP_IN, ReqIDTrEnAns );
+
+     cmd.addParam( "QueueIDIn", RSDBP_OUT, V_INTEGER );
+     cmd.addParam( "JMSMessageIDAns", RSDBP_OUT, V_STRING );
+     cmd.addParam( "JMSCorrelationIDAns", RSDBP_OUT, V_STRING );
+     cmd.addParam( "XrLogID", RSDBP_OUT, V_INTEGER ); 
+
+     cmd.execute();
+
+     stat = cmd.value("retv");
+  end;
+
+  if(stat == 0)
+    QueueIDIn = cmd.value("QueueIDIn");
+    JMSMessageIDAns = cmd.value("JMSMessageIDAns");
+    JMSCorrelationIDAns = cmd.value("JMSCorrelationIDAns");
+    XrLogID = cmd.value("XrLogID");
+  end;
+
+
+  if((stat == 0) AND (XrLogID != 0))
+    cmd = RSDCommand( "SELECT t_ID, length(t_Message) as len, t_Message FROM dxr_log_dbt WHERE t_ID = ?" );
+    cmd.NullConversion = true;
+    cmd.addParam( "", RSDBP_IN, XrLogID );
+
+    rs = RsdRecordSet(cmd);
+    if (rs.moveNext())
+      var len = int(rs.value("len"));
+      rs.Fld("t_Message").Read(XMLTrEnAns, len);
+    end; 
+  end;
+
+  if(stat == 0)
+    return true;
+  else
+    return false;
+  end;
+end;
+
+
+
+
+
+
+private macro GetDefQueueID()
+
+  var p = 0;
+
+  var cmd, rs;
+
+  var query = "select q.t_id from dqueuews_dbt q where q.t_isdefault = 'X' and q.t_type = 2"; // исходящая
+
+  cmd = RsdCommand(query);
+  rs = RsdRecordset(cmd);
+
+  if(rs.movenext)
+
+    p = SQL_ConvType(rs.value("t_id"));
+
+  end;
+
+  return p;
+
+end;
+
+private macro GetQueueIDIn(QueueID)
+
+  var p = 0;
+
+  var cmd, rs;
+
+  var query = "select qr.t_queueidin from dqueuerelws_dbt qr where qr.t_queueidout = ?";
+
+  cmd = RsdCommand(query);
+  
+  cmd.addParam( "", RSDBP_IN, QueueID);
+  
+  rs = RsdRecordset(cmd);
+
+  if(rs.movenext)
+
+    p = SQL_ConvType(rs.value("t_queueidin"));
+
+  end;
+
+  return p;
+
+end;
+
+private macro GetACCounterpartyCode(ACCounterparty)
+
+  var p = "";
+  
+  var query, cmd, rs;
+  
+  query =   " SELECT llvalues.T_CODE CODE               "+
+    " FROM dllvalues_dbt llvalues               "+
+    " WHERE  llvalues.T_LIST = 4067 AND llvalues.T_ELEMENT  = ? ";
+
+  cmd = RsdCommand(query);
+
+  cmd.addParam( "ACCounterparty", RSDBP_IN, ACCounterparty);
+
+  rs = RsdRecordset(cmd);
+
+  if (rs.movenext)
+
+      p = rs.value("CODE"); 
+    
+  end;
+  
+  return p;
+  
+end;
+
+macro SubmitRequestToWS(QueueID          :integer,// ИД очереди.
+                        ReqIDMes         :string, // ИД сообщения.
+                        SenderID         :string, // Идентификатор Бэк Офиса. (не понятно, как передавать через транспортный конверт, как вариант для типа 1 передавать через вторую секцию param, типа 2 передавать через блок расширений).
+                        IsSync           :bool  , // Признак синхронной обработки. Если не указан, = False
+                        BranchNumber     :string, // Подразделение системы-назначения.
+                        DataType         :integer,// ИД типа данных
+                        RequestText      :string, // Бизнес данные в виде XML.
+                        AuxCorrelationID :string, // Вспомогательный идентификатор для связки сообщений в журналах
+                        BranchNumber2    :string, // Подразделение системы-назначения.
+                        p_synch_timeout  :integer // 20191029 kva: Таймаут синхронного взаимодействия
+)
+  var ResSubmitRequest = TResSubmitRequestToWS;
+  var v_AuxCorrelationID; /* 20181229 - kva - параметр для сохранения в dqueue_log_dbt для исходящих сообщений */
+  
+
+  ResSubmitRequest.ReqIDMes = ReqIDMes;
+  ResSubmitRequest.SenderID = SenderID;
+  ResSubmitRequest.ResultCode = 0;
+  var sigXmltxt = "";
+  var cmd, rs;
+/*
+  var ReqIDMes      :String   = ""; // Из входящих параметров  +
+  var SenderID      :String   = ""; // Из входящих параметров  +
+  var ResultCode    :String   = ""; // Результат обработки +
+  var ResultText    :String   = ""; // Текст ошибки  
+  var JMSMessageID  :String   = ""; // ИД сообщения, переданного в ИП  
+*/                   
+
+  private FILE DataTypeWS(DataTypeWS);
+  private FILE MonTrEnWS(MonTrEnWS) write;
+  var stat = 0;
+  var error, parser;
+  var FullPathXSD = "";
+  var TypeEnvelope = 2;
+  var FromSystem = "";
+  var TransXmlText = "";
+  var EMail = "";
+  var retv;
+  var QueueIDIn = 0;
+  
+  var WaitingSyn = GetWaitingSynWS();
+  /* 20191029 kva: добавляем обработку входного параметра (таймаут синхронного взаимодействия) - begin */
+  if(ValType(p_synch_timeout) != V_UNDEF)
+    WaitingSyn = p_synch_timeout; /* Если значение передано, то используем его */
+  end;
+  /* 20191029 kva: добавляем обработку входного параметра (таймаут синхронного взаимодействия) - end */
+
+  /* 20181229 - kva - обрабатываем пустое значение */
+  if(ValType(AuxCorrelationID) == V_UNDEF)
+    v_AuxCorrelationID = "";
+  else
+    v_AuxCorrelationID = AuxCorrelationID;
+  end;
+
+  if(ResSubmitRequest.ReqIDMes == "")
+    ResSubmitRequest.ReqIDMes = CreateGUID();
+  end;  
+  
+  if(QueueID == 0)
+    QueueID = GetDefQueueID();
+  end;
+  
+  QueueIDIn = GetQueueIDIn(QueueID);
+  
+  if(QueueIDIn == 0)
+    ResSubmitRequest.ResultCode = 1008; // Не найдена связанная входящая очередь для переданной исходящей очереди  
+    ResSubmitRequest.ResultText = "Не найдена связанная входящая очередь для переданной исходящей очереди";
+
+    WriteXrLogQueueWS(SRV_XR_KIND_OUT, ResSubmitRequest.ReqIDMes, RequestText, ResSubmitRequest.ResultCode);
+  end;
+
+  stat = 0;
+  GetRegistryValue( "COMMON\\QUEUE\\E-MAIL", V_STRING, EMail, stat );
+
+  ClearRecord(DataTypeWS);
+  DataTypeWS.ID = DataType;
+  if(getEQ(DataTypeWS))
+    if(DataTypeWS.FileNameXSD != "")
+      var regValue = "";
+      GetRegistryValue( "COMMON\\QUEUE\\ПУТЬ К XSD", V_STRING, regValue, stat );
+
+      if(regValue != "")
+        FullPathXSD = regValue + "\\" + DataTypeWS.FileNameXSD;
+      else
+        FullPathXSD = DataTypeWS.FileNameXSD;
+      end;
+
+      var IsValidFile = ValidateXmlXsd(RequestText, FullPathXSD, @parser);
+      if (not IsValidFile)
+          ResSubmitRequest.ResultCode = 1001; //Контроль по XSD схеме не пройден
+          ResSubmitRequest.ResultText = "Контроль по XSD схеме "+ DataTypeWS.FileNameXSD + " не пройден. " + parser ;
+
+          WriteXrLogQueueWS(SRV_XR_KIND_OUT, ResSubmitRequest.ReqIDMes, RequestText, ResSubmitRequest.ResultCode);
+      end;
+    end;  
+  else
+    ResSubmitRequest.ResultCode = 1100; // Запись справочника типов данных не найдена. ID =  
+    ResSubmitRequest.ResultText = "Запись справочника типов данных не найдена. DataType = " + DataType ;
+
+    WriteXrLogQueueWS(SRV_XR_KIND_OUT, ResSubmitRequest.ReqIDMes, RequestText, ResSubmitRequest.ResultCode);
+  end;
+
+
+  if (DataTypeWS.ParmIP == "SendRSHBBag")
+     if (WaitingSyn < 30)
+        WaitingSyn = 31;
+     end;
+  end;
+
+
+  if(ResSubmitRequest.ResultCode == 0)
+    error = 0;
+    GetRegistryValue( "COMMON\\QUEUE\\ТИП КОНВЕРТА", V_INTEGER, TypeEnvelope, error );
+    
+    if(error != 0)
+      TypeEnvelope = 2;
+    end;
+
+    error = 0;
+    GetRegistryValue( "COMMON\\QUEUE\\КОД СИСТЕМЫ", V_STRING, FromSystem, error );
+
+    var v_BranchNumber;
+    if (BranchNumber2)
+       v_BranchNumber = BranchNumber2;
+    else
+       v_BranchNumber = "0000";
+    end;
+
+    TransXmlText = TransXmlQueueWS( RequestText );
+    var xmltxt = "";
+    if(TypeEnvelope == 2)
+
+      CaptureOutput;
+      println("<?xml version=\"1.0\" encoding=\"UTF-8\"?>");
+      println("<operation ");
+      println("    xmlns=\"http://rshb/transport/interface\">");
+      println("    <input>");
+//      println("    <input xmlns=\"\">"); /* 20181212 - kva - чтобы формировалась подпись */
+      println("        <bons2:Header xmlns:bons2=\"http://rshb/transport/envelope\">");
+      println("            <bons2:FromSystem>"+FromSystem+"</bons2:FromSystem>");
+      println("            <bons2:ToSystem>"+GetACCounterpartyCode(DataTypeWS.ACCounterparty)+"</bons2:ToSystem>");
+      println("            <bons2:Direction>REQUEST</bons2:Direction>");
+      println("            <bons2:FromBranch>"+BranchNumber+"</bons2:FromBranch>");
+// maa     println("            <bons2:ToBranch>"+GetACCounterpartyCode(DataTypeWS.ACCounterparty)+"</bons2:ToBranch>");
+//      println("            <bons2:ToBranch>0000</bons2:ToBranch>");
+      println("            <bons2:ToBranch>"+v_BranchNumber+"</bons2:ToBranch>");
+      println("            <bons2:Interaction>ASYNC</bons2:Interaction>");
+      println("            <bons2:Service>"+DataTypeWS.ParmIP+"</bons2:Service>");
+      println("        </bons2:Header>");
+      println("        <bons2:Message xmlns:bons2=\"http://rshb/transport/envelope\">"+TransXmlText+"</bons2:Message>");
+      println("    </input>");
+      println("</operation>");
+
+      xmltxt = StopCaptureOutput;
+
+    elif(TypeEnvelope == 1)
+      
+      CaptureOutput;
+
+      println("<?xml version=\"1.0\" encoding=\"UTF-8\"?>");
+      println("<ba1:plc_acct_get xmlns:ba1=\"http://OnlineBankToEsb/OnlineBank\"");
+      println("    xmlns:se=\"http://rshb/transport/security\" xmlns:tns=\"http://bis.ru/transport\">");
+      println("    <input fromBranch=\""+BranchNumber+"\" fromSystem=\""+FromSystem+"\" toSystem=\""+GetACCounterpartyCode(DataTypeWS.ACCounterparty)+"\" operation=\"\" pass=\"ASYNC\"");
+      println("        service=\""+DataTypeWS.ParmIP+"\" toBranch=\""+GetACCounterpartyCode(DataTypeWS.ACCounterparty)+"\" userDirect=\"REQUEST\">");
+      println("        <tns:parameters>");
+      println("            <tns:param>");
+      println("                <tns:name>DATA</tns:name>");
+      println("                <tns:num>1</tns:num>");
+      println("                <tns:type>DATASET</tns:type>");
+      println("                <tns:value>"+TransXmlText+"</tns:value>");
+      println("                <tns:format>NOTCODED</tns:format>");
+      println("            </tns:param>");
+      println("        </tns:parameters>");
+      println("    </input>");
+      println("</ba1:plc_acct_get>");
+
+      xmltxt = StopCaptureOutput;
+    end;
+
+      // с этого момента, перед подписанием конвертируем в Utf8  
+      xmltxt = OemToUtf8(xmltxt);
+
+      var err = null;
+      if(DataTypeWS.IsMacInfo == "X")
+        sigXmltxt = CryptXmlRequestToWS_JCP(xmltxt, @err);
+      else
+        sigXmltxt = xmltxt;
+      end;
+
+/*      if(DataTypeWS.IsMacInfo == "X")
+        CB_CryptXmlRequestToWS(xmltxt, sigXmltxt, ResSubmitRequest.ResultCode, ResSubmitRequest.ResultText);
+      else
+        sigXmltxt = xmltxt;
+      end;
+*/
+
+      var sigXmltxtOem = Utf8ToOem(sigXmltxt);
+      if(ResSubmitRequest.ResultCode == 0)
+        WriteAuditLog(UOL_WEB_SPHERE, sigXmltxtOem);
+      end;
+
+      if(ResSubmitRequest.ResultCode == 0)
+        var ReqIDTrEn = CreateGUID();
+        WriteXrLogQueueWS(SRV_XR_KIND_OUT, ReqIDTrEn, sigXmltxtOem, ResSubmitRequest.ResultCode);
+      end;
+
+      if(ResSubmitRequest.ResultCode == 0)
+         var sigXmltxtLen = strlen(sigXmltxt);
+
+         // Если больше 500kB 
+/*         if(sigXmltxtLen > 512000)
+           if(EMail != "")
+             AddNotifyToDbt("WebSphere ошибка.", "Превышен размер сообщения "+sigXmltxtLen, EMail);
+             SendNotyfyToEmail(false, false);                               
+           end;
+           
+           ResSubmitRequest.ResultCode = 1004; //  Превышен размер сообщения  
+           ResSubmitRequest.ResultText = "Превышен размер сообщения " + sigXmltxtLen;
+         end; */
+      end;
+
+//def-62960
+      if(DataTypeWS.ParmIP == "SendBrokerContractDepo") 
+         LogOnOff("CryptXml_UTF8",sigXmltxt);
+      end;
+
+      if(ResSubmitRequest.ResultCode == 0)
+         /* 20181229 - kva - добавил 5 параметр для сохранения в dqueue_log_dbt для исходящих сообщений */
+         retv = InsQueueRequestToWS(QueueID, ReqIDTrEn, ResSubmitRequest.ReqIDMes, sigXmltxt, v_AuxCorrelationID, DataTypeWS.ParmIP);
+
+         if(not retv)
+           ResSubmitRequest.ResultCode = 1101; //  Ошибка вставки конверта в очередь.
+           ResSubmitRequest.ResultText = "Ошибка вставки конверта в очередь.";
+         end;
+      end;
+
+      if(ResSubmitRequest.ResultCode == 0)
+        if(IsSync == false)
+          if(DataTypeWS.TimeOut != 0)
+              ClearRecord(MonTrEnWS);
+              MonTrEnWS.ID = 0;
+              MonTrEnWS.ReqIDTrEn = ReqIDTrEn;
+              MonTrEnWS.SysDate = date();
+              MonTrEnWS.SysTime = time();
+              MonTrEnWS.TimeOut = DataTypeWS.TimeOut;
+
+              retv = insert(MonTrEnWS);
+              if(not retv)
+                ResSubmitRequest.ResultCode = 1102; // Ошибка вставки записи сущности "Транспортные конверты, ожидающие ответа". 
+                ResSubmitRequest.ResultText = "Ошибка вставки записи сущности \"Транспортные конверты, ожидающие ответа\".";
+              end;
+          end;
+        end;
+      end;
+      
+      if(ResSubmitRequest.ResultCode == 0)
+        error = 0;
+
+        var StartDateTime; 
+        var CurDateTime;
+        var JMSMessageID = "";
+        var MessageXML = "";
+
+        
+        if(IsSync == false)
+
+          StartDateTime = CB_GetTimeBigInt();
+          //StartDateTime = StartDateTime *1000; // в миллисекунды
+          CurDateTime = StartDateTime;
+
+          while((JMSMessageID == "") AND ((CurDateTime - StartDateTime) <= WaitingSyn)) 
+            cmd = RSDCommand( "SELECT t_JMSMessageID FROM dqueuelinks_dbt WHERE t_ReqIDTrEn = ? AND t_QueueID = ? AND t_Type = ?" );
+            cmd.NullConversion = true;
+            cmd.addParam( "", RSDBP_IN, ReqIDTrEn      );
+            cmd.addParam( "", RSDBP_IN, QueueID        );
+            cmd.addParam( "", RSDBP_IN, TYPE_QUEUE_OUT );
+
+            rs = RsdRecordSet(cmd);
+            if (rs.moveNext())
+              JMSMessageID = rs.value("t_JMSMessageID");
+            end; 
+
+            CurDateTime = CB_GetTimeBigInt();
+            //CurDateTime = CurDateTime * 1000; // в миллисекунды
+          end;
+
+          if(JMSMessageID != "")
+            ResSubmitRequest.JMSMessageID = JMSMessageID;
+          else
+            ResSubmitRequest.ResultCode = 1103; //  Ответ на запрос не получен в асинхронном режиме
+            ResSubmitRequest.ResultText = "Ответ на запрос не получен в асинхронном режиме";
+          end;
+        else // IsSync == true
+
+          var ReqIDTrEnAns = CreateGUID();
+
+          var QueueIDIn2 = 0; 
+          var JMSMessageIDAns = "";
+          var JMSCorrelationIDAns= "";
+          var XMLTrEnAns = "";
+          var ParentReqIDTrEnAns = "";
+
+          /* 20191030 kva: передаем параметр времени ожидания */
+          retv = GetAnswerSyncInAQ(ReqIDTrEn, ReqIDTrEnAns, @QueueIDIn2, @JMSMessageIDAns, @JMSCorrelationIDAns, @XMLTrEnAns, p_synch_timeout);
+          if(not retv)
+            ResSubmitRequest.ResultCode = 1005; //  Ответ на запрос не получен в синхронном режиме
+            ResSubmitRequest.ResultText = "Ответ на запрос"+ReqIDTrEn+"не получен";
+
+            ResSubmitRequest.JMSMessageID = JMSMessageIDAns; //??
+
+            AddNotifyToDbt("WebSphere ошибка.", ResSubmitRequest.ResultText, EMail);
+            SendNotyfyToEmail(false, false);                               
+          end;
+
+          if(ResSubmitRequest.ResultCode == 0)
+            if(JMSCorrelationIDAns != "") 
+              /*
+              if(TypeEnvelope == 1) // ищем атрибут userDirect= "ANSWER"
+              else if(TypeEnvelope == 2) // тэг Direction="ANSWER"
+              end;
+              */
+
+              cmd = RSDCommand( "SELECT t_ReqIDTrEn"+ 
+                                "  FROM dqueueLinks_dbt "+ 
+                                " WHERE t_JMSMessageID = ? "+ 
+                                "   AND t_QueueID = ? "+ 
+                                "  AND t_Type = ? " ); // 0 исходящий 
+
+              cmd.NullConversion = true;
+              cmd.addParam( "", RSDBP_IN, JMSCorrelationIDAns );
+              cmd.addParam( "", RSDBP_IN, QueueID             );
+              cmd.addParam( "", RSDBP_IN, TYPE_QUEUE_OUT      );
+
+              rs = RsdRecordSet(cmd);
+              if (rs.moveNext())
+                ParentReqIDTrEnAns = rs.value("t_ReqIDTrEn");
+              end; 
+            end;
+          end;
+
+          if(ResSubmitRequest.ResultCode == 0)
+            error = 0;
+
+            var MonTrEnID = 0;
+            var Sec       = 0;
+            
+            cmd = RSDCommand( "SELECT t_ID, ((sysdate - TO_DATE(TO_CHAR( mon.t_SysDate, 'DD.MM.YYYY ') || TO_CHAR(mon.t_SysTime, 'HH24:MI:SS'), 'DD.MM.YYYY HH24:MI:SS')) * 86400) AS sec" +
+                              "  FROM dmontrenws_dbt mon" +
+                              " WHERE t_ReqIDTrEn = ? " +
+                              "   AND  t_IsTimeOut=CHR(0) "
+                            );
+
+            cmd.NullConversion = true;
+            cmd.addParam( "", RSDBP_IN, ParentReqIDTrEnAns    );
+
+            rs = RsdRecordSet(cmd);
+            if (rs.moveNext())
+              MonTrEnID = rs.value("t_ID");
+              Sec = rs.value("Sec");
+
+              //Sec = Sec *1000;
+            end; 
+
+            if(MonTrEnID > 0)
+              if(Sec > WaitingSyn)
+                cmd = RSDCommand( "UPDATE DMonTrEnWS_dbt SET t_IsTimeOut='X' WHERE t_ID = ?" );
+                cmd.addParam( "", RSDBP_IN, MonTrEnID );
+                cmd.Execute();
+              else
+                cmd = RSDCommand( "UPDATE DMonTrEnWS_dbt SET t_YesAnswer='X' WHERE t_ID = ?" );
+                cmd.addParam( "", RSDBP_IN, MonTrEnID );
+                cmd.Execute();
+              end;
+            end;
+          end;
+
+          // Чистка мусора
+          // chesnokov 31.01.2022 MonTrEnWSTimeOutProc();
+
+          if ((TypeEnvelope != 1) and (TypeEnvelope != 2))
+              ResSubmitRequest.ResultCode = 1; //  Ответ на запрос не получен в асинхронном режиме
+              ResSubmitRequest.ResultText = "Не корректное значение настройки \"COMMON\\QUEUE\\ТИП КОНВЕРТА\"";
+          end;
+
+          if(ResSubmitRequest.ResultCode == 0)
+            var xml = CreateXMLParser();
+            xml.validateOnParse = false;
+            xml.async = false;
+            stat = xml.loadXML(XMLTrEnAns);
+
+            if ( not stat )
+                ResSubmitRequest.ResultCode = 1;
+                ResSubmitRequest.ResultText = "Ошибка создания экземпляра msxml";
+            end;
+          end;
+
+          if(ResSubmitRequest.ResultCode == 0)
+            var Cover = WSReadCover(xml, TypeEnvelope);
+            var Direction = "";
+            if ((ValType(JMSCorrelationIDAns) != V_UNDEF) and (JMSCorrelationIDAns != ""))
+                Direction = Cover.Direction;
+
+                if (Direction == DirectionAnswer)
+
+                elif (Direction == DirectionRequest)
+                else
+                    ResSubmitRequest.ResultCode = 1;
+                    ResSubmitRequest.ResultText = "Не корректный транспортный конверт";
+                end;
+            end;
+          end;
+
+          if(ResSubmitRequest.ResultCode == 0)
+            var ParmBO_ID = 0;
+            var ParmBO = GetQueueBO(Cover.Service, @ParmBO_ID);
+      /* 
+            if (ParmBO == "")
+                //RunError("", "Не корректно заданы параметры сервиса БЭК-офиса");
+                ResSubmitRequest.ResultCode = 1;
+                ResSubmitRequest.ResultText = "Не корректно заданы параметры сервиса БЭК-офиса";
+            end;
+      */
+            if (Cover.HasMAC_info)
+                var errcode = 0, errorstring = "";
+
+                //var XMLTrEnAnsUTF8 = OemToUtf8(XMLTrEnAns);
+                //var result = CB_CryptXmlCheckBufferSignWS(XMLTrEnAnsUTF8, @errcode, @errorstring);
+                var XMLTrEnUTF8 = toAnsi(XMLTrEnAns);
+                err = null;
+
+                CryptXmlCheckBufferSignWS_JCP(XMLTrEnUTF8, @err);
+                //if (not result)
+                if (err != null)
+                    var text = "Не прошла проверка метки целостности сообщения " + ReqIDTrEn;
+                    //text = text + ". " + errorstring;
+                    text = text + ". " + err.Message;
+                    SendEmail(E_MailTitle, text);
+
+                    // var extensions_mes = GetExtensionsFromRequest(xml.xml); ??
+                    SendMessageToWSEx(QueueID, null, Cover.SenderID, Cover.FromBranch, JMSMessageIDAns, ParmBO_ID, null, "Error", text, 1006, QueueID, TYPE_QUEUE_OUT, "");
+
+                    ResSubmitRequest.ResultCode = 1006;
+                    ResSubmitRequest.ResultText = text;
+                else
+                    WS_WriteAuditMessage(errorstring);
+                end;
+            end;
+          end;
+
+          if(ResSubmitRequest.ResultCode == 0)
+            if (not WSValidateMessageByXSD(Cover.XMLMes, Cover.Service, @errorstring))
+                // var extensions_mes = GetExtensionsFromRequest(xml.xml); ??
+                SendMessageToWSEx(QueueID, null, Cover.SenderID, Cover.FromBranch, JMSMessageIDAns, ParmBO_ID, null, "Error", errorstring, 1001, QueueID, TYPE_QUEUE_OUT, "");
+
+                ResSubmitRequest.ResultCode =  1001;
+                ResSubmitRequest.ResultText =  errorstring;
+            end;
+          end;
+
+          if(ResSubmitRequest.ResultCode == 0)
+            var ReqIDMesAns = CreateGUID();
+
+            WriteXrLogQueueWS(SRV_XR_KIND_OUT, ReqIDMesAns, Cover.XMLMes , 0);
+
+            if (not WSInsertQueueLinks(ReqIDTrEnAns, ReqIDMesAns, ParentReqIDTrEnAns, JMSMessageIDAns, QueueIDIn2, TYPE_QUEUE_IN))
+                ResSubmitRequest.ResultCode =  1;
+                ResSubmitRequest.ResultText =  "Не удалось создать связь для сообщения, транспортных конвертов";
+            end;
+          end;
+
+          if(ResSubmitRequest.ResultCode == 0)
+            ResSubmitRequest.JMSMessageID = JMSMessageIDAns;
+            ResSubmitRequest.ResponseText = Cover.XMLMes;
+            if (StrUpr(Cover.Status) == "ERROR")
+               ResSubmitRequest.ResultCode = -1;
+               ResSubmitRequest.ResultText = Cover.Description;
+            end;
+          end;
+
+        end;
+      end;
+  end;
+
+  return ResSubmitRequest;
+end;
+

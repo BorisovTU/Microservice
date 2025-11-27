@@ -1,0 +1,422 @@
+/*
+$Name:        GTImpRate.mac
+$Module:      Шлюз Securities
+$Description: Импорт курсов из шлюза в банк
+*/
+
+IMPORT FIInter, "globals.mac", "rgtgtrec.mac", "gtdlfun.mac", "MoCommon.mac", "secinter.mac";
+
+PRIVATE VAR RG:TGTRecord, RateParm:TRecHandler;
+PRIVATE VAR FIID, Kind, IndexNom, FaceValue;
+
+PRIVATE CONST КодВнешнСист_ФинИн   = 17; /*Код во внешней системе*/
+PRIVATE CONST КодВнешнСист_Субъект = 38; /*Код во внешней системе*/
+
+PRIVATE CONST Код_на_РТС_ФинИн    = 12;
+
+PRIVATE const Код_на_ММВБ_ФинИн   = 11;
+PRIVATE const Код_на_ММВБ_Субъект = 8;
+
+PRIVATE CONST Код_на_СПБ_ФинИн    = 22;
+
+PRIVATE CONST SET_CHAR   = "X";
+PRIVATE CONST UNSET_CHAR = "";
+PRIVATE const RATE_POINT         = 4;/* точность задания курса  */
+
+PRIVATE CONST DV_RATE_MINCOST_KIND  = 7;  /*курс вида "Стоимость минимального шага цены"*/
+
+PRIVATE MACRO SayError( ErrStr:STRING )
+   RunError(ErrStr);
+END;
+
+PRIVATE VAR OverFIID;
+
+PRIVATE VAR 
+  Avoir = TRecHandler( "avoiriss.dbt" );
+
+/* Аналог оператора ?: в си. */
+private macro IIF( condition, value_true, value_false )
+   if( condition )
+      return value_true;
+   else 
+      return value_false;
+   end;
+end;
+
+PRIVATE MACRO GetParm( ParmName:STRING, ParmValue:@VARIANT, ParmType:INTEGER, Required:BOOL ):INTEGER
+  VAR Type;
+
+  if( Required == NULL )
+     Required = true;
+  end;
+
+  if( GetParmByName( RG, ParmName, @ParmValue, @type) == NULL ) 
+     if( Required )
+        SayError( "Ошибка при получении параметра " + ParmName );
+     end;
+     return 1;
+  elif( Type != ParmType )
+     if( Required )
+        SayError( "Неверный тип параметра " + ParmName );
+     end;
+     return 1;
+  end;
+
+  return 0;
+END;
+
+PRIVATE MACRO FindRATETYPE( Type:INTEGER )
+
+  VAR RateType = TBFile( "RateType" );
+
+  RateType.rec.Type = Type;
+  return RateType.GetEQ();
+END;
+
+PRIVATE MACRO IsMarketPlace( Type:INTEGER )
+  VAR RateType = TBFile("RateType");
+  RateType.rec.Type = Type;
+  if( GetEQ( RateType ) )
+    return RateType.rec.IsMarketPlace == "X";
+  end;
+
+  return true;
+END;
+
+PRIVATE MACRO ReadRateParms( Comment:@STRING, IsBreakRead:@bool ):INTEGER
+  PRIVATE VAR str_temp:string = "";
+  PRIVATE VAR ErrMes:string = "";
+  PRIVATE CONST RATETYPE_CLOSE_PRICE_LOCAL = 18; //DEF-68040. Для монорелиза, поэтому без закрытого кода
+
+  RateParm.Clear();
+
+  var fin       = TRecHandler( "fininstr.dbt" ),
+      rFininstr = TRecHandler( "fininstr" ),
+      BasisFI   = TRecHandler( "fininstr" ),
+      fideriv   = TBFile( "fideriv.dbt" );
+
+  VAR cur_rate, PartyCodeKind, RealFIID;
+  VAR isin_iso, for_cb, rate_isrealid, FinCodeKind, rate;
+
+  if( RG.GetSourceID() == GT_RTS )
+     Kind = FICK_PTCC;
+  elif( RG.GetSourceID() == GT_RTS2 )
+     Kind = Код_на_РТС_ФинИн;
+  elif( (RG.GetSourceID() == GT_DV_MMVB) OR (RG.GetSourceID() == GT_MMVB) OR (RG.GetSourceID() == GT_PAYMENTS) OR (RG.GetSourceID() == GT_MMVB2) OR (RG.GetSourceID() == GT_MMVB3) OR (RG.GetSourceID() == GT_CSV) OR (RG.GetSourceID() == GT_PAYMENTS_CSV))
+     Kind = Код_на_ММВБ_ФинИн;
+  elif( (RG.GetSourceID() == GT_SPB) OR (RG.GetSourceID() == GT_PAYMENTS_SPB) )
+     Kind = Код_на_СПБ_ФинИн;
+  elif( RG.GetSourceID() == GT_OTHR )
+     Kind = КодВнешнСист_ФинИн;
+  else
+     Kind = FICK_USERCODE;
+  end;
+
+  if( GetParm("RGFIRT_PARTYCODEKIND",  @PartyCodeKind, V_STRING, false ) != 0 )
+  end;
+
+  // Идентификатор базового финансового инструмента
+  if( GetParm("RGFIRT_ISIN_ISO", @isin_iso, V_STRING, true ) != 0 )
+     return 1;
+  end;
+
+  // Вид курса
+  if( (GetParm("RGFIRT_RATEKIND", @RateParm.rec.Type, V_INTEGER, false ) == 0) AND (RateParm.rec.Type > 0) )
+     if( FindRATETYPE( RateParm.rec.Type ) != true )
+        SayError( "Не найден вид курса (Type =" + RateParm.rec.Type +"), заданный в параметре RGFIRT_RATEKIND" );
+     end;
+  end;
+
+  if( (RG.GetSourceID() == GT_RTS) OR (RG.GetSourceID() == GT_DV_MMVB) OR (RG.GetSourceID() == GT_CSV) OR (RG.GetSourceID() == GT_PAYMENTS_CSV) )
+
+     if( GT_ПолучитьПИ( isin_iso, Kind, fin, fideriv, @ErrMes ) == false )
+        Comment = ErrMes;
+        IsBreakRead = true;
+        return 0;
+     end;
+
+     if( (RateParm.rec.Type == RATETYPE_MINSTEP_PRICE) and (fideriv.rec.TickCost > 0.0) )
+        Comment = "Курс не загружен: курс вида \""+DL_GetRateTypeName(RateParm.rec.Type)+"\" загружается для ПИ, в анкете кот. нет отметки \"Постоянная\" (постоянная стоимость минимального шага цены).";
+        IsBreakRead = true;
+        return 0;
+     end;
+
+     if( (fideriv.rec.PriceMode == DERIVATIVE_MODE_PARENTFI) or (RateParm.rec.Type == RATETYPE_MINSTEP_PRICE) )
+        cur_rate = fin.rec.ParentFI;
+     else
+        cur_rate = fideriv.rec.TickFIID;
+     end;
+
+  else
+
+     if( ПолучитьФинИн( isin_iso, fin, Avoir, NULL, NULL, Kind ) != 0 )/*не считаем ошибкой*/
+        Comment = "Финансовый инструмент с кодом \"" + isin_iso + "\" не найден в справочнике";
+        IsBreakRead = true;
+        return 0;
+     end;
+
+     if( GetParm("RGFIRT_CURR_RATE",  @cur_rate, V_STRING, false ) != 0 )
+     end;
+  
+     IndexNom = Avoir.rec.IndexNom;
+  end;
+
+  if( (RG.GetSourceID() == GT_MMVB3) OR (RG.GetSourceID() == GT_PAYMENTS) )
+
+     var BoardID:string = "", BoardType:string = "";
+     var AttrID:integer = 0, NumInList = "";
+
+     if( GetParm("RGFIRT_BOARDID", @BoardID, V_STRING, false ) != 0 )
+     end;
+
+     if( GetParm("RGFIRT_BOARDTYPE", @BoardType, V_STRING, false ) != 0 )
+     end;
+
+     AttrID = ПолучитьЗначениеКатегории( Avoir, 36, OBJTYPE_AVOIRISS );
+     if( not GetMainObjAttr( null, OBJTYPE_AVOIRISS, UniID(Avoir, OBJTYPE_AVOIRISS), 36, AttrID, null, NumInList ) )
+        NumInList = "";
+     end;
+     /*сравнивать с AttrID нехорошо, нужно сравнивать с NumInList*/
+     if( (BoardType == "MAIN") and (NumInList == "1"/*EQCC*/) and (BoardID == "EQCC") )
+        /* загружаем */
+     elif( (BoardType == "MAIN") and (NumInList == "2"/*EQQI*/) and (BoardID == "EQQI") )
+        /* загружаем */
+     elif( (BoardType == "MAIN") and (NumInList == "3"/*EQDP*/) and (BoardID == "EQDP") )
+        /* загружаем */
+     elif( (BoardType == "MAIN") and (NumInList == ""/*не задано*/) and (BoardID != "EQCC") and (BoardID != "EQQI") and (BoardID != "EQDP") )
+        /* загружаем */
+     elif( (fin.rec.issuer == {OurBank}) and ((BoardID == "PSAU") or (BoardID == "PSBB") or (BoardID == "AUBB") or (BoardID == "AUCT"))  )
+        /* загружаем */
+     else
+        /* НЕ загружаем */
+        Comment = "Неверный режим торгов для финансового инструмента с кодом \"" + isin_iso + "\"";
+        IsBreakRead = true;
+        return 0;
+     end;
+
+     if( GetParm("RGFIRT_FACEVALUE",  @FaceValue, V_DOUBLE, false ) != 0 )
+     end;
+
+  elif( (RG.GetSourceID() == GT_SPB) OR (RG.GetSourceID() == GT_PAYMENTS_SPB) )
+     if( GetParm("RGFIRT_FACEVALUE",  @FaceValue, V_DOUBLE, false ) != 0 )
+     end;
+  end;
+
+  RateParm.rec.OtherFI = fin.rec.FI_Code;
+  OverFIID = fin.rec.fiid;
+
+  // Признак относительной котировки
+  if( GetParm("RGFIRT_ISRELATIVE",  @RateParm.rec.IsRelative, V_STRING, false ) != 0 )
+  end;
+
+  if( GetParm("RGFIRT_FOR_CB",  @for_cb, V_STRING, false ) != 0 )
+  end;
+
+  if( for_cb == SET_CHAR )
+     if(cur_rate == "" ) /*ID валюты котировки*/
+        FIID = fin.rec.FaceValueFI;
+     else
+        if( GetParm("RGFIRT_RATE_ISREALID",  @rate_isrealid, V_STRING, true ) != 0 )
+        end;
+
+        if( rate_isrealid != SET_CHAR )
+
+           if( GetParm("RGFIRT_FINCODEKIND",  @FinCodeKind, V_STRING, true ) != 0 )
+           end;
+
+           if( GetRealID( RG_CURRENCY, cur_rate, FinCodeKind, @RealFIID, @ErrMes ) != 0 )
+              SayError( ErrMes );
+              return 1;
+           end; 
+        else
+           RealFIID = cur_rate;
+        end;
+
+
+        if( RateParm.rec.IsRelative == SET_CHAR ) /* при заданном признаке отностиельной котировки валюта котировки должна совпадать с валютой номинала*/
+           /* если это не так выведем в лог предупреждение */
+           if( fin.rec.FaceValueFI != RealFIID )
+              Comment = "Задан признак относительной котировки. Валюта котировки "+GetFICode(RealFIID) +" не совпадает с валютой номинала ц/б " + GetFICode(fin.rec.FaceValueFI);
+           end;
+        end;
+        FIID = RealFIID;
+     end;
+  else
+     /*для валют котировка в нацвалюте*/
+     FIID = NATCUR; 
+  end;
+
+  if( IsMarketPlace(RateParm.rec.Type) )
+     // ID торговой площадки
+     if( GetParm("RGFIRT_MARKETPLACE", @str_temp, V_STRING, false ) != 0 )
+     else
+        if( GetRealID( RG_PARTY, str_temp, PartyCodeKind, @RateParm.rec.Market_Place, @ErrMes ) != 0 )
+            SayError( ErrMes );
+            return 1;
+        end;
+     end;
+
+     /*Сектор биржи*/
+     if( GetParm("RGFIRT_MARKETOFFICE", @RateParm.rec.Section, V_STRING, false ) != 0 )
+     end;
+  end;
+  if ( (RateParm.rec.Type == RATETYPE_CALC_PRICE) or (RateParm.rec.Type == RATETYPE_CLOSE_PRICE_LOCAL) )
+    FIID = fideriv.rec.TickFIID; //Валюта стоимости мин. шага цены, если БА не артикул с установленным курсом "Рыночная цена"
+    if (ПолучитьФинИн( fin.rec.FaceValueFI, BasisFI ) == 0 )
+      if (BasisFI.rec.FI_KIND == FIKIND_ARTICLE)
+        var sql = RSDCommand(" SELECT T_FIID "
+                       + "   FROM dratedef_dbt "
+                       + "  WHERE t_OtherFI = ? "
+                       + "    AND t_Type = ? "
+                       + "  ORDER BY t_IsDominant DESC "); /* первым будет основной */
+        sql.addParam( "", RSDBP_IN, BasisFI.rec.FIID );
+        sql.addParam( "", RSDBP_IN, RATETYPE_MARKET_PRICE );
+        sql.execute();
+
+        var rsd = TRsbDataSet(sql);
+        if( rsd.MoveNext() )
+          var RateDef = rsd.GetRecord();
+          FIID = RateDef.FIID;
+        end;
+      end; 
+    end;
+  elif (RateParm.rec.Type == RATETYPE_CALC_PRICE_G)
+    FIID = NATCUR; 
+  end;
+
+  if( ПолучитьФинИн( FIID, rFininstr ) ) 
+     SayError( "Не найден финансовый инструмент ( FIID = " + FIID + " )" );
+     return 1;
+  else
+     RateParm.rec.FI_Code = rFininstr.rec.FI_Code;
+  end;
+
+  // Признак обратной котировки
+  if( GetParm("RGFIRT_ISINVERSE", @RateParm.rec.IsInverse, V_STRING, false ) != 0 )
+  end;
+
+  // Масштаб курса
+  if( GetParm("RGFIRT_SCALE", @RateParm.rec.Scale, V_INTEGER, false ) != 0 )
+     RateParm.rec.Scale = 1;
+  end;
+
+  // Количество значащих цифр
+  if((RG.GetSourceID() == GT_MMVB3) OR (RG.GetSourceID() == GT_PAYMENTS) or (RG.GetSourceID() == GT_SPB) OR (RG.GetSourceID() == GT_PAYMENTS_SPB))
+     if( GetParm("RGFIRT_POINT", @RateParm.rec.Point, V_INTEGER, false ) != 0 )
+        RateParm.rec.Point = RATE_POINT;
+     end;
+  else
+     if( fin.rec.FI_Kind == FIKIND_DERIVATIVE )
+        fideriv.clear();  
+        fideriv.KeyNum = 0;
+        fideriv.rec.FIID = fin.rec.FIID;
+        if( fideriv.GetEQ() == false )
+           RateParm.rec.Point = RATE_POINT;
+        else
+           if( RateParm.rec.Type == RATETYPE_MINSTEP_PRICE )
+             //TEG   RateParm.rec.Point = fin.rec.Point;
+              RateParm.rec.Point = IIF(fin.rec.Point==0,5,fin.rec.Point);
+           else
+              RateParm.rec.Point = fideriv.rec.TickPoint;
+           end;
+        end;
+     else
+        RateParm.rec.Point = RATE_POINT;
+     end;
+  end;
+
+  // Значение курса
+          /*проверим - надо ли загружать курс вида "Минимальная стоимость шага цены"*/
+//  if( (RateParm.rec.Type == DV_RATE_MINCOST_KIND) AND (fideriv.rec.TickCost != 0.) )
+//  else
+     if( GetParm("RGFIRT_RATE", @rate, V_STRING ) != 0 )
+        RateParm.rec.Rate = 1;
+     else
+        RateParm.rec.Rate = Money( floor( Double(rate) * pow(10,RateParm.rec.Point)+0.5) );
+     end;
+//  end;
+
+  // Дата установки курса
+  if( GetParm("RGFIRT_SINCEDATE", @RateParm.rec.SinceDate, V_DATE, false ) != 0 )
+     RateParm.rec.SinceDate = {curdate};
+  end;
+
+  // Признак основного курса
+  if( GetParm("RGFIRT_ISDOMINANT", @RateParm.rec.IsDominant, V_STRING, false ) != 0 )
+  end;
+
+  return 0;
+END;
+
+MACRO _Rate_CreateNew( RecordID:INTEGER, SeanceID:INTEGER, ID:@STRING, Comment:@STRING):INTEGER
+   var IsBreakRead = false, RateID = 0;
+
+   RG       = TGTRecord();
+   RateParm = TRecHandler( "rateparm" );
+
+   RG.LoadFromDB( RecordID );
+
+   var CatErr = 0;
+
+   FaceValue = NULL;
+   IndexNom = UNSET_CHAR;
+
+   // Номер отчета
+   if( ReadRateParms( @Comment, @IsBreakRead ) != 0 )
+      return 1;
+   end;
+
+   if( IsBreakRead )
+     //teg 
+     ID="0";
+     return 0;
+   end;
+
+   if( УстановитьКурс( RateParm, null, RateID ) != 0 )
+      return 1;
+   else
+      if(Comment!="")
+         Comment = Comment + "\n";
+      end;
+      Comment = Comment + "Загружен/обновлен курс ФИ "+RateParm.rec.OtherFI +" за дату " + string(RateParm.rec.SinceDate);
+   end;
+
+   // RGFIRT_TCC_FLAG
+   GetParm("RGFIRT_TCC_FLAG", @RateParm.rec.TCC_Flag, V_INTEGER, false );
+
+   var ТекущееЗначениеТСС, НовоеЗначениеТСС;
+
+   if(RateParm.rec.TCC_Flag >= 0)
+
+      GetMainObjAttr(null, OBJTYPE_AVOIRISS, L_Z(OverFIID, 10), 27, ТекущееЗначениеТСС);
+      НовоеЗначениеТСС = IIF(RateParm.rec.TCC_Flag == 1, 1, 2);
+
+      if((ValType(ТекущееЗначениеТСС) == V_UNDEF) or (ТекущееЗначениеТСС != НовоеЗначениеТСС))
+         /*Установить "Возможность надежного определения справедливой стоимости"*/
+         if( (not DisconnectObjAttr( OBJTYPE_AVOIRISS, L_Z( OverFIID, 10 ), 27 )) 
+             OR
+             (not ConnectObjAttr( CatErr, OBJTYPE_AVOIRISS, L_Z( OverFIID, 10 ), 27, НовоеЗначениеТСС )) 
+             OR
+             (CatErr != 0)
+           )
+            SayError("Ошибка при установке категории |\"" + ИмяКатегории(OBJTYPE_AVOIRISS, 27) + "\"" );
+            return 1;
+         end;
+      end;
+   end; 
+
+   ID = string(RateID) + "_" + string( RateParm.rec.SinceDate );
+
+   if( (RG.GetSourceID() == GT_MMVB3) OR (RG.GetSourceID() == GT_PAYMENTS) or (RG.GetSourceID() == GT_SPB) or (RG.GetSourceID() == GT_PAYMENTS_SPB) )
+      var ErrMsg = "";
+      ЗагрузитьНоминалДляОФЗИНЗаДату(Avoir, FaceValue, RateParm.rec.SinceDate, @ErrMsg);
+      Comment = Comment + ErrMsg;
+   end;
+   Comment = IIF (Comment == "", "Котировка с номером "+ID+" успешно загружена в систему." ,Comment);
+   
+   return 0;
+
+OnError( RslErrObj )
+   Comment = "Модуль: " + string(RslErrObj.Module) + "|Строка: " + string(RslErrObj.Line) + "|Код ошибки: " + string(RslErrObj.Code) + "|" + string(RslErrObj.Message);
+   return 1;
+end;

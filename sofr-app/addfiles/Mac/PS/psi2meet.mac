@@ -1,0 +1,297 @@
+/*
+$Name:           psi2meet.mac
+$Module:         РКО
+$Description:    Макрос шага
+*/
+
+//-----------------------------------------------------------------------------
+// Блок     : 29040 - "Оплата картотеки №2"
+// Шаг      : 10    - "Формирование оплаты картотеки №2"
+//-----------------------------------------------------------------------------
+import InsCarryDoc, WldInter, OprInter, FIInter, payconst, PaymInter, payinter, PTInter, sfinsdoc, "catfdoc.mac", cbsttls, "mpckvit.mac";
+import pm_common, pm_reserve;
+import oralib, likepy, wltools, pm_answerret;
+
+var PaymentObj:RsbPayment;
+
+private macro ValueDateForMakePaymentK2(Paym : RsbPayment) : date
+  var ValueDate : date = {curdate};
+  var DocKind = Paym.PrimDocKind;
+
+  if( GetParentOrEqualDocKindFromList(DocKind, PMDOC_CLIENTPAYMENT) )
+    ValueDate = PM_GetOperDay_BankServiceBalance(Paym.Department);
+  elif( GetParentOrEqualDocKindFromList(DocKind, DLDOC_BANKORDER) )
+    ValueDate = PM_GetOperDay_Balance(Paym.Department);
+  end;
+
+  return ValueDate;
+end;
+
+private macro GetComplementaryGround(PaymentID)
+  
+  var select:string;
+  var params:TArray;
+  var rs:object;
+  var DocKindName:string;
+  var DocDateTime, DocDate, DocTime;
+  var OrganName:string;
+  var NewGround:string;
+
+  select = " select llv.T_NAME, doc.T_DATE , doc.T_ORGANNAME " +
+           " from DPMINHIST_DBT hist, DPMCHNDOC_DBT doc, DLLVALUES_DBT llv " +
+           " where hist.T_PAYMENTID = :PaymentID         " + 
+           "   and doc.T_DOCUMENTID = hist.T_DOCUMENTID  " +
+           "   and llv.T_LIST       = 1681               " +
+           "   and llv.T_ELEMENT    = doc.T_DOCUMENTKIND "+
+           " order by hist.T_HISTORYNUM desc ";
+
+  params = makeArray( SQLParam("PaymentID", PaymentObj.PaymentID) );
+  rs     = execSQLselect( select, params, FALSE );
+  
+  if( rs AND rs.moveNext() ) 
+    DocKindName = rs.value(0);
+    DocDateTime = rs.value(1);
+    OrganName   = rs.value(2);
+    DtTmSplit( DocDateTime, DocDate, DocTime );
+    NewGround = ". Перечисление по новым реквизитам согласно: " +
+                DocKindName + " " + OrganName + " от " + DocDate;
+  else
+    NewGround = "";
+  end;
+
+  return NewGround;
+end;
+
+// Выполнение шага
+MACRO ExecuteStep( doc, payorder, DocKind:integer, ID_Operation:integer, ID_Step:integer  )
+
+  if(IsArestDebetAcc(PaymentObj.PayerAccount, PaymentObj.PayerFIID))
+    msgbox("На счет наложено ограничение операций");
+    return 1;
+  end;
+
+  if(CheckDateStartOpr(ID_Operation))
+    return 1;
+  end;
+
+  if( PaymentObj.I2PlaceDate > {curdate} )
+    msgbox("Дата помещения документа в картотеку больше даты текущего операционного дня");
+    return 1;
+  end;
+
+  var PartPayments:TArray = PaymentObj.PartPayments(true);
+
+  if(PartPayments.size() == 0)
+    return 0;
+  end;
+
+  var NewGround:string = GetComplementaryGround(PaymentObj.PaymentID);
+
+  var Status, SkipArest;
+  var i = 0;
+  var PartPaymentObj:RsbPayment;
+  
+  // Определим счета в проводках
+  var ВнебалСчетКартотеки2;
+
+  // Объект для КУ
+  var FD_CorrAcc:NotBalCorrAcc_FirstDoc = NotBalCorrAcc_FirstDoc( "П" );
+
+  // Счета КУ
+  var СистемныйСчетДляКартотек:string = FD_CorrAcc.FindAndOpenSysAccount( "ВнебалСчетКорресп", 0, {curdate} );
+  
+  if( GetAccount90902( PaymentObj.PayerAccount,
+                       PaymentObj.PayerFIID,
+                       PaymentObj.BaseFIID,
+                       ВнебалСчетКартотеки2,  // В случае успеха, сюда вернется номер "привязанного" счета
+                       PaymentObj.ValueDate ) )
+    return 1;
+  end;
+
+
+  while(i < PartPayments.size())
+    
+    PartPaymentObj = PartPayments[i];
+    PartPaymentObj.Ground = PartPaymentObj.Ground + NewGround;
+    //PayAmount = PayAmount + PartPaymentObj.PayerAmount;
+    PartPaymentObj.OutTransferDate = PmGetDefaultOutTransferDate( PartPaymentObj );
+    
+    if( PartPaymentObj.DocKind == PS_PAYORDER )
+      if( RsbPsPayOrder( PartPaymentObj.PaymentID ).AddOprState( OPR_PAYM_CONTROL, OPR_PAYM_ST_CTRL_NOTCONTROL ) )
+        msgbox("Ошибка при установке сегментов статуса экземпляра операции");
+        return 1;
+      end;                                               
+    end;
+
+    if( PM_GetOprStatus( PaymentObj.DocKind, PaymentObj.DocumentID, OPR_PAYM_PERMISSION, @Status ) and
+        (Status == OPR_PAYM_ST_PERMISSION_YES)
+      )
+      SkipArest = true;
+    else
+      SkipArest = false;
+    end;
+
+    if( CheckRestAndMakeReserve(PartPaymentObj, true, false, false, false, NULL, SkipArest, true, true, NULL, true) )
+      msgbox("Ошибка создания резерва");
+      return 1;
+    end;
+    
+    // Если исходный платеж из модуля "Проценты" - свяжем с ним планируемую оплату
+    if( IsPrcPayment( PaymentObj) )
+      if( PrcKvitLinkPayments( PaymentObj.PaymentID, PartPaymentObj.PaymentID ) )
+        return 1;
+      end;
+    end;
+
+    // Выполним проводку по внебалансу
+    var paymtr:RsbAccTransaction = PartPaymentObj.MakeTransaction();
+
+    if( paymtr == NULL )
+      MsgBox("Ошибка при создании проводки по платежу");
+      return 1;
+    end;
+
+    paymtr.Chapter         = 3;
+    paymtr.Date_Carry      = {curdate};
+    paymtr.Number_Pack     = PartPaymentObj.NumberPack;
+    paymtr.Numb_Document   = PartPaymentObj.Number;
+    paymtr.ResultCarry     = OBI2PARTCARRY;
+    paymtr.Kind_Oper       = " 1";
+    paymtr.Shifr_Oper      = "09";
+    paymtr.Department      = PaymentObj.Department;
+    paymtr.AccountPayer    = СистемныйСчетДляКартотек;
+    paymtr.AccountReceiver = ВнебалСчетКартотеки2;
+
+    paymtr.FIIDPayer       = NATCUR; 
+    paymtr.FIIDReceiver    = PartPaymentObj.BaseFIID;
+
+    paymtr.SumReceiver     = PartPaymentObj.BaseAmount;
+    if( ConvSum( paymtr.SumPayer, PartPaymentObj.BaseAmount, PaymentObj.ValueDate, PartPaymentObj.BaseFIID, NATCUR ) )
+      msgbox("Ошибка конвертации суммы");
+      return 1;
+    end;
+
+    paymtr.Ground          = "Снятие с Картотеки 2 суммы " + PartPaymentObj.BaseAmount +
+                             " по документу № "            + string(PaymentObj.Number) +
+                             " от "                        + string(PaymentObj.Date)   +
+                             " к счету "                   + string(PaymentObj.PayerAccount);
+    
+    if( not paymtr.Carry )
+      MsgBox("Ошибка при актуализации платежа");
+      return 1;
+    end;
+    
+    i = i + 1;
+  end;
+
+  // Если оплата - последняя
+  if( not PaymentObj.FutureBaseAmount )
+    // Установить дату списания
+    PaymentObj.PayerChargeOffDate = PartPaymentObj.ValueDate;
+    // Установить статус платежа
+    PaymentObj.PaymStatus = PM_FINISHED;
+
+    // Установить статус первички
+    PM_SetPrimDocumentState( PaymentObj, DOCUMENT_ST_CLOSED );
+
+    if( УстановитьСтатусыПлатежа( OPR_PAYM_STATE, OPR_PM_ST_CLOSE, OPR_PAYM_INDEX, OPR_PAYM_ST_INDEX_NO ) )
+      msgbox("Ошибка при установке сегментов статуса экземпляра операции");
+      return 1;
+    end;
+  end;
+
+  // Установить дату начала операции  равной дате значения 
+  SetOprDate(29000000, PaymentObj.ValueDate);
+
+  return 0;
+
+END;
+
+// Сообщить о неисполнении
+private macro InformAboutNonExecution( ID_Oper, ID_Step )
+  
+  record wlmes( wlmes );
+  var IsMesFound : bool = false;
+  
+  // Находим все частички, которые породили на данном шаге
+  var rs = execSQLselectPrm
+  ( "select t_DocumentID from doprdocs_dbt where t_ID_Operation = :ID_Operation and t_ID_Step = :ID_Step and t_DocKind in (:PS_PAYORDER, :PS_CPORDER, :PS_INRQ)",
+    SQLParam("ID_Operation", ID_Oper),
+    SQLParam("ID_Step", ID_Step),
+    SQLParam("PS_PAYORDER", PS_PAYORDER),
+    SQLParam("PS_CPORDER", PS_CPORDER),
+    SQLParam("PS_INRQ", PS_INRQ)
+  );
+
+  while(rs.moveNext())
+
+    var PartPaymentID = int(rs.value("t_DocumentID"));
+
+    var initialPaymentID = getInitialPaymentID(PaymentObj.PaymentID, PMLINK_KIND_EXECORDER);
+
+    if( initialPaymentID > 0 )
+      // Связанное входящее сообщение платежа 
+      if( ПолучитьСообщение( initialPaymentID, OBJTYPE_PAYMENT, 1 /*WLD_MES_IN*/, wlmes, NULL ) )  
+        IsMesFound = true;
+      else
+        ClearRecord( wlmes );
+      end;
+    end;
+
+    var MesFormatType = -1;
+    if( wlmes.MesID > 0 )
+      MesFormatType = GetMesFormatType(wlmes.MesID);
+    end;
+
+    if( ( ДокументПорожденВходящимЭСИДNew(PaymentObj.PaymentID) and (initialPaymentID == 0) )
+       or
+        (initialPaymentID > 0) and (wlmes.MesID > 0) and (MesFormatType == WLD_FORMAT_XML) )
+      
+      // Параметры создаваемого подтверждения банка
+      var ErrCode : integer = FNS_RP_PAY_NO_EXEC_NO_MONEY;
+      var ErrDescription : string = Bnk_GetLLValuesName(OBJTYPE_WLRESCODE_MNS, ErrCode);
+
+      var ErrList : RsbWlError = RsbWlError(0);
+      var wlerr_buf : TRecHandler = TRecHandler("wlerror.dbt");
+      wlerr_buf.rec.Code = "00";
+      wlerr_buf.rec.Description  = string("поручение налогового органа № ",
+          PaymentObj.Number, " от ", PaymentObj.Date,
+          " на сумму ", PaymentObj.BaseAmount, " исполнено в части суммы ", 
+          " в  связи с недостаточностью денежных средств на счете ", PaymentObj.PayerAccount,
+          " клиента ", PaymentObj.PayerName, " банка (филиала банка)");
+
+      if( ErrList.Insert( wlerr_buf ) != 0 )
+        msgbox("Ошибка при вставке подтверждения банка");
+        return;
+      end;
+
+      // Вставка подтверждения банка
+      if( not ВставитьПодтверждениеБанкаФНС( IfThenElse(IsMesFound, wlmes, NULL), ErrCode, ErrDescription, ErrList, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, PartPaymentID, 2 ) )
+        msgbox( "Ошибка при вставке подтверждения банка" );
+      end;
+    end;
+
+  end;
+end;
+
+macro PostStep( message,     /* данный параметр может принимать следующие       */
+                             /* значения: 1 - выполнение шага; 2 - откат шага;  */
+                errTrn,      /* статус выполнения шага. Если параметр не равен 0*/
+                             /* произошла ошибка                                */
+                FirstDoc,    /* указатель на первичный документ                 */
+                ID_Oper,     /* внутренний идентификатор операции               */
+                Num_Step,    /* Номер шага операции (из настроек)               */
+                KindOper,    /* номер вида операции                             */
+                KindDoc,     /* номер вида первичного документа                 */
+                KindStep,    /* вид шага операции                               */
+                ID_Step )    /* внутренний идентификатор шага операции          */
+
+  var stat = 0;
+
+  if( ( errTrn == 0 ) and ( message == 1 ) )// на выполнении шага
+    // Сообщить о неисполнении
+    InformAboutNonExecution(ID_Oper, ID_Step);
+  end;
+
+  return stat;
+end;

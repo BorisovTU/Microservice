@@ -1,0 +1,125 @@
+DROP TABLE D_SEM03_TMP CASCADE CONSTRAINTS
+/
+
+CREATE GLOBAL TEMPORARY TABLE D_SEM03_TMP
+(
+  T_ID_MB_SEM03             NUMBER(10),
+  T_ID_MB_REQUISITES        NUMBER(10),
+  T_ID_PROCESSING_LOG       NUMBER(10),
+  T_TRADEDATE               DATE,
+  T_TRADESESSIONDATE        DATE,
+  T_SESSIONNO               VARCHAR2(1),
+  T_FIRMID                  VARCHAR2(12),
+  T_CURRENCYID              VARCHAR2(3),
+  T_BOARDID                 VARCHAR2(4),
+  T_BOARDNAME               VARCHAR2(30),
+  T_SETTLEDATE              DATE,
+  T_SECURITYID              VARCHAR2(12),
+  T_SECSHORTNAME            VARCHAR2(10),
+  T_SECNAME                 VARCHAR2(30),
+  T_SECURITYTYPE            VARCHAR2(4),
+  T_INITIALFACEVALUE        NUMBER(32,12),
+  T_FACEVALUE               NUMBER(32,12),
+  T_SECCURRENCYID           VARCHAR2(3),
+  T_PRICETYPE               VARCHAR2(4),
+  T_TRDACCID                VARCHAR2(12),
+  T_CLEARINGCENTERID        VARCHAR2(3),
+  T_RECNO                   NUMBER(10),
+  T_SECSETID                VARCHAR2(12),
+  T_SECSETSHORTNAME         VARCHAR2(10),
+  T_TRADENO                 VARCHAR2(20),
+  T_TRADETIME               DATE,
+  T_BUYSELL                 VARCHAR2(1),
+  T_SETTLECODE              VARCHAR2(12),
+  T_DECIMALS                NUMBER(5),
+  T_PRICE                   NUMBER(32,12),
+  T_QUANTITY                NUMBER(10),
+  T_VALUE                   NUMBER(32,12),
+  T_AMOUNT                  NUMBER(32,12),
+  T_EXCHCOMM                NUMBER(32,12),
+  T_FACEAMOUNT              NUMBER(32,12),
+  T_ORDERNO                 VARCHAR2(20),
+  T_ACCINT                  NUMBER(32,12),
+  T_CPFIRMID                VARCHAR2(12),
+  T_CPFIRMSHORTNAME         VARCHAR2(30),
+  T_CPFIRMINN               VARCHAR2(12),
+  T_CPTRDACCID              VARCHAR2(12),
+  T_REPOVALUE               NUMBER(32,12),
+  T_REPOPERIOD              NUMBER(5),
+  T_RATETYPE                VARCHAR2(8),
+  T_BENCHMARK               VARCHAR2(12),
+  T_REPORATE                NUMBER(32,12),
+  T_OUTSTANDINGRETURNVALUE  NUMBER(32,12),
+  T_DISCOUNT                NUMBER(32,12),
+  T_LOWERDISCOUNT           NUMBER(32,12),
+  T_UPPERDISCOUNT           NUMBER(32,12),
+  T_TRADETYPE               VARCHAR2(1),
+  T_CANCELORDER             VARCHAR2(10),
+  T_ISCANCEL                VARCHAR2(1),
+  T_USERID                  VARCHAR2(12),
+  T_YIELD                   NUMBER(32,12),
+  T_PERIOD                  VARCHAR2(1),
+  T_EXTREF                  VARCHAR2(12),
+  T_PRICE2                  NUMBER(32,12),
+  T_ACCINT2                 NUMBER(32,12),
+  T_CLIENTCODE              VARCHAR2(12),
+  T_VCLIENTCODE             VARCHAR2(12),
+  T_DETAILS                 VARCHAR2(20),
+  T_SUBDETAILS              VARCHAR2(20),
+  T_REFUNDRATE              NUMBER(32,12),
+  T_MATCHREF                VARCHAR2(10),
+  T_BROKERREF               VARCHAR2(20),
+  T_SYSTEMREF               VARCHAR2(12),
+  T_CLEARINGFIRMID          VARCHAR2(12),
+  T_ISHIDDEN                VARCHAR2(1),
+  T_ISACTUALMM              VARCHAR2(1),
+  T_DOC_NO                  VARCHAR2(12),
+  T_PARTYID                 NUMBER(10),
+  T_SFCONTRID               NUMBER(10),
+  T_ISSEB                   NUMBER(5),
+  T_CPFIRMPARTYID           NUMBER(10),
+  T_CURID                   NUMBER(10),
+  T_CALENDID                NUMBER(5),
+  T_MARKETSCHEMEID          NUMBER(10),
+  T_NDAY1                   NUMBER(5),
+  T_NDAY2                   NUMBER(5),
+  T_PAYMDATE1               DATE,
+  T_PAYMDATE2               DATE,
+  T_CALCITOGDATE            DATE,
+  T_WORKSETTLEDATE          DATE,
+  T_OBJECTID                NUMBER(10),
+  T_PORTFOLIO               NUMBER(5),
+  T_FIID                    NUMBER(10),
+  T_UNDERWR                 NUMBER(5),
+  T_UNDERWR_BUY             NUMBER(5),
+  T_UNDERWRDOID             NUMBER(10),
+  T_ISREPO                  NUMBER(5),
+  T_MARKETREPORTID          NUMBER(10)
+)
+ON COMMIT PRESERVE ROWS
+NOCACHE
+/
+
+CREATE UNIQUE INDEX D_SEM03_TMP_IDX0 ON D_SEM03_TMP
+(T_ID_MB_SEM03)
+/
+
+CREATE INDEX D_SEM03_TMP_IDX1 ON D_SEM03_TMP
+(T_TRADENO, T_BUYSELL, T_VCLIENTCODE)
+/
+
+CREATE INDEX D_SEM03_TMP_IDX2 ON D_SEM03_TMP
+(T_VCLIENTCODE)
+/
+
+CREATE INDEX D_SEM03_TMP_IDX3 ON D_SEM03_TMP
+(T_TRDACCID, T_VCLIENTCODE)
+/
+
+CREATE INDEX D_SEM03_TMP_IDX4 ON D_SEM03_TMP
+(T_SECURITYID)
+/
+
+CREATE INDEX D_SEM03_TMP_IDX5 ON D_SEM03_TMP
+(T_TRDACCID)
+/

@@ -1,0 +1,919 @@
+//-----------------------------------------------------------------------------
+//  Блок        : "Предобработка"
+//
+//  Шаг         : "Проверка остатков по счетам"
+//
+//  Описание    : Выбор варианта обработки в зависимости от результата проверки 
+//                свободного остатка
+//
+//  Программист : Чукина Т.А.
+//
+//  Создан      : 10.04.2014
+//-----------------------------------------------------------------------------
+
+import PaymInter, OprInter, "pmlib.mac", "pm_common.mac", likepy, BankInter, 
+       "wlglobal.mac", "pm_setst.mac", "pm_const.mac";
+
+// Выбор варианта обработки
+PRIVATE CLASS TSelectProcMethod
+( p_Payment : RsbPayment,
+  p_Account : string,
+  p_AccChapter : integer,
+  p_AccFIID : integer,
+  p_EnoughMoney : bool, // Достаточно средств
+  p_IsArest : bool,
+  p_IsIWP : bool, // КОР
+  p_IsI2LORO : bool, // К2/КЛОРО
+  p_IsWaiting : bool // Очередь
+)
+  private var 
+    Payment : RsbPayment = p_Payment,
+    Account : string = p_Account,
+    EnoughMoney  : bool = p_EnoughMoney,
+    IsArest      : bool = p_IsArest,
+    IsIWP        : bool = p_IsIWP,
+    IsI2LORO     : bool = p_IsI2LORO,
+    IsWaiting    : bool = p_IsWaiting;
+
+  private var 
+    PSDocKind : integer = GetPSDocKind(Payment), // pspayord.DocKind
+
+    // счет является клиентским по алгоритму определения клиентских счетов
+    IsAccClient : bool = not PM_IsBankAccount(p_Account, p_AccFIID, p_AccChapter), 
+
+    // счет является корсчетом ЛОРО
+    IsAccLORO : bool = IsLoroAccount(p_Account, p_AccFIID);
+
+  // платежное поручение, или платежное требование, или инкассовое поручение РКО
+  private macro IsPsOrderDemandRequest() : bool
+    if( (Payment.DocKind == PS_PAYORDER) and 
+        InList(PSDocKind, PSPOKIND_ORDER, PSPOKIND_DEMAND, PSPOKIND_REQUEST)
+      )
+      return true;
+    end;
+
+    return false;
+  end;
+
+  // заявление на аккредитив
+  private macro IsPsAkkreditiv() : bool
+    if( (Payment.DocKind == PS_PAYORDER) and 
+        (PSDocKind == PSPOKIND_AKKREDITIV)
+      )
+      return true;
+    end;
+
+    return false;
+  end;
+
+  // рублевый банковский ордер
+  private macro IsRubBankOrder() : bool
+    return (Payment.DocKind == DLDOC_BANKORDER) and
+           (Payment.Purpose == PM_PURP_BANKORDER);
+  end;
+
+  // валютный банковский ордер
+  private macro IsCurBankOrder() : bool
+    return (Payment.DocKind == DLDOC_BANKORDER) and
+           (Payment.Purpose == PM_PURP_CBANKORDER);
+  end;
+
+
+  // Был ли создан резерв по платежу
+  MACRO WasMadeReserve() : bool
+    // Это условия, при которых метод RsbPayment.CheckRestAndMakeReserve 
+    // должен был создать резерв (если он был нужен)
+    return (EnoughMoney and not IsIWP and not IsI2LORO and not IsWaiting);
+  END;
+
+  // Направить в КОР
+  MACRO MustSendTo_IWP(ErrMsg : @string) : bool
+
+    // Подходит по виду документа
+    var IsProperDocKind : bool = false;
+    if( IsPsOrderDemandRequest() )
+      IsProperDocKind = true;
+    elif( (Payment.DocKind == DLDOC_BANKORDER) and
+          ( (Payment.Purpose == PM_PURP_BANKORDER/*рублевый*/) and IsAccClient
+            or
+            IsAccLORO
+          )
+        )
+      IsProperDocKind = true;
+    end;
+
+    // Проверяем флажки
+    if( IsProperDocKind )
+
+      if( IsArest and IsIWP
+          or
+          not EnoughMoney and IsArest and not IsIWP
+        )
+        ErrMsg = "На счет плательщика " + Account + " наложен запрет на проведение операций.";
+        RETURN TRUE;
+
+      elif( not IsArest and IsIWP and not IsI2LORO )
+        ErrMsg = "К счету плательщика " + Account + " есть картотека ожидающих разрешения.";
+        RETURN TRUE;
+      end;
+
+    end;
+
+    RETURN FALSE;
+  END;
+
+  // Направить в К2
+  MACRO MustSendTo_I2(ErrMsg : @string) : bool
+
+    var IsProperDocKindRub : bool =
+          IsPsOrderDemandRequest() 
+          or
+          IsRubBankOrder() and IsAccClient and not IsAccLORO;
+
+    var IsProperDocKindCur : bool =
+          InList(Payment.DocKind, PS_CPORDER, PS_INRQ)
+          or
+          IsCurBankOrder() and IsAccClient and not IsAccLORO;
+
+    if( IsProperDocKindRub and 
+        not IsArest and not IsIWP and IsI2LORO 
+        or
+        IsProperDocKindCur and
+        IsI2LORO
+      )
+      ErrMsg = "К счету плательщика " + Account + " есть картотека №2.";
+      RETURN TRUE;
+    end;
+
+    RETURN FALSE;
+  END;
+
+  // Направить в очередь к/с ЛОРО
+  MACRO MustSendTo_ILORO(ErrMsg : @string) : bool
+    if( not IsAccLORO )
+      RETURN FALSE;
+    end;
+
+    var IsProperDocKind : bool = 
+          IsCurBankOrder()
+          or
+          GetParentOrEqualDocKindFromList // учитываем иерархию, т.к. PMDOC_MEMORIALDOCUMENT - не листовой
+            ( Payment.PrimDocKind, // проверяем PrimDocKind, чтобы не пропустить 322-ые документы (WL_WIPM)
+              DLDOC_BANKPAYMENT, 
+              BBANK_CPORDER, 
+              PMDOC_MEMORIALDOCUMENT,
+              WL_INDOC );
+
+    if( IsRubBankOrder() and 
+        not IsArest and not IsIWP and not IsI2LORO and IsWaiting
+        or
+        IsProperDocKind and
+        IsI2LORO
+      )
+      ErrMsg = "К корреспондентскому счету ЛОРО " + Account + 
+               " есть картотека документов, неоплаченных из-за отсутствия средств на корсчете.";
+      RETURN TRUE;
+    end;
+
+    if( IsRubBankOrder() and 
+        not IsArest and not IsIWP and IsI2LORO
+        or
+        IsProperDocKind and
+        not IsI2LORO and IsWaiting
+      )
+      ErrMsg = "К корреспондентскому счету ЛОРО " + Account + 
+               " есть неоплаченные документы, ожидающие поступлений.";
+      RETURN TRUE;
+    end;
+
+    if( IsRubBankOrder() and 
+        not EnoughMoney and not IsArest and not IsIWP
+        or
+        IsProperDocKind and
+        not EnoughMoney and not IsI2LORO and not IsWaiting
+      )
+      ErrMsg = "Недостаточно средств на корреспондентском счете ЛОРО " + Account + ".";
+      RETURN TRUE;
+    end;
+
+    RETURN FALSE;
+  END;
+
+  // На ожидание поступлений
+  MACRO MustSendTo_WaitMn(ErrMsg : @string) : bool
+
+    var IsProperDocKindRub : bool = 
+          IsPsOrderDemandRequest()
+          or
+          IsRubBankOrder() and IsAccClient and not IsAccLORO;
+
+    var IsProperDocKindCur : bool =
+          InList(Payment.DocKind, PS_CPORDER, PS_INRQ)
+          or
+          IsCurBankOrder() and IsAccClient and not IsAccLORO;
+
+    if( IsProperDocKindRub and
+        not IsArest and not IsIWP and not IsI2LORO and IsWaiting
+        or
+        IsProperDocKindCur and
+        not IsI2LORO and IsWaiting
+      )
+      ErrMsg = "К счету плательщика " + Account + 
+               " есть неоплаченные документы, ожидающие поступлений.";
+      RETURN TRUE;
+    elif
+      ( IsProperDocKindRub and
+        not EnoughMoney and not IsArest and not IsIWP and not IsI2LORO and not IsWaiting
+        or
+        IsProperDocKindCur and
+        not EnoughMoney and not IsI2LORO and not IsWaiting
+      )
+      ErrMsg = "Недостаточно средств на счете плательщика " + Account + ".";
+      RETURN TRUE;
+    end;
+
+    RETURN FALSE;
+
+  END;
+
+  // Предложить выбор между КОР и К2
+  MACRO MustSendTo_IWPorI2(ErrMsg : @string) : bool
+    // Проверяем вид документа
+    var IsProperDocKind : bool = 
+          IsPsOrderDemandRequest()
+          or
+          IsRubBankOrder() and IsAccClient and not IsAccLORO;
+
+    if(not IsProperDocKind)
+      RETURN FALSE;
+    end;
+
+    // Проверяем флажки
+    if( EnoughMoney and IsArest and not IsIWP and IsI2LORO )
+
+      ErrMsg = "К счету плательщика " + Account + 
+               " есть картотека №2. На счет наложен запрет на проведение операций, не влияющий на возможность оплаты документа.";
+      RETURN TRUE;
+
+    elif( not IsArest and IsIWP and IsI2LORO )
+
+      ErrMsg = "К счету плательщика " + Account + 
+               " есть картотека №2 и картотека ОР. Запрет на проведение операций отменен.";
+      RETURN TRUE;
+
+    end;
+
+    RETURN FALSE;
+  END;
+
+  // Предложить выбор между КОР и очередью корсчета ЛОРО
+  MACRO MustSendTo_IWPorILORO(ErrMsg : @string) : bool
+    ErrMsg = "";
+
+    // Проверяем вид документа
+    var IsProperDocKind : bool = IsRubBankOrder() and IsAccLORO;
+
+    if(not IsProperDocKind)
+      RETURN FALSE;
+    end;
+
+    // Проверяем флажки
+    if(EnoughMoney and IsArest and not IsIWP and IsI2LORO)
+      ErrMsg = "К корреспондентскому счету ЛОРО " + Account + 
+               " есть картотека документов, неоплаченных из-за отсутствия средств на корсчете. На счет наложен запрет на проведение операций, не влияющий на возможность оплаты документа.";
+
+    elif(EnoughMoney and IsArest and not IsIWP and not IsI2LORO and IsWaiting)
+      ErrMsg = "К корреспондентскому счету ЛОРО " + Account + 
+               " есть очередь неоплаченных документов. На счет наложен запрет на проведение операций, не влияющий на возможность оплаты документа.";
+
+    elif(not IsArest and IsIWP and IsI2LORO)
+      ErrMsg = "К корреспондентскому счету ЛОРО " + Account + 
+               " есть картотека корсчета ЛОРО и картотека ОР. Запрет на проведение операций отменен.";
+
+    elif(not IsArest and IsIWP and not IsI2LORO and IsWaiting)
+      ErrMsg = "К корреспондентскому счету ЛОРО " + Account + 
+               " есть очередь неоплаченных документов и картотека ОР. Запрет на проведение операций отменен.";
+    end;
+
+    if(ErrMsg)
+      RETURN TRUE;
+    end;
+
+    RETURN FALSE;
+  END;
+
+  // Предложить выбор между ожиданием поступлений и КОР
+  MACRO MustSendTo_IWPorWaitMn(ErrMsg : @string) : bool
+    // Проверяем вид документа
+    var IsProperDocKind : bool = 
+          IsPsOrderDemandRequest()
+          or
+          IsRubBankOrder() and IsAccClient and not IsAccLORO;
+
+    if(not IsProperDocKind)
+      RETURN FALSE;
+    end;
+
+    // Проверяем флажки
+    if(EnoughMoney and IsArest and not IsIWP and not IsI2LORO and IsWaiting)
+      ErrMsg = "К счету плательщика " + Account + 
+               " есть очередь документов, ожидающих поступлений. На счет наложен запрет на проведение операций, не влияющий на возможность оплаты документа.";
+      RETURN TRUE;
+    elif(not EnoughMoney and not IsArest and IsIWP and not IsI2LORO and IsWaiting)
+      ErrMsg = "К счету плательщика " + Account + 
+               " есть картотека ОР и очередь документов, ожидающих поступлений.";
+      RETURN TRUE;
+    end;
+
+    RETURN FALSE;
+  END;
+
+  // Предложить выбор между КОР, К2 и ожиданием поступлений
+  MACRO MustSendTo_IWPorI2orWaitMn(ErrMsg : @string) : bool
+    // Проверяем вид документа
+    var IsProperDocKind : bool = 
+          IsPsOrderDemandRequest()
+          or
+          IsRubBankOrder() and IsAccClient and not IsAccLORO;
+
+    if(not IsProperDocKind)
+      RETURN FALSE;
+    end;
+
+    // Проверяем флажки
+    if(not IsArest and IsIWP and not IsI2LORO and not IsWaiting)
+      ErrMsg = "К счету плательщика " + Account + 
+               " есть картотека ОР. Запрет на проведение операций отменен.";
+      RETURN TRUE;
+    elif(EnoughMoney and not IsArest and IsIWP and not IsI2LORO and IsWaiting)
+      ErrMsg = "К счету плательщика " + Account + 
+               " есть картотека ОР и очередь документов, ожидающих поступлений. Запрет на проведение операций отменен.";
+      RETURN TRUE;
+    end;
+
+    RETURN FALSE;
+  END;
+
+  // Отвергнуть документ
+  MACRO MustRejectPayment(ErrMsg : @string) : bool
+    ErrMsg = "";
+
+    // Проверяем вид документа
+    var IsProperDocKind : bool = 
+          IsPsAkkreditiv()
+          or
+          not IsAccLORO and GetParentOrEqualDocKindFromList // учитываем иерархию, т.к. PMDOC_MEMORIALDOCUMENT - не листовой
+                              (Payment.DocKind, DLDOC_BANKPAYMENT,
+                                                BBANK_CPORDER,
+                                                PMDOC_MEMORIALDOCUMENT)
+          or 
+          // учитываем иерархию, т.к. PMDOC_CASHDOCUMENT - не листовой
+          // берем PrimDocKind из-за DOC_BO_PAYMENT
+          GetParentOrEqualDocKindFromList(Payment.PrimDocKind, DLDOC_BANKCLAIM,
+                                                               PMDOC_CASHDOCUMENT,
+                                                               DOC_BO_PAYMENT)
+          or
+          (Payment.DocKind == DLDOC_BANKORDER) and not IsAccLORO;
+
+    if(not IsProperDocKind)
+      RETURN FALSE;
+    end;
+
+    // Проверяем флажки
+    if(EnoughMoney and IsArest and IsIWP)
+      ErrMsg = "На счет плательщика " + Account + 
+               " наложен запрет на проведение операций.";
+
+    elif(EnoughMoney and not IsArest and IsIWP and not IsI2LORO)
+      ErrMsg = "К счету плательщика " + Account + 
+               " есть картотека ОР.";
+
+    elif(EnoughMoney and not IsArest and IsIWP and IsI2LORO)
+      ErrMsg = "К счету плательщика " + Account + 
+               " есть картотека ОР и картотека №2.";
+
+    elif(EnoughMoney and not IsIWP and IsI2LORO)
+      ErrMsg = "К счету плательщика " + Account + 
+               " есть картотека №2.";
+
+    elif(EnoughMoney and not IsArest and not IsIWP and not IsI2LORO and IsWaiting)
+      ErrMsg = "К счету плательщика " + Account + 
+               " есть очередь документов, ожидающих поступлений.";
+
+    elif(not EnoughMoney)
+      ErrMsg = "Недостаточно средств на счете плательщика " + Account + ".";
+    end;
+
+    if(ErrMsg)
+      RETURN TRUE;
+    end;
+
+    RETURN FALSE;
+  END;
+
+  // Направить на ручную обработку
+  MACRO MustSendTo_Manual(ErrMsg : @string) : bool
+    // Проверяем вид документа
+    var IsProperDocKind : bool = 
+          (Payment.PrimDocKind == WL_INDOC) and // проверяем PrimDocKind, чтобы не пропустить 322-ые документы (WL_WIPM)
+          IsDebetPaym(Payment) and 
+          not IsAccClient;
+
+    if(not IsProperDocKind)
+      RETURN FALSE;
+    end;
+
+    // Проверяем флажки
+    if(not EnoughMoney)
+      ErrMsg = "Недостаточно средств на счете плательщика " + Account + ".";
+      RETURN TRUE;
+    end;
+
+    RETURN FALSE;
+  END;
+
+  macro destructor()
+    Payment = null;
+  end;
+END;
+
+
+PRIVATE CONST ВариантПоместить : string = "Поместить",
+              ВариантОтвергнуть : string = "Отвергнуть",
+              ВариантПоместитьВКартотеку2 : string = "Поместить в картотеку №2",
+              ВариантВОчередь : string = "В очередь",
+              ВариантНаОжиданиеПоступлений : string = "На ожидание поступлений",
+              ВариантВКартотеку2 : string = "В картотеку №2",
+              ВариантВКартотекуОР : string = "В картотеку ОР";
+
+private macro GetOption
+( Context : string,
+  Question : string,
+  Options : TArray,
+  ErrMsg : string,
+  Account : string
+
+) : integer
+
+  var option : integer = null;
+
+  Context = "ProcessFailedReserve:" + Context + ".";
+  if(Account)
+    Context = Context + Account;
+  end;
+
+  if( IsOprMultiExec() )
+    option = GetCachedVar(Context);
+  end;
+
+  if(option == null)
+    var DialogFlag : TSetDialogFlag = TSetDialogFlag(1);
+
+    option = ConfWin( makeArray(ErrMsg + "\n" + Question), // Text
+                      Options // Buttons
+                    );
+
+    if( IsOprMultiExec() )
+      SetCachedVar(Context, option);
+    end;
+  end;
+
+  return option;
+end;
+
+// помещение платежа в картотеку
+private macro PlacePaymentToIndex
+( Payment : RsbPayment, 
+  IndexStVal : integer, // значение сегмента статуса операции "Картотека"
+  NeedSetCtrl : bool // нужно ли устанавливать сегмент "Контроль" в "Проконтролирован"
+
+) : integer
+
+  if( УстановитьСтатусыПлатежа( OPR_PAYM_INDEX, IndexStVal ) )
+    msgbox("Ошибка при установке сегментов статуса экземпляра операции");
+    return 1;
+  end;
+
+  if(NeedSetCtrl)
+    if( УстановитьСтатусыПлатежа( OPR_PAYM_CONTROL, OPR_PAYM_ST_CTRL_CONTROL ) )
+      msgbox("Ошибка при установке сегментов статуса экземпляра операции");
+      return 1;
+    end;
+  end;
+
+  Payment.Instancy = 0;
+
+  return 0;
+end;
+
+private macro PlacePaymentToIWP( Payment : RsbPayment ) : integer
+  return PlacePaymentToIndex(Payment, OPR_PAYM_ST_INDEX_WP, true);
+end;
+
+private macro PlacePaymentToI2( Payment : RsbPayment ) : integer
+  return PlacePaymentToIndex(Payment, OPR_PAYM_ST_INDEX_2, true);
+end;
+
+private macro PlacePaymentToWaitMn( Payment : RsbPayment ) : integer
+  return PlacePaymentToIndex(Payment, OPR_PAYM_ST_INDEX_WAIT, false);
+end;
+
+private macro PlacePaymentToQueue(Payment : RsbPayment) : integer
+
+  if( УстановитьСтатусыПлатежа( OPR_PAYM_DO, OPR_PM_ST_PRIORITY ) )
+    msgbox("Ошибка при установке сегментов статуса экземпляра операции");
+    return 1;
+  end;
+
+  Payment.Instancy = 0;
+
+  return 0;
+end;
+
+// Направление в КОР
+private macro SendTo_IWP
+( Payment : RsbPayment, 
+  ErrMsg : string, 
+  Account : string
+
+) : integer
+
+  var Options : TArray = makeArray( ВариантПоместить, 
+                                    ВариантОтвергнуть );
+
+  var option : integer = GetOption( "Направление в КОР", // Context
+                                    "Поместить в картотеку ожидания разрешений?", // Question
+                                    Options,
+                                    ErrMsg, 
+                                    Account );
+
+  if( Options[option] == ВариантПоместить )
+    return PlacePaymentToIWP(Payment);
+
+  elif( Options[option] == ВариантОтвергнуть )
+    return RejectPayment(Payment, ErrMsg);
+  end;
+
+  return 0;
+end;
+
+// Направление в К2
+private macro SendTo_I2
+( Payment : RsbPayment, 
+  ErrMsg : string, 
+  Account : string
+
+) : integer
+
+  var Options : TArray = makeArray( ВариантПоместитьВКартотеку2, 
+                                    ВариантОтвергнуть );
+
+  var option : integer = GetOption( "Направление в К2", // Context
+                                    "Что сделать с документом?", // Question
+                                    Options,
+                                    ErrMsg, 
+                                    Account );
+
+  if( Options[option] == ВариантПоместитьВКартотеку2 )
+    return PlacePaymentToI2(Payment);
+
+  elif( Options[option] == ВариантОтвергнуть )
+    return RejectPayment(Payment, ErrMsg);
+  end;
+
+  return 0;
+end;
+
+// Направление в очередь к корсчету ЛОРО
+private macro SendTo_ILORO
+( Payment : RsbPayment, 
+  ErrMsg : string, 
+  Account : string
+
+) : integer
+
+  var Options : TArray = makeArray( ВариантВОчередь, 
+                                    ВариантОтвергнуть );
+
+  var option : integer = GetOption( "Направление в очередь к корсчету ЛОРО", // Context
+                                    "Поместить документ в очередь к корсчету ЛОРО?", // Question
+                                    Options,
+                                    ErrMsg, 
+                                    Account );
+
+  if( Options[option] == ВариантВОчередь )
+    return PlacePaymentToQueue(Payment);
+
+  elif( Options[option] == ВариантОтвергнуть )
+    return RejectPayment(Payment, ErrMsg);
+  end;
+
+  return 0;
+end;
+
+// Направление на ожидание поступлений
+private macro SendTo_WaitMn
+( Payment : RsbPayment, 
+  ErrMsg : string, 
+  Account : string
+
+) : integer
+
+  var Options : TArray = makeArray( ВариантНаОжиданиеПоступлений, 
+                                    ВариантВКартотеку2, 
+                                    ВариантОтвергнуть );
+
+  var option : integer = GetOption( "Направление на ожидание поступлений", // Context
+                                    "Что сделать с документом?", // Question
+                                    Options,
+                                    ErrMsg, 
+                                    Account );
+
+  if( Options[option] == ВариантНаОжиданиеПоступлений )
+    PlacePaymentToWaitMn(Payment);
+
+  elif( Options[option] == ВариантВКартотеку2 )
+    return PlacePaymentToI2(Payment);
+
+  elif( Options[option] == ВариантОтвергнуть )
+    return RejectPayment(Payment, ErrMsg);
+  end;
+
+  return 0;
+end;
+
+// Выбор между КОР и К2
+private macro SendTo_IWPorI2
+( Payment : RsbPayment, 
+  ErrMsg : string, 
+  Account : string
+
+) : integer
+
+  var Options : TArray = makeArray( ВариантВКартотекуОР, 
+                                    ВариантВКартотеку2, 
+                                    ВариантОтвергнуть );
+
+  var option : integer = GetOption( "Выбор между КОР и К2", // Context
+                                    "Что сделать с документом?", // Question
+                                    Options,
+                                    ErrMsg, 
+                                    Account );
+
+  if( Options[option] == ВариантВКартотекуОР )
+    return PlacePaymentToIWP(Payment);
+
+  elif( Options[option] == ВариантВКартотеку2 )
+    return PlacePaymentToI2(Payment);
+
+  elif( Options[option] == ВариантОтвергнуть )
+    return RejectPayment(Payment, ErrMsg);
+  end;
+
+  return 0;
+end;
+
+// Выбор между КОР и очередью корсчета ЛОРО
+private macro SendTo_IWPorILORO
+( Payment : RsbPayment, 
+  ErrMsg : string, 
+  Account : string
+
+) : integer
+
+  var Options : TArray = makeArray( ВариантВКартотекуОР, 
+                                    ВариантВОчередь, 
+                                    ВариантОтвергнуть );
+
+  var option : integer = GetOption( "Выбор между КОР и очередью корсчета ЛОРО", // Context
+                                    "Что сделать с документом?", // Question
+                                    Options,
+                                    ErrMsg, 
+                                    Account );
+
+  if( Options[option] == ВариантВКартотекуОР )
+    return PlacePaymentToIWP(Payment);
+
+  elif( Options[option] == ВариантВОчередь )
+    return PlacePaymentToQueue(Payment);
+
+  elif( Options[option] == ВариантОтвергнуть )
+    return RejectPayment(Payment, ErrMsg);
+  end;
+
+  return 0;
+end;
+
+// Выбор между КОР и ожиданием поступлений
+private macro SendTo_IWPorWaitMn
+( Payment : RsbPayment, 
+  ErrMsg : string, 
+  Account : string
+
+) : integer
+
+  var Options : TArray = makeArray( ВариантВКартотекуОР, 
+                                    ВариантНаОжиданиеПоступлений, 
+                                    ВариантОтвергнуть );
+
+  var option : integer = GetOption( "Выбор между КОР и ожиданием поступлений", // Context
+                                    "Что сделать с документом?", // Question
+                                    Options,
+                                    ErrMsg, 
+                                    Account );
+
+  if( Options[option] == ВариантВКартотекуОР )
+    return PlacePaymentToIWP(Payment);
+
+  elif( Options[option] == ВариантНаОжиданиеПоступлений )
+    return PlacePaymentToWaitMn(Payment);
+
+  elif( Options[option] == ВариантОтвергнуть )
+    return RejectPayment(Payment, ErrMsg);
+  end;
+
+  return 0;
+end;
+
+// Выбор между КОР, К2, ожиданием поступлений
+private macro SendTo_IWPorI2orWaitMn
+( Payment : RsbPayment, 
+  ErrMsg : string, 
+  Account : string
+
+) : integer
+
+  var Options : TArray = makeArray( ВариантВКартотекуОР, 
+                                    ВариантНаОжиданиеПоступлений, 
+                                    ВариантВКартотеку2,
+                                    ВариантОтвергнуть );
+
+  var option : integer = GetOption( "Выбор между КОР, К2, ожиданием поступлений", // Context
+                                    "Что сделать с документом?", // Question
+                                    Options,
+                                    ErrMsg, 
+                                    Account );
+
+  if( Options[option] == ВариантВКартотекуОР )
+    return PlacePaymentToIWP(Payment);
+
+  elif( Options[option] == ВариантНаОжиданиеПоступлений )
+    return PlacePaymentToWaitMn(Payment);
+
+  elif( Options[option] == ВариантВКартотеку2 )
+    return PlacePaymentToI2(Payment);
+
+  elif( Options[option] == ВариантОтвергнуть )
+    return RejectPayment(Payment, ErrMsg);
+  end;
+
+  return 0;
+end;
+
+private macro CheckPiAndRun
+(
+  ProcessingMethod : ProcRef,
+  Payment : RsbPayment,
+  ErrMsg : string,
+  Account : string,
+  IsAddPI : bool
+
+) : integer
+
+  var stat : integer = 0;
+
+  // документ с разноской - только в отвергнутые
+  if(IsAddPI)
+    stat = RejectPayment(Payment, ErrMsg);
+  else
+    stat = ExecMacro2(ProcessingMethod, Payment, ErrMsg, Account);
+  end;
+
+  // раз мы сюда попали, значит, резерв не был создан, а вместо этого выбран 
+  // другой способ обработки
+  if(not stat)
+    stat = PAYMERR_NORESERVE_OTHERPROC;
+  end;
+
+  return stat;
+
+end;
+
+// Выполнить нужный вариант обработки
+private macro RunProcessingMethod
+(
+  Payment : RsbPayment,
+  Account : string, // Счет, по которому пытались создать резерв
+  AccChapter : integer,
+  AccFIID : integer,
+  IsAddPI : bool, // счет из разноски
+  EnoughMoney : bool, // Дост. средств?
+  IsArest : bool,     // Арест
+  IsIWP : bool,       // КОР
+  IsI2LORO : bool,    // К2/КЛОРО
+  IsWaiting : bool    // Очередь
+
+) : integer
+
+  var SelPrc : TSelectProcMethod = TSelectProcMethod
+        ( Payment, Account, AccChapter, AccFIID,
+          EnoughMoney, IsArest, IsIWP, IsI2LORO, IsWaiting
+        );
+
+  var ErrMsg : string = "";
+
+  if( SelPrc.WasMadeReserve() )
+    return 0;
+
+  elif( SelPrc.MustSendTo_IWP(@ErrMsg) )
+    return CheckPiAndRun( @SendTo_IWP, Payment, ErrMsg, Account, IsAddPI );
+
+  elif( SelPrc.MustSendTo_I2(@ErrMsg) )
+    return CheckPiAndRun( @SendTo_I2, Payment, ErrMsg, Account, IsAddPI );
+
+  elif( SelPrc.MustSendTo_ILORO(@ErrMsg) )
+    return CheckPiAndRun( @SendTo_ILORO, Payment, ErrMsg, Account, IsAddPI );
+
+  elif( SelPrc.MustSendTo_WaitMn(@ErrMsg) )
+    return CheckPiAndRun( @SendTo_WaitMn, Payment, ErrMsg, Account, IsAddPI );
+
+  elif( SelPrc.MustSendTo_IWPorI2(@ErrMsg) )
+    return CheckPiAndRun( @SendTo_IWPorI2, Payment, ErrMsg, Account, IsAddPI );
+
+  elif( SelPrc.MustSendTo_IWPorILORO(@ErrMsg) )
+    return CheckPiAndRun( @SendTo_IWPorILORO, Payment, ErrMsg, Account, IsAddPI );
+
+  elif( SelPrc.MustSendTo_IWPorWaitMn(@ErrMsg) )
+    return CheckPiAndRun( @SendTo_IWPorWaitMn, Payment, ErrMsg, Account, IsAddPI );
+
+  elif( SelPrc.MustSendTo_IWPorI2orWaitMn(@ErrMsg) )
+    return CheckPiAndRun( @SendTo_IWPorI2orWaitMn, Payment, ErrMsg, Account, IsAddPI );
+
+  elif( SelPrc.MustRejectPayment(@ErrMsg) )
+    return CheckPiAndRun( @RejectPayment, Payment, ErrMsg, Account, IsAddPI );
+
+  elif( SelPrc.MustSendTo_Manual(@ErrMsg) )
+    return CheckPiAndRun( @PM_ToManual, Payment, ErrMsg, Account, IsAddPI );
+  end;
+
+  // Не нашли подходящий вариант обработки
+  msgbox("Не удалось создать резерв по платежу. Подходящий вариант обработки платежа отсутствует");
+  return 1;
+end;
+
+// Обработать документ по результатам проверки свободного остатка
+MACRO ProcessCheckReserveResult
+(
+  // результаты проверки свободного остатка и создания резерва
+  ChkReserveResult : integer,
+  ReasonID : integer,
+  IsIWP : bool,       // КОР
+  IsI2LORO : bool,    // К2/КЛОРО
+  IsWaiting : bool,   // Очередь
+
+  // что проверялось
+  Payment : RsbPayment,
+  Account : string, // Счет, по которому пытались создать резерв
+  AccChapter : integer,
+  AccFIID : integer,
+  IsAddPI : bool // счет из разноски
+
+) : integer
+
+  var EnoughMoney : bool, // Дост. средств?
+      IsArest : bool;     // Арест
+
+  if(ChkReserveResult == 0)
+    EnoughMoney = true;
+  elif(ChkReserveResult == MR_NOFREEAMOUNT)
+    EnoughMoney = false;
+  else
+    RETURN ChkReserveResult;
+  end;
+
+  if(ReasonID > 0)
+    IsArest = true;
+  else
+    IsArest = false;
+  end;
+
+  RETURN RunProcessingMethod
+    (
+      Payment, Account, AccChapter, AccFIID, IsAddPI,
+      EnoughMoney, IsArest, IsIWP, IsI2LORO, IsWaiting
+
+    );
+END;
+
+// Определяет, что вернуть из ExecuteStep, когда прерываем выполнение шага
+// по результатам работы ProcessCheckReserveResult
+macro ConvertPrcChkRsrvStatForStep(PrcChkRsrvStat : integer) : integer
+
+  if( (PrcChkRsrvStat == 0) or
+      (PrcChkRsrvStat == PAYMERR_NORESERVE_OTHERPROC)
+    )
+    return 0;
+  end;
+
+  return 1;
+end;

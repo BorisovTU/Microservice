@@ -1,0 +1,1863 @@
+/*
+$Name: insdpdr.mac
+$Module: Ценные бумаги
+$Description: продедура импорта поручения депо из БО ЦБ
+*/
+
+import SecInter, rsbdataset, DPInter, "spserv.mac", "sp_catac.mac";
+
+record DepoDraftParm("draftprm.rec");
+
+private const DOCKIND_DEPO_ORDREMOVEBLOCK = 241; // Поручение снятие блокировки
+private const DOCKIND_REPDEPODRAFT = 366; // Отчет об исполнении поручения
+private const DOCKIND_DRFTCNCLDRFT = 399; // Поручение на отмену порученияs
+
+private const OBJTYPE_TRN_CONT_CANCELDRAFT = 701;
+private const spCnclDrft = 54;
+
+private const REFOBJ_SEC_GRNDOC = 3;
+private const REFOBJ_OPERATIONDEPO = 1;
+private const REFOBJ_CLIENTOPERATIONDEPO = 2;
+
+// Инициатор депозитарной операции
+private const DL_KIND_INOP_CLIENT  = 1; // Клиент
+private const DL_KIND_INOP_OURBANK = 2; // Наш банк
+
+private const SC_SPDRAFT_STATUS_PREP = 1; //отложенное
+private const SC_SPDRAFT_STATUS_CLOSE = 3; //закрытое
+
+private var is_dl_tick = false;
+private var is_dl_nett = false;
+private var is_dl_comm = false;
+private var is_dlacc = false;
+private var IsTrust = false;
+
+private var RefID_XidSecur = 0;
+private var RefNum_XidSecur = "";
+
+/* Получить попечителя на пассивном счете */
+private macro GetCuratorFromPassiveAcc(acc1:string, acc2:string, department:integer, regDate:date):integer
+  var curator = -1;
+  var query =  "SELECT dpacap.t_APartyID "
+              +"  FROM ddepoacnt_dbt depoacnt, ddpacap_dbt dpacap "
+              +"  WHERE  depoacnt.t_Kind = 2 " // passive
+              +"        AND (depoacnt.t_BriefCode = ? or depoacnt.t_BriefCode = ?)"
+              +"        AND depoacnt.t_Department = ?"
+              +"        AND dpacap.t_Role = 2"//DEPOACAPROLE_CURATOR попечитель
+              +"        AND dpacap.t_APNodeID = depoacnt.t_Root "
+              +"        AND dpacap.t_FromDate <= ?"
+              +"        AND (dpacap.t_ToDate >= ? OR dpacap.t_ToDate = to_date('01.01.0001', 'DD.MM.YYYY'))";
+  var cmd = RSDCommand(query);
+
+  cmd.addParam("", RSDBP_IN, acc1      );
+  cmd.addParam("", RSDBP_IN, acc2      );
+  cmd.addParam("", RSDBP_IN, department);
+  cmd.addParam("", RSDBP_IN, regDate   );
+  cmd.addParam("", RSDBP_IN, regDate   );
+
+  cmd.execute();
+
+  var dataSet = TRsbDataSet(cmd);
+  if (dataSet.MoveNext())
+    curator = dataSet.APartyID;
+  end;
+
+  return curator;
+end;
+
+/*Найти счет депо*/
+private macro ExistsDepoAcnt(BriefCode, Department)
+  var cmd = DL_RSDCommand("select 1 from ddepoacnt_dbt where t_BriefCode = ? and t_Department = ?");
+  cmd.AddParam(BriefCode);
+  cmd.AddParam(Department);
+  if(cmd.GetCount > 0)
+    return true;
+  end;
+
+  return false;
+end;
+
+/* Получить инициатора для БОЦБ */
+macro GetDepoInitiator(DepoDraftParm, initiatorKind:integer, clientID:integer):integer
+  var initiator = -1;
+  var acntExists = false;
+
+  if (DL_KIND_INOP_OURBANK == initiatorKind)
+    initiator = {OurBank};
+  elif (DL_KIND_INOP_CLIENT == initiatorKind)
+    if(DepoDraftParm.BnAccCode != "")
+      acntExists = ExistsDepoAcnt(DepoDraftParm.BnAccCode, DepoDraftParm.Department);
+    end;
+
+    if((acntExists == false) and (DepoDraftParm.DwAccCode != ""))
+      acntExists = ExistsDepoAcnt(DepoDraftParm.DwAccCode, DepoDraftParm.Department);
+    end;
+
+    if(acntExists == true)
+      // ищем попечителя
+      initiator = GetCuratorFromPassiveAcc(DepoDraftParm.BnAccCode, DepoDraftParm.DwAccCode, DepoDraftParm.Department, DepoDraftParm.RegisterDate);
+
+      if (initiator == -1)
+        if (clientID != -1)
+          initiator = clientID;
+        else
+          initiator = {OurBank};
+        end;
+      end;
+    end;
+  end;
+
+  return initiator;
+end;
+
+// Получить короткий код и ID корреспондента корсчета/корраздела по его ID
+macro GetCorrNodeInfo(DepoID, BriefCode:@variant, Owner:@variant, Block:@variant, RootID:@variant)
+  var query, DataSet;
+  var Select;
+  var stat = TRUE;
+
+  if(DepoID)
+    BriefCode = "";
+    Owner = -1;
+    Block = -1;
+
+    query = " select dpac.t_BriefCode BriefCode, dpac.t_Owner Owner, NVL(TO_NUMBER(atvl.t_Value), -1) Block, dpac.t_Root " +
+            "     from ddepoacnt_dbt dpac, ddepoatvl_dbt atvl " +
+            "     where dpac.t_AutoKey = ? " +
+            "      AND atvl.t_IsType(+) = chr(0) " +
+            "      AND atvl.t_ID(+) = dpac.t_AutoKey " +
+            "      AND atvl.t_AttrNum(+) = 6 ";
+
+    Select = RSDCommand( query );
+
+    Select.AddParam("DepoID",   RSDBP_IN, DepoID );  /*1*/
+
+    Select.Execute();
+
+    DataSet = TRsbDataSet(Select);
+    if(DataSet.moveNext())
+      BriefCode = string(DataSet.BriefCode);
+      Owner = string(DataSet.Owner);
+      Block = DataSet.Block;
+      RootID = DataSet.Root;
+    else
+      MsgBox("Не найден счет/раздел счета депо с Autokey = ", DepoID);
+      stat = FALSE;
+    end;
+  end;
+
+  return stat;
+end;
+
+PRIVATE MACRO CheckSPground(Kind, Xid, Direction, Department, Division, RegistrDate)
+  var stat = 0;
+  var query = "", cmd = null, ds = null;
+
+  //мануал ключ только для ненулевых значений
+  if((Kind != 0) and (Xid != "") and (Direction != 0))
+    query = " SELECT "
+              + " 1 "
+          + " FROM "
+              + " DUAL "
+          + " WHERE "
+              + " EXISTS (SELECT "
+                          + " 1 "
+                      + " FROM "
+                          + " dspground_dbt spgr "
+                      + " WHERE "
+                          + " spgr.t_Kind = ? "
+                      + " AND spgr.t_Xld = ? "
+                      + " AND spgr.t_Direction = ? "
+                      + " AND spgr.t_Department = ? "
+                      + " AND spgr.t_Division = ? "
+                      + " AND spgr.t_RegistrDate = ?) ";
+
+    cmd = DL_RSDCommand(query);
+    cmd.AddParam(Kind);
+    cmd.AddParam(Xid);
+    cmd.AddParam(Direction);
+    cmd.AddParam(Department);
+    cmd.AddParam(Division);
+    cmd.AddParam(RegistrDate);
+
+    ds = cmd.Execute();
+
+    if(ds.MoveNext())
+      stat = 1;
+    end;
+  end;
+
+  return stat;
+END;
+
+PRIVATE MACRO Generate_Xid_Secur(Kind, Direction, Department, Division, RegistrDate)
+  RefNum_XidSecur = "";
+
+  if( GenerateNumberByReference( OBJTYPE_SECDEAL, REFOBJ_SEC_GRNDOC, @RefId_XidSecur, @RefNum_XidSecur) )
+     while(CheckSPground(Kind, RefNum_XidSecur, Direction, Department, Division, RegistrDate))
+       if(not GenerateNumberByReference( OBJTYPE_SECDEAL, REFOBJ_SEC_GRNDOC, @RefId_XidSecur, @RefNum_XidSecur))
+         RefNum_XidSecur = "";
+         break;
+       end;
+     end;
+  end;
+
+  return RefNum_XidSecur;
+END;
+
+MACRO InsertDraftParm( DepoDraftParm, avr_DlRq, deal, __sourcedockind, __sourcedocid, dl_comm, GrDealForLnk, IsSummary, GrDealFIID )
+   var GroundPrm, GroundPrmDeal, spground, NoError = true, ErrCode;
+   var sourcedockind = NULL, sourcedocid = NULL;
+   var SPgroundID = 0;
+   var sql;
+   var FIID;
+
+   if(ValType(GrDealForLnk) != V_UNDEF)
+     GrDealForLnk.StartNewDraft(IsSummary);
+   end;
+
+   if(ValType(IsSummary) != V_BOOL)
+     IsSummary = false;
+   end;
+
+   if(DepoDraftParm.UserLog == SPGRUSERLOG_EMPTY)
+     if(is_dl_tick == true)
+
+      if((deal == NULL) OR (deal.ClientID == -1) OR (IsTrust == true) )
+         DepoDraftParm.UserLog = SPGRUSERLOG_OURENTER;
+      else
+         DepoDraftParm.UserLog = SPGRUSERLOG_CLIENT;
+      end;
+
+     elif(is_dl_comm == true)
+        if((deal != NULL) AND (deal.ClientID != -1) )
+           DepoDraftParm.UserLog = SPGRUSERLOG_CLIENT;
+        else
+           DepoDraftParm.UserLog = SPGRUSERLOG_OURENTER;
+        end;
+     else
+         DepoDraftParm.UserLog = SPGRUSERLOG_OURENTER;
+     end;
+   end;
+
+   if((avr_DlRq != null) and (avr_DlRq.rec.DocKind > 0))
+     DepoDraftParm.DocumentKind = avr_DlRq.rec.DocKind;
+     DepoDraftParm.DocumentID   = avr_DlRq.rec.DocID;
+   else
+     DepoDraftParm.DocumentKind = __sourcedockind;
+     DepoDraftParm.DocumentID   = __sourcedocid;
+   end;
+
+   if((ValType(dl_comm) != V_UNDEF) and (ValType(GrDealForLnk) != V_UNDEF))
+     //автоматическую привязку не делаем
+     DepoDraftParm.DocumentKind = DL_DLGRDEAL;
+     DepoDraftParm.DocumentID   = 0;
+   end;
+
+   if( NoError == true )
+      if( (NoError == true) AND (is_dl_tick == true) AND (deal != NULL) )
+         sourcedockind = deal.BOfficeKind;
+         sourcedocid   = deal.DealID;
+      else
+         sourcedockind = __sourcedockind;
+         sourcedocid   = __sourcedocid;
+      end;
+
+      if(ValType(dl_comm) != V_UNDEF)
+        sourcedockind = dl_comm.rec.DocKind;
+        sourcedocid   = dl_comm.rec.DocumentID;
+      end;
+   end;
+
+   if( NoError == true )
+         /*При выполнении экспорта должен быть в исходную сделку добавлен документ - приложение */
+         GroundPrmDeal = TRecHandler( "spgroundprm.rec" );
+         GroundPrmDeal.Clear();
+         GroundPrmDeal.rec.DocLog       = LLCLASS_KINDDOC_SECUR; /*Классификация видов документов БОЦБ*/
+         if (DepoDraftParm.DealKind == 28)
+           GroundPrmDeal.rec.Kind       = DepoDraftParm.DealKind; /*Соглашение неттинга*/
+         else
+           GroundPrmDeal.rec.Kind       = 299; /*Поручение ДЕПО*/
+         end;
+         GroundPrmDeal.rec.Direction    = EXITING;
+         GroundPrmDeal.rec.RegistrDate  = DepoDraftParm.RegisterDate;
+         GroundPrmDeal.rec.RegistrTime  = Time();
+         GroundPrmDeal.rec.PartyID      = {OurBank};
+         GroundPrmDeal.rec.Proxy        = UnknownParty;
+         GroundPrmDeal.rec.PartyName    = ПолучитьКороткоеИмяСубъекта(GroundPrmDeal.rec.PartyID);
+         GroundPrmDeal.rec.Xld          = Generate_Xid_Secur(GroundPrmDeal.rec.Kind, GroundPrmDeal.rec.Direction, {OperDprt}, SelfDivision, GroundPrmDeal.rec.RegistrDate);
+         GroundPrmDeal.rec.Division     = SelfDivision;
+         GroundPrmDeal.rec.Receptionist = {Oper};
+         GroundPrmDeal.rec.Copies       = 1;
+         GroundPrmDeal.rec.Sent         = SET_CHAR;
+         GroundPrmDeal.rec.DeliveryKind = "E"; /*лично*/
+         GroundPrmDeal.rec.BackOffice   = "S"; /**/
+         GroundPrmDeal.rec.PrimaryDocKind = sourcedockind;
+         GroundPrmDeal.rec.PrimaryDocID   = sourcedocid;
+
+         if(ValType(GrDealForLnk) != V_UNDEF)
+           if(GrDealForLnk.SetGroundPrmDeal(GroundPrmDeal) != 0)
+             NoError = false;
+           end;
+         else
+           if( ExecMacroFile("dpdrutl.mac", "SP_InsertGroundDocumentRetID", GroundPrmDeal, false, @SPgroundID) != 0 )
+              NoError = false;
+           end;
+         end;
+
+         if(NoError == true)
+           if(DepoDraftParm.AltXid == "")
+             DepoDraftParm.AltXid      = GroundPrmDeal.rec.Xld;
+             DepoDraftParm.SignedDate  = GroundPrmDeal.rec.RegistrDate;
+           end;
+           // Если дата поставки выходной день и дата формирования поручения больше даты поставки, то в качестве даты валютирования указывается факт. дата формирования поручения (дата запуска макроса)
+           if( IsHoliday(DepoDraftParm.ValueDate) and (DepoDraftParm.ValueDate < DepoDraftParm.SignedDate) )
+              DepoDraftParm.ValueDate = DepoDraftParm.SignedDate;
+           end;
+         end;
+   end;
+
+   if(NoError == true)
+     if(ValType(GrDealForLnk) != V_UNDEF)
+       if(GrDealForLnk.SetDepoDraftParm(DepoDraftParm, avr_DlRq) != 0)
+         NoError = false;
+       end;
+     else
+       DepoDraftParm.ParentDocID = SPgroundID;
+
+       var ErrStr = "";
+       if( ExecMacroFile("dpdrutl.mac", "SP_InsertDeferDraft", DepoDraftParm, avr_DlRq, null, ErrStr) != 0 )
+          if(ErrStr != "")
+            MsgBox(ErrStr);
+          end;
+          NoError = false;
+       end;
+
+       if((NoError == true) AND (ValType(GrDealForLnk) != V_UNDEF))
+         FIID = DepoDraftParm.FIID;
+         if(ValType(GrDealFIID) == V_INTEGER)
+           FIID = GrDealFIID;
+         end;
+       end;
+     end;
+   end;
+
+   /*if( (NoError == true) AND (sourcedockind != NULL) AND (sourcedocid != NULL) )*/
+   if( (NoError == true) AND (is_dl_tick == true) AND (deal != NULL) )
+      sql = RSDCommand(" SELECT spground.*" +
+                       "   FROM dspground_dbt spground, dspgrdoc_dbt spgrdoc " +
+                       "  WHERE spgrdoc.t_sourcedockind = ? AND " +
+                       "        spgrdoc.t_sourcedocid   = ? AND " +
+                       "        spgrdoc.t_spgroundid    = spground.t_spgroundid " );
+
+      sql.addParam( "", RSDBP_IN, deal.BOfficeKind );
+      sql.addParam( "", RSDBP_IN, deal.DealID );
+      sql.execute();
+
+      spground = TRSBDataSet( sql );
+
+      if( spground == NULL )
+         MsgBox("Ошибка при определении документов по сделке.\n" );
+         NoError = false;
+      else
+         while( spground.MoveNext() )
+            /*Должен быть выполнен экспорт всехдокументов -оснований по ПД БОЦБ*/
+            GroundPrm = TRecHandler( "spgroundprm.rec" );
+            GroundPrm.Clear();
+            GroundPrm.rec.DocLog    = LLCLASS_KINDDOC_DOCDEPO; /* Виды документов депозитария */
+            GroundPrm.rec.Kind      = spground.rec.Kind;
+            GroundPrm.rec.Direction = DIRECT_ANY;
+            GroundPrm.rec.PartyID   = spground.rec.Party;
+            GroundPrm.rec.PartyName = spground.rec.PartyName;
+            if( (spground.rec.Direction == ENTERING) OR (spground.rec.Direction == DIRECT_ANY) )
+               GroundPrm.rec.AltXld     = spground.rec.AltXld;
+               GroundPrm.rec.SignedDate = spground.rec.SignedDate;
+               GroundPrm.rec.SignedTime = spground.rec.SignedTime;
+            else
+               GroundPrm.rec.AltXld     = spground.rec.Xld;
+               GroundPrm.rec.SignedDate = spground.rec.RegistrDate;
+               GroundPrm.rec.SignedTime = spground.rec.RegistrTime;
+            end;
+            GroundPrm.rec.Proxy    = spground.rec.Proxy;
+            if( GroundPrm.rec.Proxy <= 0 )
+               GroundPrm.rec.Proxy = UnknownParty;
+            end;
+            GroundPrm.rec.Division     = DP_SelfDivision;
+            GroundPrm.rec.Receptionist = {Oper};
+            GroundPrm.rec.DeliveryKind = spground.rec.DeliveryKind;
+            GroundPrm.rec.BackOffice   = "Z"; /*Депозитарий*/
+            GroundPrm.rec.Comment      = spground.rec.Comment;
+            GroundPrm.rec.BeginningDate= spground.rec.BeginningDate;
+            GroundPrm.rec.TerminateDate= spground.rec.TerminateDate;
+
+            if(ValType(GrDealForLnk) != V_UNDEF)
+              if(GrDealForLnk.AddGroundPrmArr(GroundPrm) != 0)
+                NoError = false;
+              end;
+            else
+              GroundPrm.rec.PrimaryDocKind= DepoDraftParm.Kind;
+              GroundPrm.rec.PrimaryDocID  = DepoDraftParm.DraftID;
+              if( ExecMacroFile("dpdrutl.mac", "SP_InsertGroundDocument", GroundPrm, true) != 0 )
+                 NoError = false;
+              end;
+            end;
+         end;
+      end;
+   end;
+
+   if( NoError == false ) /*Откатить референсы, что бы не было дыр*/
+      if( RefNum_XidSecur != "" )
+         RestoreReference( RefID_XidSecur, RefNum_XidSecur );
+      end;
+   end;
+
+   return NoError;
+END;
+
+macro DepoDraftFillFIID_1( BaseFIID, dl_leg )
+
+   record finin(fininstr);
+
+   if( ПолучитьФинИн( BaseFIID, finin ) != 0 )
+      MsgBox( "Не найден финансовый инструмент " + string(BaseFIID) );
+      return false;
+   else
+
+      if( finin.IsGeneralized == "X" ) // обобщенный
+         DepoDraftParm.FIID = dl_leg.DeliveringFIID;
+      elif( (finin.IsGeneralized != "X") AND (finin.GeneralizedFIID == ALLFININSTR) ) // единый
+      DepoDraftParm.FIID         = dl_leg.DeliveringFIID;
+      elif( (finin.IsGeneralized != "X") AND (finin.GeneralizedFIID != ALLFININSTR) ) // фактический
+         DepoDraftParm.FIID = BaseFIID;
+   end;
+
+   end;
+
+end;
+
+macro DepoDraftFillFIID_2( BaseFIID )
+
+   record finin(fininstr);
+
+   if( ПолучитьФинИн( BaseFIID, finin ) != 0 )
+      MsgBox( "Не найден финансовый инструмент " + string(BaseFIID) );
+      return false;
+   else
+
+      if( finin.IsGeneralized == "X" ) // обобщенный
+         DepoDraftParm.FIID = ALLFININSTR;
+      elif( (finin.IsGeneralized != "X") AND (finin.GeneralizedFIID == ALLFININSTR) ) // единый
+         DepoDraftParm.FIID = BaseFIID;
+      elif( (finin.IsGeneralized != "X") AND (finin.GeneralizedFIID != ALLFININSTR) ) // фактический
+         DepoDraftParm.FIID = BaseFIID;
+      end;
+
+   end;
+
+end;
+
+macro DepoDraftFillDealData(firstdoc)
+  const DOC_CALCOPER = 389,
+        DOC_NETTING = 28,
+        DOC_RETIREMENT = 393,
+        DOC_CONVERT = 394,
+        DOC_TICKET = 287,
+        DOC_SUMMARY = 395;
+
+   if(is_dl_nett)
+     DepoDraftParm.DealKind = DOC_NETTING; /* Соглашение неттинга */
+     DepoDraftParm.Agreed   = firstdoc.RegisterDate;
+     DepoDraftParm.DealXid  = firstdoc.DealNumber;
+   elif(is_dlacc)
+     DepoDraftParm.DealKind = DOC_CALCOPER; /* Расчетная операция */
+     DepoDraftParm.Agreed   = firstdoc.Date;
+     DepoDraftParm.DealXid  = firstdoc.Code;
+   elif(is_dl_tick)
+
+     DepoDraftParm.Agreed   = firstdoc.RegDate;
+
+     if((firstdoc.BOfficeKind == DL_RETIREMENT) OR (firstdoc.BOfficeKind == DL_TRUSTRETIREMENT))
+       DepoDraftParm.DealKind = DOC_RETIREMENT; /* Операция погашения */
+     elif((firstdoc.BOfficeKind == DL_ISSUE_UNION) OR (firstdoc.BOfficeKind == DL_CONVAVR))
+       DepoDraftParm.DealKind = DOC_CONVERT; /* Операция конвертации */
+     else
+       DepoDraftParm.DealKind = DOC_TICKET; /* Тикет сделки */
+       DepoDraftParm.Agreed   = firstdoc.DealDate;
+     end;
+
+     DepoDraftParm.DealXid  = firstdoc.DealCode;
+   else
+     DepoDraftParm.DealKind = DOC_SUMMARY; /* Сводное поручение */
+     DepoDraftParm.Agreed   = firstdoc.CommDate;
+     DepoDraftParm.DealXid  = firstdoc.CommCode;
+   end;
+
+   DepoDraftParm.DealParty = {OurBank};
+end;
+
+/*Неттинг,
+  Биржевые и брокерские сделки
+  Внебиржевая сделка и счет владельца - в нашем банке и счет контрагента - не в нашем банке (старый вариант)
+  Все погашения*/
+macro InsertDraft_1( firstdoc, avr_dlrq, DepParm, OperDate, IsBack, dl_leg, DealType, Group, PrevDraft, dl_comm, GrDealForLnk, GrDealFIID, SpGroundID:integer, UseTransAcc)
+   var    Kind_Oper, MarketCode, sourcedockind = null, sourcedocid = null;
+   var    OurCorrID = -1, OurCorrAcc = "", OurCorrBlock = -1;
+   file   corschem(corschem) key 1;
+   var AccountBuff = TRecHandler("account");
+   var rqacc = TRecHandler("dlrqacc");
+
+   is_dl_tick = false;
+   is_dl_nett = false;
+   is_dl_comm = false;
+
+   if( filename(firstdoc) == "dl_tick.dbt" )
+     is_dl_tick = true;
+   elif( filename(firstdoc) == "dl_nett.dbt" )
+     is_dl_nett = true;
+   elif (filename(firstdoc) == "dl_comm.dbt")
+     is_dl_comm = true;
+   end;
+
+   if( is_dl_tick )
+      MarketCode = ПолучитьКодГруппыБиржи( firstdoc.MarketID );
+   elif( is_dl_nett )
+      MarketCode = ПолучитьКодГруппыБиржи( firstdoc.Contractor );
+   end;
+
+   ClearRecord(DepoDraftParm);
+
+   if( (SpGroundID != null) and (SpGroundID > 0) )
+      DepoDraftParm.SpGroundID = SpGroundID;
+   end;
+
+   if( DealType == DEAL_TYPE_SALE )
+      Kind_Oper = SP_DEPOPER_TRANSFERORDER; /* Поручение на междепозитарный перевод*/
+   elif( DealType == DEAL_TYPE_BUY )
+      Kind_Oper = SP_DEPOPER_ENROLMENT; /* "Зачислении безналичных ц/б" */
+   end;
+   DepoDraftParm.Kind       = Kind_Oper;
+
+   DepoDraftParm.SignedDate   = OperDate;
+   DepoDraftParm.RegisterDate = OperDate;
+   DepoDraftParm.RegisterTime = Time();
+   if(avr_DlRq.rec.Kind == DLRQ_KIND_REQUEST)
+     DepoDraftParm.DwPartyID  = avr_DlRq.rec.Party;
+   else
+     if (((not is_dl_tick) or (firstdoc.ClientID == -1)) and (is_dl_comm == false))
+       DepoDraftParm.DwPartyID  = {OurBank};
+     else
+       DepoDraftParm.DwPartyID  = firstdoc.ClientID;
+       DepoDraftParm.DeponentDoc = firstdoc.ClientID;
+     end;
+   end;
+
+   if( is_dl_tick AND (DealType == DEAL_TYPE_SALE) )
+      DepoDraftParm.DwAccPurp = OBJTYPE_DEPOKINDTYPE_DEPONENT;
+      if( IsClientDeal(firstdoc) )
+         if( IsTrust )
+            DepoDraftParm.DwPartyID = {OurBank};
+            DepoDraftParm.DwAccPurp = OBJTYPE_DEPOKINDTYPE_ISSUER;
+         end;
+      end;
+   end;
+
+   if( is_dl_tick )
+      if( IsLOAN(Group) ) /* Займ */
+         DepoDraftParm.Unblock = OBJTYPE_DEPOACC_BLOCK_STANDART; /* Стандартная */
+      elif( IsRET_ISSUE(Group) and (not IsTrust) ) /* Погашение выпуска */
+         DepoDraftParm.Unblock = OBJTYPE_DEPOACC_BLOCK_STANDART; /* Стандартная */
+      elif( IsCONVERT_SHARE(Group) OR IsCONVERT_RECEIPT(Group) )
+         DepoDraftParm.Unblock = OBJTYPE_DEPOACC_BLOCK_STANDART; /* Стандартная */
+      elif( (IsBUY(Group) AND (IsBack == false)) OR
+            (IsSALE(Group) AND IsBack )
+          )
+         /*часть покупки*/
+         DepoDraftParm.Unblock = OBJTYPE_DEPOACC_BLOCK_STANDART; /* Стандартная */
+      elif( IsREPO(Group) and IsBUY(Group) and IsBack and (firstdoc.Flag4 == SET_CHAR) )
+         /* РЕПО покупка, часть продажи, установлен флаг "Блокирован" */
+         DepoDraftParm.Unblock = OBJTYPE_DEPOACC_BLOCK_REPO;
+      elif( IsAVRWRTIN(Group) )
+         DepoDraftParm.Unblock = OBJTYPE_DEPOACC_BLOCK_STANDART; /* Стандартная */
+      else
+        /* Продажа ц/б на ОРЦБ */
+        if( IsTrust )
+           DepoDraftParm.Unblock = OBJTYPE_DEPOACC_BLOCK_INTRAST;
+        else
+           DepoDraftParm.Unblock = OBJTYPE_DEPOACC_BLOCK_INMARKETS; /* На торгах */
+        end;
+      end;
+   else
+      DepoDraftParm.Unblock = OBJTYPE_DEPOACC_BLOCK_STANDART; /* Стандартная */
+   end;
+
+   DepoDraftParm.DwCustodyID = {OurBank};
+
+   if( Kind_Oper == SP_DEPOPER_ENROLMENT) /* распоряжение на зачисление */
+
+     DepoDraftParm.DwCustodyID = ПолучитьБанкСубъектаПоСделке(DepoDraftParm.DwPartyID, avr_DlRq.rec.DocKind, avr_DlRq.rec.DocID, avr_DlRq.rec.FIID, avr_DlRq.rec.Type);//avr_paym.PayerBankID; /*Наш банк*/
+
+     if(DepoDraftParm.DwPartyID == avr_DlRq.rec.Party)
+       ПолучитПлатежныеРеквизитыПоТО(avr_dlrq, rqacc);
+     else
+       ПолучитьПлатежныеРеквизитыСубъектаПоСделке(avr_DlRq.rec.DocKind, avr_DlRq.rec.DocID, DepoDraftParm.DwPartyID, DLRQ_SUBKIND_AVOIRISS, avr_DlRq.rec.FIID, avr_DlRq.rec.Type, rqacc);
+     end;
+
+     DepoDraftParm.DwAccCode = rqacc.rec.Account;
+
+     if(rqacc.rec.ID > 0)
+       DepoDraftParm.DwCustodyAgentID = rqacc.rec.BankCorrID;
+       DepoDraftParm.DwCorAcc         = rqacc.rec.CorrAcc;
+       OurCorrID = rqacc.rec.BankCorrID;
+       if(not WorkMode_DepoCorAccPos) /*при снятой настройке получаем корсчет - иначе депозитарий спозиционируется сам*/
+         if((DepoDraftParm.DwCustodyID != {OurBank}) and (ПолучитьСчетПоПлатежнымРеквизитам(rqacc, AccountBuff) == 0))
+           OurCorrAcc = AccountBuff.rec.Account;
+         end;
+       end;
+     end;
+
+     if(DepParm.rec.DepSetID)
+       if (((is_dl_tick) AND (IsClientDeal(firstdoc))) or (is_dl_comm == true))
+         if(DepParm.rec.DPCorrNodeCln)
+           if(NOT GetCorrNodeInfo(DepParm.rec.DPCorrNodeCln, @OurCorrAcc, @OurCorrId, @OurCorrBlock))
+             return 1;
+           end;
+         end;
+       else
+         if(DepParm.rec.DPCorrNodeOur)
+           if(NOT GetCorrNodeInfo(DepParm.rec.DPCorrNodeOur, @OurCorrAcc, @OurCorrId, @OurCorrBlock))
+             return 1;
+           end;
+         end;
+       end;
+     end;
+
+     DepoDraftParm.DwOurCustAgentID = OurCorrID;
+     DepoDraftParm.DwOurCorAcc = OurCorrAcc;
+     if(OurCorrBlock != -1)
+       DepoDraftParm.Unblock = OurCorrBlock;
+     end;
+   end;
+
+   if(avr_DlRq.rec.Kind == DLRQ_KIND_REQUEST)
+     if (((not is_dl_tick) or (firstdoc.ClientID == -1)) and (is_dl_comm == false))
+       DepoDraftParm.BnPartyID  = {OurBank};
+     else
+       DepoDraftParm.BnPartyID  = firstdoc.ClientID;
+       DepoDraftParm.DeponentDoc = firstdoc.ClientID;
+     end;
+   else
+     DepoDraftParm.BnPartyID  = avr_DlRq.rec.Party;
+   end;
+   if( is_dl_tick AND (DealType == DEAL_TYPE_BUY) )
+      DepoDraftParm.BnAccPurp = OBJTYPE_DEPOKINDTYPE_DEPONENT;
+      if( IsClientDeal(firstdoc) )
+         if( IsTrust )
+            DepoDraftParm.BnPartyID    = {OurBank};
+            DepoDraftParm.BnAccPurp = OBJTYPE_DEPOKINDTYPE_ISSUER;
+         end;
+      end;
+   end;
+
+   if( is_dl_tick )
+      if( IsLOAN(Group) ) /* Займ */
+         DepoDraftParm.Block = OBJTYPE_DEPOACC_BLOCK_STANDART; /* Стандартная */
+      elif( IsREPO(Group) and IsBUY(Group) and (IsBack == false) and (firstdoc.Flag4 == SET_CHAR) )
+        /* Сделка РЕПО покупка, часть покупки, установлен флаг "Блокирован" */
+        /* Блокированы по РЕПО */
+         DepoDraftParm.Block = OBJTYPE_DEPOACC_BLOCK_REPO;
+      elif( IsCONVERT_SHARE(Group) OR IsCONVERT_RECEIPT(Group) )
+         DepoDraftParm.Unblock = OBJTYPE_DEPOACC_BLOCK_STANDART; /* Стандартная */
+      elif( (IsBUY(Group) AND (IsBack == false)) OR
+            (IsSALE(Group) AND IsBack )
+          )
+         if( IsTrust )
+            DepoDraftParm.Block = OBJTYPE_DEPOACC_BLOCK_INTRAST;
+         else
+            DepoDraftParm.Block = OBJTYPE_DEPOACC_BLOCK_INMARKETS; /* На торгах */
+         end;
+      else
+         DepoDraftParm.Block = OBJTYPE_DEPOACC_BLOCK_STANDART; /* Стандартная */
+      end;
+   else
+      DepoDraftParm.Block = OBJTYPE_DEPOACC_BLOCK_STANDART; /* Стандартная */
+   end;
+
+   DepoDraftParm.BnCustodyID = {OurBank};
+
+   if( Kind_Oper == SP_DEPOPER_TRANSFERORDER ) /* Поручение на междепозитарный перевод*/
+      DepoDraftParm.BnCustodyID = ПолучитьБанкСубъектаПоСделке(DepoDraftParm.BnPartyID, avr_DlRq.rec.DocKind, avr_DlRq.rec.DocID, avr_DlRq.rec.FIID, avr_DlRq.rec.Type);//avr_paym.ReceiverBankID;
+
+      if(DepoDraftParm.BnPartyID == avr_DlRq.rec.Party)
+        ПолучитПлатежныеРеквизитыПоТО(avr_dlrq, rqacc);
+      else
+        ПолучитьПлатежныеРеквизитыСубъектаПоСделке(avr_DlRq.rec.DocKind, avr_DlRq.rec.DocID, DepoDraftParm.BnPartyID, DLRQ_SUBKIND_AVOIRISS, avr_DlRq.rec.FIID, avr_DlRq.rec.Type, rqacc);
+      end;
+
+      DepoDraftParm.BnAccCode = rqacc.rec.Account;
+
+      if(rqacc.rec.ID > 0)
+        DepoDraftParm.BnCustodyAgentID = rqacc.rec.BankCorrID;
+        DepoDraftParm.BnCorAcc         = rqacc.rec.CorrAcc;
+        if(not WorkMode_DepoCorAccPos) /*при снятой настройке получаем корсчет - иначе депозитарий спозиционируется сам*/
+          if((DepoDraftParm.BnCustodyID != {OurBank}) and (ПолучитьСчетПоПлатежнымРеквизитам(rqacc, AccountBuff) == 0))
+            OurCorrAcc = AccountBuff.rec.Account;
+          end;
+        end;
+      end;
+
+      if(DepParm.rec.DepSetID)
+        if (((is_dl_tick) AND (IsClientDeal(firstdoc))) or (is_dl_comm == true))
+          if(DepParm.rec.DPCorrNodeCln)
+            if(NOT GetCorrNodeInfo(DepParm.rec.DPCorrNodeCln, @OurCorrAcc, @OurCorrId, @OurCorrBlock))
+              return 1;
+            end;
+          end;
+        else
+          if(DepParm.rec.DPCorrNodeOur)
+            if(NOT GetCorrNodeInfo(DepParm.rec.DPCorrNodeOur, @OurCorrAcc, @OurCorrId, @OurCorrBlock))
+              return 1;
+            end;
+          end;
+        end;
+      end;
+
+      DepoDraftParm.BnOurCorAcc = OurCorrAcc;
+      if(OurCorrBlock != -1)
+        DepoDraftParm.Block = OurCorrBlock;
+      end;
+   end;
+
+  if (is_dl_comm == true)
+    var Depositary = DepParm.rec.Depositary;
+
+    if(Depositary <= 0)
+      Depositary = {OurBank};
+    end;
+    
+    if (DealType == 1)
+      DepoDraftParm.BnCustodyID = Depositary;
+    else
+      DepoDraftParm.DwCustodyID = Depositary;
+    end;
+  end;
+ 
+  if( is_dl_tick )
+    if(IsBasket(Group))
+      DepoDraftParm.FIID = avr_dlrq.rec.FIID;
+    elif( IsBUY(Group) OR IsSALE(Group) OR IsCONVERT_SHARE(Group) OR IsCONVERT_RECEIPT(Group) ) // Покупка/продажа, конвертация
+      DepoDraftFillFIID_1( avr_dlrq.rec.FIID, dl_leg );
+    elif(IsRET_ISSUE(Group))  // Погашение выпуска
+      DepoDraftFillFIID_2( avr_dlrq.rec.FIID );
+    else  // Получение паев
+      DepoDraftParm.FIID = avr_dlrq.rec.FIID;
+    end;
+  end;
+   DepoDraftParm.GeneralizedFIID = avr_dlrq.rec.FIID;
+
+   DepoDraftParm.Amount     = avr_dlrq.rec.Amount;
+   /*Дата валютирования должна совпадать с датой поставки из сделки (- это дата валютирования из платежа по БА*/
+   DepoDraftParm.ValueDate  = avr_dlrq.rec.PlanDate;
+   if( is_dl_tick )
+      if( (MarketCode == MICEX_CODE) OR
+          ( (MarketCode == RTS_CODE) AND ( firstdoc.MarketOfficeID == СекторСГК ) )
+        )
+        DepoDraftParm.IsDVP = SET_CHAR;
+      end;
+   end;
+
+  /*Проверяем, если сделка РЕПО и тип расчетов - DVP, то ставми признак DVP*/
+  if (dl_leg != null)
+    if( dl_leg.Formula == 50 )
+      DepoDraftParm.IsDVP = SET_CHAR;
+    end;
+  end;
+
+   DepoDraftFillDealData(firstdoc);
+
+   if( is_dl_tick AND IsLOAN(Group) )
+      if( DealType == DEAL_TYPE_SALE ) /* Займ, возврат */
+         DepoDraftParm.Product = 22;   /* Возврат полученных ц/б по займу */
+      else                             /* Займ, получение */
+         DepoDraftParm.Product = 20;   /* Получение ц/б в заем */
+      end;
+   elif( is_dl_tick AND IsRET_ISSUE(Group) )
+      DepoDraftParm.Product = 9; /* Погашение */
+   else
+      DepoDraftParm.Product = 1; /* Купля - продажа */
+   end;
+   DepoDraftParm.Oper       = {oper};
+   DepoDraftParm.PaymentID  = avr_dlrq.rec.ID;
+   DepoDraftParm.Initiator   = -1; /* инициатор */
+   if(is_dl_tick)
+     DepoDraftParm.Initiator = GetDepoInitiator(DepoDraftParm, DepParm.rec.InitiatorKind, firstdoc.ClientID);
+   end;
+
+   DepoDraftParm.DontCreateInitiatorReport = UNSET_CHAR;
+   if( DealType == DEAL_TYPE_SALE )
+      DepoDraftParm.CreateDwReport = SET_CHAR;
+   else
+      DepoDraftParm.CreateDwReport = UNSET_CHAR;
+   end;
+   DepoDraftParm.CreateBnReport    = UNSET_CHAR;
+
+   DepoDraftParm.AutoSendReport    = SET_CHAR;      /* Автоматически отправлять отчеты об исполнении*/
+
+   DepoDraftParm.SettlementDate = avr_dlrq.rec.PlanDate;
+   DepoDraftParm.LateDeliveryDate = avr_dlrq.rec.PlanDate;
+  
+  if (dl_leg != null)
+    DepoDraftParm.DealAmount = dl_leg.TotalCost;
+    DepoDraftParm.DealCurrency = dl_leg.CFI;
+  end;
+   if(ValType(UseTransAcc) != V_UNDEF)
+     DepoDraftParm.FromTransitAccount = UseTransAcc;
+   end;
+
+   if (PrevDraft == true)
+      DepoDraftParm.Mode = 1;
+   else
+      DepoDraftParm.Mode = 0;
+   end;
+
+   if (is_dl_nett)
+      sourcedockind = DL_NTGSEC;
+      sourcedocid   = firstdoc.NettingID;
+   end;
+
+  if (is_dl_comm == true)
+    sourcedockind = firstdoc.DocKind;
+    sourcedocid   = firstdoc.DocumentID;
+    DepoDraftParm.Amount = firstdoc.Hidden_Sum;
+    DepoDraftParm.FIID = firstdoc.FIID;
+  end;
+
+  return InsertDraftParm(DepoDraftParm, avr_dlrq, firstdoc, sourcedockind, sourcedocid, dl_comm, GrDealForLnk, false, GrDealFIID);
+end;
+
+/*Внебиржевая клиентская сделка и счет клиента и контрагента - в нашем банке   или Расчетная операция БО */
+macro InsertDraft_2( firstdoc, avr_DlRq, DepParm, OperDate, IsBack, dl_leg, DealType, Group, PrevDraft, dl_comm, GrDealForLnk, GrDealFIID, SpGroundID:integer, UseTransAcc )
+   var  MarketCode;
+   var sourcedockind = null, sourcedocid = null;
+   var AccountBuff = TRecHandler("account");
+   var rqacc = TRecHandler("dlrqacc.dbt");
+
+   if( filename(firstdoc) == "dl_tick.dbt" )
+     is_dl_tick = true;
+   elif( filename(firstdoc) == "dl_nett.dbt" )
+     is_dl_nett = true;
+   end;
+
+   if(not is_dlacc)
+      MarketCode = ПолучитьКодГруппыБиржи( firstdoc.MarketID );
+   end;
+
+   ClearRecord(DepoDraftParm);
+
+   if( (SpGroundID != null) and (SpGroundID > 0) )
+      DepoDraftParm.SpGroundID = SpGroundID;
+   end;
+
+   DepoDraftParm.Kind         = SP_DEPOPER_BOOKORDER; /* Внутридепозитарный перевод*/
+   DepoDraftParm.SignedDate   = OperDate;
+   DepoDraftParm.RegisterDate = OperDate;
+   DepoDraftParm.RegisterTime = Time();
+   if( IsTrust )
+      DepoDraftParm.DwPartyID    = {OurBank};
+      DepoDraftParm.DwAccPurp    = OBJTYPE_DEPOKINDTYPE_ISSUER;
+   else
+      if(avr_DlRq.rec.Kind == DLRQ_KIND_REQUEST)
+        DepoDraftParm.DwPartyID    = avr_DlRq.rec.Party;
+      else
+        DepoDraftParm.DwPartyID    = firstdoc.ClientID;
+        DepoDraftParm.DeponentDoc = firstdoc.ClientID;
+      end;
+   end;
+
+   if( IsTrust )
+      DepoDraftParm.Unblock = OBJTYPE_DEPOACC_BLOCK_INTRAST;
+   else
+      if(is_dlacc)
+        DepoDraftParm.Unblock = OBJTYPE_DEPOACC_BLOCK_STANDART; /*  Стандартная */
+      else
+        if( IsREPO(Group) and IsBUY(Group) and IsBack and (firstdoc.Flag4 == SET_CHAR) )
+           /* РЕПО покупка, часть продажи, установлен флаг "Блокирован" */
+           DepoDraftParm.Unblock = OBJTYPE_DEPOACC_BLOCK_REPO;
+        else /*остальные продажи и покупки*/
+           DepoDraftParm.Unblock = OBJTYPE_DEPOACC_BLOCK_INMARKETS; /* На торгах */
+        end;
+      end;
+   end;
+   DepoDraftParm.DwCustodyID      = ПолучитьБанкСубъектаПоСделке(DepoDraftParm.DwPartyID, avr_DlRq.rec.DocKind, avr_DlRq.rec.DocID, avr_DlRq.rec.FIID, avr_DlRq.rec.Type);//avr_paym.PayerBankID; /*Наш банк*/
+
+   if(DepoDraftParm.DwPartyID == avr_DlRq.rec.Party)
+     ПолучитПлатежныеРеквизитыПоТО(avr_dlrq, rqacc);
+   else
+     ПолучитьПлатежныеРеквизитыСубъектаПоСделке(avr_DlRq.rec.DocKind, avr_DlRq.rec.DocID, DepoDraftParm.DwPartyID, DLRQ_SUBKIND_AVOIRISS, avr_DlRq.rec.FIID, avr_DlRq.rec.Type, rqacc);
+   end;
+
+   DepoDraftParm.DwAccCode = rqacc.rec.Account;
+
+   if( IsTrust )
+      DepoDraftParm.BnPartyID    = {OurBank};
+      DepoDraftParm.BnAccPurp    = OBJTYPE_DEPOKINDTYPE_ISSUER;
+   else
+      if(avr_DlRq.rec.Kind == DLRQ_KIND_REQUEST)
+        DepoDraftParm.BnPartyID    = firstdoc.ClientID;
+        DepoDraftParm.DeponentDoc = firstdoc.ClientID;
+      else
+        DepoDraftParm.BnPartyID    = avr_DlRq.rec.Party;
+      end;
+   end;
+
+   if( IsTrust )
+      DepoDraftParm.Block = OBJTYPE_DEPOACC_BLOCK_INTRAST;
+   else
+      if(is_dlacc)
+        DepoDraftParm.Block = OBJTYPE_DEPOACC_BLOCK_STANDART; /*  Стандартная */
+      else
+        if( IsREPO(Group) and IsBUY(Group) and (IsBack == false) and (firstdoc.Flag4 == SET_CHAR) )
+          /* Сделка РЕПО покупка, часть покупки, установлен флаг "Блокирован" */
+           DepoDraftParm.Block = OBJTYPE_DEPOACC_BLOCK_REPO; /* Блокированы по РЕПО */
+        else /*остальные покупки и продажи*/
+           DepoDraftParm.Block = OBJTYPE_DEPOACC_BLOCK_INMARKETS; /* На торгах */
+        end;
+      end;
+   end;
+   DepoDraftParm.BnCustodyID      = ПолучитьБанкСубъектаПоСделке(DepoDraftParm.BnPartyID, avr_DlRq.rec.DocKind, avr_DlRq.rec.DocID, avr_DlRq.rec.FIID, avr_DlRq.rec.Type);//avr_paym.ReceiverBankID;
+
+   if(DepoDraftParm.BnPartyID == avr_DlRq.rec.Party)
+     ПолучитПлатежныеРеквизитыПоТО(avr_dlrq, rqacc);
+   else
+     ПолучитьПлатежныеРеквизитыСубъектаПоСделке(avr_DlRq.rec.DocKind, avr_DlRq.rec.DocID, DepoDraftParm.BnPartyID, DLRQ_SUBKIND_AVOIRISS, avr_DlRq.rec.FIID, avr_DlRq.rec.Type, rqacc);
+   end;
+
+   DepoDraftParm.BnAccCode = rqacc.rec.Account;
+
+   DepoDraftFillDealData(firstdoc);
+
+   if(is_dlacc)
+      //DepoDraftParm.Initiator   = -1/*{OurBank}*/; /* инициатор */
+      DepoDraftParm.Initiator          = GetDepoInitiator(DepoDraftParm, DepParm.rec.InitiatorKind, firstdoc.ClientID);
+      DepoDraftParm.CreateDwReport     = UNSET_CHAR;
+      DepoDraftParm.CreateBnReport     = UNSET_CHAR;
+      DepoDraftParm.FromTransitAccount = UNSET_CHAR;
+   else
+      //DepoDraftParm.Initiator   = -1; /* инициатор */
+      DepoDraftParm.Initiator      = GetDepoInitiator(DepoDraftParm, DepParm.rec.InitiatorKind, firstdoc.ClientID);
+      DepoDraftParm.CreateDwReport = SET_CHAR;
+      DepoDraftParm.CreateBnReport = SET_CHAR;
+      if(ValType(UseTransAcc) != V_UNDEF)
+        DepoDraftParm.FromTransitAccount = UseTransAcc;
+      end;
+   end;
+
+   DepoDraftParm.AutoSendReport    = SET_CHAR;      /* Автоматически отправлять отчеты об исполнении*/
+
+   if(IsBasket(Group))
+     DepoDraftParm.FIID = avr_dlrq.rec.FIID;
+   elif( IsBUY(Group) OR IsSALE(Group) ) // Покупка/продажа
+      DepoDraftFillFIID_1( avr_DlRq.rec.FIID, dl_leg );
+   else  // Расчетная операция
+      DepoDraftFillFIID_2( avr_DlRq.rec.FIID );
+   end;
+
+   DepoDraftParm.GeneralizedFIID = avr_DlRq.rec.FIID;
+   DepoDraftParm.Amount     = avr_DlRq.rec.Amount;
+   /*Дата валютирования должна совпадать с датой поставки из сделки (- это дата валютирования из платежа по БА*/
+   DepoDraftParm.ValueDate  = avr_DlRq.rec.PlanDate;
+
+   if( (MarketCode == RTS_CODE) AND ( firstdoc.MarketOfficeID == СекторСГК ) )
+      DepoDraftParm.IsDVP = SET_CHAR;
+   end;
+
+   DepoDraftParm.Product = 1; /* Купля - продажа */
+
+   DepoDraftParm.Oper       = {oper};
+   DepoDraftParm.PaymentID  = avr_DlRq.rec.ID;
+   DepoDraftParm.DontCreateInitiatorReport = UNSET_CHAR;
+
+   DepoDraftParm.SettlementDate = avr_DlRq.rec.PlanDate;
+   DepoDraftParm.LateDeliveryDate = avr_DlRq.rec.PlanDate;
+
+   if (PrevDraft == true)
+      DepoDraftParm.Mode = 1;
+   else
+      DepoDraftParm.Mode = 0;
+   end;
+
+   if(not is_dlacc)
+      DepoDraftParm.DealAmount = dl_leg.TotalCost;
+      DepoDraftParm.DealCurrency = dl_leg.CFI;
+   end;
+
+   if(is_dlacc)
+      sourcedockind = DL_CALCOPER;
+      sourcedocid   = firstdoc.ID;
+   end;
+
+   return InsertDraftParm(DepoDraftParm, avr_DlRq, firstdoc, sourcedockind, sourcedocid, dl_comm, GrDealForLnk, false, GrDealFIID);
+end;
+
+/* Внебиржевая сделка банка и счет контрагента -в нашем банке
+   Поручение на списание:*/
+macro InsertDraft_3_Out( firstdoc, avr_dlrq, DepParm, OperDate, IsBack, dl_leg, DealType, Group, PrevDraft, dl_comm, GrDealForLnk, GrDealFIID, SpGroundID:integer, UseTransAcc)
+   var  MarketCode = ПолучитьКодГруппыБиржи( firstdoc.MarketID );
+   var  AccountBuff = TRecHandler("account");
+   var  rqacc = TRecHandler("dlrqacc.dbt");
+
+   if( filename(firstdoc) == "dl_tick.dbt" )
+     is_dl_tick = true;
+   elif( filename(firstdoc) == "dl_nett.dbt" )
+     is_dl_nett = true;
+   end;
+
+   ClearRecord(DepoDraftParm);
+
+   if( (SpGroundID != null) and (SpGroundID > 0) )
+      DepoDraftParm.SpGroundID = SpGroundID;
+   end;
+
+   DepoDraftParm.Kind         = SP_DEPOPER_TRANSFERORDER; /* Поручение на междепозитарный перевод*/
+   DepoDraftParm.SignedDate   = OperDate;
+   DepoDraftParm.RegisterDate = OperDate;
+   DepoDraftParm.RegisterTime = Time();
+
+   if( IsTrust )
+      DepoDraftParm.DwPartyID    = {OurBank};
+      DepoDraftParm.DwAccPurp    = OBJTYPE_DEPOKINDTYPE_ISSUER;
+      DepoDraftParm.Unblock = OBJTYPE_DEPOACC_BLOCK_INTRAST;
+   else
+      if(avr_dlrq.rec.Kind == DLRQ_KIND_REQUEST)
+        DepoDraftParm.DwPartyID    = avr_DlRq.rec.Party;
+      else
+        DepoDraftParm.DwPartyID    = firstdoc.ClientID;
+        DepoDraftParm.DeponentDoc = firstdoc.ClientID;
+      end;
+      if( DealType != DEAL_TYPE_BUY )
+         DepoDraftParm.DwAccPurp = OBJTYPE_DEPOKINDTYPE_DEPONENT;
+      end;
+
+      if( IsREPO(Group) and IsBUY(Group) and IsBack and (firstdoc.Flag4 == SET_CHAR) )
+         /* РЕПО покупка, часть продажи, установлен флаг "Блокирован" */
+         DepoDraftParm.Unblock = OBJTYPE_DEPOACC_BLOCK_REPO;
+      else /*остальные продажи и покупки*/
+         DepoDraftParm.Unblock = OBJTYPE_DEPOACC_BLOCK_INMARKETS; /* На торгах */
+      end;
+   end;
+
+   if(DepoDraftParm.DwPartyID == avr_DlRq.rec.Party)
+     ПолучитПлатежныеРеквизитыПоТО(avr_dlrq, rqacc);
+   else
+     ПолучитьПлатежныеРеквизитыСубъектаПоСделке(avr_DlRq.rec.DocKind, avr_DlRq.rec.DocID, DepoDraftParm.DwPartyID, DLRQ_SUBKIND_AVOIRISS, avr_DlRq.rec.FIID, avr_DlRq.rec.Type, rqacc);
+   end;
+
+   DepoDraftParm.DwAccCode = rqacc.rec.Account;
+
+   DepoDraftParm.DwCustodyID  = ПолучитьБанкСубъектаПоСделке(DepoDraftParm.DwPartyID, avr_DlRq.rec.DocKind, avr_DlRq.rec.DocID, avr_DlRq.rec.FIID, avr_DlRq.rec.Type); /*Наш банк*/
+   DepoDraftParm.BnPartyID    = {OurBank}; //наш банк
+
+   DepoDraftParm.Block       = OBJTYPE_DEPOACC_BLOCK_STANDART; /* Стандартная */
+   DepoDraftParm.BnCustodyID = dl_leg.DepositID;
+
+   if(IsBasket(Group))
+     DepoDraftParm.FIID = avr_dlrq.rec.FIID;
+   else
+     DepoDraftFillFIID_1( avr_DlRq.rec.FIID, dl_leg );
+   end;
+   DepoDraftParm.GeneralizedFIID = avr_DlRq.rec.FIID;
+   DepoDraftParm.Amount     = avr_DlRq.rec.Amount;
+   /*Дата валютирования должна совпадать с датой поставки из сделки (- это дата валютирования из платежа по БА*/
+   DepoDraftParm.ValueDate  = avr_DlRq.rec.PlanDate;
+   if( (MarketCode == RTS_CODE) AND ( firstdoc.MarketOfficeID == СекторСГК ) )
+      DepoDraftParm.IsDVP = SET_CHAR;
+   end;
+
+   DepoDraftFillDealData(firstdoc);
+
+   DepoDraftParm.Product = 1; /* Купля - продажа */
+
+   DepoDraftParm.Oper       = {oper};
+   DepoDraftParm.PaymentID  = avr_DlRq.rec.ID;
+   //DepoDraftParm.Initiator   = -1; /* инициатор */
+   DepoDraftParm.Initiator   = GetDepoInitiator(DepoDraftParm, DepParm.rec.InitiatorKind, firstdoc.ClientID);
+   DepoDraftParm.DontCreateInitiatorReport = UNSET_CHAR;
+   DepoDraftParm.CreateDwReport            = SET_CHAR;
+   DepoDraftParm.CreateBnReport            = UNSET_CHAR;
+
+   DepoDraftParm.AutoSendReport = SET_CHAR;      /* Автоматически отправлять отчеты об исполнении*/
+
+   DepoDraftParm.SettlementDate = avr_DlRq.rec.PlanDate;
+   DepoDraftParm.LateDeliveryDate = avr_DlRq.rec.PlanDate;
+
+   DepoDraftParm.DealAmount = dl_leg.TotalCost;
+   DepoDraftParm.DealCurrency = dl_leg.CFI;
+
+   if(ValType(UseTransAcc) != V_UNDEF)
+     DepoDraftParm.FromTransitAccount = UseTransAcc;
+   end;
+
+   if (PrevDraft == true)
+      DepoDraftParm.Mode = 1;
+   else
+      DepoDraftParm.Mode = 0;
+   end;
+
+   return InsertDraftParm(DepoDraftParm, avr_dlrq, firstdoc, 0, 0, dl_comm, GrDealForLnk, false, GrDealFIID);
+end;
+
+/* Внебиржевая сделка банка и счет контрагента -в нашем банке
+   Поручение на зачисление*/
+macro InsertDraft_3_In( firstdoc, avr_dlrq, DepParm, OperDate, IsBack, dl_leg, DealType, Group, PrevDraft, dl_comm, GrDealForLnk, GrDealFIID, SpGroundID:integer, UseTransAcc )
+   var  MarketCode = ПолучитьКодГруппыБиржи( firstdoc.MarketID );
+   var  AccountBuff = TRecHandler("account");
+   var  rqacc = TRecHandler("dlrqacc.dbt");
+
+   if( filename(firstdoc) == "dl_tick.dbt" )
+     is_dl_tick = true;
+   elif( filename(firstdoc) == "dl_nett.dbt" )
+     is_dl_nett = true;
+   end;
+
+   ClearRecord(DepoDraftParm);
+
+   if( (SpGroundID != null) and (SpGroundID > 0) )
+      DepoDraftParm.SpGroundID = SpGroundID;
+   end;
+
+   DepoDraftParm.Kind         = SP_DEPOPER_ENROLMENT; /* "Зачисление безналичных ц/б" */
+   DepoDraftParm.SignedDate   = OperDate;
+   DepoDraftParm.RegisterDate = OperDate;
+   DepoDraftParm.RegisterTime = Time();
+   DepoDraftParm.DwPartyID    = {OurBank}; //наш банк
+   DepoDraftParm.Unblock      = OBJTYPE_DEPOACC_BLOCK_STANDART; /* Стандартная */
+   DepoDraftParm.DwCustodyID      = dl_leg.DepositID;
+   DepoDraftParm.DwOurCustAgentID = dl_leg.DepositID;
+
+   if( IsTrust )
+      DepoDraftParm.BnPartyID    = {OurBank};
+      DepoDraftParm.BnAccPurp = OBJTYPE_DEPOKINDTYPE_ISSUER;
+      DepoDraftParm.Block        = OBJTYPE_DEPOACC_BLOCK_INTRAST;
+   else
+      if(avr_dlrq.rec.Kind == DLRQ_KIND_COMMIT)
+        DepoDraftParm.BnPartyID    = avr_DlRq.rec.Party;
+      else
+        DepoDraftParm.BnPartyID    = firstdoc.ClientID;
+        DepoDraftParm.DeponentDoc = firstdoc.ClientID;
+      end;
+      if( DealType == DEAL_TYPE_BUY )
+         DepoDraftParm.BnAccPurp = OBJTYPE_DEPOKINDTYPE_DEPONENT;
+      end;
+      if( IsREPO(Group) and IsBUY(Group) and (IsBack == false) and (firstdoc.Flag4 == SET_CHAR) )
+        /* Сделка РЕПО покупка, часть покупки, установлен флаг "Блокирован" */
+         DepoDraftParm.Block = OBJTYPE_DEPOACC_BLOCK_REPO;/* Блокированы по РЕПО */
+      else
+         DepoDraftParm.Block = OBJTYPE_DEPOACC_BLOCK_INMARKETS; /* На торгах */
+      end;
+   end;
+
+   if(DepoDraftParm.BnPartyID == avr_DlRq.rec.Party)
+     ПолучитПлатежныеРеквизитыПоТО(avr_dlrq, rqacc);
+   else
+     ПолучитьПлатежныеРеквизитыСубъектаПоСделке(avr_DlRq.rec.DocKind, avr_DlRq.rec.DocID, DepoDraftParm.BnPartyID, DLRQ_SUBKIND_AVOIRISS, avr_DlRq.rec.FIID, avr_DlRq.rec.Type, rqacc);
+   end;
+
+   DepoDraftParm.BnAccCode = rqacc.rec.Account;
+
+   DepoDraftParm.BnCustodyID      = ПолучитьБанкСубъектаПоСделке(DepoDraftParm.BnPartyID, avr_DlRq.rec.DocKind, avr_DlRq.rec.DocID, avr_DlRq.rec.FIID, avr_DlRq.rec.Type); /*Наш банк*/
+
+   if(IsBasket(Group))
+     DepoDraftParm.FIID = avr_dlrq.rec.FIID;
+   else
+     DepoDraftFillFIID_1( avr_DlRq.rec.FIID, dl_leg );
+   end;
+   DepoDraftParm.GeneralizedFIID = avr_DlRq.rec.FIID;
+   DepoDraftParm.Amount     = avr_DlRq.rec.Amount;
+   /*Дата валютирования должна совпадать с датой поставки из сделки */
+   DepoDraftParm.ValueDate  = avr_DlRq.rec.PlanDate;
+   if( (MarketCode == RTS_CODE) AND ( firstdoc.MarketOfficeID == СекторСГК ) )
+      DepoDraftParm.IsDVP = SET_CHAR;
+   end;
+
+   DepoDraftFillDealData(firstdoc);
+
+   if( IsRET_ISSUE(Group) )
+      DepoDraftParm.Product = 9; /* Погашение */
+   else
+      DepoDraftParm.Product = 1; /* Купля - продажа */
+   end;
+
+   DepoDraftParm.Oper       = {oper};
+   DepoDraftParm.PaymentID  = avr_DlRq.rec.ID;
+   //DepoDraftParm.Initiator   = -1; /* инициатор */
+   DepoDraftParm.Initiator  = GetDepoInitiator(DepoDraftParm, DepParm.rec.InitiatorKind, firstdoc.ClientID);
+   DepoDraftParm.DontCreateInitiatorReport = UNSET_CHAR;
+   DepoDraftParm.CreateDwReport            = UNSET_CHAR;
+   DepoDraftParm.CreateBnReport            = UNSET_CHAR;
+
+   DepoDraftParm.AutoSendReport = SET_CHAR;      /* Автоматически отправлять отчеты об исполнении*/
+
+   DepoDraftParm.SettlementDate = avr_DlRq.rec.PlanDate;
+   DepoDraftParm.LateDeliveryDate = avr_DlRq.rec.PlanDate;
+
+   DepoDraftParm.DealAmount = dl_leg.TotalCost;
+   DepoDraftParm.DealCurrency = dl_leg.CFI;
+
+   if(ValType(UseTransAcc) != V_UNDEF)
+     DepoDraftParm.FromTransitAccount = UseTransAcc;
+   end;
+
+   if (PrevDraft == true)
+      DepoDraftParm.Mode = 1;
+   else
+      DepoDraftParm.Mode = 0;
+   end;
+
+   return InsertDraftParm(DepoDraftParm, avr_dlrq, firstdoc, 0, 0, dl_comm, GrDealForLnk, false, GrDealFIID);
+end;
+
+/*Внебиржевые клиентские сделки и счет клиента - не в нашем банке и счет контрагента -в нашем банке*/
+macro InsertDraft_4( firstdoc, avr_dlrq, DepParm, OperDate, IsBack, dl_leg, DealType, Group, PrevDraft, dl_comm, GrDealForLnk, GrDealFIID, SpGroundID:integer, UseTransAcc )
+   var    Kind_Oper, MarketCode;
+   var    OurCorrID = -1, OurCorrAcc = "", OurCorrBlock = -1;
+   file   corschem(corschem) key 1;
+   var rqacc = TRecHandler("dlrqacc");
+   var  AccountBuff = TRecHandler("account");
+
+   if( filename(firstdoc) == "dl_tick.dbt" )
+     is_dl_tick = true;
+   elif( filename(firstdoc) == "dl_nett.dbt" )
+     is_dl_nett = true;
+   end;
+
+   MarketCode = ПолучитьКодГруппыБиржи( firstdoc.MarketID );
+
+   ClearRecord(DepoDraftParm);
+
+   if( (SpGroundID != null) and (SpGroundID > 0) )
+      DepoDraftParm.SpGroundID = SpGroundID;
+   end;
+
+   if( DealType == DEAL_TYPE_BUY )
+      Kind_Oper = SP_DEPOPER_TRANSFERORDER; /* Поручение на междепозитарный перевод*/
+   elif( DealType == DEAL_TYPE_SALE )
+      Kind_Oper = SP_DEPOPER_ENROLMENT; /* "Зачисление безналичных ц/б" */
+   end;
+   DepoDraftParm.Kind         = Kind_Oper;
+   DepoDraftParm.SignedDate   = OperDate;
+   DepoDraftParm.RegisterDate = OperDate;
+   DepoDraftParm.RegisterTime = Time();
+   if(avr_DlRq.rec.Kind == DLRQ_KIND_REQUEST)
+     DepoDraftParm.DwPartyID  = avr_DlRq.rec.Party;
+   else
+     DepoDraftParm.DwPartyID  = firstdoc.ClientID;
+     DepoDraftParm.DeponentDoc = firstdoc.ClientID;
+   end;
+
+   if( DealType == DEAL_TYPE_BUY )
+      if( IsTrust )
+         DepoDraftParm.DwPartyID    = {OurBank};
+         DepoDraftParm.DwAccPurp    = OBJTYPE_DEPOKINDTYPE_ISSUER;
+      end;
+   end;
+
+   if( DealType == DEAL_TYPE_BUY )
+      DepoDraftParm.Unblock = OBJTYPE_DEPOACC_BLOCK_INMARKETS; /* На торгах */
+   else
+      DepoDraftParm.Unblock = OBJTYPE_DEPOACC_BLOCK_STANDART; /* Стандартная */
+   end;
+
+   DepoDraftParm.DwCustodyID      = ПолучитьБанкСубъектаПоСделке(DepoDraftParm.DwPartyID, avr_DlRq.rec.DocKind, avr_DlRq.rec.DocID, avr_DlRq.rec.FIID, avr_DlRq.rec.Type);
+
+   if(DepoDraftParm.DwPartyID == avr_DlRq.rec.Party)
+     ПолучитПлатежныеРеквизитыПоТО(avr_dlrq, rqacc);
+   else
+     ПолучитьПлатежныеРеквизитыСубъектаПоСделке(avr_DlRq.rec.DocKind, avr_DlRq.rec.DocID, DepoDraftParm.DwPartyID, DLRQ_SUBKIND_AVOIRISS, avr_DlRq.rec.FIID, avr_DlRq.rec.Type, rqacc);
+   end;
+
+   DepoDraftParm.DwAccCode = rqacc.rec.Account;
+
+   if( Kind_Oper == SP_DEPOPER_ENROLMENT) /* распоряжение на зачисление */
+      if(rqacc.rec.ID > 0)
+        DepoDraftParm.DwCustodyAgentID = rqacc.rec.BankCorrID;
+        DepoDraftParm.DwCorAcc         = rqacc.rec.CorrAcc;
+        OurCorrID = rqacc.rec.BankCorrID;
+        if(not WorkMode_DepoCorAccPos) /*при снятой настройке получаем корсчет - иначе депозитарий спозиционируется сам*/
+          if((DepoDraftParm.DwCustodyID != {OurBank}) and (ПолучитьСчетПоПлатежнымРеквизитам(rqacc, AccountBuff) == 0))
+            OurCorrAcc = AccountBuff.rec.Account;
+          end;
+        end;
+      end;
+
+      if(DepParm.rec.DepSetID)
+        if(DepParm.rec.DPCorrNodeCln)
+          if(NOT GetCorrNodeInfo(DepParm.rec.DPCorrNodeCln, @OurCorrAcc, @OurCorrId, @OurCorrBlock))
+            return 1;
+          end;
+        end;
+      end;
+
+      DepoDraftParm.DwOurCustAgentID = OurCorrID;
+      DepoDraftParm.DwOurCorAcc = OurCorrAcc;
+      if(OurCorrBlock != -1)
+        DepoDraftParm.Unblock = OurCorrBlock;
+      end;
+   end;
+
+   if(avr_DlRq.rec.Kind == DLRQ_KIND_REQUEST)
+     DepoDraftParm.BnPartyID  = firstdoc.ClientID;
+     DepoDraftParm.DeponentDoc = firstdoc.ClientID;
+   else
+     DepoDraftParm.BnPartyID  = avr_DlRq.rec.Party;
+   end;
+   if( DealType == DEAL_TYPE_SALE )
+      if( IsTrust )
+         DepoDraftParm.BnPartyID    = {OurBank};
+         DepoDraftParm.BnAccPurp = OBJTYPE_DEPOKINDTYPE_ISSUER;
+      end;
+   end;
+
+   if( DealType == DEAL_TYPE_SALE )
+      DepoDraftParm.Block = OBJTYPE_DEPOACC_BLOCK_INMARKETS; /* На торгах */
+   else
+      DepoDraftParm.Block = OBJTYPE_DEPOACC_BLOCK_STANDART; /* Стандартная */
+   end;
+
+   DepoDraftParm.BnCustodyID      = ПолучитьБанкСубъектаПоСделке(DepoDraftParm.BnPartyID, avr_DlRq.rec.DocKind, avr_DlRq.rec.DocID, avr_DlRq.rec.FIID, avr_DlRq.rec.Type);
+
+   if(DepoDraftParm.BnPartyID == avr_DlRq.rec.Party)
+     ПолучитПлатежныеРеквизитыПоТО(avr_dlrq, rqacc);
+   else
+     ПолучитьПлатежныеРеквизитыСубъектаПоСделке(avr_DlRq.rec.DocKind, avr_DlRq.rec.DocID, DepoDraftParm.BnPartyID, DLRQ_SUBKIND_AVOIRISS, avr_DlRq.rec.FIID, avr_DlRq.rec.Type, rqacc);
+   end;
+
+   DepoDraftParm.BnAccCode = rqacc.rec.Account;
+
+   if( Kind_Oper == SP_DEPOPER_TRANSFERORDER ) /* Поручение на междепозитарный перевод*/
+      if(rqacc.rec.ID > 0)
+        DepoDraftParm.BnCustodyAgentID = rqacc.rec.BankCorrID;
+        DepoDraftParm.BnCorAcc         = rqacc.rec.CorrAcc;
+        if(not WorkMode_DepoCorAccPos) /*при снятой настройке получаем корсчет - иначе депозитарий спозиционируется сам*/
+          if((DepoDraftParm.BnCustodyID != {OurBank}) and (ПолучитьСчетПоПлатежнымРеквизитам(rqacc, AccountBuff) == 0))
+            OurCorrAcc = AccountBuff.rec.Account;
+          end;
+        end;
+      end;
+
+      if(DepParm.rec.DepSetID)
+        if(DepParm.rec.DPCorrNodeCln)
+          if(NOT GetCorrNodeInfo(DepParm.rec.DPCorrNodeCln, @OurCorrAcc, @OurCorrId, @OurCorrBlock))
+            return 1;
+          end;
+        end;
+      end;
+
+      DepoDraftParm.BnOurCorAcc = OurCorrAcc;
+      if(OurCorrBlock != -1)
+        DepoDraftParm.Block = OurCorrBlock;
+      end;
+   end;
+
+   if(IsBasket(Group))
+     DepoDraftParm.FIID = avr_dlrq.rec.FIID;
+   else
+     DepoDraftFillFIID_1( avr_DlRq.rec.FIID, dl_leg );
+   end;
+   DepoDraftParm.GeneralizedFIID = avr_DlRq.rec.FIID;
+   DepoDraftParm.Amount     = avr_DlRq.rec.Amount;
+   /*Дата валютирования должна совпадать с датой поставки из сделки (- это дата валютирования из платежа по БА*/
+   DepoDraftParm.ValueDate  = avr_DlRq.rec.PlanDate;
+   if( (MarketCode == RTS_CODE) AND ( firstdoc.MarketOfficeID == СекторСГК ) )
+      DepoDraftParm.IsDVP = SET_CHAR;
+   end;
+
+   DepoDraftFillDealData(firstdoc);
+
+   DepoDraftParm.Product = 1; /* Купля - продажа */
+
+   DepoDraftParm.Oper       = {oper};
+   DepoDraftParm.PaymentID  = avr_DlRq.rec.ID;
+   //DepoDraftParm.Initiator   = -1; /* инициатор */
+   DepoDraftParm.Initiator  = GetDepoInitiator(DepoDraftParm, DepParm.rec.InitiatorKind, firstdoc.ClientID);
+   DepoDraftParm.DontCreateInitiatorReport = UNSET_CHAR;
+   if( DealType == DEAL_TYPE_BUY )
+      DepoDraftParm.CreateDwReport = SET_CHAR;
+   else
+      DepoDraftParm.CreateDwReport = UNSET_CHAR;
+   end;
+   DepoDraftParm.CreateBnReport        = UNSET_CHAR;
+
+   DepoDraftParm.AutoSendReport = SET_CHAR;      /* Автоматически отправлять отчеты об исполнении*/
+
+   DepoDraftParm.SettlementDate = avr_DlRq.rec.PlanDate;
+   DepoDraftParm.LateDeliveryDate = avr_DlRq.rec.PlanDate;
+
+   DepoDraftParm.DealAmount = dl_leg.TotalCost;
+   DepoDraftParm.DealCurrency = dl_leg.CFI;
+
+   if(ValType(UseTransAcc) != V_UNDEF)
+     DepoDraftParm.FromTransitAccount = UseTransAcc;
+   end;
+
+   if (PrevDraft == true)
+      DepoDraftParm.Mode = 1;
+   else
+      DepoDraftParm.Mode = 0;
+   end;
+
+   return InsertDraftParm(DepoDraftParm, avr_dlrq, firstdoc, 0, 0, dl_comm, GrDealForLnk, false, GrDealFIID);
+end;
+
+/*Разблокирование счета при отказе от 2 части Репо
+  Выполняется в сделках Репо   покупка при отказе от 2 части, если установлен
+  признак "блокирован" и лот первой ч. поставлен и остаток на нем не 0.
+  avr_dlrq - ТО поставки по первой части
+*/
+private macro InsertDraft_Reject( firstdoc, avr_dlrq, DepParm, OperDate, IsBack, dl_leg, DealType, Group )
+   var  MarketCode = ПолучитьКодГруппыБиржи( firstdoc.MarketID );
+   var  AccountBuff = TRecHandler("account");
+   var  rqacc = TRecHandler("dlrqacc.dbt");
+
+   ClearRecord(DepoDraftParm);
+
+   ПолучитПлатежныеРеквизитыПоТО(avr_dlrq, rqacc);
+
+   DepoDraftParm.Kind         = SP_DEPOPER_BOOKORDER; /* Внутридепозитарный перевод*/
+   DepoDraftParm.DocKind      = DOCKIND_DEPO_ORDREMOVEBLOCK;
+   DepoDraftParm.SignedDate   = OperDate;
+   DepoDraftParm.RegisterDate = OperDate;
+   DepoDraftParm.RegisterTime = Time();
+
+   DepoDraftParm.DwPartyID    = avr_dlrq.rec.Party;
+   DepoDraftParm.DwAccPurp    = OBJTYPE_DEPOKINDTYPE_DEPONENT;
+   DepoDraftParm.DwAccCode    = rqacc.rec.Account;
+   DepoDraftParm.Unblock      = OBJTYPE_DEPOACC_BLOCK_REPO;
+
+   DepoDraftParm.DwCustodyID  = {OurBank};
+
+   DepoDraftParm.BnPartyID = avr_dlrq.rec.Party;
+   DepoDraftParm.BnAccPurp = OBJTYPE_DEPOKINDTYPE_DEPONENT;
+   DepoDraftParm.BnAccCode = rqacc.rec.Account;
+   DepoDraftParm.Block = OBJTYPE_DEPOACC_BLOCK_INMARKETS; /* На торгах */
+
+   DepoDraftParm.BnCustodyID = {OurBank};
+
+   if(IsBasket(Group))
+     DepoDraftParm.FIID = avr_dlrq.rec.FIID;
+   else
+     DepoDraftFillFIID_1( avr_dlrq.rec.FIID, dl_leg );
+   end;
+   DepoDraftParm.GeneralizedFIID = avr_dlrq.rec.FIID;
+   DepoDraftParm.Amount     = avr_dlrq.rec.Amount; /*Тут будет остаток лота по первой части*/
+   DepoDraftParm.ValueDate  = OperDate;
+   DepoDraftParm.IsDVP      = UNSET_CHAR;
+
+   DepoDraftFillDealData(firstdoc);
+
+   DepoDraftParm.Product = 1; /* Купля - продажа */
+
+   DepoDraftParm.Oper       = {oper};
+   DepoDraftParm.PaymentID  = avr_dlrq.rec.ID;
+
+   DepoDraftParm.FromTransitAccount = UNSET_CHAR;
+   //DepoDraftParm.Initiator   = -1; /* инициатор */
+   DepoDraftParm.Initiator  = GetDepoInitiator(DepoDraftParm, DepParm.rec.InitiatorKind, firstdoc.ClientID);
+   DepoDraftParm.DontCreateInitiatorReport = UNSET_CHAR;
+   DepoDraftParm.CreateDwReport            = UNSET_CHAR;
+   DepoDraftParm.CreateBnReport            = UNSET_CHAR;
+
+   DepoDraftParm.AutoSendReport = SET_CHAR;      /* Автоматически отправлять отчеты об исполнении*/
+
+   DepoDraftParm.SettlementDate = avr_dlrq.rec.PlanDate;
+   DepoDraftParm.LateDeliveryDate = avr_dlrq.rec.PlanDate;
+
+   DepoDraftParm.DealAmount = dl_leg.TotalCost;
+   DepoDraftParm.DealCurrency = dl_leg.CFI;
+
+   return InsertDraftParm(DepoDraftParm, avr_dlrq, firstdoc);
+end;
+
+PRIVATE Macro SetParametr( firstdoc, avr_dlrq, OperDate, IsBack, IsReject, PrevDraft, FD)
+
+ var  stat = true, LegKind, DealType, Group = 0;
+ record dl_leg( dl_leg );
+ record sf(sfcontr);
+ var NeedDraft = true;
+
+ VAR DepParm = TRecHandler( "dldepset.dbt" ); /*Параметры депозитарного учета*/
+
+ if((is_dl_tick) AND (FD != NULL) AND (StrUpr( GenClassName( FD )) == StrUpr("SPFirstDoc")))
+   if( NOT ПолучитьПараметрыДУ_ПоСделке( DepParm, FD ) )
+     return false;
+   end;
+ else
+   if( NOT ПолучитьПараметрыДУ( DepParm, -1, -1 ) )
+     return false;
+   end;
+ end;
+
+ if( is_dl_tick )
+    DealType = GetDealBuySale(firstdoc, IsBack);
+    if( (DealType != DEAL_TYPE_BUY) AND (DealType != DEAL_TYPE_SALE) )
+       MsgBox( "Вставка поручений возможна только в сделках покупки или продажи.");
+       return false;
+    end;
+
+    Group = SP_GetOperationGroup( firstdoc);
+
+    if (IsLOAN( Group ))
+       LegKind = LEG_KIND_DL_TICK;
+    else
+       if( IsBack == true )
+          LegKind = LEG_KIND_DL_TICK_BACK;
+       else
+          LegKind = LEG_KIND_DL_TICK;
+       end;
+    end;
+
+    if( FindDL_LEG( LegKind, firstdoc.DealID, 0, dl_leg ) != 0 )
+       MsgBox( "Отсутствуют условия сделки dl_leg.dbt (код сделки=", firstdoc.DealCode,")" );
+       return false;
+    end;
+
+ elif( is_dl_nett )
+    if(avr_dlrq.rec.Kind == DLRQ_KIND_REQUEST)
+      DealType = DEAL_TYPE_BUY;
+    else
+      DealType = DEAL_TYPE_SALE;
+    end;
+
+ elif( is_dlacc )
+    stat = InsertDraft_2( firstdoc, avr_dlrq, DepParm, OperDate, IsBack, dl_leg, DealType, Group );
+ end;
+
+ if( not is_dlacc)
+    if(is_dl_tick AND IsClientDeal(firstdoc))
+      ClearRecord(sf);
+      sf.ID = firstdoc.ClientContrID;
+      if(trim(readNoteForObject( OBJTYPE_SFCONTR, UniID( sf, OBJTYPE_SFCONTR), NOTEKIND_SFCONTR_ISOUTCUSTODY)) != "")
+        NeedDraft = false;
+      end;
+    end;
+
+    if( (Group != 0) AND IsOUTEXCHANGE( Group ) ) /*Внебиржевая сделка*/
+
+       /*Разблокирование счета при отказе от 2 части Репо*/
+       if( IsReject )
+          stat = InsertDraft_Reject( firstdoc, avr_dlrq, DepParm, OperDate, IsBack, dl_leg, DealType, Group );
+
+       /*счет владельца - в нашем банке и счет контрагента - не в нашем банке*/
+       elif( КлиентПоСделкеВНашемБанке( firstdoc.ClientID, avr_DlRq.rec.DocKind, avr_DlRq.rec.DocID, avr_DlRq.rec.FIID, avr_DlRq.rec.Type ) AND
+             (ДепозитарийКонтрагентаТО(avr_dlrq) != {OurBank}) AND
+             (NeedDraft == true)
+           )
+          stat = InsertDraft_1( firstdoc, avr_dlrq, DepParm, OperDate, IsBack, dl_leg, DealType, Group, PrevDraft );
+       /*Внебиржевая клиентская сделка и счет клиента и контрагента - в нашем банке  */
+       elif( IsClientDeal(firstdoc) AND (IsTrust == false) AND
+             КлиентПоСделкеВНашемБанке( firstdoc.ClientID, avr_DlRq.rec.DocKind, avr_DlRq.rec.DocID, avr_DlRq.rec.FIID, avr_DlRq.rec.Type ) AND
+             (ДепозитарийКонтрагентаТО(avr_dlrq) == {OurBank}) AND
+             ((СделкаСКлиентомКонтрагентом(firstdoc) == false) OR
+              ((СделкаСКлиентомКонтрагентом(firstdoc)) AND (DL_KINDDEPODRAFTCLIENTCONTR == DL_KINDDEPODRAFTCLIENTCONTR_TRANSFER))
+             ) AND
+             (NeedDraft == true)
+           )
+          stat = InsertDraft_2( firstdoc, avr_DlRq, DepParm, OperDate, IsBack, dl_leg, DealType, Group, PrevDraft );
+
+       /*Внебиржевая сделка банка и счет контрагента -в нашем банке */
+       //или (клиентская сделка с клиентом-контрагентом и настройка "вид поручений с клиентом-контрагентом" == "Списание + зачисление" и счет контрагента -в нашем банке)
+       elif( (((not IsClientDeal(firstdoc)) OR (IsTrust == true)) AND (ДепозитарийКонтрагентаТО(avr_dlrq) == {OurBank})) OR
+             ((IsClientDeal(firstdoc)) AND (СделкаСКлиентомКонтрагентом(firstdoc) AND (DL_KINDDEPODRAFTCLIENTCONTR == DL_KINDDEPODRAFTCLIENTCONTR_WRTENRL) AND (ДепозитарийКонтрагентаТО(avr_dlrq) == {OurBank})))
+           )
+          if((avr_dlrq.rec.Kind != DLRQ_KIND_COMMIT) OR (NeedDraft == true))
+            stat = InsertDraft_3_Out( firstdoc, avr_dlrq, DepParm, OperDate, IsBack, dl_leg, DealType, Group, PrevDraft );
+          end;
+          if( (stat) and ((avr_dlrq.rec.Kind != DLRQ_KIND_REQUEST) OR (NeedDraft == true)) AND ( DL_KINDDEPODRAFTCLIENTCONTR == DL_KINDDEPODRAFTCLIENTCONTR_WRTENRL ) )
+             stat = InsertDraft_3_In( firstdoc, avr_dlrq, DepParm, OperDate, IsBack, dl_leg, DealType, Group, PrevDraft );
+          end;
+
+       /*Внебиржевые клиентские сделки и счет клиента - в не нашем банке и счет контрагента -в нашем банке*/
+       elif( IsClientDeal(firstdoc) AND (IsTrust == false) AND
+             (КлиентПоСделкеВНашемБанке( firstdoc.ClientID, avr_DlRq.rec.DocKind, avr_DlRq.rec.DocID, avr_DlRq.rec.FIID, avr_DlRq.rec.Type ) == false) AND
+             (ДепозитарийКонтрагентаТО(avr_dlrq) == {OurBank}) AND
+             (NeedDraft == true)
+           )
+          stat = InsertDraft_4( firstdoc, avr_dlrq, DepParm, OperDate, IsBack, dl_leg, DealType, Group, PrevDraft );
+
+       else
+          return true; /*вставка поручения не нужна*/
+       end;
+    else
+       /*Неттинг, биржевые и брокерские сделки, погашения, займ*/
+       if(NeedDraft == true)
+         stat = InsertDraft_1( firstdoc, avr_dlrq, DepParm, OperDate, IsBack, dl_leg, DealType, Group, PrevDraft );
+       end;
+    end;
+ end;
+ return stat;
+End;
+
+/*
+   InsertDepoDraft - Процедура импорта из БО ЦБ поручений в депозитарий
+   Параметры :
+
+   firstdoc - первичный документ: сделка с ценнми бумагами (dl_tick.dbt) или сделка неттинга (dl_nett.dbt)
+   avr_paym - платеж по базовому активу (pmpaym.dbt)
+   OperDate - Дата вставки поручения
+   IsReject - Признак вставки поручения на разблокирование счета при отказе от 2 части Репо
+   PrevDraft- Признак - предв. поручение.
+*/
+Macro InsertDepoDraft( firstdoc, avr_dlrq, OperDate, IsReject, PrevDraft, FD )
+
+ if( FD )
+   IsTrust = FD.IsTrust();
+ end;
+
+ if( filename(firstdoc) == "dl_tick.dbt" )
+    is_dl_tick = true;
+ elif( filename(firstdoc) == "dl_nett.dbt" )
+    is_dl_nett = true;
+ elif( filename(firstdoc) == "dl_acc.dbt")
+    is_dlacc = true;
+ else
+    MsgBox( "По первичному документу из файла " + filename(firstdoc) + "|вставка поручения депо в текущей рализации не поддерживается" );
+    return false;
+ end;
+
+// if(not is_dlacc)
+    /*только если сделка не порожденна при выполнении поручения в депозитарии*/
+    if( (is_dl_tick == false) OR (firstdoc.OriginID != CodeFor("Z")) )
+
+       if( not SetParametr( firstdoc, avr_dlrq, OperDate, ((avr_dlrq.rec.DealPart == 2) OR (avr_dlrq.rec.Type == DLRQ_TYPE_COMPDELIVERY)), IsReject, PrevDraft, FD ) )
+          /*MsgBox("Ошибка при заполнении параметров");*/
+          return false;
+       end;
+
+    end;
+// end;
+
+ return true;
+End;
+
+macro InsertInfOprReject(DealID)
+    var err = 0;
+    var query = "", cmd = null, set = null;
+    var curtime = Time();
+    var grprm = TRecHandler("spgroundprm.rec"), id = 0;
+    var grprm2 = TRecHandler("spgroundprm.rec"), id2 = 0;
+    var set2 = null;
+    var dpinf = TRecHandler("depoinfo.dbt");
+
+    query = " SELECT "
+              + " spground.t_SPGroundID "
+             + " ,spground.t_Xld "
+             + " ,spdraft.t_Status "
+             + " ,spdraft.t_OperState "
+             + " ,q.t_BOfficeKind "
+             + " ,q.t_DealCode "
+             + " ,q.t_ClientID "
+          + " FROM "
+              + " dspground_dbt spground "
+             + " ,dspdraft_dbt spdraft "
+             + " ,(SELECT "
+                   + " dl_comm.t_DocumentID "
+                  + " ,dl_comm.t_DocKind "
+                  + " ,v_sctotaldeals.t_DocKind AS t_BOfficeKind "
+                  + " ,v_sctotaldeals.t_DealCode "
+                  + " ,v_sctotaldeals.t_ClientID "
+               + " FROM "
+                   + " ddl_comm_dbt dl_comm "
+                  + " ,dv_sctotaldeals v_sctotaldeals "
+               + " WHERE "
+                   + " dl_comm.t_Deal1 = v_sctotaldeals.t_DocID "
+               + " AND dl_comm.t_OperSubKind = v_sctotaldeals.t_Kind_Operation "
+               + " AND dl_comm.t_DocKInd = " + DL_DEPOACCSRVOP + " "
+               + " AND v_sctotaldeals.t_DocID = ?) q "
+          + " WHERE "
+              + " spground.t_SPGroundID = spdraft.t_SPGroundID "
+          + " AND spdraft.t_AutoKey IN (SELECT "
+                                        + " spdrprop.t_DraftID "
+                                    + " FROM "
+                                        + " dspdrprop_dbt spdrprop "
+                                    + " WHERE "
+                                        + " ((spdrprop.t_DocumentKind = q.t_DocKind "
+                                      + " AND spdrprop.t_DocumentID = q.t_DocumentID "
+                                       + " OR EXISTS (SELECT "
+                                                      + " 1 "
+                                                  + " FROM "
+                                                      + " dpmpaym_dbt sc_paym "
+                                                  + " WHERE "
+                                                      + " sc_paym.t_PaymentID = spdrprop.t_PaymentID "
+                                                  + " AND sc_paym.t_DocKind = q.t_DocKind "
+                                                  + " AND sc_paym.t_DocumentID = q.t_DocumentID) "
+                                      + " AND spdrprop.t_DocumentKind = 0 "
+                                      + " AND spdrprop.t_DocumentID = 0) "
+                                      + " OR (EXISTS (SELECT "
+                                                      + " 1 "
+                                                  + " FROM "
+                                                      + " ddlgrdeal_dbt grdeal "
+                                                  + " WHERE "
+                                                      + " grdeal.t_DocKind = q.t_DocKind "
+                                                  + " AND grdeal.t_DocID = q.t_DocumentID "
+                                                  + " AND grdeal.t_ID = spdrprop.t_DocumentID) "
+                                       + " OR EXISTS (SELECT "
+                                                      + " 1 "
+                                                  + " FROM "
+                                                      + " ddlgrdoc_dbt grdoc "
+                                                  + " WHERE "
+                                                      + " grdoc.t_ServDocKind = q.t_DocKind "
+                                                  + " AND grdoc.t_ServDocID = q.t_DocumentID "
+                                                  + " AND grdoc.t_DocKind = " + DL_DEPODRAFT + " "
+                                                  + " AND grdoc.t_DocID = spdrprop.t_DraftID "
+                                                  + " AND grdoc.t_GrDealID = spdrprop.t_DocumentID)) "
+                                     + " AND spdrprop.t_DocumentKind = " + DL_DLGRDEAL + " "
+                                     + " AND spdrprop.t_DocumentID = spdrprop.t_PaymentID)) ";
+    cmd = RsdCommand(query);
+    cmd.NullConversion = true;
+    cmd.AddParam("", RSDBP_IN, DealID);
+    cmd.Execute();
+
+    set = RsdRecordset(cmd);
+    if(set.MoveNext())
+        if((set.Value("t_Status") == SC_SPDRAFT_STATUS_CLOSE)
+       and (set.Value("t_OperState") == DP_INVSTATUSORDER_ACCEPT))
+            MsgBox("По сделке №" + set.Value("t_DealCode") + " сформировано и исполнено поручение депо №" + set.Value("t_Xld") + ". Отказ от сделки невозможен");
+            err = 1;
+        else
+            ExecMacroFile("dpdrutl.mac", "SP_InitParmSPgr", grprm.rec);
+
+            grprm.rec.Division = SelfDivision;
+            grprm.rec.Direction = EXITING;
+            grprm.rec.Kind = DOCKIND_DRFTCNCLDRFT;
+            grprm.rec.RegistrDate = {CurDate};
+            grprm.rec.Xld = Generate_Xid_Secur(grprm.rec.Kind, grprm.rec.Direction, {OperDprt}, grprm.rec.Division, grprm.rec.RegistrDate);
+
+            if((RefID_XidSecur == 0) or (grprm.rec.Xld == ""))
+                err = 1;
+            end;
+
+            grprm.rec.RegistrTime = curtime;
+            grprm.rec.PrimaryDocKind = set.Value("t_BOfficeKind");
+            grprm.rec.PrimaryDocID = DealID;
+            grprm.rec.DocLog = LLCLASS_KINDDOC_SECUR;
+            grprm.rec.PartyID = IIF(set.Value("t_ClientID") != UnknownParty, set.Value("t_ClientID"), {OurBank});
+            grprm.rec.Receptionist = {Oper};
+            grprm.rec.Copies = 1;
+            grprm.rec.Sent = SET_CHAR;
+            grprm.rec.DeliveryKind = CodeFor("E"); // Лично
+            grprm.rec.BackOffice = "S"; // БОЦБ
+
+            if(err == 0)
+                err = ExecMacroFile("dpdrutl.mac", "SP_InsertGroundDocumentRetID", grprm, false, @id);
+            end;
+
+            if(err == 0)
+                set2 = ExecMacroFile("dpcnldrf_io.mac", "DP_CreateCnclDrftSet", set.Value("t_SPGroundID"));
+                set2.MoveNext();
+
+                ExecMacroFile("dpdrutl.mac", "SP_InitParmInfOpr", dpinf.rec);
+
+                dpinf.rec.LogOprState = SC_SPDRAFT_STATUS_PREP;
+                dpinf.rec.LogOprProduct = OBJTYPE_TRN_CONT_CANCELDRAFT;
+                dpinf.rec.LogOprcarryDate = {CurDate};
+                dpinf.rec.LogOprcarryTime = curtime;
+                dpinf.rec.LogOprInitiator = IIF(set.Value("t_ClientID") != UnknownParty, set.Value("t_ClientID"), {OurBank});
+
+                dpinf.rec.InfoprdocType = spCnclDrft;
+                dpinf.rec.InfoprDesc = set.Value("t_SPGroundID");
+                dpinf.rec.InfoprParty = set2.Value("t_Owner");
+                dpinf.rec.InfoprDepoPart = set2.Value("t_AutoKey");
+                dpinf.rec.InfoprFIID = set2.Value("t_FIID2");
+                dpinf.rec.InfoprApostrophe = SET_CHAR;
+                dpinf.rec.InfoprDepartment = {OperDprt};
+                dpinf.rec.InfoprfromDate = set2.Value("t_SignedDate");
+                dpinf.rec.InfoprtoDate = set2.Value("t_RegistrDate");
+                dpinf.rec.InfoprfromXid = set2.Value("t_AltXld");
+                dpinf.rec.InfoprtoXid = set2.Value("t_Xld");
+                dpinf.rec.InfoprIssuer = set2.Value("t_Issuer");
+                dpinf.rec.InfoprToExcel = SET_CHAR;
+
+                dpinf.rec.GrDraftKind = DOCKIND_DRFTCNCLDRFT;
+                dpinf.rec.GrDraftRegistrDate = {CurDate};
+                dpinf.rec.GrDraftRegistrTime = curtime;
+                dpinf.rec.GrDraftSignedDate = grprm.rec.RegistrDate;
+                dpinf.rec.GrDraftSignedTime = grprm.rec.RegistrTime;
+                dpinf.rec.GrDraftPartyID = grprm.rec.PartyID;
+                dpinf.rec.GrDraftParent = id;
+                dpinf.rec.GrDraftAltXld = grprm.rec.AltXld;
+
+                dpinf.rec.GrReportPartyID = dpinf.rec.LogOprInitiator;
+
+                dpinf.rec.UserLog = IIF(set.Value("t_ClientID") != UnknownParty, SPGRUSERLOG_CLIENT, SPGRUSERLOG_OURENTER);
+            end;
+
+            if(err == 0)
+                err = ExecMacroFile("dpdrutl.mac", "SP_CreateInfOperation", dpinf, true);
+            end;
+
+            if(err != 0)
+                if(grprm.rec.Xld != 0)
+                    RestoreReference(RefID_XidSecur, grprm.rec.Xld);
+                end;
+            end;
+        end;
+    end;
+
+    return err;
+end;
+
+macro IsExistRepDepoDraft( DealID )
+    var query = "", cmd = null, set = null;
+
+    query = " SELECT "
+              + " 1 "
+          + " FROM "
+              + " DUAL "
+          + " WHERE "
+              + " EXISTS (SELECT "
+                          + " 1 "
+                      + " FROM "
+                          + " dspground_dbt spground "
+                         + " ,dspgrdoc_dbt spgrdoc "
+                      + " WHERE "
+                          + " spground.t_SPGroundID = spgrdoc.t_SPGroundID "
+                      + " AND spground.t_Kind = " + DOCKIND_REPDEPODRAFT + " "
+                      + " AND spgrdoc.t_SourceDocKind = " + OBJTYPE_SECDEAL + " "
+                      + " AND spgrdoc.t_SourceDocID = ?) ";
+
+    cmd = RsdCommand( query );
+    cmd.NullConversion = true;
+    cmd.AddParam( "", RSDBP_IN, DealID );
+    cmd.Execute();
+
+    set = RsdRecordset( cmd );
+
+    return set.MoveNext();
+end;
+
+macro GetInfOprRejectXld( DealID )
+    var query = "", cmd = null, set = null, xld = "";
+
+    query = " SELECT "
+              + " spground2.t_Xld "
+          + " FROM "
+              + " dspground_dbt spground2 "
+             + " ,dspground_dbt spground "
+             + " ,dspgrdoc_dbt spgrdoc "
+          + " WHERE "
+              + " spground2.t_Parent = spground.t_SPGroundID "
+          + " AND spground.t_Kind = " + DOCKIND_DRFTCNCLDRFT + " "
+          + " AND spground.t_SPGroundID = spgrdoc.t_SPGroundID "
+          + " AND spgrdoc.t_SourceDocKind = " + OBJTYPE_SECDEAL + " "
+          + " AND spgrdoc.t_SourceDocID = ? ";
+
+    cmd = RsdCommand( query );
+    cmd.NullConversion = true;
+    cmd.AddParam( "", RSDBP_IN, DealID );
+    cmd.Execute();
+
+    set = RsdRecordset( cmd );
+    if( set.MoveNext() )
+        xld = set.Value( "t_Xld" );
+    end;
+
+    return xld;
+end;

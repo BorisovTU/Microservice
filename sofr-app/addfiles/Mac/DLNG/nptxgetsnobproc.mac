@@ -1,0 +1,960 @@
+/*
+ $Name: nptxgetsnobproc.mac 
+ $Module: НДФЛ
+ $Description: Макрос выполнения процедуры запроса к источнику 
+*/
+
+IMPORT DealsInter, SPInter, PTInter, globals;
+IMPORT RsbDataSet, "dlquery.mac";
+import bnk_common;
+import "nptxstbfun.mac";
+import GetReportClientOperationReq;
+import "dlutils.mac";
+import "xls_parser.mac";
+import "conveyerfun.mac";
+
+//количество клиентов в одном запросе
+private CONST REQ_PACK_SIZE = 100;
+//количество клиентов, после которого включается конвейер
+private CONST CONVEYER_CLIENT_COUNT_THRESHOLD = 10000;
+//количество пакетов, отправляемых одним потоком конвейера
+private CONST CONVEYER_ONE_PACK_REQ_COUNT = 10;
+//количество клиентов в рамках одного потока конвейера
+private var CLIENT_COUNT_IN_ONE_CONVPACK = REQ_PACK_SIZE * CONVEYER_ONE_PACK_REQ_COUNT;
+//предельное количество пачек конвейера, после которого пересматривается количество клиентов в пакете
+private CONST PACK_COUNT_LIMIT = 10000;
+
+CLASS CnvProfilingData(_ExecID,_PackID)
+  var ExecID = _ExecID;
+  var PackID = _PackID;
+END;
+
+private macro FormObjId(OperID, ConvObj)
+  if (ConvObj)
+    return "cnv-"+string(OperID)+"-"+string(ConvObj.ExecID)+"-"+string(ConvObj.PackID);
+  end;
+  return "single-"+string(OperID);
+end;
+
+PRIVATE MACRO AddErrToAllCurrClnt(ErrStr:string)
+  var query, cmd;
+  
+  query =   " UPDATE DDLSELECTPT_TMP SPT "
+          + "    SET SPT.T_MESSAGE = ? "
+          + "  WHERE SPT.T_MESSAGE = CHR(1) ";
+
+  cmd = DL_RSDCommand(query);
+
+  cmd.AddParam(ErrStr);
+
+  cmd.ExecuteCMD();
+END;
+
+PRIVATE MACRO GetCSVPath()
+  private const RegistryPath = "РСХБ\\ДИРЕКТОРИИ\\OUT\\ПРОТОКОЛ_ЗАПРОСА_К_ХРАНИЛИЩУ";
+  var Path = "";
+  var stat = 0;
+ 
+  GetRegistryValue(RegistryPath, V_STRING, Path, stat);
+  if((stat) or (Trim(Path) == ""))
+    RunError("Не задана настройка в реестре банка:|", RegistryPath);      
+  else
+    if (Index(Path, ":") > 0)
+      RunError("Ошибка настройки",CustomError("В настройке реестра \""+RegistryPath+"\" может быть указан только относительный путь против корня терминала"));
+    end;
+  end;
+
+  return Path;
+END;
+
+private macro GetSystDateTime(SystDate:@date, SystTime:@time)
+  var cmd = DL_RSDCommand("select sysdate dt from dual");
+  var DataSet = cmd.execute();
+
+  DataSet.moveNext();
+
+  DtTmSplit(DataSet.dt, SystDate, SystTime);
+end;
+
+
+PRIVATE MACRO InitReq(Req:@variant, TaxPeriod)
+  Req = c_GetReportClientOperationRequest;
+  
+  Req.GetReportClientOperationReq.TaxYear        = TaxPeriod;  // Налоговый период, к которому относится событие (налоговый год)
+  Req.GetReportClientOperationReq.ClientInfoList = TArray;     // Список информации по клиентам
+
+  DL_RSDCommand("TRUNCATE TABLE DDLSELECTPT_TMP").ExecuteCMD();
+END;
+
+PRIVATE MACRO AddClientToReq(Req:@variant, ClientID)
+  var sz = Req.GetReportClientOperationReq.ClientInfoList.size;
+  var query, exec;
+  
+  Req.GetReportClientOperationReq.ClientInfoList[sz]                   = c_ClientInfo_GetReportClientOperation;
+  Req.GetReportClientOperationReq.ClientInfoList[sz].ClientId          = c_IntegrationSymbolicIdentifierXType();
+  Req.GetReportClientOperationReq.ClientInfoList[sz].ClientId.ObjectId = ClientID; // ID клиента в системе-источнике
+
+
+  //Добавить клиента во временную таблицу
+  query =   " INSERT INTO DDLSELECTPT_TMP (T_CLIENTID, T_CLIENTCODE, T_CLIENTNAME, T_SELECTFLAG, T_MESSAGE) "
+          + " VALUES (?, CHR(1), CHR(1), CHR(88), CHR(1)) ";
+
+  exec = DL_RSDCommand(query);
+  
+  exec.AddParam(ClientID);
+
+  exec.ExecuteCMD();
+
+END;
+
+PRIVATE MACRO GetDefault(Val, DefaultVal)
+
+  if(Val == NULL)
+    return DefaultVal;
+  end;
+
+  return Val;
+END;
+
+PRIVATE MACRO GetTaxBaseKind(TaxBaseTypeNum)
+    var query, cmd, DataSet;
+    var TaxBaseKind = 0;
+
+    query =   " select t_Element "
+            + "   from dllvalues_dbt "
+            + "  where t_List = " + OBJTYPE_STB_TAXBASEKIND
+            + "    and t_Flag = ? ";
+
+    cmd = DL_RSDCommand(query);
+
+    cmd.AddParam(int(TaxBaseTypeNum));
+
+    DataSet = cmd.Execute();
+    if(DataSet.moveNext())
+      TaxBaseKind = DataSet.Element;
+    end;
+
+    return TaxBaseKind;
+  END;
+
+PRIVATE MACRO _ExecReq(nptxop, Req:@variant, isFirstLoad, CnvPrfData)
+  var timerFullMacro = DLCTimingOperation("_ExecReq::FullMacro", 4755, FormObjId(nptxop.rec.ID,CnvPrfData), "Cчетчик времени макропроцедуры _ExecReq");
+  var Resp = NULL;
+  var ins_nptxtbext_tmp = RsbSQLInsert("nptxtbext.tmp");
+  var nptxtbext_tmp_new = TRecHandler( "nptxtbext.tmp" );
+  var query, cmd;
+  var i = 0, j = 0;
+  var TaxPeriod = Req.GetReportClientOperationReq.TaxYear;
+  var LoadDate = date(0,0,0), LoadTime = time(0);
+
+  DL_RSDCommand("TRUNCATE TABLE DNPTXTBEXT_TMP").ExecuteCMD();
+
+  if(Req.GetReportClientOperationReq.ClientInfoList.size == 0)
+    return;
+  end;
+
+  InitProgress(-1, "Отправка запроса в Хранилище", "Отправка запроса в Хранилище");
+  var timerSendReq = DLCTimingOperation("_ExecReq::SendReq", 4755, FormObjId(nptxop.rec.ID,CnvPrfData), "Cчетчик времени отправки запроса и получению ответа в макропроцедуре _ExecReq");
+  Resp = GetReportClientOperationReq(Req);
+  timerSendReq = null;
+  RemProgress();
+  
+  if(ValType(Resp) != V_GENOBJ)
+    AddErrToAllCurrClnt("Ошибка получения ответа от Хранилища");
+    return;
+  end;
+
+  if((Resp.ErrorList != NULL) and (Resp.ErrorList[0].ErrorCode != "0") and (Resp.ErrorList[0].ErrorCode != "000"))
+    AddErrToAllCurrClnt(Resp.ErrorList[0].ErrorCode + " " + Resp.ErrorList[0].ErrorDesc);
+
+    //если получили ошибку и пустой список записей, то выйти из обработки текущей группы клиентов 
+    if(Resp.ReportRecordClientList == NULL)
+      return;
+    end;
+  end;
+   
+  if(Resp.ReportRecordClientList != NULL)
+    var timerInsertAnsw = DLCTimingOperation("_ExecReq::InsertAnsw", 4755, FormObjId(nptxop.rec.ID,CnvPrfData), "Cчетчик времени вставки ответа во временную таблицу в макропроцедуре _ExecReq");
+    InitProgress(Resp.ReportRecordClientList.size, "Обработка полученной информации по клиентам", "Обработка полученной информации по клиентам");
+
+    GetSystDateTime(@LoadDate, @LoadTime);
+
+    while(i < Resp.ReportRecordClientList.size)
+
+      if((Resp.ReportRecordClientList[i].ReportRecordList != NULL) and (Resp.ReportRecordClientList[i].ReportRecordList.size > 0))
+
+        InitProgress(Resp.ReportRecordClientList[i].ReportRecordList.size, "Обработка полученной информации по клиенту", "Обработка полученной информации по клиенту");
+        j = 0;
+        while(j < Resp.ReportRecordClientList[i].ReportRecordList.size)
+          var ReportRecord = Resp.ReportRecordClientList[i].ReportRecordList[j];
+
+          nptxtbext_tmp_new.Clear();
+
+          if(Resp.ReportRecordClientList[i].ClientId)
+            nptxtbext_tmp_new.rec.ClientID            = GetDefault(Resp.ReportRecordClientList[i].ClientId.ObjectID, -1);
+          end;
+          nptxtbext_tmp_new.rec.TaxPeriod           = TaxPeriod;
+          nptxtbext_tmp_new.rec.IncDate             = date(ReportRecord.IncomeDateTime);
+          nptxtbext_tmp_new.rec.IncTime             = time(ReportRecord.IncomeDateTime);
+          nptxtbext_tmp_new.rec.KbkCalc             = GetDefault(ReportRecord.KBKCalculate, "");
+          nptxtbext_tmp_new.rec.KbkKeep             = GetDefault(ReportRecord.KBKKeep, "");
+          if(ReportRecord.TaxBaseType)
+            nptxtbext_tmp_new.rec.TaxBaseKind         = GetTaxBaseKind(GetDefault(ReportRecord.TaxBaseType.RecordCode, 0));
+          end;
+          nptxtbext_tmp_new.rec.NobAmount           = GetDefault(ReportRecord.NOBAmount, 0);           
+          nptxtbext_tmp_new.rec.NdflCalcAmount      = GetDefault(ReportRecord.NDFLCalculateAmount, 0);      
+          nptxtbext_tmp_new.rec.NDFLCalcRate        = GetDefault(ReportRecord.NDFLTaxRate, 0);        
+          nptxtbext_tmp_new.rec.NdflKeepAmount      = GetDefault(ReportRecord.NDFLKeepAmount, 0);      
+          nptxtbext_tmp_new.rec.NDFLKeepRate        = GetDefault(ReportRecord.NDFLKeepRate, 0);
+          if(ReportRecord.TaxPayerStatus)  
+            nptxtbext_tmp_new.rec.TaxPayerStatus      = GetDefault(ReportRecord.TaxPayerStatus.RecordCode, 0);     
+          end;
+          if(ReportRecord.SystemCode)
+            nptxtbext_tmp_new.rec.SystemCode          = GetDefault(ReportRecord.SystemCode.RecordCode, "");         
+          end;
+          nptxtbext_tmp_new.rec.LoadDate            = LoadDate;
+          nptxtbext_tmp_new.rec.LoadTime            = LoadTime;
+          if(ReportRecord.RecordId)
+            nptxtbext_tmp_new.rec.RecordID            = GetDefault(ReportRecord.RecordId.ObjectID, "");
+          end;
+
+          if(StrUpr(nptxtbext_tmp_new.rec.SystemCode) == "DIASOFT")
+            ins_nptxtbext_tmp.AddRecord(nptxtbext_tmp_new);
+          end;
+
+          UseProgress(j = j + 1);
+        end;
+
+        RemProgress();
+      end;
+
+      UseProgress(i = i + 1);
+    end;
+
+    ins_nptxtbext_tmp.Insert();
+
+    RemProgress();
+
+    timerInsertAnsw = null;
+  end;
+
+  var timerSaveData = DLCTimingOperation("_ExecReq::SaveData", 4755, FormObjId(nptxop.rec.ID,CnvPrfData), "Cчетчик времени сохранения полученных данных в макропроцедуре _ExecReq");
+
+  InitProgress(-1, "Сохранение полученных данных", "Сохранение полученных данных");
+  
+  //1.Если по клиенту нет записей в ответе Хранилища, то в Протокол выводим сообщение: "По клиенту отсутствуют выплаты в Депозитарии". 
+  query =   " UPDATE DDLSELECTPT_TMP SPT "
+          + "    SET SPT.T_MESSAGE = 'По клиенту отсутствуют выплаты в Депозитарии' "
+          + "  WHERE NOT EXISTS(SELECT 1 FROM DNPTXTBEXT_TMP TMP WHERE TMP.T_CLIENTID = SPT.T_CLIENTID) "
+          + "    AND SPT.T_MESSAGE = CHR(1)";
+
+  cmd = DL_RSDCommand(query);
+
+  cmd.ExecuteCMD();
+
+
+  //2.Проверка совпадения резидентности в СОФР и в полученных записях
+  //Если налоговый статус субъекта в записи в ответе из Хранилища СНОБ определен и не равен налоговому статусу по анкете клиента в СОФР, то в Протокол выводим сообщение: "Несовпадение налогового статуса клиента".
+  //Данные по такому клиенту тоже заносятся в таблицу и выводятся в скроллинг 
+  query =   " UPDATE DDLSELECTPT_TMP SPT "
+          + "    SET SPT.T_MESSAGE = 'Несовпадение налогового статуса клиента' "
+          + "  WHERE SPT.T_CLIENTID IN (SELECT Q.T_CLIENTID "
+          + "                             FROM (SELECT DISTINCT TMP.T_CLIENTID, (CASE WHEN TMP.T_TAXPAYERSTATUS = 1 THEN CHR(0) ELSE 'X' END) AS NOTRESIDENT "
+          + "                                     FROM DNPTXTBEXT_TMP TMP "
+          + "                                    WHERE TMP.T_TAXPAYERSTATUS > 0 "
+          + "                                  ) Q, DPARTY_DBT PT "
+          + "                            WHERE PT.T_PARTYID = Q.T_CLIENTID "
+          + "                              AND PT.T_NOTRESIDENT <> Q.NOTRESIDENT "
+          + "                          ) "
+          + "    AND SPT.T_MESSAGE = CHR(1)";
+
+  cmd = DL_RSDCommand(query);
+
+  cmd.ExecuteCMD();
+
+  //3.Проверка совпадения резидентности в СОФР и в полученных записях
+  //Если налоговый статус в записи в ответе из Хранилища СНОБ не определен, то в Протокол выводим сообщение: "Не определен налоговый статус клиента в записи Хранилища СНОБ". 
+  //Данные по такому клиенту тоже заносятся в таблицу и выводятся в скроллинг 
+  query =   " UPDATE DDLSELECTPT_TMP SPT "
+          + "    SET SPT.T_MESSAGE = 'Не определен налоговый статус клиента в записи Хранилища СНОБ' "
+          + "  WHERE SPT.T_CLIENTID IN (SELECT DISTINCT TMP.T_CLIENTID "
+          + "                             FROM DNPTXTBEXT_TMP TMP "
+          + "                            WHERE TMP.T_TAXPAYERSTATUS = 0 "
+          + "                          ) "
+          + "    AND SPT.T_MESSAGE = CHR(1)";
+
+  cmd = DL_RSDCommand(query);
+
+  cmd.ExecuteCMD();
+
+  //Транзакция обработки полученных данных
+  RslDefCon.BeginTrans();
+
+  //4.Добавляем новые записи
+  query =   " INSERT INTO DNPTXTBEXT_DBT (  T_ID              "
+          + "                             , T_CLIENTID        "
+          + "                             , T_TAXPERIOD       "
+          + "                             , T_INCDATE         "
+          + "                             , T_INCTIME         "
+          + "                             , T_KBKCALC         "
+          + "                             , T_KBKKEEP         "
+          + "                             , T_TAXBASEKIND     "
+          + "                             , T_NOBAMOUNT       "
+          + "                             , T_NDFLCALCAMOUNT  "
+          + "                             , T_NDFLCALCRATE    "
+          + "                             , T_NDFLKEEPAMOUNT  "
+          + "                             , T_NDFLKEEPRATE    "
+          + "                             , T_TAXPAYERSTATUS  "
+          + "                             , T_SYSTEMCODE      "
+          + "                             , T_DOCKIND         "
+          + "                             , T_DOCID           "
+          + "                             , T_ISCHANGED       "
+          + "                             , T_LOADDATE        "
+          + "                             , T_LOADTIME        "
+          + "                             , T_RECORDID        "
+          + "                            ) "
+          + "             SELECT  0                     "
+          + "                   , TMP.T_CLIENTID        "
+          + "                   , TMP.T_TAXPERIOD       "
+          + "                   , TMP.T_INCDATE         "
+          + "                   , TMP.T_INCTIME         "
+          + "                   , TMP.T_KBKCALC         "
+          + "                   , TMP.T_KBKKEEP         "
+          + "                   , TMP.T_TAXBASEKIND     "
+          + "                   , TMP.T_NOBAMOUNT       "
+          + "                   , TMP.T_NDFLCALCAMOUNT  "
+          + "                   , TMP.T_NDFLCALCRATE    "
+          + "                   , TMP.T_NDFLKEEPAMOUNT  "
+          + "                   , TMP.T_NDFLKEEPRATE    "
+          + "                   , TMP.T_TAXPAYERSTATUS  "
+          + "                   , TMP.T_SYSTEMCODE      "
+          + "                   , ? "
+          + "                   , ? "
+          + "                   , " + IIF(isFirstLoad, "CHR(0)", "CHR(88)")
+          + "                   , TMP.T_LOADDATE        "
+          + "                   , TMP.T_LOADTIME        "
+          + "                   , TMP.T_RECORDID        "
+          + "              FROM DNPTXTBEXT_TMP TMP "
+          + "             WHERE NOT EXISTS(SELECT 1 "
+          + "                                FROM DNPTXTBEXT_DBT TBEXT "
+          + "                               WHERE TBEXT.T_RECORDID = TMP.T_RECORDID "
+          + "                             )";
+
+  cmd = DL_RSDCommand(query);
+
+  cmd.AddParam(nptxop.rec.DocKind);
+  cmd.AddParam(nptxop.rec.ID);
+
+  cmd.ExecuteCMD();
+
+  //5.Обнуляем по клиентам прежние записи, которых нет в ответе
+  query =   " UPDATE DNPTXTBEXT_DBT TBEXT "
+          + "    SET TBEXT.T_NOBAMOUNT = 0, "
+          + "        TBEXT.T_NDFLCALCAMOUNT = 0, "
+          + "        TBEXT.T_NDFLKEEPAMOUNT = 0, "
+          + "        TBEXT.T_ISCHANGED = 'X', "
+          + "        TBEXT.T_DOCKIND = ?, "
+          + "        TBEXT.T_DOCID = ?, "
+          + "        TBEXT.T_LOADDATE = ?, "
+          + "        TBEXT.T_LOADTIME = ? "
+          + " WHERE (TBEXT.T_CLIENTID, TBEXT.T_TAXPERIOD) IN (SELECT SPT.T_CLIENTID, ? FROM DDLSELECTPT_TMP SPT WHERE SPT.T_SELECTFLAG = CHR(88)) " 
+          + "   AND NOT EXISTS(SELECT 1 FROM DNPTXTBEXT_TMP TMP WHERE TMP.T_RECORDID = TBEXT.T_RECORDID) ";
+
+  cmd = DL_RSDCommand(query);
+
+  cmd.AddParam(nptxop.rec.DocKind);
+  cmd.AddParam(nptxop.rec.ID);
+  cmd.AddParam(LoadDate);
+  cmd.AddParam(LoadTime);
+  cmd.AddParam(TaxPeriod);
+
+  cmd.ExecuteCMD();
+
+  RslDefCon.CommitTrans();
+
+  RemProgress();
+
+OnError(er)
+  if(RslDefCon.IsInTrans)
+    RslDefCon.RollbackTrans();
+    RemProgress();
+  end;
+    
+  AddErrToAllCurrClnt(GetFullErrorMessage(er, 500));
+END;
+
+CLASS GetSnobCnvData(_ProcessID,_NptxOpID,_ClientCount,_SelectQuery,_isFirstLoad)
+  var ProcessID = _ProcessID;
+  var NptxOpID = _NptxOpID;
+  var ClientCount = _ClientCount;
+  var SelectQuery = _SelectQuery;
+  var isFirstLoad = _isFirstLoad;
+END;
+
+PRIVATE MACRO ExecReq(protObj, nptxop, Req:@variant, isFirstLoad, CnvPrfData)
+  var timerFullMacro = DLCTimingOperation("ExecReq::FullMacro", 4755, FormObjId(nptxop.rec.ID,CnvPrfData), "Cчетчик времени макропроцедуры ExecReq");
+  var query, cmd, DataSet;
+
+  _ExecReq(nptxop, @Req, isFirstLoad, CnvPrfData);
+
+  //Печатать сообщения в файл протокола
+  query =   " select spt.t_ClientID, spt.t_Message, pt.t_ShortName, NVL(RSB_SECUR.SC_GetObjCodeOnDate("+OBJTYPE_PARTY+", 101 /*Код ЦФТ*/, spt.t_ClientID), CHR(1)) as ID_CFT"
+          + "   from ddlselectpt_tmp spt "
+          + "        inner join dparty_dbt pt on pt.t_PartyID = spt.t_ClientID "
+          + " order by spt.t_ClientID ASC ";
+
+  cmd = DL_RSDCommand(query);
+
+  DataSet = cmd.Execute();
+  while(DataSet.moveNext())
+    if ((not protObj.IsHasData()) and (not protObj.IsMultithread()))
+      protObj.WriteLine("Номер п/п;ID СОФР;ФИО;ID ЦФТ;Результат выполнения процедуры");
+    end;
+
+    protObj.WriteLine(
+                   "{row_number};"+
+                   string(DataSet.ClientID)+";"+
+                   string(DataSet.ShortName)+";"+
+                   string(DataSet.ID_CFT)+";"+
+                   string(IIF(DataSet.Message != "", DataSet.Message, "Процедура отработала успешно"))
+           );
+  end;    
+END;
+
+macro ОтобратьОбъектыДляЗапрСНОБ(_taskID, _execID, _conveyerID, _packetSize, _Params)
+  var convProfData = CnvProfilingData(_execID,0);
+  var timerFullMacro = DLCTimingOperation("ОтобратьОбъектыДляЗапрСНОБ::FullMacro", 4755, FormObjId(_Params.NptxOpID,convProfData), "Cчетчик времени макропроцедуры ОтобратьОбъектыДляЗапрСНОБ");
+  var nptxop = TBFile("nptxop.dbt");
+
+  nptxop.rec.ID = _Params.NptxOpID;
+  if(not nptxop.GetEQ)
+    RunError("Не найдена процедура с ID = " + _Params.NptxOpID);
+  end;
+
+  var clntCount = _Params.ClientCount;
+
+  if ((clntCount / CLIENT_COUNT_IN_ONE_CONVPACK) > PACK_COUNT_LIMIT)
+    // если вдруг получающихся пачек больше чем лимит, то меняем количество клиентов на пачку
+    CLIENT_COUNT_IN_ONE_CONVPACK = clntCount / PACK_COUNT_LIMIT;
+  end;
+
+  var groupCount = int(floor(double(clntCount / CLIENT_COUNT_IN_ONE_CONVPACK)));
+
+  var query = " INSERT INTO DCNVDOC_DBT(T_TASKID,T_EXECID,T_CONVTYPEID,T_PACKID,T_OBJECTTYPE,T_OBJECTID) "
+            + " SELECT "+_taskID+","+_execID+","+_conveyerID+", ntile("+string(groupCount)+") OVER(ORDER BY q.t_ClientID), 0, q.t_ClientID "
+            + "   FROM (" + _Params.SelectQuery + ") q ";
+
+  SQL_Execute(query, "Отбор объектов", false );
+
+  query =   " select NVL(max(t_PackID), 0) as cnt "
+          + "   from dcnvdoc_dbt "
+          + "  where t_ExecID = " + _execID;
+
+  var cnt = 0;
+  
+  var DataSet = TRsbDataSet(query);
+  if(DataSet.moveNext())
+    cnt = int(round(int(DataSet.cnt), 0));
+  end;
+
+  return cnt;
+end;
+
+private macro UpdateCNVPack(_execID, _conveyerID, _packetID, IsErr,ErrMsg)
+  var exec = RSDCommand(  " UPDATE dcnvpack_dbt "
+                        + " SET t_State = t_State + 1, t_Error = ?, T_ERRMSG = ? "
+                        + " WHERE t_ExecID = ? "
+                        + "   AND t_ConvTypeID = ? "
+                        + "   AND t_PackID = ? ");
+
+  exec.addParam( "", RSDBP_IN, IIF(IsErr, 1, 0) );
+  exec.addParam( "", RSDBP_IN, ErrMsg );
+  exec.addParam( "", RSDBP_IN, _execID );
+  exec.addParam( "", RSDBP_IN, _conveyerID );
+  exec.addParam( "", RSDBP_IN, _packetID );
+  exec.execute();
+end;
+
+macro ExecuteGetSNOBCnv(_taskID, _execID, _conveyerID, _operationID, _packetID, _Params)
+  var profiler = StartStopProfilingBySetting();
+  var convProfData = CnvProfilingData(_execID,_packetID);
+  var timerFullMacro = DLCTimingOperation("ExecuteGetSNOBCnv::FullMacro", 4755, FormObjId(_Params.NptxOpID,convProfData), "Cчетчик времени макропроцедуры ExecuteGetSNOBCnv");
+  var cmd, query, DataSet, cnt;
+  var TaxPeriod;
+  var Req = c_GetReportClientOperationRequest;
+  var i = 0;
+  var nptxop = TBFile("nptxop.dbt");
+
+  nptxop.rec.ID = _Params.NptxOpID;
+  if(not nptxop.GetEQ)
+    RunError("Не найдена процедура с ID = " + _Params.NptxOpID);
+  end;  
+
+  datesplit(nptxop.rec.PrevDate, NULL, NULL, TaxPeriod);
+
+  var protObj = ProcessProtocol("rsansi", _Params.ProcessID, true);
+
+  query =    " select T_OBJECTID as ClientID  "
+           + "   from DCNVDOC_DBT "
+           + "  where t_ExecID = " + string(_execID) + " and t_ConvTypeID = " + string(_conveyerID) + " and t_PackID = " + string(_packetID);
+
+  cmd = DL_RSDCommand();
+
+  DataSet = cmd.Execute(query);
+
+  InitReq(@Req, TaxPeriod);
+  while(DataSet.moveNext())
+
+    AddClientToReq(@Req, DataSet.ClientID);
+
+    if(Req.GetReportClientOperationReq.ClientInfoList.size == REQ_PACK_SIZE)
+      ExecReq(protObj, nptxop, @Req, _Params.isFirstLoad,convProfData);
+      InitReq(@Req, TaxPeriod);
+    end;
+
+    UseProgress(i = i + 1);
+  end;
+
+  if(Req.GetReportClientOperationReq.ClientInfoList.size > 0)
+    ExecReq(protObj, nptxop, @Req, _Params.isFirstLoad,convProfData);
+  end;
+
+  UpdateCNVPack(_execID, _conveyerID, _packetID, false, "");
+OnError(er)
+  UpdateCNVPack(_execID, _conveyerID, _packetID, true, GetFullErrorMessage(er, 2000));
+end;
+
+private macro CheckAndPrintErrorsByLoadedFile(protObj, nptxop, fileDataType)
+  var timerFullMacro = DLCTimingOperation("CheckAndPrintErrorsByLoadedFile::FullMacro", 4755, string(nptxop.rec.ID), "Cчетчик времени макропроцедуры CheckAndPrintErrorsByLoadedFile");
+  var query, DataSet;
+  var i = 0;
+  var cmd = DL_RSDCommand();
+
+  var TaxPeriod;
+
+  datesplit(nptxop.rec.PrevDate, NULL, NULL, TaxPeriod);
+
+  var BegDate = date(1,1,TaxPeriod);
+  var EndDate = date(31,12,TaxPeriod);
+
+
+  if (fileDataType == 1)
+    query = 
+      " SELECT sel.T_CLIENTID "
+     +"   FROM DDLSELECTPT_TMP sel "
+     +"  WHERE NOT EXISTS "
+     +"           (SELECT 1 "
+     +"              FROM dpersn_dbt pers "
+     +"             WHERE pers.t_PersonID = sel.T_CLIENTID) "
+     +"  ORDER BY sel.T_CLIENTID ASC ";
+  elif (fileDataType == 2)
+    query = 
+      " SELECT sel.T_CLIENTCODE as T_CLIENTID "
+     +"   FROM DDLSELECTPT_TMP sel "
+     +"  WHERE NOT EXISTS "
+     +"               (SELECT 1 "
+     +"                  FROM dobjcode_dbt obj "
+     +"                 WHERE     OBJ.T_OBJECTTYPE = 3 "
+     +"                       AND obj.T_CODE = sel.T_CLIENTCODE "
+     +"                       AND OBJ.T_CODEKIND = 101 "
+     +"                       AND OBJ.T_BANKDATE <= " + GetSQLDate(nptxop.rec.OperDate)
+     +"                       AND (OBJ.T_BANKCLOSEDATE = TO_DATE ('01.01.0001', 'dd.mm.yyyy') "
+     +"                            OR OBJ.T_BANKCLOSEDATE >= " + GetSQLDate(nptxop.rec.OperDate) + ")) "
+     +"        OR NOT EXISTS "
+     +"                  (SELECT 1 "
+     +"                     FROM dpersn_dbt pers "
+     +"                    WHERE pers.t_PersonID IN "
+     +"                             (SELECT OBJ.T_OBJECTID "
+     +"                                FROM dobjcode_dbt obj "
+     +"                               WHERE     OBJ.T_OBJECTTYPE = 3 "
+     +"                                     AND obj.T_CODE = sel.T_CLIENTCODE "
+     +"                                     AND OBJ.T_CODEKIND = 101 "
+     +"                                     AND OBJ.T_BANKDATE <= " + GetSQLDate(nptxop.rec.OperDate)
+     +"                                     AND (OBJ.T_BANKCLOSEDATE = TO_DATE ('01.01.0001', 'dd.mm.yyyy') "
+     +"                                          OR OBJ.T_BANKCLOSEDATE >= " + GetSQLDate(nptxop.rec.OperDate) + "))) "
+  end;
+
+  InitProgress(cmd.GetCount(query), "Поиск ошибочных ID", "Поиск ошибочных ID");
+  DataSet = cmd.Execute(query);
+  i = 0;
+  while(DataSet.moveNext())
+    protObj.WriteLine(
+                  "{row_number};"+
+                  IIF(fileDataType == 1, DataSet.ClientID,"")+";"+
+                  ";"+
+                  IIF(fileDataType == 2, DataSet.ClientID,"")+";"+
+                  "ID не найден"
+          );
+    UseProgress(i = i + 1);
+  end;
+
+  RemProgress();
+
+  if (fileDataType == 1)
+    query = 
+      " SELECT sel.T_CLIENTID, NVL(RSB_SECUR.SC_GetObjCodeOnDate("+OBJTYPE_PARTY+", 101 /*Код ЦФТ*/, sel.T_CLIENTID), CHR(1)) as t_ID_CFT "
+     +"   FROM DDLSELECTPT_TMP sel "
+     +"  where not Exists (select 1 "
+     +"                  from dnptxobj_dbt obj "
+     +"                 where obj.t_Client = sel.T_CLIENTID "
+     +"                   and obj.t_Kind IN (select ok.t_Element from dnptxkind_dbt ok where ok.t_Level = 5 and ok.t_Code LIKE 'PlusG%') "
+     +"                   and obj.t_Date between  " + GetSQLDate(BegDate) + " and  " + GetSQLDate(EndDate) + " "
+     +"               ) "
+     +"    and not Exists (select 1 "
+     +"                  from dsfcontr_dbt sf, ddlcontr_dbt dlc "
+     +"                 where sf.t_PartyID = sel.T_CLIENTID "
+     +"                   and sf.t_DateBegin <= " + GetSQLDate(nptxop.rec.OperDate) + " "
+     +"                   and (sf.t_DateClose = " + GetSQLDate(date(0,0,0)) + " or sf.t_DateClose >= " + GetSQLDate(nptxop.rec.OperDate) + ") "
+     +"                   and dlc.t_SfContrID = sf.t_ID "
+     +"               ) "
+     +"        and EXISTS "
+     +"           (SELECT 1 "
+     +"              FROM dpersn_dbt pers "
+     +"             WHERE pers.t_PersonID = sel.T_CLIENTID) "
+     +"  order by sel.T_CLIENTID ASC "; 
+  else
+    query = 
+      "   SELECT OBJ.T_OBJECTID AS T_CLIENTID, obj.T_CODE as t_ID_CFT "
+     +"     FROM dobjcode_dbt obj "
+     +"    WHERE     OBJ.T_OBJECTTYPE = 3 "
+     +"          AND obj.T_CODE IN (SELECT sel.T_CLIENTCODE "
+     +"                               FROM DDLSELECTPT_TMP sel) "
+     +"          AND OBJ.T_CODEKIND = 101 "
+     +"          AND OBJ.T_BANKDATE <= " + GetSQLDate(nptxop.rec.OperDate)
+     +"          AND (OBJ.T_BANKCLOSEDATE = TO_DATE ('01.01.0001', 'dd.mm.yyyy') "
+     +"               OR OBJ.T_BANKCLOSEDATE >= " + GetSQLDate(nptxop.rec.OperDate) + ") "
+     +"          AND EXISTS "
+     +"                 (SELECT 1 "
+     +"                    FROM dpersn_dbt pers "
+     +"                   WHERE pers.t_PersonID = OBJ.T_OBJECTID) "
+     +"    and not Exists (select 1 "
+     +"                  from dnptxobj_dbt obj "
+     +"                 where obj.t_Client = OBJ.T_OBJECTID "
+     +"                   and obj.t_Kind IN (select ok.t_Element from dnptxkind_dbt ok where ok.t_Level = 5 and ok.t_Code LIKE 'PlusG%') "
+     +"                   and obj.t_Date between  " + GetSQLDate(BegDate) + " and  " + GetSQLDate(EndDate) + " "
+     +"               ) "
+     +"    and not Exists (select 1 "
+     +"                  from dsfcontr_dbt sf, ddlcontr_dbt dlc "
+     +"                 where sf.t_PartyID = OBJ.T_OBJECTID "
+     +"                   and sf.t_DateBegin <= " + GetSQLDate(nptxop.rec.OperDate) + " "
+     +"                   and (sf.t_DateClose = " + GetSQLDate(date(0,0,0)) + " or sf.t_DateClose >= " + GetSQLDate(nptxop.rec.OperDate) + ") "
+     +"                   and dlc.t_SfContrID = sf.t_ID "
+     +"               ) "
+     +" ORDER BY OBJ.T_OBJECTID ASC "
+  end;
+
+  InitProgress(cmd.GetCount(query), "Поиск не подходящих под условия ID", "Поиск не подходящих под условия ID");
+  DataSet = cmd.Execute(query);
+  i = 0;
+  while(DataSet.moveNext())
+    protObj.WriteLine(
+                  "{row_number};"+
+                  DataSet.ClientID+";"+
+                  ";"+
+                  DataSet.ID_CFT+";"+
+                  "Не подходит под условия отбора"
+          );
+    UseProgress(i = i + 1);
+  end;
+
+  RemProgress();
+end;
+
+private macro _ExecGetSNOBProc(nptxop, isFirstLoad)
+  var timerFullMacro = DLCTimingOperation("_ExecGetSNOBProc::FullMacro", 4755, string(nptxop.rec.ID), "Cчетчик времени макропроцедуры _ExecGetSNOBProc");
+  var cmd, query, DataSet, cnt;
+  var Req = c_GetReportClientOperationRequest;
+  var i = 0;
+  var TaxPeriod;
+  var day, mon, year;
+  var hour, min, sec;
+
+  var processID = CreateGUID();
+
+  var protObj = ProcessProtocol("rsansi", processID, true);
+  protObj.WriteLine("Номер п/п;ID СОФР;ФИО;ID ЦФТ;Результат выполнения процедуры");
+
+  var nptxopgetsnobprm = TBFile("nptxopgetsnobprm.dbt");
+
+  var filePath = "";
+  var useFile = false;
+  var fileDataType = 1;
+
+  nptxopgetsnobprm.rec.nptxopid = nptxop.rec.id;
+  if(nptxopgetsnobprm.GetEQ())
+    useFile = nptxopgetsnobprm.rec.LoadFromFile == SET_CHAR;
+    fileDataType = nptxopgetsnobprm.rec.DataType;
+    filePath = nptxopgetsnobprm.rec.FilePath;
+  end;  
+
+  datesplit(nptxop.rec.PrevDate, NULL, NULL, TaxPeriod);
+  datesplit(nptxop.rec.OperDate, day, mon, year);
+
+  var BegDate = date(1,1,TaxPeriod);
+  var EndDate = date(31,12,TaxPeriod);
+
+  cmd = DL_RSDCommand();
+
+  if (useFile)
+    var timerFileLoad = DLCTimingOperation("_ExecGetSNOBProc::FileLoad", 4755, string(nptxop.rec.ID), "Cчетчик времени загрузки клиентов из файла в макропроцедуре _ExecGetSNOBProc");
+    DL_RSDCommand("TRUNCATE TABLE DDLSELECTPT_TMP").ExecuteCMD();
+
+    var ins_select = RsbSQLInsert("dlselectpt.tmp");
+    var ins_select_rec =  TRecHandler( "dlselectpt.tmp" );
+    var objExcel = CExcelPoi();
+    var fileMov = TempFileToServerMover();
+    fileMov.CreateTempFromAbsolutTermOrServPath(filePath);
+    if (not objExcel.open(fileMov.GetTempFilePath()))
+      RunError("Не удалось открыть excel файл " + filePath);
+    end;
+    var lastRowNumb = objExcel.GetLastRowNum()+1;
+    var curRow = 0;
+    var insertCount = 0;
+    var hasData = false;
+    InitProgress(lastRowNumb, "Чтение файла со списком клиентов", "Чтение файла со списком клиентов");
+    while ((curRow=curRow+1) <= lastRowNumb)
+      var cellValue = objExcel.CellValue("A"+curRow);
+      if (ValType(cellValue) == V_UNDEF)
+        continue;
+      end;
+      var curRowData = Trim(string(cellValue));
+      var dotIdx = Index(curRowData, ".");
+      if (dotIdx > 0)
+        curRowData = SubStr(curRowData, 1, dotIdx-1);
+      end;
+      if ((fileDataType == 1) and (not StrIsNumber(curRowData)))
+        protObj.WriteLine(
+                      "{row_number};"+
+                      curRowData+";"+
+                      ";"+
+                      ";"+
+                      "Некорректный ID"
+              );
+      else
+        ins_select_rec.Clear();
+        if (fileDataType == 1)
+          ins_select_rec.rec.ClientID = int(curRowData);
+        elif (fileDataType == 2)
+          ins_select_rec.rec.ClientCode = curRowData;
+        end;
+        ins_select.AddRecord(ins_select_rec);
+        hasData = true;
+        insertCount = insertCount + 1;
+        if (insertCount == 1000)
+          ins_select.Insert();
+          ins_select = RsbSQLInsert("dlselectpt.tmp");
+          insertCount = 0;
+        end;
+      end;
+      UseProgress(curRow);
+    end;
+    if (insertCount > 0)
+      ins_select.Insert();
+    end;
+    RemProgress();
+
+    timerFileLoad = null;
+
+    if (not hasData)
+      RunError("Указанный файл не содержит данных");
+    end;
+
+    CheckAndPrintErrorsByLoadedFile(protObj, nptxop, fileDataType);
+
+    if (fileDataType == 1)
+      query = 
+        " SELECT sel.T_CLIENTID "
+       +"   FROM DDLSELECTPT_TMP sel "
+       +"  where Exists (select 1 "
+       +"                  from dnptxobj_dbt obj "
+       +"                 where obj.t_Client = sel.T_CLIENTID "
+       +"                   and obj.t_Kind IN (select ok.t_Element from dnptxkind_dbt ok where ok.t_Level = 5 and ok.t_Code LIKE 'PlusG%') "
+       +"                   and obj.t_Date between  " + GetSQLDate(BegDate) + " and  " + GetSQLDate(EndDate) + " "
+       +"               ) "
+       +"     or Exists (select 1 "
+       +"                  from dsfcontr_dbt sf, ddlcontr_dbt dlc "
+       +"                 where sf.t_PartyID = sel.T_CLIENTID "
+       +"                   and sf.t_DateBegin <= " + GetSQLDate(nptxop.rec.OperDate) + " "
+       +"                   and (sf.t_DateClose = " + GetSQLDate(date(0,0,0)) + " or sf.t_DateClose >= " + GetSQLDate(nptxop.rec.OperDate) + ") "
+       +"                   and dlc.t_SfContrID = sf.t_ID "
+       +"               ) "
+       +"  order by sel.T_CLIENTID ASC "; 
+    else
+      query = 
+        "   SELECT OBJ.T_OBJECTID AS T_CLIENTID "
+       +"     FROM dobjcode_dbt obj "
+       +"    WHERE     OBJ.T_OBJECTTYPE = 3 "
+       +"          AND obj.T_CODE IN (SELECT sel.T_CLIENTCODE "
+       +"                               FROM DDLSELECTPT_TMP sel) "
+       +"          AND OBJ.T_CODEKIND = 101 "
+       +"          AND OBJ.T_BANKDATE <= " + GetSQLDate(nptxop.rec.OperDate)
+       +"          AND (OBJ.T_BANKCLOSEDATE = TO_DATE ('01.01.0001', 'dd.mm.yyyy') "
+       +"               OR OBJ.T_BANKCLOSEDATE >= " + GetSQLDate(nptxop.rec.OperDate) + ") "
+       +"   AND (Exists (select 1 "
+       +"                  from dnptxobj_dbt obj "
+       +"                 where obj.t_Client = OBJ.T_OBJECTID "
+       +"                   and obj.t_Kind IN (select ok.t_Element from dnptxkind_dbt ok where ok.t_Level = 5 and ok.t_Code LIKE 'PlusG%') "
+       +"                   and obj.t_Date between  " + GetSQLDate(BegDate) + " and  " + GetSQLDate(EndDate) + " "
+       +"               ) "
+       +"     or Exists (select 1 "
+       +"                  from dsfcontr_dbt sf, ddlcontr_dbt dlc "
+       +"                 where sf.t_PartyID = OBJ.T_OBJECTID "
+       +"                   and sf.t_DateBegin <= " + GetSQLDate(nptxop.rec.OperDate) + " "
+       +"                   and (sf.t_DateClose = " + GetSQLDate(date(0,0,0)) + " or sf.t_DateClose >= " + GetSQLDate(nptxop.rec.OperDate) + ") "
+       +"                   and dlc.t_SfContrID = sf.t_ID "
+       +"               )) "
+       +" ORDER BY OBJ.T_OBJECTID ASC "
+    end;
+
+  else
+    if(nptxop.rec.Client == -1)
+      query =    " select DISTINCT p.t_PersonID as t_ClientID "
+               + "   from dpersn_dbt p "
+               + "  where Exists (select 1 "
+               + "                  from dnptxobj_dbt obj "
+               + "                 where obj.t_Client = p.t_PersonID "
+               + "                   and obj.t_Kind IN (select ok.t_Element from dnptxkind_dbt ok where ok.t_Level = 5 and ok.t_Code LIKE 'PlusG%') "
+               + "                   and obj.t_Date between  " + GetSQLDate(BegDate) + " and  " + GetSQLDate(EndDate) + " "
+               + "               ) "
+               + "     or Exists (select 1 "
+               + "                  from dsfcontr_dbt sf, ddlcontr_dbt dlc "
+               + "                 where sf.t_PartyID = p.t_PersonID "
+               + "                   and sf.t_DateBegin <= " + GetSQLDate(nptxop.rec.OperDate) + " "
+               + "                   and (sf.t_DateClose = " + GetSQLDate(date(0,0,0)) + " or sf.t_DateClose >= " + GetSQLDate(nptxop.rec.OperDate) + ") "
+               + "                   and dlc.t_SfContrID = sf.t_ID "
+               + "               ) "
+               + "  order by p.t_PersonID ASC "; 
+
+    else
+      query =    " select pt.t_PartyID as ClientID  "
+               + "   from dparty_dbt pt "
+               + "  where pt.t_PartyID = " + string(nptxop.rec.Client);
+    end;
+  end;
+
+  var timerSelectCount = DLCTimingOperation("_ExecGetSNOBProc::SelectCount", 4755, string(nptxop.rec.ID), "Cчетчик времени подсчета количества клиентов в макропроцедуре _ExecGetSNOBProc");
+  BegAction(2000, "Подсчет количества клиентов", false);
+  cnt = cmd.GetCount(query);
+  EndAction();
+  timerSelectCount = null;
+
+  if(cnt > 0)
+    var OperID = 26; //Операция для конвейера - Пакетная операция отправки отчета брокера в БО ЦБ
+    var ConvID = 31; //Вид конвейера Отправка отчета брокера БО ЦБ
+
+    var UseConveyer = SecurUseConveyer(ConvID, OperID);
+    var tofilename = null;
+
+    var cnvWork = false;
+
+    if (UseConveyer and (cnt >= CONVEYER_CLIENT_COUNT_THRESHOLD))
+      if (GetTRUE(true, "Количество клиентов в отправляемых запросах превышет "+string(CONVEYER_CLIENT_COUNT_THRESHOLD)+
+                        ".|Осуществить отправку запросов с использованием конвейера?"))
+        cnvWork = true;
+      end;
+    end;
+
+    if (cnvWork)
+      var rslObj = GetSnobCnvData(processID, nptxop.rec.ID, cnt, query, isFirstLoad);
+
+      var cnv = RsbConveyerExec(ConvID);
+      cnv.AddParamsForConveyer(ConvID, rslObj, 0);
+      cnv.AddParamsForOperation(ConvID, OperID, rslObj, "", 0);
+      cnv.showPanelMonitoring(1);
+      var timerCnv = DLCTimingOperation("_ExecGetSNOBProc::ConveyerExec", 4755, string(nptxop.rec.ID), "Cчетчик времени работы конвейера в макропроцедуре _ExecGetSNOBProc");
+      cnv.Run();
+      timerCnv = null;
+
+      ShowErrorFromCnvpack( cnv );
+
+    else
+
+      InitProgress(cnt, "Получение информации по клиентам", "Получение информации по клиентам");
+
+      var timerCmdExec = DLCTimingOperation("_ExecGetSNOBProc::CmdExec", 4755, string(nptxop.rec.ID), "Cчетчик времени получения выборки клиентов в макропроцедуре _ExecGetSNOBProc");
+
+      DataSet = cmd.Execute(query);
+
+      timerCmdExec = null;
+
+      i = 0;
+      InitReq(@Req, TaxPeriod);
+      while(DataSet.moveNext())
+
+        AddClientToReq(@Req, DataSet.ClientID);
+
+        if(Req.GetReportClientOperationReq.ClientInfoList.size == REQ_PACK_SIZE)
+          ExecReq(protObj, nptxop, @Req, isFirstLoad);
+          InitReq(@Req, TaxPeriod);
+        end;
+
+        UseProgress(i = i + 1);
+      end;
+
+      if(Req.GetReportClientOperationReq.ClientInfoList.size > 0)
+        ExecReq(protObj, nptxop, @Req, isFirstLoad);
+      end;
+
+      RemProgress();
+
+    end;
+  end;
+
+  var tmpFile = PathCombine(GetAbsoluteTxtPath(), (SubStr(processID, 2, 36) + ".tmp"));
+  protObj.CombineAndSaveMultithreadLog(tmpFile);
+  timesplit(time(), hour, min, sec);
+  tofilename = PathCombine(
+                  GetCSVPath(),
+                  "Протокол_процедуры_запроса_к_Хранилищу_"+string(year)+string(mon:o:2)+string(day:o:2)+"_"+string(hour:o:2)+string(min:o:2)+".csv"
+  );
+
+  CopyFileToNetOrRelPath(tmpFile, tofilename);
+  RemoveFile(tmpFile);
+end;
+
+//Точка входа
+private macro ExecGetSNOBProc(ID)
+  var profiler = StartStopProfilingBySetting();
+  var timerTotal = DLCTimingOperation("ExecGetSNOB::Total", 4755, string(ID), "Общий счетчик времени выполнения всей процедуры получения данных от СНОБ");
+  var nptxop = TBFile("nptxop.dbt");
+  var query, cmd, DataSet;
+  var isFirstLoad = true;
+  
+  nptxop.Clear();
+
+  nptxop.rec.ID = ID;
+  if(not nptxop.GetEQ())
+    msgbox("Не найдена процедура с ID = " + ID);
+    return 1;
+  end;
+
+  var StartSTBDate = GetStartSTBDate();
+  if((РАБОТА_С_ВНЕШНИМ_ХРАНИЛИЩЕМ_СНОБ()) and (StartSTBDate > date(0,0,0)) and (nptxop.rec.OperDate >= StartSTBDate))
+    query =   "select 1 "
+            + "  from dnptxop_dbt "
+            + " where t_DocKind = ? "
+            + "   and t_ID <> ? "
+            + "   and t_PrevDate = ? "
+            + "   and t_OperDate <> ? "
+            + "   and ROWNUM = 1 ";
+
+    cmd = DL_RSDCommand(query);
+
+    cmd.AddParam(nptxop.rec.DocKind);
+    cmd.AddParam(nptxop.rec.ID);  
+    cmd.AddParam(nptxop.rec.PrevDate);
+    cmd.AddParam(nptxop.rec.OperDate);
+    
+    if(cmd.GetCount() > 0)
+      isFirstLoad = false;
+    end;
+
+    _ExecGetSNOBProc(nptxop, isFirstLoad);
+  end;
+
+  return 0;
+OnError(er)
+  AddDBLogWithErrorObj("ExecGetSNOBProc",er);
+  MsgBox("Ошибка! " + GetFullErrorMessage(er));
+end;
+

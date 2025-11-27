@@ -1,0 +1,331 @@
+/**
+  @file: nptxwrt105_203702.mac
+  @brief: Ценные бумаги
+  Операция списания и зачисления денежных средств. Шаг "Отправка неторгового поручения в QUIK"
+
+  # menu 
+  - БО ЦБ\Сервисные операции\Операция списания и зачисления денежных средств
+  
+  # tag
+  - functional_block: Проводки
+  - functional_block: Операция списания и зачисления денежных средств
+  - functional_block: Сервисные операции
+  - code_type: GUI
+  
+  # changelog
+  |date       |author         |tasks                                       |note                                                        
+  |-----------|---------------|--------------------------------------------|-------------------------------------------------------------
+  |2025.07.24 |Велигжанин А.В.|BOSS-9380_BOSS-10126                        | Убраны проверки на работу после 19:00 и isWorkDayStock() 
+  |2024.06.25 |Дылгеров Ц.В.  |BOSS-3136                                   | Доработка для переводов ДС с внебиржевого счета на биржевой в рублях
+  |2023.09.26 |Дылгеров Ц.В.  |BOSS-284                                    | Создание для зачислений ДС по биржевому рынку для передачи поручения по увеличению лимитов ДС из СОФРа в МНП Quik
+
+*/
+
+import BankInter, globals;
+import "nontrading_orders_quik_messages.mac"; ///< формирование JSON
+import RSD;
+import "dldlngfun.mac"; 
+import "u_common_email_utils.mac";
+import enroll_class;
+import "nptxwrt_func.mac", "cblogger2.mac";
+import oralib, likepy;
+
+
+private var OD_GRP = 78; ///< DEF-57588
+
+private macro lpad( str, len )
+    var chr;
+    if ( not GetParm(2, chr))
+       chr = " ";
+    end;
+    str = Trim( str );
+    return MkStr(chr, len - StrLen(str)) + str;
+end;
+
+private macro getDateStr(dt)
+  var day,mon,year;
+  DateSplit(dt,day,mon,year);
+  return string(lpad(string(day),2,"0"),".",lpad(string(mon),2,"0"),".",string(year));
+end;
+
+private macro getTimeStr(tm)
+  var hour,min1,sec;
+  TimeSplit(tm,hour,min1,sec);
+  return string(lpad(string(hour),2,"0"),":",lpad(string(min1),2,"0"),":",lpad(string(sec),2,"0"));
+end;
+
+private macro sendmailgrp(text, grp)
+  var emailText = text;
+  var v_email = c_email_proc_env();
+  v_email.m_set_msg_head(substr(text,1,50));
+  v_email.m_add_row_to_msg_text(text);
+  v_email.m_save_to_submit_grp(grp, true);
+  ///v_email.m_submit_email_synch();  отключим отправку, просто ставим в очередь
+end;
+
+/* 
+  @ вернуть id субдоговора по фондовому рынку для основного договора обслуживания
+  @param[in] nptxop_id - id операции
+  @return id  субдоговора по фондовому рынку
+*/
+private macro getStockSubContractID(nptxop_id)
+  var row = ExecSqlSelect(
+    "select sfc_s1.t_id                                                "+
+    "  from ddlcontrmp_dbt mp1, dsfcontr_dbt sfc_s1,                   "+
+    "       dnptxop_dbt    nt, ddlcontr_dbt   dlc                      "+
+    " where dlc.t_dlcontrid = mp1.t_dlcontrid                          "+
+    "   and mp1.t_marketid = 2                                         "+
+    "   and sfc_s1.t_id = mp1.t_sfcontrid                              "+
+    "   and sfc_s1.t_servkind = 1                                      "+
+    "   and sfc_s1.t_servkindsub = 8                                   "+
+    "   and sfc_s1.t_dateclose = TO_DATE('01010001', 'ddmmyyyy')       "+
+    "   and dlc.t_sfcontrid = nt.t_contract                            "+
+    "   and nt.t_DocKind = 4607                                        "
+                           , MakeArray(SqlParam("id", nptxop_id )));
+  if (row.MoveNext()) 
+    return row.value(0);
+  end;
+  return 0;
+end;
+
+/**
+  @brief isWorkDayStock - возвращает True, если договор биржевой и рабочий день
+  @param[in] id - id договора зачисления ДС
+  @return возвращает True, если договор биржевой и рабочий день. Статус операции должен быть открытый или отложенный
+*/
+private macro isWorkDayStock(id, servkind:@integer, legalform:@integer, shortname:@string, number:@string, outsum:@money, ccy:@string, codCFT:@string)
+  var sql = 
+    "   SELECT (case when  " +
+    "             rshb_rsi_sclimit.GetCheckDateByParams(-1, trunc(sysdate) + interval '1' day, mp.t_marketid, 1) " +
+    "               = trunc(sysdate)  " +
+    "             and rshb_rsi_sclimit.GetCheckDateByParams(1, trunc(sysdate) - interval '1' day, mp.t_marketid, 1) " +
+    "               = trunc(sysdate)  " +
+    "           then " +
+    "             1 else 0 end) isWorkDay " +
+    "         ,sfc_s.t_servkind, dp.t_legalform, dp.t_shortname " + 
+    "         ,sfc.t_number, t.t_outsum, replace(df.t_ccy, 'RUB', 'SUR') ccy " +
+    "     ,NVL((SELECT codes.T_CODE  " +
+    "    FROM DOBJCODE_DBT codes  " +
+    "   WHERE codes.T_objectID =  dp.t_partyid   " +
+    "     AND codes.T_CODEKIND = 101 " +
+    "     AND codes.t_objecttype = 3  " +
+    "     AND codes.t_state = 0 ),CHR(1)) codCFT   " +
+    "   FROM dnptxop_dbt  t, ddlcontr_dbt dlc, ddlcontrmp_dbt mp, dsfcontr_dbt sfc_s " +
+    "     , dparty_dbt dp, dfininstr_dbt df, dsfcontr_dbt sfc  " +
+    "   WHERE t.t_DocKind = 4607 " +
+    "    AND dlc.t_sfcontrid = sfc.t_id " +
+    "    AND df.t_fiid = t.t_currency " + 
+    "    AND dp.t_partyid = sfc_s.t_partyid " +
+    "     AND t.t_contract = sfc_s.t_id " +
+    "     AND mp.t_dlcontrid = dlc.t_dlcontrid " +
+    "     AND sfc_s.t_id = mp.t_sfcontrid " +
+    "     AND t.t_id = ? " +
+//    "     AND t.t_subkind_operation in (10,30) " +
+    "     AND t.t_status in (1,0) " + ///< статус операции - 2 - закрытый, 0 - отложенный, 1 - открытый
+    "     AND sfc_s.t_servkindsub = 8 " + ///< биржевой подвид обслуживания
+    "     AND sfc_s.t_servkindsub <> 9; "; ///< не внебиржевой подвид обслуживания
+  var cmd = RSDCommand(sql);
+  cmd.AddParam("",RSDBP_IN,id);
+  var rs = RSDRecordSet(cmd);
+  var isWorkDay = 1;
+  if (rs.moveNext)
+    codCFT     = rs.value("codCFT");
+    isWorkDay  = rs.value("isWorkDay");
+    servkind   = rs.value("t_servkind");
+    legalform  = rs.value("t_legalform");
+    shortname  = rs.value("t_shortname");
+    number     = rs.value("t_number");
+    outsum     = rs.value("t_outsum");
+    ccy        = rs.value("ccy");
+  end;
+
+  // BOSS-9380_BOSS-10126 Возвращается true, ранее была проверка по isWorkDay
+  return true;
+end;
+
+
+//Получить настройкy "Передача поручений по зачислениям в QUIK"
+private macro GetQEnrOrdTr()
+  var RegistryPath = "SECUR\\QUIK_ENROL_ORDER_TRANSFER";
+  var QEnrOrdTr = false;
+  var stat = 0;
+ 
+  GetRegistryValue(RegistryPath, V_BOOL, QEnrOrdTr, stat);
+  if((stat) or (QEnrOrdTr == "")) 
+    msgbox("Не задана настройка в реестре банка:|", RegistryPath);      
+  end;
+
+  return QEnrOrdTr;
+END;
+
+/*
+  @brief get10ServKindSub - вернуть подвид обслуживания (биржевой-8/внебиржевой-9) для операции зачисления
+  @param[id] - id операции зачисления
+*/
+private macro get10ServKindSub(id)
+  var sql = 
+  "SELECT sfc_s.t_servkindsub " +
+  " FROM dnptxop_dbt  t, ddlcontr_dbt dlc, ddlcontrmp_dbt mp, dsfcontr_dbt sfc_s  " +
+  "   , dsfcontr_dbt sfc   " +
+  " WHERE t.t_DocKind = 4607   " +
+  "  AND dlc.t_sfcontrid = sfc.t_id  " +
+  "  AND t.t_contract = sfc_s.t_id  " +
+  "  AND mp.t_dlcontrid = dlc.t_dlcontrid  " +
+  "  AND sfc_s.t_id = mp.t_sfcontrid  " +
+  "  AND t.t_id = :1  " + 
+  "  AND t.t_subkind_operation in (10)  " +
+  "";
+  var cmd = RSDCommand(sql);
+  cmd.AddParam("",RSDBP_IN,id);
+  var rs = RSDRecordSet(cmd);
+  var servKindSub = 0;
+  if (rs.moveNext)
+    servKindSub = rs.value("t_servkindsub");
+  end;
+  return servKindSub;
+end;
+
+/*
+  @brief GetPaymentReceiverAccount - возвращает счет платежа получателя по операции списания/зачисления ДС
+  @param[in] nptxop - структура операции
+  @return счет платежа получателя по операции или ""
+*/
+private macro GetPaymentReceiverAccount(nptxop)
+  var query =   " select t_receiveraccount "
+             + "   from dpmpaym_dbt "
+             + "  where t_dockind = ? "
+             + "    and t_documentid = ? ";
+  var cmd = DL_RSDCommand(query);
+  cmd.AddParam(nptxop.DocKind);
+  cmd.AddParam(nptxop.ID);
+  var sql = cmd.Execute();
+  if (sql.MoveNext() )
+    return sql.value("t_receiveraccount");
+  end;
+  return "";
+end;
+
+private macro sendmailgrp_theme(text, grp, theme)
+  var emailText = text;
+  var v_email = c_email_proc_env();
+  v_email.m_set_msg_head(theme);
+  v_email.m_add_row_to_msg_text(text);
+  v_email.m_save_to_submit_grp(grp, true);
+  ///v_email.m_submit_email_synch();  отключим отправку, просто ставим в очередь
+end;
+
+macro ExecuteStep( Doc, FDoc, DocKind, OperationID )
+  var sql1, cmd1, text_mail;
+  record nptxop("nptxop");
+  SetBuff( nptxop, FDoc );
+  var servkind, legalform, shortname, number, outsum, ccy, codCFT;
+  var logger = NewLogger(c_logger.IT_LOG_TYPE, "NPTXWRT105_203702.MAC");
+
+  if ( false ) // Убрана проверка по BOSS-9380_BOSS-10126, ранее было:  (time() > time(19,0,0)
+    logger.Debug("ID = " + nptxop.ID + ". Выход из шага Отправка неторгового поручения в QUIK для операции после 19-00");
+    return 0; ///< сообщение не формируется, а шаг отмечается выполненным, равно как и шаг "Получение результата обработки неторгового поручения в QUIK"
+  end;
+
+  if (not ((nptxop.subkind_operation==10) or (nptxop.subkind_operation==30)) and (nptxop.kind_operation==2037))
+    logger.Debug("ID = " + nptxop.ID + ". Выход из шага Отправка неторгового поручения в QUIK для не зачисления и перевода");
+    return 0; ///< сообщение не формируется, а шаг отмечается выполненным, равно как и шаг "Получение результата обработки неторгового поручения в QUIK"
+  end;
+
+  if ((nptxop.subkind_operation == DL_NPTXOP_WRTKIND_TBSABC))
+    var dlrq = TRecHandler("dlrq.dbt");
+    var rqacc = TRecHandler("dlrqacc");
+    ПолучитьТОпоДокументу(nptxop.DocKind, nptxop.ID, 1, DLRQ_TYPE_PAYMENT, 0, dlrq);
+    ПолучитПлатежныеРеквизитыПоТО(dlrq, rqacc);
+    var receiverAccount = rqacc.rec.Account;
+    if ((rqacc.rec.Account==null) or (strLen(rqacc.rec.Account)==0) or (rqacc.rec.Account==strFor(1)) or (rqacc.rec.Account==strFor(1)))
+      receiverAccount = GetPaymentReceiverAccount(nptxop);
+    end;  
+    if (not isExchangeAccount(receiverAccount, nptxop.operDate)) //процедура подходит для переводов и списаний
+      logger.Debug("ID = " + nptxop.ID + ". Выход с выполнением из шага Отправка неторгового поручения в QUIK для перевода на не ММВБ");
+      return 0;
+    end;
+  end;
+
+  if ( (get10ServKindSub(nptxop.id)!=8) and (nptxop.subkind_operation==10) )   ///< зачисление по внебирже не предусматривает отправку неторгового поручения для МНП QUIK
+    logger.Debug("ID = " + nptxop.ID + ". Выход с выполнением из шага Отправка неторгового поручения в QUIK для зачисления для внебиржи");
+    return 0; ///< сообщение не формируется, а шаг отмечается выполненным, равно как и шаг "Получение результата обработки неторгового поручения в QUIK"
+  end;
+  if (nptxop.subkind_operation==10)
+    if ( not isWorkDayStock(nptxop.id, @servkind, @legalform, @shortname, @number, @outsum, @ccy, @codCFT ) )  
+      MsgBox("Отправка сообщений в QUIK в нерабочий день на бирже запрещена. Операцию необходимо продолжить в рабочий день.");
+      logger.Debug("ID = " + nptxop.ID + ". Выход без выполнения из шага Отправка неторгового поручения в QUIK для выходных");
+      return 1; 
+    end;
+  elif(nptxop.subkind_operation==30)
+    if ( not isWorkDayStock(getStockSubContractID(nptxop.id), @servkind, @legalform, @shortname, @number, @outsum, @ccy, @codCFT ) )  
+      MsgBox("Отправка сообщений в QUIK в нерабочий день на бирже запрещена. Операцию необходимо продолжить в рабочий день.");
+      logger.Debug("ID = " + nptxop.ID + ". Выход без выполнения из шага Отправка неторгового поручения в QUIK для выходных");
+      return 1; 
+    end;
+  end; 
+
+  var v_tost_dttm = GetDT306Limit_dy_nptxop(nptxop.id); ///<  время когда операция по зачислению могла попасть в лимиты 
+
+  var sys_dt_prov, sys_time_prov, dt_carry, sys_dttm_prov;
+  TPROV(nptxop.id, @sys_dt_prov, @sys_time_prov, @dt_carry);  
+  sys_dttm_prov = dttm(sys_dt_prov,sys_time_prov); ///< Момент формирования проводки (Тпров)
+
+  if ( not GetQEnrOrdTr() )  
+    MsgBox("Настройка 'Передача поручений по зачислениям в QUIK' не включена, шаг операции 'Отправка неторгового поручения в QUIK' невозможен");
+    logger.Debug("ID = " + nptxop.ID + ". Выход из шага 'Отправка неторгового поручения в QUIK' - не включена настройка 'Передача поручений по зачислениям в QUIK'");
+    return 0; ///< сообщение не формируется, а шаг отмечается выполненным, равно как и шаг "Получение результата обработки неторгового поручения в QUIK"
+  end;
+
+  if ((legalform==1) and (servkind==15) and (ccy!="SUR"))  ///<юридическое лицо на срочном рынке + инвалюта
+    text_mail = 
+          "Поступило зачисление "+nptxop.id+" от клиента "+shortname+" ("+codCFT+") " + 
+          "по договору номер "+number+" на сумму "+outsum+" "+ccy+". Необходимо вручную скорректировать лимиты в QUIK"; 
+    sendmailgrp(text_mail,OD_GRP /*ОД*/);
+    logger.Debug("ID = " + nptxop.ID + ". Выход из шага Отправка неторгового поручения в QUIK. Отправлено почтовое сообщение для ЮЛ на СР");
+    return 0;
+  end;
+
+  var obj_not = RsbObjNotes(131, string(nptxop.id:34:o));
+  var v_res;
+  if ((date > date(nptxop.operdate))   ///< текущая системная дата больше даты операции зачисления 
+           and 
+      (sys_dttm_prov < v_tost_dttm)  ///< проводка вошла в утренний расчет лимитов
+       )
+    v_res = obj_not.AddNote(C_NOTEKIND_QUIK_INSTR_PROC_RESULT, "Сообщение не отправлялось, т.к. операция уже учтена в лимитах на начало дня", 
+                               {curdate});
+    logger.Debug("ID = " + nptxop.ID + ". Выход из шага Отправка неторгового поручения в QUIK, если операция учтена в лимитах на начало дня");
+    return 0; ///< сообщение не формируется, а шаг отмечается выполненным, равно как и шаг "Получение результата обработки неторгового поручения в QUIK"
+  end;
+
+  var msgSender:MoneyOrderQuikController = MoneyOrderQuikController();
+  var isNeedSendOrder:bool = true;
+  msgSender.PrepareEnroll(nptxop.id);
+
+  if (msgSender.IsExists(nptxop.id, MoneyOrderQuikTypes.ENROLL))
+    isNeedSendOrder = MsgBoxEx("Поручения по данной операции уже отправлялись в QUIK ранее. Выполнить повторную отправку?", MB_YES + MB_NO, IND_NO) == IND_YES;
+  end;
+
+  if (isNeedSendOrder and (not msgSender.SaveAndSendByOperation(nptxop.id)) )
+    MsgBox("Ошибка передачи неторгового поручения в QUIK");
+    logger.Debug("ID = " + nptxop.ID + ". Ошибка передачи неторгового поручения в QUIK");
+    return 1;
+  end;
+
+  if ((date > date(nptxop.operdate))   ///< текущая системная дата больше даты операции зачисления 
+           and 
+      (sys_dttm_prov >= v_tost_dttm)  ///< проводка НЕ вошла в утренний расчет лимитов
+     )
+    text_mail = 
+    "По зачислению д/с " + nptxop.id + " от " +  getDateStr(nptxop.operdate) + ", сегодня " + getDateStr(date) + " в " + getTimeStr(time) 
+      +" сформировано поручение на увеличение лимитов в QUIK,"
+      +" т.к. проводка по этой операции была сформирована в " + string(sys_dttm_prov) + " и она не вошла в расчет лимитов на начало дня."
+      +" В настоящее время лимиты корректны. Однако, в случае, если сегодня будет выполнен пересчет лимитов на начало дня,"
+      +" необходимо будет уменьшить лимит на сумму этого зачисления.";
+    sendmailgrp_theme(text_mail,OD_GRP,"Поручение в QUIK по зачислениям предыдущих дней");
+  end;
+  return 0;
+onerror(er)
+  MsgBox(er.Message);
+  logger.ErrorClob("id = " + nptxop.ID, GetFullErrMsg(er));
+  return 1;
+end;

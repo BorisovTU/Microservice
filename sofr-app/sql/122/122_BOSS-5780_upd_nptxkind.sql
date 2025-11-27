@@ -1,0 +1,8 @@
+/*Обновить виды объектов НДР*/
+DECLARE
+BEGIN
+  UPDATE DNPTXKIND_DBT
+     SET T_TAXBASEKIND = 0
+   WHERE T_ELEMENT IN (660, 670);
+END;
+/

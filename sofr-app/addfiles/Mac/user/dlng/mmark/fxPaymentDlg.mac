@@ -1,0 +1,2646 @@
+/*
+ *  Открытие диалогового окна с переводом (платежом) КО из монитора дилера
+ */
+
+import oralib, likepy, PTInter, FIInter, dlgCommon,dl_plib, fiInfo, SqlVBuilder, fxDealInfo, requisites,funk;
+
+
+// Используемые записи
+private Record fxPmnt (trans,"monit.lbr") dialog; // Панель диалога Перевода (платежа)
+private record r_fi (fininstr, "bank.def");       // Запись финансового инструмента
+private record r_party(party, "bank.def");        // Запись субъектов экономики
+
+private record r_accR ("account.dbt", "bank.def"); // Запись счетов
+private record r_accC ("account.dbt", "bank.def");// Запись валютных счетов
+private var g_r_acc = r_accR;                     // Указатель на запись счетов (меняется по контексту с рублёвого на валютный)
+
+// Наборы данных
+private var rsDeal   = null;    // Набор данных с данными по сделке
+private var rsPmnt   = null;    // Набор данных с данными по платежу
+private var rsPmProp = null;    // Набор данных с реквизитами платежа
+private var rsRmProp = null;    // Набор данных с реквизитами платежа для R-макета
+
+// Данные по сделке в целом
+private var g_dealId = null;    // Id сделки
+private var g_legId  = null;    // Id транша сделки (для SWAP будет и 1 и 2)
+
+// Данные по платежу
+private var g_fiid   = null;    // Id финансового инструмента платежа
+private var g_payer  = -1;      // Id субъекта для плательщика
+private var g_receiver = -1;    // Id субъекта для получателя
+private var g_corAccP = null;   // Значение номера корсчёта плательщика без разделительных точек
+private var g_corAccR = null;   // Значение номера корсчёта получателя без разделительных точек
+private var g_accP= null;       // Значение номера счёта плательщика без разделительных точек
+private var g_accP0= null;       // Значение номера счёта плательщика без разделительных точек
+private var g_accR= null;       // Значение номера счёта получателя  без разделительных точек
+private var g_accR0= null;       // Значение номера счёта получателя  без разделительных точек
+private var g_placeP = -1;      // Банк плательщика (Id субъекта)
+private var g_placeP0 = -1;     // Банк плательщика (Id субъекта)
+private var g_placecodekindP = -1;  // Вид кода банка плательщика (Id субъекта)
+private var g_placeR = -1;      // Банк получателя  (Id субъекта)
+private var g_placeR0 = -1;     // Банк получателя  (Id субъекта)
+private var g_placecodekindR = -1;  // Вид кода банка получателя  (Id субъекта)
+private var g_middle = null;    // Банк-посредник (для валютных платежей) получателя
+private var g_middlecodekind = null;// Вид кода банка-посредника (для валютных платежей) получателя
+private var g_accM   = null;    // Значение номера счёта в банке-посреднике получателя без разделительных точек
+private var g_middleP= null;    // Банк-посредник (для валютных платежей) плательщика
+private var g_middlecodekindP= null;// Вид кода банка-посредника (для валютных платежей) плательщика
+private var g_accMP  = null;    // Значение номера счёта в банке-посреднике плательщика без разделительных точек
+private var g_noteP  = null;    // Примечание к плательщику (дополнительные реквизиты)
+private var g_noteR  = null;    // Примечание к получателю  (дополнительные реквизиты)
+
+private var g_pmntType = 0;     // Id типа платежа по текущей классификации Банка
+private var g_pmntPurp = 0;     // Id назначения платежа (dPmPurp_dbt)
+private var g_bCash    = false; // Признак банкнотной сделки
+private var g_bNeedRefAccs = true;// Признак необходимости при сохранении брать данные с формы (обновлять)
+
+private var g_bCritical = false;// Признак внесения критического изменения
+private var g_bNewPmnt  = false;// Признак ввода нового платежа в сделку
+private var g_bLinkedPmnt=true; // Признак связанности вводимого платежа со сделкой
+private var g_errorText = "";   // Текст ошибки-исключения
+private var g_CorrectFlag = false;
+
+// Типы переводов (состав изменяется в процедуре InitType)
+private var aTransTypes = TArray();
+var tfiid;
+
+private var _Amount = null, _pmntDate = null;
+
+
+private const DEB_CRED = 1;     // Комментарии писать только в одну запись dPmProp_dbt, где поле  1==t_debetCredit
+
+
+//
+// Получить Id Генерального соглашения  по Id субъекта экономики (контрагента) и дате сделки
+// Если их несколько, выбирает только первый попавший
+// В случае отсутствия примечания возвращает -1.
+//
+macro GetDefGen(subj, dealDate) : String
+   var sql = " select t_contractId "
+          +" from ANK_DOGOVOR_DBT r  "
+          +" where t_PartyID=:party and t_type like 'Генеральное соглашение%'  "
+          +" and ((:dt12 between t_StartDate and t_StopDate) or  "
+          +" (:dt11 >= t_StartDate and t_StopDate=TO_DATE('01.01.0001', 'DD.MM.YYYY'))) " ;
+
+   var params = MakeArray(SQLParam("party", subj), SQLParam("dt11", dealDate), SQLParam("dt12", dealDate));
+   var rs = ExecSQLSelect(sql, params, false);
+
+   if(rs.MoveNext())
+      return rs.value(0);
+   end;
+
+   return -1;
+end;
+
+
+
+//
+// Задание в качестве вариантов типов переводов -- переводов для Forex
+//
+private macro ListTypesFx(bClear)
+
+   if(bClear)
+      aTransTypes.Size = 0;
+   end;
+
+   aTransTypes(aTransTypes.Size) = "Зачисление по сделке FOREX";        // по FOREX
+   aTransTypes(aTransTypes.Size) = "Списание по сделке FOREX";          // по FOREX
+end;
+
+//
+// Задание в качестве вариантов типов переводов -- переводов для банкнотных сделок
+//
+private macro ListTypesBn(bClear)
+   if(bClear)
+      aTransTypes.Size = 0;
+   end;
+
+   aTransTypes(aTransTypes.Size) = "Получение наличной валюты";         // по банкнотной сделке
+   aTransTypes(aTransTypes.Size) = "Оплата по банкнотной сделке";       // по банкнотной сделке
+end;
+
+//
+// Задание в качестве вариантов типов переводов -- переводов для всех КО
+//
+private macro ListTypesKo(bClear)
+   ListTypesFx(bClear);
+   ListTypesBn(false);
+end;
+
+// ИНИЦИАЛИЗАЦИЯ
+//ListTypesKo(true);
+
+
+//
+// Задание в качестве вариантов типов переводов -- переводов для МБК
+//
+private macro ListTypesMbk(bClear)
+   if(bClear)
+      aTransTypes.Size = 0;
+   end;
+
+   aTransTypes(aTransTypes.Size) = "Предоставление средств";    // по МБК
+   aTransTypes(aTransTypes.Size) = "Оплата суммы";              // по МБК
+   aTransTypes(aTransTypes.Size) = "Оплата процентов";          // по МБК
+end;
+
+//
+// Задание в качестве вариантов типов переводов -- отдельных переводов
+//
+private macro ListTypesOther(bClear)
+   if(bClear)
+      aTransTypes.Size = 0;
+   end;
+
+   aTransTypes(aTransTypes.Size) = "Оплата пл. документа";
+end;
+
+
+//
+// Процедура для задания значений полей плательщика/получателя
+//
+private macro ClearParty(party)
+   if((party!=-1) and (party!=""))
+      return party;
+   else
+      return "";
+   end;
+end;
+
+
+//
+// Получиь номер бэк-офиса по id сделки (для случая, когда вводится новый платёж)
+//
+private macro GetBOfficeKind(dealId)
+   var sql = " select t_bOfficeKind from ddl_tick_dbt where t_dealId=:dealId ";
+
+   var params = MakeArray(SQLParam("dealId", dealId));
+   var res = ExecSQLSelect(sql, params, false);
+
+   if(res.MoveNext())
+      return res.value(0);
+   end;
+
+   return -1;
+end;
+
+
+//
+// Получить ID записи с основной схемой или -1, если схема не найдена
+//
+macro GetDominantId(code, codeKind, fiid)
+   var sql = " select t_id from dstd_req_dbt "
+           + " where t_code = :code and t_codeKind = :codeKind and t_fiid = :fiid and t_isdominant='X' ";
+
+   var params = MakeArray(SQLParam("code", code), SQLParam("codeKind", codeKind), SQLParam("fiid", fiid));
+   var res = ExecSQLSelect(sql, params, false);
+
+   if(res.MoveNext())
+      return res.value(0);
+   end;
+
+   return -1;
+end;
+
+
+//
+// Проверка допустимости изменения платежа
+//
+private macro CheckCorrectSave()
+
+  if(0 == rsDeal.value("t_dealStatus"))   // Сделка лежит в отложенных
+      return true;
+   end;
+return true;
+
+//   if(10 == rsDeal.value("t_dealStatus"))  // Сделка лежит в открытых
+      //if(rsDeal.value("t_dealDate") != rsDeal.value("t_maturity"))
+      if(32000 == rsPmnt.value("t_paymStatus")) // Платёж закрыт
+         return false;
+      else
+         return true;
+      end;
+//   end;
+
+   return false;
+end;
+
+
+//
+// Получить вид кода банка
+//
+macro getCodeKind(fi):Integer
+   if (0 != fi)
+      return PTCK_SWIFT;
+   else
+      return PTCK_BIC;
+   end;
+end;
+
+
+//
+// Получить корреспондентский счёт по id участника (стороны) сделки
+// (выводится корсчёт из стандартных таблиц)
+//
+macro ПолучитьКС(partyId)
+   var res;
+
+   var sql = " select bank.t_corAcc "
+          +" from dBankDprt_dbt bank "
+          +" where bank.t_partyId=:pty " ;
+
+
+   var params:TArray;
+   params = MakeArray(SQLParam("pty", partyId));
+   res = ExecSQLSelect(sql, params, false);
+
+   if((res.MoveNext()) and (null != res.value(0)))
+      return res.value(0);      // Счёт
+   end;
+
+   return null;
+end;
+
+
+//
+// Проверка на существование вручную созданных платежей
+//
+macro ManualAddedPaymentsExists(dealId, boffice)
+   var sql;
+   var params:TArray;
+
+   if(102 == boffice)   // Для МБК при t_purpose=11 всегда t_subpurpose=1!
+      sql =" select max(sp) from"
+          +" ( "
+          +" select nvl(max(p.t_subpurpose), 0) as sp from ddl_tick_dbt t "
+          +"     inner join dPmPaym_dbt p "
+          +"     on p.t_documentId=t.t_dealId and t.t_dealId=:deal11 and t.t_bOfficeKind=:boffice11 and t_purpose!=11 and t.t_bofficekind = p.t_docKind "
+          +" union "
+          +" select nvl(max(p.t_subpurpose), 0) -1 from ddl_tick_dbt t "
+          +"     inner join dPmPaym_dbt p "
+          +"     on p.t_documentId=t.t_dealId and t.t_dealId=:deal12 and t.t_bOfficeKind=:boffice12 and t_purpose=11 and t.t_bofficekind = p.t_docKind"
+          +" ) ";
+
+      params = MakeArray(SQLParam("deal11", dealId), SQLParam("boffice11", boffice), SQLParam("deal12", dealId), SQLParam("boffice12", boffice));
+   else // Стандартные случаи
+      sql = " select nvl(max(p.t_subpurpose), 0) from ddl_tick_dbt t "
+          +"     inner join dPmPaym_dbt p "
+          +"     on p.t_documentId=t.t_dealId and t.t_dealId=:deal and t.t_bOfficeKind=:boffice and t.t_bofficekind = p.t_docKind " ;
+
+      params = MakeArray(SQLParam("deal", dealId), SQLParam("boffice", boffice));
+   end;
+
+
+
+   var res = ExecSQLSelect(sql, params, false);
+   if((res.MoveNext()))
+      if (0 < Int(res.value(0)) )
+         return true;
+      end;
+   end;
+
+   return false;
+end;
+
+
+//
+// Получить последний имеющийся подвид назначения платежа. Если платежа не было, возвращается -1
+//
+macro GetLastSubPurpose(dealId, boffice, purp)
+   var sql = " select nvl(max(p.t_subpurpose), -1) from ddl_tick_dbt t "
+          +"     inner join dPmPaym_dbt p "
+          +"     on p.t_documentId=t.t_dealId and t.t_dealId=:deal and t.t_bOfficeKind=:boffice and p.t_purpose=:purp and t.t_bofficekind = p.t_docKind " ;
+
+   var params:TArray;
+   params = MakeArray(SQLParam("deal", dealId), SQLParam("boffice", boffice), SQLParam("purp", purp));
+   var res = ExecSQLSelect(sql, params, false);
+
+   if((res.MoveNext()) and (null != res.value(0)))
+      return Int(res.value(0));
+   end;
+
+   return 0;
+end;
+
+
+
+//
+// Сохранение нового платежа в рамках транзакции
+//
+macro SaveNewPmnt()
+   var paym       = Tbfile( "pmpaym.dbt",   "W" );
+   var paymprop   = Tbfile( "pmprop.dbt",   "W" );
+   var paymprop2  = Tbfile( "pmprop.dbt",   "W" );
+   var pmrmprop   = Tbfile( "pmrmprop.dbt", "W" );
+   var stat       = 0;
+
+   var sql  = "select * from dpmpaym_dbt where t_paymentid =: paymentid";                                        //Получаем сумму базового платежа по ОД
+   var params = MakeArray(SQLParam("paymentid", fxPmnt.pmntId));
+   var paym_data = ExecSQLSelect(sql, params, false);
+   if (paym_data.moveNext())                                
+      CopyRSetToFBuff(paym, paym_data ) ;
+   end;
+   sql="select * from dpmprop_dbt where t_DEBETCREDIT = 0 and t_paymentid =: paymentid"; 
+   params = MakeArray(SQLParam("paymentid", fxPmnt.pmntId));
+   var paymprop_data = ExecSQLSelect(sql, params, false);
+   if (paymprop_data.moveNext())                                
+      CopyRSetToFBuff(paymprop, paymprop_data ) ;
+   end;
+   sql="select * from dpmprop_dbt where t_DEBETCREDIT = 1 and t_paymentid =: paymentid"; 
+   params = MakeArray(SQLParam("paymentid", fxPmnt.pmntId));
+   var paymprop2_data = ExecSQLSelect(sql, params, false);
+   if (paymprop2_data.moveNext())                                
+      CopyRSetToFBuff(paymprop2, paymprop2_data ) ;
+   end;
+   sql="select * from dpmrmprop_dbt where t_paymentid =: paymentid"; 
+   params = MakeArray(SQLParam("paymentid", fxPmnt.pmntId));
+   var pmrmprop_data = ExecSQLSelect(sql, params, false);
+   if (pmrmprop_data.moveNext())                                
+      CopyRSetToFBuff(pmrmprop, pmrmprop_data ) ;
+   end;
+    
+   var boffice   = GetBOfficeKind(g_dealId);
+   var  codeName = "БИК";
+   if(0 != g_fiid)      // Не рублёвый платёж
+      codeName = "BIC";
+   end;
+   var codeKind:Integer =  getCodeKind(g_fiid);
+   var purp = 1, subpurp = 0;
+
+   if(g_bLinkedPmnt)    // Платёж по сделке
+      if(100 == boffice)
+         if(g_bCash)    // БН
+            if(1 == g_pmntType)
+               purp = 1;
+            elif(2 == g_pmntType)
+               purp = 2;
+            end;
+         else           // FOREX
+            if(1 == g_pmntType)
+               purp = 1;
+            elif(2 == g_pmntType)
+               purp = 2;
+            end;
+         end;
+      elif(102 == boffice)      // МБК
+         if (0 == g_pmntType)
+            purp = 9;
+         elif (1 == g_pmntType)
+            purp = 10;
+         elif (2 == g_pmntType)
+            purp = 11;
+         end;
+      end;
+
+      subpurp = 1 + GetLastSubPurpose(g_dealId, boffice, purp);
+   else                 // Отдельный платёж (не привязывается к сделке)
+      purp = 7;         // см. dPmPurp_dbt
+      boffice = 140;    // Используем первичный документ "Документ неттинга"
+      g_dealId = 0;     // Временное значение (при вставке в DOCUMENTID)
+   end;
+
+   /*
+   if(g_bNeedRefAccs)
+      g_accP = FormatAccountNum(fxPmnt.PayerAcc,  false);
+      g_accR = FormatAccountNum(fxPmnt.ReceiverAcc,  false);
+   end;
+   */
+   paym.rec.PAYMENTID = 0;
+   paym.rec.DOCKIND = boffice;
+   paym.rec.DOCUMENTID = g_dealId;
+   paym.rec.PURPOSE = purp;
+   paym.rec.SUBPURPOSE = subpurp;
+   paym.rec.FIID = g_fiid;
+   paym.rec.PAYFIID = g_fiid;
+
+   /*
+   paym.rec.PAYER = g_payer;
+   paym.rec.RECEIVER = g_receiver;
+   paym.rec.PAYERCODE = ПолучитьКодСубъекта( paym.rec.PAYER, codeKind );
+   paym.rec.RECEIVERCODE = ПолучитьКодСубъекта( paym.rec.RECEIVER, codeKind );
+
+   paym.rec.PAYERBANKID = g_placeP;
+   paym.rec.RECEIVERBANKID = g_placeR;
+
+   paym.rec.PAYERACCOUNT = g_accP;
+   paym.rec.RECEIVERACCOUNT = g_accR;
+   */
+
+   paym.rec.VALUEDATE = fxPmnt.pmntDate;
+   paym.rec.PAYMSTATUS = 1000;
+   paym.rec.DEPARTMENT = {NumDprt};
+   paym.rec.ISPLANPAYM = "X";
+   /*
+   paym.rec.PAYERCODEKIND = codeKind;
+   paym.rec.RECEIVERCODEKIND = codeKind;
+   paym.rec.FIID_FUTUREPAYACC = g_fiid;
+   paym.rec.FIID_FUTURERECACC = g_fiid;
+   */
+   paym.rec.AMOUNT = money(round(FormatSum(fxPmnt.amount, false),2));
+   paym.rec.BASEAMOUNT = money(round(paym.rec.AMOUNT,2));
+   paym.rec.PAYAMOUNT =  money(round(paym.rec.AMOUNT,2));
+   paym.rec.FUTUREPAYERAMOUNT = paym.rec.AMOUNT;
+   paym.rec.FUTURERECEIVERAMOUNT = paym.rec.AMOUNT;
+   paym.rec.userfield1="";
+   paym.rec.userfield2="";
+   paym.rec.userfield3="";
+   paym.rec.userfield4="";
+   /*
+   paym.rec.BASEFIID = g_fiid;
+   paym.rec.PAYERDPBLOCK = -1;
+   paym.rec.RECEIVERDPBLOCK = -1;
+   paym.rec.OPER = {oper};
+   paym.rec.ORIGIN = 3;
+   paym.rec.STARTDEPARTMENT = {NumDprt};
+   paym.rec.ENDDEPARTMENT = {NumDprt};
+   paym.rec.PRIMDOCKIND = boffice;
+   paym.rec.COMISSFIID = -1;
+   */
+   stat = paym.insert;
+   if (not stat)
+      RunError( "Ошибка при создании нового платежа в таблице dpmpaym_dbt." );
+   end;
+                      
+
+   if(not g_bLinkedPmnt)   // Только для отдельных платежей!
+      g_dealId = /*paym.rec.DOCUMENTID =*/ paym.rec.PAYMENTID;
+      /*
+      stat = paym.update;
+      if (not stat)
+        RunError( "Ошибка при обновлении платежа." );
+      end;
+      */
+      // Update делать не надо: paym.rec.DOCUMENTID после insert'а будет равен paym.rec.PAYMENTID автоматически (если полю был присвоен ноль)
+   end;
+
+   //debet
+   paymprop.rec.PAYMENTID = paym.rec.PAYMENTID;
+   paymprop.rec.DEBETCREDIT = 0;
+   paymprop.rec.TRANSFERDATE = paym.rec.VALUEDATE;
+   /*
+   paymprop.rec.CODEKIND = g_placecodekindP;
+   paymprop.rec.CODENAME = codeName;
+   paymprop.rec.BANKCODE = ПолучитьКодСубъекта( Int(g_placeP), g_placecodekindP );
+   paymprop.rec.CORSCHEM = -1;
+   paymprop.rec.ISSENDER = "X";     
+   paymprop.rec.CORRID = -1;
+   paymprop.rec.OURCORRID = -1;
+   paymprop.rec.GROUP = 2;
+   paymprop.rec.CorrAcc = g_corAccP;
+   */
+   stat = paymprop.insert;
+   if (not stat)
+       RunError( "Ошибка при создании нового платежа 1 в таблице dpmprop_dbt." );
+   end;
+
+   //credit
+   paymprop2.rec.PAYMENTID = paym.rec.PAYMENTID;
+   paymprop2.rec.DEBETCREDIT = 1;
+   paymprop2.rec.TRANSFERDATE = paym.rec.VALUEDATE;
+   /*
+   paymprop2.rec.CODEKIND = g_placecodekindR;
+   paymprop2.rec.CODENAME = codeName;
+   paymprop2.rec.BANKCODE = ПолучитьКодСубъекта( Int(g_placeR), g_placecodekindR );
+   paymprop2.rec.CORSCHEM = -1;
+   paymprop2.rec.ISSENDER = "";
+   paymprop2.rec.CORRID = -1;
+   paymprop2.rec.OURCORRID = -1;
+   paymprop2.rec.GROUP = 2;
+   paymprop2.rec.CorrAcc = g_corAccR;
+   */
+   stat = paymprop2.insert;
+   if (not stat)
+      RunError( "Ошибка при создании нового платежа 2 в таблице dpmprop_dbt." );
+   end;
+   /*
+   //Реквизиты платежа
+   var accRmProp;
+   if(EmptyToChr1(g_accM) == EmptyToChr1("")) // Если нет посредника
+      accRmProp = StrFor(1);
+   else
+      //accRmProp = "Acc.№ "+g_accM;
+      accRmProp = g_accM;
+   end;
+   */
+
+   pmrmprop.rec.PAYMENTID = paym.rec.PAYMENTID ;   
+   pmrmprop.rec.DATE = paym.rec.VALUEDATE;
+   pmrmprop.rec.PAYDATE = paym.rec.VALUEDATE;
+   pmrmprop.rec.CLIENTDATE = paym.rec.VALUEDATE;
+   /*
+   pmrmprop.rec.PAYMENTKIND = "Э";
+   pmrmprop.rec.PAYERBANKNAME = fxPmnt.PayerPlace;
+   pmrmprop.rec.NUMBER = 0;
+   pmrmprop.rec.RECEIVERBANKNAME = fxPmnt.ReceiverPlace;
+   pmrmprop.rec.instancy = IfThenElse("X" == fxPmnt.chkInstancy, 1, 0);
+   pmrmprop.rec.receiverCorrBankName = accRmProp;
+   pmrmprop.rec.payerCorrAccNostro = ПолучитьКС(g_payer);
+   pmrmprop.rec.payerName = fxPmnt.Payer;
+   pmrmprop.rec.payerINN = ПолучитьКодСубъекта(g_payer,PTCK_INN);
+   pmrmprop.rec.receiverCorrAccNostro = ПолучитьКС(g_receiver);
+   pmrmprop.rec.receiverName = fxPmnt.Receiver;
+   pmrmprop.rec.receiverINN = ПолучитьКодСубъекта(g_receiver, PTCK_INN);
+   pmrmprop.rec.additionalInfo = EmptyToChr1(fxPmnt.reice);
+   pmrmprop.rec.Ground = EmptyToChr1(fxPmnt.Note);
+   */
+   stat = pmrmprop.insert;
+   if (not stat)
+       RunError( "Ошибка при создании нового платежа в таблице dpmrmprop_dbt." );
+   end;
+
+
+   OnError( RslErrObj )
+//      g_errorText = RslErrObj.Message;
+      AbortTrn();
+end;
+
+
+//
+// Сохранить новый введённый платёж
+//
+private macro SaveNew()
+   if (ProcessTrn(0, "SaveNewPmnt"))
+      return true;
+   else
+      MsgBox("Ошибка при вставке платежа "+g_errorText);
+      return false;
+   end;
+end;
+
+//
+// Сохранение данных с формы (используется как при сохранении платежа, так и опосредованно при сохранении с форм сделок)
+//
+private macro Save() 
+   if(g_bNewPmnt)               // Вводится новый платёж
+      return SaveNew();
+   end;
+ 
+   // Проверить возможность вносить изменение
+   if(not CheckCorrectSave())
+      MsgBox("Перевод не может быть изменён:\nПеревод обработан!");
+      return false;
+   end;
+
+/*
+   if(true == g_bCritical)      // Внесённое изменение считается критичным
+      MsgBox("Перевод не может быть изменён:\nВнесены критичные изменения!");
+      return false;
+   end;
+*/
+
+   //g_accM = FormatAccountNum(fxPmnt.MiddleAcc,  false);
+   //g_accMP= FormatAccountNum(fxPmnt.MiddleAccP, false);
+
+   if(g_bNeedRefAccs)
+      g_accP = FormatAccountNum(fxPmnt.PayerAcc,  false);
+      g_accR = FormatAccountNum(fxPmnt.ReceiverAcc,  false);
+   end;
+
+   // -------------------------------------------------------------------
+   // Сохранение данных платежа
+   var sql = " update dPmPaym_dbt "
+           + " set t_valueDate=:dat, t_baseAmount=:amount, t_Amount=:am,t_payAmount=:pam, t_futurePayerAmount=:fpam,t_futureReceiverAmount=:fram,  t_baseFiId=:bfi, t_FiId=:fi, t_payFiId=:pfi, t_FiId_futurePayAcc=:fpfi, t_FiId_futureRecAcc=:frfi, "
+           + " t_payerAccount=:pacc, t_receiverAccount=:racc, t_payer=:payer, t_receiver=:receiver, t_payerBankId=:pbId, t_receiverBankId=:rbId "
+           + " where t_paymentId=:pmntId ";
+ 
+   var am = money(round(FormatSum(fxPmnt.amount, false), 2));
+   var params = MakeArray(SQLParam("dat", fxPmnt.pmntDate), SQLParam("amount", am), SQLParam("am", am), SQLParam("pam", am), SQLParam("fpam", am), SQLParam("fram", am),
+        SQLParam("bfi", g_fiid), SQLParam("fi", g_fiid), SQLParam("pfi", g_fiid), SQLParam("fpfi", g_fiid), SQLParam("frfi", g_fiid),
+        SQLParam("pacc", EmptyToChr1(g_accP)), SQLParam("racc", EmptyToChr1(g_accR)), SQLParam("payer", g_payer), SQLParam("receiver", g_receiver),
+        SQLParam("pbId", g_placeP), SQLParam("rbId", g_placeR),
+        SQLParam("pmntId", rsPmnt.value("t_paymentId")));
+
+   var res = ExecSQL(sql, params, false);
+   if(null == res)
+      MsgBox("Ошибка при изменении платежа");
+      return false;
+   end;
+
+
+   if((0 != rsPmnt.value("t_futurePayerAmount")) and (FormatSum(fxPmnt.amount,false) != rsPmnt.value("t_futurePayerAmount"))) // Суммы расходятся => дописываем поля
+      sql = " update dPmPaym_dbt "
+          + " set t_amount=:am, t_payAmount=:pam, t_futurePayerAmount=:fpam, t_futureReceiverAmount=:fram "
+          + " where t_paymentId=:pmntId ";
+
+      params = MakeArray(SQLParam("am", am), SQLParam("pam", am), SQLParam("fpam", am), SQLParam("fram", am),
+        SQLParam("pmntId", rsPmnt.value("t_paymentId")));
+
+      res = ExecSQL(sql, params, false);
+      if(null == res)
+         MsgBox("Ошибка при изменении платежа!");
+         return false;
+      end;
+   end;
+
+
+   // -------------------------------------------------------------------
+   // Сохранение реквизитов платежа для R-макета
+   sql = " update dPmRmProp_dbt "
+       + " set t_instancy=:inst, t_receiverCorrBankName=:middle, t_date=:dat, "
+       + " t_payerCorrAccNostro=:pCorr, t_payerBankName=:pbName, t_payerName=:pName, t_payerINN=:pINN, "
+       + " t_receiverCorrAccNostro=:rCorr, t_receiverBankName=:rbName, t_receiverName=:rName, t_receiverINN=:rINN, "
+       + " t_additionalInfo=:reice, t_ground=:note "
+       + " where t_paymentId=:pmntId ";
+
+   var accRmProp;
+   if(EmptyToChr1(g_accM) == EmptyToChr1("")) // Если нет посредника
+      accRmProp = StrFor(1);
+   else
+//      accRmProp = "Acc.№ "+g_accM;
+      accRmProp = g_accM;
+   end;
+
+   params = MakeArray(SQLParam("inst", IfThenElse("X" == fxPmnt.chkInstancy, 1, 0)), SQLParam("middle", accRmProp),
+        SQLParam("dat", fxPmnt.pmntDate),
+        SQLParam("pCorr", ПолучитьКС(g_payer)), SQLParam("pbName", fxPmnt.PayerPlace), SQLParam("pName", fxPmnt.Payer), SQLParam("pINN", ПолучитьКодСубъекта(g_payer,PTCK_INN)),
+        SQLParam("rCorr", ПолучитьКС(g_receiver)), SQLParam("rbName", fxPmnt.ReceiverPlace), SQLParam("rName", fxPmnt.Receiver), SQLParam("rINN", ПолучитьКодСубъекта(g_receiver, PTCK_INN)),
+        SQLParam("reice", EmptyToChr1(fxPmnt.reice)), SQLParam("note", EmptyToChr1(fxPmnt.Note)), SQLParam("pmntId", rsPmnt.value("t_paymentId")));
+
+   res = ExecSQL(sql, params, false);
+   if(null == res)
+      MsgBox("Ошибка при изменении реквизитов платежа для R-макета");
+      return false;
+   end;
+
+
+   // -------------------------------------------------------------------
+   // Сохранение свойств платежа
+
+   var  codeName = "БИК";
+   if(0 != g_fiid)      // Не рублёвый платёж
+      codeName = "BIC";
+   end;
+   var codeKind:Integer =  getCodeKind(g_fiid);
+
+
+   // В начале сохраняются все данные, которые в RS-Bank принято записывать только в запись PmProp с t_debetCredit=1 (задано через DEB_CRED)
+   sql = " update dPmProp_dbt "
+       + " set /*t_reserve=:note,*/t_transferdate=:dat, t_CorrCode=:middle, t_corrCodeKind=:codeKind "
+       + " where t_paymentId=:pmntId and t_debetCredit=:debcred ";
+
+   params = MakeArray(/*SQLParam("note", EmptyToChr1(fxPmnt.Note)),*/SQLParam("dat", fxPmnt.pmntDate), SQLParam("middle", ПолучитьКодСубъекта(Int(g_middle), g_middlecodekind) ), SQLParam("codeKind", g_middlecodekind),
+        SQLParam("pmntId", rsPmnt.value("t_paymentId")), SQLParam("debcred", DEB_CRED));
+
+   res = ExecSQL(sql, params, false);
+   if(null == res)
+      MsgBox("Ошибка при изменении свойств платежа");
+      return false;
+   end;
+
+
+   // Свойства плательщика
+   sql = " update dPmProp_dbt "
+       + " set t_transferdate=:dat,t_codeKind = :kind, t_codeName = :name, t_bankCode = :code, t_CorrCode=:middle, t_corrCodeKind=:codeKind, t_corrAcc=:corrAcc, t_reserve=:note  "
+       + " where t_paymentId=:pmntId and t_debetCredit=:debcred ";
+   params = MakeArray( SQLParam("dat", fxPmnt.pmntDate),SQLParam("kind", g_placecodekindP), SQLParam("name", codeName),
+        SQLParam("code", ПолучитьКодСубъекта(Int(g_placeP), g_placecodekindP)),
+        SQLParam("middle", ПолучитьКодСубъекта(Int(g_middleP), g_middlecodekindP)),
+        SQLParam("codeKind", g_middlecodekindP), SQLParam("corrAcc", EmptyToChr1(/*g_accMP*/g_corAccP)),
+        SQLParam("note", EmptyToChr1(g_noteP)), SQLParam("pmntId", rsPmnt.value("t_paymentId")), SQLParam("debcred", 0));
+
+   res = ExecSQL(sql, params, false);
+   if(null == res)
+
+//msgbox(rsPmnt.value("t_paymentId"));
+/*msgbox(sql);
+msgbox(codeKind, " ", codeName, " ", rsPmnt.value("t_paymentId")," ", EmptyToChr1(g_noteR));
+msgbox(ПолучитьКодСубъекта(Int(g_placeR), codeKind));
+msgbox(ПолучитьКодСубъекта(Int(g_middleP), codeKind));
+msgbox(EmptyToChr1(g_accMP));
+msgbox(EmptyToChr1(g_noteP));*/
+
+      MsgBox("Ошибка при изменении свойств платежа плательщика");
+      return false;
+   end;
+
+   // Свойства получателя (посредник сохранён в общих св-вах с t_debetCredit=1)
+   sql = " update dPmProp_dbt "
+       + " set t_codeKind = :kind, t_codeName = :name, t_bankCode = :code, t_reserve=:note, t_corrAcc=:corr "
+       + " where t_paymentId=:pmntId and t_debetCredit=:debcred ";
+
+   params = MakeArray( SQLParam("kind", g_placecodekindR), SQLParam("name", codeName),
+        SQLParam("code", ПолучитьКодСубъекта(Int(g_placeR), g_placecodekindR)),
+        SQLParam("note", EmptyToChr1(g_noteR)), SQLParam("corr", EmptyToChr1(g_corAccR)),
+        SQLParam("pmntId", rsPmnt.value("t_paymentId")), SQLParam("debcred", 1));
+
+   res = ExecSQL(sql, params, false);
+   if(null == res)
+      MsgBox("Ошибка при изменении свойств платежа получателя");
+      return false;
+   end;
+
+
+   return true; // УСЛОВИЯ СДЕЛКИ БОЛЕЕ НЕ СОХРАНЯЮТСЯ АВТОМАТОМ (13.03.2008)
+
+   // -------------------------------------------------------------------
+   if(ManualAddedPaymentsExists(g_dealId, rsDeal.value("t_bOfficeKind")))       // Для платежей, введённых вручную, данные по сделке не пересчитываем
+      return true;
+   end;
+
+   // -------------------------------------------------------------------
+   // Сохранение данных сделки
+   sql = " update ddl_leg_dbt ";
+
+   if( (1 == rsPmnt.value("t_purpose")) or (3 == rsPmnt.value("t_purpose")))    // Платёж по базовому активу прямой или обратной сделки
+      sql = sql + " set t_principal=:amount, t_pfi=:fi  ";
+   else                                                                         // Платёж по котрактиву прямой или обратной сделки
+      sql = sql + " set t_cost=:amount, t_cfi=:fi ";
+   end;
+
+   sql = sql + " where t_dealId = :dealId and t_legId = :legId ";
+
+   params = MakeArray(SQLParam("amount", FormatSum(fxPmnt.amount, false)), SQLParam("fi", g_fiid), SQLParam("dealId", g_dealId), SQLParam("legId", g_legId));
+
+   res = ExecSQL(sql, params, false);
+   if(null == res)
+      MsgBox("Ошибка при изменении сделки");
+      return false;
+   end;
+
+
+   /*******************************/
+   /*if(0 == g_fiid)    // Для рублей всё уже заполнено.
+      return true;      // Для валюты ниже будут заполняться схемы оплаты
+   end;*/
+   /*******************************/
+
+
+
+
+   return true;
+   // ПЛАТЁЖНЫЕ СХЕМЫ БОЛЕЕ НЕ СОХРАНЯЮТСЯ АВТОМАТОМ (22.01.2008)
+   // если будут добавить в инсерты bankcodekind, corrbankcodekind
+
+
+
+
+   // -------------------------------------------------------------------
+   // Сохранение стандартных платёжных схем
+
+   sql = " select t_id, t_code, t_corrAcc, t_bankCode, t_corrBankCorrAcc, t_corrBankCode "
+          +" from dStd_req_dbt "
+          +" where t_fiid=:fiid and t_code=:code and t_codeKind=:codeKind and t_corrAcc=:corrAcc "
+          +" and t_bankCode=:bankCode and t_corrBankCorrAcc=:corrBankCorrAcc and t_corrBankCode=:corrBankCode " ;
+   var tsql = sql;
+
+   // Схема плательщика
+   var code = ПолучитьКодСубъекта (Int(g_payer), Int(codeKind));
+   var bankCode = ПолучитьКодСубъекта (Int(g_placeP), g_placecodekindP);
+
+
+   params = MakeArray(SQLParam("fiid", g_fiid), SQLParam("code", code), SQLParam("codeKind", codeKind), SQLParam("corrAcc", EmptyToChr1(g_accP)),
+        SQLParam("bankCode", bankCode), SQLParam("corrBankCorrAcc", EmptyToChr1(g_accMP)), SQLParam("corrBankCode", EmptyToChr1(g_middleP)));
+   res = ExecSQLSelect(sql, params, false);
+
+//msgbox("!"+g_fiid+"! !!"+code+ "!! !"+codeKind+"! !!"+EmptyToChr1(g_accP)+ "!! !"+bankCode+"! !!"+EmptyToChr1(g_accMP)+ "!! !" +EmptyToChr1(g_middleP)+"!");
+
+   if(not res.MoveNext()) // Нет такой схемы => добавить
+
+      sql = " insert into dStd_req_dbt  "
+          +" (t_fiId, t_code, t_codeKind, t_corrAcc, t_bankCode, t_corrBankCorrAcc, t_corrBankCode) "
+          +" values (:fiid, :code, :codeKind, :corrAcc, :bankCode, :corrBankCorrAcc, :corrBankCode) ";
+
+      params = MakeArray( SQLParam("fiid", g_fiid), SQLParam("code", code), SQLParam("codeKind", codeKind), SQLParam("corrAcc", EmptyToChr1(g_accP)),
+        SQLParam("bankCode", EmptyToChr1(bankCode)), SQLParam("corrBankCorrAcc", EmptyToChr1(g_accMP)), SQLParam("corrBankCode", EmptyToChr1(g_middleP)));
+
+      res = ExecSQL(sql, params, false);
+      if(null == res)
+         MsgBox("Ошибка при добавлении схемы плательщика");
+         return false;
+      end;
+   end;
+
+
+   // Схема получателя
+   code = ПолучитьКодСубъекта (Int(g_receiver), Int(codeKind));
+   bankCode = ПолучитьКодСубъекта (Int(g_placeR), g_placecodekindR);
+
+   sql = tsql;
+
+
+   params = MakeArray(SQLParam("fiid", g_fiid), SQLParam("code", code), SQLParam("codeKind", codeKind), SQLParam("corrAcc", EmptyToChr1(g_accR)),
+        SQLParam("bankCode", bankCode), SQLParam("corrBankCorrAcc", EmptyToChr1(g_accM)), SQLParam("corrBankCode", EmptyToChr1(g_middle)));
+   res = ExecSQLSelect(sql, params, false);
+
+
+   if(not res.MoveNext()) // Нет такой схемы => добавить
+
+      sql = " insert into dStd_req_dbt  "
+          +" (t_fiId, t_code, t_codeKind, t_corrAcc, t_bankCode, t_corrBankCorrAcc, t_corrBankCode) "
+          +" values (:fiid, :code, :codeKind, :corrAcc, :bankCode, :corrBankCorrAcc, :corrBankCode) ";
+
+      params = MakeArray( SQLParam("fiid", g_fiid), SQLParam("code", code), SQLParam("codeKind", codeKind), SQLParam("corrAcc", EmptyToChr1(g_accR)),
+        SQLParam("bankCode", EmptyToChr1(bankCode)), SQLParam("corrBankCorrAcc", EmptyToChr1(g_accM)), SQLParam("corrBankCode", EmptyToChr1(g_middle)));
+//msgbox(sql);
+//msgbox("!"+g_fiid+"! !!"+code+ "!! !"+codeKind+"! !!"+EmptyToChr1(g_accP)+ "!! !"+bankCode+"! !!"+EmptyToChr1(g_accMP)+ "!! !" +EmptyToChr1(g_middleP)+"!");
+      res = ExecSQL(sql, params, false);
+      if(null == res)
+         MsgBox("Ошибка при добавлении схемы получателя");
+         return false;
+      end;
+   end;
+
+
+   return true;
+
+end;
+
+
+
+//
+// Поиск и выбор финансового инструмента
+//
+
+private macro FindFI()
+   private var vvv;
+
+   var sql = "select * from dFinInstr_dbt where t_ccy = :ccy ";
+   var params = MakeArray(SQLParam("ccy", StrUpr(trim(fxPmnt.FI))));
+   var rs = ExecSQLSelect(sql, params, false);
+
+   if(rs.MoveNext())
+      tfiid=rs.value("t_fiid");
+      if ( tfiid > 0 )
+       CopyRSetToFBuff( r_fi, rs );
+      end;
+      g_bCritical = true;
+      return true;
+   end;
+
+   return false;
+end;
+
+
+
+
+//
+// Служебная процедура обновления поля ФИ
+//
+private macro updateFi()
+
+   if ( tfiid == 0 )
+    g_fiid    = tfiid;
+    fxPmnt.FI = "RUB";
+
+   else
+    g_fiid    = r_fi.fiid;
+    fxPmnt.FI = r_fi.ccy;
+   end;
+
+   // Сделать текущей запись рублёвую/валютную
+   if(0 == g_fiid)
+      g_r_acc = r_accR;
+   else
+      g_r_acc = r_accC;
+   end;
+
+   if(0 != g_fiid)      // Снять заперт на редактирование банка-посредника
+      enableFields(fxPmnt, FldIndex (fxPmnt, "Middle"));
+      enableFields(fxPmnt, FldIndex (fxPmnt, "MiddleAcc"));
+      enableFields(fxPmnt, FldIndex (fxPmnt, "MiddleP"));
+      enableFields(fxPmnt, FldIndex (fxPmnt, "MiddleAccP"));
+
+   else                 // Банка-посредника для рублёвых платежей быть не может!
+      //g_middle  = g_accM  = fxPmnt.Middle  = fxPmnt.MiddleAcc  = "";
+      //g_middleP = g_accMP = fxPmnt.MiddleP = fxPmnt.MiddleAccP = "";
+
+      /*disableFields(fxPmnt, FldIndex (fxPmnt, "Middle"));
+      disableFields(fxPmnt, FldIndex (fxPmnt, "MiddleAcc"));
+      disableFields(fxPmnt, FldIndex (fxPmnt, "MiddleP"));
+      disableFields(fxPmnt, FldIndex (fxPmnt, "MiddleAccP"));
+      */
+   end;
+   updateFields(fxPmnt, FldIndex(fxPmnt, "Middle"));
+   updateFields(fxPmnt, FldIndex(fxPmnt, "MiddleAcc"));
+   updateFields(fxPmnt, FldIndex(fxPmnt, "MiddleP"));
+   updateFields(fxPmnt, FldIndex(fxPmnt, "MiddleAccP"));
+
+
+   // Перерисовать окно
+   updateFields(fxPmnt, FldIndex(fxPmnt, "FI"));
+end;
+
+
+//
+// Поиск счёта
+//
+private macro FindAccount(acc, fi, accId, accVal)
+   var sql;
+
+   if("" == acc)        // Надо убрать счёт из поля
+     SetParm(2, "");
+     SetParm(3, "");
+     g_bCritical = true;
+     return true;
+   end;
+
+
+   if(0 == fi)
+      sql = "select t_account from dAccount_dbt where t_account = :acc ";
+   else
+      sql = "select t_account from dAccount_dbt where t_account = :acc ";
+   end;
+
+   var params = MakeArray(SQLParam("acc", FormatAccountNum(acc, false)));
+   var rs = ExecSQLSelect(sql, params, false);
+
+
+   if(rs.MoveNext())
+      SetParm(2, rs.value(0));                          // Номер счёта без точек
+      SetParm(3, FormatAccountNum(rs.value(0)));        // Номер счёта с точками
+      g_bCritical = true;
+      return true;
+   end;
+
+   //SetParm(2, "");
+   //SetParm(3, "");
+   return false;
+end;
+
+
+//
+// Поиск и выбор субъекта экономики
+//
+private macro FindParty(field, party)
+   if("" == field)      // Надо убрать субъекта из поля
+     SetParm(1, -1);
+     SetParm(0, "");
+     return true;
+   end;
+
+   var sql = "select t_partyId, t_shortname from dParty_dbt where upper(t_shortname) = upper(:name) ";
+   var params = MakeArray(SQLParam("name", trim(string(field))));
+   var rs = ExecSQLSelect(sql, params, false);
+
+   if(rs.MoveNext())
+      SetParm(1, rs.value(0));
+      SetParm(0, rs.value(1));
+      return true;
+   end;
+
+   return false;
+end;
+
+
+//
+// Обработать листинг участников (субъектов)
+//
+private macro ListParty(party:Integer, field, cod, mode)
+   var code; // БИК/SWIFT-код
+
+   if(ValType(mode) == V_UNDEF)
+      mode = PTLIST_ALLBANK;
+   end;
+
+   if(0 == g_fiid)
+      if( ListPT(r_party, 3, code, mode, party, PTCK_BIC) )
+         SetParm(0, r_party.partyId);
+         SetParm(1, diGetPartyNameById/*GetPartyNameById*/(r_party.partyId));
+         SetParm(2, code);
+         g_bCritical = true;
+         return true;
+      end;
+   else             // Можно задать вместо PTLIST_CONTR или PTLIST_ALLBANK значение ALLSWIFT!
+      if( ListPT(r_party, 6, code, mode, party, PTCK_SWIFT) )
+         SetParm(0, r_party.partyId);
+         SetParm(1, diGetPartyNameById/*GetPartyNameById*/(r_party.partyId));
+         SetParm(2, code);
+         g_bCritical = true;
+         return true;
+      end;
+   end;
+
+   return false;
+end;
+
+
+//
+// Обработчик скроллинга выбора банка из стандартной схемы
+//
+private macro SchemaPartyScrollEvProc(rs, cmd, id, key)
+  if (cmd == DLG_INIT)
+     rs.MoveFirst();
+     GoToScroll(rs, true);
+
+  elif (DLG_KEY == cmd)
+     if(DLG_KEY_ENTER == Key)
+        return CM_SELECT;
+     end;
+  end;
+
+  return CM_DEFAULT;
+end;
+
+
+//
+// Обработать листинг участников-мест (субъектов) по id банка, имеющего счёт в этом месте
+//
+macro ListSchemaParty(party:Integer, schemaId, bank, fiid, corr)
+   var codeKind =  getCodeKind(fiid);
+   var code = ПолучитьКодСубъекта (party, codeKind);
+
+
+      if("" == code)
+         if(codeKind == 3)
+            codeKind = 6;
+         else
+            codeKind = 3;
+         end;
+         code = ПолучитьКодСубъекта (party, codeKind);
+      end;
+
+   var codeKind2 = IfThenElse(codeKind == 3, 6, 3);
+   var code2 = ПолучитьКодСубъекта (party, codeKind2);
+
+//   var fiid = g_fiid;
+   var sql = " select req.t_id id, req.t_bankCode bcode, pt.t_name bname, req.t_BankCodeKind, req.t_corrAcc corr  "
+   +"  from dStd_req_dbt req "
+   +"  inner join dObjCode_dbt cod on cod.t_codeKind = req.t_BankcodeKind and cod.t_code = req.t_Bankcode and cod.t_objectType=3 "
+   +"  inner join dParty_dbt pt on pt.t_partyId = cod.t_objectId "
+   +"  where req.t_code in (:code, :code2) and req.t_codeKind in (3,6,:codeKind) and req.t_fiid=:fiid";
+   /*
+   var sql = " select req.t_id id, req.t_bankCode bcode, pt.t_name bname, req.t_corrAcc corr  "
+          +" from dStd_req_dbt req "
+          +"     inner join dObjCode_dbt cod "
+          +"     on cod.t_codeKind = req.t_codeKind and cod.t_code = req.t_bankCode and cod.t_objectType=3 "
+          +"         inner join dParty_dbt pt "
+          +"         on pt.t_partyId = cod.t_objectId "
+          +" where req.t_code in(:code, :code2) and req.t_codeKind in (3,6,:codeKind) and req.t_fiid=:fiid " ;
+   */
+
+   var params = MakeArray(SQLParam("code", code), SQLParam("code2", code2), SQLParam("codeKind", codeKind), SQLParam("fiid", fiid));
+   var rs = ExecSQLSelect(sql, params, false, RSDVAL_CLIENT, RSDVAL_STATIC);
+
+   var col = TArray();
+
+//   AddCol (col, 0, "bcode",             IfThenElse(3==codeKind, "БИК (ЦБ РФ)", "BIC ISO (SWIFT)"), 14);
+   AddCol (col, 0, "bcode",             "БИК (ISO SWIFT)", 14);
+   AddCol (col, 1, "bname",             "Наименование", 25);
+   AddCol (col, 2, "corr",              "Счёт", 20);
+
+   var bankParty=-1;
+
+   if(RunScroll (rs, 3, col, "SchemaPartyScroll", @SchemaPartyScrollEvProc, "Список банков",
+        "~ESC~ Выход, ~Enter~ Выбор", true, 0, 1, 100, 24) )
+
+      bankParty = ПолучитьКодСубъекта( string(rs.value("bcode")), Int(rs.value("t_BankcodeKind")) );
+      if("" == bankParty)
+         bankParty = ПолучитьКодСубъекта( string(rs.value("bcode")), Int(codeKind2) );
+      end;
+  
+      SetParm(1, rs.value("id"));
+      SetParm(2, bankParty);
+      SetParm(4, rs.value("corr"));
+      g_bCritical = true;
+      return true;
+   end;
+
+   return false;
+end;
+
+
+//
+// Проверка соответствия выбранного типа перевода целевому
+//
+
+//
+// Процедура обработки событий скроллинга типов переводов
+//
+private macro TransTypeEvProc(rs, cmd, id, key)
+  if (cmd == DLG_INIT)
+     rs.MoveFirst();
+     GoToScroll(rs, true);
+  elif (cmd == DLG_KEY)
+     if(DLG_KEY_ENTER == Key)           // Выбрать тип
+        if(g_bNewPmnt)
+           g_pmntType = rs.value(0);
+           fxPmnt.pmntType = rs.value(1);
+           return CM_SELECT;
+        end;
+
+        MsgBox("Смена типа перевода недопустима!");
+        return CM_CANCEL;
+     end;
+  end;
+
+  return CM_DEFAULT;
+end;
+
+//
+// Обработать листинг типов переводов по КО и МБК по классификации Банка
+//
+private macro ListTrans()
+
+   // Построение запроса для скроллинга
+   var trans = SqlVBuilder();
+   trans.AddAll(aTransTypes);
+
+   var sql = trans.Build();
+
+   // Вывод скроллинга на экран
+
+   var rs = ExecSQLSelect(sql, null, false, RSDVAL_CLIENT, RSDVAL_STATIC);
+
+   var col = TArray();
+   AddCol (col, 0, "Value",  "Перевод", null, true);
+
+
+   if(RunScroll (rs, 1, col, "TransTypeScroll", @TransTypeEvProc, "Типы переводов",
+        "~ESC~ выход, ~Enter~ выбор", true, 0, 1, 50) )
+      g_bCritical = true;
+      return true;
+   end;
+
+   return false;
+end;
+
+//
+// Проверка на корректность заполнения полей диалога
+//
+private macro isDataCorrect()
+   if ((_pmntDate != fxPmnt.pmntDate) or (_Amount != FormatSum(fxPmnt.amount, false)))  // Смена важных полей
+      g_bCritical = true;
+   end;
+
+   var bCorrect = g_bCritical;
+
+   if( FindFI(fxPmnt.FI) )
+      updateFi();
+   else
+      MsgBox(String("Не найдена валюта ", fxPmnt.FI, "!"));
+      return false;
+   end;
+
+   /*
+   if( not FindParty(fxPmnt.Payer, g_payer) )
+      MsgBox(String("Не найден субъект ", fxPmnt.Payer, "!"));
+      return false;
+   elif( not FindParty(fxPmnt.Receiver, g_receiver) )
+      MsgBox(String("Не найден субъект ", fxPmnt.Receiver, "!"));
+      return false;
+   elif( not FindParty(fxPmnt.PayerPlace, g_placeP) )
+      MsgBox(String("Не найден субъект ", fxPmnt.PayerPlace, "!"));
+      return false;
+   elif( not FindParty(fxPmnt.ReceiverPlace, g_placeR) )
+      MsgBox(String("Не найден субъект ", fxPmnt.ReceiverPlace, "!"));
+      return false;
+   */
+
+   if( not FindAccount( FormatAccountNum(fxPmnt.PayerAcc, false),g_fiid,g_accP) )
+
+      if(("" != fxPmnt.PayerAcc) and (g_placeP == _SelfID))
+     //    MsgBox(String("Не найден счёт ", FormatAccountNum(fxPmnt.PayerAcc), "!"));
+     //    return false;
+      end;
+
+      if(g_placeP != _SelfID)  // Счёт у нас не фигурирует, но он чужого банка
+         g_accP = FormatAccountNum(fxPmnt.PayerAcc, false);
+      end;
+   elif( not FindAccount( FormatAccountNum(fxPmnt.ReceiverAcc, false),g_fiid,g_accR )  )
+
+      if(("" != fxPmnt.PayerAcc) and (g_placeR == _SelfID))
+     //    MsgBox(String("Не найден счёт ", FormatAccountNum(fxPmnt.ReceiverAcc), "!"));
+     //    return false;
+      end;
+
+      if(g_placeR != _SelfID)  // Счёт у нас не фигурирует, но он чужого банка
+         g_accR = FormatAccountNum(fxPmnt.ReceiverAcc, false);
+      end;
+
+/*
+   elif(g_payer == g_receiver)
+      MsgBox(String("Плательщик и получатель платежа должны различаться!"));
+      return false;
+*/
+   end;
+
+
+
+   //if(0 == g_fiid)    // проверка длины счёта в рублях
+/*      if((strlen(g_accP)  != 20) and (g_accP != -1) and (strlen(g_accP)  != 0))
+         MsgBox("Длина счёта плательщика некорректна");
+         return false;
+      end;
+
+      if((strlen(g_accR)  != 20) and (g_accR != -1) and (strlen(g_accR)  != 0))
+         MsgBox("Длина счёта получателя некорректна");
+         return false;
+      end;
+*/
+   //end;
+
+
+
+  /*
+   var tmp;
+   if( FindParty(fxPmnt.Middle, tmp) )
+      g_middle = ПолучитьКодСубъекта (tmp, PTCK_SWIFT);
+   else
+      MsgBox(String("Не найден субъект ", fxPmnt.Middle, "!"));
+      return false;
+   end;
+
+   if( FindParty(fxPmnt.MiddleP, tmp) )
+      g_middleP = ПолучитьКодСубъекта (tmp, PTCK_SWIFT);
+   else
+      MsgBox(String("Не найден субъект ", fxPmnt.MiddleP, "!"));
+      return false;
+   end;
+  */
+   g_bCritical = bCorrect; // Восстановление критичности, которая была до проверки
+
+   return true;
+end;
+
+
+
+
+//
+// Установить поля плательщика
+//
+private macro SetPayer(t_id)
+   var sql = " select t_id, t_code, t_corrAcc, t_bankCode, t_bankcodekind, t_corrBankCorrAcc, t_corrBankCode, "
+            +" t_corrbankcodekind, t_addition from dStd_req_dbt where t_id=:id";
+   var params:TArray;
+   params = MakeArray(SQLParam("id", t_id));
+   var rs = ExecSQLSelect(sql, params, false);
+
+   var codeKind:Integer = getCodeKind(g_fiid);
+
+   if(rs.MoveNext())
+      // Установить значения плательщика
+
+      /////g_accP   = SpecialValue0ToEmpty(rs.value("t_corrAcc"));
+      g_corAccP = SpecialValue0ToEmpty(rs.value("t_corrAcc"));
+      g_placecodekindP = Int(rs.value("t_bankcodekind"));
+      g_placeP  = ПолучитьКодСубъекта( string(rs.value("t_bankCode")), g_placecodekindP );
+      if("" == g_placeP)
+         if(3 == codeKind)
+            codeKind = 6;
+         else
+            codeKind = 3;
+         end;
+         g_placeP = ПолучитьКодСубъекта( string(rs.value("t_bankCode")), Int(codeKind) );
+         g_placecodekindP = Int(codeKind);
+      end;
+
+      g_accMP   = SpecialValue0ToEmpty(rs.value("t_corrBankCorrAcc"));
+      g_middlecodekindP = Int(rs.value("t_corrbankcodekind"));
+      g_middleP = ПолучитьКодСубъекта( string(rs.value("t_corrBankCode")), g_middlecodekindP );
+      g_noteP   = SpecialValue0ToEmpty(rs.value("t_addition"));;
+
+      fxPmnt.PayerPlace = ClearParty(diGetPartyNameById/*GetPartyNameById*/(g_placeP));
+
+      if(null != g_accP);
+         fxPmnt.PayerAcc = FormatAccountNum( String(g_accP) );
+      end;
+      //fxPmnt.MiddleAccP = FormatAccountNum( String(g_accMP) );
+      //fxPmnt.MiddleP = ClearParty(diGetPartyNameById/*GetPartyNameById*/(g_middleP));
+
+/*      if(_SelfID != g_payer)
+         fxPmnt.Note = SpecialValue0ToEmpty(rs.value("t_addition"));
+      end;
+*/
+   end;
+end;
+
+//
+// Установить поля получателя
+//
+private macro SetReceiver(t_id)
+   var sql = " select t_id, t_code, t_corrAcc, t_bankCode, t_bankcodekind, t_corrBankCorrAcc, t_corrBankCode, "
+            +" t_corrbankcodekind, t_addition from dStd_req_dbt where t_id=:id";
+   var params:TArray;
+   params = MakeArray(SQLParam("id", t_id));
+   var rs = ExecSQLSelect(sql, params, false);
+
+   var codeKind:Integer = getCodeKind(g_fiid);
+
+   if(rs.MoveNext())
+      // Установить значения получателя
+      ////g_accR   = SpecialValue0ToEmpty(rs.value("t_corrAcc"));
+      g_corAccR = SpecialValue0ToEmpty(rs.value("t_corrAcc"));
+      g_placecodekindR = Int(rs.value("t_bankcodekind"));
+      g_placeR  = ПолучитьКодСубъекта( string(rs.value("t_bankCode")), g_placecodekindR );
+
+      if("" == g_placeR)
+         if(3 == codeKind)
+            codeKind = 6;
+         else
+            codeKind = 3;
+         end;
+         g_placeR = ПолучитьКодСубъекта( string(rs.value("t_bankCode")), Int(codeKind) );
+         g_placecodekindR = Int(codeKind);
+      end;
+
+      g_accM   = SpecialValue0ToEmpty(rs.value("t_corrBankCorrAcc"));
+      g_middlecodekind = Int(rs.value("t_corrbankcodekind"));
+      g_middle = ПолучитьКодСубъекта( string(rs.value("t_corrBankCode")), g_middlecodekind );
+      g_noteR  = SpecialValue0ToEmpty(rs.value("t_addition"));;
+
+      fxPmnt.ReceiverPlace = ClearParty(diGetPartyNameById/*GetPartyNameById*/(g_placeR));
+
+      if(null != g_accR);
+         fxPmnt.ReceiverAcc = FormatAccountNum( String(g_accR) );
+      end;
+      //fxPmnt.MiddleAcc = FormatAccountNum( String(g_accM) );
+      //fxPmnt.Middle = ClearParty(diGetPartyNameById/*GetPartyNameById*/(g_middle));
+
+/*      if(_SelfID != g_receiver)
+         fxPmnt.Note = SpecialValue0ToEmpty(rs.value("t_addition"));
+      end;
+*/
+    end;
+end;
+
+
+//
+// Загрузить стандартные платёжные реквизиты (не используется)
+//
+private macro LoadStdReq()
+   var opt=-1;
+   var reqCount=0;
+
+   // Меню вариантов способа оплаты
+   array ВарОплаты, tId;
+   var i=0;
+
+
+   var sql = " select t_id, t_code, t_corrAcc, t_bankCode, t_corrBankCorrAcc, t_corrBankCode  "
+          +" from dStd_req_dbt "
+          +" where t_fiid=:fiid and t_code=:code and t_codeKind=:codeKind  order by t_bankCode " ;
+
+   //
+   // Плательщик
+   var codeKind:Integer =  getCodeKind(g_fiid);
+   var code = ПолучитьКодСубъекта (Int(g_payer), Int(codeKind));
+
+//   msgbox(sql); msgbox(string("!", codeKind, " !!", code, " !!!", g_fiid));
+   var params:TArray;
+   params = MakeArray(SQLParam("fiid", g_fiid), SQLParam("code", code), SQLParam("codeKind", codeKind));
+   var rs = ExecSQLSelect(sql, params, false);
+
+   while(rs.MoveNext())
+      ВарОплаты(i) = "Acc. " +  rs.value("t_corrAcc") + " with " + diGetPartyNameById/*GetPartyNameById*/(ПолучитьКодСубъекта( string(rs.value("t_bankCode")), Int(codeKind) ));
+      tId(i) =  rs.value("t_id");
+
+      i = i+1;
+   end;
+
+   if(i>0)
+        reqCount=reqCount+1;
+      //while(opt<0)
+        opt = Menu(ВарОплаты, "Укажите схему оплаты для плательщика", "Выбор схемы оплаты плательщика");
+        if (opt >= 0)
+           SetPayer(tId(opt));
+           updateFields(fxPmnt, FldIndex(fxPmnt, "PayerPlace"));
+           updateFields(fxPmnt, FldIndex(fxPmnt, "PayerAcc"));
+           updateFields(fxPmnt, FldIndex(fxPmnt, "MiddleAccP"));
+           updateFields(fxPmnt, FldIndex(fxPmnt, "MiddleP"));
+           updateFields(fxPmnt, FldIndex(fxPmnt, "Note"));
+        end;
+      //end;
+   end;
+
+
+   //
+   // Получатель
+   asize(ВарОплаты, 0);
+   asize(tId, 0);
+   i=0;
+
+   code = ПолучитьКодСубъекта (Int(g_receiver), Int(codeKind));
+   params = MakeArray(SQLParam("fiid", g_fiid), SQLParam("code", code), SQLParam("codeKind", codeKind));
+   rs = ExecSQLSelect(sql, params, false);
+
+   while(rs.MoveNext())
+      ВарОплаты(i) = "Acc. " +  rs.value("t_corrAcc") + " with " + diGetPartyNameById/*GetPartyNameById*/(ПолучитьКодСубъекта( string(rs.value("t_bankCode")), Int(codeKind) ));
+      tId(i) =  rs.value("t_id");
+
+      i = i+1;
+   end;
+
+   if(i>0)
+        reqCount=reqCount+1;
+      //while(opt<0)
+        opt = Menu(ВарОплаты, "Укажите схему оплаты для получателя", "Выбор схемы оплаты получателя");
+      //end;
+
+        if (opt >= 0)
+           SetReceiver(tId(opt));
+           updateFields(fxPmnt, FldIndex(fxPmnt, "ReceiverPlace"));
+           updateFields(fxPmnt, FldIndex(fxPmnt, "ReceiverAcc"));
+           updateFields(fxPmnt, FldIndex(fxPmnt, "MiddleAcc"));
+           updateFields(fxPmnt, FldIndex(fxPmnt, "Middle"));
+           updateFields(fxPmnt, FldIndex(fxPmnt, "Note"));
+        end;
+   end;
+
+   if(0 == reqCount)
+      MsgBox("Не найдено ни одной подходящей схемы");
+      return false;
+   end;
+
+   return true;
+end;
+
+private macro СделкаОтложена() //Признак отложенной сделки
+
+  return 1;
+  var sql = "select count(*) t_cnt from ddl_tick_dbt where t_DealStatus = 0 and t_DealID = :DealID";
+  sql = ExecSQLSelect(sql, MakeArray(SQLParam("DealID", g_DealID)), false);
+  return (sql.MoveNext() and sql.value("t_cnt"));
+
+end;
+
+//
+// Процедура обработки сообщений формы
+//
+private macro EvPmntProc (dlg, cmd, id, key )
+   ClearRecord(r_fi);
+   ClearRecord(r_accR);
+   ClearRecord(r_accC);
+   var tmp = null, tmp2 = null, err = "";
+   var fldCnt = 0;
+
+
+   if ( DLG_INIT == cmd )
+     message("~ESC~ выход, ~F3~ выбор из справочника, ~F9~ сохранить");
+     DisableFields(fxPmnt, FldIndex (fxPmnt, "FI"));
+     DisableFields(fxPmnt, FldIndex (fxPmnt, "Reice"));
+     DisableFields(fxPmnt, FldIndex (fxPmnt, "PmntDate"));
+     DisableFields(fxPmnt, FldIndex (fxPmnt, "chkinstancy"));
+     DisableFields(fxPmnt, FldIndex (fxPmnt, "pmntTime"));
+     DisableFields(fxPmnt, FldIndex (fxPmnt, "pmntId"));
+     DisableFields(fxPmnt, FldIndex (fxPmnt, "pmntType"));
+     DisableFields(fxPmnt, FldIndex (fxPmnt, "Receiver"));
+     DisableFields(fxPmnt, FldIndex (fxPmnt, "Payer"));
+     g_bCritical = false;
+     if(not g_bNewPmnt)
+       if(32000 == rsPmnt.value("t_paymStatus"))         // Закрыт
+          //DisableFields(fxPmnt);
+         fldCnt = fldNumber (fxPmnt);
+         tmp=0;
+         while(tmp < fldCnt)
+            DisableFields(fxPmnt, tmp);
+            tmp = tmp+1;
+         end;
+       
+//         EnableFields(fxPmnt, FldIndex (fxPmnt, "btnOk"));
+//         EnableFields(fxPmnt, FldIndex (fxPmnt, "btnCancel"));
+       elif (55 == rsPmnt.value("t_paymStatus"))         // Пролонгирован
+         fldCnt = fldNumber (fxPmnt);
+         tmp=0;
+         while(tmp < fldCnt)
+            DisableFields(fxPmnt, tmp);
+            tmp = tmp+1;
+         end;
+//         EnableFields(fxPmnt, FldIndex (fxPmnt, "chkInstancy"));
+//         EnableFields(fxPmnt, FldIndex (fxPmnt, "Reice"));
+//         EnableFields(fxPmnt, FldIndex (fxPmnt, "btnOk"));
+//         EnableFields(fxPmnt, FldIndex (fxPmnt, "btnCancel"));
+       end;
+     end;
+     //У отложенных сделок открываем поле сумма платежа, у всех остальных закрываем
+     if(not СделкаОтложена())
+       DisableFields(fxPmnt, FldIndex (fxPmnt, "Amount"));
+     end;
+          EnableFields(fxPmnt, FldIndex (fxPmnt, "PmntDate"));
+          DisableFields(fxPmnt, FldIndex (fxPmnt, "PayerAcc"));
+          DisableFields(fxPmnt, FldIndex (fxPmnt, "ReceiverAcc"));
+          DisableFields(fxPmnt, FldIndex (fxPmnt, "PayerPlace"));
+          DisableFields(fxPmnt, FldIndex (fxPmnt, "ReceiverPlace"));
+
+
+
+/*
+     if(not g_CorrectFlag)
+       DisableFields(fxPmnt);
+     else
+       if(g_payer == _SelfID)
+          DisableFields(fxPmnt, FldIndex (fxPmnt, "PayerAcc"));
+       elif(g_receiver == _SelfID)
+          DisableFields(fxPmnt, FldIndex (fxPmnt, "ReceiverAcc"));
+       end;
+     end;
+
+*/
+
+     updateFields(fxPmnt);
+
+/*
+      if(0 == g_fiid)    // Банка-посредника для рублёвых платежей быть не может!
+        DisableFields(fxPmnt, FldIndex (fxPmnt, "Middle"));
+        DisableFields(fxPmnt, FldIndex (fxPmnt, "MiddleAcc"));
+        updateFields(fxPmnt, FldIndex(fxPmnt, "Middle"));
+        updateFields(fxPmnt, FldIndex(fxPmnt, "MiddleAcc"));
+
+        DisableFields(fxPmnt, FldIndex (fxPmnt, "MiddleP"));
+        DisableFields(fxPmnt, FldIndex (fxPmnt, "MiddleAccP"));
+        updateFields(fxPmnt, FldIndex(fxPmnt, "MiddleP"));
+        updateFields(fxPmnt, FldIndex(fxPmnt, "MiddleAccP"));
+      end;
+*/
+
+   // Событие клавиши
+   elif ( DLG_KEY == cmd )
+      if(DLG_KEY_F9 == Key)     // Сохранение по F9
+         // Проверка на корректность
+         if(not isDataCorrect())
+            return CM_IGNORE;
+         end;
+         if(not Save())
+            return CM_IGNORE;
+         end;
+         return CM_SAVE;
+
+     elif (DLG_KEY_ESC == key)  // Закрытие окна по Escape
+        if(g_CorrectFlag)       // Только если корректировка в платеже возможна
+          if(false == GetTRUE(false, "Выйти из перевода без сохранения?"))
+             return CM_IGNORE;
+          end;
+        end;
+      elif(DLG_KEY_F3 == Key)
+         if(FldIndex(fxPmnt, "FI") == id)               // Выбор финансового инструмента
+            if ( ListFI(FIKIND_CURRENCY, 0, r_fi) )
+               updateFi();
+            end;
+
+         elif(FldIndex(fxPmnt, "pmntDate") == id)       // Выбор даты перевода с помощью календарика
+            fxPmnt.pmntDate = GetDateByCalendar(date(fxPmnt.pmntDate));
+            updateFields(fxPmnt, FldIndex(fxPmnt, "pmntDate"));
+
+         elif(FldIndex(fxPmnt, "PayerAcc") == id)       // Выбор счёта плательщика
+            if(g_payer == _SelfID)
+               if ( ListAccount(g_r_acc, 1, g_fiid, FormatAccountNum( String(fxPmnt.PayerAcc), false )) )
+                  fxPmnt.PayerAcc = FormatAccountNum( String(g_r_acc.account) );
+                  updateFields(fxPmnt, FldIndex(fxPmnt, "PayerAcc"));
+                  g_accP = g_r_acc.account;
+                  g_bCritical = true;
+               end;
+            end;
+         elif(FldIndex(fxPmnt, "ReceiverAcc") == id)    // Выбор счёта получателя
+            if(g_receiver == _SelfID)
+               if ( ListAccount(g_r_acc, 1, g_fiid, FormatAccountNum( String(fxPmnt.ReceiverAcc), false )) )
+                  fxPmnt.ReceiverAcc = FormatAccountNum( String(g_r_acc.account) );
+                  updateFields(fxPmnt, FldIndex(fxPmnt, "ReceiverAcc"));
+                  g_accR = g_r_acc.account;
+                  g_bCritical = true;
+               end;
+            end;
+/*         elif(FldIndex(fxPmnt, "MiddleAcc") == id)    // Выбор счёта в банке-посреднике
+            if ( ListAccount(g_r_acc, 1, g_fiid, FormatAccountNum( String(fxPmnt.MiddleAcc), false )) )
+               fxPmnt.MiddleAcc = FormatAccountNum( String(g_r_acc.account) );
+               updateFields(fxPmnt, FldIndex(fxPmnt, "MiddleAcc"));
+               g_accM = g_r_acc.account;
+               g_bCritical = true;
+            end;
+         elif(FldIndex(fxPmnt, "MiddleAccP") == id)    // Выбор счёта в банке-посреднике
+            if ( ListAccount(g_r_acc, 1, g_fiid, FormatAccountNum( String(fxPmnt.MiddleAccP), false )) )
+               fxPmnt.MiddleAccP = FormatAccountNum( String(g_r_acc.account) );
+               updateFields(fxPmnt, FldIndex(fxPmnt, "MiddleAccP"));
+               g_accMP = g_r_acc.account;
+               g_bCritical = true;
+            end;
+*/
+         elif(FldIndex(fxPmnt, "pmntType") == id)       // Выбор типа перевода
+            if( ListTrans() )
+               updateFields(fxPmnt, FldIndex(fxPmnt, "pmntType"));
+            end;
+
+         elif(FldIndex(fxPmnt, "Payer") == id)          // Выбор плательщика
+             if(ListParty(g_payer, fxPmnt.Payer, tmp, PTLIST_CONTR))
+               updateFields(fxPmnt, fxPmnt.Payer);
+             end;
+         elif(FldIndex(fxPmnt, "Receiver") == id)       // Выбор получателя
+            if(ListParty(g_receiver, fxPmnt.Receiver, tmp, PTLIST_CONTR))
+               updateFields(fxPmnt, FldIndex(fxPmnt, "Receiver"));
+            end;
+
+
+         elif(FldIndex(fxPmnt, "PayerPlace") == id)     // Выбор банка плательщика
+
+            //if(ListParty(g_placeP, fxPmnt.PayerPlace, tmp, PTLIST_ALLCORRESP))
+            if(ListSchemaParty(g_payer, tmp, tmp2, g_fiid, g_corAccP))
+               SetPayer(tmp);
+               updateFields(fxPmnt, FldIndex(fxPmnt, "PayerPlace"));
+               //updateFields(fxPmnt, FldIndex(fxPmnt, "PayerAcc"));
+               //updateFields(fxPmnt, FldIndex(fxPmnt, "MiddleAccP"));
+               //updateFields(fxPmnt, FldIndex(fxPmnt, "MiddleP"));
+               //updateFields(fxPmnt, FldIndex(fxPmnt, "Note"));
+            end;
+
+         elif(FldIndex(fxPmnt, "ReceiverPlace") == id)  // Выбор банка получателя
+            //if(ListParty(g_placeR, fxPmnt.ReceiverPlace, tmp, PTLIST_ALLCORRESP))
+
+            if(ListSchemaParty(g_receiver, tmp, tmp2, g_fiid, g_corAccR))
+               SetReceiver(tmp);
+               updateFields(fxPmnt, FldIndex(fxPmnt, "ReceiverPlace"));
+               //updateFields(fxPmnt, FldIndex(fxPmnt, "ReceiverAcc"));
+               //updateFields(fxPmnt, FldIndex(fxPmnt, "MiddleAcc"));
+               //updateFields(fxPmnt, FldIndex(fxPmnt, "Middle"));
+               //updateFields(fxPmnt, FldIndex(fxPmnt, "Note"));
+            end;
+
+/*       elif(FldIndex(fxPmnt, "Middle") == id)         // Выбор банка-посредника
+            //if(ListParty(ПолучитьКодСубъекта(string(g_middle), /*PTCK_SWIFT*/getCodeKind(g_fiid)), fxPmnt.Middle, g_middle))
+            if(ListParty(g_middle, fxPmnt.Middle, tmp))
+
+               updateFields(fxPmnt, fxPmnt.Middle);
+            end;
+         elif(FldIndex(fxPmnt, "MiddleP") == id)        // Выбор банка-посредника
+            if(ListParty(g_middleP, fxPmnt.MiddleP, tmp))
+               updateFields(fxPmnt, fxPmnt.MiddleP);
+            end;
+*/
+         end;
+
+      elif(DLG_KEY_SPACE == Key)
+         if(FldIndex(fxPmnt, "chkInstancy") == id)      // Отметка/снятие отметки срочности платежа
+            fxPmnt.chkInstancy = IfThenElse("" == fxPmnt.chkInstancy, "X", "");
+            updateFields(fxPmnt, FldIndex(fxPmnt, "chkInstancy"));
+         end;
+      end;
+
+   // Событие кнопок на форме
+   elif ( DLG_BUTTON == cmd )
+      if (FldIndex(fxPmnt, "btnOk") == id)              // Сохранение по кнопке Ok на форме
+         // Проверка на корректность
+         if(not isDataCorrect())
+            return CM_IGNORE;
+         end;             
+         if(not Save())
+            return CM_IGNORE;
+         end;
+         return CM_SAVE;
+      elif(FldIndex(fxPmnt, "btnCancel") == id)         // Отмена (аналогично Escape) по кнопке Cancel
+         return CM_CANCEL;
+      elif(FldIndex(fxPmnt, "btnReq") == id)            // Выбор загрузки реквизитов из таблицы стандартных платёжных реквизитов
+                                                        // Функционал удалён. Для восстановления нужна на форме кнопка с именем btnReq
+         //if(GetTRUE(false, "Загрузить страндартные реквизиты?"))
+            LoadStdReq();
+            updateFields(fxPmnt);
+         //end;
+      end;
+
+
+   // Событие установки (получения) фокуса полем
+   elif ( DLG_SETFOCUS == cmd)
+      if(FldIndex(fxPmnt, "PayerAcc") == id)            // Выбор счёта плательщика
+         fxPmnt.PayerAcc = FormatAccountNum(fxPmnt.PayerAcc, false);
+         updateFields(fxPmnt, FldIndex(fxPmnt, "PayerAcc"));
+
+      elif(FldIndex(fxPmnt, "ReceiverAcc") == id)       // Выбор счёта получателя
+         fxPmnt.ReceiverAcc = FormatAccountNum(fxPmnt.ReceiverAcc, false);
+         updateFields(fxPmnt, FldIndex(fxPmnt, "ReceiverAcc"));
+
+/*      elif(FldIndex(fxPmnt, "MiddleAcc") == id)               // Выбор счёта в банке-посреднике
+         fxPmnt.MiddleAcc = FormatAccountNum(fxPmnt.MiddleAcc, false);
+         updateFields(fxPmnt, FldIndex(fxPmnt, "MiddleAcc"));
+      elif(FldIndex(fxPmnt, "MiddleAccP") == id)        // Выбор счёта в банке-посреднике
+         fxPmnt.MiddleAccP = FormatAccountNum(fxPmnt.MiddleAccP, false);
+         updateFields(fxPmnt, FldIndex(fxPmnt, "MiddleAccP"));
+*/
+      elif(FldIndex(fxPmnt, "amount") == id)            // Выбор суммы сделки
+         fxPmnt.amount = FormatSum( fxPmnt.amount, false );
+         updateFields(fxPmnt, FldIndex(fxPmnt, "amount"));
+      end;
+
+
+   // Событие потери фокуса полем
+   elif ( DLG_REMFOCUS == cmd )
+      if(FldIndex(fxPmnt, "FI") == id)                  // Выбор финансового инструмента "вручную"
+         if( FindFI(fxPmnt.FI) )
+            updateFi();
+         else
+            if("" != fxPmnt.FI)
+               MsgBox(String("Не найдена валюта ", fxPmnt.FI, "!"));
+            end;
+         end;
+
+      elif(FldIndex(fxPmnt, "amount") == id)            // Выбор суммы сделки
+        fxPmnt.amount = FormatSum( fxPmnt.amount );
+        updateFields(fxPmnt, FldIndex(fxPmnt, "amount"));
+
+
+      elif(FldIndex(fxPmnt, "PayerAcc") == id)          // Выбор счёта плательщика "вручную"
+         if( FindAccount( FormatAccountNum(fxPmnt.PayerAcc, false),g_fiid,g_accP) )
+            fxPmnt.PayerAcc = FormatAccountNum(g_accP);
+            updateFields(fxPmnt, FldIndex(fxPmnt, "PayerAcc"));
+         else
+            if(("" != fxPmnt.PayerAcc) and (g_placeP == _SelfID))
+       //        MsgBox(String("Не найден счёт ", FormatAccountNum(fxPmnt.PayerAcc), "!"));
+            end;
+
+            if(g_placeP != _SelfID)    // Счёт у нас не фигурирует, но он чужого банка
+               g_accP = FormatAccountNum(fxPmnt.PayerAcc, false);
+               fxPmnt.PayerAcc = FormatAccountNum(g_accP);
+               updateFields(fxPmnt, FldIndex(fxPmnt, "PayerAcc"));
+            end;
+         end;
+
+      elif(FldIndex(fxPmnt, "ReceiverAcc") == id)       // Выбор счёта получателя "вручную"
+
+         if( FindAccount( FormatAccountNum(fxPmnt.ReceiverAcc, false),g_fiid,g_accR ) )
+            fxPmnt.ReceiverAcc = FormatAccountNum(g_accR);
+            updateFields(fxPmnt, FldIndex(fxPmnt, "ReceiverAcc"));
+         else
+            if(("" != fxPmnt.ReceiverAcc) and (g_placeR == _SelfID))
+          //      MsgBox(String("Не найден счёт ", FormatAccountNum(fxPmnt.ReceiverAcc), "!"));
+            end;
+
+            if(g_placeR != _SelfID)    // Счёт у нас не фигурирует, но он чужого банка
+               g_accR = FormatAccountNum(fxPmnt.ReceiverAcc, false);
+               fxPmnt.ReceiverAcc = FormatAccountNum(g_accR);
+               updateFields(fxPmnt, FldIndex(fxPmnt, "ReceiverAcc"));
+            end;
+         end;
+/*
+      elif(FldIndex(fxPmnt, "MiddleAcc") == id) // Выбор счёта в банке-посреднике "вручную"
+
+         //if( FindAccount( FormatAccountNum(fxPmnt.MiddleAcc, false),g_fiid,g_accM ) )
+            g_accM = FormatAccountNum(fxPmnt.MiddleAcc, false);
+            fxPmnt.MiddleAcc = FormatAccountNum(g_accM);
+            updateFields(fxPmnt, FldIndex(fxPmnt, "MiddleAcc"));
+         //end;
+
+     elif(FldIndex(fxPmnt, "MiddleAccP") == id) // Выбор счёта в банке-посреднике "вручную"
+
+         //if( FindAccount( FormatAccountNum(fxPmnt.MiddleAccP, false),g_fiidP,g_accMP ) )
+            g_accMP = FormatAccountNum(fxPmnt.MiddleAccP, false);
+            fxPmnt.MiddleAccP = FormatAccountNum(g_accMP);
+            updateFields(fxPmnt, FldIndex(fxPmnt, "MiddleAccP"));
+         //end;
+*/
+
+    /*  elif(FldIndex(fxPmnt, "Payer") == id)                   // Выбор плательщика "вручную"
+         if( FindParty(fxPmnt.Payer, g_payer) )
+            updateFields(fxPmnt, fxPmnt.Payer);
+         else
+            MsgBox(String("Не найден субъект ", fxPmnt.Payer, "!"));
+         end;
+      elif(FldIndex(fxPmnt, "Receiver") == id)          // Выбор получателя "вручную"
+         if( FindParty(fxPmnt.Receiver, g_receiver) )
+            updateFields(fxPmnt, fxPmnt.Receiver);
+         else
+            MsgBox(String("Не найден субъект ", fxPmnt.Receiver, "!"));
+         end;
+      elif(FldIndex(fxPmnt, "PayerPlace") == id)        // Выбор банка плательщика "вручную"
+         if( FindParty(fxPmnt.PayerPlace, g_placeP) )
+            updateFields(fxPmnt, fxPmnt.PayerPlace);
+         else
+            MsgBox(String("Не найден субъект ", fxPmnt.PayerPlace, "!"));
+         end;
+      elif(FldIndex(fxPmnt, "ReceiverPlace") == id)     // Выбор банка получателя "вручную"
+         if( FindParty(fxPmnt.ReceiverPlace, g_placeR) )
+            updateFields(fxPmnt, fxPmnt.ReceiverPlace);
+         else
+            MsgBox(String("Не найден субъект ", fxPmnt.ReceiverPlace, "!"));
+         end;
+
+      elif(FldIndex(fxPmnt, "Middle") == id)            // Выбор банка-посредника "вручную"
+         if( FindParty(fxPmnt.Middle, tmp) )
+            g_middle = ПолучитьКодСубъекта (tmp, getCodeKind(g_fiid)/*PTCK_SWIFT*/);
+            updateFields(fxPmnt, fxPmnt.Middle);
+         else
+            MsgBox(String("Не найден субъект ", fxPmnt.Middle, "!"));
+         end;
+      elif(FldIndex(fxPmnt, "MiddleP") == id)           // Выбор банка-посредника "вручную"
+         if( FindParty(fxPmnt.MiddleP, tmp) )
+            g_middleP = ПолучитьКодСубъекта (tmp, getCodeKind(g_fiid)/*PTCK_SWIFT*/);
+            updateFields(fxPmnt, fxPmnt.MiddleP);
+         else
+            MsgBox(String("Не найден субъект ", fxPmnt.MiddleP, "!"));
+         end;
+    */
+      end;
+   end;
+
+   return CM_DEFAULT;
+end;
+
+//
+// Получить данные по самой сделке
+//
+private macro GetDealRS(dealId, legId)
+   var sql = " select * from ddl_tick_dbt tick "
+          +"     inner join ddl_leg_dbt leg "
+          +"     on tick.t_dealId = leg.t_dealId and (tick.t_bOfficeKind=100 or tick.t_bOfficeKind=102) and tick.t_dealId= :dealId "
+          +"     and leg.t_legKind=0 and leg.t_legId=:legId " ;
+
+   var params = MakeArray(SQLParam("dealId", dealId), SQLParam("legId", legId));
+   rsDeal = ExecSQLSelect(sql, params, false);
+   if( rsDeal.MoveNext() )
+      return true;
+   end;
+
+   return false;
+end;
+
+
+//
+// Получить свойства платежа (Реквизиты платежа для R-макета)
+//
+private macro GetRMProp(pmntId)
+   var sql = " select * from dPmRmProp_dbt where t_paymentId=:pmnt ";
+
+   var params = MakeArray(SQLParam("pmnt", pmntId));
+   rsRmProp = ExecSQLSelect(sql, params, false);
+   if( rsRmProp.MoveNext() )
+      return true;
+   end;
+
+   return false;
+end;
+
+//
+// Получить свойства платежа
+//
+private macro GetPMProp(pmntId, debCred)
+   var sql = " select * from dPmProp_dbt where t_paymentId=:pmnt and t_debetCredit=:debcred ";
+
+   var params = MakeArray(SQLParam("pmnt", pmntId), SQLParam("debcred", debCred));
+   rsPmProp = ExecSQLSelect(sql, params, false);
+   if( rsPmProp.MoveNext() )
+      return true;
+   end;
+
+   return false;
+end;
+
+
+//
+// Установить схему по умолчанию
+//
+private macro SetDefaultSchema()
+   var id;
+   var ck = getCodeKind(g_fiid);
+   var res = false;
+
+   //if("" == g_accP)  // Если счёт не задан, Установить схему по умолчанию
+      id = GetDominantId(ПолучитьКодСубъекта (Int(g_payer), ck), ck, g_fiid);
+      if(-1 == id)
+         if(3 == ck)
+            ck = 6;
+         else
+            ck = 3;
+         end;
+         id = GetDominantId(ПолучитьКодСубъекта (Int(g_payer), ck), ck, g_fiid);
+      end;
+
+      if(-1 != id)
+         SetPayer(id);
+         res = true;
+      end;
+   //end;
+
+   //if("" == g_accR)  // Если счёт не задан, Установить схему по умолчанию
+      ck = getCodeKind(g_fiid);
+      id = GetDominantId(ПолучитьКодСубъекта (Int(g_receiver), ck), ck, g_fiid);
+      if(-1 == id)
+         if(3 == ck)
+            ck = 6;
+         else
+            ck = 3;
+         end;
+         id = GetDominantId(ПолучитьКодСубъекта (Int(g_receiver), ck), ck, g_fiid);
+      end;
+
+      if(-1 != id)
+         SetReceiver(id);
+         res = true;
+      end;
+   //end;
+
+   return res;
+end;
+
+
+//
+// Восстановить актуальные данные в платеже на основе данных сделки
+//
+private macro RecoverPayerReceiver()
+   var party = rsDeal.value("t_partyId");       // Контрагент
+   var purp  = rsPmnt.value("t_purpose");       // Назначение платежа
+   var type  = rsDeal.value("t_typeDoc");       // Тип документа(актуально для КО)
+   var legId = rsDeal.value("t_legId");         // Id транша    (актуально для КО)
+   var dealT = rsDeal.value("t_dealType");      // Тип сделки   (актуально для МБК)
+
+   if(substr(rsDeal.value("t_dealCode"),1,2) == "IT" ) // В неттингах платежи не трогаем, т.к. они могут быть самыми разными
+      return;
+   end;
+   //---------------- Конверсия -----------------
+   if(100 == rsDeal.value("t_bOfficeKind"))
+      if((("B" == type) and (0 == legId))
+                 or (("S" == type) and (1 == legId)))
+                                // Покупка
+         if(1 == purp)          // -- Базовый актив
+            g_payer    = party;
+            g_receiver = _SelfID;
+
+         elif(2 == purp)        // -- Контрактив
+            g_payer    = _SelfID;
+            g_receiver = party;
+         end;
+      else                      // Продажа
+
+         if(1 == purp)          // -- Базовый актив
+            g_payer    = _SelfID;
+            g_receiver = party;
+
+         elif(2 == purp)        // -- Контрактив
+            g_payer    = party;
+            g_receiver = _SelfID;
+         end;
+      end;
+
+   //------------------ МБК ---------------------
+   elif(102 == rsDeal.value("t_bOfficeKind"))
+      if(12300 == dealT)        // Привлечение
+
+         if(9 == purp)          // -- Предоставление средств
+            g_payer    = party;
+            g_receiver = _SelfID;
+
+         elif((10 == purp) or (11 == purp))
+                                // -- Погашение основного долга или погашение процентов
+            g_payer    = _SelfID;
+            g_receiver = party;
+         end;
+      elif((12305 == dealT) or (12335 == dealT))      // Размещение
+         if(9 == purp)          // -- Предоставление средств
+            g_payer    = _SelfID;
+            g_receiver = party;
+
+         elif((10 == purp) or (11 == purp))
+                                // -- Погашение основного долга или погашение процентов
+            g_payer    = party;
+            g_receiver = _SelfID;
+         end;
+
+      end;
+   end;
+end;
+
+
+//
+// Заполнить поля плательщика и получателя перевода
+//
+private macro FillPayerReceiver()
+   var corAcc="", bicRcc="", rcc="", req="";
+   var partySwift="", partyAccount="", bankSwift="", bankName="";
+   g_placeP = g_placeR = -1;
+
+
+   g_payer = String(rsPmnt.value("t_payer"));
+   g_receiver = String(rsPmnt.value("t_receiver"));
+
+   // Восстановление важно при ошибках заполнения полей плательщика/получателя при загрузке ч/з шлюз
+   RecoverPayerReceiver();
+
+   if(0 == g_payer)
+      g_payer = _SelfID
+   end;
+
+   if(0 == g_receiver)
+      g_receiver = _SelfID
+   end;
+
+   g_accP = SpecialValue0ToEmpty(rsPmnt.value("t_payerAccount"));
+   g_accP0 = g_accP;
+   g_accR = SpecialValue0ToEmpty(rsPmnt.value("t_receiverAccount"));
+   g_accR0 = g_accR;
+
+
+   g_placeP = SpecialValue0ToEmpty(rsPmnt.value("t_payerBankId"));
+   g_placeP0 = g_placeP;
+   g_placeR = SpecialValue0ToEmpty(rsPmnt.value("t_receiverBankId"));
+   g_placeR0 = g_placeR;
+
+// 20.03.2008
+/*
+   if(0 != g_fiid)
+      //g_placeP = SpecialValue0ToEmpty(rsPmnt.value("t_payerBankId"));
+      //g_placeR = SpecialValue0ToEmpty(rsPmnt.value("t_receiverBankId"));
+   else // Для рублей место соответствует банку!
+      if("" == g_accP)
+         g_placeP = g_payer;
+      end;
+
+      if("" == g_accR)
+         g_placeR = g_receiver;
+      end;
+   end;
+ */
+
+   ///SetDefaultSchema(); // Важно вызов делать сразу перед установкой значений в поля формы!
+
+
+   fxPmnt.Payer = ClearParty(diGetPartyNameById/*GetPartyNameById*/(g_payer));
+   fxPmnt.PayerPlace = ClearParty(diGetPartyNameById/*GetPartyNameById*/(g_placeP));
+   fxPmnt.PayerAcc = FormatAccountNum( String(g_accP) );
+
+   fxPmnt.Receiver = ClearParty(diGetPartyNameById/*GetPartyNameById*/(g_receiver));
+   fxPmnt.ReceiverPlace = ClearParty(diGetPartyNameById/*GetPartyNameById*/(g_placeR));
+   fxPmnt.ReceiverAcc = FormatAccountNum( String(g_accR) );
+
+end;
+
+
+
+//
+// Инициализация типа перевода
+//
+private macro InitType()
+
+  if((g_pmntPurp>0) and (g_pmntPurp<5))
+
+   // Нам пришли деньги
+   if(  (("B" == rsDeal.value("t_typeDoc")) and (1 == g_pmntPurp)) or
+        (("S" == rsDeal.value("t_typeDoc")) and (2 == g_pmntPurp)) or
+        (("S" == rsDeal.value("t_typeDoc")) and (3 == g_pmntPurp)) or
+        (("B" == rsDeal.value("t_typeDoc")) and (4 == g_pmntPurp))    )
+
+      if(g_bCash)       // банкнотная сделка
+         if(1 == g_pmntPurp)
+            g_pmntType = 2;
+         else
+            g_pmntType = 3;
+         end;
+
+      else              // форексовская сделка
+         g_pmntType = 0;
+
+      end;
+
+      ListTypesKo(true);
+   // От нас ушли деньги
+   else
+      if(g_bCash)       // банкнотная сделка
+         if(1 == g_pmntPurp)
+            g_pmntType = 2;
+         else
+            g_pmntType = 3;
+         end;
+
+
+      else              // форексовская сделка
+         g_pmntType = 1;
+      end;
+
+      ListTypesKo(true);
+   end;
+
+  elif(7 == g_pmntPurp)
+      ListTypesOther(true);
+      fxPmnt.pmntType = aTransTypes(0)
+  elif(39 == g_pmntPurp)       
+      aTransTypes.Size = 0;
+      aTransTypes(aTransTypes.Size) = "Результат неттинга";
+
+      fxPmnt.pmntType = aTransTypes(0)
+  else          // МБК
+      ListTypesMbk(true);
+
+
+      if(9 == g_pmntPurp)
+         g_pmntType = 4;
+      elif(10 == g_pmntPurp)
+         g_pmntType = 5;
+      else
+         g_pmntType = 6;
+      end;
+      g_pmntType = g_pmntType-4;
+  end;
+
+
+   fxPmnt.pmntType = aTransTypes(g_pmntType);
+end;
+
+
+
+//
+// Заполнение полей формы
+//
+private macro InitFileds(dealId, legId, dat, paymentId, amount, fiid)
+   ClearRecord(fxPmnt);
+
+   // Данные по сделке
+   //
+   GetDealRS(dealId, legId);
+
+   if(false == rsDeal)
+      MsgBox("Ошибка получения данных по сделке");
+      return false;
+   end;
+
+
+   // Данные по платежу
+   //
+   var sql = "select * from dPmPaym_dbt where t_paymentId=:id and t_dockind in (100, 102, 140)";
+
+   var params = MakeArray(SQLParam("id", paymentId));
+   rsPmnt = ExecSQLSelect(sql, params, false);
+
+
+   // Дата сделки, номер и коды сделки, системный и пользовательский типы и транспорт
+   if(rsPmnt.MoveNext())
+      fxPmnt.pmntId   = rsPmnt.value("t_paymentId");
+      fxPmnt.pmntDate = rsPmnt.value("t_valueDate");
+      _pmntDate       = fxPmnt.pmntDate;
+      fxPmnt.pmntTime = "00:00";
+      _Amount         = money(round(rsPmnt.value("t_baseamount"), 2));
+      fxPmnt.amount   = FormatSum(_Amount);//amount;
+
+      fxPmnt.FI       = CurrencyISOLet(fiid);
+ 
+      g_pmntPurp = rsPmnt.value("t_purpose");
+
+      FillPayerReceiver();
+
+      g_bCash = diIsCashDeal(dealId);
+
+      InitType();
+
+   else
+      MsgBox("Ошибка получения данных о платеже");
+      return false;
+   end;
+
+
+   // Свойства платежа получателя
+   //
+   GetRMProp(paymentId);
+
+   if(false == rsRmProp)
+      MsgBox("Ошибка получения реквизитов платежа получателя для R-макета");
+      return false;
+   end;
+
+   fxPmnt.chkInstancy = IfThenElse(1 == rsRmProp.value("t_instancy"), "X", "");
+
+
+   fxPmnt.Reice = rsRmProp.value("t_additionalInfo");
+   fxPmnt.Note = rsRmProp.value("t_ground");
+
+   GetPMProp(paymentId, DEB_CRED);
+   if(false == rsPmProp)
+      MsgBox("Ошибка получения свойств платежа получателя");
+      return false;
+   end;
+
+   g_placecodekindR = rsPmProp.value("t_codekind");
+   g_noteP = rsPmProp.value("t_reserve");
+   g_middlecodekind = rsPmProp.value("t_corrCodeKind");
+   g_middle = ПолучитьКодСубъекта(String(rsPmProp.value("t_corrCode")), g_middlecodekind); //rsPmProp.value("t_corrCode");
+   //fxPmnt.Middle = diGetPartyNameById/*GetPartyNameById*/( g_middle ); // SWIFT банка-посредника  получателя
+
+   g_accM= rsRmProp.value("t_receiverCorrBankName");   // счёт в банке-посреднике
+   //fxPmnt.MiddleAcc = FormatAccountNum( String(g_accM) );
+   g_corAccR = rsPmProp.value("t_corrAcc");   // счёт в банке-посреднике
+   //
+   // Свойства платежа плательщика
+   GetPMProp(paymentId, 1-DEB_CRED);
+   if(false == rsPmProp)
+      MsgBox("Ошибка получения свойств платежа плательщика");
+      return false;
+   end;
+
+   g_placecodekindP = rsPmProp.value("t_codekind");
+   g_noteR = rsPmProp.value("t_reserve");
+   g_middlecodekindP = rsPmProp.value("t_corrCodeKind");
+   g_middleP = ПолучитьКодСубъекта(String(rsPmProp.value("t_corrCode")), g_middlecodekindP); //rsPmProp.value("t_corrCode");
+   //fxPmnt.MiddleP = diGetPartyNameById/*GetPartyNameById*/( g_middleP ); // SWIFT банка-посредника  плательщика
+
+   g_accMP= rsRmProp.value("t_receiverCorrBankName");   // счёт в банке-посреднике
+   //fxPmnt.MiddleAccP = FormatAccountNum( String(g_accMP) );
+   g_corAccP = rsPmProp.value("t_corrAcc");   // счёт в банке-посреднике
+
+   return true;
+end;
+
+
+//
+// Копирование данных, используемых в схеме из сделки с идентификатором base в сделку с идентификатором tar
+// У обоих сделок должен быть тип сделки dealKind одинаковый (100, 102)
+//
+macro CopyPmntSchemaData(base, tar, dealKind)
+   var sql =
+
+  " declare "
+ +" v_pmntIdbase dPmPaym_dbt.t_paymentId%type; "
+ +" v_pmntIdprol dPmPaym_dbt.t_paymentId%type; "
+
+ +" cursor get_base is  "
+ +"     select t_paymentId from dPmPaym_dbt where t_docKind=:kind and t_documentId=:base order by t_purpose; "
+ +" cursor get_prol is  "
+ +"     select t_paymentId from dPmPaym_dbt where t_docKind=:kind and t_documentId=:prol order by t_purpose; ";
+
+   sql = sql
+
+ +" begin "
+ +" open get_base; "
+ +" open get_prol; "
+ +" loop "
+ +"     exit when get_base%notfound or get_prol%notfound; "
+ +"     fetch get_base into v_pmntIdbase; "
+ +"     fetch get_prol into v_pmntIdprol; "
+ +"         begin "
+ +"             update dPmPaym_dbt set (t_payer, t_receiver, t_payerBankId, t_receiverBankId, t_payerAccount, t_receiverAccount) = "
+ +"             ( "
+ +"                 select t_payer, t_receiver, t_payerBankId, t_receiverBankId, t_payerAccount, t_receiverAccount "
+ +"                 from dPmPaym_dbt where t_paymentId=v_pmntIdbase "
+ +"             ) "
+ +"             where t_paymentId=v_pmntIdprol; "
+
+ +"             update dPmRmProp_dbt set (t_receiverCorrBankName, t_payerCorrAccNostro, t_payerBankName, t_payerName, t_payerINN, "
+ +"                 t_receiverCorrAccNostro, t_receiverBankName, t_receiverName, t_receiverINN, t_additionalInfo) = "
+ +"             ( "
+ +"                 select t_receiverCorrBankName, t_payerCorrAccNostro, t_payerBankName, t_payerName, t_payerINN, "
+ +"                     t_receiverCorrAccNostro, t_receiverBankName, t_receiverName, t_receiverINN, t_additionalInfo "
+ +"                 from dPmRmProp_dbt where t_paymentId=v_pmntIdbase "
+ +"             ) "
+ +"             where t_paymentId=v_pmntIdprol; ";
+
+   sql = sql
+
+ +"             update dPmProp_dbt set (t_codeKind, t_codeName, t_bankCode, t_CorrCode, t_corrCodeKind, t_corrAcc, t_reserve) = "
+ +"             ( "
+ +"                 select t_codeKind, t_codeName, t_bankCode, t_CorrCode, t_corrCodeKind, t_corrAcc, t_reserve "
+ +"                 from dPmProp_dbt where t_paymentId=v_pmntIdbase and t_debetCredit=0 "
+ +"             ) "
+ +"             where t_paymentId=v_pmntIdprol and t_debetCredit=0; "
+
+ +"             update dPmProp_dbt set (t_codeKind, t_codeName, t_bankCode, t_CorrCode, t_corrCodeKind, t_corrAcc, t_reserve) = "
+ +"             ( "
+ +"                 select t_codeKind, t_codeName, t_bankCode, t_CorrCode, t_corrCodeKind, t_corrAcc, t_reserve "
+ +"                 from dPmProp_dbt where t_paymentId=v_pmntIdbase and t_debetCredit=1 "
+ +"             ) "
+ +"             where t_paymentId=v_pmntIdprol and t_debetCredit=1;  "
+ +"         end; "
+ +" end loop; "
+
+ +" close get_base; "
+ +" close get_prol; "
+ +" end; ";
+
+   var params = MakeArray( SQLParam("kind", dealKind), SQLParam("base", base), SQLParam("prol", tar)  );
+
+   var res = ExecSQL(sql, params, false);
+   if(null == res)
+      MsgBox("Ошибка при копировании параметров платежей сделки");
+      return false;
+   end;
+
+   return true;
+end;
+
+
+//
+// Запись в платёж данных и платёжной схемы по умолчанию (вызывается извне)
+//
+macro SetDefPmntData(dealId,        /* ID сделки */
+                     legId,         /* Обратная сделка, 0 - нет */
+                     dat,           /* Дата платежа */
+                     paymentId,     /* ID платежа */
+                     amount,        /* Сумма платежа */
+                     fiid           /* ID финансового инструмента */
+                    )
+
+   g_dealId = dealId;
+   g_legId  = legId;
+   g_fiid   = fiid;
+   g_bNewPmnt = false;
+   g_pmntType = 0;
+   g_bNeedRefAccs = false;
+
+   InitFileds(dealId, legId, dat, paymentId, amount, fiid);
+
+/*
+// 06.04.2008 у открытых и закрытых сделок отображаются только те поля, которые допускается редактирование => проблем быть не должно
+   // Предотвращение ситуации, когда будет корректироваться сделка,
+   // у которой есть закрытые или пролонгированные платежи
+   if(55 == rsPmnt.value("t_paymStatus"))       // Пролонгирован
+      MsgBox("Перевод "+rsPmnt.value("t_paymentId")+ " не может быть изменён:\nПеревод пролонгирован!");
+      return false;
+   elif(32000 == rsPmnt.value("t_paymStatus"))          // Закрыт
+      MsgBox("Перевод "+rsPmnt.value("t_paymentId")+ " не может быть изменён:\nПеревод выполнен!");
+      return false;
+   end;
+*/
+
+   // Загрузка схемы по умолчанию
+   if (SetDefaultSchema())
+   end;
+
+
+
+   Save();
+end;
+
+
+//
+// Запись в платёж данных и заданной платёжной схемы
+//
+macro SetPmntData   (dealId,        /* ID сделки */
+                     legId,         /* Обратная сделка, 0 - нет */
+                     dat,           /* Дата платежа */
+                     paymentId,     /* ID платежа */
+                     amount,        /* Сумма платежа */
+                     fiid,          /* ID финансового инструмента */
+                     schemaIdP,     /* ID схемы плательщика */
+                     schemaIdR,     /* ID схемы получателя */
+                     payerAcc,      /* Л/С плательщика */
+                     receiverAcc    /* Л/С получателя */
+                    )
+
+   g_dealId = dealId;
+   g_legId  = legId;
+   g_fiid   = fiid;
+   g_bNewPmnt = false;
+   g_pmntType = 0;
+   g_bNeedRefAccs = false;
+
+   InitFileds(dealId, legId, dat, paymentId, amount, fiid);
+
+
+
+   if(-1 != schemaIdP)
+      SetPayer(schemaIdP);
+   end;
+
+   if(-1 != schemaIdR)
+      SetReceiver(schemaIdR);
+   end;
+
+   g_accP = payerAcc;
+   g_accR = receiverAcc;
+
+/*
+// 28.03.2008 у открытых и закрытых сделок отображаются только те поля, которые допускается редактирование => проблем быть не должно
+   // Предотвращение ситуации, когда будет корректироваться сделка,
+   // у которой есть закрытые или пролонгированные платежи
+   if(55 == rsPmnt.value("t_paymStatus"))       // Пролонгирован
+      MsgBox("Перевод "+rsPmnt.value("t_paymentId")+ " не может быть изменён:\nПеревод пролонгирован!");
+      return false;
+   elif(32000 == rsPmnt.value("t_paymStatus"))          // Закрыт
+      MsgBox("Перевод "+rsPmnt.value("t_paymentId")+ " не может быть изменён:\nПеревод выполнен!");
+      return false;
+   end;
+*/
+
+
+   Save();
+end;
+
+
+//
+// Ввод нового платежа
+//
+macro NewPaymentDlg(dealId,        /* ID сделки */
+                    legId,         /* Обратная сделка, 0 - нет */
+                    bLinked,       /* Признак необходимости подвязки вводимого платежа к сделке */      
+                    paymentid,     /* Платеж который будет взят за эталон*/
+                    fiid           /* ID финансового инструмента*/
+                   )                                  
+
+   InitFileds(dealId, legId, {curdate}, paymentId, 0, fiid);
+   fxPmnt.pmntDate = {curdate};
+   fxPmnt.pmntTime = "00:00";
+   g_bNewPmnt = true;
+   g_bCash = false;      
+   g_fiid = fiid;
+
+   var boffice = GetBOfficeKind(dealId);
+
+   
+   if(ValType(bLinked) == V_UNDEF)
+      bLinked = true;
+   end;
+
+   g_bLinkedPmnt = bLinked;
+
+   if(bLinked)
+      g_dealId = dealId;
+      g_legId  = legId;
+
+
+      if(102 == boffice)
+         ListTypesMbk(true);
+      elif(100 == boffice)
+         if (diIsCashDeal(dealId))
+            ListTypesBn(true);
+            g_bCash = true;
+         else
+            ListTypesFx(true);
+         end;
+      end;
+   else
+      ListTypesOther(true);
+      fxPmnt.pmntType = aTransTypes(0)
+   end;
+   
+   if (RunDialog (fxPmnt, @EvPmntProc))
+      return true; // Пользователь сохранил данные
+   end;
+
+   return false;
+end;
+
+
+//
+// Проверка на то, что платёж был добавлен в систему вручную из монитора дилера
+//
+private macro IsAddedPmnt(paymentId)
+
+
+         return true;
+
+/*
+   var sql = " select * from dPmPaym_dbt where t_paymentId=:pmntId ";
+
+   var params = MakeArray(SQLParam("pmntId1", paymentId));
+
+   var res = ExecSQLSelect(sql, params, false);
+
+   if(res.MoveNext())
+      if(7 == res.value("t_purpose"))   // Это отдельный платёж в панеле платежей => удалять можно
+         return true;
+      end;
+
+      if(((11 == res.value("t_purpose")) and (1 < res.value("t_subpurpose"))) or
+         ((11 != res.value("t_purpose")) and (0 < res.value("t_subpurpose"))))
+         return true;
+      end;
+   else
+      MsgBox("Не найден платёж!");
+      return false;
+   end;
+
+   return false;
+*/
+
+end;
+
+macro CheckSum(paymentid)
+   var sql, params, data, docid, delta, purpose_del_paym, purpose, amount, update_paym;
+   var a = 0, b = 0;
+   sql = "select t_documentid, t_amount, t_purpose from dpmpaym_dbt where t_paymentid =: paymentid";
+   params = MakeArray(SQLParam("paymentid", paymentid));
+   data = ExecSQLSelect(sql, params, false);
+   if (data.MoveNext())
+      docid = data.value(0);            //id сделки
+      delta = data.value(1);            //сумма платежа, который удаляем
+      purpose_del_paym = data.value(2); //направление платежа который удаляем
+   end;
+   sql = "select t_paymentid, t_purpose, t_amount from dpmpaym_dbt where t_dockind = 102 and t_purpose <> 11 and t_documentid =: docid";       //ищем платежи по предоставлению средств и по погашению ОД, чтобы сравнить общую сумму платежей
+   params = MakeArray(SQLParam("docid", docid));
+   data = ExecSQLSelect(sql, params, false);
+   while (data.MoveNext())
+      purpose = data.value(1);
+      amount = data.value(2);
+      if (purpose == 9)
+         a = a + amount;        //сумма всех платежей по предоставлению средств
+      else
+         b = b + amount;        //сумма всех платежей по погашению ОД
+      end;
+   end;
+   sql  = "select min(t_paymentid) from dpmpaym_dbt where t_dockind = 102 and t_purpose = 10 and t_documentid =: docid";            //Сначала ищем базовый платеж платеж по погашению ОД
+   params = MakeArray(SQLParam("docid", docid));
+   data = ExecSQLSelect(sql, params, false);
+   if (data.MoveNext())
+      update_paym = int(data.value(0));        //нашли id базового платежа по погашению ОД, сумму которого будет корректировать
+   end;
+   sql  = "select t_amount from dpmpaym_dbt where t_dockind = 102 and t_paymentid =: paymentid";                                        //Получаем сумму базового платежа по ОД
+   params = MakeArray(SQLParam("paymentid", update_paym));
+   data = ExecSQLSelect(sql, params, false);
+   if (data.MoveNext())   
+      amount = data.value(0);             //текущая сумма платежа до корректировки              
+      if (purpose_del_paym == 9)        //если удаляем платеж по предосталвению средств, то при выполненной ранее корректировке, при удалении уменьшаем сумму платежа по погашению ОД 
+         if ( not (a - delta == b))     
+            sql = "update dpmpaym_dbt set t_amount =: new_amount1, t_baseamount =: new_amount2, t_payamount =: new_amount3, t_futurereceiveramount =: new_amount4 where t_dockind = 102 and t_paymentid =: update_paym; ";          
+            params = MakeArray(SQLParam("new_amount1", amount - delta), SQLParam("new_amount2", amount - delta), SQLParam("new_amoun3", amount - delta), SQLParam("new_amoun4", amount - delta), SQLParam("update_paym", update_paym));
+            data = ExecSQL(sql, params, false);
+            if (null == data)
+               MsgBox("Ошибка при обновлении суммы платежа");
+               return false;
+            else
+               return true;
+            end;
+         end;
+      elif (purpose_del_paym == 10)    //если удаляем платеж по погашению ОД, то при выполненной ранее корректировке, при удалении увеличиваем сумму платежа по погашению ОД
+         if ( not (a == b - delta))     
+            sql = "update dpmpaym_dbt set t_amount =: new_amount1, t_baseamount =: new_amount2, t_payamount =: new_amount3, t_futurereceiveramount =: new_amount4 where t_dockind = 102 and t_paymentid =: update_paym; ";          
+            params = MakeArray(SQLParam("new_amount1", amount + delta), SQLParam("new_amount2", amount + delta), SQLParam("new_amoun3", amount + delta), SQLParam("new_amoun4", amount + delta), SQLParam("update_paym", update_paym));
+            data = ExecSQL(sql, params, false);
+            if (null == data)
+               MsgBox("Ошибка при обновлении суммы платежа");
+               return false;
+            else
+               return true;
+            end;
+         end;
+      end;
+   end;
+   return true;
+end;
+
+//
+// Удалить дополнительный (введённый вручную в сделку) платёж
+//
+macro DelAddedPayment(paymentId)
+   if(not IsAddedPmnt(paymentId))       // Проверка на то, что удаляется стандартный платёж, который привязывается к сделке при её создании
+      MsgBox("Базовый платёж удалить нельзя");
+      return false;
+   end;
+
+   if(false == GetTRUE(false, "Удалить платёж?"))
+      return false;
+   end;   
+   CheckSum(paymentId);  //SVE 526538 проверка на необходимость обратно корректировке платежа по погашению ОД при удалении 
+   var sql = " begin "
+           + " delete dPmProp_dbt       where t_paymentId=:pmntId1; "
+           + " delete dPmRmProp_dbt     where t_paymentId=:pmntId2; "
+           + " delete dPmPaym_dbt       where t_paymentId=:pmntId3; "
+           + " end;  ";
+
+   var params = MakeArray(SQLParam("pmntId1", paymentId), SQLParam("pmntId2", paymentId), SQLParam("pmntId3", paymentId));
+
+   var res = ExecSQL(sql, params, false);
+   if(null == res)
+      MsgBox("Ошибка при удалении платежа");
+      return false;
+   else
+      return true;
+   end;
+end;
+
+
+macro DelAddedPayment2(paymentId)
+   if(not IsAddedPmnt(paymentId))       // Проверка на то, что удаляется стандартный платёж, который привязывается к сделке при её создании
+      MsgBox("Базовый платёж удалить нельзя");
+      return false;
+   end;
+
+   var sql = " begin "
+           + " delete dPmProp_dbt       where t_paymentId=:pmntId1; "
+           + " delete dPmRmProp_dbt     where t_paymentId=:pmntId2; "
+           + " delete dPmPaym_dbt       where t_paymentId=:pmntId3; "
+           + " end;  ";
+
+   var params = MakeArray(SQLParam("pmntId1", paymentId), SQLParam("pmntId2", paymentId), SQLParam("pmntId3", paymentId));
+
+   var res = ExecSQL(sql, params, false);
+   if(null == res)
+      MsgBox("Ошибка при удалении платежа");
+      return false;
+   else
+      return true;
+   end;
+end;
+
+
+
+//
+// Открытие диалогового окна (панели) платежа
+//
+macro OpenPaymentDlg(dealId,        /* ID сделки */
+                     legId,         /* Обратная сделка, 0 - нет */
+                     dat,           /* Дата платежа */
+                     paymentId,     /* ID платежа */
+                     amount,        /* Сумма платежа */
+                     fiid,          /* ID финансового инструмента */
+                     CorrectFlag
+                    )
+
+   var strtmp="";
+   if(CorrectFlag == null)
+      g_CorrectFlag = false; //Флаг корректировки платежей если true платежи можно корректировать, иначе установлен запрет на корректировку
+   else
+      g_CorrectFlag = CorrectFlag;
+   end;
+
+   g_dealId = dealId;
+   g_legId  = legId;
+   g_fiid   = fiid;
+   g_bNewPmnt = false;
+   g_pmntType = 0;
+   g_bNeedRefAccs = true;
+
+   InitFileds(dealId, legId, dat, paymentId, amount, fiid);
+
+/*   if(0 == g_fiid)
+      fxPmnt.PayerReq    = ПолучитьРеквизиты(dcDebet, bstCB, dealId, rsPmnt.value("t_purpose"));
+      fxPmnt.ReceiverReq = ПолучитьРеквизиты(dcCredit, bstCB, dealId, rsPmnt.value("t_purpose"));
+   else
+      fxPmnt.PayerReq    = ПолучитьРеквизиты(dcDebet, bstSWIFT, dealId, rsPmnt.value("t_purpose"));
+      fxPmnt.ReceiverReq = ПолучитьРеквизиты(dcCredit, bstSWIFT, dealId, rsPmnt.value("t_purpose"));
+   end;
+*/
+ 
+   if (RunDialog (fxPmnt, @EvPmntProc))
+      return true; // Пользователь сохранил данные
+   end;
+
+   return false;
+end;

@@ -1,0 +1,16 @@
+--Изменение urefill_dbt
+CREATE OR REPLACE TRIGGER "UREFILL_T0_AINC"
+  BEFORE INSERT OR UPDATE OF T_ID ON UREFILL_DBT FOR EACH ROW
+DECLARE
+  v_id INTEGER;
+BEGIN
+  IF (:new.T_ID = 0 OR :new.T_ID IS NULL) THEN
+    SELECT UREFILL_MANUAL_SEQ.nextval INTO :new.T_ID FROM dual;
+  ELSE
+    SELECT last_number INTO v_id FROM user_sequences WHERE sequence_name = UPPER('UREFILL_MANUAL_SEQ');
+    IF :new.T_ID >= v_id THEN
+      RAISE DUP_VAL_ON_INDEX;
+    END IF;
+  END IF;
+END;
+/

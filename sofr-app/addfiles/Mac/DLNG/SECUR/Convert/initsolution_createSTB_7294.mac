@@ -1,0 +1,603 @@
+/*
+$Name:        initsolution_createSTB_7294.mac
+$Module:      Ценные бумаги
+$Description: Начальное решение по созданию событий СНОБ
+*/
+
+import DealsInter, spserv, sp_class, sp_car, spreserv, "vs4each.mac", "vsconv.mac", "vsrepay5.mac";
+
+private var TestMode   = true;      //Тестовый режим (без фиксации действий в БД)
+
+private var ExcludeONBClientID = "136515";
+
+private class TClientErr(_ClientCode, _ClientName, _ErrStr)
+  var ClientCode = _ClientCode;
+  var ClientName = _ClientName;
+  var ErrStr     = _ErrStr;     
+end;
+
+private var ErrArr = TArray();
+
+PRIVATE MACRO GetPartyName( PartyID:INTEGER ) :STRING
+    VAR Party_ForGet = TRecHandler( "party.dbt" );
+    if( ПолучитьСубъекта( PartyID, Party_ForGet ) == 0 )
+       return Party_ForGet.rec.Name;
+    end;
+    return "";
+  end;
+
+private macro GetSystDateTime(SystDate:@date, SystTime:@time)
+  var cmd = DL_RSDCommand("select sysdate dt from dual");
+  var DataSet = cmd.execute();
+
+  DataSet.moveNext();
+
+  DtTmSplit(DataSet.dt, SystDate, SystTime);
+end;
+
+private macro GetVSDateTime(dlorder, currIncDate:@date, currIncTime:@time)
+  var query, cmd, DataSet;  
+  
+  currIncDate = dlorder.rec.SignDate;
+  currIncTime = time(0);
+
+  query =   " select t_RegistrDate, t_RegistrTime "
+          + "   from dspground_dbt "
+          + "  where t_SourceDocKind = ? "
+          + "    and t_SourceDocID = ? "
+          + "    and t_Direction = 1 ";
+
+  cmd = DL_RSDCommand(query);
+
+  cmd.AddParam(dlorder.rec.DocKind);
+  cmd.AddParam(dlorder.rec.ContractID);
+
+  DataSet = cmd.Execute();
+  if(DataSet.moveNext())
+    currIncDate = date(DataSet.RegistrDate);
+    currIncTime = time(DataSet.RegistrTime);
+  end;
+end;
+
+private macro GetNptxopDateTime(nptxop, currIncDate:@date, currIncTime:@time)
+  var query, cmd, DataSet;
+
+  currIncDate = nptxop.rec.OperDate;
+  currIncTime = nptxop.rec.Time;
+
+  if(currIncTime == time(0))
+    query =   " select op.t_Syst_Time "
+            + "   from doproper_dbt op "
+            + "  where op.t_DocKind = ? "
+            + "    and op.t_DocumentID = LPAD(?, 34, '0') ";
+
+    cmd = DL_RSDCommand(query);
+
+    cmd.AddParam(nptxop.rec.DocKind);
+    cmd.AddParam(nptxop.rec.ID);
+
+    DataSet = cmd.Execute();
+    if(DataSet.moveNext())
+      currIncTime = time(DataSet.Syst_Time);
+    end;
+  end;
+end;
+
+/* Определяет сумму налога
+*/
+PRIVATE MACRO GetTax(bnr, leg, emi, order, numOrd, lnk, S:@variant)
+
+  S.Tax13_NatCur = S.Tax13_NatCur + lnk.rec.taxamount_natcur;
+  S.Tax15_NatCur = S.Tax15_NatCur + lnk.rec.taxamount15_natcur;
+  S.Tax13        = S.Tax13        + lnk.rec.taxamount;
+  S.Tax15        = S.Tax15        + lnk.rec.taxamount15;
+  S.Tax          = S.Tax13 + S.Tax15;
+
+  return 0;
+END;
+
+/* Возвращает сумму налога для договора погашения (одновременно, и валюту, и сумму погашения)
+*/
+PRIVATE MACRO GetVSTax(order, S:@variant)
+  S = RepAmountAndTax();
+  
+  return ДляКаждогоВекселя(order, @GetTax, VSORDLNK_K_DRAW, @S, null) == 0;
+END;
+
+private macro CreateSTBByClient(ClientID:integer, StartDate:date, EndDate:date)
+  record dlord_rec(dl_order);
+  var query, cmd, DataSet;
+  var nptxop = TBFile("nptxop.dbt");
+  var dlorder = TBFile("dl_order.dbt");
+  var cnt = 0, i = 0;
+  var НОБ_опер = $0, НОБ_30 = $0, НОБ_13 = $0, НОБ_15 = $0;
+  var taxe = $0, taxe15 = $0;
+  var TxArr = TArray();
+  var err = 0, ErrStr = "";
+  var AmountSNOB = $0, ValDate, ValTime;
+  var FindTaxBaseKind = "";
+  var currIncDate = date(0,0,0);
+  var currIncTime = time(0);
+  var Year = 0;
+  
+  query =   " select q.* "
+          + "   from ( "
+          //Операции расчета НОБ с типом "Окончание года" или "Закрытие ИИС"
+          + "         select nptxop.t_OperDate, nptxop.t_DocKind, nptxop.t_ID, nptxop.t_IIS "
+          + "           from dnptxop_dbt nptxop "
+          + "          where nptxop.t_DocKind = " + DL_CALCNDFL
+          + "            and nptxop.t_Client = ? "
+          + "            and nptxop.t_OperDate between ? and ? "
+          + "            and nptxop.t_SubKind_Operation IN ("+DL_TXBASECALC_OPTYPE_ENDYEAR + ", " +DL_TXBASECALC_OPTYPE_CLOSE_IIS + ") "
+          + "            and nptxop.t_Status = 2 /*DL_TXOP_Close*/ "
+          + "            and not Exists(select 1 from dnptxtotalbase_dbt tb where tb.t_ClientID = nptxop.t_Client and tb.t_DocKind = nptxop.t_DocKind and tb.t_DocID = nptxop.t_ID) "
+          + "            and not Exists(select 1 from dnptxtotalbasebc_dbt tb where tb.t_ClientID = nptxop.t_Client and tb.t_DocKind = nptxop.t_DocKind and tb.t_DocID = nptxop.t_ID) "
+          //Операции списания д/с
+          + "         union "
+          + "         select nptxop.t_OperDate, nptxop.t_DocKind, nptxop.t_ID, nptxop.t_IIS "
+          + "           from dnptxop_dbt nptxop "
+          + "          where nptxop.t_DocKind = " + DL_WRTMONEY
+          + "            and nptxop.t_Client = ? "
+          + "            and nptxop.t_OperDate between ? and ? "
+          + "            and nptxop.t_SubKind_Operation = " + DL_NPTXOP_WRTKIND_WRTOFF
+          + "            and nptxop.t_Status = 2 /*DL_TXOP_Close*/ "
+          + "            and nptxop.t_FlagTax = 'X' "
+          + "            and not Exists(select 1 from dnptxtotalbase_dbt tb where tb.t_ClientID = nptxop.t_Client and tb.t_DocKind = nptxop.t_DocKind and tb.t_DocID = nptxop.t_ID) "
+          + "            and not Exists(select 1 from dnptxtotalbasebc_dbt tb where tb.t_ClientID = nptxop.t_Client and tb.t_DocKind = nptxop.t_DocKind and tb.t_DocID = nptxop.t_ID) "
+          //Операции удержания/возврата НДФЛ
+          + "         union "
+          + "         select nptxop.t_OperDate, nptxop.t_DocKind, nptxop.t_ID, nptxop.t_IIS "
+          + "           from dnptxop_dbt nptxop "
+          + "          where nptxop.t_DocKind = " + DL_HOLDNDFL
+          + "            and nptxop.t_Client = ? "
+          + "            and nptxop.t_PrevDate between ? and ? "
+          + "            and nptxop.t_Status = 2 /*DL_TXOP_Close*/ "
+          + "            and not Exists(select 1 from dnptxtotalbase_dbt tb where tb.t_ClientID = nptxop.t_Client and tb.t_DocKind = nptxop.t_DocKind and tb.t_DocID = nptxop.t_ID) "
+          + "            and not Exists(select 1 from dnptxtotalbasebc_dbt tb where tb.t_ClientID = nptxop.t_Client and tb.t_DocKind = nptxop.t_DocKind and tb.t_DocID = nptxop.t_ID) "
+          //Операция погашения/выкупа векселей
+          + "         union "
+          + "         select dlorder.t_SignDate as t_OperDate, dlorder.t_DocKind, dlorder.t_ContractID as t_ID, CHR(0) as t_IIS "
+          + "           from ddl_order_dbt dlorder "
+          + "          where dlorder.t_DocKind = " + DL_VEKSELDRAWORDER
+          + "            and dlorder.t_Contractor = ? "
+          + "            and dlorder.t_SignDate between ? and ? "
+          + "            and dlorder.t_ContractStatus = 20 /*Закрыт*/ "  
+          + "            and not Exists(select 1 from dnptxtotalbase_dbt tb where tb.t_ClientID = dlorder.t_Contractor and tb.t_DocKind = dlorder.t_DocKind and tb.t_DocID = dlorder.t_ContractID) "
+          + "            and not Exists(select 1 from dnptxtotalbasebc_dbt tb where tb.t_ClientID = dlorder.t_Contractor and tb.t_DocKind = dlorder.t_DocKind and tb.t_DocID = dlorder.t_ContractID) "
+          + "            and Exists(select 1 from dparty_dbt pt where pt.t_PartyID = dlorder.t_Contractor and pt.t_LegalForm = 2 /*ФЛ*/)"
+          + "            and dlorder.t_Contractor NOT IN ("+ExcludeONBClientID+")"
+          + "        ) q "
+          + "  order by q.t_OperDate ASC, q.t_ID ASC ";
+
+  cmd = DL_RSDCommand(query);
+
+  cmd.AddParam(ClientID);
+  cmd.AddParam(StartDate);
+  cmd.AddParam(EndDate);
+  cmd.AddParam(ClientID);
+  cmd.AddParam(StartDate);
+  cmd.AddParam(EndDate);
+  cmd.AddParam(ClientID);
+  cmd.AddParam(StartDate);
+  cmd.AddParam(EndDate);
+  cmd.AddParam(ClientID);
+  cmd.AddParam(StartDate);
+  cmd.AddParam(EndDate);
+
+  cnt = cmd.GetCount();
+  if(cnt > 0)
+    InitProgress(cnt, "Генерация событий СНОБ по клиенту", "Генерация событий СНОБ по клиенту");
+
+    i = 0;
+    DataSet = cmd.Execute();
+    
+    RslDefCon.BeginTrans();
+
+    while((not err) and (DataSet.moveNext()))
+
+      TxArr.size = 0;
+
+      НОБ_опер = $0;
+      НОБ_30   = $0;
+      НОБ_13   = $0;
+      НОБ_15   = $0;
+      taxe     = $0;
+      taxe15   = $0;
+
+      if(DataSet.DocKind == DL_VEKSELDRAWORDER)
+        FindTaxBaseKind = NPTXTOTALBASE_TAXBASEKIND_ONB;
+      else
+        FindTaxBaseKind = IIF(DataSet.IIS == SET_CHAR, NPTXTOTALBASE_TAXBASEKIND_IIS, NPTXTOTALBASE_TAXBASEKIND_BROK);
+      end;
+
+      if((DataSet.IIS == UNSET_CHAR) and (РАБОТА_В_РЕЖИМЕ_СНОБ() == true))
+        FindTaxBaseKind = string(NPTXTOTALBASE_TAXBASEKIND_BROK) + ", " + string(NPTXTOTALBASE_TAXBASEKIND_ONB);
+      end;
+
+      if(DataSet.DocKind == DL_CALCNDFL)
+        nptxop.Clear();
+
+        nptxop.rec.ID = DataSet.ID;
+        nptxop.GetEQ();
+
+        GetNptxopDateTime(nptxop, @currIncDate, @currIncTime);
+
+        DateSplit(currIncDate, null, null, Year);
+        
+        AmountSNOB = STB_GetSumTaxBaseCurrPay(nptxop.rec.Client, FindTaxBaseKind, Year, NULL, NULL, currIncDate, currIncTime);
+
+        GetSystDateTime(@ValDate, @ValTime);
+        
+        if(nptxop.rec.Recalc == SET_CHAR)
+          err = ExecCancelSTBinCalcNDFLop(nptxop, 0, 0, @ErrStr);
+          if(not err)
+            err = ExecRecalcSTBinCalcNDFLop(nptxop, 0, 0, @ErrStr);
+          end;
+        else
+          CalcTaxSTB(nptxop, @НОБ_опер, @НОБ_30, @НОБ_13, @НОБ_15, NULL, NULL, NULL, AmountSNOB);
+
+          if(DL_GetPartyResident(nptxop.rec.Client) == NPTXPARTY_RESIDENT)
+            TxArr[TxArr.size] = STB_TaxRateParm(int(NPTXGENTAXRATE_RESIDENT*100),
+                                                НОБ_13, 
+                                                $0);
+
+            TxArr[TxArr.size] = STB_TaxRateParm(int(NPTXGENTAXRATE_RESIDENT_15*100),
+                                                НОБ_15, 
+                                                $0);
+          else
+            TxArr[TxArr.size] = STB_TaxRateParm(int(NPTXGENTAXRATE_NOTRESIDENT*100),
+                                                НОБ_30, 
+                                                $0);
+          end;
+          
+          err = STB_ExecuteCreateSTBOnStep(TxArr,
+                                           НОБ_опер,
+                                           nptxop.rec.DocKind, 
+                                           nptxop.rec.ID, 
+                                           nptxop.rec.Client, 
+                                           nptxop.rec.OperDate, 
+                                           IIF(nptxop.rec.IIS == SET_CHAR, true, false), 
+                                           Year, 
+                                           0, 
+                                           0, 
+                                           @ErrStr,
+                                           currIncDate,
+                                           currIncTime,
+                                           AmountSNOB,
+                                           $0,
+                                           date(0,0,0),
+                                           time(0)
+                                           );
+        end;
+      elif(DataSet.DocKind == DL_WRTMONEY)
+        var ToutNat = $0;
+
+        nptxop.Clear();
+
+        nptxop.rec.ID = DataSet.ID;
+        nptxop.GetEQ();
+        
+        GetNptxopDateTime(nptxop, @currIncDate, @currIncTime);
+
+        DateSplit(currIncDate, null, null, Year);
+
+        SmartConvertSum(ToutNat, nptxop.rec.OutSum, nptxop.rec.OperDate, nptxop.rec.Currency, NATCUR);
+
+        AmountSNOB = STB_GetSumTaxBaseCurrPay(nptxop.rec.Client, FindTaxBaseKind, Year, NULL, NULL, currIncDate, currIncTime);
+
+        GetSystDateTime(@ValDate, @ValTime);
+
+        CalcTaxSTB(nptxop, @НОБ_опер, @НОБ_30, @НОБ_13, @НОБ_15, @taxe, @taxe15, ToutNat, AmountSNOB);
+
+        if(DL_GetPartyResident(nptxop.rec.Client) == NPTXPARTY_RESIDENT)
+          TxArr[TxArr.size] = STB_TaxRateParm(int(NPTXGENTAXRATE_RESIDENT*100),
+                                              НОБ_13, 
+                                              IIF(nptxop.rec.Tax > 0, nptxop.rec.Tax-nptxop.rec.TaxDp, 0)
+                                             );
+
+          TxArr[TxArr.size] = STB_TaxRateParm(int(NPTXGENTAXRATE_RESIDENT_15*100),
+                                              НОБ_15, 
+                                              IIF(nptxop.rec.Tax > 0, nptxop.rec.TaxDp, 0)
+                                             );
+        else
+          TxArr[TxArr.size] = STB_TaxRateParm(int(NPTXGENTAXRATE_NOTRESIDENT*100),
+                                              НОБ_30, 
+                                              IIF(nptxop.rec.Tax > 0, nptxop.rec.Tax, 0)
+                                             );
+        end;
+
+        err = STB_ExecuteCreateSTBOnStep(TxArr,
+                                         НОБ_опер, 
+                                         nptxop.rec.DocKind,                          
+                                         nptxop.rec.ID,                               
+                                         nptxop.rec.Client,                           
+                                         nptxop.rec.OperDate,                         
+                                         IIF(nptxop.rec.IIS == SET_CHAR, true, false), 
+                                         Year, 
+                                         0, 
+                                         0, 
+                                         @ErrStr,
+                                         currIncDate,
+                                         currIncTime,
+                                         AmountSNOB,
+                                         $0,
+                                         date(0,0,0),
+                                         time(0));
+
+      elif(DataSet.DocKind == DL_HOLDNDFL)
+        var K = 1;
+
+        nptxop.Clear();
+
+        nptxop.rec.ID = DataSet.ID;
+        nptxop.GetEQ();
+
+        GetNptxopDateTime(nptxop, @currIncDate, @currIncTime);
+
+        DateSplit(nptxop.rec.PrevDate, null, null, Year);
+
+        AmountSNOB = STB_GetSumTaxBaseCurrPay(nptxop.rec.Client, FindTaxBaseKind, Year, NULL, NULL, currIncDate, currIncTime);
+
+        if(nptxop.rec.Subkind_Operation == DL_TXHOLD_OPTYPE_TAXREF) //возврат налога
+          K = -1;
+        end;
+
+        if(DL_GetPartyResident(nptxop.rec.Client) == NPTXPARTY_RESIDENT)
+          TxArr[TxArr.size] = STB_TaxRateParm(int(NPTXGENTAXRATE_RESIDENT*100),
+                                              0, 
+                                              K*(nptxop.rec.Tax - nptxop.rec.TaxDp));
+
+          TxArr[TxArr.size] = STB_TaxRateParm(int(NPTXGENTAXRATE_RESIDENT_15*100),
+                                              0, 
+                                              K*nptxop.rec.TaxDp);
+        else
+          TxArr[TxArr.size] = STB_TaxRateParm(int(NPTXGENTAXRATE_NOTRESIDENT*100),
+                                              0, 
+                                              K*nptxop.rec.Tax);
+        end;
+
+        err = STB_ExecuteCreateSTBOnStep(TxArr,
+                                         0, 
+                                         nptxop.rec.DocKind,                          
+                                         nptxop.rec.ID,                               
+                                         nptxop.rec.Client,                           
+                                         nptxop.rec.OperDate,                         
+                                         IIF(nptxop.rec.IIS == SET_CHAR, true, false), 
+                                         Year, 
+                                         0, 
+                                         0, 
+                                         @ErrStr,
+                                         currIncDate,
+                                         currIncTime,
+                                         AmountSNOB,
+                                         $0,
+                                         date(0,0,0),
+                                         time(0));
+
+      elif(DataSet.DocKind == DL_VEKSELDRAWORDER)
+        var S = RepAmountAndTax();
+    
+        dlorder.Clear();
+
+        dlorder.rec.ContractID = DataSet.ID;
+        dlorder.GetEQ();
+
+        GetVSDateTime(dlorder, @currIncDate, @currIncTime);
+
+        DateSplit(currIncDate, null, null, Year);
+
+        AmountSNOB = STB_GetSumTaxBaseCurrPay(dlorder.rec.Contractor, FindTaxBaseKind, Year, NULL, NULL, currIncDate, currIncTime);
+        
+        copy(dlord_rec, dlorder);
+
+        CalcTaxSTB_Veksel(dlord_rec, @НОБ_опер, @НОБ_30, @НОБ_13, @НОБ_15, @taxe, @taxe15, AmountSNOB, true);
+        
+        GetVSTax(dlorder, @S);
+
+        taxe   = S.Tax13_NatCur;
+        taxe15 = S.Tax15_NatCur;    
+
+        if(DL_GetPartyResident(dlorder.rec.Contractor) == NPTXPARTY_RESIDENT)
+          TxArr[TxArr.size] = STB_TaxRateParm(int(NPTXGENTAXRATE_RESIDENT*100),
+                                              НОБ_13, 
+                                              taxe);
+
+          TxArr[TxArr.size] = STB_TaxRateParm(int(NPTXGENTAXRATE_RESIDENT_15*100),
+                                              НОБ_15, 
+                                              taxe15);
+        else
+          TxArr[TxArr.size] = STB_TaxRateParm(int(NPTXGENTAXRATE_NOTRESIDENT*100),
+                                              НОБ_30, 
+                                              taxe);
+        end;
+      
+        err = STB_ExecuteCreateSTBOnStep(TxArr,
+                                         НОБ_опер,
+                                         dlorder.rec.DocKind, 
+                                         dlorder.rec.ContractID, 
+                                         dlorder.rec.Contractor, 
+                                         dlorder.rec.Signdate, 
+                                         false, 
+                                         Year, 
+                                         0, 
+                                         0, 
+                                         @ErrStr,
+                                         currIncDate,
+                                         currIncTime,
+                                         AmountSNOB,
+                                         $0,
+                                         date(0,0,0),
+                                         time(0));
+
+
+      end;
+
+
+      UseProgress(i = i + 1);
+    end;
+
+    RemProgress();
+  
+    if((TestMode) or (err))
+      RslDefCon.RollbackTrans();
+    else
+      RslDefCon.CommitTrans();
+    end;
+
+    if(err)
+      ErrArr = TClientErr(ПолучитьКодСубъекта(ClientID, PTCK_CONTR), GetPartyName(ClientID), ErrStr);
+    end;
+  end;
+
+OnError(er)
+  if(RslDefCon.IsInTrans)
+    RslDefCon.RollbackTrans();
+  end;
+
+  msgbox("Ошибка: " + er.Message);
+end;
+
+private macro ExecCreateSTB()
+  var query, cmd, DataSet;
+  var StartDate = date(0,0,0), EndDate = date();
+  var StartSTBDate = GetStartSTBDate();
+  var cnt = 0, i = 0;
+
+  ErrArr.size = 0;
+  
+  StartDate = StartSTBDate;
+
+  if(GetTRUE(FALSE, "Выполнить с фиксацией действий в БД?\n"
+                   +"(НЕТ - процедура выполнится в тестовом режиме без сохранения изменений в базе; ДА - все успешные изменения будут сохранены в базе)\n"
+                   +"Первый запуск рекомендуется выполнить в тестовом режиме и проверить в протоколе, что процедура выполняется без ошибок."))
+    TestMode = false;
+  end;
+
+  if(РАБОТА_С_ВНЕШНИМ_ХРАНИЛИЩЕМ_СНОБ() == false)
+    msgbox("Не включена работа с Хранилищем СНОБ");
+    return;
+  end;
+
+  if((StartSTBDate != date(0,0,0)) and (StartSTBDate > StartDate))
+    msgbox("Дата начала работы с Хранилищем СНОБ " + string(StartSTBDate:f) + " позже даты начала текущего налогового периода " + string(StartDate:f));
+    return;
+  end;
+
+  query =   " select distinct q.* "
+          + "   from ( "
+          //Операции расчета НОБ с типом "Окончание года" или "Закрытие ИИС"
+          + "         select distinct nptxop.t_Client "
+          + "           from dnptxop_dbt nptxop "
+          + "          where nptxop.t_DocKind = " + DL_CALCNDFL
+          + "            and nptxop.t_OperDate between ? and ? "
+          + "            and nptxop.t_SubKind_Operation IN ("+DL_TXBASECALC_OPTYPE_ENDYEAR + ", " +DL_TXBASECALC_OPTYPE_CLOSE_IIS + ") "
+          + "            and nptxop.t_Status = 2 /*DL_TXOP_Close*/ "
+          + "            and not Exists(select 1 from dnptxtotalbase_dbt tb where tb.t_ClientID = nptxop.t_Client and tb.t_DocKind = nptxop.t_DocKind and tb.t_DocID = nptxop.t_ID) "
+          + "            and not Exists(select 1 from dnptxtotalbasebc_dbt tb where tb.t_ClientID = nptxop.t_Client and tb.t_DocKind = nptxop.t_DocKind and tb.t_DocID = nptxop.t_ID) "
+          //Операции списания д/с
+          + "         union "
+          + "         select distinct nptxop.t_Client "
+          + "           from dnptxop_dbt nptxop "
+          + "          where nptxop.t_DocKind = " + DL_WRTMONEY
+          + "            and nptxop.t_OperDate between ? and ? "
+          + "            and nptxop.t_SubKind_Operation = " + DL_NPTXOP_WRTKIND_WRTOFF
+          + "            and nptxop.t_Status = 2 /*DL_TXOP_Close*/ "
+          + "            and nptxop.t_FlagTax = 'X' "            
+          + "            and not Exists(select 1 from dnptxtotalbase_dbt tb where tb.t_ClientID = nptxop.t_Client and tb.t_DocKind = nptxop.t_DocKind and tb.t_DocID = nptxop.t_ID) "
+          + "            and not Exists(select 1 from dnptxtotalbasebc_dbt tb where tb.t_ClientID = nptxop.t_Client and tb.t_DocKind = nptxop.t_DocKind and tb.t_DocID = nptxop.t_ID) "
+          + "            and Exists(select 1 from dparty_dbt pt where pt.t_PartyID = nptxop.t_Client and pt.t_LegalForm = 2 /*ФЛ*/)"
+          //Операции удержания/возврата НДФЛ
+          + "         union "
+          + "         select distinct nptxop.t_Client "
+          + "           from dnptxop_dbt nptxop "
+          + "          where nptxop.t_DocKind = " + DL_HOLDNDFL
+          + "            and nptxop.t_PrevDate between ? and ? "
+          + "            and nptxop.t_Status = 2 /*DL_TXOP_Close*/ "
+          + "            and not Exists(select 1 from dnptxtotalbase_dbt tb where tb.t_ClientID = nptxop.t_Client and tb.t_DocKind = nptxop.t_DocKind and tb.t_DocID = nptxop.t_ID) "
+          + "            and not Exists(select 1 from dnptxtotalbasebc_dbt tb where tb.t_ClientID = nptxop.t_Client and tb.t_DocKind = nptxop.t_DocKind and tb.t_DocID = nptxop.t_ID) "
+          //Операция погашения/выкупа векселей
+          + "         union "
+          + "         select distinct dlorder.t_Contractor as t_Client "
+          + "           from ddl_order_dbt dlorder "
+          + "          where dlorder.t_DocKind = " + DL_VEKSELDRAWORDER
+          + "            and dlorder.t_SignDate between ? and ? "
+          + "            and dlorder.t_ContractStatus = 20 /*Закрыт*/ "  
+          + "            and not Exists(select 1 from dnptxtotalbase_dbt tb where tb.t_ClientID = dlorder.t_Contractor and tb.t_DocKind = dlorder.t_DocKind and tb.t_DocID = dlorder.t_ContractID) "
+          + "            and not Exists(select 1 from dnptxtotalbasebc_dbt tb where tb.t_ClientID = dlorder.t_Contractor and tb.t_DocKind = dlorder.t_DocKind and tb.t_DocID = dlorder.t_ContractID) "
+          + "            and Exists(select 1 from dparty_dbt pt where pt.t_PartyID = dlorder.t_Contractor and pt.t_LegalForm = 2 /*ФЛ*/)"
+          + "            and dlorder.t_Contractor NOT IN ("+ExcludeONBClientID+")"
+          + "        ) q ";
+
+  cmd = DL_RSDCommand(query);
+
+  cmd.AddParam(StartDate);
+  cmd.AddParam(EndDate);
+  cmd.AddParam(StartDate);
+  cmd.AddParam(EndDate);
+  cmd.AddParam(StartDate);
+  cmd.AddParam(EndDate);
+  cmd.AddParam(StartDate);
+  cmd.AddParam(EndDate);
+
+  cnt = cmd.GetCount();
+
+  if(cnt > 0)
+    InitProgress(cnt, "Обработка клиентов", "Обработка клиентов");
+
+    i = 0;
+    DataSet = cmd.Execute();
+    while(DataSet.moveNext())
+
+      CreateSTBByClient(DataSet.Client, StartDate, EndDate);
+
+      UseProgress(i = i + 1);
+    end;
+
+    RemProgress();
+
+    println("Начальное заполнение данными Хранилища СНОБ в СОФР");
+
+    [Обработано клиентов: ############# Из них: успешно - ###########   с ошибкой - ###########]
+    (cnt:l, cnt-ErrArr.size:l, ErrArr.size:l);
+
+    if(ErrArr.size > 0)
+      println();
+      println("Ошибки обработки");
+      println("┌──────────────────────┬────────────────────────────────────────────────┬────────────────────────────────────────────────────────────┐");
+      println("│          Код         │                      ФИО                       │                        Сообщение                           │");
+      println("│        клиента       │                                                │                                                            │");
+      println("├──────────────────────┼────────────────────────────────────────────────┼────────────────────────────────────────────────────────────┤");
+
+      i = 0;
+
+      while(i < ErrArr.size)
+        
+              [│######################│################################################│############################################################│]
+              (string(ErrArr[i].ClientCode):c,   
+               string(ErrArr[i].ClientName):l:w,   
+               string(ErrArr[i].ErrStr):l:w        
+              );
+
+        if(i < ErrArr.size() - 1)
+          println("├──────────────────────┼────────────────────────────────────────────────┼────────────────────────────────────────────────────────────┤");
+        end;
+        
+        i = i + 1;
+      end;
+
+      println("└──────────────────────┴────────────────────────────────────────────────┴────────────────────────────────────────────────────────────┘");
+    end;
+
+  else
+    println("Нет подходящих клиентов");    
+  end; 
+
+OnError(er)
+  if(RslDefCon.IsInTrans)
+    RslDefCon.RollbackTrans();
+  end;
+
+  msgbox("Ошибка: " + er.Message);
+end;
+
+ExecCreateSTB();

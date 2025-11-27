@@ -1,0 +1,414 @@
+/*
+$Name:         dlnt400.mac
+$Module:       Неттинг
+$Description:  Квитовка платежей
+*/
+IMPORT PaymInter, mc_lib, dlntlib, dlkvitcmn;
+
+import role_model, PTInter, oralib, usr_connect_attr;
+import "dl_check_mt300.mac"; //Simanov
+PRIVATE VAR Параметры = NULL;
+
+private MACRO ПоУмолчанию(переменная, значение)
+  if (ValType(переменная) == V_UNDEF)
+      setparm(0,значение);
+  end;
+end;
+
+/* Квитовка платежей, размерности массивов PlanIDs и FactIDs одинаковые.
+*/
+PRIVATE MACRO КвитовкаПлатежа(PlanIDs, FactIDs)
+var 
+    stat = 0, 
+    fact, plan,
+    pml = TRecHandler("pmlink.dbt"),
+    СчетНевПоступления = "",
+    i = 0;
+
+    while( i < PlanIDs.size )
+        fact = RsbPayment(FactIDs[i]);
+        plan = RsbPayment(PlanIDs[i]);
+        if (fact.dockind == 140)
+            plan.FuturePayerAccount = fact.FuturePayerAccount;
+        elif (plan.dockind == 140)
+           fact.FuturePayerAccount = plan.FuturePayerAccount;
+        end;
+        if(fact.FuturePayerAccount != "")
+          СчетНевПоступления = Unkn_GetAccountPassive( {OperDprt}, fact.PayerFIID); //Получить счет "НевПоступления"
+          if((СчетНевПоступления == fact.FuturePayerAccount) and (fact.PayerFIID == plan.PayerFIID))
+            plan.FuturePayerAccount = СчетНевПоступления;
+          end;
+        end;
+
+        pml.rec.Amount = min(fact.FuturePayerAmount, plan.FuturePayerAmount);
+        pml.rec.FIID = plan.BaseFIID;
+        pml.rec.IPSign = "-";
+        pml.rec.PPSign = "-"; // сумма c FuturePayerAmount факт. платежа спишется в проводках
+        stat = plan.LinkPayment(fact, PMLINK_KIND_KVITING, pml);
+        if(stat)
+           DisplayError();
+           MsgBox("Ошибка при выполнении|квитовки планового платежа " + PlanIDs[i] + "|с фактическим платежом " + FactIDs[i]);
+           return false;
+        end;
+
+        i = i + 1;
+    end;
+
+    return (stat == 0);
+END;
+
+
+/* Массивы с информацией о исполняемых платежах для квитовки 
+   Инициализируются бэк-офисом 
+*/
+VAR PlanIDs     = TArray;
+VAR FactIDs     = TArray;
+VAR KvitAmounts = TArray;
+VAR ExecDate;
+
+PRIVATE var StepDate; // Дата шага (дата проводки док-тов)
+
+
+/* Класс - параметры квитовки
+*/
+PRIVATE CLASS KvitParms ()
+private var
+  Payms = TArray;
+
+  PRIVATE CLASS KvitPair(id, sum)
+      var PaymID = id, PaymSum = sum;
+  END;
+
+  MACRO GetPaymSum(id) /* возвращает платеж */
+    var i = 0;
+    while(i < Payms.size)
+        if(id == Payms(i).PaymID)
+            return Payms(i).PaymSum;
+        end;
+        i = i + 1;
+    end;
+
+    return -1;
+  END;
+
+  MACRO Add(id, sum) /* возвращает платеж */
+    var i = 0;
+    while(i < Payms.size)
+        if(id == Payms(i).PaymID)
+            return;
+        end;
+        i = i + 1;
+    end;
+    Payms(Payms.size) = KvitPair(id, sum);
+  END;
+
+  MACRO Minus(id, sum) /* возвращает платеж */
+    var i = 0;
+    while(i < Payms.size)
+        if(id == Payms(i).PaymID)
+            Payms(i).PaymSum = Payms(i).PaymSum - sum;
+            return;
+        end;
+        i = i + 1;
+    end;
+  END;
+END;
+
+
+/* Класс ПД для определения дополнительных счетов (пока это здесь, больше ничего и не надо)
+*/
+private class PrimDOC( DocKind : integer, DocID : integer )
+
+  var Kind : integer;
+  var Id   : integer;
+
+  var Error : integer;
+
+/* Вернуть параметр второго рода */
+macro GetParametr( ParmKind, OperDate, CatCode, FIRole )
+  if(ParmKind == MC_TYPE_PARAMETR_DEPARTMENT)
+    return 0;
+  end;
+  return -1;
+end;
+
+/* вернуть параметр первого рода */
+macro GetParametrTemplate( ObjectID, Classificator, OperDate, FIRole )
+  return -1;
+end;
+
+/* Основная роль ФИ */
+macro GetBasisFIRole(FIRole)
+  return FIROLE_UNDEF;
+end;
+
+/* Корректировка счета  */
+macro CorrectAccount( account, accblnc, ORScheme, categ, templ, accdoc, OperDate )
+  return 0;
+end;
+
+/* Конструктор */
+  Kind = DocKind;
+  Id   = DocID;
+
+  Error = 0;
+end;
+
+//Simanov. Ищет значение поля uf4 в платеже
+private macro GetUserField4 (PaymID)
+  var u4 = "";
+  var sql = ExecSqlselect("select t_userfield4 from dpmpaym_dbt where t_paymentid = "+PaymID);
+  if (sql.MoveNext() )
+    u4 = sql.value(0);
+  end;
+  return u4;
+End;
+
+//Simanov. Доработано основание проводки, ролевая модель, пачки
+PRIVATE MACRO PmBookpass(pm,
+                   BpGround,                          /* основание проводки */
+                   CreditAccount, CreditAccountFIID,  /* счет кредита с валютой */
+                   MinorAmount, MinorFIID,            /* сумма проводки с валютой */
+                   MinorCrossRate,                    /* курс конверсии Minor'а к дебету */
+                   MinorCreditCrossRate,              /* курс конверсии Minor'а к кредиту */
+                   IsPartOfMain,
+                   Date_Carry,
+                   Number_Pack,
+                   Numb_Document,
+                   Result_Carry,
+                   Oper
+                   )
+   var
+       paymtr, pd, UserField4;
+
+   paymtr = pm.MakeTransaction(CreditAccount, CreditAccountFIID,
+                                 MinorAmount, MinorFIID,
+                                 MinorCrossRate, MinorCreditCrossRate);
+   if( paymtr == NULL )
+     MsgBox("Ошибка при создании проводки по платежу");
+     return false;
+   end;
+
+   if( ValType(IsPartOfMain) != V_Undef ) paymtr.IsPartOfMain = IsPartOfMain; end;
+
+   ПоУмолчанию(Date_Carry,     {curdate});
+   ПоУмолчанию(Result_Carry,   1);
+   ПоУмолчанию(BpGround,       pm.Ground);
+   ПоУмолчанию(CreditAccount,  pm.FutureReceiverAccount);
+   ПоУмолчанию(Oper,           {Oper});
+
+   if(CreditAccount == "")
+     MsgBox("Не задан счет получателя в платеже");
+     return false;
+   end;
+
+  //Выгрузка проводок обратно в БИС для редактирования платежа
+  if (Number_Pack == 170)
+    UserField4 = GetUserField4(pm.PaymentID);
+    paymtr.Numb_Document = UserField4;
+    paymtr.UserField1 = "ENCASH:"+UserField4;
+    paymtr.UserField3 = 1;
+  end;  
+
+   paymtr.Chapter     = 1;
+   paymtr.Date_Carry  = Date_Carry;
+   paymtr.ResultCarry = Result_Carry;
+   paymtr.Kind_Oper   = " 1";
+   paymtr.Ground      = BpGround;
+   paymtr.Number_Pack = Number_Pack;
+   paymtr.Oper        = Oper;
+//   paymtr.Numb_Document = VA_GetBookpassNum(pm.FuturePayerAccount,
+//                                            CreditAccount, pm.PayerFIID, 1);
+
+   if( not paymtr.Carry )
+     MsgBox("Ошибка при проводке по платежу");
+     return false;
+   end;
+
+   if (paymtr.Number_Pack == 170)
+     Connect_attr_from_paym_to_trn(pm.PaymentID, paymtr.acctrnid, 102, 102);
+   end;
+
+   return true;
+end;
+
+
+PRIVATE MACRO ВыполнитьПроводки(parms, ground, Number_Pack, oper)
+var 
+  i = 0, Sum, needToClose = false,
+  planpaym, factpaym, stat = 0;
+
+  ПоУмолчанию(ground, "Квитовка платежа");
+
+  while (i < PlanIDs.size)
+    if((planpaym = RsbPayment(PlanIDs(i))) == null)
+      MsgBox("Не найден платеж ", planpaym.PaymentID);
+      return false;
+    elif( (planpaym.PayerBankID == {OurBank}) and (not ВнешПлатПоСхРасч(planpaym.PaymentID)) )
+      MsgBox("Квитовка внутренних платежей не поддерживается");
+      return false;
+    elif((factpaym = RsbPayment(FactIDs(i))) == null)
+      MsgBox("Не найден платеж ", FactIDs(i));
+      return false;
+    end;
+
+    //Simanov - В рублевых проводках основание использовать из входящего платежа
+    if( (factpaym.BaseFIID == NATCUR) and (factpaym.ground != "") )
+      ground = factpaym.ground;
+    end;
+
+     //Simanov. Установка 170-й пачки для ответной выгрузки в БИС.
+    if (factpaym.ReceiverAccount == planpaym.ReceiverAccount)
+      if ( planpaym.BaseAmount < factpaym.BaseAmount ) //Попался платёж по сумме больше требования => С этого платежа будут квитоваться и другие требования => пачка 170, в БИС выгружается
+        Number_Pack = 170;
+      elif ( (planpaym.BaseAmount > factpaym.BaseAmount) and (factpaym.FuturePayerAmount < factpaym.BaseAmount) ) // Попался платёж по сумме меньше требования => Если платеж уже где-то квитовался, то пачка 170, иначе 30
+        Number_Pack = 170;
+      else
+        // BIQ-8464 всегда выгружаем
+        Number_Pack = 170;
+      end;
+    else
+      Number_Pack = 170;
+    end;
+
+    Sum = min(parms.GetPaymSum(PlanIDs(i)), KvitAmounts(i));
+
+    needToClose = false;
+
+    /*if(Sum > factpaym.FuturePayerAmount)
+      MsgBox("Сумма фактического платежа меньше суммы планового.");
+      return false;*/
+    if(factpaym.FuturePayerAmount == 0)
+      needToClose = true;
+    end;
+
+    if(not PmBookpass(factpaym, ground,
+      planpaym.ReceiverAccount,            // CreditAccount
+      planpaym.ReceiverFIID,               // CreditAccountFIID
+      Sum,                                 // MinorAmount
+      factpaym.ReceiverFIID,               // MinorFIID
+      null,
+      null, null,
+      StepDate, Number_Pack,
+      null, null, oper
+    ))
+      return false;
+    else
+      parms.Minus(PlanIDs(i), Sum);
+      if(needToClose)
+          factpaym.PaymStatus = PM_FINISHED;
+          factpaym.ValueDate  = StepDate;
+      end;
+    end;
+    
+    i = i + 1;
+  end;
+
+  return true;
+END;
+
+
+/* Запуск шага
+*/
+MACRO ExecuteStep(Buffer, Document, DocKind, ID_Operation, ID_Step)
+  var stat = 0;
+  var ground, oper;
+  RECORD ntg_buff ("dl_nett");
+  SetBuff(ntg_buff, Document);
+
+  //Simanov. 13.01.20 - Проверка сквитованных МТ300 для сделок, заключенных по телефону
+  if (not DL_nett_check_kvit_mt(ntg_buff) )
+    return 1;
+  end;
+
+  ground = "Расчеты по неттингу от " + string(ntg_buff.SigningDate:f) + " с " + StrSubst(GetPartyNames(ntg_buff.contractor, PTKN_FULLNAME)[0], "'", "");
+
+  oper = GetMainOperInGroup(DocKind);
+  if (oper <= 0) 
+    oper = {oper};
+  end;
+    Параметры = ПараметрыИсполнения(false, ntg_buff);
+    if (not Параметры.ПроводимКвитовку)
+      MsgBox("Квитовка платежей не предусмотрена.");
+      return 1;
+    end;
+// инициализация массива сумм плановых платежей
+  var i = 0, parms = KvitParms(); 
+  while(i < PlanIDs.size)
+    parms.Add(PlanIDs(i), RsbPayment(PlanIDs(i)).FuturePayerAmount);
+    i = i + 1;
+  end;
+
+  if( ExecDate > {curdate} )
+    MsgBox("Преждевременное выполнение шага запрещено.");
+    stat = 1;
+  end;
+
+  if (not stat)
+    if(not КвитовкаПлатежа(PlanIDs, FactIDs))
+      stat = 1;
+    elif(not ВыполнитьПроводки(parms, ground, 30/*пачка*/, oper))
+      stat = 1;
+    end;
+  end;
+
+  return stat;
+END;
+
+macro CheckReqIsExec(pmobj, data:@variant)
+  if( Параметры.ПроводимКвитовку )
+    if ((pmobj.ReceiverBankID == {OurBank}) and (pmobj.PayerBankID != {OurBank}))
+      if ((pmobj.PaymStatus != PM_FINISHED) and (pmobj.FuturePayerAmount > 0))
+        data = false;
+      end;
+    end;
+  else
+    data = false;
+  end;
+  return true;
+end;
+
+
+MACRO PostStep (    
+                CommitOrRollback, /*1-выполнение шага,2 -отакат шага*/
+                errTrn,        /* Статус выполнения шага-!0-произошла ошибка */
+                FirstDoc,      /* Указатель на первичный документ */
+                ID_Operation,  /* Номер экземпляра операции */
+                Num_Step,      /* Номер шага операции(из настроек) */
+                Kind_Operation,/* Вид операции */
+                KindDoc,       /* Вид первичного документа */
+                KindStep,      /* Вид шага операции */
+                ID_Step)       /* Номер шага операции */
+  var sql;
+  var ntg_buff = TRecHandler("dl_nett.dbt");
+
+  if (errTrn OR (CommitOrRollback == 2)) 
+      /* Произошла ошибка или происходит откат */
+      return;
+  end;
+
+  //Simanov. Удаление привязки проводок к входящим платежам. Для корректной выгрузки в БИС
+  sql = "delete from dpmdocs_dbt "
+      + "where t_acctrnid in (select t_acctrnid from doprdocs_dbt doc "
+      + "                     where t_id_operation = " + ID_Operation
+      + "                           and t_dockind = 1 "
+      + "                           and t_id_step = " + ID_Step
+      + "                           and exists (select 1 from dacctrn_dbt where t_acctrnid = doc.t_acctrnid and t_number_pack = 170)) ";
+  ExecSql(sql);
+
+  SetBuff(ntg_buff, FirstDoc);
+
+  Параметры = ПараметрыИсполнения(false, ntg_buff.rec);
+  
+  //Если не осталось необработанных исходящих платежей - автоматически исполняется шаг требований и операция закрывается
+  var isCanExec = true;
+  if (not (Параметры.БэкОфис == "S"))
+    if (ForEachPMResPaym(ntg_buff.rec.IdentProgram, ntg_buff.rec.NettingID, @CheckReqIsExec, @isCanExec))
+      if (isCanExec)
+        Opr_ExecuteStep(ID_Operation, "Т");
+      end;
+    end;
+  end;
+
+  return 1;
+END;

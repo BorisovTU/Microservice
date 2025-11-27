@@ -1,0 +1,1127 @@
+/*
+  $Name:        genaccmesCB.mac
+  $Module:      РКО
+  $Description: Формирование сообщений по заявке ЦБ
+*/
+//-----------------------------------------------------------------------------
+//          Автоматизированная банковская система RS-Bank               
+//                 Copyright (c) R-Style Software Lab
+//
+// Подсистема   : РКО
+//
+// Описание     : Формирование сообщений по заявке ЦБ
+//
+// Программист  : Чукина Т.А.
+//
+// Создан       : 21.09.2015
+//
+//-----------------------------------------------------------------------------
+
+import rsexts, "MesForCB_lib.mac", "MesForCB_protocol.mac", "MesForCB_RecNS.mac", "MesForCB_RecOS.mac", 
+       "MesForCB_RecVS.mac", "bnk_dirfile.mac", "bnk_IStreamImpl.mac";
+
+private const LogFileName : string = "d:\\preprocess.log";
+private const NeedLog : bool = false;
+
+private macro PutLog( msg:string )
+  if(not NeedLog)
+    return;
+  end;
+
+  var OldName = SetOutput( LogFileName, true );
+  println( string(msg, ": ", time():m) );
+  SetOutput ( OldName, true);
+end;
+
+private macro ClearLog
+  if(not NeedLog)
+    return;
+  end;
+
+  RemoveFile(LogFileName);
+end;
+
+private const ZeroDate : date = date(0,0,0);
+private const V_SPECVAL : integer = 26;
+private const MAX_INT : integer = 2147483647; // Максимальное значение типа integer в RSL
+private const STR_MAX_INT : string = string(MAX_INT);
+
+private macro GetMaxFileLen : integer
+  var MaxLen : integer = Bnk_GetRegistryValue("PS\\СООБЩЕНИЯ В ЦБ\\MAX_FILE_LEN", V_INTEGER, 0);
+  if(MaxLen <= 0)
+    MaxLen = MAX_INT;
+  end;
+
+  return MaxLen;
+end;
+
+private macro GetMesTypeName(MesType : string) : string
+  if(MesType == "NS")
+    return "сообщение об открытых и закрытых счетах";
+  elif(MesType == "OS")
+    return "сообщение об остатках на счетах";
+  elif(MesType == "VS")
+    return "сообщение об операциях по счетам";
+  else
+    // такой ситуации не должно быть
+    RunError("Ошибка программирования: неверное значение параметра MesType");
+  end;
+end;
+
+// Индикатор занятости
+private class TBusyIndicator
+  private var IsInit : bool = false,
+              MaxIndicatorValue : integer = 0,
+              IndicatorValueCount : integer = 0;
+
+  macro Remove
+    if(IsInit)
+      RemProgress();
+
+      IsInit = false;
+    end;
+  end;
+
+  macro Init(Title : string, StatusLine : string, MaxValue: integer)
+    Remove();
+
+    if( MaxValue and ( MaxValue > 0 ) )
+      InitProgress(MaxValue, StatusLine, Title);
+      MaxIndicatorValue = MaxValue;
+    else
+      InitProgress(-1, StatusLine, Title);
+    end;
+
+    IsInit = true;
+  end;
+
+  macro Use(i : integer, del : integer)
+    if( (i == 0) and (del > 0) )
+      UseProgress(MaxIndicatorValue/del);
+    elif( (not i) and (not del) )
+      UseProgress(IndicatorValueCount);
+    else
+      UseProgress(i);
+    end;
+  end;
+
+  macro ValueCountInc() 
+    IndicatorValueCount = IndicatorValueCount + 1;
+  end;
+
+  macro ValueCountDec() 
+    IndicatorValueCount = IndicatorValueCount - 1;
+  end;
+
+  macro destructor
+    Remove();
+  end;
+end;
+
+private var IsRewriteAllFiles : bool;
+
+private class TMesWriter(MapVal : PSRepMap, MesData : TMesDataSelectForCB)
+  private var 
+    // дата начала периода
+    DateBeg : date = MesData.GetDateBeg(), 
+    // дата окончания периода
+    DateEnd : date = MesData.GetDateEnd(), 
+    // каталог выгрузки файлов
+    Directory : string = MapVal.Value( "Directory" ), 
+
+    // Название поля Узел ТС - филиал или ВСП
+    TSNodeField : string = GetTSNodeField( MapVal.Value("SubBranch"), 
+                                           MapVal.Value("SplitByBranch") ), 
+
+    rsOpenAndClosed = MesData.rsOpenAndClosed,
+    rsAccRests = MesData.rsAccRests,
+    rsAccRestsGK = MesData.rsAccRestsGK,//optimize
+    rsOperations = MesData.rsOperations,
+
+    CreatedFiles : TArray = TArray,
+    Protocol = MesForCB_GetProtocolObj(),
+
+    m_MapVal : PSRepMap = MapVal,
+    xml : object,
+    xmlwriter : object,
+    attrs : object = ActiveX("Msxml2.SAXAttributes"),
+    sfile : TIStreamImpl = TIStreamImpl_RS(),
+    BlockHeaderSize : integer = 0,
+    CloseParamPanel : bool = false,
+    mode_multi : bool = Opr_SetMultiExec( true ); // создавать будем в групповом режиме
+
+  private const MAX_FILE_LEN : integer = GetMaxFileLen();
+  private const FixedFileText : string =
+    "<?xml version=\"1.0\" encoding=\"windows-1251\"?>" + 
+    "<TRANSPORT verspo=\"RS-Bank V.6\">" +
+      "<Table nRec=\"" + STR_MAX_INT + "\" len=\"" + STR_MAX_INT + "\">" +
+      "</Table>" +
+    "</TRANSPORT>";
+  private const FixedFileSize : integer = StrLen(FixedFileText) + 2/*перевод строки*/;
+
+  macro destructor
+    Opr_SetMultiExec( mode_multi ); // восстанавливаем прежний режим
+    m_MapVal.Add( "CloseParamPanel", CloseParamPanel );
+  end;
+
+  macro GetRsOpenAndClosed()
+    return rsOpenAndClosed;
+  end;
+
+  macro GetRsAccRests()
+    return rsAccRests;
+  end;
+
+  macro GetRsAccRestsGK()
+    return rsAccRestsGK;
+  end;
+
+  macro GetRsOperations()
+    return rsOperations;
+  end;
+
+  private macro GetMesTypeSymbol(MesType : string) : string
+    var MesTypeSymbol : string = "";
+
+    if(MesType == "NS")
+      MesTypeSymbol = "Z";
+    elif(MesType == "OS")
+      MesTypeSymbol = "s";
+    elif(MesType == "VS")
+      MesTypeSymbol = "p";
+    else
+      // такой ситуации не должно быть
+      RunError("Ошибка программирования: неверное значение параметра MesType");
+    end;
+
+    return MesTypeSymbol;
+  end;
+
+  // Получить ИД субъекта филиала для узла ТС. Если узел ТС - ВСП, то ИД вышестоящего филиала
+  private macro GetBranchDepPartyID(Branch : integer) : integer
+    var rs : RsdRecordset = execSQLselectPrm
+    ( "select t_PartyID "
+      "  from ddp_dep_dbt "
+      " where t_NodeType = 1 /* DEPARTMENT_TYPE_FILIAL */ "
+      " start with t_Code = :Branch "
+      " connect by t_Code = prior t_ParentCode ",
+      SQLParam("Branch", Branch)
+    );
+
+    if(rs and rs.moveNext())
+      return rs.value("t_PartyID");
+    end;
+
+    return 0;
+  end;
+
+  private macro GetBankRegNum(Branch : integer, UseDprtForBranch : bool) : string
+    macro GetPartyID : integer
+      var PartyID : integer = 0; 
+
+      if(UseDprtForBranch) 
+        PartyID = GetBranchDepPartyID(Branch);
+      else
+        PartyID = GetDprtPartyID(Branch);
+      end;
+
+      if(PartyID <= 0)
+        RunError("Ошибка при поиске субъекта филиала для узла ТС");
+      end;
+
+      return PartyID;
+    end;
+    
+    // begin
+    var PartyID : integer = GetPartyID();
+
+    var BankRegNum : string = ПолучитьКодСубъекта(PartyID, PTCK_BANKREGNUM);
+    if(not BankRegNum)
+      RunError("Не найден код вида 13 для субъекта " + PartyID);
+    end;
+
+    return BankRegNum;
+  end;
+
+  private macro GetNBf(BankRegNum : string) : string
+    var NBf : string = GetSymbolsBeforeSlash(BankRegNum);
+    NBf = strLpad(NBf, 4, "0");
+    return NBf;
+  end;
+
+  private macro GetNFf(BankRegNum : string) : string
+    var NFf : string = GetSymbolsAfterSlash(BankRegNum);
+    NFf = strLpad(NFf, 4, "0");
+    return NFf;
+  end;
+
+  private macro GetFileNumber : string
+    var FileNumber : string = "";
+
+    if( GenerateReference(258, FileNumber) != 0 )
+      var ErrMsg : string = "Ошибка получения значения референса 'Номера сообщений с учетно-операционной информацией для ЦБ РФ'";
+      RunError(ErrMsg, ErrMsg);
+    end;
+
+    return FileNumber;
+  end;
+
+  private macro GetFileName(MesType : string, TSNode : integer) : string
+    var BankRegNum : string = GetBankRegNum(TSNode);
+
+    var FileName : string = 
+      "LSO" + GetMesTypeSymbol(MesType) + 
+      "_" + GetNBf(BankRegNum) + "_" + GetNFf(BankRegNum) + 
+      "_F" + DateToStr_YYYYMMDD(DateBeg) + 
+      "_L" + DateToStr_YYYYMMDD(DateEnd) + 
+      "_C" + DateToStr_YYYYMMDD( date() ) + 
+      "_" + GetFileNumber() + ".xml";
+
+    FileName = Directory + "\\" + FileName;
+
+    return FileName;
+  end;
+
+  private macro CheckFileExists(FileName : string)
+    if(not IsRewriteAllFiles and FileExists(FileName))
+        RunError("В директории выгрузки " + Directory + " уже существует файл с именем " + FileName);
+    end;
+  end;
+
+  private macro GetTSNodeTypeAndPartyID
+  ( DepID : integer, 
+    TSNodeType : @integer, 
+    TSNodePartyID : @integer
+  )
+    var rs : RsdRecordset = execSQLselectPrm
+    ( "select t_NodeType, t_PartyID "
+      "  from ddp_dep_dbt "
+      " where t_Code = :DepID ",
+      SQLParam("DepID", DepID)
+    );
+
+    if(rs and rs.moveNext())
+      TSNodeType = rs.value("t_NodeType");
+      TSNodePartyID = rs.value("t_PartyID");
+    else
+      RunError("Не найдены данные об узле ТС с номером " + DepID);
+    end;
+
+  end;
+
+  private macro GetShortFileName(FullFileName : string) : string
+    var file_name : string = "", file_ext : string = "";
+    SplitFile(FullFileName, file_name, file_ext);
+
+    return file_name + file_ext;
+  end;
+
+  private macro GetPartyNameForMes(PartyID : integer) : string
+    var Name : string = Bnk_GetPartyShortName(PartyID);
+    if(not Name)
+      Name = Bnk_GetPartyName(PartyID);
+    end;
+
+    Name = SubStr(Name, 1, 160);
+    return Name;
+  end;
+
+  private macro SetLenAttr(node : object)
+    var OpenTagLen : integer = index(node.xml, ">"),
+        CloseTagLen : integer = StrLen(node.nodeName) + 3,
+        ResultLength : integer = StrLen(node.xml) - OpenTagLen - CloseTagLen;
+
+    node.setAttribute( "len", string(ResultLength) );
+  end;
+
+  private macro FillHeader
+  ( CurrFileSize : @integer,
+    CurrFileName : string, 
+    CurrBranch : integer
+  )
+    xml = null;
+    xml = ActiveX("Microsoft.XMLDOM");
+
+    var Header : object = xml.createElement("THEADER");
+    Header.setAttribute( "date", DDpMMpYYYY(date()) );
+    Header.setAttribute( "time", TimeToStr(time(), "hh:mi:ss") );
+    Header.setAttribute( "nmbbank", GetBankRegNum(CurrBranch, true) );
+
+    var TSNodeType : integer = 0, TSNodePartyID : integer = 0;
+    GetTSNodeTypeAndPartyID(CurrBranch, @TSNodeType, @TSNodePartyID);
+
+    var vsp : string = "";
+    if( TSNodeType == 2 /* DEPARTMENT_TYPE_VSP */ )
+      vsp = GetPartyNameForMes(TSNodePartyID);
+    end;
+    Header.setAttribute( "vsp", vsp );
+
+    Header.setAttribute( "file", GetShortFileName(CurrFileName) );
+
+    var elem : object = xml.createElement("Bank");
+    var TSHeadPartyID : integer = GetTSHeadPartyID(TSNodePartyID);
+    elem.appendChild( xml.createTextNode( GetPartyNameForMes(TSHeadPartyID) ) );
+    Header.appendChild(elem);
+
+    elem = xml.createElement("PBDate");
+    elem.appendChild( xml.createTextNode( DDpMMpYYYY(DateBeg) ) );
+    Header.appendChild(elem);
+
+    elem = xml.createElement("PLDate");
+    elem.appendChild( xml.createTextNode( DDpMMpYYYY(DateEnd) ) );
+    Header.appendChild(elem);
+
+    SetLenAttr(Header);
+
+    xmlwriter.characters(Header.xml);
+    BlockHeaderSize = StrLen(Header.xml);
+    CurrFileSize = FixedFileSize + BlockHeaderSize;
+  end;
+
+  private macro CheckFileSize(FileSize : integer) : bool
+    if( (FileSize > MAX_FILE_LEN) // превышение лимита в настройке
+        or
+        (FileSize < 0) // выход за границу типа integer
+      )
+      return false;
+    end;
+
+    return true;
+  end;
+
+  private macro ErrorNotEnoughFileLen
+    CloseParamPanel = true;
+
+    var ErrMsg : string = "Необходимо увеличить заданную в настройке PS\\СООБЩЕНИЯ В ЦБ\\MAX_FILE_LEN максимальную длину файла.|Указанная длина не позволяет сформировать электронный файл";
+    RunError(ErrMsg, ErrMsg);
+  end;
+
+  private macro FillBlockRec
+  ( MesType : string,
+    rs : RsdRecordset,
+    nodeTable : object,
+    CurrNumRec : integer,
+    RecDate : date,
+    RecInfo
+
+  ) : string
+
+    var nodeRec : object = xml.createElement("Rec");
+    nodeRec.setAttribute( "RecID", CurrNumRec );
+
+    if(MesType == "NS")
+      TBlockRecNS(nodeRec, xml).Fill(rs);
+    elif(MesType == "OS")
+      //optimize
+      if(RecInfo and RecInfo.IsAccRestsGK)
+        TBlockRecOS(nodeRec, xml).Fill2(RecDate, RecInfo);
+      else
+        TBlockRecOS(nodeRec, xml).Fill(rs, RecDate);
+      end;
+    elif(MesType == "VS")
+      TBlockRecVS(nodeRec, xml).Fill(rs);
+    else
+      // такой ситуации не должно быть
+      RunError("Ошибка программирования: неверное значение параметра MesType");
+    end;
+    
+    SetLenAttr(nodeRec);
+
+    return nodeRec.xml;
+  end;
+
+  private macro GetTableAttrValuePosition(AttrName : string) : integer
+    var pos : integer = index(FixedFileText, AttrName);
+    if(not pos)
+      RunError("Ошибка при установке атрибута " + AttrName + " блока Table");
+    end;
+
+    pos = pos + BlockHeaderSize + strlen(AttrName) + 3 /* перевод строки + =" */;
+
+    return pos;
+  end;
+
+  private macro RewriteTableAttrValue(RsFile : TStream, ValPos : integer, AttrValue : string)
+    if( not RsFile.SetPos(ValPos, 0/*от начала */) )
+      // По документации SetPos должна возвращать true или false, но она ничего не возвращает
+      //RunError("Ошибка при установке атрибута блока Table");
+    end;
+
+    var s : string = strRpad(AttrValue + "\"", strlen(STR_MAX_INT) + 1, " ");
+    if( not RsFile.Write(s) )
+      RunError("Ошибка при установке атрибута блока Table");
+    end;
+  end;
+
+  private macro SetTableAttrInFile(RsFile : TStream, AttrName : string, AttrValue : string)
+    var ValPos : integer = GetTableAttrValuePosition(AttrName);
+
+    RewriteTableAttrValue(RsFile, ValPos, AttrValue);
+  end;
+
+  private macro FinishCurrentFile
+  ( CurrTableSize : integer,
+    CurrFileName : string,
+    CurrNumRec : integer
+  )
+    xmlwriter.endElement("", "", "Table");
+    xmlwriter.endElement("", "", "TRANSPORT");
+    xmlwriter.endDocument();
+
+    sfile.CloseFile();
+    xmlwriter = null;
+
+    var RsFile : TStream = TStream(CurrFileName, "W");
+    SetTableAttrInFile( RsFile, "nRec", CurrNumRec );
+    SetTableAttrInFile( RsFile, "len", CurrTableSize );
+
+    Protocol.FinishCurrentFile();
+
+  end;
+
+  private macro NewFile
+  ( MesType : string,
+    NewBranch : integer,
+    rs : RsdRecordset,
+    CurrFileSize : @integer,
+    CurrTableSize : @integer,
+    CurrFileName : @string,
+    CurrNumRec : @integer,
+    RecDate : @date,
+    RecInfo
+  )
+    // Завершить запись текущего файла
+    if(CurrFileSize)
+      FinishCurrentFile(CurrTableSize, CurrFileName, CurrNumRec);
+    end;
+
+
+    // Начать следующий файл
+    var CurrBranch : integer = NewBranch;
+    CurrFileName = GetFileName(MesType, CurrBranch);
+    CheckFileExists(CurrFileName);
+
+    xmlwriter = ActiveX("MSXML2.MXXMLWriter.3.0");
+    xmlwriter.indent = false; // не делаем отступы
+    xmlwriter.omitXMLDeclaration = true; // делать в начале строку <?xml  .. >
+    xmlwriter.encoding = "windows-1251";
+    xmlwriter.disableOutputEscaping = true;
+
+    sfile.CreateFile(CurrFileName);
+
+    CreatedFiles[ CreatedFiles.size ] = CurrFileName;
+
+    // Созданный поток указываем в качестве вывода.
+    xmlwriter.output = sfile.GetObjIStream(); 
+
+    xmlwriter.processingInstruction("xml", "version=\"1.0\" encoding=\"windows-1251\"");
+    xmlwriter.startDocument();
+
+    attrs.clear();
+    attrs.addAttribute("", "", "verspo", "", "RS-Bank V.6");
+    xmlwriter.startElement("", "", "TRANSPORT", attrs);
+
+    // Заголовок в новом файле
+    FillHeader(@CurrFileSize, CurrFileName, CurrBranch);
+
+    // начало блока данных (тэг <Table>)
+    attrs.clear();
+    attrs.addAttribute("", "", "nRec", "", STR_MAX_INT);
+    attrs.addAttribute("", "", "len", "", STR_MAX_INT);
+    xmlwriter.startElement("", "", "Table", attrs);
+
+    Protocol.NewFile(MesType, CurrFileName);
+    if(MesType == "OS")
+      var Account : string = "";
+      if(RecInfo)
+        Account = RecInfo.Account;
+      else
+        Account = rs.value("t_Account");
+      end;
+      Protocol.PrintTableRow(Account);
+    end;
+
+    // Первая запись в новом файле
+    CurrNumRec = 1;
+    var FirstRec : string = FillBlockRec(MesType, rs, null/*nodeTable*/, CurrNumRec, RecDate, RecInfo);
+    RecDate = RecDate + 1;
+    CurrTableSize = StrLen(FirstRec);
+
+    xmlwriter.characters(FirstRec);
+    Protocol.CommitLastRow();
+  end;
+
+  private macro WriteFiles(MesType : string, rs : RsdRecordset, BusyIndicator : TBusyIndicator)
+    var IsFileStarted : bool = false;
+
+    var CurrTSNode : integer = 0; // Узел ТС, по данным которого формируем файл
+    var CurrFileName : string = "";
+    var CurrNumRec : integer = 0;
+    var CurrFileSize : integer = 0;
+    var CurrTableSize : integer = 0;
+
+    var mes : object = null, nodeTable : object = null;
+
+    while( rs.moveNext() )
+      BusyIndicator.Use();
+      if(MesType == "OS")
+        Protocol.PrintTableRow(rs.value("t_Account"));
+      end;
+
+      var TSNode : integer = rs.value(TSNodeField); // Узел ТС - филиал или ВСП
+      var RecDate : date = IfThenElse(MesType == "OS", DateBeg, DateEnd);
+
+      while(RecDate <= DateEnd)
+        if(TSNode != CurrTSNode)
+          NewFile(MesType, TSNode, rs, @CurrFileSize, @CurrTableSize, @CurrFileName, @CurrNumRec, @RecDate);
+          IsFileStarted = true;
+          CurrTSNode = TSNode;
+
+        else
+          CurrNumRec = CurrNumRec + 1;
+          BusyIndicator.ValueCountInc();
+          var LastBlock : string = FillBlockRec(MesType, rs, nodeTable, CurrNumRec, RecDate);
+          RecDate = RecDate + 1;
+          CurrTableSize = CurrTableSize + StrLen(LastBlock);
+
+          if( MAX_FILE_LEN and ( MAX_FILE_LEN >= 1024 ) )
+            CurrFileSize = CurrFileSize + StrLen(LastBlock);
+
+            if( not CheckFileSize( CurrFileSize ) )
+              // Удалить из mes последний добавленный блок
+              Protocol.RollbackLastRow();
+              CurrNumRec = CurrNumRec - 1;
+              BusyIndicator.ValueCountDec();
+              RecDate = RecDate - 1;
+              CurrTableSize = CurrTableSize - StrLen(LastBlock);
+              
+              NewFile(MesType, TSNode, rs, @CurrFileSize, @CurrTableSize, @CurrFileName, @CurrNumRec, @RecDate);
+              continue;
+            end;
+          end;
+
+          xmlwriter.characters(LastBlock);
+          Protocol.CommitLastRow();
+        end;
+      end;// while(RecDate <= DateEnd)
+    end;//while( rs.moveNext() )
+
+    if(IsFileStarted)
+      FinishCurrentFile(CurrTableSize, CurrFileName, CurrNumRec);
+    end;
+
+    OnError(er)
+      Protocol.PrintProcError(er.Message);
+      RunError(er);
+      return;
+  end;
+
+
+// --------------------------------------------------------------------------------------------------
+// ОСТАТКИ - оптимизированная реализация для счетов Главной книги
+// --------------------------------------------------------------------------------------------------
+  private class TMesWriterOS
+    var IsFileStarted : bool = false;
+
+    var CurrTSNode : integer = 0; // Узел ТС, по данным которого формируем файл
+    var CurrFileName : string = "";
+    var CurrNumRec : integer = 0;
+    var CurrFileSize : integer = 0;
+    var CurrTableSize : integer = 0;
+
+    var mes : object = null, nodeTable : object = null;
+  end;
+
+  var RestWriter : TMesWriterOS = TMesWriterOS();
+
+  private macro RestsWriteDays
+    (Date1 : date, Date2 : date, TSNode : integer, Info : TRecInfoOS)
+      var MesType : string = "OS";
+      var RecDate : date = Date1;
+
+      while(RecDate <= Date2)
+        if(TSNode != RestWriter.CurrTSNode)
+          NewFile(MesType, TSNode, null/*rs*/, @RestWriter.CurrFileSize, @RestWriter.CurrTableSize, @RestWriter.CurrFileName, @RestWriter.CurrNumRec, @RecDate, Info);
+          RestWriter.IsFileStarted = true;
+          RestWriter.CurrTSNode = TSNode;
+
+        else
+          RestWriter.CurrNumRec = RestWriter.CurrNumRec + 1;
+          var LastBlock : string = FillBlockRec(MesType, null/*rs*/, RestWriter.nodeTable, RestWriter.CurrNumRec, RecDate, Info);
+          RecDate = RecDate + 1;
+          RestWriter.CurrTableSize = RestWriter.CurrTableSize + StrLen(LastBlock);
+
+          if( MAX_FILE_LEN and ( MAX_FILE_LEN >= 1024 ) )
+            RestWriter.CurrFileSize = RestWriter.CurrFileSize + StrLen(LastBlock);
+
+            if( not CheckFileSize( RestWriter.CurrFileSize ) )
+              // Удалить из mes последний добавленный блок
+              Protocol.RollbackLastRow();
+              RestWriter.CurrNumRec = RestWriter.CurrNumRec - 1;
+              RecDate = RecDate - 1;
+              RestWriter.CurrTableSize = RestWriter.CurrTableSize - StrLen(LastBlock);
+
+              NewFile(MesType, TSNode, null/*rs*/, @RestWriter.CurrFileSize, @RestWriter.CurrTableSize, @RestWriter.CurrFileName, @RestWriter.CurrNumRec, @RecDate, Info);
+              continue;
+            end;
+          end;
+
+          xmlwriter.characters(LastBlock);
+          Protocol.CommitLastRow();
+        end;
+      end; //while
+
+    OnError(er)
+      Protocol.PrintProcError(er.Message);
+      RunError(er);
+      return;
+  end;
+
+  private macro RestsFinish
+      if(RestWriter.IsFileStarted)
+        FinishCurrentFile(RestWriter.CurrTableSize, RestWriter.CurrFileName, RestWriter.CurrNumRec);
+      end;
+  end;
+
+  // Входящие остатки уже должны быть заполнены!
+  private macro CopyOutRestAndTurnsFromRs(Info : TRecInfoOS, rs : RsdRecordset)
+    Info.OutRest = rs.value("t_Rest");
+
+    if( ValType( rs.value("t_RestC") ) == V_SPECVAL )
+      // движения средств не было, рублевый остаток изменился из-за пересчета курса,
+      // валютный остаток остался прежним
+      Info.OutRestC = Info.InRestC;
+    else
+      Info.OutRestC = rs.value("t_RestC");
+    end;
+
+    Info.ObDt = rs.value("t_TurnDb");
+    Info.ObDtC = rs.value("t_TurnDbC");
+    Info.ObKt = rs.value("t_TurnCr");
+    Info.ObKtC = rs.value("t_TurnCrC");
+  end;
+
+  private macro GetCurRestBeforeDate
+  ( AccountID : integer,
+    AccFIID : integer,
+    RecDate : date
+  )
+    var RestC : money = $0;
+    PutLog( "GetCurRestBeforeDate" );
+
+    var rs : RsdRecordset = execSQLselectPrm
+      ( "select r.t_Rest "
+        "  from drestdate_dbt r "
+        " where r.t_AccountID = :AccountID "
+        "   and r.t_RestCurrency = :AccFIID "
+        "   and r.t_RestDate = ( select Max(r1.t_RestDate) "
+        "                          from drestdate_dbt r1 "
+        "                         where r1.t_AccountID = :AccountID1 "
+        "                           and r1.t_RestCurrency = :AccFIID1 "
+        "                           and r1.t_RestDate < :RecDate ) ",
+        SQLParam("AccountID", AccountID),
+        SQLParam("AccFIID", AccFIID),
+        SQLParam("AccountID1", AccountID),
+        SQLParam("AccFIID1", AccFIID),
+        SQLParam("RecDate", RecDate)
+      );
+
+    if(rs and rs.moveNext())
+      RestC = rs.value("t_Rest");
+    end;
+    PutLog( "Отработал запрос в GetCurRestBeforeDate");
+
+    return RestC;
+  end;
+
+  private macro GetInRestsFromDB
+  ( AccountID : integer,
+    AccFIID : integer,
+    RecDate : date,
+    InRest : @money,
+    InRestC : @money
+  )
+    PutLog( "GetInRestsFromDB" );
+
+    var rs : RsdRecordset = execSQLselectPrm
+      ( "select r.t_Rest, r.t_RestCurrency "
+        "  from drestdate_dbt r "
+        " where r.t_AccountID = :AccountID "
+        "   and r.t_RestDate = ( select Max(r1.t_RestDate) "
+        "                          from drestdate_dbt r1 "
+        "                         where r1.t_AccountID = :AccountID1 "
+        "                           and r1.t_RestDate < :RecDate ) ",
+        SQLParam("AccountID", AccountID),
+        SQLParam("AccountID1", AccountID),
+        SQLParam("RecDate", RecDate)
+      );
+
+    while(rs and rs.moveNext())
+      if(rs.value("t_RestCurrency") == NATCUR)
+        InRest = rs.value("t_Rest");
+      else
+        InRestC = rs.value("t_Rest");
+      end;
+    end;
+    PutLog( "Отработал запрос в GetInRestsFromDB" );
+
+    if( (InRestC == $0) and (InRest != $0) )
+      InRestC = GetCurRestBeforeDate(AccountID, AccFIID, RecDate);
+    end;
+  end;
+
+  private macro GetRestInfo(PrevRec, rs) : TRecInfoOS
+    var Info : TRecInfoOS = TRecInfoOS();
+
+    if(PrevRec)
+      Info.Account = PrevRec.Account;
+      Info.AccFIID = PrevRec.AccFIID;
+      Info.AccKind = PrevRec.AccKind;
+      Info.AccountID = PrevRec.AccountID;
+      Info.AccTSNode = PrevRec.AccTSNode;
+
+      Info.InRest = PrevRec.OutRest;
+      Info.InRestC = PrevRec.OutRestC;
+
+      if(rs)
+        CopyOutRestAndTurnsFromRs(Info, rs);
+      else
+        // движения средств не было, остатки не изменились
+        Info.OutRest = Info.InRest;
+        Info.OutRestC = Info.InRestC;
+      end;
+    elif(rs) // первая запись по счету
+      Info.Account = rs.value("t_Account");
+      Info.AccFIID = rs.value("t_AccFIID");
+      Info.AccKind = rs.value("t_Kind_Account");
+      Info.AccountID = rs.value("t_AccountID");
+      Info.AccTSNode = rs.value(TSNodeField);
+
+      var RsDate : date = rs.value("t_RestDate");
+      if( (RsDate >= DateBeg) or (RsDate == ZeroDate) )
+        // Получить остатки на дату < DateBeg и заполнить ими Info.InRest, Info.InRestC
+        GetInRestsFromDB(Info.AccountID, Info.AccFIID, DateBeg, @Info.InRest, @Info.InRestC);
+
+        if(RsDate == DateBeg)
+          CopyOutRestAndTurnsFromRs(Info, rs);
+        else
+          Info.OutRest = Info.InRest;
+          Info.OutRestC = Info.InRestC;
+
+          // обороты в этом случае нулевые
+        end;
+      else // RsDate < DateBeg
+        // Это будет PrevRec для первой записи, поэтому входящие остатки и обороты не нужны
+        Info.OutRest = rs.value("t_Rest");
+
+        if( ValType( rs.value("t_RestC") ) == V_SPECVAL )
+          // движения средств не было, рублевый остаток изменился из-за пересчета курса,
+          // валютный остаток остался прежним
+          Info.OutRestC = GetCurRestBeforeDate(Info.AccountID, Info.AccFIID, DateBeg);
+        else
+          Info.OutRestC = rs.value("t_RestC");
+        end;
+      end;
+    else
+      // такой ситуации не должно быть
+      RunError("Ошибка в алгоритме");
+    end;
+
+    return Info;
+  end;
+
+  private macro ProcessFirstAccRec
+  ( rs : RsdRecordset,
+    LastRecDate : @date,
+    PrevRec : @TRecInfoOS
+  )
+    Protocol.PrintTableRow(rs.value("t_Account"));
+
+    var RsDate : date = rs.value("t_RestDate");
+    var Info = null;
+    PutLog( "Запись данных по счету " + rs.value("t_Account") + 
+            " (AccountID = " + rs.value("t_AccountID") + ") " );
+
+    if(RsDate == ZeroDate)
+      Info = GetRestInfo(null/*PrevRec*/, rs);
+      RestsWriteDays(DateBeg, DateEnd, rs.value(TSNodeField), Info);
+
+      PrevRec = Info;
+      LastRecDate = DateEnd;
+
+    elif(RsDate < DateBeg)
+      PrevRec = GetRestInfo(null/*PrevRec*/, rs);
+      LastRecDate = ZeroDate;
+
+    elif(RsDate == DateBeg)
+      Info = GetRestInfo(null/*PrevRec*/, rs);
+      RestsWriteDays(DateBeg, DateBeg, rs.value(TSNodeField), Info);
+
+      PrevRec = Info;
+      LastRecDate = DateBeg;
+
+    else // RsDate > DateBeg
+      Info = GetRestInfo(null/*PrevRec*/, rs);
+      RestsWriteDays(DateBeg, RsDate - 1, rs.value(TSNodeField), Info);
+
+      PrevRec = Info;
+      Info = GetRestInfo(PrevRec, rs);
+      RestsWriteDays(RsDate, RsDate, rs.value(TSNodeField), Info);
+
+      PrevRec = Info;
+      LastRecDate = RsDate;
+    end;
+  end;
+
+  private macro ProcessNextAccRec
+  ( rs : RsdRecordset,
+    LastRecDate : @date,
+    PrevRec : @TRecInfoOS
+  )
+    var RecDate : date = IfThenElse(LastRecDate == ZeroDate, DateBeg, LastRecDate + 1);
+    var RsDate : date = rs.value("t_RestDate");
+    var Info = null;
+
+    if(RsDate > RecDate)
+      Info = GetRestInfo(PrevRec, null/*rs*/);
+      RestsWriteDays(RecDate, RsDate - 1, rs.value(TSNodeField), Info);
+
+      PrevRec = Info;
+      LastRecDate = RsDate - 1;
+    end;
+
+    if(RsDate >= RecDate)
+      Info = GetRestInfo(PrevRec, rs);
+      RestsWriteDays(RsDate, RsDate, rs.value(TSNodeField), Info);
+
+      PrevRec = Info;
+      LastRecDate = RsDate;
+    else
+      // такой ситуации не должно быть
+      RunError("Ошибка в алгоритме");
+    end;
+  end;
+
+  private macro ChangeAcc
+  ( rs : RsdRecordset,
+    LastRecDate : @date,
+    PrevRec : @TRecInfoOS
+  )
+    if(LastRecDate < DateEnd)
+      var RecDate : date = IfThenElse(LastRecDate == ZeroDate, DateBeg, LastRecDate + 1);
+      var Info = GetRestInfo(PrevRec, null/*rs*/);
+      RestsWriteDays(RecDate, DateEnd, PrevRec.AccTSNode, Info);
+
+      PrevRec = null;
+      LastRecDate = DateEnd;
+    end;
+
+    ProcessFirstAccRec(rs, @LastRecDate, @PrevRec);
+  end;
+
+  private macro WriteFilesForAccRests(rs : RsdRecordset, BusyIndicator : TBusyIndicator)
+    var IsFirst : bool = true,
+        LastRecDate : date = ZeroDate,
+        PrevRec : TRecInfoOS = null;
+
+    while( rs.moveNext() )
+      BusyIndicator.Use();
+
+      if( IsFirst )
+        ProcessFirstAccRec(rs, @LastRecDate, @PrevRec);
+        IsFirst = false;
+      elif( rs.value("t_AccountID") == PrevRec.AccountID ) // запись по тому же счету, что и предыдущая
+        ProcessNextAccRec(rs, @LastRecDate, @PrevRec);
+      else // пошли записи следующего счета
+        ChangeAcc(rs, @LastRecDate, @PrevRec);
+      end;
+      BusyIndicator.ValueCountInc();
+    end;
+
+    if( (LastRecDate < DateEnd) and (LastRecDate != ZeroDate) )
+      var Info : TRecInfoOS = GetRestInfo(PrevRec, null);
+      RestsWriteDays(LastRecDate + 1, DateEnd, PrevRec.AccTSNode, Info);
+    end;
+
+    RestsFinish();
+  end;
+// ОСТАТКИ --------------------------------------------------------------------------------------------------
+
+
+  macro WriteMesFiles( BusyIndicator : TBusyIndicator )
+
+    Protocol.RestoreOutput();
+
+    CreateDirectory(Directory);
+
+    if(rsOpenAndClosed)
+      WriteFiles("NS", rsOpenAndClosed, BusyIndicator);
+    end;
+        
+    //optimize
+    if(rsAccRestsGK)
+      WriteFilesForAccRests(rsAccRestsGK, BusyIndicator);
+    end;
+
+    if(rsAccRests)
+      WriteFiles("OS", rsAccRests, BusyIndicator);
+    end;
+
+    if(rsOperations)
+      WriteFiles("VS", rsOperations, BusyIndicator);
+    end;
+
+  OnError(er)
+    sfile = null; // нужно обнулить, чтобы он перестал держать открытым текущий файл
+    xmlwriter = null; // нужно обнулить, чтобы он перестал держать sfile
+  end;
+
+end;
+
+private macro WriteDays(MapVal : PSRepMap, MesTypeArray : TArray, TotalDateBeg : date, TotalDateEnd : date)
+  var ParmCurrMesArray = TArray();
+  var MesDataArray = TArray();
+  var MesWriterArray = TArray();
+
+  var SelectBusyIndicator : TBusyIndicator = TBusyIndicator();
+
+  var indicatorMaxValue = ( ( IfThenElse(MapVal.Value( "IncludeAccGK" ), 1, 0) + IfThenElse( MapVal.Value( "RegBranchesBO" ), MapVal.Value( "RegBranchesBO" ).size, 0 ) ) * 
+                                    ( IfThenElse(MapVal.Value( "NS" ), 1, 0) * ( IfThenElse(MapVal.Value( "IsOperRest" ), 1, 0) + 1 ) 
+                                    + IfThenElse(MapVal.Value( "OS" ), 1, 0) * 2 + IfThenElse(MapVal.Value( "VS" ), 1, 0) * 2 ) );
+
+  if( MesTypeArray and (MesTypeArray.size > 0) )
+    for( var MesType : string, MesTypeArray )
+      if( not MapVal.Value(MesType) )
+        continue;
+      end;
+      ParmCurrMesArray[ParmCurrMesArray.size] = TParmCurrMesForCB(MesType, TotalDateBeg, TotalDateEnd );
+    end;
+  end;
+
+  if( ParmCurrMesArray and ( ParmCurrMesArray.size > 0 ) )
+    for( var ParmCurrMes : TParmCurrMesForCB, ParmCurrMesArray )
+      MesDataArray[MesDataArray.size] = TMesDataSelectForCB(MapVal, ParmCurrMes);
+    end;
+  end;
+
+  SelectBusyIndicator.Init( "Отбор данных", "", indicatorMaxValue );
+  if( MesDataArray and ( MesDataArray.size > 0 ) )
+    var mesdtItr : integer = MesDataArray.size - 1;
+    while( mesdtItr >= 0 )
+      PutLog( "Формируем основной запрос (" + GetMesTypeName(ParmCurrMes.MesType) + ")" );
+      MesDataArray[mesdtItr].SelectData();
+      SelectBusyIndicator.Use(0, mesdtItr+1);
+      PutLog( "Отработал execSQLselect основного запроса" );
+      mesdtItr = mesdtItr - 1;
+    end;
+  end;
+  SelectBusyIndicator.Remove();
+
+  if( MesDataArray and ( MesDataArray.size > 0 ) )
+    for( var MesData : TMesDataSelectForCB, MesDataArray )
+      MesWriterArray[MesWriterArray.size] = TMesWriter(MapVal, MesData);
+    end;
+  end;
+
+  var WriteBusyIndicator : TBusyIndicator = TBusyIndicator();
+  indicatorMaxValue = 0;
+  
+  if( MesWriterArray and ( MesWriterArray.size > 0 ) )
+    var mesWrIndItr : integer = 0;
+    while( mesWrIndItr < MesWriterArray.size )
+      if( MesWriterArray[mesWrIndItr].GetRsOpenAndClosed and MesWriterArray[mesWrIndItr].GetRsOpenAndClosed.MoveNext() )
+        indicatorMaxValue = indicatorMaxValue + MesWriterArray[mesWrIndItr].GetRsOpenAndClosed.Value("t_RowCount");
+        MesWriterArray[mesWrIndItr].GetRsOpenAndClosed.Refresh();
+      end;
+      if( MesWriterArray[mesWrIndItr].GetRsAccRests and MesWriterArray[mesWrIndItr].GetRsAccRests.MoveNext() )
+        indicatorMaxValue = indicatorMaxValue + MesWriterArray[mesWrIndItr].GetRsAccRests.Value("t_RowCount");
+        MesWriterArray[mesWrIndItr].GetRsAccRests.Refresh();
+      end;
+      if( MesWriterArray[mesWrIndItr].GetRsAccRestsGK and MesWriterArray[mesWrIndItr].GetRsAccRestsGK.MoveNext() )
+        indicatorMaxValue = indicatorMaxValue + MesWriterArray[mesWrIndItr].GetRsAccRestsGK.Value("t_RowCount");
+        MesWriterArray[mesWrIndItr].GetRsAccRestsGK.Refresh();
+      end;
+      if( MesWriterArray[mesWrIndItr].GetRsOperations and MesWriterArray[mesWrIndItr].GetRsOperations.MoveNext() )
+        indicatorMaxValue = indicatorMaxValue + MesWriterArray[mesWrIndItr].GetRsOperations.Value("t_RowCount");
+        MesWriterArray[mesWrIndItr].GetRsOperations.Refresh()
+      end;
+      mesWrIndItr = mesWrIndItr + 1;
+    end;
+  end;
+
+  if( indicatorMaxValue != 0 )
+    WriteBusyIndicator.Init( "Запись данных в файл(ы)", "", indicatorMaxValue );
+    if( MesWriterArray and ( MesWriterArray.size > 0 ) )
+      var mesWrItr : integer = 0;
+      while( mesWrItr < MesWriterArray.size )
+        MesWriterArray[mesWrItr].WriteMesFiles(WriteBusyIndicator);
+        mesWrItr = mesWrItr + 1;
+      end;
+    end;                 
+    WriteBusyIndicator.Remove(); 
+  else
+    msgbox("Нет данных, удовлетворяющих указанным условиям");
+    exit(0);
+  end;
+end;
+
+private macro GetNextDateEnd(DateBeg : date, interval : integer, TotalDateEnd : date) : date
+  var NextDateEnd : date = ZeroDate;
+
+  if(interval > 0)
+    NextDateEnd = DateBeg + interval - 1;
+
+    if(NextDateEnd > TotalDateEnd)
+      NextDateEnd = TotalDateEnd;
+    end;
+  else
+    NextDateEnd = TotalDateEnd;
+  end;
+
+  return NextDateEnd;
+end;
+
+macro GenAccMesOneType(MapVal : PSRepMap, MesTypeArray : TArray)
+
+  var TotalDateBeg : date = MapVal.Value( "DateBeg" ), 
+      TotalDateEnd : date = MapVal.Value( "DateEnd" ); 
+
+  if( MesTypeArray and (MesTypeArray.size > 0) )
+    WriteDays( MapVal, MesTypeArray, TotalDateBeg, TotalDateEnd );
+  end;
+  
+end;
+
+private macro IsStrInArray( arr : TArray, str : string )
+  if( arr and ( arr.size > 0 ) and str )
+    for( var arrstr : string, arr )
+      if( arrstr == str )
+        return true;
+      end;  
+    end;
+  end;
+  return false;
+end;
+
+macro GenAccMesCB(MapVal : PSRepMap) : bool
+
+  var MesTypeArray : TArray;
+  var Protocol = MesForCB_GetProtocolObj();
+  Protocol.Start(MapVal);
+
+  ClearLog();
+
+  IsRewriteAllFiles = false;
+
+  MesTypeArray = MakeArray( "NS", "OS", "VS" );
+
+  GenAccMesOneType(MapVal, MesTypeArray);
+  
+  return true;
+
+OnError(er)
+  if( er.Code != 0 )
+    ExeptionMessage(er);
+  end;
+  return false;
+end;

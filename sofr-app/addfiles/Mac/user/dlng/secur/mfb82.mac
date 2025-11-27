@@ -1,0 +1,1070 @@
+/*
+$Name:        mfb82.mac
+$Module:      
+$Description: Загрузка отчетов MFB82, корректировка параметра 'Код участника торгов' по данным из отчета MFB82.
+Автор: Топорков Д.В. (04.2023)
+DEF-36191  */
+
+import RSD, globals, RsbFormsInter, rsexts;
+import DealsInter;
+import ServiceAction;
+import "cb_sql.mac";
+import "dlcontrfunc.mac";
+import "dlmisc.mac";
+
+private const LOG_CORRECTION_FILENAME = "Mfb82KutCorrectionLog";
+private const LOG_MFB82LOAD_FILENAME  = "Mfb82LoadDataLog";
+private const REG_IMPORT_PATH = "РСХБ\\ДИРЕКТОРИИ\\PATH_MFB82_SPB";
+private const MAX_ERROR_ALLOWABLE     = 10;                    //   = 0 пропускать все ошибки
+private const SOURCE_FILE_PREFIX = "RSXBM_MFB82";
+
+private const FIELD_TYPE_EDITABLE = 1,
+              FIELD_TYPE_READONLY = 2,
+              FIELD_TYPE_SCROLLED = 5;
+private const FILTER_PARAM_CLIENTDOC = 0,
+              FILTER_PARAM_KI        = 1,
+              FILTER_PARAM_IIS       = 2,
+              FILTER_PARAM_KUT       = 3;
+private const V_SPECVAL = 26;
+private const READONLY = true,
+              REQUIRED = true,
+              OPTIONAL = false;
+private const K_ENTER =  13,
+              K_F2    = 316,
+              K_F5    = 319,
+              K_F6    = 320,
+              K_ESC   =  27;
+private const FT_CHR = 12;
+private const ZERODATE = date(1, 1, 2) - 365;
+private const ON_TERMINAL = true,
+              ON_SERVER   = false;
+private const SEPARATOR   = "---------------------";
+
+var globalLogger;
+var mfb82DataSqlBuilder;
+var SpbID = Spb_ID();
+
+macro LogMessage(text: String)
+  globalLogger.Log(text);
+end;
+
+private class CTxtLogger(iFilename: String)
+  private var outStream: TStreamDoc;
+  private var filename: String = "";
+  
+  macro Log(message: String)
+    outStream.WriteLine(Date() + " " + Time() + ": " + message);
+  end;
+  
+  macro Close(): String
+    outStream = null;
+    return filename;
+  end;
+  
+  macro GetFileName(): String;
+    return filename;
+  end;
+  
+  //----- конструктор -------
+  filename = iFilename;
+  outStream = TStreamDoc(fileName, "c");
+end; // CTxtLogger
+
+private class CUniqueBuffer()
+  var arr: TArray;
+  
+  macro Exist(value: Variant): Integer
+    if (arr.size > 0)
+      for (var i: Integer, 0, arr.size - 1)
+        if (arr[i] == value)
+          return i;
+        end;
+      end;
+    end;
+    
+    return -1;
+  end;
+  
+  macro Add(value: Variant): Integer
+    if (Exist(value) >= 0) 
+      return -1;
+    end;
+    
+    arr[arr.Size] = value;
+    return arr.Size - 1;
+  end;
+  
+  //----- конструктор -------
+  arr = TArray();
+end; // CUniqueBuffer
+
+private macro IIF(condition, resultOnTrue, resultOnFalse)
+   if (condition)
+      return resultOnTrue;
+   else
+      return resultOnFalse;
+   end;
+end;
+
+private macro XmlDateToDate(value: String): Date
+  if (value == "")
+    return ZERODATE;
+  end;
+  return Date(Int(SubStr(value, 9, 2)), Int(SubStr(value, 6, 2)), Int(SubStr(value, 1, 4)));
+end;
+
+private macro XmlYesNoToChr(value: String): Integer
+  if (value == "Y")
+    return 88;
+  end;
+  return 0;
+end;
+
+private macro BoolToChr(value: Bool): Integer
+  return IIF(value, 88, 0);
+end;
+
+// возвращает входной параметр 'NAME' в виде 'NAME_yyyyddmmhhmmss.EXT'
+// где EXT - номер пользователя
+private macro GetUniqueFilename(filenameLeftPart: String): String;
+  var year, mon, day, 
+      hour, min, sec;
+  
+  DateSplit(Date(), day, mon, year);
+  TimeSplit(Time(), hour, min, sec);
+  
+  return filenameLeftPart 
+         + "_" 
+         + String(year) + String(mon:2) + String(day:2) + String(hour:2) + String(min:2) + String(sec:2) 
+         + "." 
+         + UserNumber;
+end;
+
+// Получить полный путь к файлу filename на сервере приложений или терминале в папке folder
+// folder - имя папки относительно "корня" приложения (Term терминала или папки в которой расположен каталог Obj сервера), 
+// filename - имя файла с расширением
+private macro GetFilenameInFolder(isTerm: Bool, folder:String, filename: String): String
+  return IIF(isTerm, GetCurDir(ON_TERMINAL) + "\\", SplitFile(GetCurDir(ON_SERVER))) 
+             + folder
+             + "\\"
+             + filename;
+end;
+
+// Получить имя файла с расширением из полного пути
+private macro ExtractFileName(fullFileName: String): String
+  var filename:  String = "",
+      extension: String = "";
+      
+  SplitFile(fullFileName, filename, extension);
+  return filename + extension;
+end;
+
+// Копирует файл на терминал в случает трехзвенки в папку targetFolder
+private macro CopyFileToTerm(targetFolder: String, sourceFileName: String): Bool
+  if (isStandAlone())
+    return false;
+  end;
+  
+  return CopyFile(sourceFileName, "$" + GetFileNameInFolder(ON_TERMINAL, targetFolder, ExtractFileName(sourceFileName)));
+end;
+
+// Копирует выбранный файл в рабочую папку WorkFile сервера
+// В случае успеха возвращает полный путь к файлу в рабочей папке 
+// или "" в случае ошибки копирования
+private macro GetFile(sourceFileName, isTerm: Bool): String  
+  var destinationFileName: String;
+  
+  destinationFileName = GetFilenameInFolder(ON_SERVER, "WorkFile", ExtractFileName(sourceFileName));
+  if (CopyFile(IIF(isTerm, "$", "") + sourceFileName, destinationFileName, true, "Загрузка файла в рабочий каталог"))
+    MsgBox("Скопирован файл в рабочий каталог " + destinationFileName);
+    return destinationFileName;
+  else
+    MsgBox("Ошибка при копировании файла " + sourceFileName + " в рабочий каталог в " + destinationFileName);
+    return "";
+  end;
+end;
+
+macro LogStart(logName: String)
+  globalLogger = CTxtLogger(GetFilenameInFolder(ON_SERVER, "TxtFile", GetUniqueFilename(logName)));
+  
+  ReplaceMacro("MsgBox", "LogMessage");
+end;
+
+macro LogEnd()
+  globalLogger.Close();
+  CopyFileToTerm("TxtFile", globalLogger.GetFileName());
+  ViewFile(globalLogger.GetFileName());
+  
+  ReplaceMacro("MsgBox", null);
+end;
+
+private class CFilterParams()
+  private var params: TArray;
+  private var clauses: TArray;
+  
+  macro Set(index: Integer, value: Variant)
+    params(index) = value;
+  end;
+  
+  macro Get(index: Integer): Variant
+    return params(index);
+  end;
+  
+  private macro GetClause(prefix: String): String
+    var result: String = "";
+    
+    for (var i: Integer, 0, params.Size-1)
+      if ( params(i) )
+        if (StrLen(result) > 0)
+          result = result + " " + prefix + " ";
+        end;
+        result = result + clauses(i);
+      end;
+    end;
+    
+    if (StrLen(result) > 0)
+      result = " AND (" + result + ")";
+    end;
+    return result;
+  end;
+  
+  macro GetOrClause(): String
+    return GetClause("OR");
+  end;
+  
+  macro GetAndClause(): String
+    return GetClause("AND");
+  end;
+  
+  //----- конструктор -------
+  params = TArray();
+  clauses = TArray();
+  params(FILTER_PARAM_CLIENTDOC)  = false;
+  clauses(FILTER_PARAM_CLIENTDOC) = "dat.t_Details != (SELECT substr(p.t_PaperSeries, 1, 2) || ' ' || substr(p.t_PaperSeries, 3, 2)  || ' ' || p.t_PaperNumber FROM dpersnidc_dbt p WHERE p.t_personid = sf.t_partyid AND p.t_paperkind = 0)";
+  params(FILTER_PARAM_KI)         = false;
+  clauses(FILTER_PARAM_KI)        = "dat.t_Q_Investor != (case when (select 1 from dscqinv_dbt qi where qi.t_partyid = sf.t_partyid and rownum = 1) is null then chr(0) else chr(88) end)";
+  params(FILTER_PARAM_IIS)        = false;
+  clauses(FILTER_PARAM_IIS)       = "dat.t_IndividualInvestmentAccount != dl.t_IIS";
+  params(FILTER_PARAM_KUT)        = false;
+  clauses(FILTER_PARAM_KUT)       = "dat.t_IdentificationCode != RSB_SECUR.SC_GetDlObjCodeOnDate(207,2,dlmp.t_DlContrId, doc.t_ReportDate)";
+end; //CFilterParams
+
+private class CSqlTextBuilder()
+  private var fields: String = ""; //в виде "t_id, t_value, ..."
+  private var params: String = ""; //в виде "?, chr(?), ..."
+  private var values = TArray();
+  
+  macro Add(sqlFieldName: String, value: Variant, isChar: Bool)
+    fields = fields + ", " + sqlFieldName;
+    params = params + ", " + IIF(isChar, "chr(?)", "?");
+    values[values.size] = value;
+  end;
+  
+  macro SetValue(index: Integer, value: Variant)
+    values[index] = value;
+  end;
+  
+  macro GetFields(): String
+    return SubStr(fields, 3);
+  end;
+  
+  macro GetParams(): String
+    return SubStr(params, 3);
+  end;
+  
+  macro AddParamsToCommand(cmd: @Object)
+    for (var i, 0, values.size-1)
+      cmd.AddParam("", RSDBP_IN, values(i));
+    end;
+  end;
+  
+  macro Build()
+  end;
+end; // CSqlTextBuilder
+
+private macro GetAttribute(xmlSection: Object, attributeName: String, isRequired: Bool, attributeMinLen: Integer, attributeMaxLen: Integer, defaultValue: String, checkMacroAddress: Variant): String
+  var attr = xmlSection.getAttribute(attributeName);
+  var errMsg: String = "";
+  if (ValType(attr) == V_SPECVAL)
+    if (isRequired)
+      MsgBox("Отсутствует обязательный атрибут '" + attributeName + "'");
+      RunError("Ошибка при чтении атрибута");
+    end;
+    attr = defaultValue;
+  else
+    var len = StrLen(attr);
+    if ((len < attributeMinLen) or (len > attributeMaxLen))
+      MsgBox("Ошибка загрузки аттрибута '" + attributeName + "', длина поля значения должена быть в пределах " + attributeMinLen + "-" + attributeMaxLen + " знаков. Текущее значение '" + attr + "'");
+      RunError("Ошибка при чтении атрибута");
+    end;
+  end;
+  if ((checkMacroAddress != NULL) and (not ExecMacro2(checkMacroAddress, attr, @errMsg)))
+    MsgBox("При проверке аттрибута '" + attributeName + "' получена ошибка: '" + errMsg + "'.");
+    RunError("Ошибка при чтении атрибута");
+  end;
+  return attr;
+end;
+
+private macro GetDateAttribute(xmlSection: Object, attributeName: String, isRequired: Bool)
+  return GetAttribute(xmlSection, attributeName, isRequired, 10, 10, "");
+end;
+
+private macro CheckYesNo(value: String, err: @String): Bool
+  if ((value != "Y") and (value != "N"))
+    err = "Допустимые значения: 'Y', 'N'. Текущее значение '" + value + "'";
+    return false;
+  end;
+  return true;
+end;
+
+private macro CheckStatus(value: String, err: @String): Bool
+  if ((value != "A") and (value != "N") and (value != "D") and
+      (value != "a") and (value != "n") and (value != "d"))
+    err = "Допустимые значения: 'A', 'N', 'D', 'a', 'n', 'd'. Текущее значение '" + value + "'";
+    return false;
+  end;
+  return true;
+end;
+
+class CMfb82Params(sectionMfb82)
+  var ReportDate: Date = XmlDateToDate(GetDateAttribute(sectionMfb82, "ReportDate",    REQUIRED));
+  var ReportDesc: String =                 GetAttribute(sectionMfb82, "ReportDesc",    OPTIONAL, 0, 500, "");
+  var ReportVersion: String =              GetAttribute(sectionMfb82, "ReportVersion", OPTIONAL, 0,   3, "");
+  var Weekday: String =                    GetAttribute(sectionMfb82, "Weekday",       OPTIONAL, 0,  20, "");
+  var MainFirmId: String =                 GetAttribute(sectionMfb82, "MainFirmId",    REQUIRED, 1,  16, "");
+  var MainFirmName: String =               GetAttribute(sectionMfb82, "MainFirmName",  OPTIONAL, 0, 120, "");
+  var MainFirmInn: String =                GetAttribute(sectionMfb82, "MainFirmINN",   OPTIONAL, 0, 128, "");
+  var Volume: Integer =                    GetAttribute(sectionMfb82, "Volume",        OPTIONAL, 0,   6, "1");
+  var VolumeTotal: Integer =               GetAttribute(sectionMfb82, "VolumeTotal",   OPTIONAL, 0,   6, "1");
+  var ReportNumber: String =               GetAttribute(sectionMfb82, "ReportNumber",  OPTIONAL, 0,  20, "");
+end;
+
+class CFirmParams(sectionFirm)
+  var FirmId: String = GetAttribute(sectionFirm, "FirmID", REQUIRED, 1, 16, "");
+end;
+
+class CLoadParams()
+  var Year: String;
+  var Month: String;
+  var Day: String;
+  var VolumeTotal: Integer; // всего файлов
+  var Volume: Integer;      // номер файла
+  var Path: String;
+end;
+
+class CRecordParams(sectionRecords)
+  var ClientCode: String =                            GetAttribute(sectionRecords, "ClientCode",         REQUIRED, 1,  16, "");
+  var Principal: Integer =              XmlYesNoToChr(GetAttribute(sectionRecords, "Principal",          REQUIRED, 1,   1, "N", @CheckYesNo));
+  var Type: String =                                  GetAttribute(sectionRecords, "Type",               REQUIRED, 1,   3, "");
+  var Details: String =                               GetAttribute(sectionRecords, "Details",            REQUIRED, 1,  41, "");
+  var CountryCode: String =                           GetAttribute(sectionRecords, "CountryCode",        OPTIONAL, 0,   4, "");
+  var Q_Investor: Integer =             XmlYesNoToChr(GetAttribute(sectionRecords, "Q_Investor",         OPTIONAL, 1,   1, "N", @CheckYesNo));
+  var IdentificationCode: String =                    GetAttribute(sectionRecords, "IdentificationCode", REQUIRED, 1, 120, "");
+  var CheckCrossMarket: Integer =       XmlYesNoToChr(GetAttribute(sectionRecords, "CheckCrossMarket",   OPTIONAL, 1,   1, "N", @CheckYesNo));
+  var Status: String =                                GetAttribute(sectionRecords, "Status",             REQUIRED, 1,   1, "",  @CheckStatus);
+  var DateOpen: Date =              XmlDateToDate(GetDateAttribute(sectionRecords, "DateOpen",           REQUIRED));
+  var DateClose: Date =             XmlDateToDate(GetDateAttribute(sectionRecords, "DateClose",          OPTIONAL));
+  var DataChanged: Integer =            XmlYesNoToChr(GetAttribute(sectionRecords, "DataChanged",        REQUIRED, 1,   1, "N", @CheckYesNo));
+  var IndividualInvestmentAccount: Integer =           XmlYesNoToChr(GetAttribute(sectionRecords, "IndividualInvestmentAccount",           OPTIONAL, 1, 1, "N", @CheckYesNo));
+  var ForeignSecurityClientProhibition: Integer =      XmlYesNoToChr(GetAttribute(sectionRecords, "ForeignSecurityClientProhibition",      OPTIONAL, 1, 1, "N", @CheckYesNo));
+  var UnquotRuSecurityClientProhibition: Integer =     XmlYesNoToChr(GetAttribute(sectionRecords, "UnquotRuSecurityClientProhibition",     OPTIONAL, 1, 1, "N", @CheckYesNo));
+  var UnratedRuBondClientProhibition: Integer =        XmlYesNoToChr(GetAttribute(sectionRecords, "UnratedRuBondClientProhibition",        OPTIONAL, 1, 1, "N", @CheckYesNo));
+  var ForeignBondClientProhibition: Integer =          XmlYesNoToChr(GetAttribute(sectionRecords, "ForeignBondClientProhibition",          OPTIONAL, 1, 1, "N", @CheckYesNo));
+  var StructuredBondClientProhibition: Integer =       XmlYesNoToChr(GetAttribute(sectionRecords, "StructuredBondClientProhibition",       OPTIONAL, 1, 1, "N", @CheckYesNo));
+  var StructuredIncomeBondClientProhibition: Integer = XmlYesNoToChr(GetAttribute(sectionRecords, "StructuredIncomeBondClientProhibition", OPTIONAL, 1, 1, "N", @CheckYesNo));
+  var ClosedFundClientProhibition: Integer =           XmlYesNoToChr(GetAttribute(sectionRecords, "ClosedFundClientProhibition",           OPTIONAL, 1, 1, "N", @CheckYesNo));
+  var DelistedClientProhibition: Integer =             XmlYesNoToChr(GetAttribute(sectionRecords, "DelistedClientProhibition",             OPTIONAL, 1, 1, "N", @CheckYesNo));
+end;
+
+private class (CSqlTextBuilder) CMfb82DataSqlBuilder()
+  macro Build(docId: Integer, recParam: CRecordParams)
+    this.SetValue(0,  docId);
+    this.SetValue(1,  recParam.ClientCode);
+    this.SetValue(2,  recParam.Principal);
+    this.SetValue(3,  recParam.Type);
+    this.SetValue(4,  recParam.Details);
+    this.SetValue(5,  recParam.CountryCode);
+    this.SetValue(6,  recParam.Q_Investor);
+    this.SetValue(7,  recParam.IdentificationCode);
+    this.SetValue(8,  recParam.CheckCrossMarket);
+    this.SetValue(9,  recParam.Status);
+    this.SetValue(10, recParam.DateOpen);
+    this.SetValue(11, recParam.DateClose);
+    this.SetValue(12, recParam.DataChanged);
+    this.SetValue(13, recParam.IndividualInvestmentAccount);
+    this.SetValue(14, recParam.ForeignSecurityClientProhibition);
+    this.SetValue(15, recParam.UnquotRuSecurityClientProhibition);
+    this.SetValue(16, recParam.UnratedRuBondClientProhibition);
+    this.SetValue(17, recParam.ForeignBondClientProhibition);
+    this.SetValue(18, recParam.StructuredBondClientProhibition);
+    this.SetValue(19, recParam.StructuredIncomeBondClientProhibition);
+    this.SetValue(20, recParam.ClosedFundClientProhibition);
+    this.SetValue(21, recParam.DelistedClientProhibition);
+  end;
+  
+  //----- конструктор -------
+  InitCSqlTextBuilder();
+  this.Add("t_DocId",              null, false);
+  this.Add("t_ClientCode",         null, false);
+  this.Add("t_Principal",          null, true );
+  this.Add("t_Type",               null, false);
+  this.Add("t_Details",            null, false);
+  this.Add("t_CountryCode",        null, false);
+  this.Add("t_Q_Investor",         null, true );
+  this.Add("t_IdentificationCode", null, false);
+  this.Add("t_CheckCrossMarket",   null, true );
+  this.Add("t_Status",             null, false);
+  this.Add("t_DateOpen",           null, false);
+  this.Add("t_DateClose",          null, false);
+  this.Add("t_DataChanged",        null, true );
+  this.Add("t_IndividualInvestmentAccount",           null, true );
+  this.Add("t_ForeignSecurityClientProhibition",      null, true );
+  this.Add("t_UnquotRuSecurityClientProhibition",     null, true );
+  this.Add("t_UnratedRuBondClientProhibition",        null, true );
+  this.Add("t_ForeignBondClientProhibition",          null, true );
+  this.Add("t_StructuredBondClientProhibition",       null, true );
+  this.Add("t_StructuredIncomeBondClientProhibition", null, true );
+  this.Add("t_ClosedFundClientProhibition",           null, true );
+  this.Add("t_DelistedClientProhibition",             null, true );
+end; // CMfb82DataSqlBuilder
+
+private macro GetRecordParams(xmlSectionRecord: Object): CRecordParams
+  var result = CRecordParams(xmlSectionRecord);
+  return result;
+  
+onError(err)
+  return null;
+end;
+
+private macro IsQueryReturnRecords(query: String): Bool
+  var cmd, rs;
+  
+  cmd = RsdCommand(query);
+  cmd.execute();
+  rs = RsdRecordset(cmd);
+  if (rs.moveNext)
+    return true;
+  end;
+  return false;
+end;
+
+private macro IsExistMfb82Doc(params: CLoadParams): Bool
+  return IsQueryReturnRecords("SELECT 1 FROM dmfb82doc_dbt" +
+                              " WHERE t_ReportDate = TO_DATE('" + params.Year + params.Month + params.Day + "', 'YYYYMMDD') " +
+                                " AND t_VolumeTotal = " + params.VolumeTotal + 
+                                " AND t_Volume = " + params.Volume + 
+                                " AND rownum = 1");
+end;
+
+private macro IsExistMfb82DocLater(docDate: date)
+  return IsQueryReturnRecords("SELECT 1 FROM dmfb82doc_dbt" +
+                              " WHERE t_ReportDate > TO_DATE('" + docDate + "', 'DD.MM.YYYY')" +
+                                " AND rownum = 1");
+end;
+
+private macro InsertMfb82Doc(mfb82: CMfb82Params, firm: CFirmParams, isLock: Bool): Integer
+  var cmd, cmdText: String;
+  var builder = CSqlTextBuilder();
+  
+  builder.Add("t_ReportDate",    mfb82.ReportDate,    false);
+  builder.Add("t_ReportDesc",    mfb82.ReportDesc,    false);
+  builder.Add("t_ReportVersion", mfb82.ReportVersion, false);
+  builder.Add("t_Weekday",       mfb82.Weekday,       false);
+  builder.Add("t_MainFirmId",    mfb82.MainFirmId,    false);
+  builder.Add("t_MainFirmName",  mfb82.MainFirmName,  false);
+  builder.Add("t_MainFirmINN",   mfb82.MainFirmInn,   false);
+  builder.Add("t_Volume",        mfb82.Volume,        false);
+  builder.Add("t_VolumeTotal",   mfb82.VolumeTotal,   false);
+  builder.Add("t_ReportNumber",  mfb82.ReportNumber,  false);
+  builder.Add("t_FirmId",        firm.FirmId,         false);
+  builder.Add("t_Lock",          BoolToChr(isLock),   true );
+
+  cmdText = "INSERT INTO dmfb82doc_dbt (" + builder.GetFields() + ") VALUES (" + builder.GetParams() + ") RETURNING t_id INTO ? ";
+  cmd = RsdCommand(cmdText);
+  builder.AddParamsToCommand(@cmd);
+  cmd.AddParam("v_id", RSDBP_OUT, V_INTEGER);
+  cmd.execute();
+
+  return SQL_ConvTypeInteger(cmd.value("v_id"));
+end;
+
+private macro InsertMfb82Data(docId: Integer, recParam: CRecordParams): Bool
+  var cmd, cmdText: String;
+
+  mfb82DataSqlBuilder.Build(docId, recParam);
+  cmdText = "INSERT INTO dmfb82data_dbt (" + mfb82DataSqlBuilder.GetFields() + ") VALUES (" + mfb82DataSqlBuilder.GetParams() + ")";
+  cmd = RsdCommand(cmdText);
+  mfb82DataSqlBuilder.AddParamsToCommand(@cmd);
+  cmd.execute();
+  return true;
+  
+onError(err)
+  return false;
+end;
+
+// Получить значение директории иморта данных из реестра
+private macro GetImportDir(): String
+  var error: Integer;
+  var registryValue: String;
+  var defaultValue: String = "..\\Import\\";
+  
+  GetRegistryValue(REG_IMPORT_PATH, V_STRING, registryValue, error);
+  if (error > 0)
+    MsgBox("Ошибка при чтении значения реестра '" + REG_IMPORT_PATH +"'");
+    return defaultValue;
+  elif (registryValue == "")
+    MsgBox("Значение реестра '" + REG_IMPORT_PATH + "' не установлено");
+    return defaultValue;
+  end;
+  if (SubStr(registryValue, StrLen(registryValue), 1) != "\\")
+    registryValue = registryValue + "\\";
+  end;
+  return registryValue;
+end;
+
+private macro CheckStringAsInteger(stringValue: String, stringLength: Integer, min: Integer, max: Integer): Bool
+  var intValue: Integer;
+  
+  if (not StrIsNumber(stringValue) or StrLen(stringValue) != stringLength)
+    return false;
+  end;
+  
+  intValue = Int(stringValue);
+  
+  return ((intValue >= min) and (intValue <= max));
+end;
+
+private macro IsYearString(value: String): Bool
+  return CheckStringAsInteger(value, 4, 2000, 2100);
+end;
+
+private macro IsMonthString(value: String): Bool
+  return CheckStringAsInteger(value, 2, 1, 12);
+end;
+
+private macro IsDayString(value: String): Bool
+  return CheckStringAsInteger(value, 2, 1, 31);
+end;
+
+// Получение параметров загрузки отчетов из имени файла
+// вида RSXBM_MFB82_YYYY-MM-DD_C_N.XML, где 
+//    C - общее количество файлов в отчете
+private macro GetLoadParams(fullFileName: String): CLoadParams
+  var loadParams: CLoadParams = CLoadParams();
+  var fileName: String;
+  var startIndex: Integer;
+  var endIndex: Integer;
+  var parts: TArray;
+  var isError: Bool = false;
+  
+  //путь по которому расположены файлы отчета
+  loadParams.Path = SplitFile(fullFileName, fileName);
+  parts = SplitString(fileName, "_");
+  
+  if ((parts.size != 5) or
+      (StrUpr(parts(0)) != "RSXBM") or
+      (StrUpr(parts(1)) != "MFB82") or
+      (StrLen(parts(2)) != 10) or          // дата YYYY-MM-DD
+      (not StrIsNumber(parts(3))) or       // С - общее количество
+      (not StrIsNumber(parts(4))))         // N - порядковый номер файла
+    isError = true;
+  end;
+  
+  if (not isError)
+    loadParams.VolumeTotal = Int(parts(3));
+    loadParams.Volume = Int(parts(4));
+    parts = SplitString(parts(2), "-");
+    if ((parts.size != 3) or
+        (not IsYearString(parts(0))) or
+        (not IsMonthString(parts(1))) or
+        (not IsDayString(parts(2))) )
+      isError = true;
+    end;
+  end;
+  
+  if (isError)
+    return null;
+  end;
+  
+  loadParams.Year  = parts(0);
+  loadParams.Month = parts(1);
+  loadParams.Day   = parts(2);
+  return loadParams;
+end; //GetLoadParams
+
+private macro ParseMfb82(sourceFileName: String): Bool
+  var xml = CreateXMLParser();
+  var sectionMfb82, sectionFirm, sectionRecords;
+  var mfb82Params, firmParams, recordParams;
+  var progressIndicator: Integer = 0;
+  var errorCount: Integer = 0;
+  var totalCount: Integer = 0;
+  var targetFileName: String;
+  
+  targetFileName = GetFile(sourceFileName, ON_SERVER);
+  if (targetFileName == "")
+    return false;
+  end;
+  
+  InitProgress(-1, "Чтение XML файла", "Чтение XML файла");  
+  if (not xml.Load(targetFileName)) 
+    MsgBox("Ошибка операции чтения XML файла");
+    return false;
+  end;
+  RemProgress();
+
+  sectionMfb82 = xml.getElementsByTagName("RTS_DOC");
+  if (sectionMfb82.length != 1)
+    MsgBox("Ошибка входного файла - " + IIF(sectionMfb82.length == 0, "отсутствует обязательная секция 'RTS_DOC'", "более одной секции 'RTS_DOC'"));
+    return false;
+  end;
+
+  sectionMfb82 = sectionMfb82.item(0).getElementsByTagName("MFB82");
+  if (sectionMfb82.length != 1)
+    MsgBox("Ошибка входного файла - " + IIF(sectionMfb82.length == 0, "отсутствует обязательная секция 'MFB82'", "более одной секции 'MFB82'"));
+    return false;
+  end;
+
+  mfb82Params = CMfb82Params(sectionMfb82.item(0));
+  
+  sectionFirm = sectionMfb82.item(0).getElementsByTagName("FIRM");
+  if (sectionFirm.length == 0)
+    MsgBox("Ошибка входного файла - отсутствует обязательная секция 'FIRM'");
+    return false;
+  end;  
+  
+  for (var i, 0, sectionFirm.length - 1)
+    firmParams = CFirmParams(sectionFirm.item(i));
+    
+    MsgBox("Загрузка записей для Firm '" + firmParams.FirmId + "'");
+    var docId: Integer = InsertMfb82Doc(mfb82Params, firmParams, false);
+
+    sectionRecords = sectionFirm.item(i).getElementsByTagName("RECORDS");
+    InitProgress(sectionRecords.length, "Обработка записей", "Чтение и запись данных для " + firmParams.FirmId); 
+    for (var j, 0, sectionRecords.length - 1)
+      recordParams = GetRecordParams(sectionRecords.item(j));
+      if (recordParams == null)
+        errorCount = errorCount + 1;
+        MsgBox("(запись № " + progressIndicator + ")");
+      else  
+        if (not InsertMfb82Data(docId, recordParams))
+          errorCount = errorCount + 1;
+          MsgBox("Ошибка при сохранении данных в таблицу Mfb82Data");
+        end;
+      end;
+      if ((MAX_ERROR_ALLOWABLE > 0) and (errorCount >= MAX_ERROR_ALLOWABLE))
+        MsgBox("ОШИБОК ПРИ ОБРАБОТКЕ СЕКЦИЙ <RECORDS> ДОСТИГЛО " + errorCount);
+        MsgBox("Загрузка данных прервана");
+        return false;
+      end;
+      totalCount = totalCount + 1;
+      UseProgress(progressIndicator = progressIndicator + 1);
+    end;
+    MsgBox("'Для Firm '" + firmParams.FirmId + "' обработано " + progressIndicator + " записей'");
+    RemProgress();
+  end;
+  
+  RemoveFile(targetFileName);
+  MsgBox("   Файл загружен успешно");
+  MsgBox("   Обработано " + totalCount + " записей");
+  MsgBox("   Записей содержащих ошибок " + errorCount);
+  return true;
+  
+onError(err)
+  MsgBox("Загрузка файла прервана: " + err.Message);
+  return false;
+end; // ParseMfb82
+
+macro Mfb82ReportLoad()
+  var targetFileName;
+  var loadParams: CLoadParams;
+  var sourceFiles;
+  var i: Integer;
+  var parsedFilesCount: Integer = 0;
+  var archivePath: String;
+  var sourceFilesSelectionMask: String;
+  
+  MsgBox("СТАРТ ПРОЦЕДУРЫ. Загрузка данных клирингового отчета MFB82\n");
+  MsgBox(SEPARATOR);
+  
+  if (not SelectFile(@targetFileName, GetImportDir() + SOURCE_FILE_PREFIX + "*.xml", "Выбор файла отчета MFB82", null, ON_SERVER))
+    MsgBox("Пользователь отказался от выбора файла");
+    return 1;
+  end;
+  
+  loadParams = GetLoadParams(targetFileName);
+  if (loadParams == null) 
+    MsgBox("Формат имени файла " + ExtractFileName(targetFileName) + " отличается от ожидаемого (RSXBM_MFB82_YYYY-MM-DD_C_N.xml)");
+    MsgBox("Выполнение прервано");
+    return 1;
+  end;
+  
+  archivePath = loadParams.Path + "Archive\\";
+  sourceFilesSelectionMask = loadParams.Path + SOURCE_FILE_PREFIX + "_" + loadParams.Year + "-" + loadParams.Month + "-" + loadParams.Day + "*.xml";
+  sourceFiles = TDirList(sourceFilesSelectionMask, "f");
+  i = 0;
+  
+  if (ExistDir(archivePath) == 2)
+    if (not MakeDir(archivePath))
+      MsgBox("Ошибка создания директории Archive");
+      archivePath = "";
+    end;
+  end;
+  
+  while (i < sourceFiles.Count)
+    var fileFullName: String = loadParams.Path + sourceFiles.name(i);
+    var fileLoadParams = GetLoadParams(fileFullName);
+    var isError: Bool = false;
+    
+    if (fileLoadParams == null)
+      MsgBox("Файл " + sourceFiles.name(i) + " не обработан, так как формат его имени отличается от ожидаемого (RSXBM_MFB82_YYYY-MM-DD_C_N.xml)");
+      isError = true;
+    end;  
+    
+    if ( (not isError) and (IsExistMfb82Doc(fileLoadParams)) )
+      MsgBox("Файл " + sourceFiles.name(i) + " загружался ранее. Не загружен");
+      isError = true;
+    end;
+    
+    if ( (not isError) and (ParseMfb82(fileFullName)) )
+      parsedFilesCount = parsedFilesCount + 1;
+    end;
+    
+    i = i + 1;
+  end;
+  
+  if (archivePath != "")
+    if (not sourceFiles.Copy(sourceFilesSelectionMask, "f", archivePath, true, false, ""))
+      MsgBox("Ошибка при перемещении файлов в папку Archive");
+    end;
+  end;
+  
+  MsgBox(SEPARATOR + "\n");
+  MsgBox("ПРОЦЕДУРА ЗАВЕРШЕНА\n");
+  MsgBox("Загружено файлов: " + parsedFilesCount + " из " + loadParams.VolumeTotal);
+  
+  if (parsedFilesCount < loadParams.VolumeTotal)
+    MsgBox("ВНИМАНИЕ - не полная загрузка отчета!");
+  end;
+end; // Mfb82ReportLoad
+
+macro KUTCorrection(mfb82DocDate: date)
+  var query: String = "";
+  var rs, cmd;
+  var totalCount:     Integer = 0;
+  var correctedCount: Integer = 0;
+  var errorCount:     Integer = 0;
+  var dlContrId:      Integer;
+  var clientCode: String;
+  var kutSofr:    String;
+  var kutMfb:     String;
+  var stat: Integer;
+  var unique: CUniqueBuffer = CUniqueBuffer();
+  var promt: String = "";
+  
+  MsgBox("СТАРТ ПРОЦЕДУРЫ коррекция параметра 'Код участника торгов' для всех записей от " + mfb82DocDate + "\n");
+  
+  if (mfb82DocDate < date())
+    promt = "Выполняется запуск по файлу дата которого меньше системной.|Возможна потеря изменений.|";
+    MsgBox(StrSubst(promt, "|", ""));
+  end;
+  
+  promt = promt + "Запустить процедуру коррекции КУТ?";
+  
+  if (not GetTrue(true, promt))
+    MsgBox("Отменено пользователем");
+    return;
+  end;
+  
+  query = " SELECT " +
+             " dat.t_ClientCode, dat.t_Details, dat.t_IdentificationCode, " +
+             " sf.t_Number, " +
+             " dl.t_DlContrId, " +
+             " dlmp.t_MpCode, " +
+             " (SELECT substr(p.t_NormalIdentSeries, 1, 2) || ' ' || substr(p.t_NormalIdentSeries, 3, 2)  || ' ' || p.t_PaperNumber FROM dpersnidc_dbt p WHERE p.t_PersonId = sf.t_PartyId AND p.t_PaperKind = 0) t_DetailsSofr, " +
+             " (RSB_SECUR.SC_GetDlObjCodeOnDate(207, 2, dlmp.t_DlContrId, to_date('" + {CurDate} + "', 'DD.MM.YYYY'))) t_IdentificationCodeSofr " +
+          " FROM " +
+             " dmfb82data_dbt dat, dmfb82doc_dbt doc, ddlcontrmp_dbt dlmp, ddlcontr_dbt dl, dsfcontr_dbt sf " +
+          " WHERE " +
+             " dat.t_DocId in (SELECT t_Id from dmfb82doc_dbt WHERE t_ReportDate = TO_DATE('" + mfb82DocDate + "', 'DD.MM.YYYY')) and " +
+             " doc.t_Id = dat.t_DocId and " +
+             " dat.t_ClientCode = dlmp.t_MpCode(+) and " +
+             " dlmp.t_MarketId(+) = " + SpbID + " and " + // ПАО СПБ
+             " dlmp.t_DlContrId = dl.t_DlContrId(+) and " +
+             " dl.t_SfContrId = sf.t_Id(+) ";
+             
+  InitProgress(-1, "Выполнение процедуры коррекции КУТ", "Выполнение процедуры коррекции КУТ");
+  MsgBox(SEPARATOR);
+  cmd = RsdCommand(query);
+  rs = RSDRecordset(cmd, RSDVAL_CLIENT, RSDVAL_STATIC);
+  
+  while (rs.MoveNext())
+    kutSofr    = SQL_ConvTypeStr(rs.value("t_IdentificationCodeSofr"));
+    kutMfb     = SQL_ConvTypeStr(rs.value("t_IdentificationCode"));
+    dlContrId  = SQL_ConvTypeInteger(rs.value("t_DlContrId"));
+    clientCode = SQL_ConvTypeStr(rs.value("t_ClientCode"));
+    totalCount = totalCount + 1;
+    UseProgress(totalCount);
+    stat = 0;
+    
+    if (kutMfb != kutSofr)
+      if ( (rs.value("t_Details") == rs.value("t_DetailsSofr")) and // данные документа (паспорта) совпадают
+           (unique.Add(dlContrId) >= 0) )  // и код на договоре еще не обновлялся (на случай нескольких записей в ddlcontrmp_dbt для одного клиента)
+        
+        if (StrLen(kutSofr) > 0) 
+          stat = DL_UnRegCodeDLCONTR(dlContrId, DLCCK_SPB_BIDCODE, DateShift({CurDate}, -1));
+        end;
+        
+        if (stat == 0)
+          stat = DL_AddCodeToDLCONTR(dlContrId, DLCCK_SPB_BIDCODE, kutMfb, {CurDate}); 
+
+          if (stat != 0)
+            MsgBox("Ошибка при записи нового КУТ для клиента " + clientCode);            
+          end;
+        else
+          MsgBox("Ошибка при обновлении КУТ " + kutSofr);
+        end;
+        
+        if (stat == 0)
+          ExecMacroFile("ContrUnloadDepo.mac", "ContrUnloadDepo", dlContrId, True);  // событие 8207 для Депозитария    
+          MsgBox("Для клиента ЕКК " + clientCode + " по договору " + rs.value("t_Number") + " установлен новый КУТ " + kutMfb);
+          correctedCount = correctedCount + 1;
+        else
+          errorCount = errorCount + 1;
+        end;
+        
+      end;
+    end;
+    
+  end; //while
+  
+  MsgBox(SEPARATOR + "\n");
+  MsgBox("ПРОЦЕДУРА ЗАВЕРШЕНА\n");
+  MsgBox("Всего обработано записей: " + totalCount);
+  MsgBox("КУТ скорректирован для " + correctedCount + " записей");
+  MsgBox("Ошибок при коррекции КУТ: " + errorCount);
+  RemProgress();
+end; // KUTCorrection
+
+private class (TRsbPanel) CFilterPanel(filterParams: @CFilterParams)
+  private var f;
+  private var params;
+  
+  private macro NewLabel(x: Integer, y: Integer, caption: String)
+    AddLabel(TRsbLabel(x, y, caption));
+  end;
+  
+  private macro NewCheckbox(x: Integer, y: Integer, controlName: String, isChecked: Bool)
+    var checkbox: Object;
+    
+    checkbox = TRsbCheckbox(1);
+    checkbox.name = controlName;
+    checkbox.dataType = FT_CHR;
+    checkbox.SetPosition(x, y);
+    checkbox.checked = isChecked;
+    AddControl(checkbox);
+  end;
+  
+  macro EventProc(event: Object)
+    if (event.keyCode == K_ESC)
+      this.Close( event.keyCode );
+    elif (event.keyCode == K_F2)
+      params.Set( FILTER_PARAM_CLIENTDOC, GetControl("ClientDoc").checked );
+      params.Set( FILTER_PARAM_KI,        GetControl("KI").checked );
+      params.Set( FILTER_PARAM_IIS,       GetControl("IIS").checked );
+      params.Set( FILTER_PARAM_KUT,       GetControl("KUT").checked );
+      this.Close( event.keyCode );
+    end;
+  end;
+  
+  InitTRsbPanel();
+  params = filterParams;
+
+  SetCaption("Фильтр скроллинга");
+  SetStatus("~Esc~ Выход   ~F2~ Применить");
+  SetSize(36, 8);
+  SetPosition(45,10);
+  
+  NewLabel(2, 1, "Выводить записи только при различии полей:");
+  NewCheckbox(4, 3, "ClientDoc", params.Get(FILTER_PARAM_CLIENTDOC));    NewLabel(6, 3, "Документ клиента");
+  NewCheckbox(4, 4, "KI",        params.Get(FILTER_PARAM_KI));           NewLabel(6, 4, "КвалИнвестор");
+  NewCheckbox(4, 5, "IIS",       params.Get(FILTER_PARAM_IIS));          NewLabel(6, 5, "ИИС");
+  NewCheckbox(4, 6, "KUT",       params.Get(FILTER_PARAM_KUT));          NewLabel(6, 6, "КУТ");
+  
+  AddEventHandler(RSB_EV_KEY_PRESSED, R2M(this, "EventProc"));
+end;  //CFilterPanel
+
+class CRslScroll
+  private var columns;
+
+  private macro GetColumnsCount(): Integer
+    return columns.size / 6;
+  end;
+
+  private macro Add(Value)
+    columns.Value(columns.Size) = Value;
+  end;
+
+  macro AddColumn (field: String, caption: String, width: Integer, type: Integer, decPoint: Integer)
+    Add(field);
+    Add(caption);
+    Add(width);
+    Add(type); 
+    Add(decPoint);
+    Add(0);  // Резерв
+  end;
+
+  macro EventProc (rs, cmd, id, key)
+  end;  
+
+  macro Run (rs: Object, scrollUniqueName: String, scrollCaption: String, statusLine: String, isReadOnly: Bool)
+    return RunScroll (rs, GetColumnsCount(), columns, scrollUniqueName, R2M(this,"EventProc"), scrollCaption, statusLine, isReadOnly);
+  end;
+
+  //----- конструктор -------
+  columns = TArray();
+end; //CRslScroll
+
+class (CRslScroll) CMfb82DataScroll
+  private var query: String = "";
+  private var rs, cmd;
+  private var filterParams = CFilterParams();
+
+  macro EventProc (rs, cmd, id, key)
+    var CM_FLAG = CM_DEFAULT;
+
+    if (cmd == DLG_KEY)
+      if (key == K_F5) 
+        CM_FLAG = CM_IGNORE;
+        if (CFilterPanel(@filterParams).Run() == K_F2)
+          CM_FLAG = CM_SELECT;
+        end;
+      end;
+    end;
+
+    return CM_FLAG;
+  end; 
+  
+  macro Run(mfb82DocId: Integer)
+    query = "SELECT " +
+                "doc.t_reportdate, " +
+                "dat.t_ClientCode, dat.t_Details, dat.t_Q_Investor, dat.t_IndividualInvestmentAccount, dat.t_IdentificationCode, dat.t_Status, dat.t_DateOpen, dat.t_DateClose, " +
+                 "dlmp.t_Mpcode, " +
+                "(select SubStr(p.t_NormalIdentSeries, 1, 2) || ' ' || substr(p.t_NormalIdentSeries, 3, 2)  || ' ' || p.t_PaperNumber from dpersnidc_dbt p where p.t_PersonId = sf.t_PartyId and p.t_PaperKind = 0) t_DetailsSofr, " +
+                "(select 'X' from dscqinv_dbt qi where qi.t_PartyId = sf.t_PartyId and rownum = 1) t_Q_InvestorSofr, " +
+                "dl.t_IIS t_IISSofr, " +
+                "(RSB_SECUR.SC_GetDlObjCodeOnDate(207,2,dlmp.t_DlContrId, to_date('" + {CurDate} + "', 'dd.mm.yyyy'))) t_IdentificationCodeSofr, " +
+                "(select max(dlmsg.t_RespDate) from ddlcontrmsg_dbt dlmsg where dlmsg.t_MarketId=" + SpbID + " and dlmsg.t_Kind=2 and dlmsg.t_DlContrId = dlmp.t_DlContrId) t_RegistrationDateSofr, " +
+                "(select max(dlmsg.t_RespDate) from ddlcontrmsg_dbt dlmsg where dlmsg.t_MarketId=" + SpbID + " and dlmsg.t_Kind=3 and dlmsg.t_DlContrId = dlmp.t_DlContrId) t_RegistrationCloseDateSofr, " +
+                "dlmp.t_MpCloseDate, " +
+                "sf.t_Number, " +
+                "sf.t_DateClose t_SfCloseDate " +
+            "FROM " +
+                "dmfb82data_dbt dat, dmfb82doc_dbt doc, ddlcontrmp_dbt dlmp, ddlcontr_dbt dl, dsfcontr_dbt sf " +
+            "WHERE " +
+                "dat.t_DocId = " + mfb82DocId + " and " +
+                "doc.t_Id = dat.t_DocId and " +
+                "dat.t_ClientCode = dlmp.t_MpCode(+) and " +
+                "dlmp.t_MarketId(+) = " + SpbID + " and " +
+                "dlmp.t_DlContrId = dl.t_DlContrId(+) and " +
+                "dl.t_SfContrId = sf.t_Id(+) ";
+    query = query + filterParams.GetAndClause();
+
+    cmd = RsdCommand(query);
+    rs = RSDRecordset(cmd, RSDVAL_CLIENT, RSDVAL_STATIC);
+    return this.Run(rs, "mfb82data", "Данные отчета MFB82", "~F5~ Фильтр   ~Esc~ Выход", READONLY);
+  end;
+  
+  //----- конструктор -------
+  InitCRslScroll();
+    
+  AddColumn("t_ReportDate",                "Дата отчета (MFB82)",                  10, FIELD_TYPE_READONLY, 0);
+  AddColumn("t_ClientCode",                "Краткий код клиента (MFB82)",          16, FIELD_TYPE_READONLY, 0);
+  AddColumn("t_Details",                   "Документ клиента (MFB82)",             20, FIELD_TYPE_READONLY, 0);
+  AddColumn("t_Q_Investor",                "КвалИнвестор (MFB82)",                  1, FIELD_TYPE_READONLY, 0);
+  AddColumn("t_IndividualInvestmentAccount", "ИИС (MFB82)",                         1, FIELD_TYPE_READONLY, 0);
+  AddColumn("t_IdentificationCode",        "КУТ (MFB82)",                          30, FIELD_TYPE_READONLY, 0);
+  AddColumn("t_Status",                    "Статус (MFB82)",                        1, FIELD_TYPE_READONLY, 0);
+  AddColumn("t_DateOpen",                  "Дата регистрации (MFB82)",             10, FIELD_TYPE_READONLY, 0);
+  AddColumn("t_DateClose",                 "Дата удаления (MFB82)",                10, FIELD_TYPE_READONLY, 0);
+  AddColumn("t_MpCode",                    "Краткий код клиента (СОФР)",           16, FIELD_TYPE_READONLY, 0);
+  AddColumn("t_Number",                    "Договор",                              10, FIELD_TYPE_READONLY, 0);
+  AddColumn("t_DetailsSofr",               "Документ клиента (СОФР)",              20, FIELD_TYPE_READONLY, 0);
+  AddColumn("t_Q_InvestorSofr",            "КвалИнвестор (СОФР)",                   1, FIELD_TYPE_READONLY, 0);
+  AddColumn("t_IISSofr",                   "ИИС (СОФР)",                            1, FIELD_TYPE_READONLY, 0);
+  AddColumn("t_IdentificationCodeSofr",    "КУТ (СОФР)",                           30, FIELD_TYPE_READONLY, 0);
+  AddColumn("t_RegistrationDateSofr",      "Дата регистрации (СОФР)",              10, FIELD_TYPE_READONLY, 0);
+  AddColumn("t_RegistrationCloseDateSofr", "Дата закрытия регистрации (СОФР)",     10, FIELD_TYPE_READONLY, 0);
+  AddColumn("t_MpCloseDate",               "Дата закрытия площадки на СПБ (СОФР)", 10, FIELD_TYPE_READONLY, 0);
+  AddColumn("t_SfCloseDate",               "Дата закрытия ДБО (СОФР)",             10, FIELD_TYPE_READONLY, 0);
+end; //CMfb82DataScroll
+
+class (CRslScroll) CMfb82DocScroll
+  private var query: String = "";
+  private var rs, cmd;
+
+  macro EventProc (rs, cmd, id, key)
+    var CM_FLAG = CM_DEFAULT;
+
+    if (cmd == DLG_KEY)
+      if (key == K_F2) 
+        if (ValType(rs.value("t_id")) != V_SPECVAL)
+          if (IsExistMfb82DocLater(rs.value("t_ReportDate")))
+            MsgBox("Запуск коррекции не возможен, есть отчеты за более позднюю дату");
+          else
+            LogStart(LOG_CORRECTION_FILENAME);
+            KUTCorrection(rs.value("t_ReportDate"));
+            LogEnd();
+            CM_FLAG = CM_SELECT;
+          end;
+        end;
+      elif (key == K_ENTER)
+        if (ValType(rs.value("t_id")) != V_SPECVAL)
+          var dataScroll = CMfb82DataScroll();
+          while (dataScroll.Run(rs.value("t_id")))
+          end;
+          CM_FLAG = CM_IGNORE;
+        end;
+      elif (key == K_F6)
+        LogStart(LOG_MFB82LOAD_FILENAME);
+        Mfb82ReportLoad();
+        LogEnd();
+        CM_FLAG = CM_SELECT;
+      end;
+    end;
+
+    return CM_FLAG;
+  end; 
+  
+  macro Run()
+    query = "SELECT "
+          + "t_Id, t_ReportDate, t_ReportDesc, t_MainFirmId, t_MainFirmName, t_MainFirmInn, t_Volume, t_VolumeTotal, t_ReportNumber, t_FirmId, t_Lock "
+          + "FROM dmfb82doc_dbt "
+          + "ORDER BY t_ReportDate DESC, t_VolumeTotal DESC, t_Volume DESC";
+
+    cmd = RsdCommand(query);
+    rs = RSDRecordset(cmd, RSDVAL_CLIENT, RSDVAL_STATIC);
+    return this.Run(rs, "mfb82doc", "Загруженные отчеты MFB82", "~F2~ Коррекция КУТ   ~F4~ Поиск   ~F6~ Загрузка XML   ~Enter~ Просмотр записей отчета", READONLY);
+  end;
+
+  //----- конструктор -------
+  InitCRslScroll();
+
+  AddColumn("t_Id",           "№",                                   6, FIELD_TYPE_READONLY, 0);
+  AddColumn("t_ReportDate",   "Дата, за которую формируется отчет", 10, FIELD_TYPE_READONLY, 0);
+  AddColumn("t_ReportDesc",   "Описание отчета",                    20, FIELD_TYPE_READONLY, 0);
+  AddColumn("t_MainFirmId",   "ID Участника клиринга",              16, FIELD_TYPE_READONLY, 0);
+  AddColumn("t_MainFirmName", "Наименование УК",                    30, FIELD_TYPE_READONLY, 0);
+  AddColumn("t_MainFirmInn",  "ИНН/TIN УК",                         20, FIELD_TYPE_READONLY, 0);
+  AddColumn("t_Volume",       "Номер тома в отчете",                 6, FIELD_TYPE_READONLY, 0);
+  AddColumn("t_VolumeTotal",  "Всего томов в отчете",                6, FIELD_TYPE_READONLY, 0);
+  AddColumn("t_ReportNumber", "Сквозной номер отчета",              20, FIELD_TYPE_READONLY, 0);
+  AddColumn("t_FirmId",       "ID Участника торгов",                16, FIELD_TYPE_READONLY, 0);
+  AddColumn("t_Lock",         "Признак блокировки",                  3, FIELD_TYPE_READONLY, 0);
+end; //CMfb82DocScroll
+
+//-------------------------------------------- Точка входа в макрос ----------------------------------
+mfb82DataSqlBuilder = CMfb82DataSqlBuilder();
+while (CMfb82DocScroll().Run())
+end;
+Exit(1);

@@ -1,0 +1,6 @@
+begin
+  UPDATE DREGPARM_DBT
+     SET T_NAME = '‘ˆ‘ŽŠ EMAIL „‹Ÿ Ž’€‚Šˆ EXCEL'
+   WHERE T_NAME = '‘ˆ‘ŽŠ EMAL „‹Ÿ Ž’€‚Šˆ EX‘EL';
+end; 
+/

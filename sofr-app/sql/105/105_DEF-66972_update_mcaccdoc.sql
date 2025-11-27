@@ -1,0 +1,2 @@
+--Исправление типа для активных счетов (направильный язык символа)
+update dmcaccdoc_dbt set t_kind_account = 'А' where t_kind_account = 'A' and t_catid = (select t_id from dmccateg_dbt where t_code = '+Биржа')/

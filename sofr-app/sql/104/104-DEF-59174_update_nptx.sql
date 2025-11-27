@@ -1,0 +1,30 @@
+--Обновление кривых записей
+DECLARE
+BEGIN
+  UPDATE DNPTXLOT_DBT
+     SET T_CLIENT   = -1*T_CLIENT,
+         T_CONTRACT = -1*T_CONTRACT,
+         T_FIID     = -1*T_FIID
+   WHERE T_ID = 3064363
+     AND T_CLIENT   = 128145
+     AND T_CONTRACT = 132506
+     AND T_FIID     = 1109;
+
+END;
+/
+
+DECLARE
+BEGIN
+  UPDATE DNPTXTS_DBT
+     SET T_BUYID    = -1*T_BUYID,
+         T_CLIENT   = -1*T_CLIENT,
+         T_CONTRACT = -1*T_CONTRACT,
+         T_FIID     = -1*T_FIID
+   WHERE T_BUYID = 3064363
+     AND T_SALEID = 0
+     AND T_CLIENT   = 128145
+     AND T_CONTRACT = 132506
+     AND T_FIID     = 1109;
+
+END;
+/

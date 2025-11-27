@@ -1,0 +1,2382 @@
+/*
+$Name:             sc_inacc.mac
+$Module:           Ценные бумаги 
+$Description:      Выполнение сервисной операции внутреннего учета
+*/
+import DealsInter, SPInter, FIInter, OprInter, "scstartcnv.mac", "sp_class.mac", "dlquery.mac", "cb_sql.mac", "dlcnst.inc", "dlntfd.mac", "sp_carin.mac", "sp_grfun.mac";
+import sc_closeacc;
+IMPORT "role_model.mac";//ролевая модель
+
+macro ОтобратьОбъектыДляВУ(_taskID, _execID, _conveyerID, _packetSize, _Params)
+  var dl_comm = TBFile("dl_comm.dbt");
+  var RetParmArr = TArray();
+  var i = 0;
+  var cnt = 0;
+  var query, cmd, DataSet;
+  
+  if(_Params.DocumentID > 0)
+    
+    dl_comm.rec.DocumentID = _Params.DocumentID;
+    if(dl_comm.GetEQ())
+
+      query = " INSERT INTO DCNVDOC_DBT(T_TASKID,T_EXECID,T_CONVTYPEID,T_PACKID,T_OBJECTTYPE,T_OBJECTID) "
+            + " SELECT ?,?,?,q.t_GroupNumber, q.t_ObjectType, q.t_ObjectID "
+            + "   FROM (" + GetInAccObjectQuery(dl_comm, _Params.mode, NULL, NULL, NULL, RetParmArr) + ") q ";
+      query = query + " ORDER BY q.t_ObjectID ";
+
+      cmd = DL_RSDCommand(query);
+
+      cmd.AddParam(_taskID);
+      cmd.AddParam(_execID);
+      cmd.AddParam(_conveyerID);
+
+      if(RetParmArr.size > 0)
+        i = 0;
+        while(i < RetParmArr.size)
+          cmd.AddParam(RetParmArr[i]);
+          i = i + 1;
+        end;
+      end;
+
+      cmd.ExecuteCMD();
+      
+      if(_packetSize == 0)
+        cnt = 1;
+      else
+        query =   " select NVL(max(t_PackID), 0) as cnt "
+                + "   from dcnvdoc_dbt "
+                + "  where t_ExecID = ?";
+        
+        cmd = DL_RSDCommand(query);
+
+        cmd.AddParam(_execID);
+
+        DataSet = cmd.Execute();
+        if(DataSet.moveNext())
+          cnt = int(round(int(DataSet.cnt), 0));
+        end;
+      end;
+    end;
+  end;
+
+  return cnt;
+end;
+
+private var FD=null, FD2=null;
+private var InAccOperTypeNamesArr = TArray(); /*массив с наименованиями видов расчетных операций (чтобы запомнить один раз и не лазить в базу)*/
+private var RepErrArr = TArray(); /*массив ошибок*/
+private var CurrErrPart = 0;
+
+private macro GetOperTypeName(OperType:integer)
+  var OperTypeName = "";
+  
+  if(ValType(InAccOperTypeNamesArr[OperType]) == V_UNDEF)
+    DL_GetValueName( OBJTYPE_CALCOPKIND, OperType, OperTypeName );
+    InAccOperTypeNamesArr[OperType] = OperTypeName;
+  else
+    OperTypeName = InAccOperTypeNamesArr[OperType];
+  end;
+
+  return OperTypeName;
+end;
+
+private macro DL_MassOprDocsExecuteNoError()
+  DL_MassOprDocsExecute();
+OnError(err)
+end;
+
+private class InAccGroundData(_OperType, _DealPart, _DealTypeName, _DealCode, _State, _StateDate, _IsDealREPO)
+  var OperType        = _OperType;
+  var DealPart        = _DealPart;
+  var DealTypeName    = _DealTypeName;
+  var DealCode        = _DealCode;
+  var State           = _State;
+  var StateDate       = _StateDate;
+  var IsDealREPO      = _IsDealREPO;
+end;
+
+macro InAcc_msgbox(StrErr)
+  if(FD != NULL)
+    if(StrUpr( GenClassName( FD )) == StrUpr("SPFirstDocContract"))
+      RepErrArr[RepErrArr.size] = CSC_InAccRepErr(CurrErrPart, FD.contr.rec.Number, 1, StrErr);
+    elif(StrUpr( GenClassName( FD )) == StrUpr("DL_NettingDoc"))
+      RepErrArr[RepErrArr.size] = CSC_InAccRepErr(CurrErrPart, FD.dl_nett.rec.DealNumber, 1, StrErr);
+    elif(StrUpr( GenClassName( FD )) == StrUpr("SPFirstDocDLCOMM"))
+      RepErrArr[RepErrArr.size] = CSC_InAccRepErr(CurrErrPart, FD.comm.rec.CommCode, 1, StrErr);
+    else
+      RepErrArr[RepErrArr.size] = CSC_InAccRepErr(CurrErrPart, FD.tick.rec.DealCode, 1, StrErr);
+    end;
+  else
+    RepErrArr[RepErrArr.size] = CSC_InAccRepErr(CurrErrPart, "", 1, StrErr);
+  end;
+end;
+
+private macro SaveErrForReport_XML( DocumentID:integer, DocKind:integer )
+
+  var RepXML = "";
+
+  if( RepErrArr.Size > 0 )
+     RepXML = SC_INACC_ERROR_LOG_DATA_XML(DocKind,DocumentID,RepErrArr,LOG_TYPE_ERROR).GetDataXML();
+  end;
+
+  if( RepXML != "" )
+     var Header = DL_LOG_HEADER_XML(DocKind).GetHeaderXML();
+
+     DL_InsertHeaderLog(DocumentID, DocKind, {Oper}, Header);
+     DL_InsertLogXMLData( DocumentID, DocKind, LOG_TYPE_ERROR, {Oper}, RepXML);
+  end;
+
+end;
+
+class InAccDataTrn(dl_comm:object, _execID, _conveyerID, _packetID)
+  var m_dl_comm = TBFile("dl_comm.dbt");
+  var m_InAccArr = TArray();      /*массив РОВУ*/
+  var m_GroundArr = TArray(); /*массив оснований для проводок*/
+  var m_size = 0;
+  var m_execID, m_conveyerID, m_packetID;
+  var m_RepDataArr = TArray();
+  var m_ScInAccGr = TArray();
+
+  macro SetGrDealID(GrDealID:integer)
+    //также запомним все строки графика во временной таблице
+    var ScInAccGrSize = m_ScInAccGr.size;
+    
+    m_ScInAccGr[ScInAccGrSize] = TRecHandler("scinaccgr.tmp");
+    m_ScInAccGr[ScInAccGrSize].Clear();
+    m_ScInAccGr[ScInAccGrSize].rec.GrDealID = GrDealID;
+  end;
+
+  /*добавить РОВУ*/
+  macro add(dlinacc:TRecHandler, GrDealID:integer, GroundData:InAccGroundData)
+    m_InAccArr[m_size] = TRecHandler("dlinacc.tmp");
+    copy(m_InAccArr[m_size], dlinacc);
+    m_InAccArr[m_size].rec.GrDealID = GrDealID;
+
+    m_GroundArr[m_size] = GroundData;
+
+    m_size = m_InAccArr.size;
+  end;
+
+  /*вставка сформированных РОВУ и проводок по ним*/
+  macro insert()
+    var dlinaccCache = RsbSQLInsert("dlinacc.tmp");
+    var ScInAccGrCache = RsbSQLInsert("scinaccgr.tmp");
+    var realIDs = TArray();
+    var arrErrCode : TArray, arrErrMessage : TArray;
+    var err = 0;
+    var i = 0;
+    var accTrnBatch = RsbBatchAccTrn;
+    var nCarry = 0, cntErr = 0;
+    var accTrn : RsbAccTransactionData;
+    var sql, cmd;
+    var prevFICode = "", prevFIID = -1;
+    var resExecute = false;
+
+    /*1. Вставляем строки графика во временную таблицу*/
+    SQL_Execute(" DELETE FROM DSCINACCGR_TMP ", null, false );
+    SQL_Execute(" DELETE FROM DDLINACC_TMP ", null, false );
+
+    ScInAccGrCache.AddRecordArray(m_ScInAccGr);
+    if(not ScInAccGrCache.insert())
+      err = 1;
+      RepErrArr[RepErrArr.size] = CSC_InAccRepErr(CurrErrPart, "", 1, "Ошибка при сохранении данных");
+    end;
+
+
+    /*2. Формируем проводки*/
+    if(not err)
+    while(i < m_size)
+      Var accTrnData = RsbAccTransactionData;
+      
+      accTrnData.Date_Carry      = m_InAccArr[i].rec.Date;
+      accTrnData.Chapter         = m_InAccArr[i].rec.Chapter;
+      accTrnData.Numb_Document   = "";
+      accTrnData.AccountPayer    = m_InAccArr[i].rec.DebAcc;
+      accTrnData.FIIDPayer       = m_InAccArr[i].rec.FIID;
+      accTrnData.SumPayer        = m_InAccArr[i].rec.Sum;
+      accTrnData.AccountReceiver = m_InAccArr[i].rec.KredAcc;
+      accTrnData.FIIDReceiver    = m_InAccArr[i].rec.FIID;
+      accTrnData.SumReceiver     = m_InAccArr[i].rec.Sum;
+
+      var OperTypeName = GetOperTypeName(m_GroundArr[i].OperType);
+
+      if((m_InAccArr[i].rec.DocumentKind == DL_SECURITYDOC) OR (m_InAccArr[i].rec.DocumentKind == DL_SECURLEG))
+        if( (m_GroundArr[i].OperType == 22) OR
+            (m_GroundArr[i].OperType == 25) OR
+            (m_GroundArr[i].OperType == 40) OR
+            (m_GroundArr[i].OperType == 41) OR
+            (m_GroundArr[i].OperType == 43) OR
+            (m_GroundArr[i].OperType == 44) OR
+            (m_GroundArr[i].OperType == 83) OR
+            (m_GroundArr[i].OperType == 84) OR
+            (m_GroundArr[i].IsDealREPO == 0) //ZMV DEF-49119 Для сделок из одной части в основание проводки часть не выводим
+          )
+           accTrnData.Ground = OperTypeName + " по сделке "+m_GroundArr[i].DealTypeName+" № "+m_GroundArr[i].DealCode;
+        else
+           accTrnData.Ground = OperTypeName + " по "+m_GroundArr[i].DealPart+" ч. сделки "+m_GroundArr[i].DealTypeName+" № "+m_GroundArr[i].DealCode;
+        end;
+      elif((m_InAccArr[i].rec.DocumentKind == DL_RETIREMENT) OR (m_InAccArr[i].rec.DocumentKind == DL_AVRWRT))
+        accTrnData.Ground = OperTypeName + " по операции "+m_GroundArr[i].DealTypeName+" № "+m_GroundArr[i].DealCode;
+      elif(m_InAccArr[i].rec.DocumentKind == DLDOC_SFCONCOM)
+        accTrnData.Ground = OperTypeName + " по договору обслуживания № "+m_GroundArr[i].DealCode;
+      elif( m_InAccArr[i].rec.DocumentKind == DL_NTGSEC )
+        accTrnData.Ground = OperTypeName + " по операции № " + m_GroundArr[i].DealCode + " от " + trim(string(m_InAccArr[i].rec.Date));
+      elif( m_InAccArr[i].rec.DocumentKind == DL_SCINOUTPOOL )
+        accTrnData.Ground = OperTypeName + " по сделке "+m_GroundArr[i].DealTypeName+" № "+m_GroundArr[i].DealCode;
+      end;
+
+
+/*DAN.Ролевая модель Определяем конечного операциониста для проводки */
+      var retvalGetMO = GetMainOperInGroup(m_InAccArr[i].rec.DocumentKind);
+      if (retvalGetMO > 0)
+	 accTrnData.Oper = retvalGetMO;
+      else
+         accTrnData.Oper = {Oper};
+      end;
+/*DAN*/
+
+
+	
+
+      accTrnBatch.AddAccTransaction( accTrnData, NULL, 0, 0 );
+
+      i = i + 1;
+    end;
+
+    DL_MassOprDocsExecuteNoError();
+
+      /*3. Исполняем проводки*/
+    resExecute = accTrnBatch.Execute(ACCTRN_EXEC_MODE_ONE_PACK);
+
+      /*4. Переносим ID проводок в РОВУ*/
+    i = 0;
+    nCarry = accTrnBatch.GetResult( arrErrCode, arrErrMessage );
+    while(i < nCarry)
+      accTrn = accTrnBatch.GetAccTransaction(i);
+
+      if( arrErrCode[i] == 0 )
+        m_InAccArr[i].rec.AccTrnID = accTrn.AccTrnID;
+        if(m_InAccArr[i].rec.GroundNum == "")
+          m_InAccArr[i].rec.GroundNum = substr(string(m_InAccArr[i].rec.Date:f), 1, 2)+substr(string(m_InAccArr[i].rec.Date:f), 4, 2)+"/"+accTrn.AccTrnID;
+        end;
+
+        if(m_InAccArr[i].rec.DocumentKind != DLDOC_SFCONCOM)
+          var FICode = "";
+          
+          if(prevFIID == accTrn.FIIDPayer)
+            FICode = prevFICode;
+          else
+            if(m_InAccArr[i].rec.Chapter == 22)
+              FICode = GetFICode(accTrn.FIIDPayer, null, FICK_USERCODE);
+            else
+              FICode = GetFICode(accTrn.FIIDPayer, null, FICK_ISONUMBER);
+            end;
+            prevFIID   = accTrn.FIIDPayer;
+            prevFICode = FICode;
+          end;
+
+          /*добавить запись в лог о выполненной проводке*/
+          m_RepDataArr[m_RepDataArr.size] = CSC_InAccRepParm(m_GroundArr[i].DealTypeName,
+                                                             m_GroundArr[i].DealCode,
+                                                             GetOperTypeName(m_GroundArr[i].OperType),      
+                                                             accTrn.AccountPayer,   
+                                                             accTrn.AccountReceiver,
+                                                             accTrn.SumPayer,         
+                                                             FICode);
+        end;
+      else
+        if( arrErrCode[i] != ACCTRN_PACKAGE_ERROR_NUMBER )
+          RepErrArr[RepErrArr.size] = CSC_InAccRepErr(CurrErrPart, m_GroundArr[i].DealCode, arrErrCode[i], "Ошибка при выполнении проводки \""+accTrn.Ground+"\". " + arrErrMessage[i]);
+          err = 1;
+        end;
+      end;
+
+      i = i + 1;
+    end;
+
+    // выведем реальные ошибки
+    if( not resExecute )
+      i = 0;
+      arrErrCode.size = 0;
+      arrErrMessage.size = 0;
+      cntErr = accTrnBatch.GetAddError(arrErrCode, arrErrMessage);
+      while( i < cntErr )
+        if( arrErrCode[i] != 0 )
+           RepErrArr[RepErrArr.size] = CSC_InAccRepErr(CurrErrPart, m_GroundArr[i].DealCode, arrErrCode[i], "Ошибка при выполнении проводки. " + arrErrMessage[i]);
+           err = 1;
+        end;
+
+        i = i + 1;
+      end;
+    end;
+    end;
+
+    if(not err)
+      /*5. Вставляем РОВУ во временную таблицу*/
+      dlinaccCache.AddRecordArray(m_InAccArr);
+      if(not dlinaccCache.insert())
+        err = 1;
+      end;
+
+      /*5.1. Переносим РОВу из веренной таблицы в постоянную, создаем привязки к сторокам графика РОВУ и проводок*/
+      if(not err)
+        sql =   "DECLARE "
+              + "  TYPE dlinacctmp_t IS TABLE OF DDLINACC_TMP%ROWTYPE INDEX BY BINARY_INTEGER; "
+              + "  v_dlinacctmp dlinacctmp_t; "
+
+              + "  TYPE id_t IS TABLE OF DDLINACC_TMP.t_id%TYPE; "
+              + "  TYPE grdealid_t IS TABLE OF DDLINACC_TMP.t_grdealid%TYPE; "
+
+              + "  v_ID         id_t; "
+              + "  v_GrDealID   grdealid_t; "
+
+
+              + "BEGIN "
+
+              + "  SELECT * "
+              + "    BULK COLLECT INTO v_dlinacctmp "
+              + "    FROM ddlinacc_tmp; "
+
+              + "  IF v_dlinacctmp.COUNT > 0 THEN "
+
+              + "    FORALL i IN v_dlinacctmp.first .. v_dlinacctmp.last "
+              + "    INSERT INTO ddlinacc_dbt "
+              + "     ( T_ID, T_BOFFICE, T_OPERTYPE, T_DOCUMENTKIND, T_DOCUMENTID, T_DATE, T_CHAPTER, "
+              + "       T_DEBACC, T_KREDACC, T_FIKIND, T_FIID, T_SUM, T_RATESUM, T_GROUNDKIND, T_GROUNDNUM, "
+              + "       T_DEPARTMENT, T_OPER, T_DEALKIND, T_ACCTRNID, T_PLACEID, T_SERVDOCKIND, T_SERVDOCID, "
+              + "       T_PARTYID, T_PARTYCONTRID, T_MARKETOFFICEID, T_SYSDATE, T_SYSTIME) "
+              + "    VALUES "
+              + "     ( 0, v_dlinacctmp(i).T_BOFFICE, v_dlinacctmp(i).T_OPERTYPE, v_dlinacctmp(i).T_DOCUMENTKIND, v_dlinacctmp(i).T_DOCUMENTID, v_dlinacctmp(i).T_DATE, v_dlinacctmp(i).T_CHAPTER, "
+              + "       v_dlinacctmp(i).T_DEBACC, v_dlinacctmp(i).T_KREDACC, v_dlinacctmp(i).T_FIKIND, v_dlinacctmp(i).T_FIID, v_dlinacctmp(i).T_SUM, v_dlinacctmp(i).T_RATESUM, v_dlinacctmp(i).T_GROUNDKIND, v_dlinacctmp(i).T_GROUNDNUM, "
+              + "       v_dlinacctmp(i).T_DEPARTMENT, v_dlinacctmp(i).T_OPER, v_dlinacctmp(i).T_DEALKIND, v_dlinacctmp(i).T_ACCTRNID, v_dlinacctmp(i).T_PLACEID, v_dlinacctmp(i).T_SERVDOCKIND, v_dlinacctmp(i).T_SERVDOCID, "
+              + "       v_dlinacctmp(i).T_PARTYID, v_dlinacctmp(i).T_PARTYCONTRID, v_dlinacctmp(i).T_MARKETOFFICEID, v_dlinacctmp(i).T_SYSDATE, v_dlinacctmp(i).T_SYSTIME) " 
+              + "    RETURNING T_ID, v_dlinacctmp(i).T_GRDEALID BULK COLLECT INTO v_ID, v_GrDealID; "
+
+
+              + "    FORALL i IN v_ID.first .. v_ID.last "
+              + "     INSERT INTO ddlgrdoc_dbt "
+              + "     (T_ID, T_GRDEALID, T_DOCKIND, T_DOCID, T_SERVDOCKIND, T_SERVDOCID, T_GRPID, T_SOURCETYPE) "
+              + "     VALUES(0, v_GrDealID(i), "+DL_DLINACC+", v_ID(i), ?, ?, 0, 0);"
+
+              + "    FORALL i IN v_dlinacctmp.first .. v_dlinacctmp.last "
+              + "     INSERT INTO ddlgrdoc_dbt "
+              + "     (T_ID, T_GRDEALID, T_DOCKIND, T_DOCID, T_SERVDOCKIND, T_SERVDOCID, T_GRPID, T_SOURCETYPE) "
+              + "     VALUES(0, v_dlinacctmp(i).t_GrDealID, "+DLDOC_CARRY+", v_dlinacctmp(i).t_AccTrnID, ?, ?, 0, 0);"
+
+              + "  END IF;"
+
+              + "END;";
+      
+        cmd = RSDCommand(sql);
+
+        cmd.addParam( "", RSDBP_IN, m_dl_comm.rec.DocKind );
+        cmd.addParam( "", RSDBP_IN, m_dl_comm.rec.DocumentID );
+        cmd.addParam( "", RSDBP_IN, m_dl_comm.rec.DocKind );
+        cmd.addParam( "", RSDBP_IN, m_dl_comm.rec.DocumentID );
+
+        cmd.execute();
+
+      end;
+    end;
+
+    /*6. Создаем информацию об обработке строк срафика*/
+    if(not err)
+
+      sql =   "DECLARE "
+            + "  TYPE dlgrdoc_t IS TABLE OF DDLGRDOC_DBT%ROWTYPE INDEX BY BINARY_INTEGER; "
+            + "  v_dlgrdoc dlgrdoc_t; "
+            + "BEGIN "
+
+            + "    SELECT 0, t_GrDealID, 0, 0, ?, ?, 0, 0 "
+            + "      BULK COLLECT INTO v_dlgrdoc "
+            + "      FROM dscinaccgr_tmp; "
+
+            + "    IF v_dlgrdoc.COUNT > 0 THEN "
+            + "      FORALL indx IN v_dlgrdoc.FIRST .. v_dlgrdoc.LAST "
+            + "          INSERT INTO DDLGRDOC_DBT "
+            + "               VALUES v_dlgrdoc (indx); "
+            
+            + "      v_dlgrdoc.delete; "
+            + "    END IF; "
+
+            + "END; ";
+
+      cmd = RSDCommand(sql);
+
+      cmd.addParam( "", RSDBP_IN, m_dl_comm.rec.DocKind );
+      cmd.addParam( "", RSDBP_IN, m_dl_comm.rec.DocumentID );
+
+      cmd.execute();
+
+    end;
+
+    if(not err)
+      /*7. Изменяем статус вида учета ВУ для обработанных строк графика*/
+      sql =  "DECLARE "
+           + "BEGIN "
+           + "  FOR one_gracc IN (";
+      if((m_conveyerID) and (m_packetID))
+        sql = sql 
+           + "                    SELECT gracc.t_GrDealID, gracc.t_AccNum"
+           + "                      FROM ddlgracc_dbt gracc "
+           + "                     WHERE gracc.t_ID IN (SELECT cnvdoc.t_ObjectID "
+           + "                                            FROM dcnvdoc_dbt cnvdoc"
+           + "                                           WHERE cnvdoc.t_ExecID = ? "
+           + "                                             AND cnvdoc.t_ConvTypeID = ? "
+           + "                                             AND cnvdoc.t_PackID = ? "
+           + "                                         ) "
+           + "                       AND Exists(SELECT 1 FROM dscinaccgr_tmp inaccgr WHERE inaccgr.t_GrDealID = gracc.t_GrDealID) "
+           + "                       AND Exists(SELECT 1 FROM ddlgrdoc_dbt grdoc WHERE grdoc.t_GrDealID = gracc.t_GrDealID AND grdoc.t_DocKind = 0 AND grdoc.t_DocID = 0 AND grdoc.t_ServDocKind = ?  AND grdoc.t_ServDocID = ?)";
+      else
+        sql = sql
+           + "                    SELECT gracc.t_GrDealID, gracc.t_AccNum"
+           + "                      FROM ddlgracc_dbt gracc, ddlgrdoc_dbt grdoc "
+           + "                     WHERE grdoc.t_ServDocKind = ? "
+           + "                       AND grdoc.t_ServDocID = ? "
+           + "                       AND grdoc.t_DocKind = 0 "
+           + "                       AND grdoc.t_DocID = 0 "
+           + "                       AND Exists(SELECT 1 FROM dscinaccgr_tmp inaccgr WHERE inaccgr.t_GrDealID = grdoc.t_GrDealID) "
+           + "                       AND gracc.t_GrDealID = grdoc.t_GrDealID "
+           + "                       AND gracc.t_AccNum = " + DLGR_ACCKIND_INNER;
+      end;
+
+      sql = sql
+           + "                   ) LOOP "
+           + "     RSI_DLGR.RSI_UpdateGrDealAccByID( one_gracc.t_GrDealID, one_gracc.t_AccNum, "+DLGRACC_STATE_FACTEXEC+", NULL, 0); "
+           + "  END LOOP; "
+           + "  RSI_DLGR.RSI_ExecCommitDLGR; "
+           + "END; ";
+       
+      cmd = RSDCommand(sql);
+
+      if((m_conveyerID) and (m_packetID))
+        cmd.addParam( "", RSDBP_IN, m_execID );
+        cmd.addParam( "", RSDBP_IN, m_conveyerID );
+        cmd.addParam( "", RSDBP_IN, m_packetID );
+        cmd.addParam( "", RSDBP_IN, m_dl_comm.rec.DocKind );
+        cmd.addParam( "", RSDBP_IN, m_dl_comm.rec.DocumentID );
+      else
+        cmd.addParam( "", RSDBP_IN, m_dl_comm.rec.DocKind );
+        cmd.addParam( "", RSDBP_IN, m_dl_comm.rec.DocumentID );
+      end;
+
+      cmd.execute(); 
+    
+      DL_SaveDataForReport_XML(m_dl_comm.rec.DocumentID, m_dl_comm.rec.DocKind, m_RepDataArr, LOG_TYPE_DATA);
+    end;
+
+    return err;
+
+OnError(er)
+
+   var j = 0;
+   var Error = "";
+
+   if (isEqClass("TRsdError", er.err))
+     for (j, 0, er.err.environment.ErrorCount-1)
+       if (er.err.environment.Error(j).NativeError != 0)
+         Error = DL_UniCreateErrorMessage(er.err.environment.Error(j).NativeError);
+         Error = Error + "|" + GetErrMsg();
+         break;
+       end;
+     end;
+   else
+     if(cmd != NULL)
+       Error = cmd.GetErrorString(er);
+   end;
+  end;
+
+  RepErrArr[RepErrArr.size] = CSC_InAccRepErr(CurrErrPart, "", 1, er.module+ " "+er.line+" "+Error);
+  SaveErrForReport_XML( m_dl_comm.rec.DocumentID, m_dl_comm.rec.DocKind );
+
+  return 1;
+
+  end;
+
+  m_size = 0;
+  m_InAccArr.size = 0;
+  m_execID = _execID; 
+  m_conveyerID =_conveyerID; 
+  m_packetID = _packetID;
+  m_dl_comm = dl_comm;
+  m_RepDataArr.size = 0;
+
+end;
+
+PRIVATE CLASS CheckCatData(_CatCode:string, _NeedFindAcc:bool)
+  var CatCode     = _CatCode;
+  var NeedFindAcc = _NeedFindAcc;
+END;
+
+PRIVATE MACRO CheckCat(CatCode, CheckCatArr)
+  var check = 0;
+  if((ValType(CheckCatArr) != V_UNDEF) and (CheckCatArr.size > 0))
+
+    var i = 0;
+    while(i < CheckCatArr.size)
+      if(CatCode == CheckCatArr[i].CatCode)
+        check = 1;
+        if(CheckCatArr[i].NeedFindAcc == true)
+          check = 2;
+        end;
+        break;
+      end;
+      i = i + 1;
+    end;
+  end;
+
+  return check;
+END;
+
+private macro CheckBondNutxGroupJur(DealId)
+  private var DataSet, cmd, query;
+  cmd = DL_RSDCommand();
+  query = " select NVL(client.t_LegalForm, 0) as ClientLegalForm, "+
+          "        tick.T_PFI as PFI, "+
+          "        RSB_SECUR.IsTaxResident(tick.t_ClientID, tick.t_DealDate) ClientIsResident, "+
+          "        RSI_NUTX.GetNUTaxGroup(tick.t_PFI, tick.t_DealDate) NUTaxGroup "+
+          "   from ddl_tick_dbt tick, dparty_dbt client "+
+          "  where client.t_PartyID = tick.t_ClientID "+
+          "    and tick.t_DealID = ? ";
+  cmd.AddParam(DealId);
+  DataSet = cmd.Execute(query);
+  if (DataSet.moveNext())
+    if((FI_IsBond(DataSet.PFI)) and 
+      (DataSet.ClientIsResident == 0) and 
+      (DataSet.ClientLegalForm == legal_form_jur) and 
+      ((DataSet.NUTaxGroup == NUTAXGROUP_15) or (DataSet.NUTaxGroup == NUTAXGROUP_20)))
+      return true;
+    end;
+  end;
+  return false;
+end;
+                                              
+PRIVATE MACRO GetAccount(isPlanMode:bool, FD, CheckCatArr, CatCode, FIRole, FIID, ActionDate, Account:@string)
+  var stat = true;
+  record recAccount(account);
+  var query1, cmd1, ds1, cnt;
+  Account = "";
+
+  if(isPlanMode)
+    var check = CheckCat(CatCode, CheckCatArr);
+    if(check > 0)
+      if(check == 1)
+        //Ничего делать не надо. Достаточно факта, что пришла нужная КУ
+        //Поэтому просто вернем не пустую строку
+        Account = "000";
+      elif(check == 2)
+        stat = FD.FindNumberAccount( CatCode,
+                                     Account,
+                                     false,
+                                     FIRole,
+                                     FIID
+                                   );
+       if (not stat)
+
+        cmd1 = DL_RSDCommand();
+        query1 =   "select count(1) as cnt "
+                 + "  from DACCOUNT_DBT "
+                 + " where t_CODE_CURRENCY = ? "
+                 + "   and t_Account = ? " 
+                 + "   and t_CHAPTER = ? ";
+
+        cmd1.AddParam(recAccount.CODE_CURRENCY);
+        cmd1.AddParam(recAccount.Account);
+        cmd1.AddParam(recAccount.CHAPTER);
+
+        ds1 = cmd1.Execute(query1);
+        if(ds1.moveNext())	  
+          cnt = ds1.cnt;
+        end;
+        RepErrArr[RepErrArr.size] = CSC_InAccRepErr(CurrErrPart, "", 6,cnt+"EP:"+FIRole+";"+recAccount.ACCOUNTID+";"+recAccount.Account+";"+recAccount.CHAPTER+";"+recAccount.CODE_CURRENCY+";"+ActionDate+";"+FIID+";"+GetErrMsg());
+       end; 
+
+      end;
+    end;
+  else
+    if(FIRole == FIROLE_KSU)
+      stat = FD.ReOpenAccount( CatCode,
+                               null,
+                               false,
+                               FIRole,
+                               recAccount,
+                               ActionDate,
+                               FIID);
+      if (not stat)
+
+        cmd1 = DL_RSDCommand();
+        query1 =   "select count(1) as cnt "
+                 + "  from DACCOUNT_DBT "
+                 + " where t_CODE_CURRENCY = ? "
+                 + "   and t_Account = ? " 
+                 + "   and t_CHAPTER = ? ";
+
+        cmd1.AddParam(recAccount.CODE_CURRENCY);
+        cmd1.AddParam(recAccount.Account);
+        cmd1.AddParam(recAccount.CHAPTER);
+
+        ds1 = cmd1.Execute(query1);
+        if(ds1.moveNext())	  
+          cnt = ds1.cnt;
+        end;
+        RepErrArr[RepErrArr.size] = CSC_InAccRepErr(CurrErrPart, "", 7,cnt+"EP:"+FIRole+";"+recAccount.ACCOUNTID+";"+recAccount.Account+";"+recAccount.CHAPTER+";"+recAccount.CODE_CURRENCY+";"+ActionDate+";"+FIID+";"+GetErrMsg());
+      end;
+    else
+      stat = FD.OpenAccount( CatCode,
+                             null,
+                             false,
+                             FIRole,
+                             recAccount,
+                             ActionDate,
+                             FIID);
+
+      if (not stat)
+         cmd1 = DL_RSDCommand();
+        query1 =   "select count(1) as cnt "
+                 + "  from DACCOUNT_DBT "
+                 + " where t_CODE_CURRENCY = ? "
+                 + "   and t_Account = ? " 
+                 + "   and t_CHAPTER = ? ";
+
+        cmd1.AddParam(recAccount.CODE_CURRENCY);
+        cmd1.AddParam(recAccount.Account);
+        cmd1.AddParam(recAccount.CHAPTER);
+
+        ds1 = cmd1.Execute(query1);
+        if(ds1.moveNext())	  
+          cnt = ds1.cnt;
+        end;
+        RepErrArr[RepErrArr.size] = CSC_InAccRepErr(CurrErrPart, "", 8,cnt+"EP:"+FIRole+";"+recAccount.ACCOUNTID+";"+recAccount.Account+";"+recAccount.CHAPTER+";"+recAccount.CODE_CURRENCY+";"+ActionDate+";"+FIID+";"+GetErrMsg());
+      end;
+    end;
+
+    if(stat)
+      Account = recAccount.Account;
+    end;
+  end;
+
+  return stat;
+END;
+
+
+PRIVATE MACRO GetInAccData(inaccdata:@variant, _taskID, _execID, _conveyerID, _operationID, _packetID, dl_comm, mode, FI, Department, ContrID, CheckCatArr)
+  var dlinacc = TRecHandler ("dlinacc.tmp");
+  var AccountPayer = "", AccountReceiver = "";
+  var CatCodePayer = "", CatCodeReceiver = "";
+  var err = 0;
+  var RQType = 0, RQParty = -1, DealPart = 0, Amount = $0;
+  var query, cmd, DataSet, cmd1, rq, cmd2, comis, basobj;
+  var spground;
+  var IsDealBuy, IsDealBroker, IsDealExchange, IsDealREPO, IsDealRet_Coupon, IsDealRet_Partly, IsDealRet_Issue, IsDealAvrWrtIn, IsDealAvrWrtOut, IsBasket, PayRegTax1, PayRegTax2;
+  var prevDealID = 0, prevBOfficeKind = 0, prevClientContrID = -1;
+  var ComPayerID = -1, ВидРО = 0;
+  var cnt = 0, i = 0;
+  var prevGrDealID = 0;
+  var isPlanMode = false;
+  var TemplNum = 0;
+  var DealId = 0;
+  var UseNUTX = DL_UseNUTX();
+  var PaidTax = $0, PaidTax0 = $0, STaidTax = $0;
+  var RetParmArr = TArray();
+  var GetCashCarry = True;
+  
+  GL_ScUseCachingAccounts(true); // использовать кэширование счетов
+
+  if((mode == INACC_MODE_PLAN_MAIN) or (mode == INACC_MODE_PLAN_MAIN_AVR))
+    isPlanMode = true;
+  end;
+
+  cmd = DL_RSDCommand();
+
+  if((_conveyerID) and (_packetID))
+    query =  "with cnvdoc as (select t_ObjectType, t_ObjectID from dcnvdoc_dbt where t_ExecID = ? and t_ConvTypeID = ? and t_PackID = ?)";
+    cmd.AddParam(_execID);
+    cmd.AddParam(_conveyerID);
+    cmd.AddParam(_packetID);
+  else
+    query =  "with cnvdoc as ("+GetInAccObjectQuery(dl_comm, mode, FI, Department, ContrID, RetParmArr)+")";
+
+    if(RetParmArr.size > 0)
+      i = 0;
+      while(i < RetParmArr.size)
+        cmd.AddParam(RetParmArr[i]);
+        i = i + 1;
+      end;
+    end;
+  end;
+
+  query = query  
+          + " select * "
+          + "   from ( "
+          + "         select /*+ INDEX_JOIN(CNVDOC1) */ grdeal.t_TemplNum as TemplNum, "
+//          + "         select  grdeal.t_TemplNum as TemplNum, "
+          + "                grdeal.t_PlanDate as PlanDate, "
+          + "                grdeal.t_ID as GrDealID, "
+          + "                grdeal.t_FIID as GrDealFIID, "
+          + "                tk.t_DealID AS DealID, "
+          + "                tk.t_BOfficeKind AS BOfficeKind, "
+          + "                tk.t_Department AS Department, "
+          + "                tk.t_DealDate AS DealDate, "
+          + "                tk.t_Flag1 AS Flag1, "
+          + "                tk.t_Flag4 AS Flag4, "
+          + "                tk.t_ClientID AS ClientID, "
+          + "                tk.t_ClientContrID AS ClientContrID, "
+          + "                CHR(1) AS ClientContrNum, "
+          + "                tk.t_MarketOfficeID AS MarketOfficeID, "
+          + "                tk.t_DealCode AS DealCode, "
+          + "                tk.t_BrokerID AS BrokerID, "
+          + "                leg1.t_PayFIID AS PayFIID, "
+          + "                leg1.t_ID as Leg1ID, "
+          + "                leg1.t_PayRegTax as PayRegTax1, "
+          + "                NVL(leg2.t_ID, 0) as Leg2ID, "
+          + "                NVL(leg2.t_PayRegTax, "
+          + "                CHR(0)) as PayRegTax2, "
+          + "                koper.t_Name as OperationName, "
+          + "                RSB_SECUR.IsBUY(RSB_SECUR.get_OperationGroup(koper.t_SysTypes)) IsDealBuy, "
+          + "                RSB_SECUR.IsBroker(RSB_SECUR.get_OperationGroup(koper.t_SysTypes)) IsDealBroker, "
+          + "                RSB_SECUR.IsExchange(RSB_SECUR.get_OperationGroup(koper.t_SysTypes)) IsDealExchange, "
+          + "                RSB_SECUR.IsTwoPart(RSB_SECUR.get_OperationGroup(koper.t_SysTypes)) IsDealREPO, "
+          + "                RSB_SECUR.IsRET_COUPON(RSB_SECUR.get_OperationGroup(koper.t_SysTypes)) IsDealRet_Coupon, "
+          + "                RSB_SECUR.IsRET_PARTLY(RSB_SECUR.get_OperationGroup(koper.t_SysTypes)) IsDealRet_Partly, "
+          + "                RSB_SECUR.IsRET_ISSUE(RSB_SECUR.get_OperationGroup(koper.t_SysTypes)) IsDealRet_Issue, "
+          + "                RSB_SECUR.IsAvrWrtIn(RSB_SECUR.get_OperationGroup(koper.t_SysTypes)) IsDealAvrWrtIn, "
+          + "                RSB_SECUR.IsAvrWrtOut(RSB_SECUR.get_OperationGroup(koper.t_SysTypes)) IsDealAvrWrtOut, "
+          + "                RSB_SECUR.IsBasket(RSB_SECUR.get_OperationGroup(koper.t_SysTypes)) IsBasket, "
+          + "                RSB_SECUR.IsLoan(RSB_SECUR.get_OperationGroup(koper.t_SysTypes)) IsLoan,"
+          + "                RSB_SECUR.SC_GetRQByGrDeal(grdeal.t_ID) RQByGrDeal, "
+          + "                CAST(0 AS NUMBER(32,12)) AS CommSum, "
+          + "                CAST(-1 AS NUMBER(10)) AS FIID_CommSum, "
+          + "                CAST(0 AS NUMBER(10)) AS DefCommID, "
+          + "                CAST("+GetSQLDate(date(0,0,0))+" AS DATE) AS DateFee, "
+          + "                -1 AS FIID, "
+          + "                0 AS Amount "
+          + "           from cnvdoc, ddlgracc_dbt gracc, ddlgrdeal_dbt grdeal, doprkoper_dbt koper, ddl_leg_dbt leg1, "
+          + "                ddl_tick_dbt tk "
+          + "                   left join ddl_leg_dbt leg2 on (    leg2.t_DealID = tk.t_DealID "
+          + "                                                  and leg2.t_LegKind = " + string(LEG_KIND_DL_TICK_BACK)
+          + "                                                  and leg2.t_LegId = 0 ) "
+          + "          where cnvdoc.t_ObjectType = 0 "
+          + "            and gracc.t_ID = cnvdoc.t_ObjectID "
+          + "            and grdeal.t_ID = gracc.t_GrDealID "
+          + "            and tk.t_BOfficeKind = grdeal.t_DocKind "
+          + "            and tk.t_DealID = grdeal.t_DocID "
+          + "            and koper.t_kind_Operation = tk.t_DealType "
+          + "            and leg1.t_DealID = tk.t_DealID "
+          + "            and leg1.t_LegKind = " + string(LEG_KIND_DL_TICK)
+          + "            and leg1.t_LegId = 0 "
+          + "         UNION ALL"
+          + "         select grdeal.t_TemplNum as TemplNum, "
+          + "                grdeal.t_PlanDate as PlanDate, "
+          + "                grdeal.t_ID as GrDealID, "
+          + "                grdeal.t_FIID as GrDealFIID, "
+          + "                ntg.t_NettingID AS DealID, "
+          + "                ntg.t_DocKind AS BOfficeKind, "
+          + "                ntg.t_Department AS Department, "
+          + "                ntg.t_SigningDate AS DealDate, "
+          + "                CHR(0) AS Flag1, "
+          + "                CHR(0) AS Flag4, "
+          + "                ntg.t_ClientID AS ClientID, "
+          + "                ntg.t_ClientContrID AS ClientContrID, "
+          + "                CHR(1) AS ClientContrNum, "
+          + "                0 AS MarketOfficeID, "
+          + "                ntg.t_DealNumber AS DealCode, "
+          + "                -1 AS BrokerID, "
+          + "                -1 AS PayFIID, "
+          + "                0 as Leg1ID, "
+          + "                CHR(0) as PayRegTax1, "
+          + "                0 as Leg2ID, "
+          + "                CHR(0) as PayRegTax2, "
+          + "                koper.t_Name as OperationName, "
+          + "                0 AS IsDealBuy, "
+          + "                0 AS IsDealBroker, "
+          + "                0 AS IsDealExchange, "
+          + "                0 AS IsDealREPO, "
+          + "                0 AS IsDealRet_Coupon, "
+          + "                0 AS IsDealRet_Partly, "
+          + "                0 AS IsDealRet_Issue, "
+          + "                0 AS IsDealAvrWrtIn, "
+          + "                0 AS IsDealAvrWrtOut, "
+          + "                0 AS IsBasket, "
+          + "                0 AS IsLoan, "
+          + "                0 AS RQByGrDeal, "
+          + "                CAST(0 AS NUMBER(32,12)) AS CommSum, "
+          + "                CAST(-1 AS NUMBER(10)) AS FIID_CommSum, "
+          + "                CAST(0 AS NUMBER(10)) AS DefCommID, "
+          + "                CAST("+GetSQLDate(date(0,0,0))+" AS DATE) AS DateFee, "
+          + "                -1 AS FIID, "
+          + "                0 AS Amount "
+          + "           from cnvdoc, ddlgracc_dbt gracc, ddlgrdeal_dbt grdeal, doprkoper_dbt koper, "
+          + "                ddl_nett_dbt ntg "
+          + "          where cnvdoc.t_ObjectType = 0 "
+          + "            and gracc.t_ID = cnvdoc.t_ObjectID "
+          + "            and grdeal.t_ID = gracc.t_GrDealID "
+          + "            and grdeal.t_DocKind = " + DL_NTGSEC
+          + "            and ntg.t_NettingID = grdeal.t_DocID "
+          + "            and koper.t_kind_Operation = ntg.t_Kind_Operation "
+          + "         UNION ALL "
+          + "         select grdeal.t_TemplNum as TemplNum, "
+          + "                grdeal.t_PlanDate as PlanDate, "
+          + "                grdeal.t_ID as GrDealID, "
+          + "                grdeal.t_FIID as GrDealFIID, "
+          + "                CAST(0 AS NUMBER(10)) AS DealID, "
+          + "                CAST(0 AS NUMBER(5)) AS BOfficeKind, "
+          + "                contr.t_Department AS Department, "
+          + "                TO_DATE('01.01.0001','DD.MM.YYYY') AS DealDate, "
+          + "                CHR(0) AS Flag1, "
+          + "                CHR(0) AS Flag4, "
+          + "                contr.t_PartyID AS ClientID, "
+          + "                defcom.t_ConID AS ClientContrID, "
+          + "                contr.t_Number AS ClientContrNum, "
+          + "                0 AS MarketOfficeID, "
+          + "                CHR(1) AS DealCode, "
+          + "                -1 AS BrokerID, "
+          + "                -1 AS PayFIID, "
+          + "                0 as Leg1ID, "
+          + "                CHR(0) as PayRegTax1, "
+          + "                0 as Leg2ID, "
+          + "                CHR(0) as PayRegTax2, "
+          + "                CHR(1) as OperationName, "
+          + "                0 AS IsDealBuy, "
+          + "                0 AS IsDealBroker, "
+          + "                0 AS IsDealExchange, "
+          + "                0 AS IsDealREPO, "
+          + "                0 AS IsDealRet_Coupon, "
+          + "                0 AS IsDealRet_Partly, "
+          + "                0 AS IsDealRet_Issue, "
+          + "                0 AS IsDealAvrWrtIn, "
+          + "                0 AS IsDealAvrWrtOut, "
+          + "                0 AS IsBasket, "
+          + "                0 AS IsLoan, "
+          + "                0 AS RQByGrDeal, "
+          + "                defcom.t_CommSum+defcom.t_NDSSum AS CommSum, "
+          + "                defcom.t_FIID_CommSum  AS FIID_CommSum, "
+          + "                defcom.t_ID AS DefCommID, "
+          + "                defcom.t_DateFee AS DateFee, "
+          + "                -1 AS FIID, "
+          + "                0 AS Amount "
+          + "           from cnvdoc, ddlgrdeal_dbt grdeal, ddlgracc_dbt gracc, dsfcontr_dbt contr, dsfdefcom_dbt defcom "
+          + "          where cnvdoc.t_ObjectType = " + OBJTYPE_SFCONTR
+          + "            and gracc.t_ID = cnvdoc.t_ObjectID "
+          + "            and grdeal.t_ID = gracc.t_GrDealID "
+          + "            and grdeal.t_DocKind = " + OBJTYPE_SFCONTR
+          + "            and contr.t_ID = grdeal.t_DocID "
+          + "            and defcom.t_ConID = contr.t_ID "
+          + "            and defcom.t_FeeType = ? "
+          + "            and defcom.t_Status <> ? "
+          + "            and (defcom.t_CommSum + defcom.t_NDSSum) > 0 ";
+
+  cmd.AddParam(SF_FEE_TYPE_PERIOD);
+  cmd.AddParam(SFINV_PAYSTATUS_PAY);
+  
+  if(isPlanMode == false)
+    query = query + "            and defcom.t_DateFee = ? ";
+    cmd.AddParam(dl_comm.rec.CommDate);
+  else
+    query = query + "            and defcom.t_DateFee >= ? "
+                  + "            and defcom.t_DateFee <= ? ";
+    cmd.AddParam(dl_comm.rec.BeginDate);
+    cmd.AddParam(dl_comm.rec.EndDate);
+  end;
+
+  if(isPlanMode == false)
+    query = query 
+            + "         UNION ALL "
+            + "         select grdeal.t_TemplNum as TemplNum, "
+            + "                grdeal.t_PlanDate as PlanDate, "
+            + "                grdeal.t_ID as GrDealID, "
+            + "                grdeal.t_FIID as GrDealFIID, "
+            + "                comm.t_DocumentID AS DealID, "
+            + "                grdeal.t_DocKind AS BOfficeKind, "
+            + "                contr.t_Department AS Department, "
+            + "                TO_DATE('01.01.0001','DD.MM.YYYY') AS DealDate, "
+            + "                CHR(0) AS Flag1, "
+            + "                CHR(0) AS Flag4, "
+            + "                contr.t_PartyID AS ClientID, "
+            + "                comm.t_ContractID AS ClientContrID, "
+            + "                contr.t_Number AS ClientContrNum, "
+            + "                0 AS MarketOfficeID, "
+            + "                comm.t_CommCode AS DealCode, "
+            + "                -1 AS BrokerID, "
+            + "                -1 AS PayFIID, "
+            + "                0 as Leg1ID, "
+            + "                CHR(0) as PayRegTax1, "
+            + "                0 as Leg2ID, "
+            + "                CHR(0) as PayRegTax2, "
+            + "                koper.t_Name as OperationName, "
+            + "                0 AS IsDealBuy, "
+            + "                0 AS IsDealBroker, "
+            + "                0 AS IsDealExchange, "
+            + "                0 AS IsDealREPO, "
+            + "                0 AS IsDealRet_Coupon, "
+            + "                0 AS IsDealRet_Partly, "
+            + "                0 AS IsDealRet_Issue, "
+            + "                0 AS IsDealAvrWrtIn, "
+            + "                0 AS IsDealAvrWrtOut, "
+            + "                0 AS IsBasket, "
+            + "                0 AS IsLoan, "
+            + "                0 AS RQByGrDeal, "
+            + "                0 AS CommSum, "
+            + "                -1 AS FIID_CommSum, "
+            + "                0 AS DefCommID, "
+            + "                TO_DATE('01.01.0001','DD.MM.YYYY') AS DateFee, "
+            + "                comm.t_FIID AS FIID, "
+            + "                comm.t_Hidden_Sum AS Amount "
+            + "           from cnvdoc, ddlgrdeal_dbt grdeal, ddlgracc_dbt gracc, dsfcontr_dbt contr, ddl_comm_dbt comm, doprkoper_dbt koper "
+            + "          where cnvdoc.t_ObjectType = 0 "
+            + "            and gracc.t_ID = cnvdoc.t_ObjectID "
+            + "            and grdeal.t_ID = gracc.t_GrDealID "
+            + "            and grdeal.t_DocKind = " + DL_SCINOUTPOOL
+            + "            and grdeal.t_DocID = comm.t_DocumentID "
+            + "            and contr.t_ID = comm.t_ContractID "
+            + "            and koper.t_kind_Operation = comm.t_OperationKind ";
+  end;
+
+  if((mode == INACC_MODE_PLAN_MAIN) or (mode == INACC_MODE_PLAN_MAIN_AVR))
+    //отобрать ТО по отложенным, отказанным, просроченным сделкам
+    query = query + " UNION ALL "          
+          + "         select tpl.t_Num as TemplNum, "
+          + "                (case when rq.t_State in(" + DLRQ_STATE_PLAN + "," + DLRQ_STATE_OVERDUE + ") then rq.t_PlanDate else rq.t_FactDate end) as PlanDate, "
+          + "                0 as GrDealID, "
+          + "                rq.t_FIID as GrDealFIID, "
+          + "                tk.t_DealID AS DealID, "
+          + "                tk.t_BOfficeKind AS BOfficeKind, "
+          + "                tk.t_Department AS Department, "
+          + "                tk.t_DealDate AS DealDate, "
+          + "                tk.t_Flag1 AS Flag1, "
+          + "                tk.t_Flag4 AS Flag4, "
+          + "                tk.t_ClientID AS ClientID, "
+          + "                tk.t_ClientContrID AS ClientContrID, "
+          + "                CHR(1) AS ClientContrNum, "
+          + "                tk.t_MarketOfficeID AS MarketOfficeID, "
+          + "                tk.t_DealCode AS DealCode, "
+          + "                tk.t_BrokerID AS BrokerID, "
+          + "                leg1.t_PayFIID AS PayFIID, "
+          + "                leg1.t_ID as Leg1ID, "
+          + "                leg1.t_PayRegTax as PayRegTax1, "
+          + "                NVL(leg2.t_ID, 0) as Leg2ID, "
+          + "                NVL(leg2.t_PayRegTax, "
+          + "                CHR(0)) as PayRegTax2, "
+          + "                koper.t_Name as OperationName, "
+          + "                RSB_SECUR.IsBUY(RSB_SECUR.get_OperationGroup(koper.t_SysTypes)) IsDealBuy, "
+          + "                RSB_SECUR.IsBroker(RSB_SECUR.get_OperationGroup(koper.t_SysTypes)) IsDealBroker, "
+          + "                RSB_SECUR.IsExchange(RSB_SECUR.get_OperationGroup(koper.t_SysTypes)) IsDealExchange, "
+          + "                RSB_SECUR.IsTwoPart(RSB_SECUR.get_OperationGroup(koper.t_SysTypes)) IsDealREPO, "
+          + "                RSB_SECUR.IsRET_COUPON(RSB_SECUR.get_OperationGroup(koper.t_SysTypes)) IsDealRet_Coupon, "
+          + "                RSB_SECUR.IsRET_PARTLY(RSB_SECUR.get_OperationGroup(koper.t_SysTypes)) IsDealRet_Partly, "
+          + "                RSB_SECUR.IsRET_ISSUE(RSB_SECUR.get_OperationGroup(koper.t_SysTypes)) IsDealRet_Issue, "
+          + "                RSB_SECUR.IsAvrWrtIn(RSB_SECUR.get_OperationGroup(koper.t_SysTypes)) IsDealAvrWrtIn, "
+          + "                RSB_SECUR.IsAvrWrtOut(RSB_SECUR.get_OperationGroup(koper.t_SysTypes)) IsDealAvrWrtOut, "
+          + "                RSB_SECUR.IsBasket(RSB_SECUR.get_OperationGroup(koper.t_SysTypes)) IsBasket, "
+          + "                RSB_SECUR.IsLoan(RSB_SECUR.get_OperationGroup(koper.t_SysTypes)) IsLoan,"
+          + "                rq.t_ID RQByGrDeal, "
+          + "                CAST(0 AS NUMBER(32,12)) AS CommSum, "
+          + "                CAST(-1 AS NUMBER(10)) AS FIID_CommSum, "
+          + "                CAST(0 AS NUMBER(10)) AS DefCommID, "
+          + "                CAST("+GetSQLDate(date(0,0,0))+" AS DATE) AS DateFee, "
+          + "                -1 AS FIID, "
+          + "                0 AS Amount "
+          + "           from ddlrq_dbt rq, doprkoper_dbt koper, ddlgrtempl_dbt tpl, ddl_leg_dbt leg1, "
+          + "                ddl_tick_dbt tk "
+          + "                   left join ddl_leg_dbt leg2 on (    leg2.t_DealID = tk.t_DealID "
+          + "                                                  and leg2.t_LegKind = " + string(LEG_KIND_DL_TICK_BACK)
+          + "                                                  and leg2.t_LegId = 0 ) "
+          + "          where rq.t_DocKind = tk.t_BOfficeKind "
+          + "            and rq.t_DocID = tk.t_DealID "
+          + "            and Not Exists (select 1 from dpmlink_dbt lnk where lnk.t_LinkKind = "+PMLINK_KIND_RQNETTING+" and lnk.t_InitialPayment = rq.t_ID)"
+          + "            and koper.t_kind_Operation = tk.t_DealType "
+          + "            and leg1.t_DealID = tk.t_DealID "
+          + "            and leg1.t_LegKind = " + string(LEG_KIND_DL_TICK)
+          + "            and leg1.t_LegId = 0 "
+          + "            and (   (rq.t_Type IN ("+DLRQ_TYPE_COMISS+")                                                                              and tpl.t_Num IN ("+DLGR_TEMPL_PAYCOM+")) "
+          + "                 or (rq.t_Type IN ("+DLRQ_TYPE_COMISS+")                        and tk.t_IsPartyClient = 'X'                          and tpl.t_Num IN ("+DLGR_TEMPL_PAYCOMCONTR+")) "
+          + "                 or (rq.t_Type IN ("+DLRQ_TYPE_AVANCE+", "+DLRQ_TYPE_DEPOSIT+") and rq.t_DealPart = 1                                 and tpl.t_Num IN ("+DLGR_TEMPL_PAYAVANCE+")) "
+          + "                 or (rq.t_Type IN ("+DLRQ_TYPE_PAYMENT+")                       and rq.t_DealPart = 1                                 and tpl.t_Num IN ("+DLGR_TEMPL_PAYMENT+")) "
+          + "                 or (rq.t_Type IN ("+DLRQ_TYPE_DELIVERY+")                      and rq.t_DealPart = 1 and tk.t_IsPartyClient = 'X'    and tpl.t_Num IN ("+DLGR_TEMPL_DELIVERY+","+DLGR_TEMPL_DELIVERYCONTR+")) "
+          + "                 or (rq.t_Type IN ("+DLRQ_TYPE_DELIVERY+")                      and rq.t_DealPart = 1 and tk.t_IsPartyClient = CHR(0) and tpl.t_Num IN ("+DLGR_TEMPL_DELIVERY+")) "
+          + "                 or (rq.t_Type IN ("+DLRQ_TYPE_AVANCE+")                        and rq.t_DealPart = 2                                 and tpl.t_Num IN ("+DLGR_TEMPL_PAYAVANCE2+")) "
+          + "                 or (rq.t_Type IN ("+DLRQ_TYPE_PAYMENT+")                       and rq.t_DealPart = 2                                 and tpl.t_Num IN ("+DLGR_TEMPL_PAYMENT2+")" + " and RSB_SECUR.IsLoan(RSB_SECUR.get_OperationGroup(koper.t_SysTypes)) != 1 ) "
+          + "                 or (rq.t_Type IN ("+DLRQ_TYPE_PAYMENT+")                       and rq.t_DealPart = 2                                 and tpl.t_Num IN ("+DLGR_TEMPL_PAYPC+")" + " and RSB_SECUR.IsLoan(RSB_SECUR.get_OperationGroup(koper.t_SysTypes)) = 1 ) "
+          + "                 or (rq.t_Type IN ("+DLRQ_TYPE_DELIVERY+")                      and rq.t_DealPart = 2 and tk.t_IsPartyClient = 'X'    and tpl.t_Num IN ("+DLGR_TEMPL_DELIVERY2+","+DLGR_TEMPL_DELIVERYCONTR2+")) "
+          + "                 or (rq.t_Type IN ("+DLRQ_TYPE_DELIVERY+")                      and rq.t_DealPart = 2 and tk.t_IsPartyClient = CHR(0) and tpl.t_Num IN ("+DLGR_TEMPL_DELIVERY2+")) "
+          + "                 or (rq.t_Type IN ("+DLRQ_TYPE_COMPDELIVERY+")                  and tk.t_IsPartyClient = 'X'                          and tpl.t_Num IN ("+DLGR_TEMPL_COMPDELIVERY+","+DLGR_TEMPL_COMPDELIVERYCONTR+")) "
+          + "                 or (rq.t_Type IN ("+DLRQ_TYPE_COMPDELIVERY+")                  and tk.t_IsPartyClient = CHR(0)                       and tpl.t_Num IN ("+DLGR_TEMPL_COMPDELIVERY+")) "
+          + "                 or (rq.t_Type IN ("+DLRQ_TYPE_COMPPAYM+")                                                                            and tpl.t_Num IN ("+DLGR_TEMPL_COMPPAYMENT+")) "
+          + "                 or (rq.t_Type IN ("+DLRQ_TYPE_PAYMREPOCOUP+")                                                                        and tpl.t_Num IN ("+DLGR_TEMPL_COUP+")) "
+          + "                 or (rq.t_Type IN ("+DLRQ_TYPE_PAYMREPOPART+")                                                                        and tpl.t_Num IN ("+DLGR_TEMPL_PARTREP+")) "
+          + "                ) "
+          + "            and (tk.t_DealDate <= ? "
+          + "                 or (tk.t_RequestID > 0 "
+          + "                     and Exists(select 1 from ddl_tick_dbt tk1 where tk1.t_DealID = tk.t_RequestID and tk1.t_DealDate <= ?)"
+          + "                    )"
+          + "                )"
+          + "            and ( (tk.t_DealStatus = " + DL_PREPARING + " and tk.t_Prognos = chr(88)) "
+          + "                  or "
+          + "                  (Exists(select 1 "
+          + "                            from ddlgrdeal_dbt gr "
+          + "                           where gr.t_DocKind  = rq.t_DocKind "
+          + "                             and gr.t_DocID    = rq.t_DocID "
+          + "                             and gr.t_TemplNum = tpl.t_Num "
+          + "                             and Exists(select 1 "
+          + "                                          from ddlgracc_dbt gracc "
+          + "                                         where gracc.t_GrDealID = gr.t_ID "
+          + "                                           and gracc.t_AccNum = " + DLGR_ACCKIND_INNER
+          + "                                           and ( gracc.t_State = " + DLGRACC_STATE_PLAN
+          + "                                               or (gracc.t_State = " + DLGRACC_STATE_FACTEXEC+ " and gracc.t_FactDate > ? ) "
+          + "                                               )"
+          + "                                       ) "
+          + "                         ) "
+          + "                  ) "
+          + "                ) "
+          + "             and not exists (select 1 " //#256054 - Для выборок по ТО отсеиваем записи которые уже попали в выборку по графику исполнения сделок
+          + "                               from (cnvdoc) cnv "
+          + "                         inner join ddlgracc_dbt gracc_innc on (gracc_innc.T_ID = cnv.t_ObjectID) "
+          + "                         inner join ddlgracc_dbt gracc_boc on (gracc_boc.t_GrDealID = gracc_innc.t_GrDealID and gracc_boc.t_AccNum = "+DLGR_ACCKIND_BACKOFFICE+") "
+          + "                         inner join ddlgrdeal_dbt grdealc on (grdealc.T_ID = gracc_boc.t_GrDealID) "
+          + "                              where gracc_boc.T_ID_OPERATION = rq.T_ID_OPERATION "
+          + "                                and grdealc.t_docid = rq.t_docid "
+          + "                                and grdealc.T_DOCKIND = rq.t_Dockind "
+          + "                                and grdealc.T_FIID = RQ.T_FIID) ";
+
+    cmd.AddParam(dl_comm.rec.EndDate);
+    cmd.AddParam(dl_comm.rec.EndDate);
+    cmd.AddParam(dl_comm.rec.EndDate);
+
+    if(dl_comm.rec.Division > 0)
+      query = query + " and tk.t_Department = ? ";
+      cmd.AddParam(dl_comm.rec.Division);
+    end;
+
+    if(dl_comm.rec.ClientID > -1)
+      query = query + "  AND tk.t_ClientID = ? ";
+      cmd.AddParam(dl_comm.rec.ClientID);
+    end;
+
+    if(dl_comm.rec.ContractID > 0)
+      query = query + "  AND tk.t_ClientContrID = ? ";
+      cmd.AddParam(dl_comm.rec.ContractID);
+    end;
+
+    //Отложенный и отказанный Неттинг
+    query = query + "         UNION ALL"
+                  + "         select tpl.t_Num as TemplNum, "
+                  + "                DECODE(rq.t_State, "+DLRQ_STATE_PLAN+", rq.t_PlanDate, rq.t_FactDate) as PlanDate, "
+                  + "                0 as GrDealID, "
+                  + "                rq.t_FIID as GrDealFIID, "
+                  + "                td.t_DocID AS DealID, "
+                  + "                td.t_DocKind AS BOfficeKind, "
+                  + "                td.t_Department AS Department, "
+                  + "                td.t_DealDate AS DealDate, "
+                  + "                CHR(0) AS Flag1, "
+                  + "                CHR(0) AS Flag4, "
+                  + "                td.t_ClientID AS ClientID, "
+                  + "                td.t_ClientContrID AS ClientContrID, "
+                  + "                CHR(1) AS ClientContrNum, "
+                  + "                0 AS MarketOfficeID, "
+                  + "                td.t_DealCode AS DealCode, "
+                  + "                -1 AS BrokerID, "
+                  + "                -1 AS PayFIID, "
+                  + "                0 as Leg1ID, "
+                  + "                CHR(0) as PayRegTax1, "
+                  + "                0 as Leg2ID, "
+                  + "                CHR(0) as PayRegTax2, "
+                  + "                koper.t_Name as OperationName, "
+                  + "                0 AS IsDealBuy, "
+                  + "                0 AS IsDealBroker, "
+                  + "                0 AS IsDealExchange, "
+                  + "                0 AS IsDealREPO, "
+                  + "                0 AS IsDealRet_Coupon, "
+                  + "                0 AS IsDealRet_Partly, "
+                  + "                0 AS IsDealRet_Issue, "
+                  + "                0 AS IsDealAvrWrtIn, "
+                  + "                0 AS IsDealAvrWrtOut, "
+                  + "                0 AS IsBasket, "
+                  + "                0 AS IsLoan, "
+                  + "                0 AS RQByGrDeal, "
+                  + "                CAST(0 AS NUMBER(32,12)) AS CommSum, "
+                  + "                CAST(-1 AS NUMBER(10)) AS FIID_CommSum, "
+                  + "                CAST(0 AS NUMBER(10)) AS DefCommID, "
+                  + "                CAST("+GetSQLDate(date(0,0,0))+" AS DATE) AS DateFee, "
+                  + "                -1 AS FIID, "
+                  + "                0 AS Amount "
+                  + "           from dv_sctotaldeals td, ddlrq_dbt rq, doprkoper_dbt koper, ddlgrtempl_dbt tpl "
+                  + "          where td.t_DocKind = " + DL_NTGSEC
+                  + "            and rq.t_DocKind = td.t_DocKind "
+                  + "            and rq.t_DocID = td.t_DocID "
+                  + "            and koper.t_kind_Operation = td.t_Kind_Operation "
+                  + "            and (   (rq.t_Type IN ("+DLRQ_TYPE_PAYMENT+")      and tpl.t_Num IN ("+DLGR_TEMPL_PAYMENT+")) "
+                  + "                 or (rq.t_Type IN ("+DLRQ_TYPE_DELIVERY+") and tpl.t_Num IN ("+DLGR_TEMPL_DELIVERYNTG+")) "
+                  + "                ) "
+                  + "            and td.t_DealDate <= ? "
+                  + "            and ( (td.t_Status = " + DL_PREPARING + " and td.t_Prognos = chr(88)) "
+                  + "                  or "
+                  + "                  (Exists(select 1 "
+                  + "                            from ddlgrdeal_dbt gr "
+                  + "                           where gr.t_DocKind = rq.t_DocKind "
+                  + "                             and gr.t_DocID   = rq.t_DocID "
+                  + "                             and gr.t_TemplNum = tpl.t_Num "
+                  + "                             and Exists(select 1 "
+                  + "                                          from ddlgracc_dbt gracc "
+                  + "                                         where gracc.t_GrDealID = gr.t_ID "
+                  + "                                           and gracc.t_AccNum = " + DLGR_ACCKIND_INNER
+                  + "                                           and ( gracc.t_State = " + DLGRACC_STATE_PLAN
+                  + "                                               or (gracc.t_State = " + DLGRACC_STATE_FACTEXEC+ " and gracc.t_FactDate > ? ) "
+                  + "                                               )"
+                  + "                                       ) "
+                  + "                         ) "
+                  + "                  ) "
+                  + "                ) ";
+
+    cmd.AddParam(dl_comm.rec.EndDate);
+    cmd.AddParam(dl_comm.rec.EndDate);
+
+    if(dl_comm.rec.Division > 0)
+      query = query + " and td.t_Department = ? ";
+      cmd.AddParam(dl_comm.rec.Division);
+    end;
+
+    if(dl_comm.rec.ClientID > -1)
+      query = query + "  AND td.t_ClientID = ? ";
+      cmd.AddParam(dl_comm.rec.ClientID);
+    end;
+
+    if(dl_comm.rec.ContractID > 0)
+      query = query + "  AND td.t_ClientContrID = ? ";
+      cmd.AddParam(dl_comm.rec.ContractID);
+    end;
+
+  end;
+
+  query = query + "        ) q order by q.ClientContrID, q.GrDealID";
+
+  if((_conveyerID == 0) and (_packetID == 0))
+    cnt = -1;//cmd.GetCount(query);
+    if(cnt)
+      InitProgress( cnt, "Идет выполнение операции...", "Внутренний учет" );
+    end;
+  end;
+   
+  DataSet = cmd.Execute(query);
+  i = 0;
+  while(DataSet.moveNext())
+     
+    ВидРО = 0;
+    err = 0;
+    DealId = SQL_ConvTypeInteger(DataSet.DealId);
+    TemplNum = DataSet.TemplNum;
+    
+    if(DealId == 0) //комиссии по договору обслуживания
+      
+      prevBOfficeKind = 0;
+      CurrErrPart = 1;
+        
+      dlinacc.Clear();
+
+      dlinacc.rec.Boffice        = OBJTYPE_BACKOFFICE_SP;
+      dlinacc.rec.ServDocKind    = dl_comm.rec.DocKind;
+      dlinacc.rec.ServDocID      = dl_comm.rec.DocumentID; 
+      dlinacc.rec.Date           = date(DataSet.DateFee);      /* Дата проводки */
+      dlinacc.rec.PlaceID        = -1;                   /* Место учета актива */
+      dlinacc.rec.DealKind       = 0;
+      dlinacc.rec.Department     = DataSet.Department;
+      dlinacc.rec.Oper           = {Oper};
+      dlinacc.rec.MarketOfficeID = 0;
+      dlinacc.rec.AccTrnID       = 0;
+      dlinacc.rec.DocumentKind   = DLDOC_SFCONCOM; 
+      dlinacc.rec.DocumentId     = DataSet.DefCommID;
+
+      ВидРО = 8; /*Оплата комиссии банка*/
+
+      dlinacc.rec.FIKind = FIKIND_CURRENCY;
+
+      dlinacc.rec.Chapter = 21;
+
+      dlinacc.rec.PartyID = DataSet.ClientID; /*Субъект (клиент)*/
+      dlinacc.rec.PartyContrID = DataSet.ClientContrID; /*Договор обслуживания клиента с банком */
+
+      if(ВУ_ВестиПосделочныйУчетКомиссий())
+
+        cmd1 = DL_RSDCommand();
+        query =   "select CAST(TO_NUMBER(t_BaseObjectID) AS NUMBER(10)) as BaseObjectID, t_CommSum+t_NDSSum AS CommSum, t_FIID "
+                + "  from dsfbasobj_dbt "
+                + " where t_DefCommID = ? "
+                + "   and t_FeeType = ? ";
+
+        cmd1.AddParam(DataSet.DefCommID);
+        cmd1.AddParam(SF_FEE_TYPE_PERIOD);
+
+        basobj = cmd1.Execute(query);
+        while(basobj.moveNext())
+
+          FD = SPFirstDoc( LEG_KIND_DL_TICK, basobj.BaseObjectID );                               
+
+          dlinacc.rec.Sum = basobj.CommSum;
+          dlinacc.rec.FIID = basobj.FIID;
+
+          if(ВидРО)
+            CatCodePayer = FD.ВУ_ПолучитьКатегориюДебет( ВидРО, null, dlinacc.rec.Date, dlinacc.rec.FIID );
+            if( not GetAccount(isPlanMode, FD, CheckCatArr, 
+                               CatCodePayer, 
+                               FD.ВУ_ПолучитьРольФИ( ВидРО, true ), 
+                               dlinacc.rec.FIID, dlinacc.rec.Date, @AccountPayer) )
+              err = 1;
+              RepErrArr[RepErrArr.size] = CSC_InAccRepErr(CurrErrPart, DataSet.ClientContrNum, err, "Ошибка при определении счета. "+GetErrMsg());
+            end;
+
+            if(not err)
+              CatCodeReceiver = FD.ВУ_ПолучитьКатегориюКредит( ВидРО, null, dlinacc.rec.Date, dlinacc.rec.FIID );
+              if( not GetAccount(isPlanMode, FD, CheckCatArr,
+                                 CatCodeReceiver, 
+                                 FD.ВУ_ПолучитьРольФИ( ВидРО, false ), 
+                                 dlinacc.rec.FIID, dlinacc.rec.Date, @AccountReceiver) )
+                err = 1;
+                RepErrArr[RepErrArr.size] = CSC_InAccRepErr(CurrErrPart, DataSet.ClientContrNum, err, "Ошибка при определении счета. "+GetErrMsg());
+              end;
+            end;
+
+            if(not err)
+              if((isPlanMode) and (AccountPayer == "") and (AccountReceiver == ""))  
+                //не добавляем такую РОВУ
+              else
+                dlinacc.rec.OperType = FD.ВУ_ПолучитьРО( ВидРО );
+                dlinacc.rec.DebAcc   = AccountPayer;
+                dlinacc.rec.KredAcc  = AccountReceiver;
+
+                inaccdata.add(dlinacc, DataSet.GrDealID, InAccGroundData(dlinacc.rec.OperType, 1, "", DataSet.ClientContrNum, DLRQ_STATE_EXEC, dlinacc.rec.Date, 0));
+              end;
+            end;
+          end;
+        end;
+        
+      else
+        
+        if(prevClientContrID != DataSet.ClientContrID)
+          FD = SPFirstDocContract( DL_STOCKCONTR, DataSet.ClientContrID );
+          prevClientContrID = DataSet.ClientContrID;
+        end;
+        
+        dlinacc.rec.Sum = DataSet.CommSum;
+        dlinacc.rec.FIID = DataSet.FIID_CommSum;
+
+        if(ВидРО)
+          CatCodePayer = FD.ВУ_ПолучитьКатегориюДебет( ВидРО, null, dlinacc.rec.Date, dlinacc.rec.FIID );
+          if( not GetAccount(isPlanMode, FD, CheckCatArr,
+                             CatCodePayer, 
+                             FD.ВУ_ПолучитьРольФИ( ВидРО, true ), 
+                             dlinacc.rec.FIID, dlinacc.rec.Date, @AccountPayer) )
+            err = 1;
+            RepErrArr[RepErrArr.size] = CSC_InAccRepErr(CurrErrPart, DataSet.ClientContrNum, err, "Ошибка при определении счета. "+GetErrMsg());
+          end;
+
+          if(not err)
+            CatCodeReceiver = FD.ВУ_ПолучитьКатегориюКредит( ВидРО, null, dlinacc.rec.Date, dlinacc.rec.FIID );
+            if( not GetAccount(isPlanMode, FD, CheckCatArr,
+                               CatCodeReceiver, 
+                               FD.ВУ_ПолучитьРольФИ( ВидРО, false ), 
+                               dlinacc.rec.FIID, dlinacc.rec.Date, @AccountReceiver) )
+              err = 1;
+              RepErrArr[RepErrArr.size] = CSC_InAccRepErr(CurrErrPart, DataSet.ClientContrNum, err, "Ошибка при определении счета. "+GetErrMsg());
+            end;
+          end;
+
+          if(not err)
+            if((isPlanMode) and (AccountPayer == "") and (AccountReceiver == ""))  
+              //не добавляем такую РОВУ
+            else 
+              dlinacc.rec.OperType = FD.ВУ_ПолучитьРО( ВидРО );
+              dlinacc.rec.DebAcc   = AccountPayer;
+              dlinacc.rec.KredAcc  = AccountReceiver;
+
+              inaccdata.add(dlinacc, DataSet.GrDealID, InAccGroundData(dlinacc.rec.OperType, 1, "", DataSet.ClientContrNum, DLRQ_STATE_EXEC, dlinacc.rec.Date, 0));
+            end
+          end;
+        end;
+      end;
+    else //сделки
+      
+      CurrErrPart = 0;
+      
+      var GrDealPrm = TRecHandler("dlgrdealprm.dbt");
+      
+      if((prevDealID != DealId) or (prevBOfficeKind != DataSet.BOfficeKind))
+        
+        FD2 = NULL;
+
+        if(DataSet.BOfficeKind == DL_NTGSEC)
+          FD = DL_NettingDoc(int(DataSet.BOfficeKind), DealId);
+        elif (DataSet.BOfficeKind == DL_SCINOUTPOOL)
+        
+          FD = SPFirstDocDLCOMM(int(DataSet.BOfficeKind), DealId);
+        else
+          
+          FD = SPFirstDoc( LEG_KIND_DL_TICK, DealId );
+          if((FD.ExistBack == true) or (IsLoan(FD.Group)))
+            FD2 = SPFirstDoc( LEG_KIND_DL_TICK_BACK, DealId );
+          end;
+          
+        end;
+        
+        IsDealBuy        = DataSet.IsDealBuy; 
+        IsDealBroker     = DataSet.IsDealBroker; 
+        if( DataSet.IsLoan )
+           PayRegTax1       = DataSet.Flag1;
+           PayRegTax2       = DataSet.Flag4;
+        else
+           PayRegTax1       = DataSet.PayRegTax1;
+           PayRegTax2       = DataSet.PayRegTax2;
+        end;
+        IsDealExchange   = DataSet.IsDealExchange;
+        IsDealREPO       = DataSet.IsDealREPO;
+        IsDealRet_Coupon = DataSet.IsDealRet_Coupon;
+        IsDealRet_Partly = DataSet.IsDealRet_Partly;
+        IsDealRet_Issue  = DataSet.IsDealRet_Issue;
+        IsDealAvrWrtIn   = DataSet.IsDealAvrWrtIn; 
+        IsDealAvrWrtOut  = DataSet.IsDealAvrWrtOut;
+        IsBasket         = DataSet.IsBasket;
+      end;
+
+      if ((DataSet.BOfficeKind != DL_NTGSEC) and (DataSet.BOfficeKind != DL_SCINOUTPOOL))
+        FD.SetCurPFI(DataSet.GrDealFIID);
+        if( FD2 != NULL )
+           FD2.SetCurPFI(DataSet.GrDealFIID);
+        end;
+      end;
+
+      prevDealID = DealId;
+      prevBOfficeKind = DataSet.BOfficeKind;
+
+      RQParty = -1;
+            
+      if(TemplNum == DLGR_TEMPL_PAYCOM)
+        RQType   = string(DLRQ_TYPE_COMISS);
+        DealPart = 0;
+        if(DataSet.BOfficeKind != DL_NTGSEC)
+          RQParty  = FD.tick.rec.ClientID;
+        end;
+      elif(TemplNum == DLGR_TEMPL_PAYCOMCONTR)
+        RQType   = string(DLRQ_TYPE_COMISS);
+        DealPart = 0;
+        if(DataSet.BOfficeKind != DL_NTGSEC)
+          RQParty  = FD.tick.rec.PartyID;
+        end;
+      elif(TemplNum == DLGR_TEMPL_PAYAVANCE)
+        RQType   = string(DLRQ_TYPE_AVANCE)+","+string(DLRQ_TYPE_DEPOSIT);
+        DealPart = 1;
+      elif(TemplNum == DLGR_TEMPL_PAYMENT)
+        RQType   = string(DLRQ_TYPE_PAYMENT);
+        DealPart = 1;
+      elif((TemplNum == DLGR_TEMPL_DELIVERYNTG) OR (TemplNum == DLGR_TEMPL_DELIVERY) OR (TemplNum == DLGR_TEMPL_DELIVERYCONTR))
+        RQType   = string(DLRQ_TYPE_DELIVERY);
+        DealPart = 1;
+      elif(TemplNum == DLGR_TEMPL_PAYAVANCE2)
+        RQType   = string(DLRQ_TYPE_AVANCE);
+        DealPart = 2;
+      elif((TemplNum == DLGR_TEMPL_PAYMENT2) OR (TemplNum == DLGR_TEMPL_PAYPC))
+        RQType   = string(DLRQ_TYPE_PAYMENT);
+        DealPart = 2;
+      elif((TemplNum == DLGR_TEMPL_DELIVERY2) OR (TemplNum == DLGR_TEMPL_DELIVERYCONTR2))
+        RQType   = string(DLRQ_TYPE_DELIVERY);
+        DealPart = 2;
+      elif((TemplNum == DLGR_TEMPL_COMPDELIVERY) OR (TemplNum == DLGR_TEMPL_COMPDELIVERYCONTR))
+        RQType   = string(DLRQ_TYPE_COMPDELIVERY);
+        DealPart = 0;
+      elif(TemplNum == DLGR_TEMPL_COMPPAYMENT)
+        RQType   = string(DLRQ_TYPE_COMPPAYM);
+        DealPart = 0;
+      elif(TemplNum == DLGR_TEMPL_COUP)
+        RQType   = string(DLRQ_TYPE_PAYMREPOCOUP);
+        DealPart = 0;
+      elif(TemplNum == DLGR_TEMPL_PARTREP)
+        RQType   = string(DLRQ_TYPE_PAYMREPOPART);
+        DealPart = 0;
+      elif(TemplNum == DLGR_TEMPL_RECDELFORTAX)
+        RQType   = string(DLRQ_TYPE_DELIVERY);
+        DealPart = 1;
+      else
+        continue; /*остальные не обрабатываются*/
+      end;
+
+      if (DataSet.BOfficeKind == DL_SCINOUTPOOL)
+        dlinacc.Clear();
+
+        dlinacc.rec.Boffice        = OBJTYPE_BACKOFFICE_SP;
+        dlinacc.rec.ServDocKind    = dl_comm.rec.DocKind;
+        dlinacc.rec.ServDocID      = dl_comm.rec.DocumentID; 
+        dlinacc.rec.Date           = date(DataSet.PlanDate); /* Дата проводки */
+        dlinacc.rec.PlaceID        = FD.comm.rec.traderID;
+        dlinacc.rec.DealKind       = DataSet.BOfficeKind;
+        dlinacc.rec.Department     = DataSet.Department;
+        dlinacc.rec.Oper           = {Oper};
+        dlinacc.rec.MarketOfficeID = DataSet.MarketOfficeID; /* ??? для корзины "РЕПО на корзину" ??? */
+        dlinacc.rec.AccTrnID       = 0;
+        dlinacc.rec.DocumentKind   = DataSet.BOfficeKind; 
+        dlinacc.rec.DocumentId     = DealId;
+        dlinacc.rec.PartyID        = DataSet.ClientID; /*Субъект (клиент)*/
+        dlinacc.rec.PartyContrID   = DataSet.ClientContrID; /*Договор обслуживания клиента с банком */
+        dlinacc.rec.FIKind         = FIKIND_AVOIRISS;
+        dlinacc.rec.FIID           = DataSet.FIID;
+        dlinacc.rec.Sum            = DataSet.Amount;
+
+        dlinacc.rec.GroundKind = 320; /*отчет биржи*/
+        spground = GetSPGroundRecByDeal( DealId, dlinacc.rec.GroundKind, null, DataSet.BOfficeKind);
+        dlinacc.rec.GroundNum = spground.XLD; 
+
+        dlinacc.rec.Chapter = 22;
+
+        var pool_code = FD.GetPoolCode(FD.comm.rec.MarketSchemeID);
+        var pool_code_2 = FD.GetPoolCode(FD.comm.rec.MarketSchemeID_2);
+        
+
+        ///////////////////////////////////////////
+        //Исполнение обязательств
+        if ((pool_code == "10") or (pool_code == "11") or (pool_code == "13"))
+          ВидРО = 55002; /*Поставка ценных бумаг - передача в пул - 1-я проводка*/
+        elif ((pool_code_2 == "10") or (pool_code_2 == "11") or (pool_code_2 == "13"))
+          ВидРО = 55001; /*Поставка ценных бумаг - возврат из пула - 1-я проводка*/
+        end;
+         
+        CatCodePayer = FD.ВУ_ПолучитьКатегориюДебет(ВидРО);
+        if( not GetAccount(isPlanMode, FD, CheckCatArr,
+                           CatCodePayer, 
+                           FD.ВУ_ПолучитьРольФИ(ВидРО, true), 
+                           dlinacc.rec.FIID, dlinacc.rec.Date, @AccountPayer) )
+          err = 1;
+          RepErrArr[RepErrArr.size] = CSC_InAccRepErr(CurrErrPart, DataSet.DealCode, err, "Ошибка при определении счета. "+GetErrMsg());
+        end;
+
+        if(not err)
+          CatCodeReceiver = FD.ВУ_ПолучитьКатегориюКредит(ВидРО);
+          if( not GetAccount(isPlanMode, FD, CheckCatArr,
+                             CatCodeReceiver, 
+                             FD.ВУ_ПолучитьРольФИ(ВидРО, false), 
+                             dlinacc.rec.FIID, dlinacc.rec.Date, @AccountReceiver) )
+            err = 1;
+            RepErrArr[RepErrArr.size] = CSC_InAccRepErr(CurrErrPart, DataSet.DealCode, err, "Ошибка при определении счета. "+GetErrMsg());
+          end;
+        end;
+
+        if( not err )
+          if((isPlanMode) and (AccountPayer == "") and (AccountReceiver == ""))  
+            //не добавляем такую РОВУ
+          else
+            dlinacc.rec.OperType = FD.ВУ_ПолучитьРО( ВидРО );
+            dlinacc.rec.DebAcc   = AccountPayer;
+            dlinacc.rec.KredAcc  = AccountReceiver;
+
+            inaccdata.add(dlinacc, DataSet.GrDealID, InAccGroundData(dlinacc.rec.OperType, 1, DataSet.OperationName, DataSet.DealCode, 2, DataSet.PlanDate, IsDealREPO));
+          end;
+        end;
+        ///////////////////////////////////////////////
+
+        ///////////////////////////////////////////////
+        //Исполнение требований
+        if ((pool_code == "10") or (pool_code == "11") or (pool_code == "13"))
+          ВидРО = 55004; /*Поставка ценных бумаг - передача в пул - 1-я проводка*/
+        elif ((pool_code_2 == "10") or (pool_code_2 == "11") or (pool_code_2 == "13"))
+          ВидРО = 55003; /*Поставка ценных бумаг - возврат из пула - 1-я проводка*/
+        end;
+
+        CatCodePayer = FD.ВУ_ПолучитьКатегориюДебет(ВидРО);
+        if( not GetAccount(isPlanMode, FD, CheckCatArr,
+                           CatCodePayer, 
+                           FD.ВУ_ПолучитьРольФИ(ВидРО, true), 
+                           dlinacc.rec.FIID, dlinacc.rec.Date, @AccountPayer) )
+          err = 1;
+          RepErrArr[RepErrArr.size] = CSC_InAccRepErr(CurrErrPart, DataSet.DealCode, err, "Ошибка при определении счета. "+GetErrMsg());
+        end;
+
+        if(not err)
+          CatCodeReceiver = FD.ВУ_ПолучитьКатегориюКредит(ВидРО);
+          if( not GetAccount(isPlanMode, FD, CheckCatArr,
+                             CatCodeReceiver, 
+                             FD.ВУ_ПолучитьРольФИ(ВидРО, false), 
+                             dlinacc.rec.FIID, dlinacc.rec.Date, @AccountReceiver) )
+            err = 1;
+            RepErrArr[RepErrArr.size] = CSC_InAccRepErr(CurrErrPart, DataSet.DealCode, err, "Ошибка при определении счета. "+GetErrMsg());
+          end;
+        end;
+
+        if( not err )
+          if((isPlanMode) and (AccountPayer == "") and (AccountReceiver == ""))  
+            //не добавляем такую РОВУ
+          else
+            dlinacc.rec.OperType = FD.ВУ_ПолучитьРО( ВидРО );
+            dlinacc.rec.DebAcc   = AccountPayer;
+            dlinacc.rec.KredAcc  = AccountReceiver;
+
+            inaccdata.add(dlinacc, DataSet.GrDealID, InAccGroundData(dlinacc.rec.OperType, 1, DataSet.OperationName, DataSet.DealCode, 2, DataSet.PlanDate, IsDealREPO));
+          end;
+        end;
+        ///////////////////////////////////////////////
+
+      else 
+
+        cmd1 = DL_RSDCommand();
+        query =   "select rq.* from ddlrq_dbt rq "
+                + " where rq.t_DocKind = ? "
+                + "   and rq.t_DocID = ? "
+                + "   and rq.t_Type IN ("+RQType+")"
+                + "   and rq.t_Netting = CHR(0) ";
+
+        cmd1.AddParam(DataSet.BOfficeKind);
+        cmd1.AddParam(DealId);
+
+        if(DataSet.RQByGrDeal > 0)
+          query = query + " and rq.t_ID = ? ";
+          cmd1.AddParam(DataSet.RQByGrDeal);
+        end;
+
+        if(isPlanMode == false)
+          query = query + " and rq.t_FactDate = ? ";
+          cmd1.AddParam(date(DataSet.PlanDate));
+        end;
+
+        if(DealPart)
+          query = query + " and rq.t_DealPart = ? "
+                        + " and Not Exists (select 1 from dpmlink_dbt lnk where lnk.t_LinkKind = "+PMLINK_KIND_RQNETTING+" and lnk.t_InitialPayment = rq.t_ID)";
+          cmd1.AddParam(DealPart);
+        end;
+
+        if(RQParty > 0)
+          if((TemplNum == DLGR_TEMPL_PAYCOM) OR (TemplNum == DLGR_TEMPL_PAYCOMCONTR))
+            query = query + " and rq.t_SourceObjKind = " + DL_SECURITYCOM
+                          + " and Exists (select 1 "
+                          + "               from ddlcomis_dbt dlc, dsfcontr_dbt sfcontr, dsfcomiss_dbt sfcom "
+                          + "              where dlc.t_ID = rq.t_SourceObjID "
+                          + "                and sfcontr.t_ID = dlc.t_Contract "
+                          + "                and sfcontr.t_PartyID = ? "
+                          + "                and sfcom.t_FeeType = dlc.t_FeeType " 
+                          + "                and sfcom.t_Number = dlc.t_ComNumber "
+                          + "                and sfcom.T_SERVICEKIND = " + PTSK_STOCKDL
+                          + "            ) ";
+
+            cmd1.AddParam(RQParty);
+          end;
+        end;
+
+        rq = cmd1.Execute(query);
+        while(rq.moveNext())
+          dlinacc.Clear();
+          ВидРО = 0;
+
+          ComPayerID = -1;
+
+          dlinacc.rec.Boffice        = OBJTYPE_BACKOFFICE_SP;
+          dlinacc.rec.ServDocKind    = dl_comm.rec.DocKind;
+          dlinacc.rec.ServDocID      = dl_comm.rec.DocumentID; 
+          dlinacc.rec.Date           = date(DataSet.PlanDate); /* Дата проводки */
+          dlinacc.rec.PlaceID        = rq.PlaceID;             /* Место учета актива */
+          dlinacc.rec.DealKind       = DataSet.BOfficeKind;
+          dlinacc.rec.Department     = DataSet.Department;
+          dlinacc.rec.Oper           = {Oper};
+          dlinacc.rec.MarketOfficeID = DataSet.MarketOfficeID; /* ??? для корзины "РЕПО на корзину" ??? */
+          dlinacc.rec.AccTrnID       = 0;
+          dlinacc.rec.DocumentKind   = DataSet.BOfficeKind; 
+          dlinacc.rec.DocumentId     = DealId;
+
+          dlinacc.rec.PartyID = DataSet.ClientID; /*Субъект (клиент)*/
+          dlinacc.rec.PartyContrID = DataSet.ClientContrID; /*Договор обслуживания клиента с банком */
+
+          /* Вид расчетной операции */
+
+          if(DataSet.BOfficeKind == DL_NTGSEC) /*Для неттинга*/
+            if(TemplNum == DLGR_TEMPL_PAYMENT)
+              
+              if (rq.rec.Kind == DLRQ_KIND_REQUEST)
+                if(DataSet.ClientID == -1)
+                  ВидРО = 46001; /*Получение итогового платежа неттинга по денежным средствам*/
+                else
+                  ВидРО = 46002; /*Получение итогового платежа неттинга по денежным средствам*/
+                end;
+              else
+                if(DataSet.ClientID == -1)
+                  ВидРО = 45001; /*Оплата итогового платежа неттинга по денежным средствам*/
+                else
+                  ВидРО = 45002; /*Оплата итогового платежа неттинга по денежным средствам*/
+                end;
+              end;
+              
+              dlinacc.rec.FIKind = FIKIND_CURRENCY;
+              dlinacc.rec.FIID = rq.FIID;
+              SmartConvertSum( dlinacc.rec.Sum, rq.Amount, dl_comm.rec.CommDate, rq.FIID, dlinacc.rec.FIID, true );
+
+              SmartConvertSum( Amount, rq.Amount, date(DataSet.DealDate), rq.FIID, dlinacc.rec.FIID, true );
+              dlinacc.rec.RateSum = dlinacc.rec.Sum - Amount;
+            elif(TemplNum == DLGR_TEMPL_DELIVERYNTG)
+              if (rq.rec.Kind == DLRQ_KIND_REQUEST)
+                if(DataSet.ClientID == -1)
+                  ВидРО = 77001; /*Получение итогового платежа неттинга по ценным бумагам*/
+                else
+                  ВидРО = 77002; /*Получение итогового платежа неттинга по ценным бумагам*/
+                end;
+              else  
+                if(DataSet.ClientID == -1)
+                  ВидРО = 76001; /*Оплата итогового платежа неттинга по ценным бумагам*/
+                else
+                  ВидРО = 76002; /*Оплата итогового платежа неттинга по ценным бумагам*/
+                end;
+              end;
+              dlinacc.rec.FIKind = FIKIND_AVOIRISS;
+              dlinacc.rec.FIID = rq.FIID;
+              dlinacc.rec.Sum = rq.Amount;
+            end;
+          else /*для сделок*/
+
+            if( (DataSet.GrDealID == 0) or (ПолучитьПараметрыПоСтрокеГрафика(DataSet.GrDealID, GrDealPrm) != 0) )
+               GrDealPrm.rec.ReturnIncomeKind = FD.tick.rec.ReturnIncomeKind;
+            end;
+
+            if((TemplNum == DLGR_TEMPL_PAYCOM) OR (TemplNum == DLGR_TEMPL_PAYCOMCONTR))
+              dlinacc.rec.FIKind = FIKIND_CURRENCY;
+
+              cmd2 = DL_RSDCommand();
+
+              query =   " select dlc.t_Sum as ComSum, sfcom.t_FIID_Comm, sfcontr.t_PartyID as PayerID, sfcom.t_ReceiverID as ReceiverID "
+                      + "   from ddlcomis_dbt dlc, dsfcomiss_dbt sfcom, dsfcontr_dbt sfcontr "
+                      + "  where dlc.t_ID = ? "
+                      + "    and sfcom.t_FeeType = dlc.t_FeeType " 
+                      + "    and sfcom.t_Number = dlc.t_ComNumber "
+                      + "    and sfcontr.t_ID = dlc.t_Contract "          
+                      + "    and sfcom.T_SERVICEKIND = ?";
+
+              cmd2.AddParam(rq.SourceObjID);
+              cmd2.AddParam(PTSK_STOCKDL);
+
+              if(TemplNum == DLGR_TEMPL_PAYCOMCONTR)
+                query = query + " and sfcontr.t_PartyID = ? ";
+                cmd2.AddParam(FD.tick.rec.PartyID);
+              elif(FD.tick.rec.ClientID != -1) 
+                query = query + " and sfcontr.t_PartyID = ? ";
+                cmd2.AddParam(FD.tick.rec.ClientID);
+              end;
+
+              comis = cmd2.Execute(query);
+              if(comis.moveNext())
+                dlinacc.rec.Sum = comis.ComSum; /*включая НДС*/
+                dlinacc.rec.FIID = comis.FIID_Comm;
+                dlinacc.rec.FIKind = FIKIND_CURRENCY;
+              
+                ComPayerID = comis.PayerID;
+              
+                if(rq.Party == {OurBank}) /* Получатель комиссии = НашБанк*/
+                  ВидРО = 8; /*Оплата комиссии банка*/
+                  if((TemplNum == DLGR_TEMPL_PAYCOMCONTR) and (СделкаСКлиентомКонтрагентом(FD.tick)) AND (ComPayerID == FD.tick.rec.PartyID))
+                    ВидРО = 80001;
+                  end;
+                elif( (not DataSet.IsLoan) and (DataSet.Flag1 == SET_CHAR) and (rq.Party == comis.ReceiverID) and (ВидСубъекта( rq.Party, PTK_MARKETPLASE ))) /*Принадлежность субъекта - биржа И признак ОРЦБ*/
+                  ВидРО = 9; /*Оплата комиссии биржи*/
+                elif(((DataSet.Flag1 == UNSET_CHAR) or DataSet.IsLoan) and (rq.Party == comis.ReceiverID) and (ВидСубъекта( rq.Party, PTK_BROKER ))) /*Принадлежность субъекта - брокер И нет признака ОРЦБ*/
+                  ВидРО = 10; /*Оплата комиссии брокера*/
+                  if((TemplNum == DLGR_TEMPL_PAYCOMCONTR) and (СделкаСКлиентомКонтрагентом(FD.tick)) AND (ComPayerID == FD.tick.rec.PartyID))
+                    ВидРО = 10001;
+                  end;
+                elif((DataSet.BrokerID > 0) and (comis.ReceiverID == DataSet.BrokerID)) /*В сделке указан посредник*/
+                  ВидРО = 12; /*Оплата комиссии посредника*/
+                elif(    ((not IsDealExchange) or (IsDealREPO)) 
+                     and (((PayRegTax1 == SET_CHAR) and (rq.DealPart == 1)) or ((PayRegTax2 == SET_CHAR) and (rq.DealPart == 2)))
+                    )
+                  ВидРО = 11; /*Оплата депозитарной комиссии*/
+                  if((TemplNum == DLGR_TEMPL_PAYCOMCONTR) and (СделкаСКлиентомКонтрагентом(FD.tick)) AND (ComPayerID == FD.tick.rec.PartyID))
+                    ВидРО = 11001;
+                  end;
+                end; 
+
+              end;
+
+              if(СделкаСКлиентомКонтрагентом(FD.tick) AND (ComPayerID == FD.tick.rec.PartyID))
+                dlinacc.rec.PartyID = FD.tick.rec.PartyID; /*Субъект (клиент)*/
+                dlinacc.rec.PartyContrID = FD.tick.rec.PartyContrID; /*Договор обслуживания клиента с банком*/
+              else
+                dlinacc.rec.PartyID = DataSet.ClientID; /*Субъект (клиент)*/
+                dlinacc.rec.PartyContrID = DataSet.ClientContrID; /*Договор обслуживания клиента с банком */
+              end;
+
+            elif(TemplNum == DLGR_TEMPL_PAYAVANCE)
+              ВидРО = 21; /*Оплата аванса/задатка*/
+              dlinacc.rec.FIKind = FIKIND_CURRENCY;
+              dlinacc.rec.FIID = DataSet.PayFIID;
+              SmartConvertSum( dlinacc.rec.Sum, rq.Amount, dl_comm.rec.CommDate, rq.FIID, dlinacc.rec.FIID, true );
+
+              SmartConvertSum( Amount, rq.Amount, date(DataSet.DealDate), rq.FIID, dlinacc.rec.FIID, true );
+              dlinacc.rec.RateSum = dlinacc.rec.Sum - Amount;
+
+            elif(TemplNum == DLGR_TEMPL_PAYMENT)
+              if(IsDealRet_Issue or IsDealRet_Partly)
+                ВидРО = 23; /*Получение суммы погашения*/
+              elif(IsDealRet_Coupon)
+                ВидРО = 22; /*Получение купонного дохода*/
+              else
+                ВидРО = 20; /*Оплата ценных бумаг*/
+              end;
+              
+              dlinacc.rec.FIKind = FIKIND_CURRENCY;
+              dlinacc.rec.FIID = DataSet.PayFIID;
+              SmartConvertSum( dlinacc.rec.Sum, rq.Amount, dl_comm.rec.CommDate, rq.FIID, dlinacc.rec.FIID, true );
+
+              SmartConvertSum( Amount, rq.Amount, date(DataSet.DealDate), rq.FIID, dlinacc.rec.FIID, true );
+              dlinacc.rec.RateSum = dlinacc.rec.Sum - Amount;
+
+              if((UseNUTX == true) and 
+                 ((IsDealREPO == 0) and (IsDealBuy == 0)) //продажа
+                )
+                
+                NUTX_GetClientDealPaidTax(DealId, dlinacc.rec.PartyID, @PaidTax, @PaidTax0);
+
+                dlinacc.rec.Sum = dlinacc.rec.Sum - PaidTax;
+              end;
+
+            elif((TemplNum == DLGR_TEMPL_DELIVERY) OR (TemplNum == DLGR_TEMPL_DELIVERYCONTR))
+              
+              ВидРО = 55; /*Поставка ценных бумаг*/
+              if(DataSet.ClientID != -1)
+                if(IsDealAvrWrtIn)
+                  ВидРО = 59; /*Прием от клиента ценных бумаг*/
+                elif(IsDealAvrWrtOut)
+                  ВидРО = 60; /*Возврат клиенту ценных бумаг*/
+                end;
+              end;
+              dlinacc.rec.FIKind = FIKIND_AVOIRISS;
+              dlinacc.rec.FIID = rq.FIID;
+              dlinacc.rec.Sum = rq.Amount;
+
+              if(TemplNum == DLGR_TEMPL_DELIVERYCONTR)
+                ВидРО = 55001; /*Поставка ценных бумаг*/
+                dlinacc.rec.PartyID = FD.tick.rec.PartyID; /*Субъект (клиент)*/
+                dlinacc.rec.PartyContrID = FD.tick.rec.PartyContrID; /*Договор обслуживания клиента с банком*/
+              end;
+
+            elif(TemplNum == DLGR_TEMPL_PAYAVANCE2)
+              ВидРО = 21; /*Оплата аванса/задатка*/
+              dlinacc.rec.FIKind = FIKIND_CURRENCY;
+              dlinacc.rec.FIID = DataSet.PayFIID;
+              SmartConvertSum( dlinacc.rec.Sum, rq.Amount, dl_comm.rec.CommDate, rq.FIID, dlinacc.rec.FIID, true );
+
+              SmartConvertSum( Amount, rq.Amount, date(DataSet.DealDate), rq.FIID, dlinacc.rec.FIID, true );
+              dlinacc.rec.RateSum = dlinacc.rec.Sum - Amount;
+
+            elif((TemplNum == DLGR_TEMPL_PAYMENT2) OR (TemplNum == DLGR_TEMPL_PAYPC))
+              var S2 = rq.Amount;
+              
+              ВидРО = 19; /*Возврат гарантийного обеспечения*/
+              dlinacc.rec.FIKind = FIKIND_CURRENCY;
+              dlinacc.rec.FIID = DataSet.PayFIID;
+              
+              if(FD2 != NULL)
+                if( (FD2.dl_leg.rec.ReturnIncome != 0.0) and (FD2.ExistsRQ(DLRQ_TYPE_INCREPO)))
+                   if( FD2.dl_leg.rec.IncomeRate > 0.0 )
+                      S2 = S2 + FD2.GetRQ(DLRQ_TYPE_INCREPO).rec.Amount;
+                   elif( FD.dl_leg.rec.IncomeRate < 0.0 )
+                      S2 = S2 - FD2.GetRQ(DLRQ_TYPE_INCREPO).rec.Amount;
+                   end;
+                end;
+              end;
+
+              if(UseNUTX == true)
+                
+                NUTX_GetClientDealPaidTax(DealId, dlinacc.rec.PartyID, @PaidTax, @PaidTax0);
+                if(rq.FIID == NATCUR)
+                  S2 = S2 - PaidTax0;
+                elif(rq.FIID == DataSet.PayFIID)
+                  S2 = S2 - PaidTax;
+                else
+                  SmartConvertSum( STaidTax, PaidTax0, dl_comm.rec.CommDate, NATCUR, rq.FIID, true );
+                  S2 = S2 - STaidTax;
+                end;
+              end;
+
+              SmartConvertSum( dlinacc.rec.Sum, S2, dl_comm.rec.CommDate, rq.FIID, dlinacc.rec.FIID, true );
+
+              SmartConvertSum( Amount, S2, date(DataSet.DealDate), rq.FIID, dlinacc.rec.FIID, true );
+              dlinacc.rec.RateSum = dlinacc.rec.Sum - Amount;
+
+            elif((TemplNum == DLGR_TEMPL_DELIVERY2) OR (TemplNum == DLGR_TEMPL_DELIVERYCONTR2))
+              ВидРО = 55; /*Поставка ценных бумаг*/
+              dlinacc.rec.FIKind = FIKIND_AVOIRISS;
+              dlinacc.rec.FIID = rq.FIID;
+              dlinacc.rec.Sum = rq.Amount;
+
+              if(TemplNum == DLGR_TEMPL_DELIVERYCONTR2)
+                dlinacc.rec.PartyID = FD.tick.rec.PartyID; /*Субъект (клиент)*/
+                dlinacc.rec.PartyContrID = FD.tick.rec.PartyContrID; /*Договор обслуживания клиента с банком*/
+              end;
+
+            elif(TemplNum == DLGR_TEMPL_COMPPAYMENT)
+              if( IsDealBuy ) /*обратное РЕПО*/
+                 if( rq.rec.Kind == DLRQ_KIND_COMMIT ) /*увеличение*/
+                    ВидРО = 4401; /*Получение компенсационного взноса*/
+                 else /*уменьшение*/
+                    ВидРО = 4301; /*Выплата компенсационного взноса*/
+                 end;
+              else /*прямое РЕПО*/
+                 if( rq.rec.Kind == DLRQ_KIND_REQUEST ) /*увеличение*/
+                    ВидРО = 4301; /*Выплата компенсационного взноса*/
+                 else /*уменьшение*/
+                    ВидРО = 4401; /*Получение компенсационного взноса*/
+                 end;
+              end;
+              
+              dlinacc.rec.FIKind = FIKIND_CURRENCY;
+              dlinacc.rec.FIID = DataSet.PayFIID;
+              SmartConvertSum( dlinacc.rec.Sum, rq.Amount, dl_comm.rec.CommDate, rq.FIID, dlinacc.rec.FIID, true );
+
+              SmartConvertSum( Amount, rq.Amount, date(DataSet.DealDate), rq.FIID, dlinacc.rec.FIID, true );
+              dlinacc.rec.RateSum = dlinacc.rec.Sum - Amount;
+            
+            elif((TemplNum == DLGR_TEMPL_COMPDELIVERY) OR (TemplNum == DLGR_TEMPL_COMPDELIVERYCONTR))
+              if( IsDealBuy ) /*обратное РЕПО*/
+                 if( rq.rec.Kind == DLRQ_KIND_REQUEST ) /*увеличение*/
+                    if( TemplNum == DLGR_TEMPL_COMPDELIVERYCONTR )
+                       ВидРО = 8202; /*Выплата компенсационного взноса*/
+                    else
+                       ВидРО = 4402; /*Получение компенсационного взноса*/
+                    end;
+                 else /*уменьшение*/
+                    if( TemplNum == DLGR_TEMPL_COMPDELIVERYCONTR )
+                       ВидРО = 8302; /*Получение компенсационного взноса*/
+                    else
+                       ВидРО = 4302; /*Выплата компенсационного взноса*/
+                    end;
+                 end;
+              else /*прямое РЕПО*/
+                 if( rq.rec.Kind == DLRQ_KIND_COMMIT ) /*увеличение*/
+                    if( TemplNum == DLGR_TEMPL_COMPDELIVERYCONTR )
+                       ВидРО = 8302; /*Получение компенсационного взноса*/
+                    else
+                       ВидРО = 4302; /*Выплата компенсационного взноса*/
+                    end;
+                 else /*уменьшение*/
+                    if( TemplNum == DLGR_TEMPL_COMPDELIVERYCONTR )
+                       ВидРО = 8202; /*Выплата компенсационного взноса*/
+                    else
+                       ВидРО = 4402; /*Получение компенсационного взноса*/
+                    end;
+                 end;
+              end;
+              
+              dlinacc.rec.FIKind = FIKIND_AVOIRISS;
+              dlinacc.rec.FIID = rq.FIID;
+              dlinacc.rec.Sum = rq.Amount;
+
+              if(TemplNum == DLGR_TEMPL_COMPDELIVERYCONTR)
+                dlinacc.rec.PartyID = FD.tick.rec.PartyID; /*Субъект (клиент)*/
+                dlinacc.rec.PartyContrID = FD.tick.rec.PartyContrID; /*Договор обслуживания клиента с банком*/
+              end;
+
+            elif(TemplNum == DLGR_TEMPL_COUP)
+              if( GrDealPrm.rec.ReturnIncomeKind == SP_RETURNINCOME_PAYMENT )
+                var S = rq.Amount;
+                
+                if(IsDealBuy)
+                  ВидРО = 25; /*Возврат купонного дохода*/
+                else
+                  ВидРО = 22; /*Получение купонного дохода*/
+
+                  if(UseNUTX == true)
+                
+                    NUTX_GetClientDealTaxCoup(DealId, dlinacc.rec.PartyID, dl_comm.rec.CommDate, @PaidTax, @PaidTax0);
+                    if(rq.FIID == NATCUR)
+                      S = S - PaidTax0;
+                    elif(rq.FIID == DataSet.PayFIID)
+                      S = S - PaidTax;
+                    else
+                      SmartConvertSum( STaidTax, PaidTax0, dl_comm.rec.CommDate, NATCUR, rq.FIID, true );
+                      S = S - STaidTax;
+                    end;
+                  end;
+                end;
+              
+                dlinacc.rec.FIKind = FIKIND_CURRENCY;
+                dlinacc.rec.FIID = DataSet.PayFIID;
+                SmartConvertSum( dlinacc.rec.Sum, S, dl_comm.rec.CommDate, rq.FIID, dlinacc.rec.FIID, true );
+
+                SmartConvertSum( Amount, S, date(DataSet.DealDate), rq.FIID, dlinacc.rec.FIID, true );
+                dlinacc.rec.RateSum = dlinacc.rec.Sum - Amount;
+              end;
+            elif(TemplNum == DLGR_TEMPL_PARTREP)
+              if( GrDealPrm.rec.ReturnIncomeKind == SP_RETURNINCOME_PAYMENT )
+                if(IsDealBuy)
+                  ВидРО = 40; /*Возврат суммы частичного погашения ц/б контрагенту*/
+                else
+                  ВидРО = 41; /*Получение суммы частичного погашения по ц/б от контрагента*/
+                end;
+              
+                dlinacc.rec.FIKind = FIKIND_CURRENCY;
+                dlinacc.rec.FIID = DataSet.PayFIID;
+                SmartConvertSum( dlinacc.rec.Sum, rq.Amount, dl_comm.rec.CommDate, rq.FIID, dlinacc.rec.FIID, true );
+
+                SmartConvertSum( Amount, rq.Amount, date(DataSet.DealDate), rq.FIID, dlinacc.rec.FIID, true );
+                dlinacc.rec.RateSum = dlinacc.rec.Sum - Amount;
+              end;
+            elif(TemplNum == DLGR_TEMPL_RECDELFORTAX)
+              ВидРО = 17; /*Удержание налога на доходы физ.лиц и юрлиц-нерезидентов*/
+
+              dlinacc.rec.FIKind = FIKIND_CURRENCY;
+              dlinacc.rec.FIID   = DataSet.PayFIID;
+
+              NUTX_GetClientDealPaidTax(DealId, dlinacc.rec.PartyID, @PaidTax, @PaidTax0);
+
+              dlinacc.rec.Sum = PaidTax;
+            end;
+
+            if(FD.ExistBack == true)
+              dlinacc.rec.DocumentKind = DL_SECURLEG;
+              if(rq.DealPart == 2)
+                dlinacc.rec.DocumentId = DataSet.Leg2ID;
+              else
+                dlinacc.rec.DocumentId = DataSet.Leg1ID;
+              end;
+            end;
+
+            if(IsDealExchange)
+              dlinacc.rec.GroundKind = 320; /*отчет биржи*/
+              spground = GetSPGroundRecByDeal( DealId, dlinacc.rec.GroundKind, null, DataSet.BOfficeKind);
+              dlinacc.rec.GroundNum = spground.XLD; 
+
+            elif(IsDealBroker)
+              dlinacc.rec.GroundKind = 321; /*отчет брокера*/
+              spground = GetSPGroundRecByDeal( DealId, dlinacc.rec.GroundKind, null, DataSet.BOfficeKind);
+              dlinacc.rec.GroundNum = spground.XLD;
+            else
+              if(dlinacc.rec.FIKind == FIKIND_CURRENCY)
+                spground = GetSPGroundRecByDeal( DealId, 313/*Платежное поручение */, null, DataSet.BOfficeKind);
+                if( (spground.Kind == 313) and (spground.RegistrDate == dlinacc.rec.Date) )
+                  dlinacc.rec.GroundKind = spground.Kind;
+                  dlinacc.rec.GroundNum = spground.XLD;
+                else
+                  spground = GetSPGroundRecByDeal( DealId, 314/*Кассовый ордер */, null, DataSet.BOfficeKind);
+                  if( (spground.Kind == 314) and (spground.RegistrDate == dlinacc.rec.Date) )
+                    dlinacc.rec.GroundKind = spground.Kind;
+                    dlinacc.rec.GroundNum = spground.XLD;
+                  end;
+                end;
+              else
+                spground = GetSPGroundRecByDeal( DealId, 300/*Отчет об исполнении поручения депо */, null, DataSet.BOfficeKind);
+                if( (spground.Kind == 300) and (spground.RegistrDate == dlinacc.rec.Date) )
+                  dlinacc.rec.GroundKind = spground.Kind;
+                  dlinacc.rec.GroundNum = spground.XLD;
+                else
+                  spground = GetSPGroundRecByDeal( DealId, 315/*Подтверждение перерегистрации */, null, DataSet.BOfficeKind);
+                  if( (spground.Kind == 315) and (spground.RegistrDate == dlinacc.rec.Date) )
+                    dlinacc.rec.GroundKind = spground.Kind;
+                    dlinacc.rec.GroundNum = spground.XLD;
+                  end;
+                end;
+              end;
+            end;
+          end;
+
+          if(dlinacc.rec.FIKind == FIKIND_CURRENCY)
+            dlinacc.rec.Chapter = 21;
+          else
+            dlinacc.rec.Chapter = 22;
+          end;
+
+          if((ВидРО) and (dlinacc.rec.Sum != $0))
+            
+            if(rq.DealPart == 2)
+              CatCodePayer = FD2.ВУ_ПолучитьКатегориюДебет(ВидРО, GrDealPrm.rec.ReturnIncomeKind);
+              if( not GetAccount(isPlanMode, FD2, CheckCatArr,
+                                 CatCodePayer, 
+                                 FD2.ВУ_ПолучитьРольФИ(ВидРО, true, GrDealPrm.rec.ReturnIncomeKind), 
+                                 dlinacc.rec.FIID, dlinacc.rec.Date, @AccountPayer) )
+                err = 1;
+                RepErrArr[RepErrArr.size] = CSC_InAccRepErr(CurrErrPart, DataSet.DealCode, err, "Ошибка при определении счета. "+GetErrMsg());
+              end;
+
+              if(not err)
+                CatCodeReceiver = FD2.ВУ_ПолучитьКатегориюКредит(ВидРО, GrDealPrm.rec.ReturnIncomeKind);
+                if( not GetAccount(isPlanMode, FD2, CheckCatArr,
+                                   CatCodeReceiver, 
+                                   FD2.ВУ_ПолучитьРольФИ(ВидРО, false, GrDealPrm.rec.ReturnIncomeKind), 
+                                   dlinacc.rec.FIID, dlinacc.rec.Date, @AccountReceiver) )
+                  err = 1;
+                  RepErrArr[RepErrArr.size] = CSC_InAccRepErr(CurrErrPart, DataSet.DealCode, err, "Ошибка при определении счета. "+GetErrMsg());
+                end;
+              end;
+            else
+              CatCodePayer = FD.ВУ_ПолучитьКатегориюДебет(ВидРО, GrDealPrm.rec.ReturnIncomeKind);
+              if( not GetAccount(isPlanMode, FD, CheckCatArr,
+                                 CatCodePayer, 
+                                 FD.ВУ_ПолучитьРольФИ(ВидРО, true, GrDealPrm.rec.ReturnIncomeKind), 
+                                 dlinacc.rec.FIID, dlinacc.rec.Date, @AccountPayer) )
+                err = 1;
+                RepErrArr[RepErrArr.size] = CSC_InAccRepErr(CurrErrPart, DataSet.DealCode, err, "Ошибка при определении счета. "+GetErrMsg());
+              end;
+
+              if(not err)
+                CatCodeReceiver = FD.ВУ_ПолучитьКатегориюКредит(ВидРО, GrDealPrm.rec.ReturnIncomeKind);
+                if( not GetAccount(isPlanMode, FD, CheckCatArr,
+                                   CatCodeReceiver, 
+                                   FD.ВУ_ПолучитьРольФИ(ВидРО, false, GrDealPrm.rec.ReturnIncomeKind), 
+                                   dlinacc.rec.FIID, dlinacc.rec.Date, @AccountReceiver) )
+                  err = 1;
+                  RepErrArr[RepErrArr.size] = CSC_InAccRepErr(CurrErrPart, DataSet.DealCode, err, "Ошибка при определении счета. "+GetErrMsg());
+                end;
+              end;
+            end;
+
+            if(not err)    
+              if((isPlanMode) and (AccountPayer == "") and (AccountReceiver == ""))  
+                //не добавляем такую РОВУ
+              else
+                dlinacc.rec.OperType = FD.ВУ_ПолучитьРО( ВидРО );
+                dlinacc.rec.DebAcc   = AccountPayer;
+                dlinacc.rec.KredAcc  = AccountReceiver;
+
+            /*DAN  Если операция погашения ЦБ (12021) клиентская то отключаем проводку получения ДС */ 
+                if (valtype(FD) != v_undef)
+                  if((dlInAcc.rec.DealKind == DL_RETIREMENT) and (dlInAcc.rec.partyID != -1) and (dlInAcc.rec.opertype == 23) and (FD.Tick.Rec.dealtype == 12021 ))
+                   GetCashCarry = false;
+                  else 
+                   GetCashCarry = True; 
+                  end;
+                else
+                  GetCashCarry = True;  
+                end;
+            /*DAN*/
+
+                if (GetCashCarry)
+                  inaccdata.add(dlinacc, DataSet.GrDealID, InAccGroundData(dlinacc.rec.OperType, rq.DealPart, DataSet.OperationName, DataSet.DealCode, rq.rec.State, rq.rec.FactDate, IsDealREPO));
+                end;
+
+              end;
+
+              if( (ВидРО == 20) or (ВидРО == 21) )
+                if( ((TemplNum == DLGR_TEMPL_PAYMENT)or(TemplNum == DLGR_TEMPL_PAYAVANCE)) and СделкаСКлиентомКонтрагентом(FD.tick) )
+                  /* вставим ещё одно РОВУ */
+                  if( TemplNum == DLGR_TEMPL_PAYMENT )
+                     ВидРО = 20001; /*Оплата ценных бумаг*/
+                  elif( TemplNum == DLGR_TEMPL_PAYAVANCE )
+                     ВидРО = 21001; /*Оплата аванса\задатка*/
+                  end;
+
+                  dlinacc.rec.PartyID = FD.tick.rec.PartyID; /*Субъект (клиент)*/
+                  dlinacc.rec.PartyContrID = FD.tick.rec.PartyContrID; /*Договор обслуживания клиента с банком*/
+
+                  CatCodePayer = FD.ВУ_ПолучитьКатегориюДебет( ВидРО, null, dlinacc.rec.Date, dlinacc.rec.FIID );
+                  if( not GetAccount(isPlanMode, FD, CheckCatArr,
+                                     CatCodePayer, 
+                                     FD.ВУ_ПолучитьРольФИ( ВидРО, true ), 
+                                     dlinacc.rec.FIID, dlinacc.rec.Date, @AccountPayer) )
+                    err = 1;
+                    RepErrArr[RepErrArr.size] = CSC_InAccRepErr(CurrErrPart, DataSet.DealCode, err, "Ошибка при определении счета. "+GetErrMsg());
+                  end;
+
+                  if(not err)
+                    CatCodeReceiver = FD.ВУ_ПолучитьКатегориюКредит( ВидРО, null, dlinacc.rec.Date, dlinacc.rec.FIID );
+                    if( not GetAccount(isPlanMode, FD, CheckCatArr,
+                                       CatCodeReceiver, 
+                                       FD.ВУ_ПолучитьРольФИ( ВидРО, false ), 
+                                       dlinacc.rec.FIID, dlinacc.rec.Date, @AccountReceiver) )
+                      err = 1;
+                      RepErrArr[RepErrArr.size] = CSC_InAccRepErr(CurrErrPart, DataSet.DealCode, err, "Ошибка при определении счета. "+GetErrMsg());
+                    end;
+                  end;
+
+                  if( not err )
+                    if((isPlanMode) and (AccountPayer == "") and (AccountReceiver == ""))  
+                      //не добавляем такую РОВУ
+                    else
+                      dlinacc.rec.OperType = FD.ВУ_ПолучитьРО( ВидРО );
+                      dlinacc.rec.DebAcc   = AccountPayer;
+                      dlinacc.rec.KredAcc  = AccountReceiver;
+   
+                      inaccdata.add(dlinacc, DataSet.GrDealID, InAccGroundData(dlinacc.rec.OperType, rq.DealPart, DataSet.OperationName, DataSet.DealCode, rq.rec.State, rq.rec.FactDate, IsDealREPO));
+                    end;
+                  end;
+                end;
+              end;
+
+              if ((TemplNum == DLGR_TEMPL_PAYMENT) and (UseNUTX) //Проводки по ВУ для облигаций ГНУДЮН 15 и 20. #257452
+                  and (CheckBondNutxGroupJur(DealId)))
+                NUTX_GetClientDealPaidTax(DealId, dlinacc.rec.PartyID, @PaidTax, @PaidTax0);
+                if (PaidTax > $0)
+                  ВидРО = 17; /*Удержание налога на доходы физ.лиц и юрлиц-нерезидентов*/
+                  dlinacc.rec.FIKind = FIKIND_CURRENCY;
+                  dlinacc.rec.FIID   = DataSet.PayFIID;
+                  dlinacc.rec.Chapter = 21;
+                  dlinacc.rec.Sum = PaidTax;
+                  CatCodePayer = FD.ВУ_ПолучитьКатегориюДебет(ВидРО, GrDealPrm.rec.ReturnIncomeKind);
+                  if( not GetAccount(isPlanMode, FD, CheckCatArr,
+                                    CatCodePayer, 
+                                    FD.ВУ_ПолучитьРольФИ(ВидРО, true, GrDealPrm.rec.ReturnIncomeKind), 
+                                    dlinacc.rec.FIID, dlinacc.rec.Date, @AccountPayer) )
+                    err = 1;
+                    RepErrArr[RepErrArr.size] = CSC_InAccRepErr(CurrErrPart, DataSet.DealCode, err, "Ошибка при определении счета. "+GetErrMsg());
+                  end;
+                  if(not err)
+                    CatCodeReceiver = FD.ВУ_ПолучитьКатегориюКредит(ВидРО, GrDealPrm.rec.ReturnIncomeKind);
+                    if( not GetAccount(isPlanMode, FD, CheckCatArr,
+                                      CatCodeReceiver, 
+                                      FD.ВУ_ПолучитьРольФИ(ВидРО, false, GrDealPrm.rec.ReturnIncomeKind), 
+                                      dlinacc.rec.FIID, dlinacc.rec.Date, @AccountReceiver) )
+                      err = 1;
+                      RepErrArr[RepErrArr.size] = CSC_InAccRepErr(CurrErrPart, DataSet.DealCode, err, "Ошибка при определении счета. "+GetErrMsg());
+                    end;
+                  end;
+                  if (not err)
+                    if((isPlanMode) and (AccountPayer == "") and (AccountReceiver == ""))  
+                      //не добавляем такую РОВУ
+                    else
+                      dlinacc.rec.OperType = FD.ВУ_ПолучитьРО( ВидРО );
+                      dlinacc.rec.DebAcc   = AccountPayer;
+                      dlinacc.rec.KredAcc  = AccountReceiver;
+
+                      inaccdata.add(dlinacc, DataSet.GrDealID, InAccGroundData(dlinacc.rec.OperType, rq.DealPart, DataSet.OperationName, DataSet.DealCode, rq.rec.State, rq.rec.FactDate, IsDealREPO));
+                    end;
+                  end;
+                end;
+              end;
+
+            end;
+          end;
+        end;
+
+      end;
+    end;
+
+    if((not err) and (prevGrDealID != DataSet.GrDealID))
+      inaccdata.SetGrDealID(DataSet.GrDealID);
+    end;
+
+    prevGrDealID = DataSet.GrDealID;
+
+    if(cnt)
+      UseProgress( i = i +1 );
+    end;
+  end;
+
+  if(cnt)
+    RemProgress();
+  end;
+
+  GL_ScUseCachingAccounts(false);
+
+  return err;
+END;
+
+//получить планируемые РОВУ без открытия счетов и исполнения
+MACRO SC_GetPlanInAcc(inaccdata:@variant, Department:integer, ClientID:integer, ContrID:integer, BeginDate:date, EndDate:date, CheckCatArr:TArray, OnlyAvr:bool)
+  var dl_comm = TRecHandler("dl_comm.dbt");
+  var _CheckCatArr = TArray();
+  var i = 0;
+  var err = 0;
+
+  dl_comm.Clear();
+
+  dl_comm.rec.Division     = Department;
+  dl_comm.rec.ClientID     = ClientID;
+  dl_comm.rec.ContractID   = ContrID;
+  dl_comm.rec.FIID         = ALLFININSTR;
+  dl_comm.rec.BeginDate    = BeginDate;
+  dl_comm.rec.EndDate      = EndDate;
+  dl_comm.rec.ContractKind = SP_SECDEALTYPE_ALL;
+
+  dl_comm.rec.CommDate     = EndDate; 
+
+  InAccOperTypeNamesArr.size = 0;
+
+  inaccdata = InAccDataTrn(dl_comm, 0, 0, 0);
+
+  if(CheckCatArr.size > 0)
+    while(i < CheckCatArr.size)
+      _CheckCatArr[i] = CheckCatData(CheckCatArr[i], IIF(OnlyAvr == true, true, false));
+
+      i = i + 1;
+    end;
+  end;
+
+  err = GetInAccData(@inaccdata, 0, 0, 0, 0, 0, dl_comm, IIF(OnlyAvr == true, INACC_MODE_PLAN_MAIN_AVR, INACC_MODE_PLAN_MAIN), -1, 0, 0, _CheckCatArr);
+
+  GL_ScUseCachingAccounts(false);
+
+  return err;
+END;
+
+var _inaccdata = NULL;
+
+macro ExecAllAcc()
+  if(_inaccdata.insert() != 0)
+    AbortTrn();
+  end;
+end;
+
+private macro _ExecuteInAcc(_taskID, _execID, _conveyerID, _operationID, _packetID, dl_comm, mode, FI, Department, ContrID)
+  var err = 0;
+
+  DL_MassOprDocsBegin();
+
+  InAccOperTypeNamesArr.size = 0;
+
+  _inaccdata = InAccDataTrn(dl_comm, _execID, _conveyerID, _packetID);
+
+  err = GetInAccData(@_inaccdata, _taskID, _execID, _conveyerID, _operationID, _packetID, dl_comm, mode, FI, Department, ContrID);
+  
+  if( (not err) and (ValType(_inaccdata) != V_UNDEF))
+     /*Начать транзакцию*/
+     LoopInTrn(true);
+     if (not ProcessTrn(0, "ExecAllAcc"))
+       err = 1;
+     end;
+     _inaccdata = NULL;
+  end;
+
+  // закрытие счетов
+  if (not err)
+    SC_CCloseAccountInAcc(dl_comm).processDeal();
+  end; 
+
+  GL_ScUseCachingAccounts(false);
+  
+  return err;
+
+/*OnError(er)
+  ReplaceMacro( "msgbox", NULL );
+  
+  if(RslDefCon.IsInTrans)
+    RslDefCon.RollbackTrans();
+  end;
+
+  RepErrArr[RepErrArr.size] = CSC_InAccRepErr(CurrErrPart, "", 1, er.module+ " "+er.line+" "+er.message);
+  SaveErrForReport_XML( dl_comm.rec.DocumentID, dl_comm.rec.DocKind );
+
+  GL_ScUseCachingAccounts(false);
+
+  return 1; */
+end;
+
+private macro ExecuteAllInAcc(dl_comm, _taskID, _execID, _conveyerID, _operationID, _packetID, _Params)
+  var RetParmArr = TArray();
+  var err = 0;
+  var i = 0;
+
+  if((_conveyerID) and (_packetID))
+    err = _ExecuteInAcc(_taskID, _execID, _conveyerID, _operationID, _packetID, dl_comm, _Params.mode);
+  else
+    if(_Params.mode == INACC_MODE_MAIN)
+      var query = "select distinct q.t_FI, q.t_Department, q.t_ContrID from ("+GetInAccObjectQuery(dl_comm, _Params.mode, NULL, NULL, NULL, RetParmArr)+") q order by q.t_FI, q.t_Department, q.t_ContrID";
+      var cmd = DL_RSDCommand(query);
+
+      if(RetParmArr.size > 0)
+        i = 0;
+        while(i < RetParmArr.size)
+          cmd.AddParam(RetParmArr[i]);
+          i = i + 1;
+        end;
+      end;
+
+      var cnt = cmd.GetCount();
+      
+      if(cnt > 0)
+        InitProgress( cnt, "Идет выполнение операции...", "Внутренний учет" );
+        
+        var DataSet = cmd.Execute();
+        i = 0;
+        while((not err) and (DataSet.moveNext()))
+          err = _ExecuteInAcc(0, 0, 0, 0, 0, dl_comm, _Params.mode, DataSet.FI, DataSet.Department, DataSet.ContrID);
+
+          UseProgress(i = i + 1);
+        end;
+
+        RemProgress();
+      end;
+    else
+      err = _ExecuteInAcc(0, 0, 0, 0, 0, dl_comm, _Params.mode);
+    end;
+  end;
+  
+  /*27.01.2020 RAS:498414 Закрытие счетов ВУ по уже закрытым ц/б*/
+  var cmdClose = DL_RSDCommand(
+                   "SELECT DISTINCT t_fiid, t_expirydate, t_account, t_accountid \n" +
+                   "  FROM ( select distinct fi.t_fiid, fi.t_expirydate, ac.t_account,ac.t_chapter,ac.t_code_currency, ac.t_accountid  \n" +
+				   "  			FROM davoiriss_dbt  avr, dfininstr_dbt fi, dmcaccdoc_dbt accdoc, daccount_dbt ac \n" +
+                   " 			WHERE     accdoc.t_fiid = fi.t_fiid and fi.t_fiid = avr.t_fiid \n" +
+                   "       		AND ac.t_account = accdoc.t_account \n" +
+                   "       		AND ac.t_chapter = accdoc.t_chapter \n" +
+                   "       		and accdoc.t_chapter = 22 \n" +
+                   "       		and accdoc.t_iscommon = chr(88) \n" +
+                   "       		AND AC.T_CODE_CURRENCY = ACCDOC.T_CURRENCY \n" +
+                   "       		AND accdoc.t_catid IN (362, 364, 366, 368) \n" +
+                   "       		AND ac.t_open_close <> 'З' \n" +
+                   "       		AND ac.t_close_date = TO_DATE ('01.01.0001', 'dd.mm.yyyy') \n" +
+                   "       		AND avr.t_spisclosed = 'X' )\n" +
+				   "    where RSI_RSB_ACCOUNT.restall (t_account, \n" +
+                   "                                   t_chapter, \n" +
+                   "                                   t_code_currency, \n" +
+                   "                                    ? \n" +
+                   "                                   ) = 0 \n" );
+
+  cmdClose.AddParam({curdate});
+  var DataSetClose = cmdClose.execute();
+  while( DataSetClose.moveNext() )
+    var updClose = RSDCommand("UPDATE daccount_dbt " +
+                                 "SET t_open_close = 'З', " +
+                                     "t_close_date = ? " +
+                               "WHERE t_accountid = ?");
+
+    updClose.addParam( "", RSDBP_IN, DataSetClose.Expirydate );
+    updClose.addParam( "", RSDBP_IN, DataSetClose.AccountID );
+    updClose.execute();
+  end;
+
+  return err;
+
+OnError(er)
+  
+  if(RslDefCon.IsInTrans)
+    RslDefCon.RollbackTrans();
+  end;
+
+  RepErrArr[RepErrArr.size] = CSC_InAccRepErr(CurrErrPart, "", 1, er.module+ " "+er.line+" "+er.message);
+
+  return 1;
+end;
+
+
+macro ExecuteInAcc(_taskID, _execID, _conveyerID, _operationID, _packetID, _Params)
+  var dl_comm = TBFile("dl_comm.dbt");
+  var err = 0;
+
+  RepErrArr.size = 0;
+
+  if(_Params.DocumentID > 0)
+    ReplaceMacro( "msgbox", "InAcc_msgbox" );
+
+    dl_comm.rec.DocumentID = _Params.DocumentID;
+    dl_comm.GetEQ();
+
+    err = ExecuteAllInAcc(dl_comm, _taskID, _execID, _conveyerID, _operationID, _packetID, _Params);
+
+    ReplaceMacro( "msgbox", NULL );
+
+    SaveErrForReport_XML( dl_comm.rec.DocumentID, dl_comm.rec.DocKind );
+  end;
+
+  if((_conveyerID) and (_packetID))
+    /*не зависимо от того, делали что-то или нет - ставим исходящий статус обрабатываемой пачке*/
+    var exec = RSDCommand(  " UPDATE dcnvpack_dbt "
+                          + " SET t_State = t_State + 1, t_Error = ? "
+                          + " WHERE t_ExecID = ? "
+                          + "   AND t_ConvTypeID = ? "
+                          + "   AND t_PackID = ? ");
+
+    exec.addParam( "", RSDBP_IN, IIF(err != 0, 1, 0) );
+    exec.addParam( "", RSDBP_IN, _execID );
+    exec.addParam( "", RSDBP_IN, _conveyerID );
+    exec.addParam( "", RSDBP_IN, _packetID );
+    exec.execute();
+  end;
+
+  return err;
+
+OnError(er)
+  ReplaceMacro( "msgbox", NULL );
+  
+  if(RslDefCon.IsInTrans)
+    RslDefCon.RollbackTrans();
+  end;
+
+  RepErrArr[RepErrArr.size] = CSC_InAccRepErr(CurrErrPart, "", 1, er.module+ " "+er.line+" "+er.message);
+  SaveErrForReport_XML( dl_comm.rec.DocumentID, dl_comm.rec.DocKind );
+  return 1;
+
+end;

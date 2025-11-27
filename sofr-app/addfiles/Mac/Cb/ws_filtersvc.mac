@@ -1,0 +1,1062 @@
+ /*
+ $Name: ws_filtersvc.mac
+ $Module: WEB
+ $Description: Сервисы для работы с фильтрами
+ */
+
+import rsd;
+import XmlRpcInter, serviceaction;
+import BankInter, cb_sql, globals;
+import ws_filter;
+
+private macro Bool2Char(v)
+    if (v)
+        return 88;
+    else
+        return 0;
+    end;
+end;
+
+private macro Char2Bool(v)
+    if (SQL_ConvTypeStr(v) == "")
+        return false;
+    else
+        return true;
+    end;
+end;
+macro TrimErrText(e)
+    return StrSubst(e, "Error: Ошибка выполнения", "");
+end;
+
+private const WEB_FILTER_SYSTEM = 0; // системный (дистрибутивный) = 0
+private const WEB_FILTER_SHARED = 1; // общий (по подразделениям ТС) = 1
+private const WEB_FILTER_PRIVATE = 2; // личный (по пользователям) = 2
+
+private const WEB_FILTER_FLAG_INHERITED = 1;
+private const WEB_FILTER_FLAG_CHILD = 2;
+
+private const WEB_FILTER_ERROR_ALREADY_EXISTS = -2;
+private const WEB_FILTER_SQL_CONCURRENT_CHANGES = 20100;
+
+class ResultInfo(code, text, id)
+    var ResultCode : integer;
+    var ErrorText : string;
+    var FilterId  : integer;
+    var Filter;
+
+    ResultCode = code;
+    ErrorText = text;
+    FilterID = id;
+    Filter = null;
+end;
+
+class TFilterIdNamePair(i1, i2)
+  var Id = i1;
+  var Name = i2;
+end;
+
+// OperID Номер пользователя (persn.Oper), для которого применяется фильтр. Указывается, если тип фильтра Type. = <личный>.
+// Для остальных = 0.
+
+
+macro IsFilterAdministratorUser()
+    return not (({cTypePerson} == TP_OPER) or ({cTypePerson} == TP_AUDITOR));
+end;
+
+macro FindFilter(filterid :Integer)
+  var cmd, cmdText, rs;
+
+  if (filterid <= 0)
+    RunError("filterid должен быть > 0");
+  end;
+
+  cmdText = "SELECT T_FILTERID, TO_CHAR(T_PANEL) T_PANEL, T_TYPE, T_OPERID, T_NAME, T_VERSION "
+                        " FROM DWEB_FILTER_DBT WHERE T_FILTERID = ?";
+  cmd = RsdCommand(cmdText);
+
+  cmd.AddParam("", RSDBP_IN, filterid);
+  cmd.execute();
+  rs = RsdRecordset(cmd);
+
+  if(rs.moveNext())
+    return rs;
+  end;
+
+  return null;
+end;
+
+macro SelectFiltersByPanel(panel :string)
+  var cmd, cmdText, rs;
+
+  if (panel == "")
+    RunError("Имя панели не может быть пустым");
+  end;
+
+  cmdText = "SELECT * FROM DWEB_FILTER_DBT WHERE TOCHAR(T_PANEL) = ?";
+  cmd = RsdCommand(cmdText);
+
+  cmd.AddParam("", RSDBP_IN, panel);
+  cmd.execute();
+  rs = RsdRecordset(cmd);
+
+  return rs;
+end;
+
+macro ClearDefaultFiltersByPanel(panel :string, oper :integer)
+  var cmd, cmdText;
+
+  if (panel == "")
+    RunError("Имя панели не может быть пустым");
+  end;
+
+  cmdText = "DELETE FROM DWEB_FILTERDEF_DBT "
+            "  WHERE T_FILTERID in (select T_FILTERID from DWEB_FILTER_DBT where TO_CHAR(T_PANEL) = ?)"
+            "    and T_OPERID = ?";
+  cmd = RsdCommand(cmdText);
+
+  cmd.AddParam("", RSDBP_IN, panel);
+  cmd.AddParam("", RSDBP_IN, oper);
+
+  cmd.execute();
+end;
+
+
+macro InsertNewDefaultFilter(filterid :integer, oper :integer)
+  var cmd, cmdText;
+
+  if (filterid <= 0)
+    RunError("ID фильтра должен быть больше нуля");
+  elif (oper <= 0)
+    RunError("ID операциониста должен быть больше нуля");
+  end;
+
+  cmdText = "insert into DWEB_FILTERDEF_DBT(T_FILTERID, T_OPERID) VALUES(?, ?)";
+  cmd = RsdCommand(cmdText);
+
+  cmd.AddParam("", RSDBP_IN, filterid);
+  cmd.AddParam("", RSDBP_IN, oper);
+  cmd.execute();
+end;
+
+
+macro IsSharedFilterApplicable(filterid :integer, branch :integer)
+
+  var cmdText = 
+        "SELECT t_filterid"
+        "   FROM DWEB_FILTERDEP_DBT"
+        "  WHERE     t_filterid = ?"
+        "        AND t_branchid IN (    SELECT dp.t_Code"
+        "                                 FROM ddp_dep_dbt dp"
+        "                           CONNECT BY PRIOR dp.t_ParentCode = dp.t_Code"
+        "                           START WITH dp.t_Code = ?)";
+
+  var cmd = RsdCommand(cmdText);
+  cmd.AddParam("", RSDBP_IN, filterid);
+  cmd.AddParam("", RSDBP_IN, branch);
+  cmd.execute();
+
+  var rs = RsdRecordset(cmd);
+  if (rs.movenext)
+    return true;
+  end;
+
+  return false;
+end;
+
+macro IsFilterApplicable(filterid :integer, branch :integer)
+    var filter = FindFilter(filterid);
+
+    if (filter == null)
+       RunError("Фильтр с ID = " + filterid + " не найден");
+    end;
+
+    if (filter.value("t_type") == WEB_FILTER_PRIVATE)
+        if (filter.value("t_operid") != {oper})
+            RunError("Фильтр не принадлежит текущему операционисту");
+        end;
+    elif (filter.value("t_type") == WEB_FILTER_SHARED)
+        if (not IsSharedFilterApplicable(filterid, branch))
+            RunError("Фильтр не действует в данном подразделении");
+        end;
+    end;
+end;
+
+macro SetDefaultFilter(filterid :integer, set :bool)
+    var result = ResultInfo(0, "", 0);
+
+    var filter = FindFilter(filterid);
+
+    if (filter == null)
+       RunError("Фильтр с ID = " + filterid + " не найден");
+    end;
+
+    var panel = filter.value("t_panel");
+    ClearDefaultFiltersByPanel(panel, {oper});
+
+    if (set)
+        IsFilterApplicable(filter.value("t_filterid"), {operDprtNode});
+        InsertNewDefaultFilter(filterid, {oper});
+    end;
+
+  return result;
+
+OnError(e)
+    result.ResultCode = 1;
+    result.ErrorText = TrimErrText(e.Message);
+    return result;
+end;
+
+macro RemoveFilterByID(filterid :integer)
+  var cmd, cmdText;
+
+  if (filterid <= 0)
+      RunError("ID фильтра должен быть больше нуля");
+  end;
+
+  cmdText = "DELETE FROM DWEB_FILTER_DBT WHERE T_FILTERID = ?";
+  cmd = RsdCommand(cmdText);
+  cmd.AddParam("", RSDBP_IN, filterid);
+  cmd.execute();
+end;
+
+// удаляет привязки фильтров к подразделениям для текущего и подчиненых
+macro RemoveFilterDepForCurrentAndSlave(filterid :integer, branch :integer)
+  var cmd, cmdText;
+
+  if (filterid <= 0)
+      RunError("ID фильтра должен быть больше нуля");
+  elif (branch <= 0)
+      RunError("ID подразделения должен быть больше нуля");
+  end;
+
+  cmdText = "DELETE FROM DWEB_FILTERDEP_DBT WHERE T_FILTERID = ? "
+            " and T_BRANCHID in "
+                " (SELECT t_Code FROM ddp_dep_dbt dp"
+                    " CONNECT BY PRIOR dp.t_Code = dp.t_ParentCode START WITH dp.t_Code = ?)";
+  cmd = RsdCommand(cmdText);
+  cmd.AddParam("", RSDBP_IN, filterid);
+  cmd.AddParam("", RSDBP_IN, branch);
+  cmd.execute();
+end;
+
+// привязан ли фильтр хоть к одному подразделению
+macro IsFilterDepExists(filterid :integer)
+  var cmd, cmdText, rs;
+
+  if (filterid <= 0)
+    RunError("filterid должен быть > 0");
+  end;
+
+  cmdText = "select count(T_FILTERID) from DWEB_FILTERDEP_DBT where T_FILTERID = ?";
+  cmd = RsdCommand(cmdText);
+  cmd.AddParam("", RSDBP_IN, filterid);
+  cmd.execute();
+  rs = RsdRecordset(cmd);
+
+  if(rs.moveNext())
+    return rs.value(0) > 0;
+  end;
+
+  RunError("Assertion failed");
+end;
+
+
+macro DeleteFilter(filterid :integer)
+    var result = ResultInfo(0, "", 0);
+    var filter = FindFilter(filterid);
+
+    if (filter == null)
+       RunError("Фильтр с ID = " + filterid + " не найден");
+    end;
+
+    const filterType = filter.value("t_type");
+
+    if (WEB_FILTER_PRIVATE == filterType)
+        if (filter.value("t_operid") != {oper})
+            RunError("Фильтр \"" + filter.value("t_name") + "\" не может быть удален. \nДанный операционист не владелец фильтра.");
+        end;
+        RemoveFilterByID(filterid);
+
+    elif (WEB_FILTER_SHARED == filterType)
+        // удалим привязки к текущему узлу и подчиненным
+        RemoveFilterDepForCurrentAndSlave(filterid, {OperDprtNode});
+
+        if (not IsFilterDepExists(filterid))
+            RemoveFilterByID(filterid);
+        end;
+
+    elif (WEB_FILTER_SYSTEM == filterType)
+        RunError("Фильтр \"" + filter.value("t_name") + "\" не может быть удален. Фильтр системный.");
+    end;
+
+  return result;
+
+OnError(e)
+    result.ResultCode = 1;
+    result.ErrorText = TrimErrText(e.Message);
+    return result;
+end;
+
+macro SelectSlaveFilters(panel :string, branch :integer)
+    if (panel == "")
+        RunError("Имя панели не может быть пустым");
+    elif (branch <= 0)
+        RunError("ID подразделения должен быть больше нуля");
+    end;
+
+  var cmdText = 
+        "SELECT flt.* FROM DWEB_FILTER_DBT flt, DWEB_FILTERDEP_DBT fltdep "
+        "  WHERE  flt.t_filterid = fltdep.T_FILTERID and t_type = 1 and TO_CHAR (t_panel) = ?"
+        "     and T_BRANCHID in "
+        "         (SELECT t_Code FROM ddp_dep_dbt dp "
+        "             where  dp.t_Code <> ? "
+        "             CONNECT BY PRIOR dp.t_Code = dp.t_ParentCode START WITH dp.t_Code = ?) ";
+
+  var cmd = RsdCommand(cmdText);
+  cmd.AddParam("", RSDBP_IN, panel);
+  cmd.AddParam("", RSDBP_IN, branch);
+  cmd.AddParam("", RSDBP_IN, branch);
+  cmd.execute();
+
+  var rs = RsdRecordset(cmd);
+  return rs;
+end;
+
+macro SelectDefaultFiltersByPanel(panel :string, oper :integer)
+  var cmd, cmdText;
+
+  if (panel == "")
+    RunError("Имя панели не может быть пустым");
+  elif (oper <= 0)
+    RunError("ID операциониста должен быть больше нуля");
+  end;
+
+  cmdText = 
+    " SELECT flt.* FROM DWEB_FILTER_DBT flt, DWEB_FILTERDEF_DBT fltdef "
+    "    WHERE flt.T_FILTERID = fltdef.T_FILTERID and TO_CHAR(flt.T_PANEL) = ? and fltdef.t_operid = ?";
+
+  cmd = RsdCommand(cmdText);
+  cmd.AddParam("", RSDBP_IN, panel);
+  cmd.AddParam("", RSDBP_IN, oper);
+  cmd.execute();
+
+  var rs = RsdRecordset(cmd);
+  return rs;
+end;
+
+macro GetDefaultFilterID(panel :string, oper :integer)
+    var defFilters = SelectDefaultFiltersByPanel(panel, oper);
+    if (defFilters.moveNext)
+        return defFilters.value("t_filterid");
+    end;
+    return 0;
+end;
+
+macro GetFilterConditionItems(filterid :integer)
+
+  var cmdText = 
+        " SELECT 1, "
+        "  (SELECT T_ITEMS "
+        "   FROM DWEB_FILTER_DBT "
+        "  WHERE     T_FILTERID = ? )"
+        "  FILTERITEMS FROM DUAL";
+
+  var cmd = RsdCommand(cmdText);
+  cmd.AddParam("", RSDBP_IN, filterid);
+  cmd.execute();
+
+  var ds = TRsbDataSet(cmd, RSDVAL_CLIENT, RSDVAL_STATIC);
+  if (ds.movenext)
+    return ds.FILTERITEMS;
+  end;
+
+  return "";
+end;
+
+macro SelectFiltersForPanelAndUser(panel :string, oper :integer, branch :integer)
+  var cmd, cmdText, rs;
+
+  if (panel == "")
+    RunError("Имя панели не может быть пустым");
+  elif (oper <= 0)
+    RunError("ID операциониста должен быть больше нуля");
+  end;
+
+    cmdText = 
+        "SELECT T_FILTERID, TO_CHAR(T_PANEL) T_PANEL, T_TYPE, T_OPERID, T_NAME, T_VERSION FROM DWEB_FILTER_DBT wflt "
+        " WHERE TO_CHAR (t_panel) = ?" 
+        "       AND ( (WFLT.T_TYPE = 2 AND WFLT.T_OPERID = ?) "
+        "            OR (WFLT.T_TYPE = 1 "
+        "                AND ((EXISTS  (SELECT t_filterid FROM DWEB_FILTERDEP_DBT  WHERE t_filterid = wflt.t_filterid AND t_branchid = ?)) "
+        "                         OR (exists (SELECT t_filterid FROM DWEB_FILTERDEP_DBT   WHERE t_filterid = wflt.t_filterid "
+        "                                               AND T_WITHCHILDDEP <> CHR (0) "
+        "                                               AND t_branchid IN "
+        "                                                      (  SELECT dp.t_Code  FROM ddp_dep_dbt dp WHERE dp.t_Code <> ?"
+        "                                                         CONNECT BY PRIOR dp.t_ParentCode = dp.t_Code  START WITH dp.t_Code = ?) )"
+        "                               ) ) )"
+        "            OR (WFLT.T_TYPE = 0))";
+
+  cmd = RsdCommand(cmdText);
+  cmd.AddParam("", RSDBP_IN, panel);
+  cmd.AddParam("", RSDBP_IN, oper);
+  cmd.AddParam("", RSDBP_IN, branch);
+  cmd.AddParam("", RSDBP_IN, branch);
+  cmd.AddParam("", RSDBP_IN, branch);
+
+  cmd.execute();
+  rs = RsdRecordset(cmd);
+
+  return rs;
+end;
+
+macro SelectParentAndChildFilterBranches(filterid :integer, branch :integer)
+    var cmd, cmdText, rs;
+
+    cmdText = 
+         "SELECT * FROM DWEB_FILTERDEP_DBT WHERE T_FILTERID = ? "
+         "    and T_BRANCHID in "
+         "        ((SELECT t_Code FROM ddp_dep_dbt dp "
+         "            CONNECT BY PRIOR dp.t_Code = dp.t_ParentCode START WITH dp.t_Code = ?) "
+         "           UNION "
+         "        (SELECT t_Code FROM ddp_dep_dbt dp "
+         "            CONNECT BY PRIOR dp.t_ParentCode = dp.t_Code  START WITH dp.t_Code = ?))";
+
+  cmd = RsdCommand(cmdText);
+  cmd.AddParam("", RSDBP_IN, filterid);
+  cmd.AddParam("", RSDBP_IN, branch);
+  cmd.AddParam("", RSDBP_IN, branch);
+
+  cmd.execute();
+  rs = RsdRecordset(cmd);
+
+  return rs;
+end;
+
+macro GetBranchName(branch :integer)
+    var cmd, cmdText, rs;
+
+    cmdText = "SELECT t_name FROM ddp_dep_dbt where t_Code = ?";
+    cmd = RsdCommand(cmdText);
+    cmd.AddParam("", RSDBP_IN, branch);
+    cmd.execute();
+    rs = RsdRecordset(cmd);
+
+    if (not rs.moveNext)
+        RunError("Подразделение с ID = " + branch + " не найдено");
+    end;
+
+    return rs.value(0);
+end;
+
+macro GetBranches(filterid :integer, branch :integer);
+    var result = TArray();
+    var flt_branches = SelectParentAndChildFilterBranches(filterid, branch);
+
+    var fltdep = null;
+    while (flt_branches.moveNext)
+        fltdep = FltByBranch();
+        fltdep.Id = flt_branches.value("T_BRANCHID");
+        fltdep.Name = GetBranchName(flt_branches.value("T_BRANCHID"));
+        fltdep.AppliedToChild = Char2Bool(flt_branches.value("T_WITHCHILDDEP"));
+        result[result.size] = fltdep;
+    end;
+
+    return result;
+end;
+
+macro ConditionsFormXML(xml_obj)
+    var arr;
+    if (xml_obj == "")
+        arr = TArray();
+        arr[0] = null;
+        return arr;
+        //return null;
+    end;
+    
+    var obj = null;
+    ConvertToRSL(xml_obj, obj);
+    return obj;
+end;
+
+macro IsDefaultFilter(filterid, operid)
+  var cmd, cmdText;
+
+  cmdText =  "SELECT 1 FROM DWEB_FILTERDEF_DBT WHERE T_FILTERID = ? and t_operid = ?";
+
+  cmd = RsdCommand(cmdText);
+  cmd.AddParam("", RSDBP_IN, filterid);
+  cmd.AddParam("", RSDBP_IN, operid);
+  cmd.execute();
+
+  var rs = RsdRecordset(cmd);
+  if (rs.movenext)
+    return true;
+  end;
+  
+  return false;
+
+end;
+
+macro SelectChildFilters(panel :string, branch :integer)
+  var cmd, cmdText, rs;
+
+    cmdText = 
+        "SELECT T_FILTERID, "
+        "       TO_CHAR (T_PANEL) T_PANEL, "
+        "       T_TYPE, "
+        "       T_OPERID, "
+        "       T_NAME, "
+        "       T_VERSION "
+        "  FROM DWEB_FILTER_DBT wflt "
+        " WHERE     TO_CHAR (t_panel) = ? "
+        "       AND WFLT.T_TYPE = 1 "
+        "       AND ( (EXISTS "
+        "                 (SELECT t_filterid "
+        "                    FROM DWEB_FILTERDEP_DBT "
+        "                   WHERE     t_filterid = wflt.t_filterid "
+        "                         AND t_branchid IN "
+        "                                (    SELECT dp.t_Code "
+        "                                       FROM ddp_dep_dbt dp "
+        "                                      WHERE dp.t_Code <> ? "
+        "                                 CONNECT BY PRIOR dp.t_Code = dp.t_ParentCode "
+        "                                 START WITH dp.t_Code = ?)))) "
+        "        AND (not exists (SELECT t_filterid "
+        "                    FROM DWEB_FILTERDEP_DBT "
+        "                   WHERE  t_filterid = wflt.t_filterid "
+                                            "  AND t_branchid IN "
+        "                                (    SELECT dp.t_Code "
+        "                                       FROM ddp_dep_dbt dp "
+        "                                 CONNECT BY PRIOR dp.t_ParentCode = dp.t_Code "
+        "                                 START WITH dp.t_Code = ?)))";
+
+  cmd = RsdCommand(cmdText);
+
+  cmd.AddParam("", RSDBP_IN, panel);
+  cmd.AddParam("", RSDBP_IN, branch);
+  cmd.AddParam("", RSDBP_IN, branch);
+  cmd.AddParam("", RSDBP_IN, branch);
+  
+  cmd.execute();
+  rs = RsdRecordset(cmd);
+
+  return rs;
+end;
+
+macro IsInheritedFilter(filterid, branch)
+  var cmd, cmdText, rs;
+
+    cmdText = 
+        "SELECT t_filterid, t_branchid "
+        "  FROM DWEB_FILTERDEP_DBT "
+        " WHERE     t_filterid = ? "
+        "       AND (   (    (SELECT dp.t_nodetype "
+        "                       FROM ddp_dep_dbt dp "
+        "                      WHERE dp.t_Code = ?) = 1 "
+        "                AND T_WITHCHILDDEP <> CHR (0)) "
+        "            OR ( (SELECT dp.t_nodetype "
+        "                    FROM ddp_dep_dbt dp "
+        "                   WHERE dp.t_Code = ?) = 2)) "
+        "       AND t_branchid IN (    SELECT dp.t_Code "
+        "                                FROM ddp_dep_dbt dp "
+        "                               WHERE dp.t_Code <> ? "
+        "                          CONNECT BY PRIOR dp.t_ParentCode = dp.t_Code "
+        "                          START WITH dp.t_Code = ?) ";
+  cmd = RsdCommand(cmdText);
+
+  cmd.AddParam("", RSDBP_IN, filterid);
+  cmd.AddParam("", RSDBP_IN, branch);
+  cmd.AddParam("", RSDBP_IN, branch);
+  cmd.AddParam("", RSDBP_IN, branch);
+  cmd.AddParam("", RSDBP_IN, branch);
+  cmd.execute();
+
+  rs = RsdRecordset(cmd);
+  if (rs.movenext)
+    return true;
+  end;
+
+  return false;
+end;
+
+macro IsChildFilter(filterid, branch)
+  var cmd, cmdText, rs;
+
+    cmdText = 
+        "SELECT T_FILTERID "
+        "  FROM DWEB_FILTER_DBT wflt "
+        " WHERE     wflt.T_FILTERID = ? "
+        "       AND WFLT.T_TYPE = 1 "
+        "       AND ( (EXISTS "
+        "                 (SELECT t_filterid "
+        "                    FROM DWEB_FILTERDEP_DBT "
+        "                   WHERE     t_filterid = wflt.t_filterid "
+        "                         AND t_branchid IN "
+        "                                (    SELECT dp.t_Code "
+        "                                       FROM ddp_dep_dbt dp "
+        "                                      WHERE dp.t_Code <> ? "
+        "                                 CONNECT BY PRIOR dp.t_Code = dp.t_ParentCode "
+        "                                 START WITH dp.t_Code = ?)))) "
+        "        AND (not exists (SELECT t_filterid "
+        "                    FROM DWEB_FILTERDEP_DBT "
+        "                   WHERE  t_filterid = wflt.t_filterid "
+                                            "  AND t_branchid IN "
+        "                                (    SELECT dp.t_Code "
+        "                                       FROM ddp_dep_dbt dp "
+        "                                 CONNECT BY PRIOR dp.t_ParentCode = dp.t_Code "
+        "                                 START WITH dp.t_Code = ?)))";
+
+  cmd = RsdCommand(cmdText);
+
+  cmd.AddParam("", RSDBP_IN, filterid);
+  cmd.AddParam("", RSDBP_IN, branch);
+  cmd.AddParam("", RSDBP_IN, branch);
+  cmd.AddParam("", RSDBP_IN, branch);
+  
+  cmd.execute();
+  rs = RsdRecordset(cmd);
+
+  if (rs.movenext)
+    return true;
+  end;
+
+  return false;
+end;
+
+macro ParseFilter(rs)
+    var flt = Filter();
+
+    flt.Id = rs.value("t_filterid");  
+    flt.Panel = rs.value("t_panel");
+    flt.Name = rs.value("t_name");
+    flt.Conditions = ConditionsFormXML(GetFilterConditionItems(flt.Id));
+    flt.IsDefault = IsDefaultFilter(flt.Id, {oper});
+    flt.Type = rs.value("t_type");
+    flt.Branches = GetBranches(flt.Id, {operDprtNode});
+    flt.Version = rs.value("t_version");
+
+    return flt;
+end;
+
+macro ReadFilter(filterid, branch)
+  var cmd, cmdText, rs;
+
+    cmdText = 
+        "SELECT T_FILTERID, TO_CHAR(T_PANEL) T_PANEL, T_TYPE, T_OPERID, T_NAME, T_VERSION FROM DWEB_FILTER_DBT "
+        " WHERE t_filterid = ?" ;
+
+  cmd = RsdCommand(cmdText);
+  cmd.AddParam("", RSDBP_IN, filterid);
+  cmd.AddParam("", RSDBP_IN, branch);
+
+  cmd.execute();
+  rs = RsdRecordset(cmd);
+
+    if (not rs.movenext)
+        RunError("Фильтр не найден");
+    end;
+    
+    var flt = ParseFilter(rs);
+    
+    if (IsInheritedFilter(flt.Id, {operDprtNode}))
+        flt.Flags = WEB_FILTER_FLAG_INHERITED;
+    end;
+
+    if (IsChildFilter(flt.Id, {operDprtNode}))
+        flt.Flags = WEB_FILTER_FLAG_CHILD;
+    end;
+
+  return flt;
+end;
+
+macro SelectPanelFilters(panel :string)
+    var result = TArray();
+    var user_filters = SelectFiltersForPanelAndUser(panel, {oper}, {operDprtNode});
+
+    var flt = null;
+    while (user_filters.movenext)
+        flt = ParseFilter(user_filters);
+        if (IsInheritedFilter(flt.Id, {operDprtNode}))
+            flt.Flags = WEB_FILTER_FLAG_INHERITED;
+        end;
+        result[result.size] = flt;
+    end;
+
+    var child_filters = null;
+    if (IsFilterAdministratorUser())
+        child_filters = SelectChildFilters(panel, {operDprtNode});
+        if (child_filters != null)
+                while (child_filters.movenext)
+                    flt = ParseFilter(child_filters);
+                    flt.Flags = WEB_FILTER_FLAG_CHILD;
+                    result[result.size] = flt;
+                end;
+        end;
+    end;
+
+    return result;
+end;
+
+macro CheckPrivateFilterNameExists(panel, name, oper)
+  var cmd, cmdText, rs;
+
+  cmdText = "SELECT T_FILTERID FROM DWEB_FILTER_DBT WHERE TO_CHAR(T_PANEL) = ? and T_TYPE = ? and UPPER(T_NAME) = UPPER(?) and T_OPERID = ?";
+  cmd = RsdCommand(cmdText);
+
+  cmd.AddParam("", RSDBP_IN, panel);
+  cmd.AddParam("", RSDBP_IN, WEB_FILTER_PRIVATE);  
+  cmd.AddParam("", RSDBP_IN, name);
+  cmd.AddParam("", RSDBP_IN, oper);  
+  cmd.execute();
+  rs = RsdRecordset(cmd);
+
+  if(rs.moveNext())
+    return rs.value(0);
+  end;
+
+  return -1;
+end;
+
+macro CheckSharedFilterNameExists(panel, name, branch)
+  var cmd, cmdText, rs;
+
+    cmdText = 
+        "SELECT flt.T_FILTERID FROM DWEB_FILTER_DBT flt, DWEB_FILTERDEP_DBT fltdef "
+        "          WHERE flt.T_FILTERID = fltdef.T_FILTERID and TO_CHAR(flt.T_PANEL) = ? and UPPER(flt.T_NAME) = UPPER(?) "
+        "             and fltdef.T_BRANCHID in "
+        "                 ((SELECT t_Code FROM ddp_dep_dbt dp "
+        "                     CONNECT BY PRIOR dp.t_Code = dp.t_ParentCode START WITH dp.t_Code = ?) "
+        "                    UNION "
+        "                 (SELECT t_Code FROM ddp_dep_dbt dp "
+        "                     CONNECT BY PRIOR dp.t_ParentCode = dp.t_Code  START WITH dp.t_Code = ?))";
+
+  cmd = RsdCommand(cmdText);
+  cmd.AddParam("", RSDBP_IN, panel);
+  cmd.AddParam("", RSDBP_IN, name);
+  cmd.AddParam("", RSDBP_IN, branch);
+  cmd.AddParam("", RSDBP_IN, branch);
+  cmd.execute();
+
+  rs = RsdRecordset(cmd);
+
+  if (rs.moveNext())
+    return rs.value(0);
+  end;
+
+  return -1;
+end;
+
+macro InsertNewFilter(panel, type, oper, name, items)
+    var cmd, cmdText;
+
+    cmdText = "insert into DWEB_FILTER_DBT(T_PANEL, T_TYPE, T_OPERID, T_NAME, T_ITEMS) "
+                      " VALUES( ?, ?, ?, ?, ?) RETURNING T_FILTERID into ? ";
+
+    cmd = RsdCommand(cmdText);
+
+    cmd.AddParam("", RSDBP_IN, panel);
+    cmd.AddParam("", RSDBP_IN, type);  
+    cmd.AddParam("", RSDBP_IN, oper);    
+    cmd.AddParam("", RSDBP_IN, name);
+    cmd.AddParam("", RSDBP_IN, items);
+
+    cmd.AddParam("genFilterID", RSDBP_OUT, V_INTEGER);
+    cmd.execute();
+    
+    return cmd.value("genFilterID");
+end;
+
+macro UpdateFilterRecord(filterid, panel, type, oper, name, items, version)
+    var cmd, cmdText, rs;
+
+    if (type != WEB_FILTER_PRIVATE)
+        oper = 0;
+    end;
+    
+    cmdText = "UPDATE DWEB_FILTER_DBT SET T_PANEL = ?, T_TYPE = ?, T_OPERID = ?, T_NAME = ?, T_ITEMS = ?, T_VERSION = ? "
+                      " WHERE T_FILTERID = ? ";
+
+    cmd = RsdCommand(cmdText);
+
+    cmd.AddParam("", RSDBP_IN, panel);
+    cmd.AddParam("", RSDBP_IN, type);  
+    cmd.AddParam("", RSDBP_IN, oper);    
+    cmd.AddParam("", RSDBP_IN, name);
+    cmd.AddParam("", RSDBP_IN, items);
+    cmd.AddParam("", RSDBP_IN, version);
+    cmd.AddParam("", RSDBP_IN, filterid);
+    cmd.execute();
+end;
+
+macro InsertNewFilterDep(filterid, branchid, withchilddep)
+    var cmd, cmdText, rs;
+    
+    cmdText = "insert into DWEB_FILTERDEP_DBT(T_FILTERID, T_BRANCHID, T_WITHCHILDDEP) "
+                      " VALUES(?, ?, chr(?))";
+
+    cmd = RsdCommand(cmdText);
+
+    cmd.AddParam("", RSDBP_IN, filterid);
+    cmd.AddParam("", RSDBP_IN, branchid);  
+    cmd.AddParam("", RSDBP_IN, Bool2Char(withchilddep));
+    cmd.execute();
+end;
+
+macro InsertFilterBranchesLink(filterid, branches)
+    var i = 0;
+    while (i < branches.size)
+        InsertNewFilterDep(filterid, branches[i].Id, branches[i].AppliedToChild);
+        i = i + 1;
+    end;
+end;
+
+macro CreateNewFilter(panel :string, type: integer, branches, filterName :string, conditions :TArray)
+    var result = ResultInfo(0, "", 0);
+
+    if (panel == "")
+        RunError("Имя панели не может быть пустым");
+    elif ((type <= WEB_FILTER_SYSTEM) or (type > WEB_FILTER_PRIVATE))
+        RunError("Неверное значение типа фильтра");
+    elif (filterName == "")
+        RunError("Имя фильтра не может быть пустым");
+    elif (conditions.size == 0)
+        RunError("Должно быть задано хотя бы одно условие");
+    end;
+
+    if (not IsFilterAdministratorUser())
+        RunError("Отсутствуют права доступа");
+    end;
+
+    var filterid = 0;
+    var xml_obj = "";
+
+    if (0 != ConvertToXML(conditions, null, xml_obj))
+        RunError("Ошибка преобразования объекта в XML");
+    end;
+
+    if (type == WEB_FILTER_PRIVATE)
+        filterid = CheckPrivateFilterNameExists(panel, filterName, {oper});
+        if (filterid != -1)
+            result.FilterID = filterid;
+            result.ResultCode = WEB_FILTER_ERROR_ALREADY_EXISTS;
+            result.Filter = ReadFilter(filterid, {operDprtNode});
+            RunError("Фильтр с именем " + filterName + " уже существует");
+        end;
+        filterid = InsertNewFilter(panel, type, {oper}, filterName, xml_obj);
+    elif (type == WEB_FILTER_SHARED)
+        filterid = CheckSharedFilterNameExists(panel, filterName, {operDprtNode});
+         if (filterid != -1)
+            result.FilterID = filterid;
+            result.ResultCode = WEB_FILTER_ERROR_ALREADY_EXISTS;
+            result.Filter = ReadFilter(filterid, {operDprtNode});
+            RunError("Фильтр с именем " + filterName + " уже существует");
+        end;
+        filterid = InsertNewFilter(panel, type, 0, filterName, xml_obj);
+        InsertFilterBranchesLink(filterid, branches);
+    end;
+
+    result.FilterID = filterid;
+    result.Filter = ReadFilter(filterid, {operDprtNode});
+    return result;
+onerror(e)
+    if (result.ResultCode == 0)
+    result.ResultCode = 1;
+    end;
+    result.ErrorText = TrimErrText(e.Message);
+    return result;
+end;
+
+private macro IsSqlException(e)
+  return isEqClass("TRsdError", e.err);
+end;
+
+private macro GetSqlExceptionCode(e)
+    var i = 0;
+    if (isEqClass("TRsdError", e.err))
+      while (i < e.err.environment.ErrorCount)
+        if (e.err.environment.Error(i).NativeError != 0)
+          return e.err.environment.Error(i).NativeError;
+        end;
+        i = i + 1;
+      end;
+    end;
+    return 0;
+end;
+
+macro UpdateFilter(filterid :integer, panel :string, type: integer, branches, filterName :string, conditions :TArray, Version)
+    var result = ResultInfo(0, "", 0);
+    var id = -1;
+    result.Filter = Filter();
+
+    if (panel == "")
+        RunError("Имя панели не может быть пустым");
+    elif ((type < WEB_FILTER_SYSTEM) or (type > WEB_FILTER_PRIVATE))
+        RunError("Неверное значение типа фильтра");
+    elif (filterName == "")
+        RunError("Имя фильтра не может быть пустым");
+    elif (conditions.size == 0)
+        RunError("Должно быть задано хотя бы одно условие");
+    end;
+
+    if (not IsFilterAdministratorUser())
+        RunError("Отсутствуют права доступа");
+    end;
+
+    var filter = FindFilter(filterid);
+
+    if (filter == null)
+       RunError("Фильтр с ID = " + filterid + " не найден");
+    end;
+
+    if (filterName != filter.value("t_name"))
+        if (type == WEB_FILTER_PRIVATE)
+            id = CheckPrivateFilterNameExists(panel, filterName, {oper});
+            if (id != -1)
+                result.FilterID = id;
+                result.ResultCode = WEB_FILTER_ERROR_ALREADY_EXISTS;
+                result.Filter = ReadFilter(id, {operDprtNode});
+                RunError("Фильтр с именем " + filterName + " уже существует");
+            end;
+            
+        elif (type == WEB_FILTER_SHARED)
+             id = CheckSharedFilterNameExists(panel, filterName, {operDprtNode});
+             if (id != -1)
+                result.FilterID = id;
+                result.ResultCode = WEB_FILTER_ERROR_ALREADY_EXISTS;
+                result.Filter = ReadFilter(id, {operDprtNode});
+                RunError("Фильтр с именем " + filterName + " уже существует");
+            end;
+        end;
+    end;
+
+    var xml_obj = null;
+    if (0 != ConvertToXML(conditions, null, xml_obj))
+        RunError("Ошибка преобразования объекта в XML");
+    end;
+
+    UpdateFilterRecord(filterid, panel, type, {oper}, filterName, xml_obj, Version);
+    RemoveFilterDepForCurrentAndSlave(filterid, {operDprtNode});
+    InsertFilterBranchesLink(filterid, branches);
+
+    result.Filter = ReadFilter(filterid, {operDprtNode});
+    return result;            
+onerror(e)
+    if (result.ResultCode == 0)
+        result.ResultCode = 1;
+    end;
+
+    result.ErrorText = TrimErrText(e.Message);
+
+    if (IsSqlException(e))
+      var exceptionCode = GetSqlExceptionCode(e);
+      if (exceptionCode == WEB_FILTER_SQL_CONCURRENT_CHANGES)
+        result.ErrorText = "Фильтр конкурентно изменен";
+      end;
+    end;
+
+    return result;
+end;
+
+macro GetFilterById(filterid :integer)
+
+    var result = ResultInfo(0, "", 0);
+    result.Filter = null;
+
+    result.Filter = ReadFilter(filterid, {operDprtNode});
+    result.FilterId = result.Filter.Id;
+    return result;            
+
+onerror(e)
+    if (result.ResultCode == 0)
+        result.ResultCode = 1;
+    end;
+
+    result.ErrorText = TrimErrText(e.Message);
+    return result;
+end;
+
+private macro ListToString(idList)
+    var result = "";
+    
+    if (idList.size > 0)
+        result = result + string(idList[0]);
+        var i = 1;
+        while (i < idList.size)
+          result = result + ", " + string(idList[i]);
+          i = i + 1;
+        end;
+    end;
+
+    return result;
+end;
+
+macro GetFilterNameByIdList(idList) // : TArray of TFilterIdNamePair
+
+    var result = TArray();
+    var list = ListToString(idList);
+    var cmdText = "select T_FILTERID, T_NAME from DWEB_FILTER_DBT where T_FILTERID in (" + list + ")";
+    var cmd = RsdCommand(cmdText);
+    cmd.execute();
+    var rs = RsdRecordset(cmd);
+
+    var item;
+    while (rs.moveNext())
+      item = TFilterIdNamePair(rs.value(0), rs.value(1));
+      result[result.size] = item;
+    end;
+
+    return result;
+end;
+
+macro GetRootDepatment()
+  var cmd, cmdText, rs;
+
+  cmdText = "select t_code from ddp_dep_dbt where t_parentcode = 0";
+  cmd = RsdCommand(cmdText);
+  cmd.execute();
+  rs = RsdRecordset(cmd);
+
+  if (rs.moveNext())
+    return rs.value(0);
+  end;
+
+  return -1;
+end;
+
+macro GetDepartmentTree(branch :integer)
+
+    if (branch == -1)
+        branch = GetRootDepatment();
+    end;
+
+    if (branch <= 0)
+        RunError("ID узла должен быть задан");
+    end;
+
+     var result:string = "";
+     
+      var query = 
+            "SELECT 1, XMLELEMENT ( "
+            "          BRANCH_LIST, "
+            "          (SELECT DBMS_XMLGEN.getxmltype ( "
+            "                     DBMS_XMLGEN.newcontextfromhierarchy ( "
+            "                        'select level, XMLElement( BRANCHES, "
+            "                            XMLElement(\"CODE\", t_code),  "
+            "                            XMLElement(\"NAME\", t_name), "
+            "                            XMLElement(\"TYPE\", T_NODETYPE), "
+            "                            XMLElement(\"PARENT\", t_ParentCode)) "
+            "                            FROM ddp_dep_dbt "
+            "                                 CONNECT BY PRIOR t_Code = t_ParentCode  START WITH t_Code = "  + branch +
+            "                                 ORDER SIBLINGS BY t_parentcode ')) "
+            "             FROM DUAL)).GETCLOBVAL () xmldoc  FROM DUAL ";
+
+
+  var ds = TRsbDataSet(query, RSDVAL_CLIENT, RSDVAL_STATIC);
+
+  if (ds.MoveNext())
+     result = ds.XMLDOC;
+  end;
+
+  return result;
+
+end;
+

@@ -1,0 +1,4 @@
+begin
+  UPDATE doprostep_dbt SET T_SYMBOL=chr(128) WHERE T_BLOCKID=203702 AND T_NUMBER_STEP=107;
+end;
+/

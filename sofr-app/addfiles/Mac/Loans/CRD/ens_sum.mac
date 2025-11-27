@@ -1,0 +1,356 @@
+/*
+$Name:ens_sum.mac
+$Module:Кредитование
+$Description:Расчёт суммы и валюты поручительства договора обеспечения
+*/
+/*------------------------------------------------------------------------------
+                        Библиотека интерпретируемых модулей
+
+ Filename    : ens_sum.mac
+ Description : Расчёт суммы и валюты поручительства договора обеспечения
+
+ Programmer  : Vasyukova O.E.
+ 06.02.03    : Создан
+ Изменения   :
+------------------------------------------------------------------------------*/
+import oralib, "total.mac", SbCrdInter, ПроцентыБухгалтер;
+
+record  enscontr    ("enscontr.dbt", "loans.def"); // Текущий буфер договора обеспечения
+//record  Обеспечение ("ensobj.dbt"  , "loans.def");
+record  credit_c    ("credit_c.dbt", "loans.def"); // Ключ по ID кредитного договора
+
+//private VAR ensobj      = TBFile ("ensobj.dbt" , "r", 0);
+//private VAR ecn_eob     = TBFile ("ecn_eob.dbt", "r", 0);
+private VAR planpay_tmp = TBFile ("planpay.tmp", "w", 1, "planpay.tmp", "loans.def");
+private VAR claim       = TBFile ("claim.dbt"  , "r", 0, "claim.dbt",   "loans.def");
+//private VAR ens_crd     = Tbfile ("ens_crd.dbt", "r", 0
+
+private record rlcusrate("lcusrate.dbt", "loans.def");
+
+VAR {GROUP_MODE};
+
+MACRO GetEnsSysType(_EnsType)
+    RETURN LnSelectValue ("SELECT t_systypeensid_ref FROM dtype_ens_dbt WHERE t_typeensid = " + String(enscontr.EnsSysType), V_INTEGER);
+END;
+
+MACRO Check(TypeOp, OpDate, SumOp, CurOp)
+    VAR OSum : money;
+    VAR GETcurrence : string;
+    IF (TypeOp != CF_CHANGEENS)
+        IF (SumOp <= 0)
+            LoansError (18031);
+            RETURN false;
+        END;
+    END;
+    
+    IF (({GROUP_MODE} == false) AND (enscontr.enssystype != 1))
+        GETcurrence = "loanskernel.getcurrencyrate(" + SQLDate(OpDate) + ", t_ratingcurcode, " + CurOp + ")";
+        OSum = LnSelectValue ("SELECT SUM(t_ratingsum*(SELECT CASE WHEN ( " + GETcurrence + " ) = 0 " +
+                              "           THEN 1 ELSE " + GETcurrence + 
+                              "           END " +
+                              "           FROM DUAL)) " +
+                              "FROM decn_eob_dbt " + 
+                              "WHERE t_enscontractid_ref = " + enscontr.EnsContractID,
+                              V_MONEY);
+ 
+        IF (OSum < SumOp)
+            RETURN GetTrue(true, "Учетная сумма обеспечения превышает сумму оценочных стоимостей ОО по этому договору. Продолжить?");
+        END;
+    END;
+    
+    RETURN true;
+END;
+
+MACRO InsertPlanPayTmp (Rate_:integer, Rest_:money, Date_:date, Marker_:string)
+    planpay_tmp.Clear();
+    planpay_tmp.Rec.RateID = Rate_;
+    planpay_tmp.Rec.Rest   = Rest_;
+    planpay_tmp.Rec.Date   = Date_;
+    planpay_tmp.Rec.Marker = Marker_;
+    planpay_tmp.Insert();
+END;
+
+// Расчет учетной суммы обеспечения
+PRIVATE MACRO CalcRatingSum (OpDate : date, isCredit : bool)
+    VAR RatingSum : money = $0;
+    VAR RegSum : money = $0;
+
+    VAR RateVal = 0; // % ставка по ОД, установленная по кредитному договору
+    VAR Prc: double, EndDate: date;
+    VAR SelectItem: integer, RateID = TRU_CRD, ObjectTypeID = 0, ObjectNumber = 0, DutyID = 0, PayNum = 0;
+    VAR rs = null, RSDcmd = null, CredOperID = 0;
+    Array MenuItem;
+    VAR OpType;
+
+    IF (((GetEnsSysType(enscontr.EnsSysType) == Поручительство) OR
+         (GetEnsSysType(enscontr.EnsSysType) == Гарантия_Обеспечение)) AND (isCredit == true))
+        prc = 0;
+
+        MenuItem(0) = " Рассчитать сумму поручительства (основной долг) ";
+        MenuItem(1) = " Рассчитать сумму поручительства (проценты) ";
+        MenuItem(2) = " Рассчитать сумму поручительства (ОД и проценты) ";
+        SelectItem = Menu (MenuItem, null, "Расчет суммы обеспечения", null, null, 0);
+        
+        /*ens_crd.AddFilter("t_enscontractID_Ref = " + enscontr.enscontractID);
+        while (ens_crd.next())
+            if (ens_crd.rec.CreditNumber_Ref != 0)
+                Loans_FindCrdContract(ens_crd.rec.CreditNumber_Ref, credit_c);
+            end;
+        end;*/
+
+        if (enscontr.ClaimID_Ref > 0) 
+            claim.Clear;                                                                                      
+            claim.AddFilter("t_ClaimID = " + enscontr.ClaimID_Ref);                                        
+            claim.rec.ClaimID = enscontr.ClaimID_Ref;                                                                                                                                   
+            if (claim.GetEQ)                                                                                         
+                claim.DropFilter;
+                ObjectTypeID = LO_CLAIM;
+                ObjectNumber = claim.Rec.ClaimID;         
+            end;
+        else
+            ObjectTypeID = credit_c.crd_kind;
+            ObjectNumber = credit_c.CreditNumber;
+        end;   
+        
+        // 1
+        IF (ObjectTypeID == LO_CLAIM) // Заявка
+            RegSum = claim.Rec.bcreditsum;
+        END;
+
+        // 2, 3
+        IF ((ObjectTypeID == LO_CREDIT) AND // КД
+            (/*(credit_c.paytype == CF_REP) OR*/       // Частями
+             (credit_c.paytype == CF_NONREP) OR        // Разовый
+             (credit_c.paytype == CF_POSTERESTANTE) OR // До востребования
+             (credit_c.paytype == CF_BEFOREMATURITY))) // До наступления условий
+
+            DutyID = CRSDCommand("SELECT t_dutyid FROM dduty_crd_dbt WHERE t_creditnumber_ref = ? AND t_dutystate = ?",
+                                 "p1", ObjectNumber,
+                                 "p2", "О",
+                                 V_INTEGER);
+            IF (DutyID > 0)
+                ObjectTypeID = LO_DUTY;
+                ObjectNumber = DutyID;
+            END;
+            
+            PayNum = CRSDCommand("SELECT COUNT(*) FROM dcrd_op_dbt WHERE t_creditnumber_ref = ? AND t_IsDeleted = 0 AND t_systemoperationid = ?",
+                                 "p1", credit_c.CreditNumber,
+                                 "p2", CS_PAY,
+                                 V_INTEGER);
+
+            IF (PayNum > 0)
+                RegSum = GetAllRegRest(credit_c.crd_kind, credit_c.CreditNumber, TDR_MAINREST, OpDate);
+            ELSE
+                RegSum = credit_c.CreditSum;
+            END;
+        END;
+
+        // 4
+        IF ((ObjectTypeID == LO_CREDIT) AND       // КД (кредитная линия)
+             ((credit_c.paytype == CF_CRLINNO) OR    // Невозобновляемая кредитная линия
+              (credit_c.paytype == CF_CRLINNEW) OR   // Кредитная линия под лимит задолженности
+              (credit_c.paytype == CF_CRLIN)))       // Лимит выд+задолж
+            RegSum = MAX(MAX(ОстатокРегистра (LO_CREDIT, ObjectNumber, TDR_LIMDUTY,        OpDate),
+                             ОстатокРегистра (LO_CREDIT, ObjectNumber, TDR_LIMPAY,         OpDate)),
+                             ОстатокРегистра (LO_CREDIT, ObjectNumber, TDR_AVAILABLELIMIT, OpDate));
+        END;     
+
+        IF ((ObjectTypeID == LO_GENAGGR) OR      // Генсоглашение
+            (ObjectTypeID == LO_GENAGGROV) OR    // Генсоглашение по ОВ
+            (ObjectTypeID == LO_GENAGGRREFSERV)) // Ген. соглашение по рефинансированию и обслуживанию
+            RegSum = MAX(MAX(ОстатокРегистра (ObjectTypeID, ObjectNumber, TDR_LIMDUTY,        OpDate, credit_c.CurCode),
+                             ОстатокРегистра (ObjectTypeID, ObjectNumber, TDR_LIMPAY,         OpDate, credit_c.CurCode)),
+                             ОстатокРегистра (ObjectTypeID, ObjectNumber, TDR_AVAILABLELIMIT, OpDate, credit_c.CurCode));
+        END;        
+        
+        // 4,5
+        IF ((ObjectTypeID == LO_KARTA) OR   // Банковская карта
+            (ObjectTypeID == LO_OVERDRAFT)) // Договор овердрафтного кредитования
+            IF (ObjectTypeID == LO_OVERDRAFT)
+                OpType = CF_OVC_CHANGE_LIMIT;
+            ELSE
+                OpType = CF_OVLIM;
+            END;
+
+            RSDcmd = RsdCommand (RslDefCon, "BEGIN ? := LoansKernel.LastOpID(?, ?, ?, ?); END;");
+            RSDcmd.addParam ("CredOperID", RSDBP_RETVAL, V_INTEGER);
+
+            RSDcmd.addParam ("ObjK",   RSDBP_IN); RSDcmd.value ("ObjK")   = ObjectTypeID;
+            RSDcmd.addParam ("ObjN",   RSDBP_IN); RSDcmd.value ("ObjN")   = ObjectNumber;
+            RSDcmd.addParam ("OpSyst", RSDBP_IN); RSDcmd.value ("OpSyst") = CS_CHANGE_LIM;
+            RSDcmd.addParam ("OpType", RSDBP_IN); RSDcmd.value ("OpType") = OpType;
+            RSDcmd.execute();
+
+            CredOperID = RSDcmd.value ("CredOperID"); RSDcmd = null;
+
+            IF (CredOperID == 0)
+                RSDcmd = RsdCommand (RslDefCon, "BEGIN ? := LoansKernel.GetLimObj ( ?,?,?,? ); END;");
+                RSDcmd.addParam ("RegSum", RSDBP_RETVAL, V_MONEY);
+
+                RSDcmd.addParam ("ObjK",   RSDBP_IN); RSDcmd.value ("ObjK")   = LO_TYPECREDIT;
+                RSDcmd.addParam ("ObjN",   RSDBP_IN); RSDcmd.value ("ObjN")   = credit_c.CreditTypeID_Ref;
+                RSDcmd.addParam ("OpDate", RSDBP_IN); RSDcmd.value ("OpDate") = OpDate;
+                RSDcmd.addParam ("LimT",   RSDBP_IN); RSDcmd.value ("LimT")   = 0;
+                RSDcmd.execute ();
+
+                RegSum = RSDcmd.value ("RegSum");
+            ELSE
+                RegSum = CRSDCommand("SELECT h1.t_rest FROM dchlimhis_dbt h1 WHERE h1.t_creditnumber_ref = ? " + 
+                                     " AND h1.t_type = ? " +
+                                     " AND h1.t_date =   " +
+                                     " ( " +
+                                     " SELECT MAX(h2.t_date) FROM dchlimhis_dbt h2 WHERE h2.t_creditnumber_ref = h1.t_creditnumber_ref " +
+                                     " AND h2.t_type  = h1.t_type " +
+                                     " AND h2.t_date <= ? " +
+                                     " ) ", "p1", ObjectNumber,
+                                     "p2", TDR_LIMDUTY,
+                                     "p3", OpDate,
+                                     V_MONEY);
+            END;
+        END;
+
+        // 6,7,8
+        IF (ObjectTypeID == LO_GUARANTEE)
+            IF (credit_c.paytype == CF_GUARANTEELINE)
+                RegSum = ОстатокРегистра (ObjectTypeID, ObjectNumber, TDR_LIMGUAR, OpDate);
+            ELSE
+                PayNum = CRSDCommand("SELECT COUNT(*) FROM dcrd_op_dbt WHERE t_creditnumber_ref = ? AND t_IsDeleted = 0 AND t_systemoperationid = ?",
+                                     "p1", credit_c.CreditNumber,
+                                     "p2", CS_GUARPAY,
+                                     V_INTEGER);
+
+                IF (PayNum > 0)
+                    RegSum = ОстатокРегистра (ObjectTypeID, ObjectNumber, TDR_PAYEDGUARANTEE, OpDate);
+                ELSE
+                    RegSum = credit_c.CreditSum;
+                END;
+            END;
+            
+            RateID = TRU_PAYMGUAR;
+        END;
+
+        IF ((SelectItem == 1) OR (SelectItem == 2))
+            IF (Loans_FindLCUR(ObjectTypeID, ObjectNumber, RateID, 0, rlcusrate))
+                LnSQLExec("DELETE FROM dplanpay_tmp");
+     
+                IF ((credit_c.paytype == CF_POSTERESTANTE) OR (credit_c.paytype == CF_BEFOREMATURITY))
+                    EndDate = credit_c.Regdate + 365;
+                ELSE
+                    EndDate = credit_c.ReturnDate;
+                END;
+
+                InsertPlanPayTmp (rlcusrate.RateID_Ref, RegSum, Credit_c.Regdate, "" );
+                InsertPlanPayTmp (rlcusrate.RateID_Ref, 0,      EndDate,          "X");
+
+                //RateVal = ПроцСтавка (ObjectTypeID, ObjectNumber, RateID, OpDate);
+
+                Prc = LoansCalcPercent(rlcusrate.RateID_Ref, Credit_c.Regdate, EndDate, DS_PERC, OpDate, 99/*CN_USERCALC*/);
+            END;
+        END;
+
+        IF (SelectItem == 1)
+            RegSum = Prc;
+        END;
+
+        IF (SelectItem == 2)
+            RegSum = RegSum + Prc;
+        END;
+
+        RatingSum = RegSum;
+    ELSE
+        rs = LnGetRecordSet ("SELECT * FROM decn_eob_dbt WHERE t_enscontractid_ref = " + enscontr.EnsContractID);
+
+        IF (rs != null)
+            WHILE (rs.MoveNext())
+                ConvSum (RegSum,
+                         rs.value ("t_RatingSum", null, V_MONEY),
+                         OpDate,
+                         rs.value ("t_RatingCurCode", null, V_INTEGER),
+                         EnsContr.EnsContractCur
+                        );
+                RatingSum = RatingSum + RegSum;
+            END;
+        END;
+    END;
+
+    RatingSum = RatingSum * (1 - enscontr.Discount);
+
+    RETURN money(round(RatingSum));
+END;
+
+/*-------------------------------------------------------------
+ Вызывается по F6 из панели корректировки договора обеспечения
+ ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+ Входные параметры:
+-------------------------------------------------------------*/
+
+macro CalcEnsSum ()
+    VAR CalcDate:date;
+    VAR rs = null;
+
+    /*------------------------------------------------------------------------------------------------------
+     Перед запуском расчета суммы залогового ДО производится проверка на наличие по ДО объектов обеспечения
+    ------------------------------------------------------------------------------------------------------*/
+    IF ((enscontr.EnsSysType == 2) OR   // Здесь не T_SYSTYPEENSID_REF
+        (enscontr.EnsSysType == 3) OR   // Здесь T_TYPEENSID
+        (enscontr.EnsSysType == 8) OR
+        (enscontr.EnsSysType == 5) OR
+        (enscontr.EnsSysType == 6) OR
+        (enscontr.EnsSysType == 7))
+        rs = LnGetRecordSet ("SELECT * FROM decn_eob_dbt WHERE t_enscontractid_ref = " + enscontr.EnsContractID);
+
+        IF ((rs == null) OR ((rs != null) AND (not(rs.MoveNext()))))
+            msgbox("Нельзя провести расчет! | По договору не открыто ни одного объекта обеспечения.");
+            RETURN true;
+        END;     
+    END;
+    
+    CalcDate = {curdate};
+
+    IF (not GetDate (CalcDate, "Введите дату расчета: "))
+        RETURN true;
+    END;
+
+    IF (CalcDate > {curdate} )
+        msgbox("Дата превышает текущую");
+        RETURN true;
+    END;
+
+    IF (CalcDate < enscontr.EnsContractFirstDate )
+        msgbox("Дата расчета меньше даты начала договора");
+        RETURN true;
+    END;
+
+    IF (CalcDate > enscontr.EnsContractLastDate )
+        msgbox("Дата расчета больше даты окончания договора");
+        RETURN true;
+    END;
+
+    IF ((GetEnsSysType(enscontr.EnsSysType) == Поручительство) OR
+        (GetEnsSysType(enscontr.EnsSysType) == Гарантия_Обеспечение)) 
+        enscontr.EnsContractSum = CalcRatingSum (CalcDate, true);
+        enscontr.EnsContractCur = credit_c.CurCode;
+    ELSE
+        enscontr.EnsContractSum = CalcRatingSum (CalcDate, true);
+    END;
+
+    RETURN true;
+END;
+
+/*------------------------------------------------------------------------------
+                        Библиотека интерпретируемых модулей
+
+ Filename    : ens_sum.mac
+ Description : Расчёт учетной суммы обеспечения
+
+ Programmer  : Tereshenko F.S.
+ 19.06.03    : Создан
+ Изменения   :
+------------------------------------------------------------------------------*/
+MACRO CalcDirectSum (OpDate : date)
+    VAR EnsSum : money = $0;
+
+    EnsSum = CalcRatingSum (OpDate, false);
+
+    RETURN EnsSum;
+END;

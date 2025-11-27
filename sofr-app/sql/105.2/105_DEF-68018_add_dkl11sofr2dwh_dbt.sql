@@ -1,0 +1,4 @@
+BEGIN
+   EXECUTE IMMEDIATE 'ALTER TABLE dkl11sofr2dwh_dbt ADD t_contrsofrid NUMBER(10)';
+END;
+/

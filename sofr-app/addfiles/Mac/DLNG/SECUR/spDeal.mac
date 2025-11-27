@@ -1,0 +1,2248 @@
+/**
+ @file      spDeal.mac
+ @brief     макрос обслуживания сделок
+
+ # changelog
+ |date       |autor          |tasks                                           |note
+ |-----------|---------------|------------------------------------------------|-------------------------------------------------------------
+ |11.04.2025 |Велигжанин А.В.|DEF-86490                                       |Исправление в Проверить_Сделку() для сделки DealType == 32743
+ |01.04.2025 |Велигжанин А.В.|DEF-86490                                       |Доработка Проверить_Сделку() для сделки DealType == 32743
+ |           |               |                                                |Запрет изменения клиента и номера договора
+
+*/
+import BankInter, SPInter, PaymInter, OprInter, Payments, Globals, secinter;
+import "sp_class.mac", "mccatacc.mac","sccomiss.mac","sp_catac.mac","secinter.mac", "sp_carin.mac", "SPQICheckOper.mac", "spcomcalc.mac", "fi.mac";
+//import "bocrmsginf.mac";
+import "boswift54x.mac";
+import "sc_depoacc.mac";
+import "UpdateStatusDeal.mac";  // Интеграция: сервис выгрузки статуса сделки
+import "boswift54xprint.mac";
+import "pnlConfirmTransport.mac";
+import "nptxfun.mac";
+import "PkoWriteOffBuffer.mac";
+import oralib;
+import "cblogger2.mac";
+import "secur_resending_funcobj.mac";
+
+const retOk    =0,
+      retError =1;
+
+/**
+  @brief it_log - сохранение в лог текстового сообщения
+  @param[in] text - текстовое сообщение
+*/
+private macro it_log(text)
+  var sql = "begin it_log.log(:1); end;";
+  var cmd = RSDCommand(sql);
+  cmd.AddParam("",RSDBP_IN,text);
+  cmd.execute;
+end;
+
+
+Private Macro UpdateDeal(leg, rqid, NewNKD, NewTotalcost)
+    var Query = "";
+    var Cmd = null;
+    Query = " UPDATE "
+              + " ddlrq_dbt rq "
+          + " SET "
+              + " rq.t_amount = " +NewTotalcost  
+              + ", rq.t_factamount = " +NewTotalcost 
+          + " WHERE "
+              + " rq.t_ID = " + rqid 
+          + " AND rq.t_type = 2 " ;
+    Cmd = RSDCommand(Query);
+    Cmd.Execute();
+    Query = " UPDATE "
+              + " ddl_leg_dbt l "
+          + " SET "
+              + " l.t_NKD = " + NewNKD  
+              + ", l.t_Totalcost = " + NewTotalcost
+          + " WHERE "
+              + " l.t_id = " + leg.id 
+          + " AND l.t_legkind = 0 " ;
+    Cmd = RSDCommand(Query);
+    Cmd.Execute();
+End;
+Private macro ChangeDealClir(deal, leg)
+     var Query = "", Data, NewPrice, NewNkd, NewTotalCost;
+     Query = RSDCommand( " select cl.*, rq.t_id rqid, rq.t_amount rqamount, rq.t_factamount rqfactamount " +
+                         "   from ddlclir_dbt cl, ddlrq_dbt rq " +
+                         "    where cl.t_dealid = ? AND rq.t_dockind = 101 and rq.t_docid = cl.t_dealid and rq.t_type = 2      ");
+     Query.addParam("", RSDBP_IN, deal.dealid);
+     Query.execute();
+
+     Data = TRsbDataSet(Query);
+     if( Data.MoveNext() )
+        NewNkd = Data.NKD;
+        NewTotalCost = Data.Totalcost;
+        If( (leg.Nkd != NewNkd) OR (leg.Totalcost != NewTotalCost) OR (Data.rqamount != NewTotalCost) )
+           UpdateDeal(leg, Data.rqid, NewNkd, NewTotalCost);
+           MsgBox("Изменения выполнены");
+           return true;
+        else
+           MsgBox("Изменения по сделке не требуются");
+           return true;
+        end;
+     else
+           MsgBox("Изменения по сделке не требуются");
+           return true;
+     end;
+End;
+
+private macro  DeleteComiss(deal);
+     var Query = "";
+     Query = RSDCommand( "delete from ddlrq_dbt where  t_dockind = 101 and t_docid = ? and t_type = 6; ");
+     Query.addParam("", RSDBP_IN, deal.dealid);
+     Query.execute();
+     Query = null;
+     Query = RSDCommand( "update ddlgracc_dbt set t_state = 0 where t_id in ( " +
+      "select t_id from ddlgracc_dbt where t_grdealid in (select t_id from ddlgrdeal_dbt where t_dockind = 101 and t_docid = ? and t_templnum = 9) ); ");
+     Query.addParam("", RSDBP_IN, deal.dealid);
+     Query.execute();
+     Query = null;
+     Query = RSDCommand("delete from ddlcomis_dbt where t_dockind = 101 and t_docid = ?; "
+      );
+     Query.addParam("", RSDBP_IN, deal.dealid);
+     Query.execute();
+end;
+
+/* Контексты, в которых вызвана функция "Проверить_Сделку" (параметр Mode) */
+const modeInsert        =  1, /* Функция вызвана при вставке новой сделки */
+      modeUpdate        =  2, /* -"- при обновлении сделки */
+      modeDelete        =  3, /* -"- при удалении сделки */
+      modeBeginOper     =  4, /* -"- перед началом операции для сделки */
+      modeMoveToPrep    =  5, /* -"- при переводе сделки в отложенные */
+
+      modePreInsert     =  9, /* -"- перед вызовом панели сделки для вставки сделки по F9 */
+      modePreUpdate     =  6, /* -"- перед вызовом панели сделки для редактирования\просмотра по Enter */
+      modeAfterInsert   =  7, /* -"- после выхода из панели вставки сделки. Если вставка была выполнена, DealID будет не нулевой */
+      modeAfterUpdate   =  8, /* -"- после выхода из панели редактирования сделки. Обновление сделки и платежей уже выполнено */
+      modeAfterDelete   = 10, /* -"- после успешного удаления сделки. */
+
+      modeMassBeginOper = 11, /* -"- перед массовым началом операций для сделок */
+      modeAfterMoveToPrep = 12; /* -"- после перевода сделки в отложенные */
+
+
+record Сделка("dl_tick");
+record СтараяСделка("dl_tick");
+
+record ДокументПоручение("SPGROUND");
+record СтарыйДокументПоручение("SPGROUND");
+
+record УсловияСделки("dl_leg");
+record УсловияСделки_Обр("dl_leg");
+record СтарыеУсловияСделки("dl_leg");
+record СтарыеУсловияСделки_Обр("dl_leg");
+record ДисконтныйДоход("dlsum");
+record СтоимостьпокупкивНУ("dlsum");
+record СтараяСтоимостьпокупкивНУ("dlsum");
+
+private record  avr( avoiriss );
+private record  FI( fininstr );
+
+/*проверка - включен ли режим хранилища данных для НУ*/
+PRIVATE VAR DepositoryMode = NULL;
+private macro CheckTaxDepositoryMode()
+   var ErrCode = 0;
+
+   if( DepositoryMode == NULL )
+      GetRegistryValue( "SECUR\\РЕЖИМ ХРАНИЛИЩА ДАННЫХ ДЛЯ НУ", V_BOOL, DepositoryMode, ErrCode );
+   end;
+
+   return DepositoryMode and (ErrCode == 0);
+end;
+
+/*Получить все значения классификатора ClsNum */
+PRIVATE MACRO GetLLClassValues( Classificator:INTEGER, Values:TArray )
+  VAR NextRec, ClsVal = TBFile("llclsval.dbt", "R", 0 );
+
+  Values.Size = 0;
+  ClsVal.rec.Classificator = Classificator;
+  NextRec = ClsVal.GetGE();
+  while( NextRec AND (ClsVal.rec.Classificator == Classificator) )
+     Values[Values.Size] = ClsVal.rec.Element;
+     NextRec = ClsVal.Next();
+  end;
+END;
+
+PRIVATE MACRO GetLLClass( FD:SPFirstDoc ):INTEGER
+   if( Сделка.BofficeKind == DL_TRUSTAVRWRT )
+      return 1710;   /*Допустимые портфели при зачислении/списании ц/б в ДУ */
+   elif( FI_IsShare(FI, true) ) // акции и ДР
+      if( IsBUY( FD.Group ) OR IsAVRWRTIN(FD.Group) OR (Сделка.BofficeKind == DL_INVESTSHARE) )
+         return 1642;  /*Допустимые портфели при покупке акций и ДР*/
+      else
+         return 1645;  /*Допустимые портфели при продаже акций и ДР*/
+      end;
+   elif( FI_IsInvestmentShare(FI) or FI_IsHypothecaryCert(FI) )
+      if( IsBUY( FD.Group ) OR IsAVRWRTIN(FD.Group) OR (Сделка.BofficeKind == DL_INVESTSHARE) )
+         return 1643;  /*Допустимые портфели при покупке паев, ИСУ*/
+      else
+         return 1646;  /*Допустимые портфели при продаже паев, ИСУ*/
+      end;
+   elif( FI_IsBond( FI ) )
+      if( IsBUY( FD.Group ) OR (Сделка.BofficeKind == DL_INVESTSHARE) )
+         return 1644;  /*Допустимые портфели при покупке долговых ц/б*/
+      elif( IsAVRWRTIN(FD.Group) OR IsAVRWRTOUT(FD.Group) )
+         if( FI_IsKSU( FI ) )
+            return 1828;
+         else
+            return 1709;  /* Допустимые портфели при зачислении/списании ц/б не в ДУ (LLCLASS_PORT_AVRWRT)*/
+         end;
+      else
+         return 1647;  /*Допустимые портфели при продаже долговых ц/б*/
+      end;
+   elif( (Сделка.BofficeKind == DL_AVRWRT) and (FI_IsKSU( FI )) )
+      return 1828; /*Допустимые портфели в операциях с КСУ (зачисление/списание ц/б)*/
+   end;
+   return -1;
+END;
+
+private macro GetAmount( KindPortf:INTEGER ):MONEY
+   var ClientID = -1, ContrID = 0;
+   if (KindPortf == KINDPORT_CLIENT)
+      ClientID = 0; //Не проверять
+      ContrID = -1; //Не проверять
+   end;
+   return WRTGetPortfolioAmount(Сделка.Department, FI.FIID, ClientID, ContrID, KindPortf, -1, Сделка.DealDate, true, true, false );
+end;
+
+PRIVATE MACRO ПроверитьПортфель( LLClass, PortfolioID )
+   VAR DS, Query = RSDCommand( "select 1 NR from dllclsval_dbt where t_Classificator = ? AND t_Element = ? AND rownum=1" );
+
+   Query.addParam( "", RSDBP_IN, LLClass );
+   Query.addParam( "", RSDBP_IN, PortfolioID );
+   Query.execute();
+
+   DS = TRsbDataSet( Query );
+   return ( DS.MoveNext() AND (DS.NR > 0) );
+END;
+
+PRIVATE VAR LastMarketID = NULL, LastMarketID_Office = NULL;
+PRIVATE MACRO ЕстьСекторБиржи( MarketID )
+   if( LastMarketID != MarketID )
+      VAR DS, Query = RSDCommand( "select 1 NR from dptoffice_dbt where t_PartyID = ? AND rownum=1" );
+
+      Query.addParam( "", RSDBP_IN, MarketID );
+      Query.execute();
+
+      DS = TRsbDataSet( Query );
+      LastMarketID_Office = ( DS.MoveNext() AND (DS.NR > 0) );
+   end;
+   return LastMarketID_Office;
+END;
+
+private macro CheckPortfolio( FD )
+   var Where = "", Amount = $0, Amount_1  = $0, i = 0, LLClass;
+
+   if( Сделка.PortfolioID == -1 )
+      msgbox("Не задан тип портфеля");
+      return retError;
+   end;
+
+   LLClass = GetLLClass( FD );
+   if( not ПроверитьПортфель( LLClass, Сделка.PortfolioID ) )
+      msgbox( "Неверно задан портфель в сделке. Список допустимых портфелей определен в классификаторе " + LLClass );
+      return retError;
+   end;
+
+   if( not IsTODAY(FD.Group) )
+
+      if( (FI_IsShare(FI, true) or FI_IsInvestmentShare(FI) or FI_IsHypothecaryCert(FI))
+          AND ( (Сделка.PortfolioID == KINDPORT_PROMISSORY) or (Сделка.PortfolioID == KINDPORT_RETIRE) )
+        )
+         MsgBox("Для акций, депозитраных расписок, инвестиционных паев и ИСУ запрещен выбор портфелей АС_ЦБ и ПДО");
+          return 1;
+      end;
+
+      if( FI_IsBond(FI) AND ( Сделка.PortfolioID == KINDPORT_CONTR ) ) // облигации
+          MsgBox( "Для облигаций запрещен выбор портфеля контрольного участия" );
+          return 1;
+      end;
+
+   end;
+
+   if( IsOprMultiExec() )
+      return 0;
+   end;
+
+   if( IsBUY( FD.Group ) OR IsAVRWRTIN(FD.Group) OR (Сделка.BofficeKind == DL_INVESTSHARE) )
+      if( FI_IsShare(FI, true) ) // акции и ДР
+         /*если ц/б  зачисляются в ПКУ, выдавать предупреждение, если на дату операции такие же бумаги есть в др. портфелях, входящих в классификатор ППкАкц*/
+         if( Сделка.PortfolioID == KINDPORT_CONTR )
+             i = 0;
+
+             VAR Portfolio = TArray();
+             GetLLClassValues( LLClass, Portfolio );
+             while( i < Portfolio.Size )
+                if( GetAmount( Portfolio[i] ) > 0 )
+                   if( MsgBoxEx( "Выпуск "+ FI.FI_Code +" уже учитывается в портфеле \"" + DL_GetValueName( OBJTYPE_KINDPORT, (Portfolio[i] ))+ "\""+".|Выполнять операцию ?",
+                       MB_YES+MB_NO, IND_NO,
+                       "Подтверждение начала операции", "Подтверждение начала операции" ) != IND_YES )
+                      return retError;
+                   end;
+                   break;
+                end;
+                i = i + 1;
+             end;
+         else /*если ц/б зачисляются в прочии портфели ППкАкц, выдавать предупреждение, если они есть в ПКУ*/
+            if( GetAmount( KINDPORT_CONTR ) > 0 )
+               if( MsgBoxEx( "Выпуск "+ FI.FI_Code +" уже учитывается в портфеле \"" + DL_GetValueName( OBJTYPE_KINDPORT, KINDPORT_CONTR)+ "\""+".|Выполнять операцию ?",
+                   MB_YES+MB_NO, IND_NO,
+                   "Подтверждение начала операции", "Подтверждение начала операции" ) != IND_YES )
+                  return retError;
+               end;
+            end;
+         end;
+      end;
+   end;
+
+   return 0;
+end;
+
+private macro MassCheckPortfolio()
+   var cmd;
+   var query_NotExistBack = " and Not Exists(select 1 from ddl_leg_dbt leg "+
+                            "                 where leg.t_DealID = tk.t_DealID " +
+                            "                   and leg.t_LegKind = " + LEG_KIND_DL_TICK_BACK +
+                            "                   and leg.t_LegID = 0 " +
+                            "                               )";
+
+   cmd = RsdCommand(
+     "UPDATE DOPRTEMP_TMP temp SET temp.t_ErrorStatus = ?, temp.t_ErrorMessage = ? " +
+     " WHERE temp.t_ErrorStatus = 0 "+
+     "   and temp.t_SkipDocument = 0 " +
+     "   and temp.t_DocKind NOT IN ("+DL_SECUROWN+", "+DL_AVRWRTOWN+") " +
+     "   and Exists(select 1 from ddl_tick_dbt tk " +
+     "               where tk.t_DealID = temp.t_OrderID " + query_NotExistBack +
+     "                 and tk.t_PortfolioID = -1 " +
+     "             )"
+    );
+   cmd.addParam( "", RSDBP_IN, retError );
+   cmd.addParam( "", RSDBP_IN, "Не задан тип портфеля." );
+
+   SQL_Execute( cmd, "Проверка сделок: тип портфеля", true );
+
+   ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+   cmd = RsdCommand(
+     "UPDATE DOPRTEMP_TMP temp SET temp.t_ErrorStatus = ?, temp.t_ErrorMessage = ? " +
+     " WHERE temp.t_ErrorStatus = 0 "+
+     "   and temp.t_SkipDocument = 0 " +
+     "   and temp.t_DocKind NOT IN ("+DL_SECUROWN+", "+DL_AVRWRTOWN+") " +
+     "   and Exists(select 1 from ddl_tick_dbt tk, dfininstr_dbt fin " +
+     "               where tk.t_DealID = temp.t_OrderID " + query_NotExistBack +
+     "                 and fin.t_FIID = tk.t_PFI " +
+     "                 and not Exists(select 1 " +
+     "                                  from dllclsval_dbt "+
+     "                                 where t_Classificator = (case when RSB_FIInstr.FI_AvrKindsGetRoot( fin.t_FI_Kind, fin.t_AvoirKind ) = "+AVOIRISSKIND_SHARE+
+     "                                                                    OR RSB_FIInstr.FI_AvrKindsGetRoot( fin.t_FI_Kind, fin.t_AvoirKind ) = "+AVOIRISSKIND_DEPOSITORY_RECEIPT+" then "+
+     "                                                                    (case when rsb_secur.IsBuy(rsb_secur.get_OperationGroup(rsb_secur.get_OperSysTypes(tk.t_DealType, tk.t_BofficeKind))) = 1 OR "+
+     "                                                                               rsb_secur.IsAvrWrtIn(rsb_secur.get_OperationGroup(rsb_secur.get_OperSysTypes(tk.t_DealType, tk.t_BofficeKind))) = 1 OR "+
+     "                                                                               tk.t_BOfficeKind = "+DL_INVESTSHARE+" then 1642 "+
+     "                                                                          else 1645 end"+
+     "                                                                    )"+
+     "                                                               when RSB_FIInstr.FI_AvrKindsGetRoot( fin.t_FI_Kind, fin.t_AvoirKind ) = "+AVOIRISSKIND_INVESTMENT_SHARE+
+     "                                                                    OR RSB_FIInstr.FI_AvrKindsGetRoot( fin.t_FI_Kind, fin.t_AvoirKind ) = "+AVOIRISSKIND_HYPOTHECARY_CERT+" then "+
+     "                                                                    (case when rsb_secur.IsBuy(rsb_secur.get_OperationGroup(rsb_secur.get_OperSysTypes(tk.t_DealType, tk.t_BofficeKind))) = 1 OR "+
+     "                                                                               rsb_secur.IsAvrWrtIn(rsb_secur.get_OperationGroup(rsb_secur.get_OperSysTypes(tk.t_DealType, tk.t_BofficeKind))) = 1 OR "+
+     "                                                                               tk.t_BOfficeKind = "+DL_INVESTSHARE+" then 1643 "+
+     "                                                                          else 1646 end"+
+     "                                                                    )"+
+     "                                                               when RSB_FIInstr.FI_AvrKindsGetRoot( fin.t_FI_Kind, fin.t_AvoirKind ) = "+AVOIRISSKIND_BOND+" then "+
+     "                                                                    (case when rsb_secur.IsBuy(rsb_secur.get_OperationGroup(rsb_secur.get_OperSysTypes(tk.t_DealType, tk.t_BofficeKind))) = 1 OR "+
+     "                                                                               rsb_secur.IsAvrWrtIn(rsb_secur.get_OperationGroup(rsb_secur.get_OperSysTypes(tk.t_DealType, tk.t_BofficeKind))) = 1 OR "+
+     "                                                                               tk.t_BOfficeKind = "+DL_INVESTSHARE+" then 1644 "+
+     "                                                                          when rsb_secur.IsAvrWrtOut(rsb_secur.get_OperationGroup(rsb_secur.get_OperSysTypes(tk.t_DealType, tk.t_BofficeKind))) = 1 then 1709 "+
+     "                                                                          else 1644 end"+
+     "                                                                    )"+
+     "                                                               when tk.t_BOfficeKind = "+DL_AVRWRT+" AND RSB_FIInstr.FI_IsKSU(fin.t_FIID) = 1 then 1828 "
+     "                                                          else -1 end )"
+     "                                   and t_Element = tk.t_PortfolioID) " +
+     "             )"
+    );
+   cmd.addParam( "", RSDBP_IN, retError );
+   cmd.addParam( "", RSDBP_IN, "Неверно задан портфель в сделке." );
+
+   SQL_Execute( cmd, "Проверка сделок: портфель", true );
+
+ 
+   ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+   cmd = RsdCommand(
+     "UPDATE DOPRTEMP_TMP temp SET temp.t_ErrorStatus = ?, temp.t_ErrorMessage = ? " +
+     " WHERE temp.t_ErrorStatus = 0 "+
+     "   and temp.t_SkipDocument = 0 " +
+     "   and rsb_secur.IsToday(rsb_secur.get_OperationGroup(rsb_secur.get_OperSysTypes(temp.t_Kind_Operation, temp.t_DocKind))) = 0 "+
+     "   and Exists(select 1 from ddl_tick_dbt tk, dfininstr_dbt fin  " +
+     "               where tk.t_DealID = temp.t_OrderID " + query_NotExistBack +
+     "                 and tk.t_PortfolioID IN (" + KINDPORT_PROMISSORY +", "+KINDPORT_RETIRE+")"+
+     "                 and fin.t_FIID = tk.t_PFI " +
+     "                 and (   RSB_FIInstr.FI_AvrKindsGetRoot( fin.t_FI_Kind, fin.t_AvoirKind ) = "+AVOIRISSKIND_SHARE+
+     "                      or RSB_FIInstr.FI_AvrKindsGetRoot( fin.t_FI_Kind, fin.t_AvoirKind ) = "+AVOIRISSKIND_DEPOSITORY_RECEIPT+
+     "                      or RSB_FIInstr.FI_AvrKindsGetRoot( fin.t_FI_Kind, fin.t_AvoirKind ) = "+AVOIRISSKIND_INVESTMENT_SHARE+
+     "                      or RSB_FIInstr.FI_AvrKindsGetRoot( fin.t_FI_Kind, fin.t_AvoirKind ) = "+AVOIRISSKIND_HYPOTHECARY_CERT+
+     "                     )" +
+     "             )"
+    );
+   cmd.addParam( "", RSDBP_IN, retError );
+   cmd.addParam( "", RSDBP_IN, "Для акций, депозитраных расписок, инвестиционных паев и ИСУ запрещен выбор портфелей АС_ЦБ и ПДО." );
+
+   SQL_Execute( cmd, "Проверка сделок: портфели АС_ЦБ и ПДО", true );
+
+   ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+   cmd = RsdCommand(
+     "UPDATE DOPRTEMP_TMP temp SET temp.t_ErrorStatus = ?, temp.t_ErrorMessage = ? " +
+     " WHERE temp.t_ErrorStatus = 0 "+
+     "   and temp.t_SkipDocument = 0 " +
+     "   and rsb_secur.IsToday(rsb_secur.get_OperationGroup(rsb_secur.get_OperSysTypes(temp.t_Kind_Operation, temp.t_DocKind))) = 0 "+
+     "   and Exists(select 1 from ddl_tick_dbt tk, dfininstr_dbt fin  " +
+     "               where tk.t_DealID = temp.t_OrderID " + query_NotExistBack +
+     "                 and tk.t_PortfolioID = " + KINDPORT_CONTR+
+     "                 and fin.t_FIID = tk.t_PFI " +
+     "                 and RSB_FIInstr.FI_AvrKindsGetRoot( fin.t_FI_Kind, fin.t_AvoirKind ) = "+AVOIRISSKIND_BOND +
+     "             )"
+    );
+   cmd.addParam( "", RSDBP_IN, retError );
+   cmd.addParam( "", RSDBP_IN, "Для облигаций запрещен выбор портфеля контрольного участия." );
+
+   SQL_Execute( cmd, "Проверка сделок: портфель контрольного участия", true );
+
+   return 0;
+end;
+
+private macro МассовыеПроверкиДляСделки()
+  var cmd, query;
+
+  query =   "DECLARE "
+          + "  v_Percent   NUMBER := 0; "
+          + "BEGIN "
+          + "  FOR one_rec IN (SELECT rsb_secur.IsBuy(rsb_secur.get_OperationGroup(rsb_secur.get_OperSysTypes(tk.t_DealType, tk.t_BofficeKind))) as IsBuy, "
+          + "                         (SELECT NVL(sum(RSB_FIInstr.FI_GetQTYOnDate( f.t_FIID, tk.t_DealDate )),0) "
+          + "                            FROM dfininstr_dbt f, davoiriss_dbt av "
+          + "                           WHERE f.t_FIID = av.t_FIID AND f.t_Issuer = fin.t_Issuer AND f.t_Issued <= tk.t_DealDate"
+          + "                             AND RSB_FIInstr.FI_AvrKindsGetRoot( f.t_FI_Kind, f.t_AvoirKind ) = "+AVOIRISSKIND_SHARE
+          + "                             AND av.t_IsVoting = 'X') as AmountAll, "
+          + "                         (SELECT NVL(sum(wsum.t_Amount),0) "
+          + "                            FROM dpmwrtsum_dbt wsum,dfininstr_dbt f,davoiriss_dbt av "
+          + "                           WHERE wsum.t_Buy_Sale = 0 "
+          + "                             AND wsum.t_State = " + PM_WRTSUM_FORM
+          + "                             AND wsum.t_Date <= tk.t_DealDate "
+          + "                             AND f.t_FIID = wsum.t_FIID "
+          + "                             AND av.t_FIID = f.t_FIID "
+          + "                             AND f.t_Issuer = fin.t_Issuer "
+          + "                             AND RSB_FIInstr.FI_AvrKindsGetRoot( f.t_FI_Kind, f.t_AvoirKind ) = "+AVOIRISSKIND_SHARE
+          + "                             AND av.t_IsVoting = 'X') as Amount, "
+          + "                         leg.t_Principal as Principal, tk.t_DealID as dealID "
+          + "                    FROM DOPRTEMP_TMP temp, ddl_tick_dbt tk, ddl_leg_dbt leg, dfininstr_dbt fin, davoiriss_dbt avr "
+          + "                   WHERE temp.t_ErrorStatus = 0 "
+          + "                     AND temp.t_SkipDocument = 0 "
+          + "                     AND tk.t_DealID = temp.t_OrderID "
+          + "                     AND tk.t_BOfficeKind = " + DL_SECURITYDOC
+          + "                     AND leg.t_DealID = tk.t_DealID "
+          + "                     AND leg.t_LegKind = " + LEG_KIND_DL_TICK
+          + "                     AND leg.t_LegID = 0 "
+          + "                     AND fin.t_FIID = tk.t_PFI "
+          + "                     AND avr.t_FIID = fin.t_FIID "
+          + "                     AND RSB_FIInstr.FI_AvrKindsGetRoot( fin.t_FI_Kind, fin.t_AvoirKind ) = "+AVOIRISSKIND_SHARE
+          + "                     AND avr.t_IsVoting = 'X' "
+          + "                     AND (   (rsb_secur.IsBuy(rsb_secur.get_OperationGroup(rsb_secur.get_OperSysTypes(tk.t_DealType, tk.t_BofficeKind))) = 1 and tk.t_PortfolioID <> " +KINDPORT_CONTR+") "
+          + "                          or (rsb_secur.IsBuy(rsb_secur.get_OperationGroup(rsb_secur.get_OperSysTypes(tk.t_DealType, tk.t_BofficeKind))) = 0 and tk.t_PortfolioID = " +KINDPORT_CONTR+") )"
+          + "                  ) LOOP"
+          + "     IF one_rec.AmountAll > 0 THEN "
+          + "       IF one_rec.IsBuy = 1 THEN "
+          + "         v_Percent := ((one_rec.Amount + one_rec.Principal) / one_rec.AmountAll) * 100.0;"
+          + "         IF v_Percent > 20 THEN "
+          + "           UPDATE DOPRTEMP_TMP temp "
+          + "              SET temp.t_ErrorStatus = 1, "
+          + "                  temp.t_ErrorMessage = 'Ценные бумаги выпуска должны быть зачислены в портфель контрольного участия.' "
+          + "            WHERE temp.t_OrderID = one_rec.DealID; "
+          + "         END IF;"
+          + "       ELSE "
+          + "         v_Percent := ((one_rec.Amount - one_rec.Principal) / one_rec.AmountAll) * 100.0;"
+          + "         IF v_Percent < 20 AND (one_rec.Amount - one_rec.Principal) > 0 THEN "
+          + "           UPDATE DOPRTEMP_TMP temp "
+          + "              SET temp.t_ErrorStatus = 1, "
+          + "                  temp.t_ErrorMessage = 'Ценные бумаги выпуска должны быть списаны из портфеля контрольного участия.' "
+          + "            WHERE temp.t_OrderID = one_rec.DealID; "
+          + "         END IF;"
+          + "       END IF;"
+          + "     END IF;"
+          + "  END LOOP; "
+          + "END;";
+
+  cmd = RsdCommand(query);
+  SQL_Execute( cmd, "Проверка сделок: голосующие акции", true );
+
+  ///////////////////////////////////////////////////////////////////////////////////////
+  cmd = RsdCommand(
+    "UPDATE DOPRTEMP_TMP temp SET temp.t_ErrorStatus = ?, temp.t_ErrorMessage = ? " +
+    " WHERE temp.t_ErrorStatus = 0 "+
+    "   and temp.t_SkipDocument = 0 " +
+    "   and temp.t_DocKind = " + DL_SECURITYDOC +
+    "   and Exists(select 1 from ddl_tick_dbt tk " +
+    "               where tk.t_DealID = temp.t_OrderID " +
+    "                 and tk.t_ClientID > 0 " +
+    "                 and tk.t_PreOutLay <> 0 "+
+    "             )"
+   );
+  cmd.addParam( "", RSDBP_IN, retError );
+  cmd.addParam( "", RSDBP_IN, "Для клиентских сделок предварительные затраты задавать запрещено");
+
+  SQL_Execute( cmd, "Проверка сделок: предварительные затраты", true );
+
+  ///////////////////////////////////////////////////////////////////////////////////////
+  if(CheckTaxDepositoryMode() != true)
+    cmd = RsdCommand(
+      "UPDATE DOPRTEMP_TMP temp SET temp.t_ErrorStatus = ?, temp.t_ErrorMessage = ? " +
+      " WHERE temp.t_ErrorStatus = 0 "+
+      "   and temp.t_SkipDocument = 0 " +
+      "   and temp.t_DocKind = " + DL_SECURITYDOC +
+      "   and rsb_secur.IsExchange(rsb_secur.get_OperationGroup(rsb_secur.get_OperSysTypes(temp.t_Kind_Operation, temp.t_DocKind))) = 1 "+
+      "   and Exists(select 1 from ddl_tick_dbt tk " +
+      "               where tk.t_DealID = temp.t_OrderID " +
+      "                 and tk.t_MarketOfficeID <= 0 "+
+      "                 and Exists(select 1 NR from dptoffice_dbt ofc where ofc.t_PartyID = tk.t_MarketID)" +
+      "             )"
+     );
+    cmd.addParam( "", RSDBP_IN, retError );
+    cmd.addParam( "", RSDBP_IN, "Поле \"Сектор\" должно быть заполнено");
+
+    SQL_Execute( cmd, "Проверка сделок: сектор", true );
+  end;
+
+  ///////////////////////////////////////////////////////////////////////////////////////
+  cmd = RsdCommand(
+    "UPDATE DOPRTEMP_TMP temp SET temp.t_ErrorStatus = ?, temp.t_ErrorMessage = ? " +
+    " WHERE temp.t_ErrorStatus = 0 "+
+    "   and temp.t_SkipDocument = 0 " +
+    "   and temp.t_DocKind = " + DL_SECURITYDOC +
+    "   and rsb_secur.IsExchange(rsb_secur.get_OperationGroup(rsb_secur.get_OperSysTypes(temp.t_Kind_Operation, temp.t_DocKind))) = 1 "+
+    "   and Exists(select 1 from ddl_tick_dbt tk " +
+    "               where tk.t_DealID = temp.t_OrderID " +
+    "                 and tk.t_Flag1 = CHR(0) " +
+    "                 and '"+MICEX_CODE+"' = NVL((select (case when pt.t_Code = '"+MICEX_CODE_FB+"' then '"+MICEX_CODE+"' else pt.t_Code end)"
+    "                                             from dpartcode_dbt pt "+
+    "                                            where pt.t_PartyID = tk.t_MarketID "+
+    "                                              and pt.t_CodeKind = "+PTCK_CONTR+
+    "                                          ), CHR(1))"
+    "             )"
+   );
+  cmd.addParam( "", RSDBP_IN, retError );
+  cmd.addParam( "", RSDBP_IN, "Для сделок на ММВБ должен быть установлен признак \"Биржа\"");
+
+  SQL_Execute( cmd, "Проверка сделок: ММВБ", true );
+
+  ///////////////////////////////////////////////////////////////////////////////////////
+  cmd = RsdCommand(
+    "UPDATE DOPRTEMP_TMP temp SET temp.t_ErrorStatus = ?, temp.t_ErrorMessage = ? " +
+    " WHERE temp.t_ErrorStatus = 0 "+
+    "   and temp.t_SkipDocument = 0 " +
+    "   and temp.t_DocKind = " + DL_SECURITYDOC +
+    "   and rsb_secur.IsOutExchange(rsb_secur.get_OperationGroup(rsb_secur.get_OperSysTypes(temp.t_Kind_Operation, temp.t_DocKind))) = 1 "+
+    "   and Exists(select 1 from ddl_tick_dbt tk " +
+    "               where tk.t_DealID = temp.t_OrderID " +
+    "                 and tk.t_PartyID = tk.t_MarketID " +
+    "             )"
+   );
+  cmd.addParam( "", RSDBP_IN, retError );
+  cmd.addParam( "", RSDBP_IN, "Для внебиржевой сделки контрагент и организатор торговли совпадать не должны");
+
+  SQL_Execute( cmd, "Проверка сделок: контрагент и организатор", true );
+
+  ///////////////////////////////////////////////////////////////////////////////////////
+  cmd = RsdCommand(
+    "UPDATE DOPRTEMP_TMP temp SET temp.t_ErrorStatus = ?, temp.t_ErrorMessage = ? " +
+    " WHERE temp.t_ErrorStatus = 0 "+
+    "   and temp.t_SkipDocument = 0 " +
+    "   and temp.t_DocKind = " + DL_SECURITYDOC +
+    "   and rsb_secur.IsOutExchange(rsb_secur.get_OperationGroup(rsb_secur.get_OperSysTypes(temp.t_Kind_Operation, temp.t_DocKind))) = 1 "+
+    "   and Exists(select 1 from ddl_tick_dbt tk " +
+    "               where tk.t_DealID = temp.t_OrderID " +
+    "                 and tk.t_IsPartyClient = CHR(0) " +
+    "                 and ((   tk.t_PortfolioID <> " + KINDPORT_CLIENT +
+    "                      or tk.t_ClientID < 0 ) "+
+    "                      and tk.t_PartyID = "+{OurBank}+
+    "                     )"+
+    "             )"
+   );
+  cmd.addParam( "", RSDBP_IN, retError );
+  cmd.addParam( "", RSDBP_IN, "Контрагент может быть Нашим Банком, если задан клиент");
+
+  SQL_Execute( cmd, "Проверка сделок: контрагент", true );
+
+  ///////////////////////////////////////////////////////////////////////////////////////
+  cmd = RsdCommand(
+    "UPDATE DOPRTEMP_TMP temp SET temp.t_ErrorStatus = ?, temp.t_ErrorMessage = ? " +
+    " WHERE temp.t_ErrorStatus = 0 "+
+    "   and temp.t_SkipDocument = 0 " +
+    "   and temp.t_DocKind = " + DL_SECURITYDOC +
+    "   and rsb_secur.IsOutExchange(rsb_secur.get_OperationGroup(rsb_secur.get_OperSysTypes(temp.t_Kind_Operation, temp.t_DocKind))) = 1 "+
+    "   and Exists(select 1 from ddl_tick_dbt tk, ddl_leg_dbt leg " +
+    "               where tk.t_DealID = temp.t_OrderID " +
+    "                 and leg.t_DealID = tk.t_DealID "
+    "                 and leg.t_LegKind = " + LEG_KIND_DL_TICK +
+    "                 and leg.t_LegID = 0 " +
+    "                 and leg.t_Formula = " + SP_TYPE_CALC_DVP + /*поставка против платежа*/
+    "                 and (case when leg.t_MaturityIsPrincipal = 'X' then RSI_RsbCalendar.GetDateAfterWorkDay(leg.t_Expiry, 0) "+
+    "                           else RSI_RsbCalendar.GetDateAfterWorkDay(leg.t_Maturity, 0) end) "+
+    "                     <> " +
+    "                     (case when leg.t_MaturityIsPrincipal = 'X' then RSI_RsbCalendar.GetDateAfterWorkDay(leg.t_Maturity, 0) "+
+    "                           else RSI_RsbCalendar.GetDateAfterWorkDay(leg.t_Expiry, 0) end) "+
+    "             )"
+   );
+  cmd.addParam( "", RSDBP_IN, retError );
+  cmd.addParam( "", RSDBP_IN, "Дата поставки для сделки должна быть равна дате оплаты.");
+
+  SQL_Execute( cmd, "Проверка сделок: поставка против платежа 1ч", true );
+
+  ///////////////////////////////////////////////////////////////////////////////////////
+  cmd = RsdCommand(
+    "UPDATE DOPRTEMP_TMP temp SET temp.t_ErrorStatus = ?, temp.t_ErrorMessage = ? " +
+    " WHERE temp.t_ErrorStatus = 0 "+
+    "   and temp.t_SkipDocument = 0 " +
+    "   and temp.t_DocKind = " + DL_SECURITYDOC +
+    "   and rsb_secur.IsOutExchange(rsb_secur.get_OperationGroup(rsb_secur.get_OperSysTypes(temp.t_Kind_Operation, temp.t_DocKind))) = 1 "+
+    "   and Exists(select 1 from ddl_tick_dbt tk, ddl_leg_dbt leg " +
+    "               where tk.t_DealID = temp.t_OrderID " +
+    "                 and leg.t_DealID = tk.t_DealID "
+    "                 and leg.t_LegKind = " + LEG_KIND_DL_TICK +
+    "                 and leg.t_LegID = 0 " +
+    "                 and leg.t_Formula = " + SP_TYPE_CALC_PP + /*предоплата*/
+    "                 and (case when leg.t_MaturityIsPrincipal = 'X' then RSI_RsbCalendar.GetDateAfterWorkDay(leg.t_Expiry, 0) "+
+    "                           else RSI_RsbCalendar.GetDateAfterWorkDay(leg.t_Maturity, 0) end) "+
+    "                     > " +
+    "                     (case when leg.t_MaturityIsPrincipal = 'X' then RSI_RsbCalendar.GetDateAfterWorkDay(leg.t_Maturity, 0) "+
+    "                           else RSI_RsbCalendar.GetDateAfterWorkDay(leg.t_Expiry, 0) end) "+
+    "             )"
+   );
+  cmd.addParam( "", RSDBP_IN, retError );
+  cmd.addParam( "", RSDBP_IN, "Дата оплаты для сделки должна быть меньше или равна дате поставки.");
+
+  SQL_Execute( cmd, "Проверка сделок: предоплата 1ч", true );
+
+  ///////////////////////////////////////////////////////////////////////////////////////
+  cmd = RsdCommand(
+    "UPDATE DOPRTEMP_TMP temp SET temp.t_ErrorStatus = ?, temp.t_ErrorMessage = ? " +
+    " WHERE temp.t_ErrorStatus = 0 "+
+    "   and temp.t_SkipDocument = 0 " +
+    "   and temp.t_DocKind = " + DL_SECURITYDOC +
+    "   and rsb_secur.IsOutExchange(rsb_secur.get_OperationGroup(rsb_secur.get_OperSysTypes(temp.t_Kind_Operation, temp.t_DocKind))) = 1 "+
+    "   and Exists(select 1 from ddl_tick_dbt tk, ddl_leg_dbt leg " +
+    "               where tk.t_DealID = temp.t_OrderID " +
+    "                 and leg.t_DealID = tk.t_DealID "
+    "                 and leg.t_LegKind = " + LEG_KIND_DL_TICK +
+    "                 and leg.t_LegID = 0 " +
+    "                 and leg.t_Formula = " + SP_TYPE_CALC_PD + /*предпоставка*/
+    "                 and (case when leg.t_MaturityIsPrincipal = 'X' then RSI_RsbCalendar.GetDateAfterWorkDay(leg.t_Expiry, 0) "+
+    "                           else RSI_RsbCalendar.GetDateAfterWorkDay(leg.t_Maturity, 0) end) "+
+    "                     < " +
+    "                     (case when leg.t_MaturityIsPrincipal = 'X' then RSI_RsbCalendar.GetDateAfterWorkDay(leg.t_Maturity, 0) "+
+    "                           else RSI_RsbCalendar.GetDateAfterWorkDay(leg.t_Expiry, 0) end) "+
+    "             )"
+   );
+  cmd.addParam( "", RSDBP_IN, retError );
+  cmd.addParam( "", RSDBP_IN, "Дата оплаты для сделки должна быть меньше или равна дате оплаты.");
+
+  SQL_Execute( cmd, "Проверка сделок: предпоставка 1ч", true );
+
+  ///////////////////////////////////////////////////////////////////////////////////////
+  cmd = RsdCommand(
+    "UPDATE DOPRTEMP_TMP temp SET temp.t_ErrorStatus = ?, temp.t_ErrorMessage = ? " +
+    " WHERE temp.t_ErrorStatus = 0 "+
+    "   and temp.t_SkipDocument = 0 " +
+    "   and temp.t_DocKind = " + DL_SECURITYDOC +
+    "   and rsb_secur.IsOutExchange(rsb_secur.get_OperationGroup(rsb_secur.get_OperSysTypes(temp.t_Kind_Operation, temp.t_DocKind))) = 1 "+
+    "   and Exists(select 1 from ddl_tick_dbt tk, ddl_leg_dbt leg" +
+    "               where tk.t_DealID = temp.t_OrderID " +
+    "                 and leg.t_DealID = tk.t_DealID "
+    "                 and leg.t_LegKind = " + LEG_KIND_DL_TICK_BACK +
+    "                 and leg.t_LegID = 0 " +
+    "                 and leg.t_Formula = " + SP_TYPE_CALC_DVP + /*поставка против платежа*/
+    "                 and (case when leg.t_MaturityIsPrincipal = 'X' then RSI_RsbCalendar.GetDateAfterWorkDay(leg.t_Expiry, 0) "+
+    "                           else RSI_RsbCalendar.GetDateAfterWorkDay(leg.t_Maturity, 0) end) "+
+    "                     <> " +
+    "                     (case when leg.t_MaturityIsPrincipal = 'X' then RSI_RsbCalendar.GetDateAfterWorkDay(leg.t_Maturity, 0) "+
+    "                           else RSI_RsbCalendar.GetDateAfterWorkDay(leg.t_Expiry, 0) end) "+
+    "             )"
+   );
+  cmd.addParam( "", RSDBP_IN, retError );
+  cmd.addParam( "", RSDBP_IN, "Дата поставки для обратной части сделки должна быть равна дате оплаты.");
+
+  SQL_Execute( cmd, "Проверка сделок: поставка против платежа 2ч", true );
+
+  ///////////////////////////////////////////////////////////////////////////////////////
+  cmd = RsdCommand(
+    "UPDATE DOPRTEMP_TMP temp SET temp.t_ErrorStatus = ?, temp.t_ErrorMessage = ? " +
+    " WHERE temp.t_ErrorStatus = 0 "+
+    "   and temp.t_SkipDocument = 0 " +
+    "   and temp.t_DocKind = " + DL_SECURITYDOC +
+    "   and rsb_secur.IsOutExchange(rsb_secur.get_OperationGroup(rsb_secur.get_OperSysTypes(temp.t_Kind_Operation, temp.t_DocKind))) = 1 "+
+    "   and Exists(select 1 from ddl_tick_dbt tk, ddl_leg_dbt leg " +
+    "               where tk.t_DealID = temp.t_OrderID " +
+    "                 and leg.t_DealID = tk.t_DealID "
+    "                 and leg.t_LegKind = " + LEG_KIND_DL_TICK_BACK +
+    "                 and leg.t_LegID = 0 " +
+    "                 and leg.t_Formula = " + SP_TYPE_CALC_PP + /*предоплата*/
+    "                 and (case when leg.t_MaturityIsPrincipal = 'X' then RSI_RsbCalendar.GetDateAfterWorkDay(leg.t_Expiry, 0) "+
+    "                           else RSI_RsbCalendar.GetDateAfterWorkDay(leg.t_Maturity, 0) end) "+
+    "                     > " +
+    "                     (case when leg.t_MaturityIsPrincipal = 'X' then RSI_RsbCalendar.GetDateAfterWorkDay(leg.t_Maturity, 0) "+
+    "                           else RSI_RsbCalendar.GetDateAfterWorkDay(leg.t_Expiry, 0) end) "+
+    "             )"
+   );
+  cmd.addParam( "", RSDBP_IN, retError );
+  cmd.addParam( "", RSDBP_IN, "Дата оплаты для обратной части сделки должна быть меньше или равна дате поставки.");
+
+  SQL_Execute( cmd, "Проверка сделок: предоплата 2ч", true );
+
+  ///////////////////////////////////////////////////////////////////////////////////////
+  cmd = RsdCommand(
+    "UPDATE DOPRTEMP_TMP temp SET temp.t_ErrorStatus = ?, temp.t_ErrorMessage = ? " +
+    " WHERE temp.t_ErrorStatus = 0 "+
+    "   and temp.t_SkipDocument = 0 " +
+    "   and temp.t_DocKind = " + DL_SECURITYDOC +
+    "   and rsb_secur.IsOutExchange(rsb_secur.get_OperationGroup(rsb_secur.get_OperSysTypes(temp.t_Kind_Operation, temp.t_DocKind))) = 1 "+
+    "   and Exists(select 1 from ddl_tick_dbt tk, ddl_leg_dbt leg " +
+    "               where tk.t_DealID = temp.t_OrderID " +
+    "                 and leg.t_DealID = tk.t_DealID "
+    "                 and leg.t_LegKind = " + LEG_KIND_DL_TICK_BACK +
+    "                 and leg.t_LegID = 0 " +
+    "                 and leg.t_Formula = " + SP_TYPE_CALC_PD + /*предпоставка*/
+    "                 and (case when leg.t_MaturityIsPrincipal = 'X' then RSI_RsbCalendar.GetDateAfterWorkDay(leg.t_Expiry, 0) "+
+    "                           else RSI_RsbCalendar.GetDateAfterWorkDay(leg.t_Maturity, 0) end) "+
+    "                     < " +
+    "                     (case when leg.t_MaturityIsPrincipal = 'X' then RSI_RsbCalendar.GetDateAfterWorkDay(leg.t_Maturity, 0) "+
+    "                           else RSI_RsbCalendar.GetDateAfterWorkDay(leg.t_Expiry, 0) end) "+
+    "             )"
+   );
+  cmd.addParam( "", RSDBP_IN, retError );
+  cmd.addParam( "", RSDBP_IN, "Дата оплаты для обратной части сделки должна быть меньше или равна дате оплаты.");
+
+  SQL_Execute( cmd, "Проверка сделок: предпоставка 2ч", true );
+
+  ///////////////////////////////////////////////////////////////////////////////////////
+  cmd = RsdCommand(
+    "UPDATE DOPRTEMP_TMP temp SET temp.t_ErrorStatus = ?, " +
+    "                             temp.t_ErrorMessage = 'По Договору '||" +
+    "                                                   NVL((SELECT sfcontr.t_Number FROM ddl_tick_dbt tk, ddlcontrmp_dbt contrmp, ddlcontr_dbt dlcontr, dsfcontr_dbt sfcontr " +
+    "                                                         WHERE tk.t_DealID = temp.t_OrderID AND contrmp.t_SfContrID = tk.t_ClientContrID AND dlcontr.t_DlContrID = contrmp.t_DlContrID AND sfcontr.t_ID = dlcontr.t_SfContrID), '')||" +
+    "                                                   ' клиентом не предоставлены документы о расторжении договора ИИС, заключенного с другим ПУ. Выполнение операции запрещено' " +
+    " WHERE temp.t_ErrorStatus = 0 "+
+    "   and temp.t_SkipDocument = 0 " +
+    "   and temp.t_DocKind = " + DL_SECURITYDOC +
+    "   and Exists(select 1 from ddl_tick_dbt tk, ddlcontrmp_dbt contrmp, ddlcontr_dbt dlcontr " +
+    "               where tk.t_DealID = temp.t_OrderID " +
+    "                 and contrmp.t_SfContrID = tk.t_ClientContrID " +
+    "                 and dlcontr.t_DlContrID = contrmp.t_DlContrID " +
+    "                 and dlcontr.t_IIS = 'X' " +
+    "                 and rsb_secur.GetMainObjAttr(207, LPAD(dlcontr.t_DlContrID, 34, '0'), 121/*Сведения о наличии или отсутствии ИИС у другого ПУ*/, tk.t_DealDate) = 1 " +
+    "                 and rsb_secur.GetMainObjAttr(207, LPAD(dlcontr.t_DlContrID, 34, '0'), 122/*Предоставлены подтвержд. документы о расторжении ИИС у другого ПУ*/, tk.t_DealDate) <> 1 " +
+    "             )"
+   );
+  cmd.addParam( "", RSDBP_IN, retError );
+
+  SQL_Execute( cmd, "Проверка сделок: ИИС у другого ПУ", true );
+end;
+
+MACRO МассовыеПроверкиДляСделкиОЭБ()
+  var cmd;
+
+  cmd = RsdCommand(
+    "UPDATE DOPRTEMP_TMP temp SET temp.t_ErrorStatus = ?, temp.t_ErrorMessage = ? " +
+    " WHERE temp.t_ErrorStatus = 0 "+
+    "   and temp.t_SkipDocument = 0 " +
+    "   and temp.t_DocKind = " + DL_SECUROWN +
+    "   and Exists(select 1 from ddl_tick_dbt tk " +
+    "               where tk.t_DealID = temp.t_OrderID " +
+    "                 and RSB_SECUR.GetMainObjAttrNoDate("+OBJTYPE_AVOIRISS+", LPAD(tk.t_PFI, 10, '0'), 60) = 0 "
+    "             )"
+   );
+  cmd.addParam( "", RSDBP_IN, 1 );
+  cmd.addParam( "", RSDBP_IN, "Необходимо задать значение категории \"Наблюдаемые исходные данные\" для ц/б" );
+
+  SQL_Execute( cmd, "Проверка сделок: значение категории \"Наблюдаемые исходные данные\" для ц/б", true );
+
+
+  cmd = RsdCommand(
+    "UPDATE DOPRTEMP_TMP temp SET temp.t_ErrorStatus = ?, temp.t_ErrorMessage = ? " +
+    " WHERE temp.t_ErrorStatus = 0 "+
+    "   and temp.t_SkipDocument = 0 " +
+    "   and temp.t_DocKind = " + DL_SECUROWN +
+    "   and Exists(select 1 from ddl_tick_dbt tk, davoiriss_dbt avr " + 
+    "               where tk.t_DealID = temp.t_OrderID " + 
+    "                 and avr.t_FIID = tk.t_PFI " +
+    "                 and avr.t_Subordinated = 'X' " +
+    "                 and RSB_SECUR.GetMainObjAttrNoDate("+OBJTYPE_AVOIRISS+", LPAD(avr.t_FIID, 10, '0'), "+OBJGROUP_SUBORDCVALTYPE+") = 0 "
+    "             )"
+   );
+  cmd.addParam( "", RSDBP_IN, 1 );
+  cmd.addParam( "", RSDBP_IN, "Необходимо задать значение категории \"Квалификационный признак суборд.ОЭБ\" для ц/б" );
+
+  SQL_Execute( cmd, "Проверка сделок: значение категории \"Квалификационный признак суборд.ОЭБ\" для ц/б", true );
+
+
+  ///////////////////////////////////////////////////////////////////////////////////////
+  cmd = RsdCommand(
+        "UPDATE DOPRTEMP_TMP temp SET temp.t_ErrorStatus = ?, temp.t_ErrorMessage = ? " +
+        " WHERE temp.t_ErrorStatus = 0 "+
+        "   and temp.t_SkipDocument = 0 " +
+        "   and temp.t_DocKind = " + DL_SECUROWN +
+        "   and rsb_secur.IsSale(rsb_secur.get_OperationGroup(rsb_secur.get_OperSysTypes(temp.t_Kind_Operation, temp.t_DocKind))) = 1 " +
+        "   and Exists(select 1 from ddl_tick_dbt tk, davoiriss_dbt av " +
+        "               where tk.t_DealID = temp.t_OrderID " +
+        "                 and tk.t_PFI = av.t_FIID " +
+        "                 and tk.t_DealDate < av.t_InCirCulationDate " +
+        "             )"
+   );
+
+  cmd.addParam( "", RSDBP_IN, 1 );
+  cmd.addParam( "", RSDBP_IN, "Дата заключения сделки меньше даты начала обращения выпуска" );
+
+  SQL_Execute( cmd, "Проверка сделок: дата заключения", true );
+
+  ///////////////////////////////////////////////////////////////////////////////////////
+  cmd = RsdCommand(
+        "UPDATE DOPRTEMP_TMP temp SET temp.t_ErrorStatus = ?, temp.t_ErrorMessage = ? " +
+        " WHERE temp.t_ErrorStatus = 0 "+
+        "   and temp.t_SkipDocument = 0 " +
+        "   and temp.t_DocKind = " + DL_SECUROWN +
+        "   and Exists(select 1 from ddl_tick_dbt tk, davoiriss_dbt av, dfininstr_dbt fin" +
+        "               where tk.t_DealID = temp.t_OrderID " +
+        "                 and tk.t_PFI = av.t_FIID " +
+        "                 and tk.t_PFI = fin.t_FIID " +
+        "                 and tk.t_DealDate "
+        "                     < " +
+        "                     (case when av.t_BegPlacementDate <> TO_DATE('01010001', 'DDMMYYYY') " +
+        "                      then (case when av.t_BegPlacementDate < fin.t_Issued then av.t_BegPlacementDate else fin.t_Issued end) " +
+        "                      else fin.t_Issued end)" +
+        "             )"
+   );
+
+  cmd.addParam( "", RSDBP_IN, 1 );
+  cmd.addParam( "", RSDBP_IN, "Дата заключения сделки меньше даты начала размещения или даты регистрации выпуска" );
+
+  SQL_Execute( cmd, "Проверка сделок: дата заключения", true );
+
+  ///////////////////////////////////////////////////////////////////////////////////////
+  cmd = RsdCommand(
+        "UPDATE DOPRTEMP_TMP temp SET temp.t_ErrorStatus = ?, temp.t_ErrorMessage = ? " +
+        " WHERE temp.t_ErrorStatus = 0 "+
+        "   and temp.t_SkipDocument = 0 " +
+        "   and temp.t_DocKind = " + DL_SECUROWN +
+        "   and rsb_secur.IsSale(rsb_secur.get_OperationGroup(rsb_secur.get_OperSysTypes(temp.t_Kind_Operation, temp.t_DocKind))) = 1 " +
+        "   and Exists(select 1 from ddl_tick_dbt tk, ddl_leg_dbt leg, davoiriss_dbt av " +
+        "               where tk.t_DealID = temp.t_OrderID " +
+        "                 and leg.t_DealID = tk.t_DealID "
+        "                 and leg.t_LegKind = " + LEG_KIND_DL_TICK +
+        "                 and leg.t_LegID = 0 " +
+        "                 and tk.t_PFI = av.t_FIID " +
+        "                 and leg.t_Maturity < av.t_InCirCulationDate " +
+        "             )"
+   );
+
+  cmd.addParam( "", RSDBP_IN, 1 );
+  cmd.addParam( "", RSDBP_IN, "Дата поставки меньше даты начала обращения выпуска" );
+
+  SQL_Execute( cmd, "Проверка сделок: дата поставки", true );
+
+  ///////////////////////////////////////////////////////////////////////////////////////
+  cmd = RsdCommand(
+        "UPDATE DOPRTEMP_TMP temp SET temp.t_ErrorStatus = ?, temp.t_ErrorMessage = ? " +
+        " WHERE temp.t_ErrorStatus = 0 "+
+        "   and temp.t_SkipDocument = 0 " +
+        "   and temp.t_DocKind = " + DL_SECUROWN +
+        "   and Exists(select 1 from ddl_tick_dbt tk, ddl_leg_dbt leg, davoiriss_dbt av, dfininstr_dbt fin" +
+        "               where tk.t_DealID = temp.t_OrderID " +
+        "                 and leg.t_DealID = tk.t_DealID "
+        "                 and leg.t_LegKind = " + LEG_KIND_DL_TICK +
+        "                 and leg.t_LegID = 0 " +
+        "                 and tk.t_PFI = av.t_FIID " +
+        "                 and tk.t_PFI = fin.t_FIID " +
+        "                 and tk.t_DealDate "
+        "                     < " +
+        "                     (case when av.t_BegPlacementDate <> TO_DATE('01010001', 'DDMMYYYY') " +
+        "                      then (case when av.t_BegPlacementDate < fin.t_Issued then av.t_BegPlacementDate else fin.t_Issued end) " +
+        "                      else fin.t_Issued end)" +
+        "             )"
+   );
+
+  cmd.addParam( "", RSDBP_IN, 1 );
+  cmd.addParam( "", RSDBP_IN, "Дата поставки меньше даты начала размещения или даты регистрации выпуска" );
+
+  SQL_Execute( cmd, "Проверка сделок: дата поставки", true );
+END;
+
+private macro ПроверкиДляСделки( FD )
+
+   if( not ВыполнитьПроверкиДляГолосующихАкций( FD ) )
+      return retError;
+   end;
+
+   if( not FD.ExistBack )
+      if( CheckPortfolio( FD ) )
+         return retError;
+      end;
+   end;
+
+   /*для клиентских сделок нельзя задавать предв. затраты*/
+   if( (Сделка.ClientID > 0) AND (Сделка.PreOutlay != 0) )
+      msgbox( "Для клиентских сделок предварительные затраты задавать запрещено" );
+      return retError;
+   end;
+
+   /*для биржевых сделок дополнительные проверки*/
+   if( IsEXCHANGE( FD.Group ) )
+
+       /*проверка сектора организатора торговли*/
+       if( (CheckTaxDepositoryMode() != true) AND (Сделка.MarketOfficeID <= 0) )
+          if( ЕстьСекторБиржи( Сделка.MarketID ) )
+             msgbox("Поле \"Сектор\" должно быть заполнено");
+             return retError;
+          end;
+       end;
+
+       /*если биржа - ММВБ, то сделка должна быть ОРЦБ*/
+       if( FD.СделкаОРЦБ() != true )
+          if( MICEX_CODE == ПолучитьКодГруппыБиржи(Сделка.MarketID) )
+             msgbox(" Для сделок на ММВБ должен быть установлен признак \"Биржа\"");
+             return retError;
+          end;
+       end;
+   elif( IsOUTEXCHANGE( FD.Group )  )
+
+      if( Сделка.PartyID == Сделка.MarketID )
+         msgbox( "Для внебиржевой сделки контрагент и организатор торговли совпадать не должны" );
+         return retError;
+      end;
+
+      if( Сделка.isPartyClient != SET_CHAR )
+         if( ((Сделка.PortfolioID != KINDPORT_CLIENT) OR (Сделка.ClientID < 0)) AND (Сделка.PartyID == {OurBank} ) )
+            msgbox("Контрагент может быть Нашим Банком, если задан клиент");
+            return retError;
+         end;
+      end;
+
+      if( FD.ПроверитьДатыОплатыПоставки( УсловияСделки, true, true ) == false )
+         return retError;
+      end;
+
+      if( FD.ExistBack )
+         VAR FD_2 = SPFirstDoc( Сделка, true, true, УсловияСделки_Обр );
+
+         if( FD_2.ПроверитьДатыОплатыПоставки( УсловияСделки_Обр, true, true ) == false )
+            return retError;
+         end;
+      end;
+   end;
+
+   /*ZMV BIQ-8258 блокировка исполнения сделок фондового рынка для договоров, 
+     у которых категория "Сведения о наличии или отсутствии ИИС у другого ПУ" = "Да" И категория "Предоставлены подтвержд. документы о расторжении ИИС у другого ПУ" на дату операции равно "Нет" или не заполнено*/ 
+   if( ДоговорИИСуДругогоПУ(Сделка.ClientContrID, Сделка.DealDate) )
+      return retError;
+   end;
+
+   return retOk;
+end;
+
+private macro ПроверкиДляКонвертацииЦБ( FD )
+   var FD_2;
+
+   if( IsClientDeal(Сделка) )
+      if( (Сделка.PortfolioID != KINDPORT_CLIENT) OR (Сделка.PortfolioID_2 != KINDPORT_CLIENT) )
+         MsgBox( "В сделке для клиента портфели списания и зачисления должны быть клиентскими." );
+         return retError;
+      end;
+   else /*свои сделки*/
+      FD_2 = SPFirstDoc( Сделка, true, true, УсловияСделки_Обр );
+      copy( FI, FD_2.fininstr );
+      copy( avr, FD_2.Avoiriss );
+
+      if( (Сделка.PortfolioID == KINDPORT_TRADE) AND (FI_IsQuoted( FD.avoiriss ) == false) )
+         MsgBox( "Портфель ССПУ_ЦБ в списании ц/б допустим только для котируемых ц/б." );
+         return retError;
+      end;
+
+      if( (Сделка.PortfolioID_2 == KINDPORT_TRADE) AND (FI_IsQuoted( FD_2.avoiriss ) == false) )
+         MsgBox( "Портфель ССПУ_ЦБ в зачислении ц/б допустим только для котируемых ц/б." );
+         return retError;
+      end;
+
+      if( (Сделка.PortfolioID_2 == KINDPORT_CONTR) and
+          (
+           (WRTGetPortfolioAmount(Сделка.Department, FI.FIID, -1, 0, KINDPORT_TRADE, -1, Сделка.DealDate, true, true, false ) > 0) OR
+           (WRTGetPortfolioAmount(Сделка.Department, FI.FIID, -1, 0, KINDPORT_SALE, -1, Сделка.DealDate, true, true, false ) > 0)
+          )
+        )
+         MsgBox( " Ценная бумага " + FI.FIID + " уже учитывается|либо в портфеле ССПУ_ЦБ, либо в Портфеле ц/б для продажи" );
+      end;
+
+      if( ( (Сделка.PortfolioID_2 == KINDPORT_TRADE) OR
+            (Сделка.PortfolioID_2 == KINDPORT_SALE)
+          ) AND
+          ( WRTGetPortfolioAmount(Сделка.Department, FI.FIID, -1, 0, KINDPORT_CONTR, -1, Сделка.DealDate, true, true, false ) > 0 )
+        )
+         MsgBox( " Ценная бумага " + FI.FIID + " уже учитывается в Портфеле контрольного участия" );
+      end;
+
+      if( (Сделка.PortfolioID == KINDPORT_TRADE) AND (FI_IsQuoted( FD.avoiriss ) == false) )
+         MsgBox( "Портфель ССПУ_ЦБ в списании ц/б допустим только для котируемых ц/б." );
+         return retError;
+      end;
+
+   end;
+
+   return retOk;
+end;
+
+private macro ПроверкиДляПаев( FD )
+   if( CheckPortfolio( FD ) )
+      return retError;
+   end;
+   return retOk;
+end;
+
+private macro ПроверкиДляСделокОЭБ( FD )
+  var rs;
+  var cmd:string = "";
+  var ErrMsg:string = "";
+  var RetVal:bool = true;
+  var MinDateFin;
+
+  cmd = "SELECT av.t_BegPlacementDate, av.t_InCirCulationDate, fin.t_Issued FROM DAVOIRISS_DBT av, DFININSTR_DBT fin WHERE";
+  cmd = cmd + " av.t_FIID = " + FD.dl_leg.rec.PFI + " and fin.t_FIID = " + FD.dl_leg.rec.PFI;
+
+
+  rs = RsdRecordset(cmd);
+
+  if (rs.MoveNext())
+
+    if (SQL_ConvTypeDate(rs.value("t_BegPlacementDate")) != date(0,0,0))
+      MinDateFin = min (SQL_ConvTypeDate(rs.value("t_BegPlacementDate")), SQL_ConvTypeDate(rs.value("t_Issued")));
+    else
+      MinDateFin = SQL_ConvTypeDate(rs.value("t_Issued"));
+    end;
+
+    if (IsSALE(GetOperationGroup ( FD.tick.rec.DealType )))
+      if (SQL_ConvTypeDate(rs.value("t_InCirCulationDate")) > FD.tick.rec.DealDate)
+        ErrMsg = "Дата заключения сделки меньше даты начала обращения выпуска";
+        if (MsgBoxEx( ErrMsg + "| Продолжить выполнение?", MB_YES+MB_NO, IND_NO ) == IND_NO)
+          return retError;
+        end;
+      end;
+      if (SQL_ConvTypeDate(rs.value("t_InCirCulationDate")) > FD.dl_leg.rec.Maturity)
+        ErrMsg = "Дата поставки меньше даты начала обращения выпуска";
+        if (MsgBoxEx( ErrMsg + "| Продолжить выполнение?", MB_YES+MB_NO, IND_NO ) == IND_NO)
+          return retError;
+        end;
+      end;
+    end;
+
+    if (MinDateFin > FD.tick.rec.DealDate)
+      ErrMsg = "Дата заключения сделки меньше даты начала размещения или даты регистрации выпуска";
+      if (MsgBoxEx( ErrMsg + "| Продолжить выполнение?", MB_YES+MB_NO, IND_NO ) == IND_NO)
+        return retError;
+      end;
+    end;
+    if (MinDateFin > FD.dl_leg.rec.Maturity)
+      ErrMsg = "Дата поставки меньше даты начала размещения или даты регистрации выпуска";
+      if (MsgBoxEx( ErrMsg + "| Продолжить выполнение?", MB_YES+MB_NO, IND_NO ) == IND_NO)
+        return retError;
+      end;
+    end;
+  end;
+
+  if(GetObservedBaselineDataAttrID(FD.fininstr.rec.FIID) == 0)
+     MsgBox( "Необходимо задать значение категории \"Наблюдаемые исходные данные\" для ц/б" );
+     return retError;
+  end;
+
+  if((FD.avoiriss.rec.Subordinated == SET_CHAR) and (GetSubordCvalTypeAttrID(FD.fininstr.rec.FIID) == 0))
+     MsgBox( "Необходимо задать значение категории \"Квалификационный признак суборд.ОЭБ\" для ц/б" );
+     return retError;
+  end;
+
+  return retOk;
+end;
+
+private macro ПроверкиДляЗайма( FD )
+   return retOk;
+end;
+
+private macro ПроверкиДляОперцийДивидендов( FD )
+   return retOk;
+end;
+
+private macro МассовыеПроверкиДляЗачисленийИСписаний()
+  var cmd;
+
+  ///////////////////////////////////////////////////////////////////////////////////////
+  cmd = RsdCommand(
+    "UPDATE DOPRTEMP_TMP temp SET temp.t_ErrorStatus = ?, temp.t_ErrorMessage = ? " +
+    " WHERE temp.t_ErrorStatus = 0 "+
+    "   and temp.t_SkipDocument = 0 " +
+    "   and temp.t_DocKind = " + DL_AVRWRT +
+    "   and Exists(select 1 from ddl_leg_dbt leg " +
+    "               where leg.t_DealID = temp.t_OrderID " +
+    "                 and leg.t_LegKind = " + LEG_KIND_DL_TICK +
+    "                 and leg.t_LegID = 0 " +
+    "                 and leg.t_Principal <= 0 "+
+    "             )"
+   );
+  cmd.addParam( "", RSDBP_IN, retError );
+  cmd.addParam( "", RSDBP_IN, "Количество должно быть положительным." );
+
+  SQL_Execute( cmd, "Проверка сделок: количество", true );
+
+  ///////////////////////////////////////////////////////////////////////////////////////
+  cmd = RsdCommand(
+    "UPDATE DOPRTEMP_TMP temp SET temp.t_ErrorStatus = ?, temp.t_ErrorMessage = ? " +
+    " WHERE temp.t_ErrorStatus = 0 "+
+    "   and temp.t_SkipDocument = 0 " +
+    "   and temp.t_DocKind = " + DL_AVRWRT +
+    "   and Exists(select 1 from ddl_tick_dbt tk, ddl_leg_dbt leg " +
+    "               where tk.t_DealID = temp.t_OrderID " +
+    "                 and tk.t_PortfolioID IN ("+KINDPORT_TRADE+","+KINDPORT_SALE+","+KINDPORT_CONTR+")"+
+    "                 and leg.t_DealID = tk.t_DealID " +
+    "                 and leg.t_LegKind = " + LEG_KIND_DL_TICK +
+    "                 and leg.t_LegID = 0 " +
+    "                 and (leg.t_Price <= 0 or leg.t_Cost <= 0) "+
+    "             )"
+   );
+  cmd.addParam( "", RSDBP_IN, retError );
+  cmd.addParam( "", RSDBP_IN, "Поля \"Цена\" и \"Стоимость\" должны быть положительными." );
+
+  SQL_Execute( cmd, "Проверка сделок: цена и стоимость", true );
+
+  ///////////////////////////////////////////////////////////////////////////////////////
+  cmd = RsdCommand(
+    "UPDATE DOPRTEMP_TMP temp SET temp.t_ErrorStatus = ?, temp.t_ErrorMessage = ? " +
+    " WHERE temp.t_ErrorStatus = 0 "+
+    "   and temp.t_SkipDocument = 0 " +
+    "   and temp.t_DocKind = " + DL_AVRWRT +
+    "   and Exists(select 1 from ddl_tick_dbt tk, ddl_leg_dbt leg " +
+    "               where tk.t_DealID = temp.t_OrderID " +
+    "                 and tk.t_PortfolioID = "+KINDPORT_CLIENT+
+    "                 and leg.t_DealID = tk.t_DealID " +
+    "                 and leg.t_LegKind = " + LEG_KIND_DL_TICK +
+    "                 and leg.t_LegID = 0 " +
+    "                 and (leg.t_Price < 0 or leg.t_Cost < 0) "+
+    "             )"
+   );
+  cmd.addParam( "", RSDBP_IN, retError );
+  cmd.addParam( "", RSDBP_IN, "Поля \"Цена\" и \"Стоимость\" должны быть не отрицательными." );
+
+  SQL_Execute( cmd, "Проверка сделок: цена и стоимость клиентской сделки", true );
+
+  ///////////////////////////////////////////////////////////////////////////////////////
+  cmd = RsdCommand(
+    "UPDATE DOPRTEMP_TMP temp SET temp.t_ErrorStatus = ?, temp.t_ErrorMessage = ? " +
+    " WHERE temp.t_ErrorStatus = 0 "+
+    "   and temp.t_SkipDocument = 0 " +
+    "   and temp.t_DocKind = " + DL_AVRWRT +
+    "   and Exists(select 1 from ddl_tick_dbt tk " +
+    "               where tk.t_DealID = temp.t_OrderID " +
+    "                 and RSB_FIInstr.FI_IsKSU(tk.t_PFI) = 1 "+
+    "                 and tk.t_MarketSchemeID <= 0"+
+    "             )"
+   );
+  cmd.addParam( "", RSDBP_IN, retError );
+  cmd.addParam( "", RSDBP_IN, "Не задана схема расчетов с биржей." );
+
+  SQL_Execute( cmd, "Проверка сделок: схема расчетов", true );
+
+end;
+
+private macro ПроверкиДляЗачисленийИСписанийОЭБ( FD )
+    return retOk;
+end;
+
+private macro ПроверкиДляЗачисленийИСписаний( FD )
+   if( CheckPortfolio( FD ) )
+      return retError;
+   end;
+
+   if(УсловияСделки.Principal <= 0)
+      MsgBox( "Количество должно быть положительным" );
+      return retError;
+   end;
+
+   if ( (Сделка.PortfolioID == KINDPORT_TRADE) or (Сделка.PortfolioID == KINDPORT_SALE) or (Сделка.PortfolioID == KINDPORT_CONTR))
+//      if ( (УсловияСделки.Price <= 0) or (УсловияСделки.Cost <= 0) )
+      if ( (УсловияСделки.Price < 0) or (УсловияСделки.Cost < 0) )
+         MsgBox( "Поля \"Цена\" и \"Стоимость\" должны быть положительными" );
+         return retError;
+      end;
+   elif ( (Сделка.PortfolioID == KINDPORT_CLIENT) )
+      if ( (УсловияСделки.Price < 0) or (УсловияСделки.Cost < 0) )
+         MsgBox( "Поля \"Цена\" и \"Стоимость\" должны быть не отрицательными" );
+         return retError;
+      end;
+   end;
+
+   if(FI_IsKSU(FD.fininstr))
+     if(Сделка.MarketSchemeID <= 0)
+       MsgBox( "Не задана схема расчетов с биржей" );
+       return retError;
+     end;
+   end;
+
+   return retOk;
+end;
+
+private macro ЗаполнитьЗаявку()
+  var Group;
+
+  if( (Сделка.OriginID == 0) AND (Сделка.BofficeKind != DL_TRUSTDOC) AND (Сделка.BofficeKind != DL_RETURN_DIVIDEND)) /*не шлюз и не ДУ*/
+     Group = SP_GetOperationGroup( Сделка );
+     if( ( Сделка.ClientID > 0 ) and
+         (    IsOUTEXCHANGE( Group )
+           or IsBROKER( Group )
+           or (     IsEXCHANGE( Group )
+                and (Сделка.Flag1 != SET_CHAR) )
+         )
+       )
+       DL_СкорректироватьДатуЗаявки( Сделка.DealDate, Сделка.DealTime, @ДокументПоручение.RegistrDate, @ДокументПоручение.RegistrTime );
+       ДокументПоручение.XLD = DL_СформироватьНомерЗаявки( Сделка.MarketID, ДокументПоручение.RegistrDate, ДокументПоручение.RegistrTime );
+       ДокументПоручение.SignedDate = ДокументПоручение.RegistrDate;
+       ДокументПоручение.SignedTime = ДокументПоручение.RegistrTime;
+     end;
+  end;
+end;
+
+private macro CheckDealOwn()
+
+  if(Сделка.BofficeKind == DL_SECUROWN)
+    var FD = SPFirstDoc( Сделка );
+    var fininstr = TRecHandler("fininstr.dbt");
+    var avoiriss = TRecHandler("avoiriss.dbt");
+
+    if( ПолучитьФинИн(УсловияСделки.PFI, fininstr ) != 0 ) 
+       msgbox( "Не найдена ценная бумага (FIID = " + УсловияСделки.PFI + ")");
+       return retError;
+    end;
+    
+    var MinDatePlacement = date(0,0,0);
+    var DeliveryPlanDate = SP_GetAvoirissPlanDate(УсловияСделки, true);
+    
+    if(Сделка.DealDate >= fininstr.rec.DrawingDate)
+      msgbox("Дата заключения сделки больше даты погашения выпуска");
+    end;
+
+    if(DeliveryPlanDate >= fininstr.rec.DrawingDate)
+      msgbox("Дата поставки больше даты погашения выпуска");
+    end;
+
+    if(avoiriss.rec.BegPlacementDate == ZeroDate)
+      MinDatePlacement = fininstr.rec.Issued;
+    else
+      MinDatePlacement = min(avoiriss.rec.BegPlacementDate, fininstr.rec.Issued);
+    end;
+
+    if(Сделка.DealDate < MinDatePlacement)
+      msgbox("Дата заключения сделки меньше даты начала размещения или даты регистрации выпуска");
+    end;
+
+    if(DeliveryPlanDate < MinDatePlacement)
+      msgbox("Дата поставки меньше даты начала размещения или даты регистрации выпуска");
+    end;
+
+    if(IsSALE(FD.Group))
+      if(Сделка.DealDate < avoiriss.rec.InCirculationDate)
+        msgbox("Дата заключения сделки меньше даты начала обращения выпуска");
+      end;
+
+      if(DeliveryPlanDate < avoiriss.rec.InCirculationDate)
+        msgbox("Дата поставки меньше даты начала обращения выпуска");
+      end;
+    end;
+  end;
+
+  return retOk;
+end;
+
+private macro Новая_Сделка(Type:integer):integer
+  return retOk;
+end;
+
+macro Проверить_Сделку(Type:integer, Mode:integer, IsWeb:bool):integer
+
+
+  var FD, stat, RegistrDate, CheckDate,dp, cmd, RQMaxDate = date(0, 0, 0);
+
+  /*По запросам 104226, 109099 - если изменили поставляемый выпуск и уже сформировано
+    поручение депо, то предупреждаем пользователя об этом изменении.
+  */
+
+  /*BIQ-13034 BOSS-814 BOSS-789 */
+  if ((Сделка.DealType == 32743) and (Mode == modeUpdate))
+    if (УсловияСделки.DeliveringFIID != СтарыеУсловияСделки.DeliveringFIID) 
+      MsgBox("Для операции 32743 запрещено изменение ЦБ " + string(СтарыеУсловияСделки.DeliveringFIID) + "=>" + string(УсловияСделки.DeliveringFIID));
+      return retError;
+    end; 
+    // DEF-86490 в файле spdlmac.c в строке 64 в "if( !D->deal->getSave()" убрано !   
+    //           теперь СтараяСделка должна заполняться, можно сделать проверки.
+    //           на всякий случай добавлено условие "СтараяСделка.PartyId > 0",
+    //           чтобы, если не сработает код заполнения буфера СтараяСделка, никто не пострадал
+    if ((Сделка.PartyId != СтараяСделка.PartyId) OR (Сделка.ClientContrId != СтараяСделка.ClientContrId))  
+      MsgBox("Для операции 32743 запрещено изменение Клиента и номера Договора");
+      return retError;
+    end; 
+    if (УсловияСделки.Principal != СтарыеУсловияСделки.Principal) 
+      MsgBox("Для операции 32743 запрещено изменение количества ЦБ " + string(СтарыеУсловияСделки.Principal) + "=>" + string(УсловияСделки.Principal));
+      return retError;
+    end; 
+  end;
+
+  If (Сделка.DealType == 32143) // установим признак агента в сделке, BIQ-8720 , DEF-15796
+      Сделка.bondagent = "X";
+  End;
+  
+  if( Mode == modeUpdate )
+
+     if(Сделка.BofficeKind != DL_RETURN_DIVIDEND)
+       /*Только если ведется учет в депозитарии*/
+       //if( DL_CustodyAccounting == DL_CUSTODYACCOUNTING_CUSTODY )
+          /*Если изменили поставляемый выпуск*/
+/*
+          if (УсловияСделки.DeliveringFIID != СтарыеУсловияСделки.DeliveringFIID)
+             FD = SPFirstDoc( Сделка, false, true, УсловияСделки );
+             stat = ExecMacroFile("dpdrutl.mac", "SP_GetDraftDate", FD.GetRQ(DLRQ_TYPE_DELIVERY), RegistrDate);
+
+             if (stat == true)
+                msgbox("Необходимо выполнить в модуле \"Депозитарий\" корректировку реквизита \n " +
+                       "\"поставляемый выпуск\" \n " +
+                       "в поручении депо, сформированном по данной сделке"
+                      );
+             end;
+          end;
+*/
+       //end;
+
+       ЗаполнитьЗаявку();
+     end;
+
+     if(Сделка.BofficeKind == DL_SECUROWN)
+       if(CheckDealOwn() != retOk)
+         return retError;
+       end;
+     end;
+
+     If (Сделка.BofficeKind == DL_AVRWRT)
+        if ((СтоимостьпокупкивНУ.NotCountedOnIIS != СтараяСтоимостьпокупкивНУ.NotCountedOnIIS) and (not DL_CheckContrIIS(Сделка.ClientContrID)))
+           var lotExist = ExecSQLSelect("SELECT 1 FROM DNPTXLOT_DBT WHERE T_DOCKIND = :dockind and T_DOCID = :docid", MakeArray(SQLParam("dockind", Сделка.BofficeKind), SQLParam("docid", Сделка.dealid)), false);
+           if (lotExist.MoveNext())
+             MsgBox("Изменилось значение признака учета ц/б на ИИС. Требуется пересчет НОБ с квитовкой.");
+           end;
+        end;
+     end;
+
+     return retOk;
+
+  elif( Mode == modePreInsert )
+
+     return retOk;
+
+  elif( Mode == modePreUpdate )
+
+     return retOk;
+
+  elif( Mode == modeBeginOper )
+
+     if( Сделка.DealDate > {CurDate} )
+        MsgBox( "Дата заключения сделки должна быть меньше или равна текущей." );
+        return retError;
+     end;
+
+     FD = SPFirstDoc( Сделка, false, true, УсловияСделки );
+     if( FD.IsOldDeal() )
+        MsgBox( "Выполнение сделок данного вида запрещено." );
+        return retError;
+     end;
+
+     if( not FD.CheckCliring( false ) )
+        return retError;
+     end;
+
+     /*получить запись для покупаемой ценной бумаги*/
+     copy( FI, FD.fininstr );
+     copy( avr, FD.Avoiriss );
+
+     if(not IsTODAY( FD.Group ))
+        if( IsBUY( FD.Group ) OR IsAVRWRTIN(FD.Group) OR Сделка.BofficeKind == DL_INVESTSHARE )
+           if( Сделка.PortfolioID == KINDPORT_PROMISSORY )
+              if( Сделка.DealDate < FD.fininstr.rec.DrawingDate )
+                 if( MsgBoxEx( "Дата сделки меньше даты погашения ц/б.|Выполнять операцию ?",
+                     MB_YES+MB_NO, IND_NO,
+                     "", "Подтверждение начала операции" ) != IND_YES )
+                    return retError;
+                 end;
+              end;
+           else
+              if (FD.avoiriss.rec.BegPlacementDate != Date(0,0,0))
+                 CheckDate = minDate(FD.fininstr.rec.Issued, FD.avoiriss.rec.BegPlacementDate);
+              else
+                 CheckDate = FD.fininstr.rec.Issued;
+              end;
+
+              /*4.1.2*/
+              if( Сделка.DealDate < CheckDate )
+                 if( MsgBoxEx( "Дата сделки меньше даты выпуска ц/б.|Выполнять операцию ?",
+                    MB_YES+MB_NO, IND_NO,
+                    "", "Подтверждение начала операции" ) != IND_YES )
+                    return retError;
+                 end;
+              end;
+
+              /*4.2.1*/
+              dp = IIF(FD.dl_leg.rec.MaturityIsPrincipal == SET_CHAR, FD.dl_leg.rec.Maturity, FD.dl_leg.rec.Expiry);
+              if (not IsAVRWRTIN(FD.Group))
+                 if( (FD.fininstr.rec.DrawingDate != Date(0,0,0)) AND (dp > FD.fininstr.rec.DrawingDate) )
+                     if( MsgBoxEx( "Дата поставки больше даты погашения ц/б.|Выполнять операцию ?",
+                        MB_YES+MB_NO, IND_NO,
+                        "", "Подтверждение начала операции" ) != IND_YES )
+                        return retError;
+                     end;
+                 end;
+              end;
+
+              /*4.2.2*/
+              if( dp < CheckDate )
+                 if( MsgBoxEx( "Дата поставки меньше даты выпуска ц/б.|Выполнять операцию ?",
+                    MB_YES+MB_NO, IND_NO,
+                    "", "Подтверждение начала операции" ) != IND_YES )
+                    return retError;
+                 end;
+              end;
+           end;
+
+        elif( IsSALE( FD.Group ) OR IsAVRWRTOUT(FD.Group) )
+           /*4.1.3*/
+           if( Сделка.DealDate < FD.avoiriss.rec.InCirculationDate )
+              if( MsgBoxEx( "Дата сделки меньше даты ввода ц/б в обращение.|Выполнять операцию ?",
+                 MB_YES+MB_NO, IND_NO,
+                 "", "Подтверждение начала операции" ) != IND_YES )
+                 return retError;
+              end;
+           end;
+           /*4.2.3*/
+           dp = IIF(FD.dl_leg.rec.MaturityIsPrincipal == SET_CHAR, FD.dl_leg.rec.Maturity, FD.dl_leg.rec.Expiry);
+           if( dp < FD.avoiriss.rec.InCirculationDate )
+              if( MsgBoxEx( "Дата поставки меньше даты ввода ц/б в обращение.|Выполнять операцию ?",
+                 MB_YES+MB_NO, IND_NO,
+                 "", "Подтверждение начала операции" ) != IND_YES )
+                 return retError;
+              end;
+           end;
+        end;
+        /*для зачислений/списаний и для ДУ проверки не нужны*/
+     end;
+
+     RQMaxDate = IIF(FD.dl_leg.rec.Maturity > FD.dl_leg.rec.Expiry, FD.dl_leg.rec.Maturity, FD.dl_leg.rec.Expiry);
+     RQMaxDate = IIF(RQMaxDate > Сделка.DealDate, RQMaxDate, Сделка.DealDate);
+     if (not IsAVRWRTIN(FD.Group))
+        if( ((FD.fininstr.rec.ExpiryDate != Date(0,0,0)) AND (RQMaxDate >= FD.fininstr.rec.ExpiryDate)) or 
+            ((FD.fininstr.rec.DrawingDate != Date(0,0,0)) AND (RQMaxDate >= FD.fininstr.rec.DrawingDate)) )
+              MsgBox("Выпуск " + FD.fininstr.rec.FI_Code + " полностью погашен на дату " + string(RQMaxDate:f));
+              return retError; 
+        end;
+     end;
+
+     if( (Сделка.BofficeKind == DL_SECURITYDOC) OR (Сделка.BofficeKind == DL_CONVAVR) OR (Сделка.BofficeKind == DL_AVRWRT) )
+        if( НужнаПеренумерацияСделокЗаДату(Сделка.DealDate) )
+           if( MsgBoxEx("Требуется выполнить перенумерацию сделок в дате " + string(Сделка.DealDate:f) + ". Продолжить выполнение без перенумерации?", MB_YES+MB_NO, IND_NO) != IND_YES )
+              return retError;
+           end;
+        end;
+     end;
+
+     if( IsBasket( FD.Group ) and (FD.tick.rec.OriginID > 0) )
+        var FD_2 = SPFirstDoc( Сделка, true, true, УсловияСделки_Обр );
+
+        if( FD_2.dl_leg.rec.Maturity == ZeroDate )
+           MsgBox( "По сделке не задана дата исполнения 2 части. Нельзя продолжить исполнение.");
+           return retError;
+        end;
+        if( not FD.IsExistsTick_ENS() )
+           MsgBox( "По сделке не задано обеспечение. Нельзя продолжить исполнение.");
+           return retError;
+        end;
+        if( (FD.dl_leg.rec.Cost < FD.dl_leg.rec.TotalCost) OR (FD.dl_leg.rec.Cost > FD.dl_leg.rec.TotalCost) )
+           if( MsgBoxEx( "Загруженное обеспечение по сделке не соответствует сумме сделки.|Выполнять операцию ?",
+              MB_YES+MB_NO, IND_NO,
+              "", "Подтверждение начала операции" ) != IND_YES )
+              return retError;
+           end;
+        end;
+     end;
+
+     if( (Сделка.BofficeKind == DL_AVRWRT) OR (Сделка.BofficeKind == DL_TRUSTAVRWRT) )
+        return ПроверкиДляЗачисленийИСписаний( FD );
+     elif ( Сделка.BofficeKind == DL_AVRWRTOWN )
+        return ПроверкиДляЗачисленийИСписанийОЭБ( FD );
+     elif( Сделка.BofficeKind == DL_CONVAVR )
+        return ПроверкиДляКонвертацииЦБ( FD );
+     elif( Сделка.BofficeKind == DL_INVESTSHARE )
+        return ПроверкиДляПаев( FD );
+     elif( Сделка.BofficeKind == DL_SECUROWN )
+        return ПроверкиДляСделокОЭБ( FD );
+     elif( FD.IsOperLOAN == true )
+        return ПроверкиДляЗайма( FD );
+     elif( Сделка.BofficeKind == DL_GET_DIVIDEND )
+        return ПроверкиДляОперцийДивидендов( FD );
+     elif ( Сделка.BofficeKind == DL_RETURN_DIVIDEND )
+        return 0;
+     else
+        return ПроверкиДляСделки( FD );
+     end;
+
+  elif( Mode == modeMassBeginOper )
+
+     cmd = RsdCommand(
+       "UPDATE DOPRTEMP_TMP temp SET temp.t_ErrorStatus = ?, temp.t_ErrorMessage = ? " +
+       " WHERE temp.t_ErrorStatus = 0 and temp.t_SkipDocument = 0"+
+       "   AND Exists(select 1 from ddl_tick_dbt tk where tk.t_DealID = temp.t_OrderID and tk.t_DealDate > ?)"
+      );
+     cmd.addParam( "", RSDBP_IN, retError );
+     cmd.addParam( "", RSDBP_IN, "Дата заключения сделки должна быть меньше или равна текущей." );
+     cmd.addParam( "", RSDBP_IN, {curdate} );
+
+     SQL_Execute( cmd, "Проверка сделок: дата заключения", true );
+
+     //////////////////////////////////////////////////////////////////////////////////////////////////////////
+     cmd = RsdCommand(
+       "UPDATE DOPRTEMP_TMP temp SET temp.t_ErrorStatus = ?, temp.t_ErrorMessage = ? " +
+       " WHERE temp.t_ErrorStatus = 0 and temp.t_SkipDocument = 0 and temp.t_Kind_Operation IN (2141,2151,2142,2152,2121,2126,2131,2136,2161,2171,2182,2192) "
+      );
+     cmd.addParam( "", RSDBP_IN, retError );
+     cmd.addParam( "", RSDBP_IN, "Выполнение сделок данного вида запрещено." );
+
+     SQL_Execute( cmd, "Проверка сделок.", true );
+
+     //////////////////////////////////////////////////////////////////////////////////////////////////////////
+/*
+     cmd = RsdCommand(
+       "UPDATE DOPRTEMP_TMP temp SET temp.t_ErrorStatus = ?, temp.t_ErrorMessage = ? " +
+       " WHERE temp.t_ErrorStatus = 0"+
+       "   and temp.t_SkipDocument = 0 " +
+       "   and Exists(select 1 from ddl_tick_dbt tk, ddl_leg_dbt leg " +
+       "               where tk.t_DealID = temp.t_OrderID " +
+       "                 and leg.t_DealID = tk.t_DealID " +
+       "                 and leg.t_LegKind = " + LEG_KIND_DL_TICK +
+       "                 and leg.t_LegID = 0 " +
+       "                 and leg.t_CliringDate <> " + GetSQLDate(DATE(0,0,0)) +
+       "                 and leg.t_CliringChange = 'X' " +
+       "                 and Exists(select 1 "+
+       "                              from ddlrq_dbt rq " +
+       "                             where rq.t_DocKind = tk.t_BOfficeKind " +
+       "                               and rq.t_DocID = tk.t_DealID " +
+       "                               and rq.t_DealPart = 1" +
+       "                               and rq.t_Type = " + DLRQ_TYPE_DELIVERY +
+       "                               and rq.t_State not IN ("+DLRQ_STATE_EXEC+", "+DLRQ_STATE_GO_CLOSE+")"+
+       "                           ) " +
+       "             )"
+      );
+     cmd.addParam( "", RSDBP_IN, retError );
+     cmd.addParam( "", RSDBP_IN, "По сделке было изменение условий в клиринге. Требуется подтверждение выполнения операции." );
+
+     SQL_Execute( cmd, "Проверка сделок: изменение условий в клиринге", true );
+*/
+     //////////////////////////////////////////////////////////////////////////////////////////////////////////
+     cmd = RsdCommand(
+       "UPDATE DOPRTEMP_TMP temp SET temp.t_ErrorStatus = ?, temp.t_ErrorMessage = ? " +
+       " WHERE temp.t_ErrorStatus = 0 "+
+       "   and temp.t_SkipDocument = 0 " +
+       "   and rsb_secur.IsToday(rsb_secur.get_OperationGroup(rsb_secur.get_OperSysTypes(temp.t_Kind_Operation, temp.t_DocKind))) = 0 " +
+       "   and (   temp.t_DocKind = "+DL_INVESTSHARE+
+       "        or rsb_secur.IsBuy(rsb_secur.get_OperationGroup(rsb_secur.get_OperSysTypes(temp.t_Kind_Operation, temp.t_DocKind))) = 1 "+
+       "        or rsb_secur.IsAvrWrtIn(rsb_secur.get_OperationGroup(rsb_secur.get_OperSysTypes(temp.t_Kind_Operation, temp.t_DocKind))) = 1"+
+       "       )" +
+       "   and Exists(select 1 from ddl_tick_dbt tk, dfininstr_dbt fin " +
+       "               where tk.t_DealID = temp.t_OrderID " +
+       "                 and tk.t_PortfolioID = "+KINDPORT_PROMISSORY+
+       "                 and fin.t_FIID = tk.t_PFI "+
+       "                 and tk.t_DealDate < fin.t_DrawingDate " +
+       "                 and tk.t_DealDate >= TO_DATE('01.01.2019','DD.MM.YYYY') " +
+       "             )"
+      );
+     cmd.addParam( "", RSDBP_IN, retError );
+     cmd.addParam( "", RSDBP_IN, "Дата сделки меньше даты погашения ц/б. Требуется подтверждение выполнения операции." );
+
+     SQL_Execute( cmd, "Проверка сделок: дата сделки и дата погашения ц/б", true );
+
+     //////////////////////////////////////////////////////////////////////////////////////////////////////////
+     cmd = RsdCommand(
+       "UPDATE DOPRTEMP_TMP temp SET temp.t_ErrorStatus = ?, temp.t_ErrorMessage = ? " +
+       " WHERE temp.t_ErrorStatus = 0 "+
+       "   and temp.t_SkipDocument = 0 " +
+       "   and rsb_secur.IsToday(rsb_secur.get_OperationGroup(rsb_secur.get_OperSysTypes(temp.t_Kind_Operation, temp.t_DocKind))) = 0 " +
+       "   and (   temp.t_DocKind = "+DL_INVESTSHARE+
+       "        or rsb_secur.IsBuy(rsb_secur.get_OperationGroup(rsb_secur.get_OperSysTypes(temp.t_Kind_Operation, temp.t_DocKind))) = 1 "+
+//biq 12207       "        or rsb_secur.IsAvrWrtIn(rsb_secur.get_OperationGroup(rsb_secur.get_OperSysTypes(temp.t_Kind_Operation, temp.t_DocKind))) = 1"+
+       "       )" +
+       "   and Exists(select 1 from ddl_tick_dbt tk, dfininstr_dbt fin " +
+       "               where tk.t_DealID = temp.t_OrderID " +
+       "                 and tk.t_PortfolioID <> "+KINDPORT_PROMISSORY+
+       "                 and fin.t_FIID = tk.t_PFI "+
+       "                 and tk.t_DealDate > fin.t_DrawingDate and fin.t_DrawingDate > " + GetSQLDate(date(0,0,0)) +
+       "             )"
+      );
+     cmd.addParam( "", RSDBP_IN, retError );
+     cmd.addParam( "", RSDBP_IN, "Дата сделки больше даты погашения ц/б. Требуется подтверждение выполнения операции." );
+
+     SQL_Execute( cmd, "Проверка сделок: дата сделки и дата погашения ц/б", true );
+
+     //////////////////////////////////////////////////////////////////////////////////////////////////////////
+     cmd = RsdCommand(
+       "UPDATE DOPRTEMP_TMP temp SET temp.t_ErrorStatus = ?, temp.t_ErrorMessage = ? " +
+       " WHERE temp.t_ErrorStatus = 0 "+
+       "   and temp.t_SkipDocument = 0 " +
+       "   and rsb_secur.IsToday(rsb_secur.get_OperationGroup(rsb_secur.get_OperSysTypes(temp.t_Kind_Operation, temp.t_DocKind))) = 0 " +
+       "   and (   temp.t_DocKind = "+DL_INVESTSHARE+
+       "        or rsb_secur.IsBuy(rsb_secur.get_OperationGroup(rsb_secur.get_OperSysTypes(temp.t_Kind_Operation, temp.t_DocKind))) = 1 "+
+       "        or rsb_secur.IsAvrWrtIn(rsb_secur.get_OperationGroup(rsb_secur.get_OperSysTypes(temp.t_Kind_Operation, temp.t_DocKind))) = 1"+
+       "       )" +
+       "   and Exists(select 1 from ddl_tick_dbt tk, dfininstr_dbt fin, davoiriss_dbt avr " +
+       "               where tk.t_DealID = temp.t_OrderID " +
+       "                 and tk.t_PortfolioID <> "+KINDPORT_PROMISSORY+
+       "                 and fin.t_FIID = tk.t_PFI "+
+       "                 and avr.t_FIID = fin.t_FIID "+
+       "                 and tk.t_DealDate < (case when avr.t_BegPlacementDate <> "+GetSQLDate(date(0,0,0))+" then least(fin.t_Issued, avr.t_BegPlacementDate) else fin.t_Issued end)"+
+       "             )"
+      );
+     cmd.addParam( "", RSDBP_IN, retError );
+     cmd.addParam( "", RSDBP_IN, "Дата сделки меньше даты выпуска ц/б. Требуется подтверждение выполнения операции." );
+
+     SQL_Execute( cmd, "Проверка сделок: дата сделки и дата выпуска ц/б", true );
+
+     //////////////////////////////////////////////////////////////////////////////////////////////////////////
+     cmd = RsdCommand(
+       "UPDATE DOPRTEMP_TMP temp SET temp.t_ErrorStatus = ?, temp.t_ErrorMessage = ? " +
+       " WHERE temp.t_ErrorStatus = 0 "+
+       "   and temp.t_SkipDocument = 0 " +
+       "   and rsb_secur.IsToday(rsb_secur.get_OperationGroup(rsb_secur.get_OperSysTypes(temp.t_Kind_Operation, temp.t_DocKind))) = 0 " +
+       "   and (   temp.t_DocKind = "+DL_INVESTSHARE+
+       "        or rsb_secur.IsBuy(rsb_secur.get_OperationGroup(rsb_secur.get_OperSysTypes(temp.t_Kind_Operation, temp.t_DocKind))) = 1 "+
+//biq 12207 "        or rsb_secur.IsAvrWrtIn(rsb_secur.get_OperationGroup(rsb_secur.get_OperSysTypes(temp.t_Kind_Operation, temp.t_DocKind))) = 1"+
+       "       )" +
+       "   and Exists(select 1 from ddl_tick_dbt tk, dfininstr_dbt fin, ddl_leg_dbt leg " +
+       "               where tk.t_DealID = temp.t_OrderID " +
+       "                 and rsb_secur.IsToday(rsb_secur.get_OperationGroup(rsb_secur.get_OperSysTypes(tk.t_DealType, tk.t_BofficeKind))) = 0 " +
+//biq 12207       "                 and (tk.t_BofficeKind = "+DL_INVESTSHARE+" or rsb_secur.IsBuy(rsb_secur.get_OperationGroup(rsb_secur.get_OperSysTypes(tk.t_DealType, tk.t_BofficeKind))) = 1 /* or rsb_secur.IsAvrWrtIn(rsb_secur.get_OperationGroup(rsb_secur.get_OperSysTypes(tk.t_DealType, tk.t_BofficeKind))) = 1*/)" +
+       "                 and (tk.t_BofficeKind = "+DL_INVESTSHARE+" or rsb_secur.IsBuy(rsb_secur.get_OperationGroup(rsb_secur.get_OperSysTypes(tk.t_DealType, tk.t_BofficeKind))) = 1)" +
+       "                 and tk.t_PortfolioID <> "+KINDPORT_PROMISSORY+
+       "                 and leg.t_DealID = tk.t_DealID " +
+       "                 and leg.t_LegKind = " + LEG_KIND_DL_TICK +
+       "                 and leg.t_LegID = 0 " +
+       "                 and fin.t_FIID = tk.t_PFI "+
+       "                 and fin.t_DrawingDate > " + GetSQLDate(date(0,0,0)) +
+       "                 and fin.t_DrawingDate < (case when leg.t_MaturityIsPrincipal = 'X' then leg.t_Maturity else leg.t_Expiry end)" +
+       "             )"
+      );
+     cmd.addParam( "", RSDBP_IN, retError );
+     cmd.addParam( "", RSDBP_IN, "Дата поставки больше даты погашения ц/б. Требуется подтверждение выполнения операции." );
+
+     SQL_Execute( cmd, "Проверка сделок: дата поставки и дата погашения ц/б", true );
+
+     //////////////////////////////////////////////////////////////////////////////////////////////////////////
+     cmd = RsdCommand(
+       "UPDATE DOPRTEMP_TMP temp SET temp.t_ErrorStatus = ?, temp.t_ErrorMessage = ? " +
+       " WHERE temp.t_ErrorStatus = 0 "+
+       "   and temp.t_SkipDocument = 0 " +
+       "   and rsb_secur.IsToday(rsb_secur.get_OperationGroup(rsb_secur.get_OperSysTypes(temp.t_Kind_Operation, temp.t_DocKind))) = 0 " +
+       "   and (   temp.t_DocKind = "+DL_INVESTSHARE+
+       "        or rsb_secur.IsBuy(rsb_secur.get_OperationGroup(rsb_secur.get_OperSysTypes(temp.t_Kind_Operation, temp.t_DocKind))) = 1 "+
+       "        or rsb_secur.IsAvrWrtIn(rsb_secur.get_OperationGroup(rsb_secur.get_OperSysTypes(temp.t_Kind_Operation, temp.t_DocKind))) = 1"+
+       "       )" +
+       "   and Exists(select 1 from ddl_tick_dbt tk, dfininstr_dbt fin, davoiriss_dbt avr, ddl_leg_dbt leg " +
+       "               where tk.t_DealID = temp.t_OrderID " +
+       "                 and tk.t_PortfolioID <> "+KINDPORT_PROMISSORY+
+       "                 and leg.t_DealID = tk.t_DealID " +
+       "                 and leg.t_LegKind = " + LEG_KIND_DL_TICK +
+       "                 and leg.t_LegID = 0 " +
+       "                 and fin.t_FIID = tk.t_PFI "+
+       "                 and avr.t_FIID = fin.t_FIID "+
+       "                 and (case when leg.t_MaturityIsPrincipal = 'X' then leg.t_Maturity else leg.t_Expiry end) < (case when avr.t_BegPlacementDate <> "+GetSQLDate(date(0,0,0))+" then least(fin.t_Issued, avr.t_BegPlacementDate) else fin.t_Issued end)"+
+       "             )"
+      );
+     cmd.addParam( "", RSDBP_IN, retError );
+     cmd.addParam( "", RSDBP_IN, "Дата поставки меньше даты выпуска ц/б. Требуется подтверждение выполнения операции." );
+
+     SQL_Execute( cmd, "Проверка сделок: дата поставки и дата выпуска ц/б", true );
+
+     //////////////////////////////////////////////////////////////////////////////////////////////////////////
+     cmd = RsdCommand(
+       "UPDATE DOPRTEMP_TMP temp SET temp.t_ErrorStatus = ?, temp.t_ErrorMessage = ? " +
+       " WHERE temp.t_ErrorStatus = 0 "+
+       "   and temp.t_SkipDocument = 0 " +
+       "   and rsb_secur.IsToday(rsb_secur.get_OperationGroup(rsb_secur.get_OperSysTypes(temp.t_Kind_Operation, temp.t_DocKind))) = 0 " +
+       "   and (   rsb_secur.IsSale(rsb_secur.get_OperationGroup(rsb_secur.get_OperSysTypes(temp.t_Kind_Operation, temp.t_DocKind))) = 1 "+
+       "        or rsb_secur.IsAvrWrtOut(rsb_secur.get_OperationGroup(rsb_secur.get_OperSysTypes(temp.t_Kind_Operation, temp.t_DocKind))) = 1"+
+       "       )" +
+       "   and Exists(select 1 from ddl_tick_dbt tk, dfininstr_dbt fin, davoiriss_dbt avr " +
+       "               where tk.t_DealID = temp.t_OrderID " +
+       "                 and fin.t_FIID = tk.t_PFI "+
+       "                 and avr.t_FIID = fin.t_FIID "+
+       "                 and tk.t_DealDate < avr.t_InCirculationDate" +
+       "             )"
+      );
+     cmd.addParam( "", RSDBP_IN, retError );
+     cmd.addParam( "", RSDBP_IN, "Дата сделки меньше даты ввода ц/б в обращение. Требуется подтверждение выполнения операции." );
+
+     SQL_Execute( cmd, "Проверка сделок: дата сделки и дата ввода ц/б в обращение", true );
+
+     //////////////////////////////////////////////////////////////////////////////////////////////////////////
+     cmd = RsdCommand(
+       "UPDATE DOPRTEMP_TMP temp SET temp.t_ErrorStatus = ?, temp.t_ErrorMessage = ? " +
+       " WHERE temp.t_ErrorStatus = 0 "+
+       "   and temp.t_SkipDocument = 0 " +
+       "   and rsb_secur.IsToday(rsb_secur.get_OperationGroup(rsb_secur.get_OperSysTypes(temp.t_Kind_Operation, temp.t_DocKind))) = 0 " +
+       "   and (   rsb_secur.IsSale(rsb_secur.get_OperationGroup(rsb_secur.get_OperSysTypes(temp.t_Kind_Operation, temp.t_DocKind))) = 1 "+
+       "        or rsb_secur.IsAvrWrtOut(rsb_secur.get_OperationGroup(rsb_secur.get_OperSysTypes(temp.t_Kind_Operation, temp.t_DocKind))) = 1"+
+       "       )" +
+       "   and Exists(select 1 from ddl_tick_dbt tk, dfininstr_dbt fin, davoiriss_dbt avr, ddl_leg_dbt leg " +
+       "               where tk.t_DealID = temp.t_OrderID " +
+       "                 and leg.t_DealID = tk.t_DealID " +
+       "                 and leg.t_LegKind = " + LEG_KIND_DL_TICK +
+       "                 and leg.t_LegID = 0 " +
+       "                 and fin.t_FIID = tk.t_PFI "+
+       "                 and avr.t_FIID = fin.t_FIID "+
+       "                 and (case when leg.t_MaturityIsPrincipal = 'X' then leg.t_Maturity else leg.t_Expiry end) < avr.t_InCirculationDate" +
+       "             )"
+      );
+     cmd.addParam( "", RSDBP_IN, retError );
+     cmd.addParam( "", RSDBP_IN, "Дата поставки меньше даты ввода ц/б в обращение. Требуется подтверждение выполнения операции." );
+
+     SQL_Execute( cmd, "Проверка сделок: дата поставки и дата ввода ц/б в обращение", true );
+
+     //////////////////////////////////////////////////////////////////////////////////////////////////////////
+     if( DL_ТребоватьПеренумерациюСделок() )
+       cmd = RsdCommand(
+         "UPDATE DOPRTEMP_TMP temp SET temp.t_ErrorStatus = ?, temp.t_ErrorMessage = ? " +
+         " WHERE temp.t_ErrorStatus = 0 "+
+         "   and temp.t_SkipDocument = 0 " +
+         "   and temp.t_DocKind IN ("+DL_SECURITYDOC+","+DL_AVRWRT+","+DL_CONVAVR+")"+
+         "   and rsb_secur.IsToday(rsb_secur.get_OperationGroup(rsb_secur.get_OperSysTypes(temp.t_Kind_Operation, temp.t_DocKind))) = 0 " +
+         "   and (   rsb_secur.IsSale(rsb_secur.get_OperationGroup(rsb_secur.get_OperSysTypes(temp.t_Kind_Operation, temp.t_DocKind))) = 1 "+
+         "        or rsb_secur.IsAvrWrtOut(rsb_secur.get_OperationGroup(rsb_secur.get_OperSysTypes(temp.t_Kind_Operation, temp.t_DocKind))) = 1"+
+         "       )" +
+         "   and Exists(select 1 from ddl_tick_dbt tk, dfininstr_dbt fin, davoiriss_dbt avr, ddl_leg_dbt leg " +
+         "               where tk.t_DealID = temp.t_OrderID " +
+         "                 and Exists(select 1 from DDLDATECALC_DBT dt where dt.t_Date = tk.t_DealDate and (dt.t_CalcState = 0 or dt.t_CalcState = 2)) " +
+         "                 and leg.t_DealID = tk.t_DealID " +
+         "                 and leg.t_LegKind = " + LEG_KIND_DL_TICK +
+         "                 and leg.t_LegID = 0 " +
+         "                 and fin.t_FIID = tk.t_PFI "+
+         "                 and avr.t_FIID = fin.t_FIID "+
+         "                 and (case when leg.t_MaturityIsPrincipal = 'X' then leg.t_Maturity else leg.t_Expiry end) < avr.t_InCirculationDate" +
+         "             )"
+        );
+       cmd.addParam( "", RSDBP_IN, retError );
+       cmd.addParam( "", RSDBP_IN, "Требуется выполнить перенумерацию сделок. Требуется подтверждение выполнения операции." );
+
+       SQL_Execute( cmd, "Проверка сделок: необходимость перенумерации", true );
+     end;
+
+     //////////////////////////////////////////////////////////////////////////////////////////////////////////
+     cmd = RsdCommand(
+       "UPDATE DOPRTEMP_TMP temp SET temp.t_ErrorStatus = ?, temp.t_ErrorMessage = ? " +
+       " WHERE temp.t_ErrorStatus = 0 "+
+       "   and temp.t_SkipDocument = 0 " +
+       "   and rsb_secur.IsBasket(rsb_secur.get_OperationGroup(rsb_secur.get_OperSysTypes(temp.t_Kind_Operation, temp.t_DocKind))) = 1 " +
+       "   and Exists(select 1 from ddl_tick_dbt tk, ddl_leg_dbt leg " +
+       "               where tk.t_DealID = temp.t_OrderID " +
+       "                 and tk.t_OriginID > 0 "+
+       "                 and leg.t_DealID = tk.t_DealID " +
+       "                 and leg.t_LegKind = " + LEG_KIND_DL_TICK_BACK +
+       "                 and leg.t_LegID = 0 " +
+       "                 and leg.t_Maturity = " + GetSQLDate(date(0,0,0)) +
+       "             )"
+      );
+     cmd.addParam( "", RSDBP_IN, retError );
+     cmd.addParam( "", RSDBP_IN, "По сделке не задана дата исполнения 2 части." );
+
+     SQL_Execute( cmd, "Проверка сделок: дата исполнения 2 части", true );
+
+     //////////////////////////////////////////////////////////////////////////////////////////////////////////
+     cmd = RsdCommand(
+       "UPDATE DOPRTEMP_TMP temp SET temp.t_ErrorStatus = ?, temp.t_ErrorMessage = ? " +
+       " WHERE temp.t_ErrorStatus = 0 "+
+       "   and temp.t_SkipDocument = 0 " +
+       "   and rsb_secur.IsBasket(rsb_secur.get_OperationGroup(rsb_secur.get_OperSysTypes(temp.t_Kind_Operation, temp.t_DocKind))) = 1 " +
+       "   and Exists(select 1 from ddl_tick_dbt tk " +
+       "               where tk.t_DealID = temp.t_OrderID " +
+       "                 and tk.t_OriginID > 0 "+
+       "                 and Not Exists(select 1 from DDL_TICK_ENS_DBT ens where ens.t_DealID = tk.t_DealID)" +
+       "             )"
+      );
+     cmd.addParam( "", RSDBP_IN, retError );
+     cmd.addParam( "", RSDBP_IN, "По сделке не задано обеспечение." );
+
+     SQL_Execute( cmd, "Проверка сделок: обеспечение", true );
+
+     //////////////////////////////////////////////////////////////////////////////////////////////////////////
+     cmd = RsdCommand(
+       "UPDATE DOPRTEMP_TMP temp SET temp.t_ErrorStatus = ?, temp.t_ErrorMessage = ? " +
+       " WHERE temp.t_ErrorStatus = 0 "+
+       "   and temp.t_SkipDocument = 0 " +
+       "   and rsb_secur.IsBasket(rsb_secur.get_OperationGroup(rsb_secur.get_OperSysTypes(temp.t_Kind_Operation, temp.t_DocKind))) = 1 " +
+       "   and Exists(select 1 from ddl_tick_dbt tk, ddl_leg_dbt leg " +
+       "               where tk.t_DealID = temp.t_OrderID " +
+       "                 and tk.t_OriginID > 0 "+
+       "                 and leg.t_DealID = tk.t_DealID " +
+       "                 and leg.t_LegKind = " + LEG_KIND_DL_TICK +
+       "                 and leg.t_LegID = 0 " +
+       "                 and (leg.t_Cost < leg.t_TotalCost or leg.t_Cost > leg.t_TotalCost)" +
+       "             )"
+      );
+     cmd.addParam( "", RSDBP_IN, retError );
+     cmd.addParam( "", RSDBP_IN, "Загруженное обеспечение по сделке не соответствует сумме сделки. Требуется подтверждение выполнения операции." );
+
+     SQL_Execute( cmd, "Проверка сделок: сумма обеспечения и сумма сделки", true );
+
+     //////////////////////////////////////////////////////////////////////////////////////////////////////////
+     MassCheckPortfolio();
+     МассовыеПроверкиДляЗачисленийИСписаний();
+     МассовыеПроверкиДляСделки();
+     МассовыеПроверкиДляСделкиОЭБ();
+
+  elif( Mode == modeMoveToPrep )
+
+     return retOk;
+
+  elif( Mode == modeDelete )
+     /*проверки при удалении сделки в режиме хранилища данных*/
+     if( CheckTaxDepositoryMode() )
+        if(not IsWeb)
+        FD = SPFirstDoc( Сделка );
+        return IIF(SP_CheckTaxDatePreDel(FD.GetRQ(DLRQ_TYPE_DELIVERY)),retOk,retError);
+        else //для веб выполняется своя аналогичная проверка
+           return retOk;
+        end;
+     else
+        return retOk;
+     end;
+
+  elif( Mode == modeAfterInsert )
+
+     if(Сделка.dealtype == 32732)
+       ConnectObjAttr(stat, OBJTYPE_SECDEAL, string(Сделка.DealID:o:34), 118, 1 , null, null, {curdate});
+     end;
+
+     if(Сделка.dealtype == 32742)
+       var cmdOfbu = RsdCommand("update ddl_tick_dbt set t_ofbu = chr(88) where t_dealid = ? ");
+       cmdOfbu.addParam( "", RSDBP_IN, Сделка.dealid );
+       cmdOfbu.execute();
+     end;
+
+     return retOk;
+
+  elif( Mode == modeAfterUpdate )
+
+     return retOk;
+
+  elif( Mode == modeAfterDelete )
+
+     return retOk;
+
+  elif( Mode == modeAfterMoveToPrep )
+
+     return retOk;
+
+  elif( Mode == modeInsert )
+
+     FD = SPFirstDoc( Сделка );
+     if( FD.IsOldDeal() )
+        MsgBox( "Ввод сделок данного типа запрещен." );
+        return retError;
+     end;
+
+     if(Сделка.BofficeKind == DL_SECUROWN)
+       if(CheckDealOwn() != retOk)
+         return retError;
+       end;
+     end;
+
+//     ЗаполнитьЗаявку();
+
+     return retOk;
+
+  end;
+
+  return retOk;
+end;
+
+private macro Проверить_документ(Type:integer):integer
+/* Константы важности внесенных изменений:           */
+/* CHANG_NOTIMPORTANT   - изменения неважные (сохранение без отката операции)*/
+/* CHANG_IMPORTANT      - изменения важны (сохранение изменений возможно только при откате) */
+/* CHANG_NOTKEEP        - не сохранять изменения */
+/* Если возвращаемое значение  > 0, то это оно интерпритируется как номер поля с ошибочным параметром*/
+/* Если возвращаемое значение  = 0, то cчитается, что проверка прошла успешно
+   и сохранение изменений можно производить без отката операции      */
+  return CHANG_NOTIMPORTANT;
+end;
+
+/* Установка подсказки для скролингов из макроса */
+PRIVATE MACRO УстановитьПодсказку( TableName:string, IndexNum:integer, DefaultHint:string, ScrolStatus:integer, ScrolKind:integer ):string
+  //  Возможные значения ScrolStatus:
+  //0 //SC_vmNotClosed,
+  //1 //SC_vmClosed,
+  //2 //SC_vmNotOperated,
+  //3 //SC_vmAll
+
+
+  //  Возможные значения ScrolKind:
+  //  SC_DEALSSCROLKIND_ALL             = 0, //Вообще всё
+  //  SC_DEALSSCROLKIND_DEALS           = 1, //Сделки
+  //  SC_DEALSSCROLKIND_AVRWRT          = 2, //Зачисления/списания
+  //  SC_DEALSSCROLKIND_RETIREMENT      = 3, //Погашения
+  //  SC_DEALSSCROLKIND_RETIREMENT_DST  = 4, //Распределение сумм погашения
+  //  SC_DEALSSCROLKIND_CONVAVR         = 5, //Конвертация ц/б
+  //  SC_DEALSSCROLKIND_INVESTSHARE     = 6, //Получение паёв
+  //  SC_DEALSSCROLKIND_GET_DIVIDEND    = 7, //Получение дивидендов
+  //  SC_DEALSSCROLKIND_RETURN_DIVIDEND = 8, //Возврат дивидендов
+
+  //пример
+  //return "/*+FIRST_ROWS LEADING(t) INDEX(t ddl_tick_dbt_idx0)*/";
+
+  return DefaultHint;
+
+END;
+
+PRIVATE MACRO УстановитьПодсказкуПоиска( TableName:string, IndexNum:integer, DefaultHint:string, ScrolStatus:integer, ScrolKind:integer ):string
+  //  Возможные значения ScrolStatus:
+  //3 //SC_vmAll
+
+  //  Возможные значения ScrolKind:
+  //  SC_DEALSSCROLKIND_ALL             = 0, //Вообще всё
+  //  SC_DEALSSCROLKIND_DEALS           = 1, //Сделки
+  //  SC_DEALSSCROLKIND_AVRWRT          = 2, //Зачисления/списания
+  //  SC_DEALSSCROLKIND_RETIREMENT      = 3, //Погашения
+  //  SC_DEALSSCROLKIND_RETIREMENT_DST  = 4, //Распределение сумм погашения
+  //  SC_DEALSSCROLKIND_CONVAVR         = 5, //Конвертация ц/б
+  //  SC_DEALSSCROLKIND_INVESTSHARE     = 6, //Получение паёв
+  //  SC_DEALSSCROLKIND_GET_DIVIDEND    = 7, //Получение дивидендов
+  //  SC_DEALSSCROLKIND_RETURN_DIVIDEND = 8, //Возврат дивидендов
+
+  //пример
+  //return "/*+FIRST_ROWS LEADING(t) INDEX(t doprstep_dbt_idx7)*/";
+
+  return DefaultHint;
+end;
+
+/// проверить наличие записи в Картотеке 
+private macro checkPKO_Writeoff(id)
+  var sql = "select * from PKO_WriteOff where dealid = :1 ";
+  var cmd = RSDCommand(sql);
+  cmd.AddParam("",RSDBP_IN,id);
+  cmd.execute;
+  var rs = TRsbDataSet(cmd);
+  if (rs.movenext())
+    return true;
+  end;
+  return false;  
+end;
+
+private macro SendLimitMessageDiasoft(SofrOperationId , LimitCheckStatus):bool
+  var ErrorCode = 0 , ErrorDesc ;
+  var comment = "";
+
+  if (LimitCheckStatus == 1)
+   comment = "Лимит на списание есть";
+  else
+   comment = "Лимитов на списание нет";
+  end;
+
+  var sql = 
+"  declare                        " +
+"    o_ErrorCode integer;         " +
+"    o_ErrorDesc varchar2(2000);  " +
+"  begin                          " +
+"  it_diasoft.SendLimitMessage(:1 " +  //Id операции в СОФР
+"                            , null " +  //Id операции в Диасофт  
+"                            , :3 " +  //статус проверки лимитов в СОФР
+"                            , :4 " +  //комментарий статуса проверки лимитов в СОФР
+"                            ,o_ErrorCode " + 
+"                            ,o_ErrorDesc " +
+"                           );    " +
+"    if  o_ErrorCode = 0 then  " +
+"      commit;  " +
+"    else       " +
+"      rollback;" +
+"    end if;    " +
+"    :5 := o_ErrorCode; " +
+"    :6 := o_ErrorDesc; " +
+"  end; ";     
+  var cmd = RSDCommand(sql);
+  cmd.addParam( ":1", RSDBP_IN, SofrOperationId);
+//  cmd.addParam( ":2", RSDBP_IN, DiasoftId);
+  cmd.addParam( ":3", RSDBP_IN, LimitCheckStatus);
+  cmd.addParam( ":4", RSDBP_IN, comment);
+  cmd.addParam( "p_ErrorCode", RSDBP_OUT,V_INTEGER);
+  cmd.addParam( "p_ErrorDesc", RSDBP_OUT,V_STRING,3000);
+  cmd.Execute;
+  ErrorCode = int( cmd.value("p_ErrorCode"));
+  ErrorDesc = cmd.value("p_ErrorDesc");
+  if (ErrorCode == 0)
+     Return true;
+  else
+     MsgBox("ОШИБКА отправки сообщения ! \n"+ErrorDesc);
+	 return false;
+  end ;
+onerror(err)
+  MsgBox(err.message);
+  return false;
+end;
+
+//сообщение в микросервис корпоративных действий
+private macro SendLimitMessageMSA(dealId:integer, limitState:integer):bool
+   var query = 
+           "begin "
+         + "   it_sinv.send_nontrade_limit_state( "
+         + "      p_deal_id => :dealId, "
+         + "      p_limit_status => :limitState "
+         + "   ); "
+         + "end; ";
+   var params = MakeSqlParamsArray(dealId, limitState);
+   ExecSql(query, params);
+
+   return true;
+OnError(err)
+   var logger:c_logger = LoggerFactory().NewItLog("SendLimitMessageMSA").GetLogger();
+   logger.ErrorClob("Error", GetFullErrMsg(err));
+   return false;
+end;
+
+macro SendLimitMessage(dealId, LimitCheckStatus)
+   var result:bool;
+   var pko = PKOWriteOff(dealId);
+
+   if (pko.isVoluntaryRedemption)
+      result = SendLimitMessageMSA(dealId, LimitCheckStatus);
+   else
+      result = SendLimitMessageDiasoft(dealId, LimitCheckStatus);
+   end;
+
+   return result;
+end;
+
+/*упрощенная реализация*/
+private macro diasoft_Pko_blockSecurities(dealid)
+  var  CustodyOrderId ;
+  if (not checkPKO_Writeoff(dealid))
+    MsgBox("По данной операции не нужно отправлять сообщения о достаточности лимитов, т.к. она не была загружена из Диасофт");
+    return;
+  end;
+  if (SendLimitMessage(dealid, 1, "Лимит на списание есть"))
+     MsgBox("В Диасофт отправлено сообщение о блокировке ц/б");
+  end; 
+onerror(err)
+  MsgBox(err.message);
+end;
+
+private macro getStatus(dealid)
+  var sql = "select d.t_dealstatus from ddl_tick_dbt d where d.t_dealid = :1";
+  var cmd =  rsdcommand(sql);
+  cmd.AddParam("",RSDBP_IN,dealid);
+  var rs = RSDRecordSet(cmd);
+  if (rs.movenext)
+    return rs.value(0);
+  end;
+  return -1;
+end;
+
+/* полная реализация */
+macro diasoft_Pko_blockSecurities_open_func(dealid,rescode,restxt)
+  var  CustodyOrderId;
+  rescode = 0 ;
+  if (not checkPKO_Writeoff(dealid))
+    restxt = "По данной операции не нужно отправлять сообщения о достаточности лимитов, т.к. она не была загружена из Диасофт" ;
+    rescode = 1 ;
+    MsgBox(restxt);
+    return;
+  end;
+  if (getstatus(dealid)!=0)
+    restxt = "Операция не в статусе Отложенная ";
+    rescode = 2 ;
+    MsgBox(restxt);
+   return;
+  end;
+
+  if (SendLimitMessage(dealid, 1, "Лимит на списание есть"))
+     MsgBox("В Диасофт отправлено сообщение о блокировке ц/б");
+  else
+    restxt = "В Диасофт не отправлено сообщение о блокировке ц/б";
+    rescode = 3 ;
+    return;
+  end; 
+  
+  //остановка на первом шаге
+  var sql = "update pko_writeoff p set step1_waitstatus = 0 where dealid = :1";
+  var cmd = rsdcommand(sql);
+  cmd.AddParam("",RSDBP_IN,dealid);
+  cmd.execute;
+
+  //запуск операции - фактически перевести в Открытые - операция должна остановиться на шаге Ожидание
+  var ErrCount = SP_ExecDeal(Dealid, false, {curdate}); 
+  if (ErrCount>0)
+    //MsgBox("Ошибка, либо остановка на шаге Ожидание при запуске операции");
+    restxt = "Ошибка, либо остановка на шаге Ожидание при запуске операции";
+    rescode = 10 ;
+    var errDs = TRsbDataSet("select LTRIM(t_documentid,'0') as documentid, t_errormessage from doprdistaff_tmp where t_errorstatus not in (0)");
+    While(errDs.movenext())
+      println("Сделка с ID = " + errDs.documentid + " " + Dealid + ". Сообщение об ошибке или логической ошибке(остановке - что не является ошибкой): " + errDs.errormessage);
+      it_log("Сделка с ID = " + errDs.documentid + " " + Dealid + ". Сообщение об ошибке или логической ошибке(остановке - что не является ошибкой): " + errDs.errormessage);
+    end;
+    //RunError("Ошибка при открытии операции");
+  end;
+  // в PKO_WriteOff проставляется LimitCorrectionTimeStamp и IsLimitCorrected
+  // Отмечает запись в таблице картотеки как обработанную в лимитах 
+  var sql1 = "update pko_writeoff p set LimitCorrectionTimeStamp = :1 , IsLimitCorrected = chr(88) where dealid = :2 ";
+  var cmd1 = rsdCommand(sql1);
+  cmd1.addParam("",RSDBP_IN,dttm(date,time));
+  cmd1.addParam("",RSDBP_IN,dealid);
+  cmd1.execute;
+//onerror(err)
+//  MsgBox(err.message);
+end;
+
+macro diasoft_Pko_NoSecurities_func(dealid);
+  var  CustodyOrderId ;
+  if (not checkPKO_Writeoff(dealid))
+    MsgBox("По данной операции не нужно отправлять сообщения о недостаточности лимитов, т.к. она не была загружена из Диасофт");
+    return;
+  end;
+  if (SendLimitMessage(dealid, 0, "Лимитов на списание нет"))
+     MsgBox("В Диасофт отправлено сообщение о недостаточности ц/б у клиента");
+  end; 
+end;
+
+macro diasoft_Pko_ChangeDTdeal(dealcode,dealid);
+  var  DTdeal = date ;
+  if (not checkPKO_Writeoff(dealid))
+    MsgBox("По данной операции не нужно изменять дату сделки, т.к. она не была загружена из Диасофт");
+    return;
+  end;
+  if (GetDate(DTdeal,string("Дата исполнения сделки ",dealcode))) 
+    var sql = "call it_diasoft.Set_DealDate(p_deailid => :dealid, "+
+                         " p_finalstatusdate => :DTdeal, "+
+                         " o_ErrorCode => :o_ErrorCode, "+
+                         " o_ErrorDesc => :o_ErrorDesc); ";
+    var cmd = rsdcommand(sql);
+    cmd.AddParam("",RSDBP_IN,dealid);
+    cmd.AddParam("",RSDBP_IN,DTdeal);
+    cmd.addParam( "o_ErrorCode", RSDBP_OUT,V_INTEGER);
+    cmd.addParam( "o_ErrorDesc", RSDBP_OUT,V_STRING,3000);
+    cmd.execute;
+    if (int( cmd.value("o_ErrorCode")) == 0)
+      MsgBox(string("Дата исполнения сделки ",dealcode," установлена в ",DTdeal));
+    else
+       MsgBox("ОШИБКА установки даты исполнения сделки  ! \n"+cmd.value("o_ErrorDesc"));
+    end ;
+  end;
+end;
+
+private macro ФункцияПользователя(Type:integer):integer
+  
+  var tmp_QrRec = TRecHandler("scqracc.dbt");
+  var tmp_rq = TRecHandler("dlrq");
+  var FD;
+  var tmp_cmd="", res;
+  array strmenu;
+  array MenuItems;
+  var MenuResult;
+  var nPos = -1;
+  var nPosDelComiss = -1;
+  var nPosReportEnough = -1;
+  var nPosReportFew = -1;
+  var nPosReportChangeDT = -1;
+
+  strmenu(0) = "Формирование Swift сообщения";
+  strmenu(1) = "Разблокировка сделки в Кондор";
+  strmenu(2) = "Учесть изменения в клиринге";
+  strmenu(3) = "Просмотр Swift сообщения";
+  strmenu(4) = "Переотправка операции";
+  if ({oper}==1)
+     nPosDelComiss = asize(strmenu) ;
+     strmenu(nPosDelComiss) = "Удалить все комиссии со сделки";
+  end;
+  nPos = asize(strmenu) ;
+  strmenu(nPos) = "Транспорт по сообщению";
+  if (((Сделка.dealtype == 2010) or (Сделка.dealtype == 32743)) and Сделка.dealstatus == 0 )
+    nPosReportEnough = asize(strmenu);
+    strmenu(nPosReportEnough) = "Отметить как заблокированное в лимитах";
+    nPosReportFew = asize(strmenu);
+    strmenu(nPosReportFew) = "Передать сообщение о недостаточности ц/б";
+  end;
+  if ((Сделка.dealtype == 32743) and (Сделка.dealstatus == 10))
+      nPosReportChangeDT = asize(strmenu);
+      strmenu(nPosReportChangeDT) = "Изменить дату сделки";
+  end;
+
+  res = menu(strmenu, "Выберите действие:");
+ 
+  If (res == 0)              // swift
+     DL_CreateMsgInf( Сделка );
+  elif (res == 1)            // Разблокировка в К+
+     //MsgBox("1");
+
+     //интеграция: выгрузка статуса сделки при помещении в отложенные
+     UpdateStatusDeal(CreateObjectForExport( Сделка, EXPORT_DEAL_ROLLED_BACK, "DEAL" ), true);
+  elif (res == 2)            // Изменения в клиринге
+     FD = SPFirstDoc( Сделка, false, true, УсловияСделки );
+     if( not IsRepo(FD.Group))    
+        ChangeDealClir(Сделка, УсловияСделки);
+     else
+        MsgBox("Для Репо изменение условий еще не предусмотрено...");
+     end;
+  elif (res == nPos)          //Транспорт по сообщению   
+
+    //ExecMacroFile ("pnlConfirmTransport.mac","exec_ConfirmKind", Сделка.dealid);
+    exec_ConfirmKind(Сделка.dealid);
+  elif(res == 3)              // просмотр swift
+     MenuItems[0] = "Просмотр исходящего МТ54x";
+     MenuItems[1] = "Просмотр сквитованного МТ54x"; 
+     MenuResult = Menu(MenuItems, "Выбрать действие");
+     var DealId = SPFirstDoc(Сделка, false).tick.rec.dealid;
+     if( MenuResult == 0 )
+        //PrintSWIFTMessage(dealId, false, 8);
+     elif( MenuResult == 1 )
+        //PrintSWIFTMessage(dealId, true, 8);
+     end;
+  elif(res == nPosDelComiss) // удалить комиссии
+     DeleteComiss(Сделка);         
+  elif(res==nPosReportEnough) //Сообщить о достаточности лимитов в Diasoft
+    if (Сделка.dealtype == 32743) 
+      diasoft_Pko_blockSecurities_Open_func(Сделка.dealid);
+    else
+      diasoft_Pko_blockSecurities(Сделка.dealid);
+    end;
+  elif(res==nPosReportFew) //Сообщить о недостаточности лимитов в Diasoft
+     diasoft_Pko_NoSecurities_func(Сделка.dealid);
+  elif(res==nPosReportChangeDT) //Изменить дату сделки
+     diasoft_Pko_ChangeDTdeal(Сделка.dealcode, Сделка.dealid);
+  elif(res == 4)
+      //логика переотправки в фанкобж
+      var funcObjRes:SecurFuncobjResender = SecurFuncobjResender();
+      funcObjRes.resendTask(Сделка.dealid);    
+  end;
+
+ /*
+
+   tmp_cmd = DL_RSDCommand(  "select * from dscqracc_dbt qracc"
+                               + " where qracc.t_StorageId  = ? "
+                               + "   and qracc.t_Fiid  = ? "
+                               + "   and qracc.t_DepoPartCode = ? "
+                               + "   and rownum = 1"
+                               ); 
+    tmp_cmd.AddParam(tmp_rq.rec.PlaceId);
+    tmp_cmd.AddParam(tmp_rq.rec.Fiid);
+    tmp_cmd.AddParam(DepoPartCode);
+   var tmp_ DataSet =tmp_cmd.Execute();
+   if (tmp_DataSet.moveNext())
+      tmp_DataSet.GetRecord().CopyTo(ScQrAcc.rec);
+   end;
+ */
+
+
+  return retOk;
+end;

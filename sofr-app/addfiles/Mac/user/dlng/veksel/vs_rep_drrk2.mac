@@ -1,0 +1,309 @@
+/*
+vs_rep_drrk2.mac
+Реестр собственных векселей на дату
+*/
+import globals, or_rep_h, oralib, likepy, vslib, "DlReport_h.mac";
+
+private var sqlString:string;
+private var repDate;
+
+//-----------------------------------------------------------------------------------------
+private macro collectOutProc ( str )
+    sqlString = sqlString + "\n" + trim (str);
+End;
+
+private macro CaptureOutput
+   sqlString = "";
+   SetOutHandler (@collectOutProc);
+End;
+                     
+private macro StopCaptureOutput
+    SetOutHandler ();
+    return sqlString;
+End;
+//-----------------------------------------------------------------------------------------
+
+//Посчитать ставку дисконта
+private macro CalcDiscountRate (sql):double
+  var c365:double, c366:double;
+  var facevalue = sql.value("facevalue");
+  var sumbuy = sql.value("buycost");
+
+  GetDaysCoef(sql.value("issuedate"), sql.value("planrepaydate"), @c365, @c366);
+
+  return (facevalue-sumbuy)/sumbuy/(c365+c366);
+End;
+
+//Находит корреспонденцию переданного счета со всеми счетам 706*
+macro GetCorrespSum (account, dt, innatcur):money
+  var query = "select nvl((select sum("+ifThenElse(innatcur, "t_sum_natcur", "t_sum_receiver")+") from dacctrn_dbt where t_chapter = 1 and t_account_receiver = :acc1 and t_account_payer like '706%' and t_date_carry <= :dt1), 0) "
+            + "      -nvl((select sum("+ifThenElse(innatcur, "t_sum_natcur", "t_sum_payer")+") from dacctrn_dbt where t_chapter = 1 and t_account_payer = :acc2 and t_account_receiver like '706%' and t_date_carry <= :dt2), 0) "
+            + "as sumcor from dual";
+  var sql = ExecSqlSelect(query, MakeArray(SqlParam("acc1", account ),
+                                           SqlParam("dt1",  dt      ),
+                                           SqlParam("acc2", account ),
+                                           SqlParam("dt2",  dt      )));
+  if (sql.MoveNext()) 
+    return sql.value(0);
+  end;
+  return 0;
+End;
+
+PRIVATE CLASS (DL_CReportTemplate) DRRK_2_Report
+   macro PrintMode():INTEGER
+     return DL_OUTREPORT_EXCEL;
+   end;
+
+   macro BeginReport()
+   end;
+
+   macro Create()
+      var sql, dt = {curdate};
+      var ExistData = true;
+      var num = 0;
+      var perc_costs = "", perc_costs_natcur = "";
+      var repaymentdate = Date(0, 0, 0), repaymentdate_str = "";
+      var DaysToRepay = 0, planrepaydate = Date(0, 0, 0);
+      var DiscountRate = "";
+      var A27 = "", A29 = 0.0, A30 = 0.0, A32 = "", A33 = "";
+      
+      SetActiveSheet("Отчет");
+      
+      if (not GetDate(dt))
+         return;
+      end;
+      repDate = dt;
+      PrintFormatString(NULL, "N1_RepDate", "Отчетная дата: " + string(dt:f));
+
+      InitProgress(-1, "Отбор данных", "Отбор данных");
+      CaptureOutput();
+      [select depname,
+              body_acc,
+              holdername,
+              ordernumber,
+              bcnumber,
+              bcseries,
+              issuedate,
+              case when t_pfi<>0 then bccost else 0 end bccost_pfi,
+              case when t_pfi<>0 then RSI_RSB_FIInstr.ConvSum(bccost, t_pfi, 0, issuedate, 2) else bccost end bccost_rub,
+              pfi_iso,
+              RSI_RSB_FIInstr.ConvSum(t_principal, t_pfi, 0, issuedate, 2) principal_issue,
+              case when t_pfi <>0 then abs(rsi_rsb_account.RestAll (body_acc,1,t_pfi,rsi_rsbCalendar.GetDateAfterWorkDay(:dt, -1),0)) else  abs(rsi_rsb_account.RestAll(body_acc, 1, t_pfi, :dt, 0))  end   body_rest,/*CHVA*/
+              case when incometype='Д' then discount_acc else chr(1) end discount_acc,
+              case when t_pfi <>0 then abs(rsi_rsb_account.RestAll (discount_acc,1,t_pfi,rsi_rsbCalendar.GetDateAfterWorkDay(:dt, -1),0)) else  abs(rsi_rsb_account.RestAll(discount_acc, 1, t_pfi, :dt, 0))  end   discount_rest,/*CHVA*/
+              case when t_pfi = 0 then 0 else t_principal end t_principal,
+              repaymentdate,
+              planrepaydate,
+              t_bctermformula,
+              t_maturity,
+              t_expiry,
+              incometype,
+              perc_rate,
+              facevalue,
+              buycost,
+              case when (select nvl(min(t_changedate), to_date('31.12.9999', 'dd.mm.yyyy')) from dvsbnrbck_dbt where instr(t_newbcstate, 'И')>0 and t_bcid=t.t_bcid)<=:dt
+                                    then  case  when t_pfi<>0 /*CHVA*/
+                                                        then abs(rsi_rsb_account.RestAll(percent_acc, 1, t_pfi, rsi_rsbCalendar.GetDateAfterWorkDay(:dt, -1), 0))-RSI_RSB_FIInstr.ConvSum(t_principal, t_pfi, 0, rsi_rsbCalendar.GetDateAfterWorkDay(:dt, -1), 2)  
+                                                        else abs(rsi_rsb_account.RestAll(percent_acc, 1, t_pfi, :dt, 0))-RSI_RSB_FIInstr.ConvSum(t_principal, t_pfi, 0, :dt, 2) end 
+                                     else case when t_pfi<>0 
+                                                         then abs(rsi_rsb_account.RestAll(percent_acc, 1, t_pfi,  rsi_rsbCalendar.GetDateAfterWorkDay(:dt, -1), 0)) else abs(rsi_rsb_account.RestAll(percent_acc, 1, t_pfi, :dt, 0))  end 
+                                     end percent_rest,/*CHVA*/
+              percent_acc_main,
+              count(1) over() as t_Count
+       from (select (select t_name from dparty_dbt p where t_partyid = bnr.t_issuer) depname,
+                    nvl(rsb_bill_rshb.VS_GetBannerAccount (bnr.t_bcid, :dt), ' ') body_acc,
+                    bnr.t_holdername holdername,
+                    (select t_ordernumber from ddl_order_dbt o where t_contractid=(select t_contractid from dvsordlnk_dbt where t_bcid=bnr.t_bcid and t_linkkind=0 and t_dockind=109)) ordernumber,
+                    trim(bnr.t_bcnumber) bcnumber,
+                    bnr.t_bcseries bcseries,
+                    bnr.t_issuedate issuedate,
+                    (select t_bccost from dvsordlnk_dbt where t_bcid=bnr.t_bcid and t_dockind=109 and t_linkkind=0) bccost,
+                    (select t_iso_number from dfininstr_dbt where t_fiid=leg.t_pfi) pfi_iso,
+                    leg.t_pfi,
+                    leg.t_principal,
+                    nvl((select t_account from dmcaccdoc_dbt mcacc where t_dockind = 164 and t_docid=bnr.t_bcid
+                           and t_catnum = case when (select nvl(min(t_changedate), to_date('31.12.9999', 'dd.mm.yyyy')) from dvsbnrbck_dbt where instr(t_newbcstate, 'И')>0 and t_bcid=bnr.t_bcid)<=:dt then 451 else 1384 end
+                           and t_iscommon = chr(0) and (:dt between t_activatedate and t_disablingdate-1 or (t_disablingdate=to_date('01.01.0001', 'dd.mm.yyyy') and t_activatedate<=:dt and t_isusable=chr(88))) ), chr(1)) discount_acc,
+                    bnr.t_repaymentdate repaymentdate,
+                    case when t_bctermformula = 10 then t_maturity 
+                         when t_bctermformula = 20 and t_maturity = to_date('01.01.0001', 'dd.mm.yyyy') and t_expiry = to_date('01.01.0001', 'dd.mm.yyyy') then t_issuedate + rsb_bill_rshb.GetDaysInYearByBasis(t_basis, t_issuedate) 
+                         when t_bctermformula = 20 and t_maturity > :dt and t_expiry = to_date('01.01.0001', 'dd.mm.yyyy') then t_maturity + rsb_bill_rshb.GetDaysInYearByBasis(t_basis, t_issuedate) 
+                         when t_bctermformula = 20 and t_maturity > to_date('01.01.0001', 'dd.mm.yyyy') and t_expiry = to_date('01.01.0001', 'dd.mm.yyyy') and t_maturity <= :dt then t_maturity 
+                         else t_expiry end planrepaydate,
+                    bnr.t_bctermformula,
+                    leg.t_maturity,
+                    leg.t_expiry,
+                    case when t_formula = 1 then 'П' when t_formula = 0 and leg.t_principal-leg.t_receiptamount<>0 then 'Д' else 'Б' end incometype,
+                    leg.t_price/power(10, leg.t_point+2) perc_rate,
+                    /*Счет учета процентов, действующий на дату отчета. с учетом переноса "к исполнению"*/
+                    nvl((select t_account from dmcaccdoc_dbt mcacc where t_dockind = 164 and t_docid=bnr.t_bcid
+                           and t_catnum = case when (select nvl(min(t_changedate), to_date('31.12.9999', 'dd.mm.yyyy')) from dvsbnrbck_dbt where instr(t_newbcstate, 'И')>0 and t_bcid=bnr.t_bcid)<=:dt then 451 else 452 end
+                           and t_iscommon = chr(0) and (:dt between t_activatedate and t_disablingdate-1 or (t_disablingdate=to_date('01.01.0001', 'dd.mm.yyyy') and t_activatedate<=:dt and t_isusable=chr(88))) ), chr(1)) percent_acc,
+                    /*Счет учета процентов 52501*/
+                    nvl((select t_account from dmcaccdoc_dbt mcacc where t_dockind = 164 and t_docid=bnr.t_bcid and t_catnum = 452), chr(1)) percent_acc_main,
+                    bnr.t_bcid,
+                    leg.t_principal facevalue,
+                    leg.t_receiptamount buycost
+             from dvsbanner_dbt bnr, ddl_leg_dbt leg
+             where     exists (select 1 from ddp_dep_dbt where t_partyid=bnr.t_issuer)
+                   and ( (:dt between bnr.t_issuedate and t_repaymentdate) or (t_repaymentdate = to_date('01.01.0001', 'dd.mm.yyyy') and bnr.t_issuedate < :dt))
+                   and leg.t_dealid = bnr.t_bcid
+                   and leg.t_legkind = 1
+                   and leg.t_legid = 0
+             ) t
+       ];
+      sql = ExecSqlSelect(StopCaptureOutput(), MakeArray(SqlParam("dt", dt)), false);
+
+      RegisterTable("N1_MainTable", NULL, "N1_A1", "N1_A2", "N1_A3", "N1_A4", "N1_A5", "N1_A6", "N1_A7", "N1_A8", "N1_A9", "N1_A10", "N1_A11", "N1_A12", "N1_A13", "N1_A14", "N1_A15",
+                                          "N1_A16", "N1_A17", "N1_A18", "N1_A19", "N1_A20", "N1_A21", "N1_A22", "N1_A23", "N1_A24", "N1_A25", "N1_A26", "N1_A27", "N1_A28", "N1_A29",
+                                          "N1_A30", "N1_A31", "N1_A32", "N1_A33", "N1_A34", "N1_A35", "N1_A36", "N1_A37");
+
+      if(sql.MoveNext())
+         RemProgress();
+
+         InitProgress(Int(sql.value("t_Count")), "Печать отчета", "Печать отчета");
+         while(ExistData)
+            //Считает корреспонденцию процентных векселей со счетами доходов
+            if (sql.value("incometype") == "П")
+               perc_costs = GetCorrespSum(sql.value("percent_acc_main"), dt, false);
+               perc_costs_natcur = GetCorrespSum(sql.value("percent_acc_main"), dt, true);
+               if (SubStr(sql.value("body_acc"), 1, 5) == "52406")
+                  perc_costs = perc_costs + GetCorrespSum(sql.value("body_acc"), dt, false);
+                  perc_costs_natcur = perc_costs_natcur + GetCorrespSum(sql.value("body_acc"), dt, true);
+               end;      
+            end;
+
+            repaymentdate = Date(sql.value("repaymentdate"));
+            planrepaydate = Date(sql.value("planrepaydate"));
+            if(repaymentdate != Date(0, 0, 0))
+               repaymentdate_str = string(repaymentdate:f);
+               DaysToRepay = repaymentdate - dt;
+            else
+               repaymentdate_str = "";
+               DaysToRepay = planrepaydate - dt;
+            end;
+
+            if (sql.value("incometype") == "Д")
+               DiscountRate = string(CalcDiscountRate(sql)); // Ставка дисконта
+            else
+               DiscountRate = ""; // Ставка дисконта
+            end;
+
+            if ( (repaymentdate == Date(0, 0, 0)) and (sql.value("incometype") == "П"))
+               A27 = string(planrepaydate:f); // Ближайшая дата процентных выплат
+            else
+               A27 = ""; // Ближайшая дата процентных выплат
+            end;
+
+            if (SubStr(sql.value("body_acc"), 1, 5) == "52406")
+               A29 = 0.0; // начисленные проценты по состоянию на отчетную дату (52501)
+               A30 = sql.value("percent_rest"); // начисленные проценты по состоянию на отчетную дату (52406)
+            else
+               A29 = sql.value("percent_rest"); // начисленные проценты по состоянию на отчетную дату (52501)
+               A30 = 0.0; // начисленные проценты по состоянию на отчетную дату (52406)
+            end;
+
+            if (sql.value("incometype") == "П")
+              A32 = perc_costs; // Сумма начисленных процентных расходов за отчетный период (ОПУ), в валюте номинирования
+              A33 = perc_costs_natcur; // Сумма начисленных процентных расходов за отчетный период (ОПУ), в рублях
+            else
+              A32 = ""; // Сумма начисленных процентных расходов за отчетный период (ОПУ), в валюте номинирования
+              A33 = ""; // Сумма начисленных процентных расходов за отчетный период (ОПУ), в рублях
+            end;
+
+            PrintTableLine("N1_A1", sql.value("depname"), NULL,
+                           "N1_A2", SubStr(sql.value("body_acc"), 1, 5), NULL,
+                           "N1_A3", sql.value("body_acc"), NULL,
+                           "N1_A4", "Вексель", NULL,
+                           "N1_A5", sql.value("holdername"), NULL,
+                           "N1_A6", sql.value("ordernumber"), NULL,
+                           "N1_A7", sql.value("bcnumber"), NULL,
+                           "N1_A8", sql.value("bcseries"), NULL,
+                           "N1_A9", Date(sql.value("issuedate")), NULL,
+                           "N1_A10", sql.value("bccost_pfi"), NULL,
+                           "N1_A11", sql.value("bccost_rub"), NULL,
+                           "N1_A12", sql.value("pfi_iso"), NULL,
+                           "N1_A13", sql.value("principal_issue"), NULL,
+                           "N1_A14", sql.value("body_rest")+sql.value("discount_rest"), NULL,
+                           "N1_A15", sql.value("body_rest"), NULL,
+                           "N1_A16", sql.value("discount_acc"), NULL,
+                           "N1_A17", sql.value("discount_rest"), NULL,
+                           "N1_A18", sql.value("t_principal"), NULL,
+                           "N1_A19", repaymentdate_str, NULL,
+                           "N1_A20", string(planrepaydate:f), NULL,
+                           "N1_A21", DaysToRepay, NULL,
+                           "N1_A22", VS_TermFormula(sql.value("t_bctermformula"), sql.value("t_maturity"), sql.value("t_expiry")), NULL,
+                           "N1_A23", sql.value("incometype"), NULL,
+                           "N1_A24", sql.value("perc_rate"), NULL,
+                           "N1_A25", DiscountRate, NULL,
+                           "N1_A26", "", NULL,
+                           "N1_A27", A27, NULL,
+                           "N1_A28", "", NULL,
+                           "N1_A29", A29, NULL,
+                           "N1_A30", A30, NULL,
+                           "N1_A31", "", NULL,
+                           "N1_A32", A32, NULL,
+                           "N1_A33", A33, NULL,
+                           "N1_A34", "", NULL,
+                           "N1_A35", "", NULL,
+                           "N1_A36", "", NULL,
+                           "N1_A37", "", NULL);
+
+            ExistData = sql.MoveNext();
+            UseProgress(num = num + 1);
+         end;
+
+         RemProgress();
+      else
+         RemProgress();
+         PrintTableLine("N1_A1", "Нет данных для построения отчета", NULL,
+                        "N1_A2", "", NULL,
+                        "N1_A3", "", NULL,
+                        "N1_A4", "", NULL,
+                        "N1_A5", "", NULL,
+                        "N1_A6", "", NULL,
+                        "N1_A7", "", NULL,
+                        "N1_A8", "", NULL,
+                        "N1_A9", "", NULL,
+                        "N1_A10", "", NULL,
+                        "N1_A11", "", NULL,
+                        "N1_A12", "", NULL,
+                        "N1_A13", "", NULL,
+                        "N1_A14", "", NULL,
+                        "N1_A15", "", NULL,
+                        "N1_A16", "", NULL,
+                        "N1_A17", "", NULL,
+                        "N1_A18", "", NULL,
+                        "N1_A19", "", NULL,
+                        "N1_A20", "", NULL,
+                        "N1_A21", "", NULL,
+                        "N1_A22", "", NULL,
+                        "N1_A23", "", NULL,
+                        "N1_A24", "", NULL,
+                        "N1_A25", "", NULL,
+                        "N1_A26", "", NULL,
+                        "N1_A27", "", NULL,
+                        "N1_A28", "", NULL,
+                        "N1_A29", "", NULL,
+                        "N1_A30", "", NULL,
+                        "N1_A31", "", NULL,
+                        "N1_A32", "", NULL,
+                        "N1_A33", "", NULL,
+                        "N1_A34", "", NULL,
+                        "N1_A35", "", NULL,
+                        "N1_A36", "", NULL,
+                        "N1_A37", "", NULL);
+      end;
+
+      EndTable();
+   end;
+
+   macro EndReport()
+      SetLastTotalBookName("ДРРК_2_" + repDate + ".");
+   end;
+
+   initDL_CReportTemplate(NULL, "Report_DRRK_2.xls", false, false, NULL, true);
+END;
+
+DRRK_2_Report().Run();
+exit(1);

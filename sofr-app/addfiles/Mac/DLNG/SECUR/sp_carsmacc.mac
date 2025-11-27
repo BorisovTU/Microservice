@@ -1,0 +1,615 @@
+/*
+$Name:        sp_carsmacc.mac
+$Module:      Ценные бумаги
+$Description: Выполнение сводных проводок.
+ PROGRAMMED BY:   Леонов И. Е.
+ CREATION DATE:   23.03.04
+*/
+IMPORT "sp_caracc.mac", RsbDataSet, "spRepFun.mac";
+
+/*Настройка в регистре*/
+PRIVATE CONST REG_PAIRACCMODE = "COMMON\\КАТЕГОРИИ СРЕДСТВ\\PAIRACCMODE";
+PRIVATE VAR   PairAccModeValue;
+
+PRIVATE FILE   DocOffTMP( "docoff.tmp" ) key 0 write;
+PRIVATE FILE   DocOffTMPDtCt( "docoff.tmp" ) key 1 write;
+PRIVATE FILE   DocOffTMPState( "docoff.tmp" ) key 2 write;
+PRIVATE RECORD AccountPayer(account);
+PRIVATE RECORD AccountReceiver(account);
+PRIVATE RECORD rAccount(account);
+PRIVATE VAR    NameFile;
+
+/*Виды идентичных по счетам проводок */
+PRIVATE CONST CARRY_CURRENT   = 0, /*текущая (сравниваемая) проводка*/
+              CARRY_PAIR_DT   = 1, /*Проводка со счетом Дт парным счету Дт текущей (CARRY_CURRENT) проводки*/
+              CARRY_PAIR_CT   = 2, /*Проводка со счетом Кт парным счету Кт текущей (CARRY_CURRENT) проводки*/
+              CARRY_PAIR_DTCT = 3; /*Проводка со счетами Дт и Кт парными счетам Дт и Кт текущей (CARRY_CURRENT) проводки*/
+
+PRIVATE MACRO SayError( RslErrObj )
+   MsgBox( RslErrObj.Module + " строка " + RslErrObj.Line + "|" + RslErrObj.Message);
+   return 1;
+END;
+
+/*Закачать во временный файл проводку. 
+  Если там уже есть проводка с такими же параметрами, то просуммировать */
+PRIVATE MACRO AddInDocOffTMP(spdocoff:variant)
+
+   ClearRecord( DocOffTMPDtCt );
+   DocOffTMPDtCt.Chapter    = spdocoff.Chapter;
+   DocOffTMPDtCt.DtFIID     = spdocoff.Currency_Payer;
+   DocOffTMPDtCt.DtAccount  = spdocoff.Account_Payer;
+   DocOffTMPDtCt.CtFIID     = spdocoff.Currency_Receiver;
+   DocOffTMPDtCt.CtAccount  = spdocoff.Account_Receiver;
+   DocOffTMPDtCt.State      = STATE_CHECK;
+   DocOffTMPDtCt.DocOffID   = spdocoff.Id;
+   DocOffTMPDtCt.GroundKind = spdocoff.GroundKind;
+
+   if( GetEQ( DocOffTMPDtCt ) )                        
+      DocOffTMPDtCt.DtSumma = DocOffTMPDtCt.DtSumma + spdocoff.Sum_Payer;
+      DocOffTMPDtCt.CtSumma = DocOffTMPDtCt.CtSumma + spdocoff.Sum_Receiver;
+      Update( DocOffTMPDtCt, null, true );
+   else
+      DocOffTMPDtCt.DtSumma = spdocoff.Sum_Payer;
+      DocOffTMPDtCt.CtSumma = spdocoff.Sum_Receiver;
+      Insert( DocOffTMPDtCt, null, true );
+   end;
+   return 0;
+
+   OnError( RslErrObj )
+      return SayError( RslErrObj );
+END;                      
+
+PRIVATE MACRO НайтиПарныйСчет( Chapter:INTEGER, FIID:INTEGER, Account:STRING )
+   if( GetAccount( Chapter, FIID, Account, rAccount ) )
+       return rAccount.PairAccount;
+   end;
+   return "";
+END;
+
+PRIVATE MACRO ЕстьПроводкиПоСчету( Chapter:INTEGER, FIID:INTEGER, Account:STRING, CarryDate:DATE, ID:INTEGER )
+   var ExistCarry, Continue_cicle;
+
+   if( FIID == NATCUR )
+      ExistCarry = ( DebetA( Account, CarryDate, NULL, Chapter ) != 0 );
+      if( ExistCarry == false )
+         ExistCarry = ( KreditA( Account, CarryDate, NULL, Chapter ) != 0 );
+      end;
+   else
+      ExistCarry = ( DebetAC( Account, FIID, CarryDate, NULL, Chapter ) != 0 );
+      if( ExistCarry == false )
+         ExistCarry = ( KreditAC( Account, FIID, CarryDate, NULL, Chapter ) != 0 );
+      end;
+   end;
+
+   if( ExistCarry == false ) /*проверить в отложенных*/
+      ClearRecord( DocOffTMP );
+      Continue_cicle = GetGE( DocOffTMP ); /*Сортировка по ID*/
+      while( Continue_cicle AND (DocOffTMP.ID < ID) )
+
+         if( (DocOffTMP.State   == STATE_EXECUTE) AND
+             (DocOffTMP.Chapter == Chapter) AND
+             ( ( (DocOffTMP.DtFIID == FIID) AND (DocOffTMP.DtAccount == Account)
+               ) OR
+               ( (DocOffTMP.CtFIID == FIID) AND (DocOffTMP.CtAccount == Account)
+               )
+             )
+           )
+            ExistCarry = true;
+            Continue_cicle   = false;
+         else
+            Continue_cicle = Next( DocOffTMP ); /*Сортировка по ID*/
+         end;
+      end;
+   end;
+
+   return ExistCarry;
+END;
+
+PRIVATE MACRO ОстатокСчета( Chapter:INTEGER, FIID:INTEGER, Account:STRING, CarryDate:DATE )
+   if( FIID ) 
+      return RestAC( Account, FIID, CarryDate, null, Chapter );
+   else
+      return RestA( Account, CarryDate, null, Chapter );
+   end;
+END;
+
+PRIVATE MACRO ВыбратьПарныйСчет( Chapter:INTEGER, FIID:INTEGER, Account:STRING, CarryDate:DATE, ID:INTEGER )
+   var PairAccount = НайтиПарныйСчет( Chapter, FIID, Account );
+
+   if( PairAccount == "" )
+      return Account;
+   end;
+
+   /*Проверить наличие исполненных проводок
+     Если по одному из счетов были проводки, а по другому нет, то вернуть тот, по которому были
+     Если проводки были по обоим счетам, вернуть "Номер счета"(Account) */
+   if( ЕстьПроводкиПоСчету( Chapter, FIID, Account, CarryDate, ID ) )
+      return Account; /*Праводка была либо только по основному счету, либо по обоим (основному и парному) счетам*/
+   elif( ЕстьПроводкиПоСчету( Chapter, FIID, PairAccount, CarryDate, ID ) )
+      return PairAccount; /*Проводка была только по парному счету*/
+   end;
+
+   /*Проводок по счетам не было, 
+     Проверить наличие остатков по счетам Account и PairAccount на начало заданной Даты.
+     Если по одному счету есть остаток, а по другому  -нет, то вернуть тот, по которому есть.
+     Если остатки есть по обоим счетам, вернуть "Номер счета"(Account) */
+   if( ОстатокСчета( Chapter, FIID, Account, CarryDate-1 ) != 0 )
+      return Account;
+   elif( ОстатокСчета( Chapter, FIID, PairAccount, CarryDate-1 ) != 0 )
+      return PairAccount;
+   end;
+
+   /*По счетам нет проводок и остатков на дату*/
+   return Account;
+END;
+
+PRIVATE MACRO СтатусПарногоСчета( DocOff )
+   if( (PairAccModeValue == 0) OR  /*"По 61 инструкции"*/
+       (PairAccModeValue == 2)     /*"По 61 инструкции с контролем остатков"*/
+     ) 
+      DocOff.State = STATE_CORRECTPAIR;
+   else
+      DocOff.State = STATE_EXECUTE;
+   end;
+END;
+
+/*ф-я переделана по 87909*/
+PRIVATE MACRO GetNextDocOffTMPState( State:INTEGER )
+
+   var Query, DataSet;
+
+   Query = " Select t_State, t_DocOffId, t_Id "
+         + "   FROM " + NameFile
+         + " WHERE t_State = " + string(State)
+         + " Order By t_State, t_DocOffId, t_Id "; /*по 2 ключу*/
+
+   DataSet = TRsbDataSet(Query);
+   if (DataSet.MoveNext())
+
+      ClearRecord( DocOffTMPState );
+      DocOffTMPState.State    = DataSet.State;
+      DocOffTMPState.DocOffId = DataSet.DocOffId;
+      DocOffTMPState.Id       = DataSet.Id;
+
+      return (GetEQ(DocOffTMPState));
+   end;
+   return false;
+END;
+
+PRIVATE MACRO DeleteDocOffTMPByID( Id:INTEGER )
+   ClearRecord( DocOffTMP );
+   DocOffTMP.Id = Id;
+   if( GetEQ( DocOffTMP ) )
+      Delete( DocOffTMP );
+   end;
+END;
+
+PRIVATE MACRO UpdateDocOffTMPByID( DocOff:VARIANT )
+   ClearRecord( DocOffTMP );
+   DocOffTMP.Id = DocOff.Id;
+   if( GetEQ( DocOffTMP ) )
+      copy( DocOffTMP, DocOff );
+      update( DocOffTMP, null, true );
+   end;
+END;
+
+PRIVATE MACRO FindDocOffTMPDtCt( Chapter:INTEGER, DtFIID:INTEGER, DtAccount:STRING, CtFIID:INTEGER, CtAccount:STRING, GroundKind:INTEGER )
+   ClearRecord( DocOffTMPDtCt );
+   DocOffTMPDtCt.Chapter   = Chapter;
+   DocOffTMPDtCt.DtFIID    = DtFIID;
+   DocOffTMPDtCt.DtAccount = DtAccount;
+   DocOffTMPDtCt.CtFIID    = CtFIID;
+   DocOffTMPDtCt.CtAccount = CtAccount;
+   DocOffTMPDtCt.GroundKind = GroundKind;
+   if( GetEQ( DocOffTMPDtCt ) )
+      return DocOffTMPDtCt;
+   end;
+   return null;
+END;
+
+PRIVATE MACRO FindCarryInArray( IdentCarry:TArray, DtKind_Account:STRING, CtKind_Account:STRING )
+   var i = 0;
+   while( i < IdentCarry.Size )
+     if( IdentCarry[i] != null )
+        if( ( (DtKind_Account == "") OR
+              (  GetAccount( IdentCarry[i].Chapter, IdentCarry[i].DtFIID, IdentCarry[i].DtAccount, rAccount ) AND
+                 (rAccount.Kind_Account == DtKind_Account)
+              )
+            ) AND
+            ( (CtKind_Account == "") OR
+              (  GetAccount( IdentCarry[i].Chapter, IdentCarry[i].CtFIID, IdentCarry[i].CtAccount, rAccount ) AND
+                 (rAccount.Kind_Account == CtKind_Account)
+              )
+            )
+          )
+           return IdentCarry[i].Id;
+        end;
+     end;
+     i = i + 1;
+   end;
+   return 0;
+END;
+
+/* Массив IdentCarry содержит от 1 до 4-х записей идентичных по счетам проводок
+  Выбираем среди них  главную в порядке следующих приоритетов:
+  a.  если оба счета парные - такую, что по Дт  - активный счет, и по Кт -пассивный счет
+  b.  если счет по Дт парный -такую, что счет по Дт активный, а по Кт -любой
+  c.  если счет по Кт парный -такую, что счет по Кт пассивный, а по Дт -любой
+  d.  текущую 
+  Оставляем только главную проводку, остальные суммируем к ней и удаляем*/
+PRIVATE MACRO СформироватьСуммарнуюПроводку( IdentCarry:TArray )
+   var i = 0, MainAccIndex = -1, MainAccID = 0;
+
+   if( IdentCarry[CARRY_PAIR_DTCT] != null ) /*оба счета парные*/
+      MainAccID = FindCarryInArray( IdentCarry, bal_acc_active, bal_acc_passive );
+   end;
+   if( (MainAccID == 0) AND (IdentCarry[CARRY_PAIR_DT] != null) ) /*счет по Дт парный*/
+      MainAccID = FindCarryInArray( IdentCarry, bal_acc_active, "" );
+   end;
+   if( (MainAccID == 0) AND (IdentCarry[CARRY_PAIR_CT] != null) ) /*счет по Кт парный*/
+      MainAccID = FindCarryInArray( IdentCarry, "", bal_acc_passive );
+   end;
+   if( MainAccID == 0 )
+      MainAccID = IdentCarry[CARRY_CURRENT].Id;
+   end;
+
+   i = 0; /*Индекс главной проводки*/
+   while( (MainAccIndex < 0) AND (i < IdentCarry.Size) )
+      if( (IdentCarry[i] != null) AND (IdentCarry[i].Id == MainAccID) )
+         MainAccIndex = i;
+      end;
+      i = i + 1;
+   end;
+
+   i = 0; /*Суммируем к главной остальные*/
+   while( i < IdentCarry.Size )
+      if( (i != MainAccIndex) AND (IdentCarry[i] != null) )
+         IdentCarry[MainAccIndex].DtSumma = IdentCarry[MainAccIndex].DtSumma + IdentCarry[i].DtSumma;
+         IdentCarry[MainAccIndex].CtSumma = IdentCarry[MainAccIndex].CtSumma + IdentCarry[i].CtSumma;
+         /*удаляем просуммированную проводку*/
+         DeleteDocOffTMPByID( IdentCarry[i].Id );
+      end;
+      i = i + 1;
+   end;
+
+   /*На главную проводку ставим статус STATE_COMPARE для дальнейшей обработки в "СверткаПротивоположныхПарныхПроводок"*/
+   IdentCarry[MainAccIndex].State = STATE_COMPARE;
+   UpdateDocOffTMPByID( IdentCarry[MainAccIndex] );
+END;
+
+/* A1, A2 - суммы по Дт и Кт первой проводки
+   B1, B2 - суммы по Дт и Кт второй проводки */
+PRIVATE MACRO СравнитьСуммы( A1:MONEY, A2:MONEY, B1:MONEY, B2:MONEY )
+   if( (A1 == B2) AND (A2 == B1) )
+      return 0; /*проводки равны*/
+   elif( ( (A1 > B2) AND (A2 > B1) ) )
+      return 1; /*первая больше*/
+   elif( ( (A1 < B2) AND (A2 < B1) ) )
+      return -1; /*первая меньше*/
+   else
+      return 2; /*нельзя сравнить*/
+   end;
+END;
+
+PRIVATE MACRO СформироватьРезультирующуюПроводку( Carry:VARIANT, BackCarry:VARIANT )
+   var CmpSum;
+   if( BackCarry == null )
+      СтатусПарногоСчета( Carry );
+      UpdateDocOffTMPByID( Carry );
+   else
+      CmpSum = СравнитьСуммы( Carry.DtSumma, Carry.CtSumma, BackCarry.DtSumma, BackCarry.CtSumma );
+      if( CmpSum == 0 ) /*проводки равны, взаимно погасились*/
+         DeleteDocOffTMPByID( Carry.Id );
+         DeleteDocOffTMPByID( BackCarry.Id );
+      elif( CmpSum == 1 ) /*первая больше*/
+         СтатусПарногоСчета( Carry );
+         Carry.DtSumma = Carry.DtSumma - BackCarry.DtSumma;
+         Carry.CtSumma = Carry.CtSumma - BackCarry.CtSumma;
+         UpdateDocOffTMPByID( Carry );
+         DeleteDocOffTMPByID( BackCarry.Id );
+      elif( CmpSum == -1 ) /*вторая больше*/
+         СтатусПарногоСчета( BackCarry );
+         BackCarry.DtSumma =  BackCarry.DtSumma - Carry.DtSumma;
+         BackCarry.CtSumma =  BackCarry.CtSumma - Carry.CtSumma;
+         UpdateDocOffTMPByID( BackCarry);
+         DeleteDocOffTMPByID( Carry.Id );
+      else /*нельзя сравнить, все оставляем как есть*/
+         СтатусПарногоСчета( Carry );
+         СтатусПарногоСчета( BackCarry );
+         UpdateDocOffTMPByID( Carry );
+         UpdateDocOffTMPByID( BackCarry);
+      end;
+   end;
+END;
+
+/*Перебирает проводки со статусом STATE_CHECK и из проводок с одинаковыми 
+  счетами по Дт и Кт (с учетом возможной парности счетов) оставляет только 
+  одну суммарную*/
+PRIVATE MACRO СверткаИдентичныхПарныхПроводок()
+   var NumCarry = 0, DtPairAcc, CtPairAcc,
+       IdentCarry = TArray();
+
+   InitProgress( -1, "Выполнение сводных проводок ...", "Свертка идентичных проводок по парным счетам" );
+
+   /*Изменяем ключевую последовательность (State), поэтому всегда GetGE*/
+   while( GetNextDocOffTMPState( STATE_CHECK ) )
+      DtPairAcc = НайтиПарныйСчет( DocOffTMPState.Chapter, DocOffTMPState.DtFIID, DocOffTMPState.DtAccount);
+      CtPairAcc = НайтиПарныйСчет( DocOffTMPState.Chapter, DocOffTMPState.CtFIID, DocOffTMPState.CtAccount);
+      /*Оба счета не парные*/
+      if( (DtPairAcc == "") AND (CtPairAcc == "") ) 
+         /*Проставить статус STATE_EXECUTE для дальнейшей обработки в "ВыполнитьПроводки"*/
+         DocOffTMPState.State = STATE_EXECUTE;
+         Update( DocOffTMPState, null, true );
+      else
+        /*194654*/
+        /*Проверяем, возможно по проводке запрещено использовать парные счета*/
+        if( GetAccount( DocOffTMPState.Chapter, DocOffTMPState.DtFIID, DocOffTMPState.DtAccount, AccountPayer) AND 
+            GetAccount( DocOffTMPState.Chapter, DocOffTMPState.CtFIID, DocOffTMPState.CtAccount, AccountReceiver) 
+          ) 
+           if( НеИспользоватьПарныеСчета(AccountPayer, AccountReceiver) == true )
+             /*Проставить статус STATE_EXECUTE для дальнейшей обработки в "ВыполнитьПроводки"*/
+             DocOffTMPState.State = STATE_EXECUTE;
+             Update( DocOffTMPState, null, true );
+             UseProgress( NumCarry = NumCarry + 1 );
+             continue; 
+           end;
+         end; 
+
+         IdentCarry[CARRY_CURRENT] = DocOffTMPState;
+
+         if( DtPairAcc != "" ) /*Счет дебета парный*/
+            /*Ищем проводку с таким же Кт и парным Дт*/
+            IdentCarry[CARRY_PAIR_DT] = FindDocOffTMPDtCt( DocOffTMPState.Chapter, 
+                                                           DocOffTMPState.DtFIID,
+                                                           DtPairAcc, 
+                                                           DocOffTMPState.CtFIID, 
+                                                           DocOffTMPState.CtAccount,
+                                                           DocOffTMPState.GroundKind );
+         end;
+
+         if( CtPairAcc != "" ) /*Счет кредита парный*/
+            /*Ищем проводку с таким же Дт и парным Кт*/
+            IdentCarry[CARRY_PAIR_CT] = FindDocOffTMPDtCt( DocOffTMPState.Chapter, 
+                                                           DocOffTMPState.DtFIID,
+                                                           DocOffTMPState.DtAccount, 
+                                                           DocOffTMPState.CtFIID,  
+                                                           CtPairAcc,
+                                                           DocOffTMPState.GroundKind );
+         end;                                              
+
+         if( (DtPairAcc != "") AND (CtPairAcc != "") ) /*Оба счета парные*/
+            /*Ищем проводку с таким же парным Дт и парным Кт*/
+            IdentCarry[CARRY_PAIR_DTCT] = FindDocOffTMPDtCt( DocOffTMPState.Chapter, 
+                                                           DocOffTMPState.DtFIID,
+                                                           DtPairAcc, 
+                                                           DocOffTMPState.CtFIID,  
+                                                             CtPairAcc,
+                                                             DocOffTMPState.GroundKind );
+         end;
+
+         /*Теперь в массиве IdentCarry имеем от 1 до 4-х записей идентичных по счетам проводок*/
+         СформироватьСуммарнуюПроводку( IdentCarry );
+      end;
+
+      UseProgress( NumCarry = NumCarry + 1 );
+   end;
+   RemProgress();
+   return 0;
+
+   OnError( RslErrObj )
+      RemProgress();
+      return SayError( RslErrObj );
+END;
+
+PRIVATE MACRO СверткаПротивоположныхПарныхПроводок()
+   var NumCarry = 0, DtPairAcc, CtPairAcc, DtAccount, CtAccount, BackCarry;
+
+   InitProgress( -1, "Выполнение сводных проводок ...", "Свертка противоположных проводок по парным счетам" );
+
+   /*Изменяем ключевую последовательность (State), поэтому всегда GetGE*/
+   while( GetNextDocOffTMPState( STATE_COMPARE ) )
+      DtAccount = CtAccount = "";
+
+      DtPairAcc = НайтиПарныйСчет( DocOffTMPState.Chapter, DocOffTMPState.DtFIID, DocOffTMPState.DtAccount);
+      CtPairAcc = НайтиПарныйСчет( DocOffTMPState.Chapter, DocOffTMPState.CtFIID, DocOffTMPState.CtAccount);
+
+      if( DtPairAcc != "" ) /*Счет дебета парный*/
+         /*Ищем проводку со счетом Кт == парному Дт текущей записи
+           и счетом по Дт == Кт текущей записи */
+         DtAccount = DocOffTMPState.CtAccount; 
+         CtAccount = DtPairAcc;
+      end;
+
+      if( CtPairAcc != "" ) /*Счет кредита парный*/
+         /*Ищем проводку со счетом Дт == парному Кт текущей записи
+           и счетом по Кт == Дт текущей записи */
+         DtAccount = CtPairAcc; 
+         CtAccount = DocOffTMPState.DtAccount;
+      end;                                              
+
+      if( (DtPairAcc != "") AND (CtPairAcc != "") ) /*Оба счета парные*/
+         /*Ищем проводку со счетом Дт и Кт парными соответственно 
+           счетам Кт и Дт текущей записи*/
+         DtAccount = CtPairAcc; 
+         CtAccount = DtPairAcc;
+      end;
+      /*ищем проводку по той же главе, что и текущая и валютам 
+        Дт == Кт текущей и Кт == Дт текущей*/
+      if( (DtAccount != "") AND (CtAccount != "") )
+         BackCarry = FindDocOffTMPDtCt( DocOffTMPState.Chapter, 
+                                        DocOffTMPState.CtFIID, DtAccount, 
+                                        DocOffTMPState.DtFIID, CtAccount, DocOffTMPState.GroundKind );
+      else
+         BackCarry = null;
+      end;
+      СформироватьРезультирующуюПроводку( DocOffTMPState ,BackCarry );
+      UseProgress( NumCarry = NumCarry + 1 );
+   end;
+
+   RemProgress();
+   return 0;
+
+   OnError( RslErrObj )
+      RemProgress();
+      return SayError( RslErrObj );
+END;
+
+PRIVATE MACRO КорректироватьПарныеСчета( CarryDate:DATE )
+   var NumCarry = 0;
+
+   InitProgress( -1, "Выполнение сводных проводок ...", "Корректировка парных счетов" );
+
+   /*Изменяем ключевую последовательность (State), поэтому всегда GetGE*/
+   while( GetNextDocOffTMPState( STATE_CORRECTPAIR ) )
+
+      DocOffTMPState.DtAccount = ВыбратьПарныйСчет( DocOffTMPState.Chapter, 
+                                                    DocOffTMPState.DtFIID, 
+                                                    DocOffTMPState.DtAccount, 
+                                                    CarryDate, 
+                                                    DocOffTMPState.ID );
+                     
+      DocOffTMPState.CtAccount = ВыбратьПарныйСчет( DocOffTMPState.Chapter, 
+                                                    DocOffTMPState.CtFIID, 
+                                                    DocOffTMPState.CtAccount, 
+                                                    CarryDate, 
+                                                    DocOffTMPState.ID );
+
+      DocOffTMPState.State = STATE_EXECUTE; 
+      UpdateDocOffTMPByID( DocOffTMPState );
+      UseProgress( NumCarry = NumCarry + 1 );
+   end;
+
+   RemProgress();
+   return 0;
+
+   OnError( RslErrObj )
+      RemProgress();
+      return SayError( RslErrObj );
+END;
+
+PRIVATE MACRO ВыполнитьПроводки( FD:SPFirstDocDLCOMM, GrpId:integer )
+   var continue_cicle, Error = 0, NumCarry = 0, Ground = "";
+   
+   InitProgress( -1, "Выполнение сводных проводок по сделкам ...", "Выполнение сводных проводок" );
+   ClearRecord( DocOffTMPState );
+   DocOffTMPState.State = STATE_EXECUTE;
+   continue_cicle = GetGE( DocOffTMPState );
+
+   while( continue_cicle AND (DocOffTMPState.State == STATE_EXECUTE) )
+        if( GetAccount( DocOffTMPState.Chapter, DocOffTMPState.DtFIID, DocOffTMPState.DtAccount, AccountPayer) AND 
+            GetAccount( DocOffTMPState.Chapter, DocOffTMPState.CtFIID, DocOffTMPState.CtAccount, AccountReceiver) 
+          ) 
+           if( (ПолучитьПараметрыСводнойПроводки( AccountPayer, AccountReceiver, DocOffTMPState.GroundKind, null, null, Ground ) == false) OR
+               (Ground == "") 
+             )
+              Ground = "Сводная проводка на ОРЦБ";
+           end;
+
+           if(not БУ_ПроводкаПоКатегориямУчета( FD, 
+                  AccountPayer, AccountReceiver, /* Деб , КатегКредит*/
+                  FD.comm.rec.CommDate,                     /* Дата */
+                  DocOffTMPState.Chapter,        /* Глава */
+                  DocOffTMPState.DtFIID,         /* Валюта */
+                  DocOffTMPState.DtSumma,        /* Сумма */
+                  INPCARRY,                      /* Result_Carry */
+                  " 1",                          /* Kind_Oper */
+                  "Сводн. проводка",                            /* Numb_Document */
+                  Ground,                        /* Ground */
+                  null,null,null,
+                  DocOffTMPState.DtFIID, DocOffTMPState.CtFIID,
+                  DocOffTMPState.CtFIID, DocOffTMPState.CtSumma,
+                  null, true
+                 ))
+               Error = 1;
+           end;
+        end;
+        if( Error == 0 )
+           continue_cicle = Next( DocOffTMPState );
+        else
+           continue_cicle = false;
+        end;
+
+        UseProgress( NumCarry = NumCarry + 1 );
+   end;
+   RemProgress();
+
+   return Error;
+END;
+
+MACRO БУ_ВыполнитьСводныеПроводки( DocKind, DocumentID, pGrpID:integer, IsClientAcc:BOOL )
+   var errcode, errtext, TmpFName;
+   var Error = 0, cmd, DataSet;
+   var FD;
+   var GrpID = 0, WhereCond="   and spdocoff.t_IsClientCarry = " +IIF(IsClientAcc, "'X'", "chr(0)");
+   
+   if( not ИспользоватьСводныеПроводки( IsClientAcc ) )
+      return 0;
+   end;
+
+   TmpFName = GetWorkFileName("docoff");
+   FD = SPFirstDocDLCOMM( DocKind, DocumentID );
+   
+   GetRegistryValue( REG_PAIRACCMODE, V_INTEGER, PairAccModeValue, errcode );
+   if( errcode != 0 )
+      MsgBox( "Ошибка при получении значения настройки \"" + REG_PAIRACCMODE + "\"");
+      return 1;
+   end;
+
+   var del = RSDCommand("DELETE FROM ddocoff_tmp");
+   del.Execute();
+   
+   /*отбираем записи в dspdocoff_dbt, касающиеся обрабатываемой пачки (в каждой пачке обработки одна запись DPMWRTGRP_DBT.T_ID)*/
+   cmd = DL_RSDCommand("select spdocoff.* from dspdocoff_dbt spdocoff "+
+                       " where spdocoff.t_GrpID = ? "+
+                       "   and spdocoff.t_ServOperID = ? " +
+                       "   and spdocoff.t_State = ? " + WhereCond
+                      );
+
+   cmd.AddParam(pGrpID);
+   cmd.AddParam(DocumentID);
+   cmd.AddParam(SPDOCOFF_STATE_PREPARED);
+
+   DataSet = cmd.Execute();
+   while( DataSet.moveNext() )
+      if( DataSet.Chapter != 5 ) /*Не ДЕПО*/
+         Error = AddInDocOffTMP(DataSet);
+      end; 
+      if( Error != 0 )   
+         break;
+      end;
+      GrpID = DataSet.GrpID;
+   end;
+
+   /*Получим название временной базы*/
+   NameFile = FileName(DocOffTMPState);
+   NameFile = "d"+NameFile;
+   NameFile = StrSubst ( NameFile, ".", "_" );
+
+   if( Error == 0 )
+      Error = СверткаИдентичныхПарныхПроводок();
+   end;
+   if( Error == 0 )
+      Error = СверткаПротивоположныхПарныхПроводок();
+   end;
+   if( Error == 0 )
+      Error = КорректироватьПарныеСчета( FD.comm.rec.CommDate );
+   end;
+   if( Error == 0 )
+      Error = ВыполнитьПроводки( FD, GrpID );
+   end;   
+
+   return Error;
+END;
+
+MACRO БУ_ПоставитьИспНаОтложСводнПр(pServOperID:integer, pGrpID:integer, IsClientAcc:BOOL)
+   var WhereCond="   and t_IsClientCarry = " +IIF(IsClientAcc, "'X'", "chr(0)");
+   var exec = RSDCommand(  " UPDATE DSPDOCOFF_DBT SET t_State = ? WHERE t_ServOperID = ? and t_GrpID = ? and t_State = ? "+WhereCond);
+  
+   exec.addParam( "", RSDBP_IN, SPDOCOFF_STATE_EXECUTED );
+   exec.addParam( "", RSDBP_IN, pServOperID );
+   exec.addParam( "", RSDBP_IN, pGrpID );
+   exec.addParam( "", RSDBP_IN, SPDOCOFF_STATE_PREPARED );
+   exec.execute();
+
+   return 0;
+END;

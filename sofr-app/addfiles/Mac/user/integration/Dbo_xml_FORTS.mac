@@ -1,0 +1,299 @@
+/*
+Создание XML для интеграции с ДБО
+
+Файлы создаются в txtfile\
+Имя файла diasoft_ddmmyyyy.xml
+
+Вопросы diasoft:
+Где и как найти данные по депо счетам, а именно:
+  остатки ценной бумаги
+  биржа/внебиржа
+Всегда ли биржа - ММВБ?
+Какого формата будут примечания, когда к одному брокерскому договору будет привязано несколько депо счетов? и будет ли такое?
+Есть депосчет, а есть тоорговый депосчет. Выводить в xml нужно и то и другое?
+В таблице для депосчетов (rshb_dbodatadepoaccounts) поле с номером счёта депо (depoaccount) пришлось делать varchar (1500). По-другому записать в это поле значение из примечания типа RAW не получилось. МБ есть какой способ это сделать иначе?
+   из-за этого последствие. поле deoaccount длиной всегда 1500, и искать в этой таблице данные по номеру счёта депо нужно таким образом: where depoaccount like 'deponum%'. trim() не обрезает
+   если по-другому нельзя вытащить значение типа RAW, то нужно будет сделать триггер, который будет обрезать вставляемое в depoaccount значение до первого chr(0)
+Если есть договор брокерского обслуживания, но нету брокерских счетов, привязанных к договору, добавлять в xml информацию по договору?
+*/
+import oralib, likepy, globals, cb_sql;
+
+//Виды рынков
+private const MARKET_FORTS = 1, //срочный рынок (FORTS)
+              MARKET_FOND  = 0; //фондовый рынок
+
+//Виды торговых площадок
+private const EXCHANGE = 1,     //Биржа
+              NON_EXCHANGE = 0; //Внебиржа
+
+private const REG_EXPORT_PATH = "РСХБ\\ИНТЕГРАЦИЯ\\ДИРЕКТОРИИ\\EXPORT\\ДБО"; //путь для выгрузки файла
+//Наимнования торговых площадок
+private const EXCHANGE_NAME = "ММВБ",
+              NON_EXCHANGE_NAME = "Внебиржа"; 
+
+class MakeXMLDocDboData ()
+
+  var xml:object;
+  var TempXML = "";
+  var /*BrokerService*/ Forts, ClientData, /*Contracts*/ DogBroks, /*Contract*/DogBrok, BrokerAccounts, Account, DepoAccounts, AccountD, Contracts, Contract;
+
+  var IsDepo         = false;         // Признак формирования счетов депо
+  var market         = -1;            // Вид рынка
+  var ClientID       = 0;             // ИД клиента в БИСКВИТ
+  var ContractNumber = "";            // номер брокерского договора
+  var ContractID     = 0;             // ИД брокерского договора
+  var ContractDate   = Date(0, 0, 0); // Дата начала брокерского договора
+  var IsIIS          = -1;            // Признак ИИС
+
+  // Создаёт дочерний элемент вида:  <ElementName>ElementValue</ElementName> 
+  macro MakeOneElement (ParentElement, ElementName, ElementValue)
+    var Element;
+    Element = xml.createElement(ElementName);
+    Element.Text = ElementValue;
+    ParentElement.appendChild(Element);
+  End;
+
+  //Принимает дату, возвращает строку формата ddmmyyyy
+  macro MakeDateStr (_dt:Date)
+    var dt = String(_dt);
+    dt = StrSubst(dt, " ", "0");
+    dt = StrSubst(dt, ".", "");
+	dt = substr(dt,1,2) + substr(dt,3,2) + substr(dt,5);
+    return dt;
+  End;
+
+  //Проверка, есть ли депо счета у клиента
+  private macro CheckDepoAccByClient()
+    var sql;
+    sql = "select 1  "
+      + "from rshb_dbodatadepoaccounts depoacc, rshb_dbodatacontracts contract "
+      + "where     depoacc.contractid = contract.contractid "
+      + "      and contract.clientid = :clientid ";
+    sql = ExecSqlSelect(sql, MakeArray(SqlParam("clientid", ClientID)), false);
+    if (sql.MoveNext()) 
+      return true;
+    end;
+    return false;
+  End;
+
+  //Проверка, есть ли привязанные счета к договору брокерского обслуживания
+  private macro CheckDepoAccByContract ()
+    var sql = "select 1 from rshb_dbodatadepoaccounts where contractid = :contractid";
+    sql = ExecSqlSelect(sql, MakeArray(SqlParam("contractid", ContractID)), false);
+    if (sql.MoveNext() )
+      return true;
+    end;
+    return false;
+  End;
+
+  /*Брокерские счета клиента по договору
+    ContractID - ИД единого договора в RS-Bank
+    IsExchange - биржа/внебиржа
+  */
+  private macro ClientBrokerAccount (IsExchange)
+    var sql;
+
+    BrokerAccounts = xml.createElement("BrokerAccounts");
+
+    sql = "select accnumber, "
+        + "       restacc "
+        + "from rshb_dboDataAccounts "
+        + "where ContractID = :id "
+        + "      and market = 1 ";
+    sql = ExecSqlSelect(sql, MakeArray(SqlParam("id", ContractID),
+                                       SqlParam("market", market)), false);
+VAR ST = "";
+    while (sql.MoveNext() )
+      Account = xml.createElement("Account");
+      MakeOneElement (Account, "Number", sql.value("accnumber"));
+      st = st+sql.value("restacc");
+      st = strsubst(st, ",", ".");
+      MakeOneElement (Account, "Rest", st);
+      st = "";
+      
+      BrokerAccounts.appendChild(Account);
+    end;
+
+    /*Contract*/DogBrok.appendChild(BrokerAccounts);
+  End;
+
+  private macro ClientCont ()
+    var sql;
+    Contracts = xml.createElement("Contracts");
+    sql = "SELECT avr.t_name as T_Type, obj.t_code,fi.t_name as T_name,dft.t_LongPosition - dft.t_ShortPosition as Rest "+
+            " FROM ddvfipos_dbt t  "+
+            " LEFT JOIN dfininstr_dbt fi  ON t.T_FIID = FI.T_FIID "+
+            " left join dobjcode_dbt obj on obj.t_objecttype = 9 and obj.t_codekind = 11 and obj.t_objectid = FI.T_FIID "+
+            " LEFT JOIN davrkinds_dbt avr ON FI.T_AVOIRKIND = AVR.T_AVOIRKIND "+
+            " left join  ddvfiturn_dbt dft on  dft.t_FIID = t.t_FIID "+
+            " AND dft.t_Department = t.t_Department "+
+            " AND dft.t_Broker = t.t_Broker "+
+            " AND dft.t_ClientContr = t.t_ClientContr "+
+            " AND dft.t_GenAgrID = t.t_GenAgrID "+
+            " AND (dft.t_Date IS NULL OR dft.t_Date = NVL ((SELECT MAX (tableDVF.t_Date) t_TurnDate FROM ddvfiturn_dbt tableDVF "+
+            "               WHERE tableDVF.t_FIID = dft.t_FIID                        "+
+            "                      AND tableDVF.t_Department =                         "+
+            "                             dft.t_Department                             "+
+            "                      AND tableDVF.t_Broker = dft.t_Broker                "+
+            "                      AND tableDVF.t_ClientContr =                        "+
+            "                             dft.t_ClientContr                            "+
+            "                      AND tableDVF.t_GenAgrID = dft.t_GenAgrID), :date1)) "+                                                   
+            "     WHERE t.t_clientcontr = :clientcontr  ";
+    sql = ExecSqlSelect(sql, MakeArray(SqlParam("date1", {curdate}),
+                                       SqlParam("clientcontr", ContractID)), false);
+    while (sql.MoveNext() )
+      Contract = xml.createElement("Contract");
+      MakeOneElement (Contract, "Type", sql.value("t_Type"));
+      MakeOneElement (Contract, "Number", sql.value("Number"));
+      MakeOneElement (Contract, "Name", sql.value("T_name"));
+      MakeOneElement (Contract, "Rest", sql.value("Rest"));
+      Contracts.appendChild(Contract);
+    end;
+    DogBrok.appendChild(Contracts);
+
+  End;
+
+
+  /*Депо счета клиента по договору
+    ContractID - ИД единого договора в RS-Bank
+    IsExchange - биржа/внебиржа
+  */
+/* private macro ClientDepoAccount ()
+    var sql;
+
+    DepoAccounts = xml.createElement("DepoAccounts");
+
+    sql = "select distinct depoaccount, contractid "
+        + "from rshb_dbodatadepoaccounts "
+        + "where contractid = :id ";
+    sql = ExecSqlSelect(sql, MakeArray(SqlParam("id", ContractID)), false);
+
+    while (sql.MoveNext() )
+      AccountD = xml.createElement("AccountD");
+      MakeOneElement (AccountD, "NumberD", sql.value("depoaccount"));
+      DepoAccountData(AccountD, sql.value("contractid"), sql.value("depoaccount"));
+      DepoAccounts.appendChild(AccountD);
+    end;
+    
+   
+  End;*/
+
+  private macro ШапкаДоговора (/*NameTP*/)
+    MakeOneElement (/*Contract*/DogBrok, "DogBrok", ContractNumber);
+    MakeOneElement (/*Contract*/DogBrok, "IIS", IsIIS);
+  End;
+
+  //Договоры брокерского обслуживания клиента
+  private macro ClientContracts ()
+    var sql;
+
+    if ( valtype(IsDepo) == V_UNDEF)
+      IsDepo = false;
+    end;
+
+    sql = "select contractnumber, "
+        + "       IsIIS, "
+        + "       ContractDate, "
+        + "       ContractID "
+        + "from Rshb_Dbodatacontracts "
+        + "where clientid = :BisID ";
+    sql = ExecSqlSelect(sql, MakeArray(SqlParam("BisID", ClientID)), false);
+
+    /*Contracts*/DogBroks = xml.createElement(/*"Contracts"*/"DogBroks");
+
+    //по всем договорам брокерского обслуживания клиента
+    while (sql.MoveNext())
+      ContractNumber = sql.value("contractnumber");
+      ContractID     = sql.value("ContractID");
+//      ContractDate   = sql.value("ContractDate", null, V_DATE);
+      IsIIS          = sql.value("IsIIS");
+      
+      if (IsDepo and not CheckDepoAccByContract() )
+        continue;
+      end;
+
+      /*Contract*/DogBrok = xml.createElement(/*"Contract"*/"DogBrok");
+
+        ШапкаДоговора(/*CHANGE_NAME*/);
+        ClientBrokerAccount();
+        ClientCont();
+      /*Contracts*/DogBroks.appendChild(/*Contract*/DogBrok);
+    end;
+
+    ClientData.appendChild(/*Contracts*/DogBroks);
+    return /*Contracts*/DogBroks;
+  End;
+
+  private macro ПоВсемКлиентам ()
+    return ExecSqlSelect("select distinct clientid, branchid from Rshb_Dbodatacontracts contr "+
+                         " where                                                              "+
+                         " (select count(*) from rshb_dbodataaccounts acct                    "+  
+		           " where contr.contractid = acct.contractid and acct.market = 1)>0    "+
+                         " order by clientid                                                  ", null, false);
+
+  End;
+
+  //Создать xml, структурой из diasoft
+  macro MakeDiasoft (RepDt)
+    var sql, ErrCode, StrPath;
+    IsDepo         = false;         // Признак формирования счетов депо
+    market         = -1;            // Вид рынка
+    ClientID       = 0;             // ИД клиента в БИСКВИТ
+    ContractNumber = "";            // номер брокерского договора
+    ContractID     = 0;             // ИД брокерского договора
+    ContractDate   = Date(0, 0, 0); // Дата начала брокерского договора
+    IsIIS          = -1;            // Признак ИИС
+    //market = MARKET_FOND;
+    //получим значение пути выгрузки из реестра
+    GetRegistryValue(REG_EXPORT_PATH, V_STRING, StrPath, ErrCode);
+    if( ErrCode > 0 )
+       StrPath = "d:\\rshb_sofr\\export\\DBO";
+    end;
+    TempXML = StrPath+"\\forts_"+MakeDateStr(RepDt)+".xml";
+
+     initprogress(sql_getnrecs("select distinct clientid, branchid from Rshb_Dbodatacontracts order by clientid"),"Выгрузка в файл", "Выгрузка в файл : " + TempXML);
+    var cnt = 1;
+    xml = ActiveX("Microsoft.XMLDOM");
+    xml.appendChild( xml.createProcessingInstruction("xml"," version='1.0' encoding='UTF-8'") );
+
+    /*BrokerService*/Forts = xml.createElement(/*"BrokerService"*/"Forts");
+    MakeOneElement (/*BrokerService*/Forts, "RepDate", RepDt);
+    sql = ПоВсемКлиентам();
+
+    //Сначала брокерские счета
+    while (sql.MoveNext() )
+      IsDepo = false;
+      ClientID = sql.value("clientid");
+      ClientData = xml.createElement("ClientData");
+
+      MakeOneElement (ClientData, "Branch", sql.value("branchid", null, V_STRING));
+      var BisId = sql.value("clientid", null, V_STRING);
+      BisId = subStr(BisId,6);
+      MakeOneElement (ClientData, "BisId", BisId);
+      ClientContracts();
+
+      /*BrokerService*/Forts.appendChild(ClientData);
+      useprogress(cnt = cnt+1);
+    end;
+
+
+        xml.appendChild(/*BrokerService*/ Forts);
+remprogress;
+    println("Файл сохранен "+TempXML);
+    xml.Save(TempXML);
+
+  End;
+
+END;
+macro start
+/*begaction(2000, "Выгрузка данных");
+var cmd = "begin "+
+" rshb_prepDataAccounts(null,false,:date1); "+
+" end;";
+cmd = rsdcommand(cmd);
+cmd.AddParam("date1", RSDBP_IN, {curdate});
+cmd.execute;*/
+var a = MakeXMLDocDboData();
+a.MakeDiasoft({curdate});
+//endaction(200);
+end;

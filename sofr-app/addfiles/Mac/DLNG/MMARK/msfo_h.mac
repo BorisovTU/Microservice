@@ -1,0 +1,325 @@
+/*
+$Name:        msfo_h.mac
+$Module:      МБ Кредиты
+$Description: API-функции межбанковского кредитования
+*/
+
+import RsbDataSet, RSD, mmcnst_j, mmlibr, PTInter, FIInter, globals, or_exl_h, mmlb_j, mmlib, mmcateg, msfo_mmupgrdlib;
+
+PRIVATE VAR ExecDate,
+            mmhstimp = TBFile("mmhstimp.dbt", "W", 0);
+
+PRIVATE VAR C  = TArray(), // расчетная база
+            R  = TArray(), // пруденциальные резервы
+            Ra = TArray(), // оценочные резервы
+            С_об = $0,     // Сумма оборотов
+            Ra_общ = $0;    // Общая сумма пруденциальных резервов
+
+PRIVATE CONST
+    MM_RSRV_TYPE_MMDEAL = 3;
+
+PRIVATE CONST RTYPE_MD     = 1, // ОД
+              RTYPE_CHC    = 2, // Просроченны ОД
+              RTYPE_PC     = 3, // %%
+              RTYPE_PC_CHC = 4, // Просроченные %
+              RTYPE_PN     = 5, // неустойки
+              RTYPE_LIAB   = 6, // условные обязательства
+              RTYPE_COUNT  = 7;
+
+PRIVATE CONST STYPE_ADJ      = 10, // корректировка стоимости
+              STYPE_EXPENSES = 11; // Затраты
+
+PRIVATE MACRO InsertHstImp(deal_pd, ImpStage, PercLoss)
+    VAR cmd, rs;
+    cmd = RsdCommand(RslDefCon, "SELECT 1 FROM dmmhstimp_dbt WHERE T_DEALID = ? AND T_DATE = ? AND T_IMPGRADE = ? AND T_PERCLOSS = ?");
+    cmd.AddParam("p1", RSDBP_IN); cmd.Value("p1") = deal_pd.GetTick().DealID;
+    cmd.AddParam("p2", RSDBP_IN); cmd.Value("p2") = deal_pd.GetLeg().Start;
+    cmd.AddParam("p3", RSDBP_IN); cmd.Value("p3") = ImpStage - 1;
+    cmd.AddParam("p4", RSDBP_IN); cmd.Value("p4") = PercLoss;
+    cmd.Execute();
+    rs = RsdRecordSet(cmd);
+    // уже есть
+    IF (rs.MoveNext())
+        return true;
+    end;
+
+    mmhstimp.clear();
+    mmhstimp.rec.ID       = 0;
+    mmhstimp.rec.DealID   = deal_pd.GetTick().DealID;
+    mmhstimp.rec.Date     = deal_pd.GetLeg().Start;
+    mmhstimp.rec.ImpGrade = ImpStage - 1;
+    mmhstimp.rec.PercLoss = PercLoss;
+    return mmhstimp.Insert();
+END;
+
+PRIVATE MACRO InsertDlResLnk(TypeBase, deal_pd)
+    VAR
+        reslnk = TBfile("dlreslnk.dbt", "W", 0),
+        ККС = 0, ПР = 0, DataSet, С_об = $0;
+
+    DataSet = TRsbDataSet("select t_qualitycategory, t_reservepercent " +
+                          " from ddlreslnk_dbt " +
+                          " where (t_type = 3) and (t_parentid = " + deal_pd.GetTick().DealID + ")" +
+                          " and (t_childid = -1) " +
+                          " and (t_lnkdate <= '"+ Date({curdate}) + "')" +
+                          " order by t_lnkdate desc, t_id desc");
+
+    IF (not DataSet.MoveNext) 
+       PrintLn(deal_pd.GetTick().DealCode, "Не заданы параметры резервирования в сделке");
+       RETURN 1;
+    END;
+
+    ККС = DataSet.QualityCategory;
+    ПР = DataSet.ReservePercent;
+
+    reslnk.clear();
+    reslnk.rec.ParentID          = deal_pd.GetTick().DealID;       // Порождающий документ
+    reslnk.rec.ChildID           = -1;                             // Порожденный документ
+    reslnk.rec.Type              = MM_RSRV_TYPE_MMDEAL;            // Тип связи
+    reslnk.rec.LnkDate           = ExecDate;                       // Дата
+    reslnk.rec.QualityCategory   = ККС;                            // Категория качества
+    reslnk.rec.ReservePercent    = ПР;                             // Процент резерва
+    reslnk.rec.SecurityAmount    = С_об;                           // Сумма обеспечения
+    reslnk.rec.SecurityCurrency  = NATCUR;                         // Валюта обеспечения 
+    reslnk.rec.ReserveKind       = 1;                              // Вид резерва
+    reslnk.rec.ReserveDate       = ExecDate;                       // Дата расчета резерва
+    reslnk.rec.Flag1             = "";                             // Валютная корректировка
+    reslnk.rec.IsManual          = 0;                              // Признак пользовательской корректировки
+    reslnk.rec.RiseQC            = 0;                              // Повышение ККС
+    reslnk.rec.ReserveSubKind    = 0;                              //
+    reslnk.rec.TypeBase          = TypeBase;                       // Тип базы расчета
+    reslnk.rec.ReserveAmount      = R[TypeBase-1];
+    reslnk.rec.ReserveAssesAmount = Ra[TypeBase-1];
+
+    if ((reslnk.rec.ReserveAmount == 0) and (reslnk.rec.ReserveAssesAmount == 0))
+        return 0;
+    end;
+
+    return reslnk.Insert();
+END;
+
+PRIVATE MACRO MakeTrnSS(S, deal_pd)
+    var at = MM_Carry;
+    at.date_carry       = ExecDate;
+    at.PrimaryDoc       = deal_pd;
+    at.FIID             = NATCUR;
+    at.Sum              = abs(S);
+    at.Chapter          = 1;
+
+    if (S > 0)
+        at.CatPayer    = ПолучитьКатСчетаКорреспонденции(tdr_rezadjP(deal_pd.GetTick().TypeDoc), true, deal_pd, ExecDate);
+        at.CatReceiver = tdr_assesrez;
+        at.Ground      = "Создание/Увеличение оценочного резерва";
+    else
+        at.CatPayer    = tdr_assesrez;
+        at.CatReceiver = ПолучитьКатСчетаКорреспонденции(tdr_rezadjR(deal_pd.GetTick().TypeDoc), false, deal_pd, ExecDate);
+        at.Ground      = "Списание/Уменьшение оценочного резерва";
+    end;
+
+    return at.carry();
+END;
+
+PRIVATE MACRO MakeTrnAC(КОРi, type, deal_pd)
+    var at = MM_Carry;
+    at.date_carry       = ExecDate;
+    at.PrimaryDoc       = deal_pd;
+    at.FIIDPayer        = 
+    at.FIIDReceiver     = NATCUR;
+    at.Sum              = abs(КОРi);
+    at.Chapter          = 1;
+
+    if (type == RTYPE_MD) // ОД
+        if (КОРi > 0)
+            at.CatPayer    = ПолучитьКатСчетаКорреспонденции(tdr_rezadjP(deal_pd.GetTick().TypeDoc), true, deal_pd, ExecDate);
+            at.CatReceiver = tdr_rezadjodR;
+            at.Ground      = "Корректировка, увеличивающая резерв по ОД без нарушения сроков оплаты до размера оценочного";
+        else
+            at.CatPayer    = tdr_rezadjodP;
+            at.CatReceiver = ПолучитьКатСчетаКорреспонденции(tdr_rezadjR(deal_pd.GetTick().TypeDoc), false, deal_pd, ExecDate);
+            at.Ground      = "Корректировка, уменьшающая резерв по ОД без нарушения сроков оплаты до размера оценочного";
+        end;
+
+    elif (type == RTYPE_CHC)
+        if (КОРi > 0)
+            at.CatPayer    = ПолучитьКатСчетаКорреспонденции(tdr_rezadjP(deal_pd.GetTick().TypeDoc), true, deal_pd, ExecDate);
+            at.CatReceiver = tdr_rezadjexpodR;
+            at.Ground      = "Корректировка, увеличивающая резерв по просроченному ОД до размера оценочного";
+        else
+            at.CatPayer    = tdr_rezadjexpodP;
+            at.CatReceiver = ПолучитьКатСчетаКорреспонденции(tdr_rezadjR(deal_pd.GetTick().TypeDoc), false, deal_pd, ExecDate);
+            at.Ground      = "Корректировка, уменьшающая резерв по просроченному ОД до размера оценочного";
+        end;
+
+    elif (type == RTYPE_PC)
+        if (КОРi > 0)
+            at.CatPayer    = ПолучитьКатСчетаКорреспонденции(tdr_rezadjP(deal_pd.GetTick().TypeDoc), true, deal_pd, ExecDate);
+            at.CatReceiver = tdr_rezadjprcR;
+            at.Ground      = "Корректировка, увеличивающая резерв по процентам без нарушения сроков оплаты до размера оценочного";
+        else
+            at.CatPayer    = tdr_rezadjprcP;
+            at.CatReceiver = ПолучитьКатСчетаКорреспонденции(tdr_rezadjR(deal_pd.GetTick().TypeDoc), false, deal_pd, ExecDate);
+            at.Ground      = "Корректировка, уменьшающая резерв по процентам без нарушения сроков оплаты до размера оценочного";
+        end;
+
+    elif (type == RTYPE_PC_CHC)
+        if (КОРi > 0)
+            at.CatPayer    = ПолучитьКатСчетаКорреспонденции(tdr_rezadjP(deal_pd.GetTick().TypeDoc), true, deal_pd, ExecDate);
+            at.CatReceiver = tdr_rezadjexpprcR;
+            at.Ground      = "Корректировка, увеличивающая резерв по просроченным процентам до размера оценочного";
+        else
+            at.CatPayer    = tdr_rezadjexpprcP;
+            at.CatReceiver = ПолучитьКатСчетаКорреспонденции(tdr_rezadjR(deal_pd.GetTick().TypeDoc), false, deal_pd, ExecDate);
+            at.Ground      = "Корректировка, уменьшающая резерв по просроченным процентам до размера оценочного";
+        end;
+
+    elif (type == RTYPE_PN)
+        if (КОРi > 0)
+            at.CatPayer    = ПолучитьКатСчетаКорреспонденции(tdr_rezadjcostP, true, deal_pd, ExecDate);
+            at.CatReceiver = tdr_rezadjpennyR;
+            at.Ground      = "Корректировка, увеличивающая резерв по неустойкам (штрафам, пеням) до размера оценочного";
+        else
+            at.CatPayer    = tdr_rezadjpennyP;
+            at.CatReceiver = ПолучитьКатСчетаКорреспонденции(tdr_rezadjcostR, false, deal_pd, ExecDate);
+            at.Ground      = "Корректировка, уменьшающая резерв по неустойкам (штрафам, пеням) до размера оценочного";
+        end;
+
+    elif (type == RTYPE_LIAB)
+        if (КОРi > 0)
+            at.CatPayer    = ПолучитьКатСчетаКорреспонденции(tdr_rezadjliabP, true, deal_pd, ExecDate);
+            at.CatReceiver = tdr_rezadjlimR;
+            at.Ground      = "Корректировка, увеличивающая резерв по условным обязательствам кредитного характера до размера оценочного";
+        else
+            at.CatPayer    = tdr_rezadjlimP;
+            at.CatReceiver = ПолучитьКатСчетаКорреспонденции(tdr_rezadjliabR, false, deal_pd, ExecDate);
+            at.Ground      = "Корректировка, уменьшающая резерв по условным обязательствам кредитного характера до размера оценочного";
+        end;
+
+    elif (type == STYPE_ADJ)
+        if (КОРi > 0)
+            at.CatPayer    = ПолучитьКатСчетаКорреспонденции(tdr_rezadjP(deal_pd.GetTick().TypeDoc), true, deal_pd, ExecDate);
+            at.CatReceiver = tdr_rezadjadjR;
+            at.Ground      = "Корректировка на сумму корректировки стоимости, увеличивающая резерв по сделке до размера оценочного";
+        else
+            at.CatPayer    = tdr_rezadjadjP;
+            at.CatReceiver = ПолучитьКатСчетаКорреспонденции(tdr_rezadjR(deal_pd.GetTick().TypeDoc), false, deal_pd, ExecDate);
+            at.Ground      = "Корректировка на сумму корректировки стоимости, уменьшающая резерв по сделке до размера оценочного";
+        end;
+
+    elif (type == STYPE_EXPENSES)
+        if (КОРi > 0)
+            at.CatPayer    = ПолучитьКатСчетаКорреспонденции(tdr_rezadjP(deal_pd.GetTick().TypeDoc), true, deal_pd, ExecDate);
+            at.CatReceiver = tdr_rezadjexpR;
+            at.Ground      = "Корректировка на сумму затрат, увеличивающая резерв по сделке до размера оценочного";
+        end;
+    end;
+
+    return at.carry();
+END;
+
+PRIVATE MACRO ProcessDeal(deal_pd, ImpStage, PercLoss)
+    var stat, i = 0, rez = true, AsCategory = 0, Ra_общ = $0, КОРккст, КОРкз;
+
+    // расчетная база
+    var penny_ODR   = 0,
+        penny_percR = 0,
+        tdr_obl;
+
+    if (not InsertHstImp(deal_pd, ImpStage, PercLoss))
+        mm_error("Не удалось добавить запись в историю параметров обесценения");
+        return false;
+    end;
+
+    // получение расчетной базы
+    ПолучитьОстатокСчета(deal_pd, tdr_mainrest,    NULL, 1, C[0],        ExecDate, deal_pd.GetLeg().PFI);
+    ПолучитьОстатокСчета(deal_pd, tdr_exprestR,    NULL, 1, C[1],        ExecDate, deal_pd.GetLeg().PFI);
+    ПолучитьОстатокСчета(deal_pd, tdr_claimR,      NULL, 1, C[2],        ExecDate, deal_pd.GetLeg().PFI);
+    ПолучитьОстатокСчета(deal_pd, tdr_exppercR,    NULL, 1, C[3],        ExecDate, deal_pd.GetLeg().PFI);
+    ПолучитьОстатокСчета(deal_pd, tdr_penny_ODR,   NULL, 1, penny_ODR,   ExecDate, deal_pd.GetLeg().PFI);
+    ПолучитьОстатокСчета(deal_pd, tdr_penny_percR, NULL, 1, penny_percR, ExecDate, deal_pd.GetLeg().PFI);
+    C[4] = penny_ODR + penny_percR;
+
+    if (isSale(GetOperationGroup(deal_pd.GetTick().DealType)))
+        tdr_obl = tdr_oblP;
+    else
+        tdr_obl = tdr_oblR;
+    end;
+    ПолучитьОстатокСчета(deal_pd, tdr_obl,         NULL, 1, C[5],        ExecDate, deal_pd.GetTick().LimitCur);
+
+    // Расчет оченочного резерва
+    while (i < RTYPE_COUNT-1)
+        Ra[i] = MM_CalcAssesRes(DL_IBCDOC, deal_pd.GetTick().DealID, C[i], ExecDate, 0);
+        С_об = С_об + C[i];
+        Ra_общ = Ra_общ + Ra[i];
+        i = i + 1;
+    end;
+
+    // получение пруденциального резерва
+    ПолучитьОстатокСчета(deal_pd, tdr_rez_mainrest, NULL, 1, R[0], ExecDate, NATCUR);
+    ПолучитьОстатокСчета(deal_pd, tdr_rez_exprest,  NULL, 1, R[1], ExecDate, NATCUR);
+    ПолучитьОстатокСчета(deal_pd, tdr_rez_perc,     NULL, 1, R[2], ExecDate, NATCUR);
+    ПолучитьОстатокСчета(deal_pd, tdr_rez_expperc,  NULL, 1, R[3], ExecDate, NATCUR);
+    ПолучитьОстатокСчета(deal_pd, tdr_rez_penny,    NULL, 1, R[4], ExecDate, NATCUR);
+    ПолучитьОстатокСчета(deal_pd, tdr_rezerve9,     NULL, 1, R[5], ExecDate, NATCUR);
+
+    // формирование проводок
+    // получить категорию оценки
+    GetMainObjAttr(NULL, OBJTYPE_MMARKDEAL, UniID(deal_pd.tick, OBJTYPE_MMARKDEAL), 5, AsCategory, NULL, NULL, ExecDate);
+    if (AsCategory == 4)
+        rez = MakeTrnSS(Ra_общ, deal_pd);
+    else
+        i = 0;
+        while ((i < RTYPE_COUNT-1) and rez)
+            rez = MakeTrnAC((Ra[i] - R[i]), (i + 1), deal_pd);
+            i = i + 1;
+        end;
+    end;
+    // формирование доп. корректировок
+    ПолучитьОстатокСчетаУчетЗнака(deal_pd, tdr_adjplR, NULL, 1, КОРккст, ExecDate, NATCUR);
+    if (КОРккст == 0)
+        ПолучитьОстатокСчетаУчетЗнака(deal_pd, tdr_adjplP, NULL, 1, КОРккст, ExecDate, NATCUR);
+    end;
+    ПолучитьОстатокСчета(deal_pd, tdr_expenses, NULL, 1, КОРкз, ExecDate, NATCUR);
+
+    КОРккст = MM_CalcAssesRes(DL_IBCDOC, deal_pd.GetTick().DealID, КОРккст, ExecDate, 0);
+    КОРкз   = MM_CalcAssesRes(DL_IBCDOC, deal_pd.GetTick().DealID, КОРкз,   ExecDate, 0);
+
+    rez = MakeTrnAC(КОРккст, STYPE_ADJ, deal_pd);
+    if (rez)
+        rez = MakeTrnAC(КОРкз, STYPE_EXPENSES, deal_pd);
+    end;
+
+    // сохранение результата
+    if (rez)
+        i = 0;
+        while (i < RTYPE_COUNT-1)
+            InsertDlResLnk((i + 1), deal_pd);
+            i = i + 1;
+        end;
+    end;
+
+    return rez;
+END;
+
+MACRO ExecuteStep(Buffer, Document)
+   record deal(dl_tick);
+   SetBuff(deal, Document);
+
+   ExecDate = {curdate}; // Как дату передать ?
+
+   VAR deal_pd, cmd = RsdCommand(RslDefCon, "SELECT * FROM DMSFO_UPGRADE_DBT WHERE T_DEALID = ?");
+   cmd.AddParam("p1", RSDBP_IN); cmd.Value("p1") = deal.DealID;
+   cmd.Execute();
+   VAR rs = RsdRecordSet(cmd);
+   IF (rs.MoveNext())
+      VAR ImpStage   = rs.Value("T_SUM1");   // ID договора обслуживания
+      VAR PercLoss   = rs.Value("T_SUM2");   // Валюта
+
+      deal_pd = MMFirstDoc (deal.BOfficeKind, deal.DealID, true);
+
+      if (not ProcessDeal(deal_pd, ImpStage, PercLoss))
+        return 1;
+      end;
+   END;
+
+   RETURN 0;
+END;

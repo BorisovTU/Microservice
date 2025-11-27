@@ -1,0 +1,268 @@
+
+CREATE OR REPLACE TRIGGER DSCQINV_DBT_TIUR
+   BEFORE UPDATE OF T_CHANGEDATE ON DSCQINV_DBT
+   FOR EACH ROW
+DECLARE
+   v_OldDate DATE;
+   v_NewDate DATE;
+BEGIN
+
+  IF( :OLD.T_CHANGEDATE != TO_DATE( '01.01.0001', 'dd.mm.yyyy' ) ) THEN
+     v_OldDate := :OLD.T_CHANGEDATE;
+  ELSE
+     v_OldDate := :OLD.T_REGDATE;
+  END IF;
+
+  IF( :NEW.T_CHANGEDATE != TO_DATE( '01.01.0001', 'dd.mm.yyyy' ) ) THEN
+     v_NewDate := :NEW.T_CHANGEDATE;
+  ELSE
+     v_NewDate := :NEW.T_REGDATE;
+  END IF;
+
+  IF( v_OldDate > v_NewDate ) THEN
+     RAISE_APPLICATION_ERROR(-20201,''); --Нарушена последовательность выполнения операций
+  END IF;
+  
+  IF (:OLD.t_state = :NEW.t_state AND :OLD.t_state = 1 AND :OLD.t_controlDate < :NEW.t_controlDate) THEN
+    -- Пролонгация
+    INSERT INTO DSCQINVH_DBT
+      ( T_PARTYID, T_KIND, T_STATE, T_BEGDATE, T_ENDDATE, T_OPER, T_SYSDATE, T_SYSTIME, T_CAUSE, T_CODE, T_CONTROLDATE )
+    VALUES
+      ( :NEW.T_PARTYID, :NEW.T_KIND, :OLD.T_STATE, v_OldDate, :NEW.T_CHANGEDATE - 1, :OLD.T_OPER, :OLD.T_SYSDATE, :OLD.T_SYSTIME, :OLD.T_CAUSE, :OLD.T_CODE, :OLD.T_CONTROLDATE );
+  END IF;
+
+END DSCQINV_DBT_TIUR;
+/
+
+CREATE OR REPLACE TRIGGER DSCQINV_DBT_TUR
+   AFTER UPDATE OF T_STATE ON DSCQINV_DBT
+   FOR EACH ROW
+DECLARE
+   v_BegDate DATE;
+   v_EndDate DATE;
+BEGIN
+
+  IF( (:OLD.T_STATE = 1) AND (:NEW.T_STATE = 0) ) THEN
+     v_BegDate := GREATEST(:OLD.T_REGDATE, :OLD.T_CHANGEDATE);
+     v_EndDate := :NEW.T_CHANGEDATE - 1;
+  ELSE
+     v_BegDate := :OLD.T_CHANGEDATE;
+     v_EndDate := :NEW.T_REGDATE - 1;
+  END IF;
+
+  IF( v_BegDate > v_EndDate ) THEN
+     RAISE_APPLICATION_ERROR(-20202,''); --Неверный период действия статуса КИ
+  END IF;
+
+  IF( (:NEW.T_STATE = 0) AND (:NEW.T_KIND = 2) ) THEN
+     TRGPCKG_DSCQINVFI_TD.v_InTrgr := true;
+     UPDATE DSCQINVFI_DBT
+        SET T_STATE     = 0,
+            T_STATEDATE = :NEW.T_CHANGEDATE,
+            T_OPER      = :NEW.T_OPER,
+            T_SYSDATE   = :NEW.T_SYSDATE,
+            T_SYSTIME   = :NEW.T_SYSTIME
+      WHERE T_PARTYID = :NEW.T_PARTYID
+        AND T_STATE   = 1;
+     TRGPCKG_DSCQINVFI_TD.v_InTrgr := false;
+  END IF;
+
+  INSERT INTO DSCQINVH_DBT
+        ( T_PARTYID, T_KIND, T_STATE, T_BEGDATE, T_ENDDATE, T_OPER, T_SYSDATE, T_SYSTIME, T_CAUSE, T_CODE, T_CONTROLDATE )
+  VALUES( :NEW.T_PARTYID, :OLD.T_KIND, :OLD.T_STATE, v_BegDate, v_EndDate, :OLD.T_OPER, :OLD.T_SYSDATE, :OLD.T_SYSTIME, :OLD.T_CAUSE, :OLD.T_CODE, :OLD.T_CONTROLDATE );
+
+END DSCQINV_DBT_TUR;
+/
+
+CREATE OR REPLACE TRIGGER DSCQINV_DBT_TDR
+   AFTER DELETE ON DSCQINV_DBT
+   FOR EACH ROW
+DECLARE
+BEGIN
+
+  DELETE FROM DSCQINVH_DBT
+  WHERE T_PARTYID = :OLD.T_PARTYID;
+
+  IF( :OLD.T_KIND = 2 ) THEN
+     TRGPCKG_DSCQINVFI_TD.v_InTrgr := true;
+     DELETE FROM DSCQINVFI_DBT
+     WHERE T_PARTYID = :OLD.T_PARTYID;
+     TRGPCKG_DSCQINVFI_TD.v_InTrgr := false;
+  END IF;
+
+END DSCQINV_DBT_TDR;
+/
+
+CREATE OR REPLACE TRIGGER DSCQINV_DBT_TIUSR
+   AFTER INSERT OR UPDATE OF T_STATE ON DSCQINV_DBT
+   FOR EACH ROW
+   WHEN ( NEW.T_STATE = 1 )
+DECLARE
+BEGIN
+
+  TRGPCKG_DSCQINV_DBT_TIUS.v_NumEnt := TRGPCKG_DSCQINV_DBT_TIUS.v_NumEnt + 1;
+  TRGPCKG_DSCQINV_DBT_TIUS.v_t_PartyID(TRGPCKG_DSCQINV_DBT_TIUS.v_NumEnt) := :NEW.T_PARTYID;
+  IF( :NEW.T_KIND = 1 ) THEN
+     TRGPCKG_DSCQINV_DBT_TIUS.v_t_Kind(TRGPCKG_DSCQINV_DBT_TIUS.v_NumEnt) := 2;
+  ELSE
+     TRGPCKG_DSCQINV_DBT_TIUS.v_t_Kind(TRGPCKG_DSCQINV_DBT_TIUS.v_NumEnt) := 1;
+  END IF;
+  TRGPCKG_DSCQINV_DBT_TIUS.v_t_RegDate(TRGPCKG_DSCQINV_DBT_TIUS.v_NumEnt) := :NEW.T_REGDATE;
+
+END DSCQINV_DBT_TIUSR;
+/
+
+CREATE OR REPLACE TRIGGER DSCQINV_DBT_TIUS
+   AFTER INSERT OR UPDATE OF T_STATE ON DSCQINV_DBT
+DECLARE
+   CountRow INTEGER;
+BEGIN
+
+  IF( TRGPCKG_DSCQINV_DBT_TIUS.v_NumEnt <> 0 ) THEN
+
+     FOR j IN 1..TRGPCKG_DSCQINV_DBT_TIUS.v_NumEnt
+     LOOP
+        CountRow := 0;
+        SELECT COUNT(1) INTO CountRow
+          FROM DV_SCQINVHIST QIHist
+         WHERE QIHist.T_PARTYID  = TRGPCKG_DSCQINV_DBT_TIUS.v_t_PartyID(j)
+           AND QIHist.T_KIND     = TRGPCKG_DSCQINV_DBT_TIUS.v_t_Kind(j)
+           AND QIHist.T_BEGDATE >= TRGPCKG_DSCQINV_DBT_TIUS.v_t_RegDate(j);
+
+        IF( CountRow > 0 ) THEN
+           TRGPCKG_DSCQINV_DBT_TIUS.v_NumEnt := 0;
+           RAISE_APPLICATION_ERROR(-20206,''); --Субект уже включен в перечень КИ с другим видом
+        END IF;
+     END LOOP;
+
+     TRGPCKG_DSCQINV_DBT_TIUS.v_NumEnt := 0;
+  END IF;
+
+END DSCQINV_DBT_TIUS;
+/
+
+CREATE OR REPLACE TRIGGER DSCQINVFI_DBT_TIUR
+   AFTER INSERT OR UPDATE OF T_STATE ON DSCQINVFI_DBT
+   FOR EACH ROW
+DECLARE
+   v_State      NUMBER;
+   v_ChangeDate DATE;
+   v_Kind       NUMBER;
+   v_RegDate    DATE;
+BEGIN
+
+  IF( TRGPCKG_DSCQINVFI_TD.v_InTrgr = false ) THEN
+
+     v_State := 0;
+     v_Kind  := 0;
+     SELECT T_STATE, T_CHANGEDATE, T_KIND, T_REGDATE INTO v_State, v_ChangeDate, v_Kind, v_RegDate
+       FROM DSCQINV_DBT
+      WHERE T_PARTYID = :NEW.T_PARTYID;
+
+     IF( v_State = 0 ) THEN
+        RAISE_APPLICATION_ERROR(-20203,''); --Попытка изменить анкету исключенного КИ
+     END IF;
+
+     IF( INSERTING AND (v_Kind = 1) ) THEN
+        RAISE_APPLICATION_ERROR(-20205,''); --Попытка добавить вид ФИ для КИ по закону
+     END IF;
+
+     IF( (v_RegDate > :NEW.T_STATEDATE) OR (UPDATING AND (:OLD.T_STATEDATE > :NEW.T_STATEDATE)) ) THEN
+        RAISE_APPLICATION_ERROR(-20207,''); --Неверная дата изменения статуса вида ФИ
+     END IF;
+
+     IF( v_ChangeDate < :NEW.T_STATEDATE ) THEN
+        UPDATE DSCQINV_DBT
+           SET T_CHANGEDATE = :NEW.T_STATEDATE
+         WHERE T_PARTYID = :NEW.T_PARTYID;
+     END IF;
+
+     IF( UPDATING ) THEN
+        IF( :OLD.T_STATEDATE > (:NEW.T_STATEDATE - 1) ) THEN
+           RAISE_APPLICATION_ERROR(-20204,''); --Неверный период действия статуса вида ФИ
+        END IF;
+        INSERT INTO DSCQINVFH_DBT
+              ( T_PARTYID, T_AVOIRKIND, T_STATE, T_BEGDATE, T_ENDDATE, T_OPER, T_SYSDATE, T_SYSTIME )
+        VALUES( :NEW.T_PARTYID, :NEW.T_AVOIRKIND, :OLD.T_STATE, :OLD.T_STATEDATE, :NEW.T_STATEDATE-1, :OLD.T_OPER, :OLD.T_SYSDATE, :OLD.T_SYSTIME );
+     END IF;
+
+  END IF;
+
+END DSCQINVFI_DBT_TIUR;
+/
+
+CREATE OR REPLACE TRIGGER DSCQINVFI_DBT_TDR
+   AFTER DELETE ON DSCQINVFI_DBT
+   FOR EACH ROW
+DECLARE
+BEGIN
+
+  DELETE FROM DSCQINVFH_DBT
+  WHERE T_PARTYID = :OLD.T_PARTYID
+    AND T_AVOIRKIND = :OLD.T_AVOIRKIND;
+
+  IF( TRGPCKG_DSCQINVFI_TD.v_InTrgr = false ) THEN
+      FOR j IN 1..TRGPCKG_DSCQINVFI_TD.v_NumEnt
+      LOOP
+         IF( TRGPCKG_DSCQINVFI_TD.v_t_PartyID(j) = :OLD.T_PARTYID ) THEN 
+            EXIT;
+         END IF;
+         TRGPCKG_DSCQINVFI_TD.v_NumEnt := TRGPCKG_DSCQINVFI_TD.v_NumEnt + 1;
+         TRGPCKG_DSCQINVFI_TD.v_t_PartyID(TRGPCKG_DSCQINVFI_TD.v_NumEnt) := :OLD.T_PARTYID;
+      END LOOP;
+  END IF;
+
+END DSCQINVFI_DBT_TDR;
+/
+
+CREATE OR REPLACE TRIGGER DSCQINVFI_DBT_TD
+   AFTER DELETE ON DSCQINV_DBT
+   FOR EACH ROW
+DECLARE
+   v_State     NUMBER;
+   v_StateDate DATE;
+   v_RegDate   DATE;
+   v_CD        DATE;
+   v_SD        DATE;
+BEGIN
+
+  IF( (TRGPCKG_DSCQINVFI_TD.v_NumEnt != 0) and (TRGPCKG_DSCQINVFI_TD.v_InTrgr = false) ) THEN
+
+      v_State := 1;
+      FOR j IN 1..TRGPCKG_DSCQINVFI_TD.v_NumEnt
+      LOOP
+
+         v_State := 0;
+         SELECT T_STATE, T_CHANGEDATE, T_REGDATE INTO v_State, v_StateDate, v_RegDate
+           FROM DSCQINV_DBT
+          WHERE T_PARTYID = :NEW.T_PARTYID;
+
+         IF( v_State = 0 ) THEN
+            EXIT; --RAISE_APPLICATION_ERROR(-20203,''); --Попытка изменить анкету исключенного КИ
+         END IF;
+
+         SELECT NVL(max(T_STATEDATE), TO_DATE( '01.01.0001', 'dd.mm.yyyy' )) INTO v_CD
+           FROM DSCQINVFI_DBT
+          WHERE T_PARTYID = TRGPCKG_DSCQINVFI_TD.v_t_PartyID(j);
+
+         IF( (v_CD = TO_DATE( '01.01.0001', 'dd.mm.yyyy' )) OR (v_CD < v_RegDate) ) THEN
+            v_SD := TO_DATE( '01.01.0001', 'dd.mm.yyyy' );
+         ELSE
+            v_SD := v_CD;
+         END IF;
+
+         UPDATE DSCQINV_DBT
+            SET T_CHANGEDATE = v_SD
+         WHERE T_PARTYID = :NEW.T_PARTYID;
+
+      END LOOP;
+
+      TRGPCKG_DSCQINVFI_TD.v_NumEnt := 0;
+      IF( v_State = 0 ) THEN
+         RAISE_APPLICATION_ERROR(-20203,''); --Попытка изменить анкету исключенного КИ
+      END IF;
+
+  END IF;
+
+END DSCQINVFI_DBT_TD;
+/

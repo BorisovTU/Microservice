@@ -1,0 +1,12 @@
+DECLARE
+  PROCEDURE addFields
+  IS
+  BEGIN
+    EXECUTE IMMEDIATE 'ALTER TABLE DDL_REGIABUF_DBT ADD t_princprecision NUMBER(5)';
+  EXCEPTION WHEN others THEN 
+    NULL;
+  END;
+BEGIN
+  addFields(); 
+END;
+/

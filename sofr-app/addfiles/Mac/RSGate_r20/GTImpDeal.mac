@@ -1,0 +1,2548 @@
+/*
+ $Name:         GTImpDeal.mac
+ $Module:       Шлюз Securities
+ $Description:  Импорт сделок
+*/
+
+import OPrInter, SpInter, FiInter, PtInter, SfInter, CtInter, DealsInter, BankInter, SecInter, "globals.mac", "gtdlfun.mac";
+import "rgtgtrec.mac", "gtconst.inc", "rgobj.mac", "sp_class"/*USR*/;
+import "spserv.mac", "loadRUData.mac"/*USR*/;
+IMPORT "cb_err.mac";
+
+PRIVATE CONST SP_KINDBASISCALC_365    = 0, // 1. 365 дней в году
+              SP_KINDBASISCALC_360    = 1; // 2. 360 дней в году
+
+PRIVATE CONST UnknownParty = -1;
+
+PRIVATE CONST SET_CHAR   = "X";
+PRIVATE CONST UNSET_CHAR = "";
+
+PRIVATE CONST КодВнешнСист_ФинИн   = 17; /*Код во внешней системе*/
+PRIVATE CONST КодВнешнСист_Субъект = 38; /*Код во внешней системе*/
+//USR
+private const MICEX_CODE     = "ММВБ";
+private const SPBEX_CODE     = "ПАО СПБ";
+//USR
+
+VAR Код_ФинИн, Код_Субъект;
+VAR imp_date;
+VAR ErrMes:string;
+
+private macro GetSpbexID()
+   var Dt = TRsbDataSet("SELECT rshb_rsi_sclimit.GetSpbexID() as t_spbid FROM dual");
+   if (Dt.movenext())
+      return SQL_ConvTypeInteger(dt.spbid);
+   end;
+   return 0;
+end;
+
+PRIVATE CONST SPB_TORG_CALEND_PARAM = makeArray(
+          DL_KeyPair("ObjectType",DL_CALLNK_MARKET),
+          DL_KeyPair("Market",GetSpbexID()),
+          DL_KeyPair("DayType",DL_CALLNK_MRKTDAY_TRADE),
+          DL_KeyPair("MarketPlace",DL_CALLNK_MARKETPLACE_SEC)
+        );  /*Параметры календаря торговых дней фондового рынка Санкт-Петербуржской биржи*/
+
+PRIVATE MACRO SetError( ErrorText )
+  RunError( "", ErrorText );
+END;
+
+PRIVATE MACRO SetWarning( Comment:@STRING, WarningText:String )
+  Comment = WarningText; 
+  return -1;
+END;
+
+PRIVATE MACRO ЗначениеНоминалаПоСделке( ErrorCode:@INTEGER ) :BOOL
+  VAR RegValue = false;
+  VAR RegPath  = "SECUR\\ЗНАЧЕНИЕ НОМИНАЛА ПО СДЕЛКЕ";
+  GetRegistryValue( RegPath, V_BOOL, RegValue, ErrorCode );
+
+  if( ErrorCode != 0 )
+     MsgBox( "Ошибка при получении значения настройки \"" + RegPath + "\"");
+     return false;
+  end;
+
+  return RegValue;
+END;
+
+/* Аналог оператора ?: в си. */
+private macro IIF( condition, value_true, value_false )
+   if( condition )
+      return value_true;
+   else 
+      return value_false;
+   end;
+end;
+
+private macro SP_Set_DL_LEG_dates_lf( dl_leg:TrecHandler, base_date:date, contr_date:date )
+  if( base_date < contr_date )
+     dl_leg.rec.MaturityIsPrincipal = SET_CHAR;      
+  else
+     dl_leg.rec.MaturityIsPrincipal = UNSET_CHAR;      
+  end;
+
+  /*большая из дат поставки и оплаты заносится в Expiry, меньшая в Maturity*/
+  dl_leg.rec.Expiry   = IIF(base_date >= contr_date,base_date,contr_date);
+  dl_leg.rec.Maturity = IIF(base_date <= contr_date,base_date,contr_date);
+end;
+
+//USR
+PRIVATE MACRO UserGetContrID( ServKind:INTEGER, Number:STRING, Birg_id, PayerID:@INTEGER, ErrMsg:@STRING ):INTEGER
+   return USERRGDLFUN_GetContrID( ServKind, imp_date, Number, Birg_id, @PayerID, @ErrMsg );
+END;
+//USR
+
+/*получить ID договора обслуживания ПЗО*/
+PRIVATE MACRO GetContrID( ServKind:INTEGER, ReceiverID:INTEGER, PayerID:INTEGER, Number:STRING, ErrMsg:@STRING ):INTEGER
+  return RGDLFUN_GetContrID( ServKind, ReceiverID, PayerID, imp_date, Number, NULL, @ErrMsg );
+END;
+
+//USR
+PRIVATE MACRO ExistNOSS(avr, deal):BOOL
+  VAR NumInList = "", ValidFromDate = DATE(0,0,0);
+
+  return (    (GetMainObjAttr( null, OBJTYPE_AVOIRISS, UniID(avr, OBJTYPE_AVOIRISS), 27/*Возможность надежного расчета TCC*/, null, null, NumInList, deal.DealDate, ValidFromDate) == true)
+          AND (ValidFromDate <= deal.DealDate)
+          AND (NumInList == "1")
+         );
+END;
+//USR
+
+PRIVATE MACRO PortfPriorityOrDefault(avr, deal):INTEGER
+  var ValidFromDate = DATE(0,0,0);
+  var AttrID = 0;
+  var PortfID = -1;
+  var Val_Set = -1;
+  if  ( (GetMainObjAttr( null, OBJTYPE_AVOIRISS, UniID(avr, OBJTYPE_AVOIRISS), 61/*Приоритетный портфель*/, AttrID, null, null, deal.DealDate, ValidFromDate) == true)
+          AND (ValidFromDate <= deal.DealDate) )
+    if(AttrID == 1)
+       PortfID = KINDPORT_RETIRE;
+    elif(AttrID == 2)
+       PortfID = KINDPORT_TRADE;
+    elif(AttrID == 3)
+       PortfID = KINDPORT_SALE;
+    end;
+  else
+    PortfID = -1;
+  end;
+
+  if(not(PortfID > 0))
+    GetRegistryValue("SECUR\\МСФО\\ПОРТФЕЛЬ ПО УМОЛЧАНИЮ", V_INTEGER, Val_Set);
+    if( Val_Set == 0)
+      PortfID = KINDPORT_TRADE;
+    else
+      PortfID = KINDPORT_SALE;
+    end;
+  end;
+
+  return PortfID;
+END;
+
+// параметры для заполнения платежей
+class SP_ParmPaym
+   var ClAccount       :string  = "",  //счет клиента
+       ClBank          :integer = UnknownParty, //банк клиента
+       ClCorAccount    :string  = "",  //корсчет банка клиента
+       ClCorBank       :integer = UnknownParty, //банк-корреспондент банка клиента 
+       DepoAccount     :string  = "",  //счет ДЕПО
+       Custody         :integer = UnknownParty, //депозитарий
+       CntrAccount     :string  = "",  //счет контрагента
+       CntrBank        :integer = UnknownParty, //контрагент   
+       CntrCorAccount  :string  = "",  //корсчет банка контрагента
+       CntrCorBank     :integer = UnknownParty, //банк-корреспондент контрагента
+       CntrDepoAccount :string  = "",  //счет ДЕПО контрагента
+       CntrCustody     :integer = UnknownParty; //депозитарий контрагента
+end;
+
+private macro ReclcDealPriceAndAmount( IsBond:BOOL, Price:DOUBLE, NumLots:DOUBLE, DealSumNoNKD:DOUBLE, FaceValue:DOUBLE, AmountBase:@MONEY )
+   var VL, VLT, C, S1, DstSumma;
+
+   /*Цена*/
+   if( IsBond == true ) /*для облигаций цена задана в процентах от номинала*/
+     C = FaceValue*Price/100.;
+   else 
+     C = Price;
+   end;
+
+   /*Определяем величину VLT: VLT= LOG 10 {RGDLLG_COST_01/ (NNN *  RGDLLG_PRICE_01)},
+     Где:
+        RGDLLG_COST_01 - стоимость лота (значение из поля 12) (DealSumNoNKD)
+        NNN - количество лотов (значение из поля 11) (NumLots)*/
+   if(C != 0.0)
+      VLT = Log10( DealSumNoNKD/(NumLots * C) );
+   else
+      VLT = 0.0;
+   end;
+
+   /*Определяем объем лота VL: VL=10N, где N- округленное по математическим правилам до целого VLT*/
+   VL = pow( 10, floor( VLT+0.5 ) );
+
+   /*Определяем количество*/
+   AmountBase = money( NumLots * VL );
+
+   /*рассчитываем проверочную сумму  S1: S1= RGDLTC_PRINCIPAL * RGDLLG_PRICE_01  и округляем 
+     ее по арифметическим правилам с точностью до двух знаков после запятой*/
+   S1 = Round( Money(AmountBase * C), 2 );
+   DstSumma = DealSumNoNKD;
+   if( DstSumma != S1 )
+      ErrMes = "Рассчитанное значение суммы сделки " + string(S1) + " не совпадает с заданным в поле 12 файла импорта значением суммы " + string(DstSumma);
+      AbortTrn;
+   end;
+
+   return Price;
+end;
+
+class SP_Note
+   var NoteKind :integer,
+       Note     :string;
+end;
+
+private macro GetDepSetIDByTrdAccID( TrdAccID:string, MarketID:integer, ClientID:integer ):integer
+
+  var RetVal:integer = 0;
+
+  var sql = RSDCommand( " select tracc.t_DepSetID " +
+                        "   from ddltracc_dbt tracc " +
+                        "  where tracc.t_TradAcc  = ? " +
+                        "    and tracc.t_MarketID = ? "
+                      );
+  sql.addParam("", RSDBP_IN, TrdAccID);
+  sql.addParam("", RSDBP_IN, MarketID);
+  sql.execute();
+  var DataSet = TRsbDataSet(sql);
+  if( DataSet.MoveNext() )
+     RetVal = DataSet.DepSetID;
+  end;
+
+  if( RetVal <= 0 )
+     var sql_ = RSDCommand( " select tracc.t_DepSetID " +
+                            "   from ddltracc_dbt tracc " +
+                            "  where tracc.t_MarketID = ? " +
+                            "    and tracc.t_Default = chr(88) " +
+                            "    and tracc.t_Affiliation = ? " );
+     sql_.addParam("", RSDBP_IN, MarketID);
+     sql_.addParam("", RSDBP_IN, IIF(ClientID > 0, ALG_SP_MONEY_SOURCE_CLIENT, ALG_SP_MONEY_SOURCE_OWN));
+     sql_.execute();
+     var DataSet_ = TRsbDataSet(sql_);
+     if( DataSet_.MoveNext() )
+        RetVal = DataSet_.DepSetID;
+     end;
+  end;
+
+  return RetVal;
+end;
+
+/* Получить сделку с установленным признаком Прогноз*/
+private macro IsUpdateDealPrognos(dealCode:string, tick:TRecHandler) : bool
+  var cmd, dataSet;
+  var retVal = false;
+
+  cmd = DL_RSDCommand("SELECT * FROM ddl_tick_dbt WHERE t_DealCode = ? AND t_Prognos = chr(88)");
+  
+  cmd.addParam(dealCode);
+
+  dataSet = cmd.execute();
+
+  retVal = dataSet.MoveNext();
+  if (retVal)
+    dataSet.GetRecord().copyTo(tick.rec);
+  end;
+
+  return retVal;
+end;
+/* Получить dl_leg*/
+private macro GetDlLeg(dealID:integer, legKind:integer, dl_leg:TRecHandler) : bool
+  var cmd, dataSet;
+  var retVal = false;
+
+  cmd = DL_RSDCommand("SELECT * FROM ddl_leg_dbt WHERE t_DealID = ? AND t_LegKind = ? AND t_LegID = 0");
+
+  cmd.addParam(dealID);
+  cmd.addParam(legKind);
+
+  dataSet = cmd.execute();
+
+  retVal = dataSet.MoveNext();
+  if (retVal)
+    dataSet.GetRecord().copyTo(dl_leg.rec);
+  end;
+
+  return retVal;
+end;
+
+PRIVATE MACRO CheckBondAgent( ClientID, TrdAccID):BOOL
+   var cmd, dataSet, objId, note = "";
+   var dlcontr = TRecHandler("dlcontr.dbt");
+
+   cmd = DL_RSDCommand( " SELECT MP.T_DLCONTRID " +
+                          " FROM DDLCONTRMP_DBT MP, DSFCONTR_DBT SM" +
+                         " WHERE SM.T_ID = MP.T_SFCONTRID " +
+                           " and SM.T_PARTYID = ? " +
+                        " and SM.T_SERVKIND = ? " +
+                        " and SM.T_SERVKINDSUB = ? ");
+
+   cmd.addParam(ClientID);
+   cmd.addParam(PTSK_STOCKDL);
+   cmd.addParam(11);  // Агент по приобретению облигаций
+
+   dataSet = cmd.execute();
+
+   while( dataSet.MoveNext())
+      dlcontr.Clear();
+      dlcontr.rec.DlContrID = dataSet.DlContrID;
+      objId = makeObjectID(OBJTYPE_BROKERCONTR_DL, NULL, dlcontr);
+      note = ReadNoteForObject( OBJTYPE_BROKERCONTR_DL, objId, 2); // Торгово-клиринговый счёт (ТКС) услуг агента по приобретению облигаций
+      if(note == TrdAccID)
+         return true;
+      end;
+   end;
+
+   return false;
+END;
+
+/**
+ @brief Проверка на то, что сделка является сделкой первичного размещения
+ @param[in] BoardID режим торгов сделки 
+ @return true, если является, иначе false
+*/
+PRIVATE MACRO CheckPrimaryPlacement(BoardID:string):bool
+   var CodeStr:string = "";
+   var TempVal:string = "";
+   var Ind:integer = 0;
+
+   GetRegistryValue("РСХБ\\БРОКЕРСКОЕ ОБСЛУЖИВАНИЕ\\ПЕРВИЧ_РАЗМЕЩ_РЕЖИМЫ_ТОРГОВ", V_STRING, CodeStr);
+
+   Ind = Index(CodeStr, ",");
+   while(Ind != 0)
+      TempVal = Trim(Substr(CodeStr, 1, Ind-1));
+      if(BoardID == TempVal)
+         return true;
+      end;
+      CodeStr = Trim(Substr(CodeStr, Ind+1));
+      Ind = Index(CodeStr, ",");
+   end;
+
+   if(BoardID == CodeStr)
+      return true;
+   end; 
+
+   return false;
+END;
+
+/**
+ @brief Проверка на то, что сделка является адресной
+ @param[in] BoardID режим торгов сделки 
+ @return true, если является, иначе false
+*/
+PRIVATE MACRO CheckAddressDeal(BoardID:string):bool
+   var CodeStr:string = "";
+   var TempVal:string = "";
+   var Ind:integer = 0;
+
+   GetRegistryValue("РСХБ\\БРОКЕРСКОЕ ОБСЛУЖИВАНИЕ\\АДРЕСНЫЕ_СДЕЛКИ_РЕЖИМЫ_ТОРГОВ", V_STRING, CodeStr);
+
+   Ind = Index(CodeStr, ",");
+   while(Ind != 0)
+      TempVal = Trim(Substr(CodeStr, 1, Ind-1));
+      if(BoardID == TempVal)
+         return true;
+      end;
+      CodeStr = Trim(Substr(CodeStr, Ind+1));
+      Ind = Index(CodeStr, ",");
+   end;
+
+   if(BoardID == CodeStr)
+      return true;
+   end; 
+
+   return false;
+END;
+
+macro _SecDeal_CreateNew(RecordID:INTEGER, SeanceID:INTEGER, ID:@STRING, Comment:@STRING):INTEGER
+   var RG;
+   var ppaym;
+   var type:integer;
+   var OperGroup;
+   var stat:integer;
+   var cmd, qwery;
+
+   var tick           = TRecHandler( "dl_tick.dbt"  );
+   var ClntRep        = TRecHandler( "spground.dbt" );
+   var outlay         = TRecHandler( "dlsum.dbt"    );
+
+   var spgrdoc        = TRecHandler( "spgrdoc.dbt"  );
+   var dl_leg1        = TRecHandler( "dl_leg.dbt"   );
+   var dl_leg2        = TRecHandler( "dl_leg.dbt"   );
+   var spgr1          = TRecHandler( "spground.dbt" );
+   var spgr2          = TRecHandler( "spground.dbt" );
+
+   var rq_avance1   = TRecHandler( "dlrq.dbt" );
+   var rq_avance2   = TRecHandler( "dlrq.dbt" );
+   var rq_acc_clnt  = TRecHandler( "dlrqacc.dbt" );
+   var rq_acc_contr = TRecHandler( "dlrqacc.dbt" );
+   var rq_acc_clnt_depo  = TRecHandler( "dlrqacc.dbt" );
+   var rq_acc_contr_depo = TRecHandler( "dlrqacc.dbt" );
+
+   var dlcomis_market = TRecHandler( "dlcomis.dbt"  );
+   var dlmarket       = TRecHandler( "dlmarket.dbt");  
+
+   VAR ArrComSums = TArray();/*список комиссиий (бирже)*/
+   
+   record Party(party);
+   record sfcontr(sfcontr);
+   record fininstr(fininstr);
+   record finin_pfi(fininstr);
+   record finin_delivering(fininstr);
+
+   var StrTempParm:string = "";
+   var MainDealDate;
+   var DealSumNoNKD, DealSumNoNKD_Back, NKD_PayFIID, NKDBack_PayFIID;
+   var PayFIID:integer = 0;
+   var NKDComment = "", NKDFromFile1 = $0, NKDFromFile2 = $0, NKDCalc1 = $0, NKDCalc2 = $0, NKD_Date1 = Date(0,0,0), NKD_Date2 = Date(0,0,0);
+   var BoardID = "", BoardType = "", MarketSchemeCode = "", TradePeriod, SpecialPeriod, CodeComiss, FIID_Comm, SpbClirComT1 = false;
+   var IsPrimaryPlacement:bool = false;
+
+   Comment = "";
+
+   record issues(avoiriss);
+
+   //заполнить счета в ТО
+   PRIVATE MACRO SetAccountsRQ( tick:TRecHandler, ppaym:SP_ParmPaym )
+
+      MACRO SetProp( rq:TRecHandler, BankID:INTEGER, Account:STRING, CorBank:INTEGER, CorAccount:STRING )
+         VAR err = 0;
+              
+         if( BankID > 0 )
+            rq.rec.BankID       = BankID;
+            rq.rec.Account      = Account;
+            if( CorBank ) 
+               rq.rec.BankCorrID   = CorBank;
+               rq.rec.CorrAcc      = CorAccount;
+               rq.rec.BankCorrCode = ПолучитьКодСубъекта( CorBank, PTCK_BIC, err );
+               if( (rq.rec.BankCorrCode != "") AND (err == 0) )
+                  rq.rec.BankCorrCodeKind = PTCK_BIC;
+               end;
+            end;
+         end;
+      END;
+
+      /*для клиента*/
+      SetProp( rq_acc_clnt, ppaym.ClBank, ppaym.ClAccount, ppaym.ClCorBank, ppaym.ClCorAccount );
+      /*для контрагента*/
+      SetProp( rq_acc_contr, ppaym.CntrBank, ppaym.CntrAccount, ppaym.CntrCorBank, ppaym.CntrCorAccount );
+
+      /*для клиента*/
+      SetProp( rq_acc_clnt_depo, ppaym.Custody, ppaym.DepoAccount, 0, null );
+      /*для контрагента*/
+      SetProp( rq_acc_contr_depo, ppaym.CntrCustody, ppaym.CntrDepoAccount, 0, null );
+   END;
+
+   //получение параметров одинаковых для 1-ой и 2-ой частей сделки
+   PRIVATE MACRO FillDealFirstSecondParms_Part1( IsBack, dl_leg:TrecHandler )
+
+      VAR PayDate:date, SupDate:date;
+
+      if( (GetParmByName( RG,IIF(NOT IsBack,"RGDLLG_SUPDATE_01","RGDLLG_SUPDATE_02"), @SupDate, @type )  == NULL) OR (type != V_DATE) OR ( SupDate == Date(0,0,0) ) )
+         SupDate = tick.rec.DealDate;
+      end;
+
+      if( tick.rec.BofficeKind != DL_AVRWRT )
+         if( (GetParmByName( RG,IIF(NOT IsBack,"RGDLLG_PAYDATE_01","RGDLLG_PAYDATE_02"), @PayDate, @type ) == NULL) OR (type != V_DATE) OR ( PayDate == Date(0,0,0) ) )
+            PayDate = tick.rec.DealDate;
+         end;
+      else
+         PayDate = SupDate;
+      end;
+
+      SP_Set_DL_LEG_dates_lf( dl_leg, PayDate, SupDate );
+      
+      // точность цены
+      dl_leg.rec.Point = 4;
+      if( (GetParmByName(RG, IIF(NOT IsBack, "RGDLLG_POINT_01", "RGDLLG_POINT_02"), @dl_leg.rec.Point, @type) == NULL) OR (type != V_INTEGER) )
+         dl_leg.rec.Point = 4;
+      end;
+
+      if( IsREPO(OperGroup) )
+         dl_leg.rec.IncomePoint = dl_leg.rec.Point;
+      end;
+
+      // ставка РЕПО
+      if( IsREPO(OperGroup) )
+         if( (GetParmByName(RG, "RGDLTC_INCOMERATE", @dl_leg.rec.IncomeRate, @type) == NULL) OR (type != V_DOUBLE) )
+         end;
+         dl_leg.rec.IncomeRate = round(dl_leg.rec.IncomeRate, dl_leg.rec.IncomePoint);
+
+         if (IsBack)
+         if( (GetParmByName(RG, "RGDLTC_ISFLOATING", @dl_leg.rec.isflrate, @type) == NULL) OR (type != V_STRING) )
+           dl_leg.rec.isflrate = UNSET_CHAR;
+         end;
+
+         if(dl_leg.rec.isflrate == SET_CHAR)
+           if( (GetParmByName(RG, "RGDLTC_BENCHMARK", @dl_leg.rec.flrtid, @type) == NULL) OR (type != V_INTEGER) )
+             dl_leg.rec.flrtid = ALLFININSTR;
+           end;
+
+           if( (GetParmByName(RG, "RGDLTC_REPORATE", @dl_leg.rec.spredflrt, @type) == NULL) OR (type != V_DOUBLEL) )
+             dl_leg.rec.spredflrt = 0;
+           end;
+
+           if( (GetParmByName(RG, "RGDLTC_BMRATE", @dl_leg.rec.flrate, @type) == NULL) OR (type != V_DOUBLEL) )
+             dl_leg.rec.flrate = 0;
+           end;
+         end;
+         end;
+      end;
+
+      return 0;
+   END;
+
+   //получение параметров одинаковых для 1-ой и 2-ой частей сделки
+   PRIVATE MACRO FillDealFirstSecondParms_Part2(IsBack, dl_leg:TrecHandler, spgr:TrecHandler)
+
+      VAR CFI_FIID:integer, AmountNKD = $0, DelivFIID:integer;
+      VAR SourceID = RG.GetSourceID();
+      VAR SupDate:date;
+      VAR Is_MMVB3_ASTS_SPB = ((SourceID==GT_MMVB3)or(SourceID==GT_PAYMENTS)or(SourceID==GT_ASTS)or(SourceID==GT_SPB)or(SourceID==GT_PAYMENTS_SPB));/*обрабатываются одинаково, поэтому объединяем*/
+
+      if( (GetParmByName( RG,IIF(NOT IsBack,"RGDLLG_SUPDATE_01","RGDLLG_SUPDATE_02"), @SupDate, @type )  == NULL) OR (type != V_DATE) OR ( SupDate == Date(0,0,0) ) )
+         SupDate = tick.rec.DealDate;
+      end;
+
+      // RGDLLG_SUPTIME_01/02 - время поставки
+      if( (tick.rec.BofficeKind != DL_AVRWRT) and (SourceID!=GT_SPB) and (SourceID!=GT_PAYMENTS_SPB) ) 
+         if( (GetParmByName( RG,IIF(NOT IsBack,"RGDLLG_SUPTIME_01","RGDLLG_SUPTIME_02"), @dl_leg.rec.SupplyTime, @type )  == NULL) OR (type != V_TIME) )
+            SetError( "Не найдено время поставки" + string(dl_leg.rec.SupplyTime) + " в параметре " + IIF(NOT IsBack,"RGDLLG_SUPTIME_01","RGDLLG_SUPTIME_02") + " объекта " + String(RecordID) );
+         end;
+      end;
+
+      IF( SourceID == GT_OTHR )
+
+         if( IsOUTEXCHANGE( OperGroup ) )
+            if( (GetParmByName( RG,IIF(NOT IsBack,"RGDLLG_PAYREGTAX_01","RGDLLG_PAYREGTAX_02"), @dl_leg.rec.PayRegTax, @type )  == NULL) OR (type != V_STRING)  )
+               dl_leg.rec.PayRegTax = UNSET_CHAR;
+            else
+               // RGDLLG_REGISTER_01/02 - Регистратор
+               // игнорируется во всех сделках, кроме ВНЕбиржевых
+               if( (GetParmByName( RG,IIF(NOT IsBack,"RGDLLG_REGISTER_01","RGDLLG_REGISTER_02"), @StrTempParm, @type )  == NULL) OR (type != V_STRING)  OR (StrTempParm == "") )
+                  SetError( "Не найден регистратор" + StrTempParm + " в параметре " + IIF(NOT IsBack,"RGDLLG_REGISTER_01","RGDLLG_REGISTER_02") + " объекта " + String(RecordID) );
+               else
+                  if( GetRealID( RG_PARTY, StrTempParm, Код_Субъект, @dl_leg.rec.Registrar, @ErrMes ) != 0 )
+                     SetError( ErrMes );
+                  end;
+               end;
+            end;
+
+            // RGDLLG_DOCTEMPL_01/02 - вид договора купли\продажи
+            // игнорируется во всех сделках, кроме ВНЕбиржевых, для РЕПО игнорируется по 2-й части
+            if( (NOT IsREPO(OperGroup)) OR (NOT IsBack) )
+               if( (GetParmByName( RG,IIF(NOT IsBack,"RGDLLG_DOCTEMPL_01","RGDLLG_DOCTEMPL_02"), @spgr.rec.DocTemplate, @type )  == NULL) OR (type != V_INTEGER) )
+                  SetError( "Не найден вид договора купли\продажи" + string(spgr.rec.DocTemplate) + " в параметре " + IIF(NOT IsBack,"RGDLLG_DOCTEMPL_01","RGDLLG_DOCTEMPL_02") + " объекта " + String(RecordID) );
+               end;
+            end;
+
+            // RGDLLG_DOCNUMBER_01/02 - вид договора купли\продажи
+            // игнорируется во всех сделках, кроме ВНЕбиржевых, для РЕПО игнорируется по 2-й части
+            if( spgr.rec.DocTemplate AND ( (NOT IsREPO(OperGroup)) OR (NOT IsBack)) )
+               if( (GetParmByName( RG,IIF(NOT IsBack,"RGDLLG_DOCNUMBER_01","RGDLLG_DOCNUMBER_02"), @spgr.rec.AltXld, @type )  == NULL) OR (type != V_STRING)  )
+                  SetError( "Не найден вид договора купли\продажи" + string(spgr.rec.AltXld) + " в параметре " + IIF(NOT IsBack,"RGDLLG_DOCNUMBER_01","RGDLLG_DOCNUMBER_02") + " объекта " + String(RecordID) );
+               else
+                  spgr.rec.Xld == "";
+               end;
+
+               // RGDLLG_DOCDATE_01/02 - Дата аванса по активу, для РЕПО игнорируется по 2-й части
+               // игнорируется во всех сделках, кроме ВНЕбиржевых
+               if( (GetParmByName( RG,IIF(NOT IsBack,"RGDLLG_DOCDATE_01","RGDLLG_DOCDATE_02"), @spgr.rec.SignedDate, @type )  == NULL) OR (type != V_DATE) )
+                  SetError( "Не найдена дата аванса по активу" + string(spgr.rec.SignedDate) + " в параметре " + IIF(NOT IsBack,"RGDLLG_DOCDATE_01","RGDLLG_DOCDATE_02") + " объекта " + String(RecordID) );
+               end;
+            end;
+         end;
+
+         // RGDLTC_PFI - ID ценной бумаги
+         if( (GetParmByName( RG,"RGDLTC_PFI", @StrTempParm, @type )  == NULL) OR (type != V_STRING) OR (StrTempParm == "") )
+
+            /* Если не задана - 
+                -  если в поле "Поставляемый выпуск" задан фактический выпуск, то занести сюда обобщенный выпуск поставляемого */
+
+            if( (GetParmByName( RG,IIF(NOT IsBack,"RGDLTC_DELIVERINCFI_01","RGDLTC_DELIVERINCFI_02"), @StrTempParm, @type ) == NULL) OR (type != V_STRING) OR (StrTempParm == "") )
+               SetError( "Должен быть задан поставляемый выпуск" );
+            else
+               if( GetRealID( RG_AVOIRISS, StrTempParm, Код_ФинИн, @DelivFIID, @ErrMes ) != 0 )
+                  SetError( ErrMes );
+               end;
+
+               if( ПолучитьФинИн( DelivFIID, finin_delivering ) != 0 )
+                  SetError( "Не найден финансовый инструмент " + string(dl_leg.rec.DeliveringFIID) + " в параметре " + "RGDLTC_DELIVERINCFI" + " объекта " + String(RecordID) );
+               end;
+            end;
+
+            if( (finin_delivering.IsGeneralized != "X") AND (finin_delivering.GeneralizedFIID != ALLFININSTR) ) // фактический
+               dl_leg.rec.PFI = finin_delivering.GeneralizedFIID;
+            else
+               dl_leg.rec.PFI = ALLFININSTR;
+            end;
+
+         else /*Иначе если в ц/б задан обобщенный или единый выпуск, указать его
+              Иначе (фактический) указать обобщенный выпуск указанного*/
+
+            if( GetRealID( RG_AVOIRISS, StrTempParm, Код_ФинИн, @dl_leg.rec.PFI, @ErrMes ) != 0 )
+               SetError( ErrMes );
+            end;
+
+            if( ПолучитьФинИн( dl_leg.rec.PFI, finin_pfi ) != 0 )
+               SetError( "Не найден финансовый инструмент " + string(dl_leg.rec.PFI) + " в параметре " + "RGDLTC_PFI" + " объекта " + String(RecordID) );
+            end;
+            
+            if( finin_pfi.IsGeneralized == "X" ) // обобщенный
+               // dl_leg.rec.PFI уже занесён
+            elif( (finin_pfi.IsGeneralized != "X") AND (finin_pfi.GeneralizedFIID == ALLFININSTR) ) // единый
+               // dl_leg.rec.PFI уже занесён
+            elif( (finin_pfi.IsGeneralized != "X") AND (finin_pfi.GeneralizedFIID != ALLFININSTR) ) // фактический
+               dl_leg.rec.PFI = finin_pfi.GeneralizedFIID;
+            end;
+
+         end;
+
+         // RGDLTC_DELIVERINCFI_01/02 - Код поставляемого ФИ
+         if( (GetParmByName( RG,IIF(NOT IsBack,"RGDLTC_DELIVERINCFI_01","RGDLTC_DELIVERINCFI_02"), @StrTempParm, @type ) == NULL) OR (type != V_STRING) OR (StrTempParm == "") )
+
+            if(dl_leg.rec.PFI == ALLFININSTR )
+               SetError( "Не задан ID ценной бумаги и Код поставляемого ФИ" );
+            else
+               if( ПолучитьФинИн( dl_leg.rec.PFI, finin_delivering ) != 0 )
+                  SetError( "Не найден финансовый инструмент " + string(dl_leg.rec.PFI) + " в параметре " + "RGDLTC_DELIVERINCFI" + " объекта " + String(RecordID) );
+               end;
+
+               dl_leg.rec.DeliveringFIID = ALLFININSTR;
+
+               if( finin_delivering.IsGeneralized == "X" ) // обобщенный
+                  // игнорируем
+               elif( (finin_delivering.IsGeneralized != "X") AND (finin_delivering.GeneralizedFIID == ALLFININSTR) ) // единый
+                  dl_leg.rec.DeliveringFIID = dl_leg.rec.PFI; /* или fininstr.FIID без разницы */
+               elif( (finin_delivering.IsGeneralized != "X") AND (finin_delivering.GeneralizedFIID != ALLFININSTR) ) // фактический
+                  // игнорируем
+               end;
+            end;
+         
+         else
+            if( GetRealID( RG_AVOIRISS, StrTempParm, Код_ФинИн, @DelivFIID, @ErrMes ) != 0 )
+               SetError( ErrMes );
+            end;
+
+            if( ПолучитьФинИн( DelivFIID, finin_delivering ) != 0 )
+               SetError( "Не найден финансовый инструмент " + string(dl_leg.rec.DeliveringFIID) + " в параметре " + "RGDLTC_DELIVERINCFI" + " объекта " + String(RecordID) );
+            end;
+
+            dl_leg.rec.DeliveringFIID = ALLFININSTR;
+            
+            if( finin_delivering.IsGeneralized == "X" ) // обобщенный
+               SetError( "Поставляемый выпуск не должен быть обобщенным" );
+            elif( (finin_delivering.IsGeneralized != "X") AND (finin_delivering.GeneralizedFIID == ALLFININSTR) AND (dl_leg.rec.PFI == ALLFININSTR) ) // единый и ц/б не задана
+               dl_leg.rec.DeliveringFIID = DelivFIID;
+               /*если RGDLTC_PFI не задан*/
+               dl_leg.rec.PFI = DelivFIID;       
+            elif( (finin_delivering.IsGeneralized != "X") AND (finin_delivering.GeneralizedFIID == ALLFININSTR) AND (dl_leg.rec.PFI != ALLFININSTR) ) // единый и ц/б задана
+               dl_leg.rec.DeliveringFIID = dl_leg.rec.PFI;
+            elif( (finin_delivering.IsGeneralized != "X") AND (finin_delivering.GeneralizedFIID != ALLFININSTR) AND (dl_leg.rec.PFI != ALLFININSTR) ) // фактический и ц/б задана
+
+               if(finin_delivering.GeneralizedFIID != dl_leg.rec.PFI)
+                  SetError( "Неверный код поставляемого ФИ");
+               else
+                  dl_leg.rec.DeliveringFIID = DelivFIID;
+               end;
+            end;
+         
+         end;
+         
+         if( ПолучитьФинИн( dl_leg.rec.PFI, fininstr ) != 0 )
+            SetError( "Не найден финансовый инструмент " + string(dl_leg.rec.PFI) + " в параметре " + "RGDLTC_PFI" + " объекта " + String(RecordID) );
+         end;
+
+         if( (GetParmByName( RG,"RGDLTC_PRINCIPAL", @dl_leg.rec.Principal, @type )  == NULL) OR (type != V_MONEY) )
+            SetError( "Не найдена сумма платежа по активу" + string(dl_leg.rec.Principal) + " в параметре " + "RGDLTC_PRINCIPAL" + " объекта " + String(RecordID) );
+         else
+            dl_leg.rec.Principal = RG_MakeMoney(dl_leg.rec.Principal);
+         end;
+
+         // RGDLLG_CFI_01/02 - ID ФИ платежа по контрактиву
+         if( (GetParmByName( RG,IIF(NOT IsBack,"RGDLLG_CFI_01","RGDLLG_CFI_02"), @StrTempParm, @type )  == NULL) OR (type != V_STRING) OR (StrTempParm == "") );
+         else
+            if( GetRealID( RG_CURRENCY, StrTempParm, Код_ФинИн, @dl_leg.rec.CFI, @ErrMes ) != 0 )
+               SetError( ErrMes );
+            else
+               CFI_FIID = dl_leg.rec.CFI;
+            end;
+         end;
+
+         // RGDLLG_NKD_01/02 - Сумма НКД
+         if( dl_leg.rec.PFI > 0 ) 
+            if(FI_IsCouponAvoiriss(fininstr))
+               if( (GetParmByName( RG,IIF(NOT IsBack,"RGDLLG_NKD_01","RGDLLG_NKD_02"), @dl_leg.rec.NKD, @type )  == NULL) OR (type != V_MONEY) )
+               else
+                  dl_leg.rec.NKD = RG_MakeMoney(dl_leg.rec.NKD);
+                  AmountNKD = dl_leg.rec.NKD;
+
+                  if( fininstr.FaceValueFI != CFI_FIID ) 
+                     if( not SmartConvertSum( AmountNKD, AmountNKD, MainDealDate, fininstr.FaceValueFI, CFI_FIID, false ) )
+                        AmountNKD = $0;
+                     end;
+                  end;
+
+                  if( NOT IsBack )
+                     NKDFromFile1 = dl_leg.rec.NKD;
+                     if(not FI_IsShare(fininstr)) //USR
+                     NKDCalc1 = НКД(fininstr.FIID, dl_leg.rec.Principal, SupDate);
+                     end;//USR
+                     NKD_Date1 = SupDate;
+                  else
+                     NKDFromFile2 = dl_leg.rec.NKD;
+                     if(not FI_IsShare(fininstr))//USR
+                     NKDCalc2 = НКД(fininstr.FIID, dl_leg.rec.Principal, SupDate);
+                     end;//USR
+                     NKD_Date2 = SupDate;
+                  end;
+               end;
+            end;
+         end;
+
+         // RGDLLG_PRICE_01/02 - цена ц/б
+         if( (GetParmByName( RG,IIF(NOT IsBack,"RGDLLG_PRICE_01","RGDLLG_PRICE_02"), @dl_leg.rec.Price, @type )  == NULL) OR (type != V_DOUBLE) )
+         end;
+
+         // RGDLLG_FORMULA_01/02 - тип расчетов
+         if( (GetParmByName( RG,IIF(NOT IsBack,"RGDLLG_FORMULA_01","RGDLLG_FORMULA_02"), @dl_leg.rec.Formula, @type )  == NULL) OR (type != V_INTEGER) )
+         end;
+
+         // RGDLLG_COST_01/02 - стоимость ц/б (без НКД)
+         if( (GetParmByName( RG,IIF(NOT IsBack,"RGDLLG_COST_01","RGDLLG_COST_02"), @dl_leg.rec.Cost, @type )  == NULL) OR (type != V_MONEY) )
+         end;
+         dl_leg.rec.Cost = RG_MakeMoney(dl_leg.rec.Cost);
+
+         if( NOT IsBack )
+            DealSumNoNKD = dl_leg1.rec.Cost;
+         end;
+
+         // RGDLLG_TOTALCOST_01/02 - стоимость ц/б (с НКД)
+         dl_leg.rec.TotalCost = RG_MakeMoney(dl_leg.rec.Cost + AmountNKD);
+
+      ELIF( (SourceID == GT_MMVB) OR (SourceID == GT_MMVB2) OR Is_MMVB3_ASTS_SPB OR (SourceID == GT_QUIK) )
+
+         if( fininstr.AvoirKind == AVOIRISSKIND_KSU )
+            dl_leg.rec.PFI = fininstr.FIID;
+         else
+            // RGDLTC_PFI - ID ценной бумаги
+            if( (fininstr.IsGeneralized != "X") AND (fininstr.GeneralizedFIID != ALLFININSTR) ) // фактический
+               dl_leg.rec.PFI = fininstr.GeneralizedFIID;
+            else
+               dl_leg.rec.PFI = fininstr.FIID;
+            end;
+           
+            // RGDLTC_DELIVERINCFI_01/02 - Код поставляемого ФИ
+            if( ПолучитьФинИн( dl_leg.rec.PFI, finin_delivering ) != 0 )
+               SetError( "Не найден финансовый инструмент " + string(dl_leg.rec.PFI) );
+            else
+           
+               dl_leg.rec.DeliveringFIID = ALLFININSTR;
+           
+               if( finin_delivering.IsGeneralized == "X" ) // обобщенный
+           
+                  if( (GetParmByName( RG,IIF(NOT IsBack,"RGDLTC_DELIVERINCFI_01","RGDLTC_DELIVERINCFI_02"), @StrTempParm, @type )  == NULL) OR (type != V_STRING) OR (StrTempParm == "") )
+                  else
+                     if( GetRealID( RG_AVOIRISS, StrTempParm, Код_ФинИн, @dl_leg.rec.DeliveringFIID, @ErrMes ) != 0 )
+                        SetError( ErrMes );
+                     end;
+                  end;
+           
+                  if(dl_leg.rec.DeliveringFIID != ALLFININSTR)
+                     if(dl_leg.rec.DeliveringFIID != finin_delivering.GeneralizedFIID)
+                        SetError( "Неверный код поставляемого ФИ");
+                     end;
+                  end;
+           
+               elif( (finin_delivering.IsGeneralized != "X") AND (finin_delivering.GeneralizedFIID == ALLFININSTR) ) // единый
+                  dl_leg.rec.DeliveringFIID = dl_leg.rec.PFI; /* или finin_delivering.FIID без разницы */
+           
+               elif( (finin_delivering.IsGeneralized != "X") AND (finin_delivering.GeneralizedFIID != ALLFININSTR) ) // фактический
+                  // игнорируем
+               end;
+           
+            end;
+         end;
+
+         // RGDLLG_RELATIVEPRICE_01/02 - признак - цена это % от номинала
+         if( Is_MMVB3_ASTS_SPB AND IsREPO(OperGroup) AND (PayFIID != fininstr.FaceValueFI) )
+            dl_leg.rec.RelativePrice = UNSET_CHAR; // Указанное значение цены пересчитывается в абсолютное значение в валюте PayFIID
+         else
+            dl_leg.rec.RelativePrice = UNSET_CHAR;
+            if( FI_IsBond(fininstr) AND /*bpv*/(PayFIID == fininstr.FaceValueFI)/*>>bpv 230419*/)
+               if(SourceID==GT_ASTS)
+                  dl_leg.rec.RelativePrice = SET_CHAR;
+               else
+               if( (GetParmByName(RG, IIF(NOT IsBack,"RGDLLG_RELATIVEPRICE_01","RGDLLG_RELATIVEPRICE_02"), @dl_leg.rec.RelativePrice, @type ) == NULL) OR (type != V_STRING)  )
+                  dl_leg.rec.RelativePrice = UNSET_CHAR;
+               end;
+            end;
+         end;
+         end;
+
+         if( (NOT IsBack) OR ((IsBack) AND (IsREPO(OperGroup))) )
+            if( not Is_MMVB3_ASTS_SPB )
+               dl_leg.rec.CFI = dl_leg.rec.NKDFIID = fininstr.FaceValueFI;
+            else
+               dl_leg.rec.CFI = PayFIID;
+               if( IsREPO(OperGroup) )
+                  if( (PayFIID != fininstr.FaceValueFI) AND СуммыВВалютеРасчетов() )
+                     dl_leg.rec.NKDFIID = PayFIID;
+                  else
+                     dl_leg.rec.NKDFIID = fininstr.FaceValueFI; // если ВР != ВН, то НКД пересчитывается в валюту номинала по курсу на дату торгов
+                  end;
+               else
+                  dl_leg.rec.NKDFIID = fininstr.FaceValueFI; // если ВР != ВН, то НКД пересчитывается в валюту номинала по курсу на дату торгов
+               end;
+            end;
+         end;
+
+         IF( SourceID == GT_MMVB )
+
+            // RGDLLG_TOTALCOST_01/02 - стоимость ц/б (с НКД)
+            if(IsREPO(OperGroup))
+               if( (GetParmByName( RG,IIF(NOT IsBack,"RGDLLG_TOTALCOST_01","RGDLLG_TOTALCOST_02"), @dl_leg.rec.TotalCost, @type )  == NULL) OR (type != V_MONEY) )
+               end;
+            elif(NOT IsBack)
+               dl_leg.rec.TotalCost = DealSumNoNKD + NKD_PayFIID;
+            end;
+            dl_leg.rec.TotalCost = RG_MakeMoney(dl_leg.rec.TotalCost);
+
+         ELIF( (SourceID == GT_MMVB2) OR (SourceID == GT_QUIK) )
+            // RGDLLG_TOTALCOST_01/02 - стоимость ц/б (с НКД)
+            if(IsREPO(OperGroup))
+
+               if(NOT IsBack)
+                  if( (GetParmByName( RG,"RGDLLG_TOTALCOST_01", @dl_leg.rec.TotalCost, @type )  == NULL) OR (type != V_MONEY) )
+                  end;
+               else
+                  dl_leg.rec.TotalCost = DealSumNoNKD_Back + NKDBack_PayFIID;
+               end;
+            
+            elif(NOT IsBack)
+               dl_leg.rec.TotalCost = DealSumNoNKD + NKD_PayFIID;
+            end;
+            dl_leg.rec.TotalCost = RG_MakeMoney(dl_leg.rec.TotalCost);
+         ELIF( Is_MMVB3_ASTS_SPB )
+            /*для XML рассчитываем только если не заполнено в загрузочном файле*/
+            if( dl_leg.rec.TotalCost == $0. )
+               if(IsREPO(OperGroup))
+                  if(NOT IsBack)
+                     dl_leg.rec.TotalCost = DealSumNoNKD + NKD_PayFIID;
+                  else
+                     dl_leg.rec.TotalCost = DealSumNoNKD_Back + NKDBack_PayFIID;
+                  end;
+               elif(NOT IsBack)
+                  dl_leg.rec.TotalCost = DealSumNoNKD + NKD_PayFIID;
+               end;
+               dl_leg.rec.TotalCost = RG_MakeMoney(dl_leg.rec.TotalCost);
+            end;
+         END;
+      END;
+
+      if( NOT IsBack )
+         tick.rec.Points = dl_leg.rec.Point;
+      end;
+      
+      //для внебиржевого репо определим базис 
+      if( IsREPO(OperGroup) AND IsOUTEXCHANGE(OperGroup) )
+         if(ПолучитьСубъекта( tick.rec.PartyID, Party ))
+            if( Party.NotResident == SET_CHAR )
+               dl_leg.rec.Basis = SP_KINDBASISCALC_360;
+            else
+               dl_leg.rec.Basis = SP_KINDBASISCALC_365;
+            end;
+         end;
+      end;
+
+      if( SourceID == GT_OTHR )
+
+         if( (GetParmByName( RG,GetParmName("RGDLPM_PAYFI", IIF(IsBack, Cri, CAi) ), @StrTempParm, @type )  == NULL) OR (type != V_STRING) OR (StrTempParm == ""))
+         else
+            if( GetRealID( RG_CURRENCY, StrTempParm, Код_ФинИн, @dl_leg.rec.PayFIID, @ErrMes ) != 0 )
+               SetError( ErrMes );
+            end;  
+         end;
+      end;
+
+      return 0;
+   END;
+
+   PRIVATE MACRO GetAvanceParm( rq:TrecHandler, dl_leg:TrecHandler, pPurpose:INTEGER )
+                 
+      VAR Purpose, SubPurpose, tmp;
+
+      rq.Clear();
+      rq.rec.Type = DLRQ_TYPE_UNKNOWN;
+      if( (GetParmByName( RG, GetParmName("RGDLPM_PURPOSE",pPurpose ), @Purpose, @type )  == NULL) OR (type != V_INTEGER) )
+         return 0;
+      elif( Purpose != pPurpose )
+         SetError( "Не найдено назначение платежа " + string(Purpose) + " в параметре " + GetParmName("RGDLPM_PURPOSE",Purpose ) + " объекта " + String(RecordID) );
+      end;
+
+      if( (GetParmByName( RG,GetParmName("RGDLPM_SUBPURPOSE",pPurpose ), @SubPurpose, @type )  == NULL) OR (type != V_INTEGER) )
+         SubPurpose = DLRQ_TYPE_AVANCE;
+      end;
+      
+      rq.rec.Type     = IIF( SubPurpose == SP_KINDAVANCE_DEPOSIT, DLRQ_TYPE_DEPOSIT, DLRQ_TYPE_AVANCE );
+      rq.rec.DealPart = IIF( pPurpose == PM_PURP_AVANCE, 1, 2 );
+                                                                                
+      if( (GetParmByName( RG,GetParmName("RGDLPM_BASEAMOUNT",pPurpose ), @rq.rec.Amount, @type )  == NULL) OR (type != V_MONEYL) )
+         SetError( "Не задана сумма аванса по активу в параметре " + IIF(pPurpose == PM_PURP_AVANCE,"RGDLLG_ADVDATE_01","RGDLLG_ADVDATE_02") + " объекта " + String(RecordID) );
+      end;
+                                                                                                        
+      if( (GetParmByName( RG,IIF( pPurpose == PM_PURP_AVANCE, "RGDLLG_ADVDATE_01","RGDLLG_ADVDATE_02"), @rq.rec.PlanDate, @type )  == NULL) OR (type != V_DATE) )
+         SetError( "Не задана дата аванса по активу в параметре " + IIF(pPurpose == PM_PURP_AVANCE,"RGDLLG_ADVDATE_01","RGDLLG_ADVDATE_02") + " объекта " + String(RecordID) );
+      end;
+
+      dl_leg.rec.Start = rq.rec.PlanDate;
+
+      return 0;
+   END;
+
+   tick.Clear();
+   ClntRep.Clear();
+   outlay.Clear();
+   spgrdoc.Clear();
+   dl_leg1.Clear();
+   dl_leg2.Clear();
+   spgr1.Clear();
+   spgr2.Clear();
+
+   dlcomis_market.Clear();
+
+   RG = TGTRecord();
+   RG.LoadFromDB(RecordID);
+
+   ppaym = SP_ParmPaym();
+
+   tick.rec.OriginID = GetIdentProgram();
+
+   VAR PriceParm, NumLotsParm, BaseFIID, FaceValue = $0, Error = 0, rate = 0.0, PtKindName = "";
+   NKDFromFile1 = NKDFromFile2 = NKDCalc1 = NKDCalc2 = $0;
+
+   var isUpdate = false; // обновление биржевой сделки
+   VAR SourceID = RG.GetSourceID();
+   VAR Is_MMVB3_ASTS_SPB = ((SourceID==GT_MMVB3)or(SourceID==GT_PAYMENTS)or(SourceID==GT_ASTS)or(SourceID==GT_SPB)or(SourceID==GT_PAYMENTS_SPB));/*обрабатываются одинаково, поэтому объединяем*/
+   Var Birg_code; //USR
+
+   // RGDLTC_DEALTYPE - Идентификатор типа сделки
+   if( (GetParmByName( RG,"RGDLTC_DEALTYPE", @tick.rec.DealType, @type)  == NULL) OR (type != V_INTEGER) )
+      SetError( "Не найден вид операции " + string(tick.rec.DealType) + " в параметре " + "RGDLTC_DEALTYPE" + " объекта " + String(RecordID) );
+   else
+      if( tick.rec.DealType != 0 )
+         var koper    = TBFile( "oprkoper", "R", 0 );
+
+         koper.Clear();
+         koper.rec.Kind_Operation = tick.rec.DealType;
+
+         if( koper.GetEQ() )
+            if((koper.rec.DocKind == DL_SECURITYDOC) OR
+               (koper.rec.DocKind == DL_TRUSTDOC) OR
+               (koper.rec.DocKind == DL_AVRWRT) OR
+               (koper.rec.DocKind == DL_RETIREMENT) OR
+               (koper.rec.DocKind == DL_RETIREMENT_DST) OR
+               (koper.rec.DocKind == DL_SECUROWN)
+              )
+               tick.rec.BofficeKind = koper.rec.DocKind;
+               OperGroup = GetOperationGroup( tick.rec.DealType );
+            else
+               SetError( "Операция " +  string(tick.rec.DealType) + " не является сделкой БОЦБ." );
+            end;
+         else
+            SetError( "Не найден вид операции " + string(tick.rec.DealType) + " в параметре " + "RGDLTC_DEALTYPE" + " объекта " + String(RecordID) );
+         end;
+      end;
+   end;
+
+   // RGDLTC_DEALDATE - Дата заключения сделки
+   if( (GetParmByName(RG, "RGDLTC_DEALDATE", @tick.rec.DealDate, @type) == NULL) OR (type != V_DATE) )
+      SetError( "Не найдена дата заключения сделки " + string(tick.rec.DealDate) + " в параметре RGDLTC_DEALDATE объекта " + String(RecordID) );
+   else
+      MainDealDate = tick.rec.DealDate;
+   end;
+
+   if( SourceID != GT_NRD )
+      FillDealFirstSecondParms_Part1(false, dl_leg1);
+
+      if( IsREPO( OperGroup ) )
+         FillDealFirstSecondParms_Part1(true, dl_leg2);
+      end;
+   end;
+
+   IF( (SourceID == GT_MMVB) OR (SourceID == GT_MMVB2) OR Is_MMVB3_ASTS_SPB OR (SourceID == GT_QUIK) )
+      if( (SourceID == GT_SPB) or (SourceID == GT_PAYMENTS_SPB) )
+        Код_Субъект = PTCK_SPBEX;
+        Код_ФинИн = FICK_SPBEX;
+        Birg_code = SPBEX_CODE; //USR
+      else
+        Код_Субъект = PTCK_MICEX;
+        Код_ФинИн = FICK_MICEX;
+        Birg_code = MICEX_CODE; //USR
+
+      end;
+
+      var dealCode = "", prognos = UNSET_CHAR;
+      // RGDLTC_DEALCODE - Номер сделки
+      if( (GetParmByName( RG,"RGDLTC_DEALCODE", @dealCode, @type )  == NULL) OR (type != V_STRING) )
+         SetError( "Не найден номер сделки " + string(dealCode) + " в параметре " + "RGDLTC_DEALCODE" + " объекта " + String(RecordID) );
+      end;
+
+      // RGDLTC_PROGNOS
+      if ((GetParmByName( RG,"RGDLTC_PROGNOS", @prognos, @type )  == NULL) OR (type != V_STRING) )
+      end;
+   
+      // Для биржевых если не установлен признак Прогноз, то ищем сделку с признаком Прогноз. 
+      // Если нашли, то обновляем ее.
+      if (IsEXCHANGE( OperGroup, true ) and (prognos == UNSET_CHAR))
+         isUpdate = IsUpdateDealPrognos(dealCode, tick);
+
+         if (isUpdate)
+            GetDlLeg( tick.rec.DealID, LEG_KIND_DL_TICK,      dl_leg1 );
+            GetDlLeg( tick.rec.DealID, LEG_KIND_DL_TICK_BACK, dl_leg2 );
+
+            tick.rec.Oper = {Oper};
+         end;
+      end;
+      tick.rec.Prognos = prognos;
+
+      // RGDLTC_ISIN
+      if( (GetParmByName( RG,"RGDLTC_ISIN", @StrTempParm, @type )  == NULL) OR (type != V_STRING) OR (StrTempParm == "") )
+         SetError( "Не найден ISIN" + StrTempParm + " в параметре " + "RGDLTC_ISIN" + " объекта " + String(RecordID) );
+      else
+         if( GetRealID( RG_AVOIRISS, StrTempParm, Код_ФинИн, @BaseFIID, @ErrMes ) != 0 )
+            /*если не нашли в шлюзе код для ценной бумаги, то считаем, что во входном файле задан ISIN бумаги и ищем по нему бумагу в справочнике*/
+            if( ПолучитьФинИн( StrTempParm, fininstr, issues, NULL, NULL, FICK_ISIN ) != 0 )
+               if( SOFR_LoadRuDataByCode( StrTempParm, 1, Birg_code ) )
+                  if( GetRealID( RG_AVOIRISS, StrTempParm, Код_ФинИн, @BaseFIID, @ErrMes ) != 0 )
+                     return SetWarning(@comment, " не найдена в справочнике ценная бумага с ISIN = \'" + StrTempParm + "\'");
+                  else
+                     if( ПолучитьФинИн( BaseFIID, fininstr, issues, NULL, NULL ) != 0 )
+                        return SetWarning(@comment, " ошибка в справочнике для ценной бумаги \'" + string(BaseFIID) + "\'");
+                     end;
+                  end;
+               else
+                  return SetWarning(@comment, " не найдена в справочнике ценная бумага с ISIN = \'" + StrTempParm + "\'");
+               end;
+            end; 
+         else 
+            if( ПолучитьФинИн( BaseFIID, fininstr, issues, NULL, NULL ) != 0 )
+               return SetWarning(@comment, " ошибка в справочнике для ценной бумаги \'" + string(BaseFIID) + "\'");
+            end;
+         end;  
+      end;
+
+      if( IsDealKSU(OperGroup) and (fininstr.AvoirKind != AVOIRISSKIND_KSU) )
+         SetError( "Сделка с кодом "+dealCode+" является сделкой РЕПО с КСУ. Вид ц/б в сделке "+dealCode+" не соответствует виду \'Клиринговый сертификат участия\'" );
+      end;
+
+      if( (fininstr.AvoirKind == AVOIRISSKIND_KSU) and (not IsDealKSU(OperGroup)) )
+         SetError( "Вид ц/б в сделке "+dealCode+" - \'Клиринговый сертификат участия\'. Сделка с кодом "+dealCode+" не является сделкой РЕПО с КСУ" );
+      end;
+
+      /* номинал */
+      if( (ЗначениеНоминалаПоСделке(Error) == true) AND Is_MMVB3_ASTS_SPB AND (SourceID!=GT_SPB) AND (SourceID!=GT_PAYMENTS_SPB))
+         if( (GetParmByName( RG,"RGDLTC_FACEVALUE", @FaceValue, @type )  == NULL) OR (type != V_DOUBLE) )
+           /*на всякий случай, если не задан (обязателен только для SEM03 xml-формата)*/
+           FaceValue = GT_GetNominal( fininstr.FIID );
+         end;
+      else
+         FaceValue = GT_GetNominal( fininstr.FIID );
+      end;
+      FaceValue = double(FaceValue);
+
+      /* цена в процентах ? */
+      var IsRelativePrice1 = UNSET_CHAR, IsRelativePrice2 = UNSET_CHAR;
+      if( FI_IsBond(fininstr) )
+         if(SourceID==GT_ASTS)
+            IsRelativePrice1 = SET_CHAR;
+            IsRelativePrice2 = SET_CHAR;
+         else
+         if( (GetParmByName( RG, "RGDLLG_RELATIVEPRICE_01", @IsRelativePrice1, @type ) == NULL) OR (type != V_STRING) )
+            IsRelativePrice1 = UNSET_CHAR;
+         end;
+         if( IsREPO( OperGroup ) == true )
+            if( (GetParmByName( RG, "RGDLLG_RELATIVEPRICE_02", @IsRelativePrice2, @type ) == NULL) OR (type != V_STRING) )
+               IsRelativePrice2 = UNSET_CHAR;
+            end;
+         end;
+      end;
+      end;
+
+      /* количество */
+      if( (GetParmByName( RG,"RGDLTC_NUMLOTS", @NumLotsParm, @type )  == NULL) OR (type != V_DOUBLE) )
+      end;
+
+      if( SourceID==GT_ASTS )
+         /*Для онлайн-ММВБ NumLotsParm всегда рассчитываем, потому что в RGDLTC_NUMLOTS приходит не кол-во бумаг, а кол-во лотов*/
+         NumLotsParm = 0;
+      end;
+
+      if( (NumLotsParm == 0) and Is_MMVB3_ASTS_SPB )
+         var vPrice:double = 0.0;
+         var vCost:money = $0.0;
+         if( (GetParmByName(RG, "RGDLTC_PRICE", @vPrice, @type) == NULL) OR (type != V_DOUBLE) OR
+             (GetParmByName(RG, "RGDLLG_COST_01", @vCost, @type) == NULL) OR (type != V_MONEY) )
+            SetError(" ошибка при расчете ценовых параметров" );
+         else
+            if( IsRelativePrice1 == SET_CHAR )
+               vPrice = vPrice / 100.0 * FaceValue;
+            end;
+            NumLotsParm = round(vCost / vPrice, 0);
+         end;
+      end;
+
+      var SettleDate1, SettleDate2;
+      var AskQuest:bool = true;
+      var ConsiderCompulsorily:bool = true;
+
+      /* дата расчётов */
+      if( (GetParmByName( RG, "RGDLLG_SUPDATE_01", @SettleDate1, @type )  == NULL) OR (type != V_DATE) )
+      end;
+      if(IsREPO(OperGroup))
+         if( (GetParmByName( RG, "RGDLLG_SUPDATE_02", @SettleDate2, @type )  == NULL) OR (type != V_DATE) )
+            SettleDate2 = SettleDate1;
+         end;
+      end;
+
+      if(Is_MMVB3_ASTS_SPB)
+
+         if( IsDealKSU(OperGroup) )
+            dl_leg1.rec.Basis = SP_KINDBASISCALC_CAL_CAL;
+            dl_leg2.rec.Basis = SP_KINDBASISCALC_CAL_CAL;
+         end;
+
+         /* валюта расчётов */
+         if( (GetParmByName(RG, GetParmName("RGDLPM_PAYFI", BAi), @StrTempParm, @type) == NULL) OR (type != V_STRING) OR (StrTempParm == "") )
+         else
+            if( GetRealID(RG_CURRENCY, StrTempParm, Код_ФинИн, @PayFIID, @ErrMes) != 0 )
+               SetError( ErrMes );
+            end;
+            if( ПолучитьФинИн(PayFIID) )
+               SetError( "Не найден финансовый инструмент " + string(PayFIID) + " в параметре " + GetParmName("RGDLPM_PAYFI", BAi ) + " объекта " + String(RecordID) );
+            end;
+            dl_leg1.rec.PayFIID = PayFIID;
+            if( IsREPO(OperGroup) )
+               dl_leg2.rec.PayFIID = PayFIID;
+            end;
+         end;
+
+         /* стоимость сделки с НКД */
+         if( (GetParmByName( RG,"RGDLLG_TOTALCOST_01", @dl_leg1.rec.TotalCost, @type )  == NULL) OR (type != V_MONEY) )
+         end;
+         dl_leg1.rec.TotalCost = RG_MakeMoney(dl_leg1.rec.TotalCost);
+
+         /* стоимость 2ч сделки с НКД */
+         if(IsREPO(OperGroup))
+            if( (GetParmByName(RG,"RGDLLG_TOTALCOST_02", @dl_leg2.rec.TotalCost, @type) == NULL) OR (type != V_MONEY) OR (dl_leg2.rec.TotalCost == 0.0) )
+               dl_leg2.rec.TotalCost = dl_leg1.rec.TotalCost * (1 + dl_leg2.rec.IncomeRate / 100 * SP_FloatYears( IIF(dl_leg1.rec.MaturityIsPrincipal == SET_CHAR, dl_leg1.rec.Maturity, dl_leg1.rec.Expiry),
+                                                                                                                  IIF(dl_leg2.rec.MaturityIsPrincipal == SET_CHAR, dl_leg2.rec.Maturity, dl_leg2.rec.Expiry)
+                                                                                                                ));
+            end;
+            dl_leg2.rec.TotalCost = RG_MakeMoney(dl_leg2.rec.TotalCost);
+         end;
+      end;
+
+      // RGDLLG_NKD_01/02 - Сумма НКД
+      if( (GetParmByName( RG,"RGDLLG_NKD_01", @dl_leg1.rec.NKD, @type )  == NULL) OR (type != V_MONEY) )
+      else
+         dl_leg1.rec.NKD = RG_MakeMoney(dl_leg1.rec.NKD);
+         if( Is_MMVB3_ASTS_SPB )
+            if( IsREPO(OperGroup) and (PayFIID != fininstr.FaceValueFI) AND (not СуммыВВалютеРасчетов()) )
+               dl_leg1.rec.NKD = НКД(fininstr.FIID, NumLotsParm, SettleDate1, NULL, false, AskQuest, ConsiderCompulsorily);
+            elif( IsREPO(OperGroup) and (PayFIID != fininstr.FaceValueFI) AND СуммыВВалютеРасчетов() )
+               /*конвертация не нужна т.к. NKDFIID = PayFIID */
+            else
+               /* конвернтируем из валюты расчётов в валюту номинала на дату торгов*/
+               SettleDate1 = tick.rec.DealDate;
+               if( fininstr.FaceValueFI != PayFIID )
+                  if( not SmartConvertSum(dl_leg1.rec.NKD, dl_leg1.rec.NKD, SettleDate1, PayFIID, fininstr.FaceValueFI, false) )
+                     dl_leg1.rec.NKD = $0;
+                  else
+                     dl_leg1.rec.NKD = RG_MakeMoney(dl_leg1.rec.NKD);
+                  end;
+               end;
+            end;
+            NKDFromFile1 = dl_leg1.rec.NKD;
+//USR
+               if(not FI_IsShare(fininstr))
+                    NKDCalc1 = НКД(fininstr.FIID, NumLotsParm, SettleDate1, NULL, false, true, false/*ConsiderCompulsorily*/);
+               end;
+            if( IsREPO(OperGroup) and (PayFIID != fininstr.FaceValueFI) AND СуммыВВалютеРасчетов() )
+               if( not SmartConvertSum(NKDCalc1, NKDCalc1, SettleDate1, fininstr.FaceValueFI, PayFIID, false) )
+                  NKDCalc1 = $0;
+               else
+                  NKDCalc1 = RG_MakeMoney(NKDCalc1);
+               end;
+            end;
+            NKD_Date1 = SettleDate1;
+         else
+            NKDFromFile1 = dl_leg1.rec.NKD;
+//USR
+            NKDCalc1 = НКД(fininstr.FIID, NumLotsParm, SettleDate1, NULL, false, true, false/*ConsiderCompulsorily*/);
+            NKD_Date1 = SettleDate1;
+         end;
+
+         NKD_PayFIID = dl_leg1.rec.NKD;
+         if( Is_MMVB3_ASTS_SPB )
+            if( IsREPO(OperGroup) and (PayFIID != fininstr.FaceValueFI) AND СуммыВВалютеРасчетов() )
+               /* сумма и так в PayFIID */
+            elif( PayFIID != fininstr.FaceValueFI )
+               if( not SmartConvertSum(NKD_PayFIID, NKD_PayFIID, SettleDate1, fininstr.FaceValueFI, PayFIID, false) )
+                  NKD_PayFIID = $0;
+               else
+                  NKD_PayFIID = RG_MakeMoney(NKD_PayFIID);
+               end;
+            end;
+         end;
+      end;
+
+      if( IsREPO(OperGroup) )
+         if( (GetParmByName( RG,"RGDLLG_NKD_02", @dl_leg2.rec.NKD, @type )  == NULL) OR (type != V_MONEY) )
+         else
+            dl_leg2.rec.NKD = RG_MakeMoney(dl_leg2.rec.NKD);
+            if( Is_MMVB3_ASTS_SPB )
+               if( IsREPO(OperGroup) and (PayFIID != fininstr.FaceValueFI) AND (not СуммыВВалютеРасчетов()) )
+                  dl_leg2.rec.NKD = НКД(fininstr.FIID, NumLotsParm, SettleDate2, NULL, false, AskQuest, ConsiderCompulsorily);
+               elif( IsREPO(OperGroup) and (PayFIID != fininstr.FaceValueFI) AND СуммыВВалютеРасчетов() )
+                     /*конвертация не нужна т.к. NKDFIID = PayFIID */
+               else
+                  /* конвернтируем из валюты расчётов в валюту номинала на дату торгов*/
+/*KD*/
+/*                  SettleDate2 = tick.rec.DealDate;*/
+
+                  if( fininstr.FaceValueFI != PayFIID ) 
+                     SettleDate2 = tick.rec.DealDate;
+                     if( not SmartConvertSum( dl_leg2.rec.NKD, dl_leg2.rec.NKD, SettleDate2, PayFIID, fininstr.FaceValueFI, false ) )
+                        dl_leg2.rec.NKD = $0;
+                     else
+                        dl_leg2.rec.NKD = RG_MakeMoney(dl_leg2.rec.NKD);
+                     end;
+                  end;
+               end;
+               NKDFromFile2 = dl_leg2.rec.NKD;
+//USR
+                  if(not FI_IsShare(fininstr))
+                      NKDCalc2 = НКД(fininstr.FIID, NumLotsParm, SettleDate2, NULL, false, true, false/*ConsiderCompulsorily*/);
+                  end;
+
+               if( IsREPO(OperGroup) and (PayFIID != fininstr.FaceValueFI) AND СуммыВВалютеРасчетов() )
+                  if( not SmartConvertSum(NKDCalc2, NKDCalc2, SettleDate2, fininstr.FaceValueFI, PayFIID, false) )
+                     NKDCalc2 = $0;
+                  else
+                     NKDCalc2 = RG_MakeMoney(NKDCalc2);
+                  end;
+               end;
+               NKD_Date2 = SettleDate2;
+            else
+               NKDFromFile2 = dl_leg2.rec.NKD;
+//USR
+               NKDCalc2 = НКД(fininstr.FIID, NumLotsParm, SettleDate2, NULL, false, true, false/*ConsiderCompulsorily*/);
+               NKD_Date2 = SettleDate2;
+            end;
+
+            NKDBack_PayFIID = dl_leg2.rec.NKD;
+            if(Is_MMVB3_ASTS_SPB)
+               if( IsREPO(OperGroup) and (PayFIID != fininstr.FaceValueFI) AND СуммыВВалютеРасчетов() )
+                  /* сумма и так в PayFIID */
+               elif( PayFIID != fininstr.FaceValueFI )
+                  if( not SmartConvertSum(NKDBack_PayFIID, NKDBack_PayFIID, SettleDate2, fininstr.FaceValueFI, PayFIID, false) )
+                     NKDBack_PayFIID = $0;
+                  else
+                     NKDBack_PayFIID = RG_MakeMoney(NKDBack_PayFIID);
+                  end;
+               end;
+            end;
+         end;
+      end;
+
+      // RGDLLG_COST_01/02 - стоимость ц/б (без НКД)
+      if( (GetParmByName(RG, "RGDLLG_COST_01", @dl_leg1.rec.Cost, @type)  == NULL) OR (type != V_MONEY) )
+      else
+         dl_leg1.rec.Cost = RG_MakeMoney(dl_leg1.rec.Cost);
+         if( Is_MMVB3_ASTS_SPB and
+             ((dl_leg1.rec.Cost == 0.0) or /* если грузим xml файл и в файле не задано поле Value */
+              (IsREPO(OperGroup) and (PayFIID != fininstr.FaceValueFI) and (not СуммыВВалютеРасчетов()) ) /*зачем пересчёт не понятно, но так просит банк*/
+             )
+           )
+            dl_leg1.rec.Cost = RG_MakeMoney(dl_leg1.rec.TotalCost - NKD_PayFIID);
+         end;
+         DealSumNoNKD = dl_leg1.rec.Cost;
+      end;
+
+      if( (GetParmByName(RG, "RGDLTC_PRICE", @PriceParm, @type) == NULL) OR (type != V_DOUBLE) )
+      else
+         if( Is_MMVB3_ASTS_SPB AND (PriceParm == 0.0) )
+            PriceParm = DealSumNoNKD / NumLotsParm;
+         elif( Is_MMVB3_ASTS_SPB AND (PayFIID != fininstr.FaceValueFI) AND (IsRelativePrice1 == SET_CHAR) )
+            PriceParm = PriceParm / 100.0 * FaceValue;
+            if( not SmartConvertSumDbl(PriceParm, PriceParm, tick.rec.DealDate, fininstr.FaceValueFI, PayFIID, false) )
+               PriceParm = 0;
+            end;
+         end;
+      end;
+
+      var IsPercFromNom:bool = false;
+      if( not Is_MMVB3_ASTS_SPB )
+         IsPercFromNom = FI_IsBond(fininstr);
+      else
+         IsPercFromNom = (IsRelativePrice1 == SET_CHAR);
+      end;
+
+      var AmountBase = $0;
+      //RGDLLG_PRICE_01
+      if( SourceID == GT_QUIK )
+         dl_leg1.rec.Price = ReclcDealPriceAndAmount(IsPercFromNom, PriceParm, NumLotsParm, Double(DealSumNoNKD/*100.*/), FaceValue, @AmountBase);
+      else
+         dl_leg1.rec.Price = PriceParm;
+         AmountBase = NumLotsParm;
+      end;
+
+      dl_leg1.rec.Principal = AmountBase;
+      if( IsREPO(OperGroup) )
+
+         dl_leg2.rec.Principal = dl_leg1.rec.Principal;
+         if( (GetParmByName( RG,"RGDLLG_COST_02", @dl_leg2.rec.Cost, @type )  == NULL) OR (type != V_MONEY) )
+         else
+            dl_leg2.rec.Cost = RG_MakeMoney(dl_leg2.rec.Cost);
+         end;
+
+         if( (GetParmByName( RG,"RGDLLG_PRICE_02", @dl_leg2.rec.Price, @type )  == NULL) OR (type != V_DOUBLEL) )
+         else
+            if( Is_MMVB3_ASTS_SPB )
+               if( dl_leg2.rec.Price == 0.0 )
+                  if( dl_leg2.rec.Cost == 0.0 )
+                     dl_leg2.rec.Cost = RG_MakeMoney(dl_leg2.rec.TotalCost - NKDBack_PayFIID);
+                  end;
+                  dl_leg2.rec.Price = dl_leg2.rec.Cost / NumLotsParm;
+               else
+                  if( (PayFIID != fininstr.FaceValueFI) AND (IsRelativePrice2 == SET_CHAR) )
+                     dl_leg2.rec.Price = dl_leg2.rec.Price / 100.0 * FaceValue;
+                     if( not SmartConvertSumDbl(dl_leg2.rec.Price, dl_leg2.rec.Price, tick.rec.DealDate, fininstr.FaceValueFI, PayFIID, false) )
+                        dl_leg2.rec.Price = 0;
+                     end;
+                  end;
+
+                  if( dl_leg2.rec.Cost == 0.0 )
+                     if( (IsRelativePrice2 == SET_CHAR) AND (PayFIID == fininstr.FaceValueFI) )
+                        dl_leg2.rec.Cost = RG_MakeMoney(AmountBase * double(FaceValue * dl_leg2.rec.Price / 100.));
+                     else
+                        dl_leg2.rec.Cost = RG_MakeMoney(AmountBase*dl_leg2.rec.Price);
+                     end;
+                  end;
+               end;
+            else
+               if( FI_IsBond(fininstr) )
+                  dl_leg2.rec.Cost = RG_MakeMoney(AmountBase * double(FaceValue * dl_leg2.rec.Price / 100.));
+               else
+                  dl_leg2.rec.Cost = RG_MakeMoney(AmountBase*dl_leg2.rec.Price);
+               end;
+            end;
+         end;
+
+      DealSumNoNKD_Back = dl_leg2.rec.Cost;
+      end;
+
+   ELIF( SourceID == GT_NRD )
+
+      Код_ФинИн   = FICK_NRD;
+      Код_Субъект = PTCK_NDC;
+
+      /*код корзины*/
+      if( (GetParmByName( RG,"RGDLTC_PFI", @StrTempParm, @type )  == NULL) OR (type != V_STRING) OR (StrTempParm == "") )
+         SetError( "Не найден код ц/б" + StrTempParm + " в параметре " + "RGDLTC_PFI" + " объекта " + String(RecordID) );
+      else
+         if( GetRealID( RG_AVOIRISS, StrTempParm, Код_ФинИн, @BaseFIID, @ErrMes ) != 0 )
+            SetError( " не найдена в справочнике ценная бумага с кодом = \'" + StrTempParm + "\'" );
+         else 
+            if( ПолучитьФинИн( BaseFIID, fininstr, issues, NULL, NULL ) != 0 )
+               SetError( " ошибка в справочнике для ценной бумаги \'" + string(BaseFIID) + "\'" );
+            end;
+         end;
+         tick.rec.PFI = dl_leg1.rec.PFI = fininstr.FIID;
+      end;
+
+      dl_leg2.rec.PFI = dl_leg1.rec.PFI;
+
+      /*Дата исполнения 1 ч сделки*/
+      var PayDate1:date = date(0,0,0);
+      if( (GetParmByName( RG,"RGDLLG_PAYDATE_01", @PayDate1, @type )  == NULL) OR (type != V_DATE) OR (PayDate1 == Date(0,0,0)) )
+         SetError( "Не найдена дата исполнения 1 части по сделке" + StrTempParm + " в параметре " + "RGDLLG_PAYDATE_01" + " объекта " + String(RecordID) );
+      end;
+
+      /*Дата исполнения 2 ч сделки*/
+      var PayDate2:date = date(0,0,0);
+      if( (GetParmByName( RG,"RGDLLG_PAYDATE_02", @PayDate2, @type )  == NULL) OR (type != V_DATE) OR (PayDate2 == Date(0,0,0)) )
+      end;
+
+      SP_Set_DL_LEG_dates_lf(dl_leg1, PayDate1, PayDate1);
+      SP_Set_DL_LEG_dates_lf(dl_leg2, PayDate2, PayDate2);
+
+      /*сумма 1 ч сделки*/
+      if( (GetParmByName( RG,"RGDLLG_TOTALCOST_01", @dl_leg1.rec.TotalCost, @type )  == NULL) OR (type != V_MONEY) OR (dl_leg1.rec.TotalCost == $0) )
+         SetError( "Не найдена сумма сделки по 1 части" + StrTempParm + " в параметре " + "RGDLLG_TOTALCOST_01" + " объекта " + String(RecordID) );
+      end;
+      dl_leg1.rec.TotalCost = RG_MakeMoney(dl_leg1.rec.TotalCost);
+
+      /*сумма 2 ч сделки*/
+      if( (GetParmByName( RG,"RGDLLG_TOTALCOST_02", @dl_leg2.rec.TotalCost, @type )  == NULL) OR (type != V_MONEY) OR (dl_leg2.rec.TotalCost == $0) )
+         SetError( "Не найдена сумма сделки по 2 части" + StrTempParm + " в параметре " + "RGDLLG_TOTALCOST_02" + " объекта " + String(RecordID) );
+      end;
+      dl_leg2.rec.TotalCost = RG_MakeMoney(dl_leg2.rec.TotalCost);
+
+      dl_leg2.rec.ReturnIncome = RG_MakeMoney(Abs(dl_leg2.rec.TotalCost-dl_leg1.rec.TotalCost));
+
+      dl_leg1.rec.Point = dl_leg2.rec.Point = 4;
+      if( (GetParmByName( RG,"RGDLLG_POINT_01", @dl_leg1.rec.Point, @type )  == NULL) OR (type != V_INTEGER) )
+         dl_leg1.rec.Point = 4;
+      end;
+      if( (GetParmByName( RG,"RGDLLG_POINT_02", @dl_leg2.rec.Point, @type )  == NULL) OR (type != V_INTEGER) )
+         dl_leg2.rec.Point = 4;
+      end;
+
+      tick.rec.Points = dl_leg1.rec.Point;
+      
+      dl_leg1.rec.IncomePoint = dl_leg1.rec.Point;
+      dl_leg2.rec.IncomePoint = dl_leg2.rec.Point;
+
+      if( (GetParmByName( RG,"RGDLTC_INCOMERATE", @dl_leg1.rec.IncomeRate, @type )  == NULL) OR (type != V_DOUBLE) )
+      end;
+      dl_leg1.rec.IncomeRate = round(dl_leg1.rec.IncomeRate, dl_leg1.rec.IncomePoint);
+      dl_leg2.rec.IncomeRate = round(dl_leg1.rec.IncomeRate, dl_leg2.rec.IncomePoint);
+
+      // RGDLTC_CUSTODY - депозитарий
+      if( (GetParmByName( RG,"RGDLTC_CUSTODY", @StrTempParm, @type )  == NULL) OR (type != V_STRING) OR (StrTempParm == "") )
+         SetError( "Не найден депозитарий по сделке" + StrTempParm + " в параметре " + "RGDLTC_CUSTODY" + " объекта " + String(RecordID) );
+      else
+         if( GetRealID( RG_PARTY, StrTempParm, Код_Субъект, @dl_leg1.rec.DepositID, @ErrMes ) != 0 )
+            SetError( ErrMes );                              
+         end;
+      end;
+      dl_leg2.rec.DepositID = dl_leg1.rec.DepositID;
+//USR
+      /*заполняем автоматически: задается в макросе константой, так как субъект <Банк России> - не дистрибутивный*/                                                                   
+      tick.rec.PartyID = DL_GetOurCentralBankID();
+
+      tick.rec.PartyID = 113743;
+
+      if( tick.rec.PartyID == UnknownParty )
+//USR
+         DL_GetPartyKindNames(PTK_CENTRBANK,null,@PtKindName);
+         SetError( "Не найден субъект-резидент с принадлежностью \""+string(PtKindName)+"\"" );
+      end;
+
+      /* валюта расчётов */
+      if( (GetParmByName( RG,GetParmName("RGDLPM_PAYFI", CAi ), @StrTempParm, @type )  == NULL) OR (type != V_STRING) OR (StrTempParm == ""))
+      else
+         if( GetRealID( RG_CURRENCY, StrTempParm, 3, @PayFIID, @ErrMes ) != 0 )
+            SetError( ErrMes );
+         end;  
+         if(ПолучитьФинИн( PayFIID))
+            SetError( "Не найден финансовый инструмент с кодом " + string(PayFIID) + " в параметре " + GetParmName("RGDLPM_PAYFI", CAi ) + " объекта " + String(RecordID) );
+         end;
+         dl_leg1.rec.PayFIID = PayFIID;
+      end;
+
+      /* валюта расчётов */
+      if( (GetParmByName( RG,GetParmName("RGDLPM_PAYFI", CRi ), @StrTempParm, @type )  == NULL) OR (type != V_STRING) OR (StrTempParm == ""))
+      else
+         if( GetRealID( RG_CURRENCY, StrTempParm, 3, @PayFIID, @ErrMes ) != 0 )
+            SetError( ErrMes );
+         end;  
+         if(ПолучитьФинИн( PayFIID))
+            SetError( "Не найден финансовый инструмент с кодом " + string(PayFIID) + " в параметре " + GetParmName("RGDLPM_PAYFI", CRi ) + " объекта " + String(RecordID) );
+         end;
+         dl_leg2.rec.PayFIID = PayFIID;
+      end;
+
+      // RGDLLG_COST_02 - стоимость ц/б
+      if( (GetParmByName( RG,"RGDLLG_COST_02", @dl_leg2.rec.Cost, @type )  == NULL) OR (type != V_MONEY) )
+      end;
+      dl_leg2.rec.Cost = RG_MakeMoney(dl_leg2.rec.Cost);
+
+      dl_leg1.rec.DeliveringFIID = dl_leg2.rec.DeliveringFIID = ALLFININSTR;
+
+      /*управляющий обеспечением*/
+      if( (GetParmByName( RG,"RGDLLG_REGISTER_01", @StrTempParm, @type ) == NULL) OR (type != V_STRING)  OR (StrTempParm == "") )
+         if( GetRealID( RG_PARTY, NRD_CODE, PTCK_CONTR, @dl_leg1.rec.Registrar, @ErrMes ) != 0 )
+            SetError( ErrMes );
+         end;
+      else
+         if( GetRealID( RG_PARTY, StrTempParm, PTCK_CONTR, @dl_leg1.rec.Registrar, @ErrMes ) != 0 )
+            SetError( ErrMes );
+         end;
+      end;
+
+      imp_date = tick.rec.dealdate;
+
+      if( dl_leg1.rec.Registrar > 0 )
+         dl_leg1.rec.RegistrarContrID = GetContrID( PTSK_STOCKDL, dl_leg1.rec.Registrar, {OurBank} );
+         if( dl_leg1.rec.RegistrarContrID <= 0 )/*договор с НРД должен быть обязательно*/
+            SetError( "Не найден № договора с НРД" );
+         end;
+      end;
+
+      dl_leg2.rec.Registrar = dl_leg1.rec.Registrar;
+      dl_leg2.rec.RegistrarContrID = dl_leg1.rec.RegistrarContrID;
+
+      dl_leg1.rec.Basis = SP_KINDBASISCALC_CAL_CAL;
+      dl_leg2.rec.Basis = SP_KINDBASISCALC_CAL_CAL;
+   END;   
+
+   IF( SourceID == GT_OTHR )
+      Код_ФинИн   = КодВнешнСист_ФинИн;
+      Код_Субъект = КодВнешнСист_Субъект;
+   END;
+
+   // RGDLTC_MARKET - Идентификатор торговой площадки
+   //для списания\зачисления и внебиржи этот параметр игнорируется
+   tick.rec.MarketID = UnknownParty;
+   if( (tick.rec.BofficeKind != DL_AVRWRT) and (SourceID != GT_NRD) ) 
+      if( (GetParmByName( RG,"RGDLTC_MARKET", @StrTempParm, @type )  == NULL) OR (type != V_STRING) OR (StrTempParm == "") )
+      else
+         if( GetRealID( RG_PARTY, StrTempParm, Код_Субъект, @tick.rec.MarketID, @ErrMes ) != 0 )
+            return SetWarning(@comment, ErrMes);
+         end;
+      end;
+
+      if( tick.rec.MarketID != UnknownParty )
+         if(ПолучитьСубъекта( tick.rec.MarketID, Party ))
+            return SetWarning(@comment, "Не найден идентификатор торговой площадки " + string(tick.rec.MarketID) + " в параметре " + "RGDLTC_MARKET" + " объекта " + String(RecordID));
+         end;
+      end;
+   end;
+
+   // RGDLTC_CLIENT - Идентификатор клиента
+   tick.rec.ClientID = UnknownParty;
+   if( (SourceID != GT_NRD) /*and (not IsDealKSU(OperGroup))*/ )/*в РЕПО с корзиной и РЕПО с КСУ нет клиента*/
+      if( (GetParmByName( RG,"RGDLTC_CLIENT", @StrTempParm, @type )  == NULL) OR (type != V_STRING) OR (StrTempParm == "") )
+      else
+        imp_date = tick.rec.dealdate;
+        if (tick.rec.dealtype == ПокупкаБиржTodayUnderWr) //установим признак агента в сделке, BIQ-8720 , DEF-15797
+          tick.rec.bondagent = "X"; 
+        end;
+        tick.rec.ClientContrID = UserGetContrID( PTSK_STOCKDL, StrTempParm, tick.rec.MarketID, @tick.rec.ClientID, @ErrMes );
+
+        if( tick.rec.ClientContrID <= 0 )
+          return SetWarning(@comment, ErrMes);
+        end;
+      end;
+   end;
+
+   // RGDLTC_CONTRID - Идентификатор договора на обслуживание клиента
+   // задается для клиентских сделок  
+   if( tick.rec.ClientID != UnknownParty )
+      if( (GetParmByName( RG,"RGDLTC_CONTRID", @StrTempParm, @type )  == NULL) OR (type != V_STRING)  )
+      else
+         imp_date = tick.rec.dealdate;
+         if( tick.rec.ClientContrID <= 0 )
+            tick.rec.ClientContrID = GetContrID( PTSK_STOCKDL, {OurBank}, tick.rec.ClientID, StrTempParm );
+         end;
+
+         if( tick.rec.ClientContrID > 0 )
+            if(SfGetContr(tick.rec.ClientContrID, sfcontr) == false)
+               SetError( "Не найден договор на обслуживание клиента с Id = " + string(tick.rec.ClientContrID) + " в параметре " + "RGDLTC_CONTRID" + " объекта " + String(RecordID) );
+            end;
+         end;
+      end;
+   end;
+
+   tick.rec.ISPFI = UNSET_CHAR;
+   if( (GetParmByName( RG,"RGDLTC_DAYBEFOREEXECUTE", @StrTempParm, @type )  == NULL) OR (type != V_INTEGER) )
+   else
+      if( Is_MMVB3_ASTS_SPB and (tick.rec.ClientID <= 0) and (not IsREPO( OperGroup )) and (not IsLoan( OperGroup )) and (not IsToday( OperGroup ))
+          and ЗагружатьКакПФИ() and (StrTempParm >= 3)
+        )
+         tick.rec.ISPFI = SET_CHAR;
+      end;
+   end;
+
+   if( tick.rec.ClientID == {OurBank} )
+      tick.rec.ClientID = UnknownParty;
+   end;
+
+   if( tick.rec.ClientID != UnknownParty )
+      if(ПолучитьСубъекта( tick.rec.ClientID, Party ))
+         SetError( "Не найден идентификатор клиента" + string(tick.rec.ClientID) + " в параметре " + "RGDLTC_CLIENT" + " объекта " + String(RecordID) );
+      end;
+   end;
+
+   if( tick.rec.BofficeKind == DL_SECUROWN )
+      if( fininstr.Issuer != {OurBank} )
+         SetError( "В сделках СЭБ эмитентом ц/б должен быть наш банк, fiid ц/б " + string(fininstr.fiid) + " объекта " + String(RecordID) );
+      end;
+      if( tick.rec.ClientID != UnknownParty )
+         SetError( "В сделках СЭБ не может быть задан клиент " + string(tick.rec.ClientID) + " объекта " + String(RecordID) );
+      end;
+
+      if( (GetParmByName(RG, "RGDLTC_BOARDID", @BoardID, @type) == NULL) OR (type != V_STRING) )
+      end;
+      if( (BoardID == "PSAU") or (BoardID == "AUCT") )
+         tick.rec.Placement = SET_CHAR;
+      elif( (BoardID == "PSBB") or (BoardID == "AUBB") )
+         tick.rec.Offer = SET_CHAR;
+      end;
+   end;
+
+   // RGDLTC_DEALCODE - Номер сделки
+   if( (GetParmByName( RG,"RGDLTC_DEALCODE", @tick.rec.DealCode, @type )  == NULL) OR (type != V_STRING) )
+      if( SourceID != GT_NRD )
+         SetError( "Не найден номер сделки " + string(tick.rec.DealCode) + " в параметре " + "RGDLTC_DEALCODE" + " объекта " + String(RecordID) );
+      end;
+   end;
+
+   // RGDLTC_DEALCODETS - Номер сделки в торговой системе
+   if( (GetParmByName( RG,"RGDLTC_DEALCODETS", @tick.rec.DealCodeTS, @type )  == NULL) OR (type != V_STRING) )
+      SetError( "Не найден номер сделки в торговой системе " + string(tick.rec.DealCodeTS) + " в параметре " + "RGDLTC_DEALCODETS" + " объекта " + String(RecordID) );
+   end;
+
+//USR
+    if( SourceID == GT_NRD )
+        tick.rec.DealCode = tick.rec.DealCodeTS;
+    end;
+
+   // RGDLTC_DEALTIME - Время заключения сделки
+   if( (GetParmByName( RG,"RGDLTC_DEALTIME", @tick.rec.DealTime, @type )  == NULL) OR (type != V_TIME) )
+      SetError( "Не найдено время заключения сделки " + string(tick.rec.DealTime) + " в параметре " + "RGDLTC_DEALTIME" + " объекта " + String(RecordID) );
+   end;
+
+   if( SourceID == GT_NRD )
+      dl_leg1.rec.SupplyTime = dl_leg2.rec.SupplyTime = tick.rec.DealTime;
+   end;
+
+   // RGDLTC_KIND - тип сделки на бирже
+   if( SourceID != GT_NRD )
+      if( (GetParmByName( RG,"RGDLTC_KIND", @tick.rec.TypeDoc, @type )  == NULL) OR (type != V_STRING) )
+         SetError( "Не найден тип сделки на бирже " + string(tick.rec.TypeDoc) + " в параметре " + "RGDLTC_KIND" + " объекта " + String(RecordID) );
+      else
+         if( NOT IsREPO( OperGroup ) AND (tick.rec.TypeDoc == SP_TYPEDOC_REPO) )
+            tick.rec.TypeDoc = ""; //тип "Сделка РЕПО" заполняем только для сделок РЕПО
+         end;
+      end;
+    
+      // RGDLTC_PARTY - Идентификатор контрагента
+      tick.rec.PartyID = UnknownParty;
+      if( tick.rec.BofficeKind != DL_AVRWRT ) 
+         if( (GetParmByName( RG,"RGDLTC_PARTY", @StrTempParm, @type )  == NULL) OR (type != V_STRING) OR (StrTempParm == "") )
+            /*для СделкаToday (не срочных и не РЕПО) в качестве контрагента ставим субъекта с принадлежностью 'Центральный контрагент'*/
+            if( (GetParmByName( RG,"RGDLLG_PAYDATE_01", @StrTempParm, @type ) == NULL) OR (type != V_DATE) )
+               SetError( "Не найдена дата платежа по контрактиву " + string(StrTempParm) + " в параметре " + "RGDLLG_PAYDATE_01" + " объекта " + String(RecordID) );
+            elif( Is_MMVB3_ASTS_SPB AND (NOT IsREPO(OperGroup)) AND
+                  (tick.rec.DealDate == SettleDate1) AND (tick.rec.DealDate == StrTempParm) AND (tick.rec.DealDate >= date(1,11,2011)) AND
+                  (not RG_GetCentralContrForMarket( IIF(((SourceID == GT_SPB)or(SourceID==GT_PAYMENTS_SPB)), false, true ), null,@tick.rec.PartyID,@ErrMes))
+                )
+               return SetWarning(@comment, ErrMes);
+            end;
+         else
+            if( GetRealID( RG_PARTY, @StrTempParm, Код_Субъект, @tick.rec.PartyID, @ErrMes ) != 0 )
+               return SetWarning(@comment, ErrMes);
+            end;
+         end;
+                                                                                 
+         if( tick.rec.PartyID != UnknownParty )
+            if(ПолучитьСубъекта( tick.rec.PartyID, Party ))
+               return SetWarning(@comment, "Не найден контрагент" + string(tick.rec.PartyID) + " в параметре " + "RGDLTC_PARTY" + " объекта " + String(RecordID));
+            end;
+         end;
+      end;
+   end;
+
+   // RGDLTC_MARKETSCHEME - Идентификатор схемы расчетов с биржей
+   // Обяз. в биржевых, в прочих игнорируется. Должна быть задана схема по заданной бирже по ц/б.
+   if( SourceID != GT_NRD )
+      if( (GetParmByName(RG, "RGDLTC_MARKETSCHEME", @tick.rec.MarketSchemeID, @type )  == NULL) OR (type != V_INTEGER) )
+      end;
+   end;
+
+   if(IsEXCHANGE( OperGroup ))
+      var DepSetID:integer = 0;
+
+      if( Is_MMVB3_ASTS_SPB )
+         var TrdAccID:string = "";
+         if( (SourceID != GT_SPB) and (SourceID!=GT_PAYMENTS_SPB) and  ((GetParmByName(RG, "RGDLTC_TRDACCID", @TrdAccID, @type ) == NULL) OR (type != V_STRING) OR (TrdAccID == "")) )
+            SetError("Не найден торговый счет в параметре " + "RGDLTC_TRDACCID" + " объекта " + String(RecordID) );
+         else
+            tick.rec.DepSetID = GetDepSetIDByTrdAccID(TrdAccID, tick.rec.MarketID, tick.rec.ClientID);
+            if( tick.rec.DepSetID == 0 )
+//USR
+//               Comment = Comment + "Не найдена подходящая схема депозитарного учёта для сделки с TrdAccId = '" + TrdAccID + "'\n";
+               tick.rec.DepSetID = DepSetID;
+            end;
+         end;
+      else
+         tick.rec.DepSetID = DepSetID;
+      end;
+
+      if( tick.rec.DepSetID > 0 )
+         /* заполним депозитарий */
+         var sql = RSDCommand( " select DepSet.t_Depositary   " +
+                               "   from ddlDepSet_dbt DepSet  " +
+                               "  where DepSet.t_depsetid = ? " );
+         sql.addParam( "", RSDBP_IN, tick.rec.DepSetID );
+         sql.execute();
+         var DataSet = TRsbDataSet(sql);
+         if( DataSet.MoveNext() )
+            if( (tick.rec.BofficeKind == DL_RETIREMENT) or (tick.rec.BofficeKind == DL_RETIREMENT_DST) or (tick.rec.BofficeKind == DL_TRUSTRETIREMENT) )
+               dl_leg1.rec.Registrar = DataSet.Depositary;
+            else
+               dl_leg1.rec.DepositID = DataSet.Depositary;
+               if( IsREPO(OperGroup) )
+                  dl_leg2.rec.DepositID = DataSet.Depositary;
+               end;
+            end;
+         end;
+      end;
+
+      if(tick.rec.MarketSchemeID > 0)
+         if(FindDLMARKET( tick.rec.MarketSchemeID, dlmarket) != 0 )
+            SetError( "Не найден идентификатор схемы биржи " + string(tick.rec.MarketSchemeID)+ " в параметре " + "RGDLTC_MARKETSCHEME" + " объекта " + String(RecordID) );
+         else
+            MarketSchemeCode        = dlmarket.rec.Code;
+            tick.rec.TraderID       = dlmarket.rec.Centr;
+            tick.rec.MarketOfficeID = dlmarket.rec.CentrOffice;
+            DepSetID                = dlmarket.rec.DepSetID;
+         end;
+      else //это для загрузки из внешних систем, там нет RGDLTC_MARKETSCHEME, значит определим сами
+
+         if( Is_MMVB3_ASTS_SPB )
+            if( RG_MarketSchemeBySettleCode(tick.rec.MarketID, null, false, @dlmarket, TrdAccID, IIF(tick.rec.ClientID!=UnknownParty,ALG_SP_MONEY_SOURCE_CLIENT,ALG_SP_MONEY_SOURCE_OWN) ) == false )
+               if( Index(TrdAccID,"+") == 4 )
+                  SetError( "Не найдена схема расчетов по ТКС \'" + TrdAccId + "\': в справочнике расчетных кодов не найден расчетный код, связанный с ТКС!" );
+               else
+                  SetError( "Не найдена схема биржи объекта " + String(RecordID) );
+               end;
+            else
+               MarketSchemeCode        = dlmarket.rec.Code;
+               tick.rec.TraderID       = dlmarket.rec.Centr;
+               tick.rec.MarketOfficeID = dlmarket.rec.CentrOffice;
+               DepSetID                = dlmarket.rec.DepSetID;
+               tick.rec.MarketSchemeID = dlmarket.rec.ID;
+            end;
+         end;
+
+         if(tick.rec.MarketSchemeID <= 0)
+            VAR RS = TRsbDataSet( "select * " +
+                              "from ddlmarket_dbt " + 
+                              "where t_Market = " + tick.rec.MarketID + " and t_ORCB = 'X' and t_Fi_Kind = " + FIKIND_AVOIRISS );
+           
+            if( RS.MoveNext() ) 
+               MarketSchemeCode        = RS.Code;
+               tick.rec.TraderID       = RS.Centr;
+               tick.rec.MarketOfficeID = RS.CentrOffice;
+               DepSetID                = RS.DepSetID;
+               tick.rec.MarketSchemeID = RS.ID;
+            else
+               SetError( "Не найдена схема биржи объекта " + String(RecordID) );
+            end;
+         end;
+      end;
+
+      if( (GetParmByName(RG, "RGDLTC_BOARDID", @BoardID, @type) == NULL) OR (type != V_STRING) )
+      end;
+      if( ((SourceID == GT_MMVB3) or (SourceID == GT_PAYMENTS) or (SourceID == GT_ASTS)) and (tick.rec.ClientID != UnknownParty) 
+         and (TrdAccID != "") and ((BoardID == "PSBB") or (BoardID == "AUBB")) 
+         and ((IsBuy(OperGroup)) and (not IsTwoPart(OperGroup)) and (not IsBROKER(OperGroup)))
+         and (tick.rec.ClientID == fininstr.Issuer) )
+         if(CheckBondAgent(tick.rec.ClientID, TrdAccID))
+            tick.rec.BondAgent = SET_CHAR;
+         end;
+      end;
+      if( ((SourceID == GT_MMVB3) or (SourceID == GT_PAYMENTS) or (SourceID == GT_ASTS)) and (tick.rec.ClientID != UnknownParty) and CheckPrimaryPlacement(BoardID) ) 
+         IsPrimaryPlacement = true;
+      end;
+   else
+      tick.rec.MarketSchemeID = 0;
+      tick.rec.TraderID = UnknownParty;
+      tick.rec.MarketOfficeID = -1;
+      tick.rec.DepSetID = 0;
+   end;
+
+   // RGDLTC_BROKER - Идентификатор брокера
+   //для списания\зачисления и биржи этот параметр игнорируется
+   tick.rec.BrokerID = UnknownParty;
+   if( (tick.rec.BofficeKind != DL_AVRWRT) and (SourceID != GT_NRD) ) 
+      if( (GetParmByName( RG,"RGDLTC_BROKER", @StrTempParm, @type )  == NULL) OR (type != V_STRING) OR (StrTempParm == "") )
+      else
+         if( GetRealID( RG_PARTY, StrTempParm, Код_Субъект, @tick.rec.BrokerID, @ErrMes ) != 0 )
+            SetError( ErrMes );
+         end;
+      end;
+      if( tick.rec.BrokerID != UnknownParty )
+         if(ПолучитьСубъекта( tick.rec.BrokerID, Party ))
+            SetError( "Не найден идентификатор брокера" + string(tick.rec.BrokerID) + " в параметре " + "RGDLTC_BROKER" + " объекта " + String(RecordID) );
+         end;
+      end;
+   end;
+
+   // RGDLTC_BROKERCONTRID - Идентификатор договора на обслуживание брокера
+   // если не задан брокер - игнорировать
+   if( IsEXCHANGE(OperGroup) OR IsBROKER(OperGroup) OR (IsOUTEXCHANGE(OperGroup) AND (tick.rec.BrokerID != UnknownParty) ) )
+      if( (GetParmByName( RG,"RGDLTC_BROKERCONTRID", @StrTempParm, @type )  == NULL) OR (type != V_STRING)  )
+         if( IsBROKER( OperGroup ) ) //проверка для брокерской 
+            SetError( "Для брокерской сделки " + string(tick.rec.DealCode) + " не задан номер договора обслуживания посредника" );
+         end;
+      else
+         imp_date = tick.rec.dealdate;
+         tick.rec.BrokerContrID = GetContrID( PTSK_STOCKDL, tick.rec.BrokerID, {OurBank}, StrTempParm );
+
+         if( tick.rec.BrokerContrID > 0 )
+            if(SfGetContr(tick.rec.BrokerContrID, sfcontr) == false)
+               SetError( "Не найден договор на обслуживание посредника с Id = " + string(tick.rec.BrokerContrID) + " в параметре " + "RGDLTC_BROKERCONTRID" + " объекта " + String(RecordID) );
+            end;
+         end;
+      end;
+   end;
+
+   if( (tick.rec.ClientID != UnknownParty) AND (not IsAVRWRTIN(OperGroup)) AND (not IsAVRWRTOUT(OperGroup)) )
+      // RGDLTC_INDOC - Номер поручения на сделку
+      if( (GetParmByName( RG,"RGDLTC_INDOC", @ClntRep.rec.AltXld, @type )  == NULL) OR (type != V_STRING) )
+         ClntRep.rec.AltXld = "";
+      end;
+
+      // RGDLTC_INDOCDATE/RGDLTC_INDOCTIME - дата поручения на сделку
+      if( trim(ClntRep.rec.AltXld) != "" )
+         if( (GetParmByName( RG,"RGDLTC_INDOCDATE", @ClntRep.rec.SignedDate,@type )  == NULL) OR (type != V_DATE)  )
+            SetError( "Не найдена дата поручения на сделку" + string(ClntRep.rec.SignedDate) + " в параметре " + "RGDLTC_INDOCDATE" + " объекта " + String(RecordID) );
+         else
+            ClntRep.rec.RegistrDate = ClntRep.rec.SignedDate;
+         end;
+         if( (GetParmByName( RG,"RGDLTC_INDOCTIME", @ClntRep.rec.SignedTime,@type )  == NULL) OR (type != V_TIME)  )
+            SetError( "Не найдено время поручения на сделку" + string(ClntRep.rec.SignedTime) + " в параметре " + "RGDLTC_INDOCTIME" + " объекта " + String(RecordID) );
+         else
+            ClntRep.rec.RegistrTime = ClntRep.rec.SignedTime;
+         end;
+      else
+         GetParmByName( RG,"RGDLTC_ORDERNOM", @ClntRep.rec.AltXld, @type );
+      end;
+      if( (GetParmByName( RG,"RGDLTC_ORDERNOM", @tick.rec.OrderNo, @type )  == NULL) OR (type != V_STRING) )
+         tick.rec.OrderNo = "";
+      end;
+      ClntRep.rec.Xld = ClntRep.rec.AltXld;
+      ClntRep.rec.IsMakeAuto = SET_CHAR;
+   end;
+
+   // RGDLTC_PORTFOLIO - тип портфеля
+   // Допустимый портфель в собств.. сделках для данного вида ц/б и операции (по классификатору)
+   // В клиентских сделках - клиентский
+   // В Репо. - не задается
+   if( tick.rec.BofficeKind != DL_SECUROWN )
+      if( SourceID == GT_NRD )
+         tick.rec.PortfolioID   = KINDPORT_UNDEF;
+         tick.rec.PortfolioID_2 = KINDPORT_UNDEF;
+      else
+         if( tick.rec.ClientID != UnknownParty )                
+            tick.rec.PortfolioID   = KINDPORT_CLIENT;
+            tick.rec.PortfolioID_2 = KINDPORT_CLIENT;
+         elif(IsREPO(OperGroup))
+            tick.rec.PortfolioID_2 = KINDPORT_UNDEF;
+            if( IsBuy(OperGroup) ) /*для обратного Репо - портфель = ПВО, ddl_tick_dbt.Portfolio2 = -1*/
+                  if( IsDealKSU(OperGroup) )
+                     tick.rec.PortfolioID = KINDPORT_BACK_KSU;/*ПВО_КСУ*/
+                  else
+                     tick.rec.PortfolioID = KINDPORT_BACK/* ПВО*/;
+                  end;
+            else
+               tick.rec.PortfolioID = KINDPORT_UNDEF;
+            end;
+         else
+            tick.rec.PortfolioID_2 = KINDPORT_UNDEF;
+      
+            IF( (SourceID == GT_MMVB) OR (SourceID == GT_MMVB2) OR Is_MMVB3_ASTS_SPB OR (SourceID == GT_QUIK) )
+               if( (GetParmByName( RG,"RGDLTC_PORTFOLIO", @tick.rec.PortfolioID, @type )  == NULL) OR (type != V_INTEGER) OR (tick.rec.PortfolioID == KINDPORT_UNDEF) )
+                  if( WRTGetPortfolioAmount( -1, issues.FIID, -1, 0, KINDPORT_CONTR, -1, tick.rec.DealDate, true, true, false ) > $0 )
+                     tick.rec.PortfolioID = KINDPORT_CONTR;                                                                                                    
+//USR
+                  elif( FI_IsBond(fininstr) and (fininstr.FaceValueFI != NATCUR) )                                                                        
+                     tick.rec.PortfolioID = KINDPORT_SALE;                                                                                                     
+                  elif( ExistNOSS(issues, tick.rec) )                                                                                                            
+                     tick.rec.PortfolioID = KINDPORT_TRADE;                                                                                                    
+                  else                                                                                                                                         
+//USR
+                     tick.rec.PortfolioID = KINDPORT_SALE;                                                                                                     
+                  end;                                                                                                                                         
+               end;                                                                                                                                            
+            else    /* GT_OTHR */
+               if( (GetParmByName( RG,"RGDLTC_PORTFOLIO", @tick.rec.PortfolioID, @type )  == NULL) OR (type != V_INTEGER) )
+                  SetError( "Не найден тип портфеля " + string(tick.rec.PortfolioID) + " в параметре " + "RGDLTC_PORTFOLIO" + " объекта " + String(RecordID) );
+               end;
+            end;
+         end; 
+      end;
+   end;
+
+   // RGDLTC_USERFLAG1 - Пользовательский флаг 1 (признак сделки ОРЦБ)
+   // игнорируется во всех, кроме биржевых
+   if( IsEXCHANGE( OperGroup ) )
+      if(IsREPO( OperGroup ))
+         tick.rec.Flag1 = SET_CHAR;
+      else
+         if( (GetParmByName( RG,"RGDLTC_USERFLAG1", @tick.rec.Flag1, @type )  == NULL) OR (type != V_STRING) )
+            SetError( "Не найден пользовательский флаг 1 " + string(tick.rec.Flag1) + " в параметре " + "RGDLTC_USERFLAG1" + " объекта " + String(RecordID) );
+         end;
+      end;
+   end;
+
+   // RGDLTC_USERFLAG2 - Пользовательский флаг 2 (ghноформления договора нашим банком)
+   // игнорируется во всех, кроме ВНЕбиржевых
+   tick.rec.Flag2 = UNSET_CHAR;
+   if( IsOUTEXCHANGE( OperGroup ) )  
+      if( (GetParmByName( RG,"RGDLTC_USERFLAG2", @tick.rec.Flag2, @type )  == NULL) OR (type != V_STRING) )
+         tick.rec.Flag2 = UNSET_CHAR;
+      end;
+   end;
+
+   // RGDLTC_USERFLAG3 - Срок в днях
+   // Только во внебиржевых
+   tick.rec.Flag3 = UNSET_CHAR; // По умолчанию - в календарных
+   if( IsOUTEXCHANGE( OperGroup ) )
+      if( (GetParmByName( RG,"RGDLTC_USERFLAG3", @tick.rec.Flag3, @type )  == NULL) OR (type != V_STRING) );
+         tick.rec.Flag3 = UNSET_CHAR;
+      end;
+   end;
+
+   // RGDLTC_USERFLAG4 - Расчеты через брокера
+   // Только в Репо
+   tick.rec.Flag4 = UNSET_CHAR; // По умолчанию - нет
+   if(IsREPO( OperGroup ))
+      if( (GetParmByName( RG,"RGDLTC_USERFLAG4", @tick.rec.Flag4, @type )  == NULL) OR (type != V_STRING) );
+         tick.rec.Flag4 = UNSET_CHAR;
+      end;
+   end;
+
+   // RGDLTC_DATE_CM - Дата оплаты комиссии
+   // в зачислении\списании игнорируется
+   if( (tick.rec.BofficeKind != DL_AVRWRT) and (SourceID != GT_NRD) )
+      if( (GetParmByName( RG,"RGDLTC_DATE_CM", @tick.rec.CommDate, @type )  == NULL) OR (type != V_DATE) )
+      end;
+   end;
+
+   // RGDLTC_RETURNINCOMEKIND - Способ возврата дохода
+   //Только в Репо. В биржевых всегда - Списание с суммы Репо
+   if(IsREPO( OperGroup ))
+      if(IsEXCHANGE( OperGroup ))
+         tick.rec.Flag5 = SET_CHAR;
+         tick.rec.ReturnIncomeKind = SP_RETURNINCOME_PAYMENT;
+      else
+         if( (GetParmByName( RG,"RGDLTC_RETURNINCOMEKIND", @tick.rec.ReturnIncomeKind, @type )  == NULL) OR (type != V_MONEY) )
+            tick.rec.ReturnIncomeKind = 0;
+         else
+            // Если задано - взвести так же признак возврата доходов dl_tick.Flag5
+            tick.rec.Flag5 = SET_CHAR;
+         end;
+      end;
+   end;
+   
+   if( SourceID != GT_NRD ) 
+      // RGDLTC_PREOUTLAY - предварительные затраты
+      // только для наших сделок
+      if( tick.rec.ClientID == UnknownParty )
+         if( (GetParmByName( RG,"RGDLTC_PREOUTLAY", @tick.rec.PreOutlay, @type )  == NULL) OR (type != V_MONEY) )
+         else
+            // RGDLTC_PREOUTLAYFIID - Валюта предварительных затрат
+            tick.rec.PreOutlayFIID = NATCUR;
+            if( (GetParmByName( RG,"RGDLTC_PREOUTLAYFIID", @StrTempParm, @type )  == NULL) OR (type != V_STRING) OR (StrTempParm == "") )
+            else
+               if( GetRealID( RG_CURRENCY, StrTempParm, Код_ФинИн, @tick.rec.PreOutlayFIID, @ErrMes ) != 0 )
+                  SetError( ErrMes );
+               end;
+            end;
+         end;
+      end;
+    
+      // RGDLTC_OUTLAY - сумма платежа по активу
+      // только зачисление\списание  
+      if( tick.rec.BofficeKind == DL_AVRWRT )
+         if( (GetParmByName( RG,"RGDLTC_OUTLAY", @outlay.rec.Sum, @type )  == NULL) OR (type != V_MONEY) )
+         else
+            // RGDLTC_OUTLAYFIID
+            outlay.rec.Currency = NATCUR;
+            if( (GetParmByName( RG,"RGDLTC_OUTLAYFIID", @StrTempParm, @type )  == NULL) OR (type != V_STRING) OR (StrTempParm == "") )
+            else
+               if( GetRealID( RG_CURRENCY, StrTempParm, Код_ФинИн, @outlay.rec.Currency, @ErrMes ) != 0 )
+                  SetError( ErrMes );
+               end;
+            end;
+         end
+      end;
+   end;
+   
+   // RGDLTC_AMOUNT_COMM - комиссия посреднику         
+   // RGDLTC_FI_COMM - валюта комиссии посреднику         
+   // в списаниях и клиентских зачислениях игнорируется
+   // валюты комиссий не проверяем (предполагается в рублях) - грузим сумму как есть
+   ArrComSums.Size = 0;
+   var ArrComSums_i = 0, ComSum = $0;
+   if( (SourceID == GT_OTHR) and (not IsAVRWRTOUT( OperGroup )) AND (not IsAVRWRTIN( OperGroup )) and (tick.rec.BrokerID > 0) )
+
+      if( (GetParmByName( RG,"RGDLTC_AMOUNT_COMM", @ComSum, @type )  == NULL) OR (type != V_MONEY) )
+      elif( ComSum > $0.0 )
+         if( not RG_InitDlComis( "БрокерНовПериод", dlcomis_market, @ErrMes, SF_FEE_TYPE_PERIOD ) )
+            SetError( ErrMes );
+         else
+            dlcomis_market.rec.Sum = ComSum;
+            if( (GetParmByName( RG,"RGDLTC_NDS_COMM", @dlcomis_market.rec.NDS, @type )  == NULL) OR (type != V_MONEY) )
+            end;
+
+            dlcomis_market.rec.Date = dlcomis_market.rec.PLANPAYDATE = iif((tick.rec.CommDate!=Date(0,0,0)),tick.rec.CommDate,tick.rec.DealDate);
+
+            if( dlcomis_market.rec.Sum > $0.0 )
+               ArrComSums_i = ArrComSums.Size;
+               ArrComSums(ArrComSums_i) = TRecHandler("dlcomis");
+               copy(ArrComSums(ArrComSums_i),dlcomis_market);
+            end;
+         end;
+      end;
+
+   elif( (NOT IsAVRWRTOUT(OperGroup)) AND (NOT IsAVRWRTIN(OperGroup) ) and IsEXCHANGE(OperGroup) )
+
+      if((SourceID == GT_SPB) or (SourceID == GT_PAYMENTS_SPB))
+         if( (GetParmByName( RG,"RGDLTC_TRADEPERIOD", @TradePeriod, @type ) == NULL) OR (type != V_STRING) )
+            TradePeriod=""
+         end;
+         if( (GetParmByName( RG,"RGDLTC_SPECIALPERIOD", @SpecialPeriod, @type ) == NULL) OR (type != V_STRING) )
+            SpecialPeriod=""
+         end;
+      end;
+
+      if( (GetParmByName( RG,"RGDLTC_AMOUNT_COMM", @ComSum, @type )  == NULL) OR (type != V_MONEY) )
+      elif( ComSum > $0.0 )
+         CodeComiss = "МскБиржНов"; FIID_Comm = null;
+         if((SourceID == GT_SPB) or (SourceID==GT_PAYMENTS_SPB))
+            CodeComiss = "СПбБирж";
+            FIID_Comm = RG_IIF( FI_IsBond(fininstr), fininstr.FaceValueFI, PayFIID );
+         end;
+
+         if( not RG_InitDlComis(CodeComiss, dlcomis_market, @ErrMes, SF_FEE_TYPE_PERIOD, null, FIID_Comm, tick.rec.ClientContrID, tick.rec.DealDate, IsPrimaryPlacement) )
+            SetError( ErrMes );
+         else
+            dlcomis_market.rec.Sum = ComSum;
+
+         /*КД Для клиентских сделок комиссию Биржи грузим в дату оплаты по сделке( 1 части для Репо)*/
+            if(tick.rec.Clientid  == -1)
+               dlcomis_market.rec.Date = dlcomis_market.rec.PLANPAYDATE = tick.rec.DealDate;
+            else
+               dlcomis_market.rec.Date = dlcomis_market.rec.PLANPAYDATE = dl_leg1.rec.expiry;
+            end;
+
+            if( dlcomis_market.rec.Sum > $0.0 )
+               ArrComSums_i = ArrComSums.Size;
+               ArrComSums(ArrComSums_i) = TRecHandler("dlcomis");
+               copy(ArrComSums(ArrComSums_i),dlcomis_market);
+            end;
+         end;
+      end;
+
+      if( (GetParmByName( RG,"RGDLTC_CLRCOMM", @ComSum, @type )  == NULL) OR (type != V_MONEY) )
+      elif( ComSum > $0.0 )
+         CodeComiss = "МскБиржКлирНов"; FIID_Comm = null;
+         if((SourceID == GT_SPB) or (SourceID==GT_PAYMENTS_SPB))
+            CodeComiss = "СПбБиржКлир";
+            FIID_Comm = RG_IIF( FI_IsBond(fininstr), fininstr.FaceValueFI, PayFIID );
+         end;
+
+         if( not RG_InitDlComis(CodeComiss, dlcomis_market, @ErrMes, SF_FEE_TYPE_PERIOD, null, FIID_Comm, tick.rec.ClientContrID, tick.rec.DealDate, IsPrimaryPlacement) )
+            SetError( ErrMes );
+         else
+            dlcomis_market.rec.Sum = ComSum;
+
+         /*КД Для клиентских сделок комиссию Биржи грузим в дату оплаты по сделке( 1 части для Репо)*/
+            if(tick.rec.Clientid  == -1)
+               dlcomis_market.rec.Date = dlcomis_market.rec.PLANPAYDATE = tick.rec.DealDate;
+            else
+               dlcomis_market.rec.Date = dlcomis_market.rec.PLANPAYDATE = dl_leg1.rec.expiry;
+            end;
+/*КД*/
+            SpbClirComT1 = false;
+            if (CodeComiss == "СПбБиржКлир") 
+               If((TradePeriod == "EVE") and ( (SpecialPeriod == "EXTRA_HIGH") OR (SpecialPeriod == "CLOSE") OR (SpecialPeriod == "EXTRA") OR 
+                  ( (SpecialPeriod == "EXTRA_AFTERMARKET") AND (tick.rec.DealTime <= Time(23,59,59)) AND (tick.rec.DealTime >= Time(19,0,0)) ) ) )   
+                  SpbClirComT1 = true;
+                  dlcomis_market.rec.Date = GetDateAfterWorkDays(tick.rec.DealDate, 1, DL_GetCalendByDynParam(83,SPB_TORG_CALEND_PARAM)); // Календарь торговых дней на бирже СПБ
+               end;
+            end;
+
+            if( dlcomis_market.rec.Sum > $0.0 )
+               ArrComSums_i = ArrComSums.Size;
+               ArrComSums(ArrComSums_i) = TRecHandler("dlcomis");
+               copy(ArrComSums(ArrComSums_i),dlcomis_market);
+            end;
+         end;
+      end;
+
+   end;
+
+   // RGDLTC_CLACCOUNT - счет клиента
+   // в зачислениях\списания и во всех НЕ кдиентских сделках игнорируется 
+   if( (tick.rec.BofficeKind != DL_AVRWRT) AND (tick.rec.ClientID != UnknownParty) )
+      if( (GetParmByName( RG,"RGDLTC_CLACCOUNT", @ppaym.ClAccount, @type )  == NULL) OR (type != V_STRING)  )
+         ppaym.ClAccount = "";
+      end;
+   end;
+
+   // RGDLTC_CLBANK - банк клиента
+   // в зачислениях\списания и во всех НЕ кдиентских сделках игнорируется 
+   if( (tick.rec.BofficeKind != DL_AVRWRT) AND (tick.rec.ClientID != UnknownParty) )
+      if( (GetParmByName( RG,"RGDLTC_CLBANK", @StrTempParm, @type )  == NULL) OR (type != V_STRING) OR (StrTempParm == "") )
+         ppaym.ClBank = UnknownParty;
+      else
+         if( GetRealID( RG_PARTY, StrTempParm, Код_Субъект, @ppaym.ClBank, @ErrMes ) != 0 )
+            SetError( ErrMes );
+         end;
+      end;
+   end;
+
+   // RGDLTC_CLCORACCOUNT - счет клиента
+   // в зачислениях\списания и во всех НЕ кдиентских сделках игнорируется 
+   if( (tick.rec.BofficeKind != DL_AVRWRT) AND (tick.rec.ClientID != UnknownParty) )
+      if( (GetParmByName( RG,"RGDLTC_CLCORACCOUNT", @ppaym.ClCorAccount, @type )  == NULL) OR (type != V_STRING) )
+         ppaym.ClCorAccount = "";
+      end;
+   end;
+   
+   // RGDLTC_CLCORBANK - банк клиента
+   // в зачисленияхсписаниях игнорируется 
+   if( (tick.rec.BofficeKind != DL_AVRWRT) AND (tick.rec.ClientID != UnknownParty) )
+      if( (GetParmByName( RG,"RGDLTC_CLCORBANK", @StrTempParm, @type )  == NULL) OR (type != V_STRING) OR (StrTempParm == "") )
+         ppaym.ClCorBank = UnknownParty;
+      else
+         if( GetRealID( RG_PARTY, StrTempParm, Код_Субъект, @ppaym.ClCorBank, @ErrMes ) != 0 )
+            SetError( ErrMes );
+         end;
+      end;
+   end;
+
+   // RGDLTC_DEPOACCOUNT - счет ДЕПО
+   if( SourceID != GT_NRD ) 
+      if( (GetParmByName( RG,"RGDLTC_DEPOACCOUNT", @ppaym.DepoAccount, @type )  == NULL) OR (type != V_STRING)  )
+         ppaym.DepoAccount = "";
+      end;
+   end;
+
+   // RGDLTC_CUSTODY - депозитарий
+   if(tick.rec.ClientID != UnknownParty)
+      if( (GetParmByName( RG,"RGDLTC_CUSTODY", @StrTempParm, @type )  == NULL) OR (type != V_STRING) OR (StrTempParm == "") )
+         ppaym.Custody = UnknownParty;
+      else
+         if( GetRealID( RG_PARTY, StrTempParm, Код_Субъект, @ppaym.Custody, @ErrMes ) != 0 )
+            SetError( ErrMes );
+         end;
+      end;
+   else
+      ppaym.Custody = {OurBank};
+   end;
+
+   // RGDLTC_CNTRACCOUNT - счет контрагента
+   // в зачислениях\списаниях игнорируется 
+   if( (tick.rec.BofficeKind != DL_AVRWRT) AND (SourceID != GT_NRD) AND (tick.rec.PartyID != UnknownParty) )
+      if( (GetParmByName( RG,"RGDLTC_CNTRACCOUNT", @ppaym.CntrAccount, @type )  == NULL) OR (type != V_STRING)  )
+         ppaym.CntrAccount = "";
+      end;
+   end;
+
+   // RGDLTC_CNTRBANK - банк контрагента
+   // в зачисленияхсписаниях игнорируется 
+   if( (tick.rec.BofficeKind != DL_AVRWRT) AND (SourceID != GT_NRD) AND (tick.rec.PartyID != UnknownParty) )
+      if( (GetParmByName( RG,"RGDLTC_CNTRBANK", @StrTempParm, @type )  == NULL) OR (type != V_STRING) OR (StrTempParm == "") )
+         ppaym.CntrBank = UnknownParty;
+      else
+         if( GetRealID( RG_PARTY, StrTempParm, Код_Субъект, @ppaym.CntrBank, @ErrMes ) != 0 )
+            SetError( ErrMes );
+         end;
+      end;
+   end;
+
+   // RGDLTC_CNTRCORACCOUNT - корсчет банка контрагента
+   // в зачислениях\списаниях игнорируется 
+   if( (tick.rec.BofficeKind != DL_AVRWRT) AND (SourceID != GT_NRD) AND (tick.rec.PartyID != UnknownParty) )
+      if( (GetParmByName( RG,"RGDLTC_CNTRCORACCOUNT", @ppaym.CntrCorAccount, @type )  == NULL) OR (type != V_STRING)  )
+         ppaym.CntrCorAccount = "";
+      end;
+   end;
+
+   // RGDLTC_CNTRCORBANK - банк-корреспондент контрагента
+   // в зачисленияхсписаниях игнорируется 
+   if( (tick.rec.BofficeKind != DL_AVRWRT) AND (SourceID != GT_NRD) AND (tick.rec.PartyID != UnknownParty) )
+      if( (GetParmByName( RG,"RGDLTC_CNTRCORBANK", @StrTempParm, @type )  == NULL) OR (type != V_STRING) OR (StrTempParm == "") )
+         ppaym.CntrCorBank = UnknownParty;
+      else
+        if( GetRealID( RG_PARTY, StrTempParm, Код_Субъект, @ppaym.CntrCorBank, @ErrMes ) != 0 )
+           SetError( ErrMes );
+        end;
+      end;
+   end;
+
+   // RGDLTC_CNTRDEPOACCOUNT - корсчет банка контрагента
+   // в зачислениях\списаниях игнорируется 
+   if( (GetParmByName( RG,"RGDLTC_CNTRDEPOACCOUNT", @ppaym.CntrDepoAccount, @type )  == NULL) OR (type != V_STRING)  )
+      ppaym.CntrDepoAccount = "";
+   end;
+
+   // RGDLTC_CNTRCUSTODY - банк-корреспондент контрагента
+   if( tick.rec.BofficeKind != DL_AVRWRT )
+      if( (GetParmByName( RG,"RGDLTC_CNTRCUSTODY", @StrTempParm, @type )  == NULL) OR (type != V_STRING) OR (StrTempParm == "") )
+      else
+         if( GetRealID( RG_PARTY, StrTempParm, Код_Субъект, @ppaym.CntrCustody, @ErrMes ) != 0 )
+            SetError( ErrMes );
+         end;
+      end;
+   else
+      ppaym.CntrCustody = {OurBank}; // в зачислениях/списаниях всегда наш банк
+   end;
+
+   // RGDLTC_COMMENT - комментарий
+   if( (GetParmByName( RG,"RGDLTC_COMMENT", @tick.rec.Comment, @type )  == NULL) OR (type != V_STRING)  )
+      tick.rec.Comment = "";
+   end;
+
+   // RGDLTC_DEALSTATUS - статус сделки
+   if( (GetParmByName( RG,"RGDLTC_DEALSTATUS", @tick.rec.DealStatus, @type )  == NULL) OR (type != V_INTEGER)  )
+   end;
+
+   var marketreportid, strSPGroundID;
+   
+   //RGDLTC_MARKETREPORT_ID - Идентификатор документа-подтверждения 
+   if( SourceID != GT_NRD ) 
+      if( IsEXCHANGE( OperGroup ) )
+         if( (GetParmByName( RG,"RGDLTC_MARKETREPORT_ID", @marketreportid, @type )  == NULL) OR (type != V_INTEGER)  )
+            marketreportid = 0;
+         end;
+         if( (marketreportid > 0) AND (GetObjectCode(11 /*$(RS-Bank получатель)*/, marketreportid, @strSPGroundID) == 0) )     
+            if( strSPGroundID != "" )
+               spgrdoc.rec.SPGroundID = int(strSPGroundID);
+            end;
+         end;
+      end;
+   end;
+
+   // RGDLTC_DEPARTMENT - Номер филиала
+   if( (GetParmByName( RG,"RGDLTC_DEPARTMENT", @tick.rec.Department, @type )  == NULL) OR (type != V_INTEGER) )
+   end;
+
+   // RGDLTC_USERFIELD1 - Пользовательское поле 1
+   if( (GetParmByName( RG,"RGDLTC_USERFIELD1", @tick.rec.UserField1, @type )  == NULL) OR (type != V_STRING)  )
+      tick.rec.UserField1 = "";
+   end;
+
+   // RGDLTC_USERFIELD2 - Пользовательское поле 2
+   if( (GetParmByName( RG,"RGDLTC_USERFIELD2", @tick.rec.UserField2, @type )  == NULL) OR (type != V_STRING)  )
+      tick.rec.UserField2 = "";
+   end;
+
+   // RGDLTC_USERFIELD3 - Пользовательское поле 3
+   if( (GetParmByName( RG,"RGDLTC_USERFIELD3", @tick.rec.UserField3, @type )  == NULL) OR (type != V_STRING)  )
+      tick.rec.UserField3 = "";
+   end;
+
+   // RGDLTC_USERFIELD4 - Пользовательское поле 4
+   if( (GetParmByName( RG,"RGDLTC_USERFIELD4", @tick.rec.UserField4, @type )  == NULL) OR (type != V_STRING)  )
+      tick.rec.UserField4 = "";
+   end;
+
+   if( SourceID == GT_OTHR )
+      GetAvanceParm( rq_avance1, dl_leg1, PM_PURP_AVANCE );
+ 
+      if( IsREPO( OperGroup ) )
+         GetAvanceParm( rq_avance2, dl_leg2, PM_PURP_BACK_AVANCE );
+      end;
+   end;
+    
+   if( SourceID != GT_NRD )
+      FillDealFirstSecondParms_Part2( false, dl_leg1, spgr1  );
+    
+      if( IsREPO( OperGroup ) )
+          FillDealFirstSecondParms_Part2( true, dl_leg2, spgr2  );
+      end;
+    
+      if( IsREPO(OperGroup) )
+         VAR dp_1 = IIF( dl_leg1.rec.MaturityIsPrincipal == SET_CHAR, dl_leg1.rec.Maturity, dl_leg1.rec.Expiry),
+             dp_2 = IIF( dl_leg2.rec.MaturityIsPrincipal == SET_CHAR, dl_leg2.rec.Maturity, dl_leg2.rec.Expiry);
+    
+         //для сделок РЕПО попытаться расчитать цену или ставку, если они не заданы
+         if( (dl_leg2.rec.Cost != 0) AND (dl_leg2.rec.IncomeRate == 0.0) )
+            SP_CalcForREPO( dl_leg1, dl_leg2, dp_1, dp_2, true );
+         elif( (dl_leg2.rec.Cost == 0) AND (dl_leg2.rec.IncomeRate != 0.0) )
+            SP_CalcForREPO( dl_leg1, dl_leg2, dp_1, dp_2, false );
+         end;
+      end;
+
+      SetAccountsRQ( tick, ppaym );
+   end;
+
+   var ReturnIncome:money = $0;
+   var CmdKind = "Insert";
+
+   // RGDLTC_RETURNINCOME - Сумма процентов
+   if( IsREPO( OperGroup ) and (SourceID != GT_NRD) )
+
+      if( (GetParmByName( RG,"RGDLTC_RETURNINCOME", @ReturnIncome, @type ) == NULL) OR (type != V_MONEY) OR (ReturnIncome == $0) )
+         ReturnIncome = dl_leg2.rec.TotalCost - dl_leg1.rec.TotalCost;
+         dl_leg2.rec.ReturnIncome = RG_MakeMoney(Abs(ReturnIncome));
+      end;
+   end;
+
+   if( SourceID == GT_NRD )
+      /*если находим сделку в отложенных, то пытаемся обновить ее*/                                                                          
+      /*теоретически повторная загрузка(обновление) может быть*/
+      VAR cmd_tick = RSDCommand( "SELECT tick.t_DealID, tick.t_DealStatus, leg1.t_ID LegID1, leg2.t_ID LegID2, leg1.t_Cost Cost1, leg1.t_Principal Principal1, leg2.t_Principal Principal2, leg2.t_Maturity Maturity2, leg2.t_Expiry Expiry2 "+
+                                 "  FROM ddl_tick_dbt tick, ddl_leg_dbt leg1, ddl_leg_dbt leg2 " +
+                                 " WHERE     tick.t_DealCodeTS  = ? " +
+                                 "       AND tick.t_BofficeKind = ? " +
+                                 "       AND tick.t_DealType    = ? " +
+                                 "       AND leg1.t_LegKind     = ? " +
+                                 "       AND leg1.t_DealID      = tick.t_DealID " +
+                                 "       AND leg1.t_LegID       = 0 " +
+                                 "       AND leg2.t_LegKind     = ? " +
+                                 "       AND leg2.t_DealID      = tick.t_DealID " +
+                                 "       AND leg2.t_LegID       = 0 "
+                               );  
+      
+      cmd_tick.addParam( "", RSDBP_IN, tick.rec.DealCodeTS );
+      cmd_tick.addParam( "", RSDBP_IN, DL_SECURITYDOC );
+      cmd_tick.addParam( "", RSDBP_IN, РепоНаКорзину );
+      cmd_tick.addParam( "", RSDBP_IN, LEG_KIND_DL_TICK );
+      cmd_tick.addParam( "", RSDBP_IN, LEG_KIND_DL_TICK_BACK );
+      
+      cmd_tick.NullConversion = true;
+      cmd_tick.execute();
+
+      var DataSet_tick = TRsbDataSet( cmd_tick );
+      if( DataSet_tick.MoveNext() )
+         if( DataSet_tick.DealStatus == DL_PREPARING )
+            tick.rec.DealID = DataSet_tick.DealID;/*для того, чтобы существующая сделка была обновлена в ф-и SP_DealGateCreateNew*/
+            dl_leg1.rec.DealID    = DataSet_tick.DealID;
+            dl_leg2.rec.DealID    = DataSet_tick.DealID;
+            dl_leg1.rec.ID        = DataSet_tick.LegID1;
+            dl_leg2.rec.ID        = DataSet_tick.LegID2;
+            dl_leg1.rec.LEGKIND   = LEG_KIND_DL_TICK;
+            dl_leg2.rec.LEGKIND   = LEG_KIND_DL_TICK_BACK;
+            dl_leg1.rec.Cost      = DataSet_tick.Cost1;
+            dl_leg1.rec.Principal = DataSet_tick.Principal1;
+            dl_leg2.rec.Principal = DataSet_tick.Principal2;
+            dl_leg2.rec.Maturity  = SQL_ConvTypeDate(DataSet_tick.Maturity2);
+            dl_leg2.rec.Expiry    = SQL_ConvTypeDate(DataSet_tick.Expiry2);
+
+            CmdKind = "Update";
+         else
+            SetError("Ошибка при обновлении сделки в БОЦБ.\nВ БОЦБ уже существует сделка с внешним кодом \""+tick.rec.DealCodeTS+"\".\nДля обновления она должна быть отложена.");
+         end;
+      end;
+   end;
+
+   /*SP_DealGateCreateNew зовет внутри транзакцию*/
+   stat = SP_DealGateCreateNew( tick,
+                                dl_leg1, dl_leg2,
+                                spgr1, spgr2,
+                                rq_avance1,   
+                                rq_avance2,
+                                rq_acc_clnt,
+                                rq_acc_contr,
+                                rq_acc_clnt_depo,
+                                rq_acc_contr_depo,
+                                ClntRep,
+                                outlay,  ArrComSums,
+                                spgrdoc );
+   if(stat != 0)
+      SetError("Ошибка при "+iif((CmdKind == "Update"),"обновлении","вставке")+" сделки в БОЦБ.\n" 
+        + CB_ErrMsg(GetErrMsg(), tick.rec.clientid, dl_leg1.rec.cfi) // DEF-66627 заменяем неинформативное сообщение
+      );
+   end;
+//USR
+    Var NoteVal1 = "", FD;
+
+   if ( tick.rec.BofficeKind != DL_SECUROWN ) // Заполнение примечаний
+      var noteDayBefEx;
+      if( ( GetParmByName ( RG,"RGDLTC_DAYBEFOREEXECUTE", @noteDayBefEx, @type ) == NULL ) or ( type != V_INTEGER ) )
+      else
+         if( addNoteForObject( tick.rec.BofficeKind, 
+                               makeObjectID(tick.rec.BofficeKind, NULL, tick),
+                               NOTEKIND_SECDEAL_EXEC_DAYS, 
+                               noteDayBefEx, 
+                               tick.rec.DealDate ) ) 
+               SetError("Ошибка при установке примечания |\""+ИмяПримечания(tick.rec.BofficeKind, NOTEKIND_SECDEAL_EXEC_DAYS)+"\" для объекта " + String(RecordID));
+            end;
+      end;
+
+      var SettleCode;
+      if( ( GetParmByName ( RG,"RGDLTC_PCODE", @SettleCode, @type ) == NULL ) or ( type != V_STRING ) )
+      else
+         if( addNoteForObject( tick.rec.BofficeKind, 
+                               makeObjectID(tick.rec.BofficeKind, NULL, tick),
+                               NOTEKIND_SECDEAL_SETTLE_CODE, 
+                               SettleCode, 
+                               tick.rec.DealDate ) ) 
+               SetError("Ошибка при установке примечания |\""+ИмяПримечания(tick.rec.BofficeKind, NOTEKIND_SECDEAL_SETTLE_CODE)+"\" для объекта " + String(RecordID));
+            end;
+      end;
+   end; // if ( tick.rec.BofficeKind != DL_SECUROWN )
+
+   ID  = string( tick.rec.DealID );
+   if (tick.rec.Prognos == SET_CHAR)
+      ID = ID + "_pr";
+   end;
+
+/*КД*/
+    if( (GetParmByName( RG,"RGDLTC_NOTEVAL1", @NoteVal1, @type )  == NULL) OR (type != V_STRING) )
+    else
+
+      If(NoteVal1 != "")
+         If(NoteVal1 == "spec")
+           if( ( not DisconnectObjAttr(OBJTYPE_SECDEAL,  UniID( tick, OBJTYPE_SECDEAL), SPEC_CATEGORY) ) OR
+               ( not ConnectObjAttr(stat, OBJTYPE_SECDEAL, UniID( tick, OBJTYPE_SECDEAL), SPEC_CATEGORY, 1, null, null, tick.rec.DealDate) ) OR
+               ( stat != 0 ) )
+                SetError("Ошибка при установке категории 'Специальная сделка'  для объекта " + String(RecordID));
+           end;
+         else
+           If((tick.rec.dealtype != 13143) and (tick.rec.dealtype != 13153))     //  не ОЭБ 
+
+              if( addNoteForObject( tick.rec.BofficeKind, 
+                                    makeObjectID(tick.rec.BofficeKind, NULL, tick),
+                                    TRADER_NOTE, 
+                                    NoteVal1, 
+                                    tick.rec.DealDate ) )
+       
+                 SetError("Ошибка при установке примечания |\""+ИмяПримечания(tick.rec.BofficeKind, TRADER_NOTE)+"\" для объекта " + String(RecordID));
+              end;
+           end;
+         end;
+      end;
+   end;
+
+   var TraderCode:string = "";
+   if( (GetParmByName( RG,"RGDLTC_TRADERCODE", @TraderCode, @type ) != NULL) and (type == V_STRING) and (TraderCode != ""))
+     if(Index(TraderCode, "mc") > 0)
+       if( ( not DisconnectObjAttr(OBJTYPE_SECDEAL,  UniID( tick, OBJTYPE_SECDEAL), MARGINCALL_CATEGORY) ) OR
+           ( not ConnectObjAttr(stat, OBJTYPE_SECDEAL, UniID( tick, OBJTYPE_SECDEAL), MARGINCALL_CATEGORY, 1/*Да*/, null, null, tick.rec.DealDate) ) OR
+           ( stat != 0 ) )
+           SetError("Ошибка при установке категории 'Margin Call' для объекта " + String(RecordID));
+       end;
+     end;
+   end;
+
+   if( (GetParmByName(RG, "RGDLTC_BOARDID", @BoardID, @type) != NULL) AND (type == V_STRING) )
+      if( (BoardID != "") and (ValType(BoardID) != V_UNDEF))
+         var  _BoardID = substr(BoardID, 1, 2);
+
+         if( (GetParmByName(RG, "RGDLTC_BOARDTYPE", @BoardType, @type) == NULL) OR (type != V_STRING) )
+            BoardType = "";
+         end;
+
+         var AttrIDBoardID = GetAttrIDBoardID(BoardID, BoardType);
+         if( ( not DisconnectObjAttr(OBJTYPE_SECDEAL,  UniID( tick, OBJTYPE_SECDEAL), BOARDID_CATEGORY) ) OR
+             ( not ConnectObjAttr(stat, OBJTYPE_SECDEAL, UniID( tick, OBJTYPE_SECDEAL), BOARDID_CATEGORY, GetAttrIDBoardID(BoardID), null, null, tick.rec.DealDate) ) OR
+             ( stat != 0 ) )
+              SetError("Ошибка при установке категории 'Режим торгов' для объекта " + String(RecordID));
+         end;
+
+         if(CheckAddressDeal(BoardID))
+            if( ( not DisconnectObjAttr(OBJTYPE_SECDEAL,  UniID(tick, OBJTYPE_SECDEAL), OTC_CATEGORY) ) OR
+                ( not ConnectObjAttr(stat, OBJTYPE_SECDEAL, UniID( tick, OBJTYPE_SECDEAL), OTC_CATEGORY, 2, null, null, tick.rec.DealDate) ) OR
+                ( stat != 0 ) )
+               SetError("Ошибка при установке категории '(Без-)адресная сделка' для объекта " + String(RecordID));
+            end;
+            ConnectObjAttr(NULL, OBJTYPE_SECDEAL, UniID(tick, OBJTYPE_SECDEAL), 52, 1, null, null, tick.rec.DealDate); 
+         else
+            if( ( not DisconnectObjAttr(OBJTYPE_SECDEAL,  UniID(tick, OBJTYPE_SECDEAL), OTC_CATEGORY) ) OR
+                ( not ConnectObjAttr(stat, OBJTYPE_SECDEAL, UniID( tick, OBJTYPE_SECDEAL), OTC_CATEGORY, 1, null, null, tick.rec.DealDate) ) OR
+                ( stat != 0 ) )
+               SetError("Ошибка при установке категории '(Без-)адресная сделка' для объекта " + String(RecordID));
+            end;
+            ConnectObjAttr(NULL, OBJTYPE_SECDEAL, UniID(tick, OBJTYPE_SECDEAL), 52, 2, null, null, tick.rec.DealDate); 
+         end;
+                      
+         if ( (BoardID == "PUGC") OR  
+              (BoardID == "PEGC") OR 
+              (_BoardID == "PS") OR 
+              (_BoardID == "EQ") OR 
+              (_BoardID == "ET") OR 
+              (_BoardID == "GC") OR 
+              (_BoardID == "GU") OR 
+              (_BoardID == "GE") )  
+            if(substr(BoardType, 1, 9) == "РЕПО с ЦК")
+               ConnectObjAttr(NULL, OBJTYPE_SECDEAL, UniID(tick, OBJTYPE_SECDEAL), 54, 2);    // Сделка с участием ЦК - "Да"
+            end;
+         end;
+
+         if((tick.rec.DealType == ПокупкаOTC) OR (tick.rec.DealType == ПродажаOTC))
+            if(BoardID == "MTQR")
+               if( ( not DisconnectObjAttr(OBJTYPE_SECDEAL, UniID( tick, OBJTYPE_SECDEAL), ISBLOCKED_CATEGORY) ) OR
+                   ( not ConnectObjAttr(stat, OBJTYPE_SECDEAL, UniID( tick, OBJTYPE_SECDEAL), ISBLOCKED_CATEGORY, 1, null, null, tick.rec.DealDate) ) OR
+                   ( stat != 0 ) )
+                  SetError("Ошибка при установке категории 'Сделка с заблокированными ценными бумагами' для объекта " + String(RecordID));
+               end;
+            end;
+         end; 
+      end;
+   end;
+
+   if(SourceID == GT_PAYMENTS)
+     if(IsREPO( OperGroup ) and (dl_leg2.rec.IsFlRate == SET_CHAR))
+       InsertIncRateHist(tick.rec.DealID, tick.rec.BofficeKind, tick.rec.DealDate, dl_leg2.rec.IncomeRate);
+     end;
+   end;
+
+   /*KD сохраним признак учета комиссии за клиринг не в дату сделки*/
+   if((SourceID == GT_SPB) or (SourceID == GT_PAYMENTS_SPB))
+      If(SpbClirComT1)
+         if( ( not DisconnectObjAttr(OBJTYPE_SECDEAL,  UniID( tick, OBJTYPE_SECDEAL), 115) ) OR
+             ( not ConnectObjAttr(stat, OBJTYPE_SECDEAL, UniID( tick, OBJTYPE_SECDEAL), 115, 1, null, null, tick.rec.DealDate) ) OR
+             ( stat != 0 ) )
+              SetError("Ошибка при установке категории 'Комиссия СПБ не в дату заключения' для объекта " + String(RecordID));
+         end;
+      end;
+   end;
+   /*<<bpv*/
+   
+   if( SourceID == GT_NRD )
+      var OrderNom = "";
+      if( (GetParmByName( RG,"RGDLTC_ORDERNOM", @OrderNom, @type )  == NULL) OR (type != V_STRING)  )
+      else
+         ID = OrderNom+"_"+ID;
+      end;
+   end;
+
+   if( IsPrimaryPlacement )
+      ConnectObjAttr(NULL, OBJTYPE_SECDEAL, UniID(tick, OBJTYPE_SECDEAL), 53, 2); // Первичное размещение - "Да"
+   end;
+
+   var SessionDate:date = date(0,0,0);
+   if((GetParmByName(RG, "RGDLTC_SESSIONDATE", @SessionDate, @type) != NULL) and (type == V_DATE) and (SessionDate != date(0,0,0)))
+      if(addNoteForObject(tick.rec.BofficeKind, 
+                          makeObjectID(tick.rec.BofficeKind, NULL, tick),
+                          DEAL_SESSIONDATE_NOTE, 
+                          SessionDate, 
+                          tick.rec.DealDate)) 
+         SetError("Ошибка при установке примечания |\""+ИмяПримечания(tick.rec.BofficeKind, DEAL_SESSIONDATE_NOTE)+"\" для объекта " + String(RecordID));
+      end;
+   end;
+
+
+   NKDComment = "";
+   if( NKDFromFile1 != NKDCalc1 )
+     NKDComment = NKDComment + "\n" + "!Значение НКД в сделке не совпадает с расчётным:";
+     NKDComment = NKDComment + "\n" + "   - в сделке: " + NKDFromFile1;
+     NKDComment = NKDComment + "\n" + "   - расчёт: " + NKDCalc1 + " (FIID = " + dl_leg1.rec.pfi + ", количество = "
+                             + dl_leg1.rec.Principal + ", дата = " + NKD_Date1 + ")";/*!!!*/
+   end;
+
+   if( NKDFromFile2 != NKDCalc2 )
+     NKDComment = NKDComment + "\n" + "!Значение НКД в сделке (2ч) не совпадает с расчётным:";
+     NKDComment = NKDComment + "\n" + "   - в сделке: " + NKDFromFile2;
+     NKDComment = NKDComment + "\n" + "   - расчёт: " + NKDCalc2 + " (FIID = " + dl_leg2.rec.pfi + ", количество = "
+                             + dl_leg2.rec.Principal + ", дата = " + NKD_Date2 + ")";
+   end;
+
+   Comment = Comment + "В БОЦБ "+iif((CmdKind == "Update"),"обновлена","создана")+" сделка №" + tick.rec.DealCode + ". DealID = " + tick.rec.DealID + NKDComment;
+   return 0;
+
+OnError( ErrObj )
+   if( ErrObj.Err != NULL )
+      Comment = ErrObj.Err;
+   else
+      Comment = ErrObj.Module + " строка " + ErrObj.Line + "\n" + ErrObj.Message;
+   end;
+   return 1;
+end;

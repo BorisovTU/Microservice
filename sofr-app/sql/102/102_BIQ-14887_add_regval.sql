@@ -1,0 +1,24 @@
+DECLARE
+  v_ID       NUMBER := 0;
+  v_ParentID NUMBER := 0;
+BEGIN
+  SELECT T_KEYID INTO v_ParentID FROM DREGPARM_DBT WHERE T_PARENTID = (SELECT T_KEYID FROM DREGPARM_DBT WHERE T_PARENTID = 0 AND LOWER(T_NAME) = LOWER('РСХБ')) AND LOWER(T_NAME) = LOWER('БРОКЕРСКОЕ ОБСЛУЖИВАНИЕ');
+
+  IF(v_ParentId <> 0) THEN 
+    INSERT INTO DREGPARM_DBT (T_KEYID,T_PARENTID,T_NAME,T_TYPE,T_GLOBAL,T_DESCRIPTION,T_SECURITY,T_ISBRANCH,T_TEMPLATE)
+                      VALUES (0,v_ParentID,'ИНВЕСТ_СОВЕТНИК',0,CHR(0),CHR(1),CHR(0),CHR(0),CHR(1)) returning T_KEYID INTO v_ID;
+
+    INSERT INTO DREGVAL_DBT (T_KEYID,T_REGKIND,T_OBJECTID,T_BLOCKUSERVALUE,T_EXPDEP,T_LINTVALUE,T_LDOUBLEVALUE,T_FMTBLOBDATA_XXXX)
+                     VALUES (v_ID,0,0,CHR(0),0,0,0,'');
+
+    v_ParentId := v_ID;
+    IF(v_ParentId <> 0) THEN 
+      INSERT INTO DREGPARM_DBT (T_KEYID,T_PARENTID,T_NAME,T_TYPE,T_GLOBAL,T_DESCRIPTION,T_SECURITY,T_ISBRANCH,T_TEMPLATE)
+                        VALUES (0,v_ParentID,'МИН РАЗМЕР СЧА ИНВЕСТ СОВЕТНИК',1,'X','Минимальный размер портфеля клиента (руб.), необходимый для подключения услуги инвестиционного консультирования',CHR(0),CHR(0),CHR(1)) returning T_KEYID INTO v_ID;
+     
+      INSERT INTO DREGVAL_DBT (T_KEYID,T_REGKIND,T_OBJECTID,T_BLOCKUSERVALUE,T_EXPDEP,T_LINTVALUE,T_LDOUBLEVALUE,T_FMTBLOBDATA_XXXX)
+                       VALUES (v_ID,0,0,CHR(0),0,0,6000000,'');
+    END IF;
+  END IF;
+END;
+/

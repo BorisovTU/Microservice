@@ -1,0 +1,680 @@
+import rsd, rsexts, commonInter, deposInter, календарь, operCode, wf_params, wf_log, wf_uiFormManager;
+
+private file messages("sbbank.msg") key 0;
+private file dep("depositr.dbt") key 8;
+private file curr("currency.dbt") key 0;
+
+private const OK = "OK";
+
+private const USER_ABORT = 4786,
+              INTERNAL_ERROR = 9999;
+
+private const K_ESC = 27,
+              K_F2 = 316;
+
+private const D_OUT = 2,
+              D_GET = 3;
+
+private const SB_DEPOSIT = 1;
+
+private const NONCASH_COMMISSION = 7;
+
+private const V_SPECVAL = 26;
+
+private const IS_INITED = "deposits_inited";
+
+private const FMCR_SUSPENDED = "ОТЛОЖЕНА",
+              FMCR_PERMITTED = "РАЗРЕШЕНА",
+              FMCR_VETO = "ЗАБЛОКИРОВАНА";
+
+private const FORM_WITHDRAW_PARAMS = "WithdrawParams",
+              FORM_COMM_INFO       = "CommInfo",
+              FORM_FM_CHECK        = "FmCheck",
+              FORM_FM_RESUME       = "FmResume",
+              FORM_REPORT_VIEWER   = "ReportViewer";
+
+private const NEW_LINE = "{nl}";
+
+private var {curdate}, {oper}, {name_bank}, cNum = getCNum;
+private var clientList = TClientList;
+private var textDir = getRegVal("BANK_INI\\ОБЩИЕ ПАРАМЕТРЫ\\ДИРЕКТОРИИ\\TEXTDIR");
+
+/*************************************************
+ *  Utility functions for applications
+ ************************************************/
+
+private macro toBool(s : String)
+  return strLwr(s) == "true";
+end;
+
+private macro newSessionId
+  return formApplicationKey(0);
+end;
+
+private macro getMessageForNumber(number : Integer) : String
+  messages.number = number;
+  if (getEq(messages))
+    return messages.contents;
+  else
+    return "Сообщение №" + number;
+  end;
+end;
+
+private macro findAccount(ref : Integer)
+  dep.referenc = ref;
+  if (not getEq(dep))
+    runError(logError("Не найден счет с референсом " + ref));
+  end; 
+end;
+
+private macro getCurrencyCcy(currCode : Integer)
+  curr.code_currency = currCode;
+  if (not getEq(curr))
+    runError(logError("Не найдена валюта с кодом " + currCode));
+  end; 
+  return curr.short_name;
+end;
+
+private macro isNotResident(clientCode : Integer) : Bool 
+  if ( not clientList.getRecord(clientCode))
+    runError(logError("Не найден клиент с кодом " + clientCode));
+  end;
+
+  return clientList.curRec.rec.notResident != strFor(0);
+end;
+
+private macro handleResult(errCode : Integer, msg : String) : TParameters
+  var outParams = TParameters;
+  
+  if (msg == null)
+    if (errCode == 0)
+      msg = OK;
+    else
+      topErrorMessage(msg);
+      if ((msg == null) or (msg == ""))
+        msg = getMessageForNumber(errCode);
+      end;
+    end;
+  end;
+
+  outParams.add("КодОшибки", errCode);
+  outParams.add("Сообщение", msg);
+  return outParams;
+end;
+
+private macro singleResult(name : String, value)
+  var outParams = handleResult(0);
+  outParams.add(name, value); 
+  return outParams;
+end;
+
+private macro handleStoredProcResult : TParameters
+  var cmd = RsdCommand("{? = call rsu_rtlcommon.getLastErrorCode()}");
+  cmd.addParam("p_retVal", RsdBp_Out, V_INTEGER);
+  cmd.execute;
+  var errorCode = cmd.value("p_retVal");
+
+  var msg = null;
+  if (errorCode != 0)
+    cmd = RsdCommand("{? = call rsu_rtlcommon.getLastErrorMessage()}");
+    cmd.addParam("p_retVal", RsdBp_Out, V_STRING, 10000);
+    cmd.execute;
+    msg = cmd.value("p_retVal");
+    if (valType(msg) == V_SPECVAL)
+      msg = "";
+    end;
+  end; 
+
+  if (errorCode != 0)
+    msgbox(errorCode, ": ", msg);
+  end;
+  return handleResult(errorCode, msg);
+end;
+
+private macro createAccountingDocuments(appKind : Integer, appKey : String, chainAppKind : Integer, operationReference : String, contextStr : String) : TParameters
+  var cmd = RsdCommand("{? = call rsu_rtlbook.createDocuments(?, ?, ?, ?, ?, 0)}");
+  cmd.addParam("p_retVal", RsdBp_Out, V_INTEGER);
+  cmd.addParam("p_appKind", RsdBp_In, appKind);
+  cmd.addParam("p_appKey", RsdBp_In, appKey);
+  cmd.addParam("p_chainAppKind", RsdBp_In, chainAppKind);
+  cmd.addParam("p_operationReference", RsdBp_In, operationReference);
+  cmd.addParam("p_contextStr", RsdBp_In, contextStr);
+  
+  cmd.execute;
+
+  return handleStoredProcResult;
+end;
+
+private macro initStoredProcDocBunch(appKind : Integer, appKey : String)
+  var cmd = RsdCommand("{? = call RSI_RTLCOMMON.InitDocBunch(?, ?, false)}");
+  cmd.addParam("p_retVal", RsdBp_Out, V_INTEGER);
+  cmd.addParam("p_appKind", RsdBp_In, appKind);
+  cmd.addParam("p_appKey", RsdBp_In, appKey);
+  cmd.execute;
+
+  var errorCode = cmd.value("p_retVal");
+  if (errorCode != 0)
+    runError(logError("Ошибка инициализации связки. Код " + errorCode));
+  end;
+end;
+
+private macro commonInit
+  var inited = retrieveValue(IS_INITED);
+
+  if ((inited == null) or (inited == false))
+    if (not openDepFiles)
+      runError(logError("Ошибка при открытии виртуальных таблиц"));
+    end;
+    createGDDList;
+    storeValue(IS_INITED, 1);
+  end;
+end;
+
+private macro setCommonVars(params : TParameters)
+  params.add("ДатаВыполненияБаланс", getNextDateAfterDays({curdate}, getFilialNum, null, CALENDAR_BALANCE_YES, 0));    
+  params.add("Название@БанкНаш", {name_bank});   
+  params.add("КонтрРаботник", {oper});   
+end;
+
+private macro makeDepDocument(ref : Integer, complexOp : Integer, op : Integer, subOp : Integer, kindOp : Integer, inAmount : Money, outAmount : Money, ground : String)
+  record doc(sbdepdoc);
+  var errCode = 0;
+
+  findAccount(ref);
+
+  clearRecord(doc);
+  doc.referenc         = ref;
+  doc.isCur            = dep.isCur;
+  doc.fnCash           = dep.fnCash;
+  doc.account          = dep.account;
+  doc.type_account     = dep.type_account;
+  doc.codClient        = dep.codClient;
+  doc.oper             = {oper};
+  doc.code_currency    = dep.code_currency;
+  doc.date_document    = {curdate};
+  doc.depDate_document = {curdate};
+  doc.typeComplexOper  = complexOp;
+  doc.typeOper         = op;
+  doc.applType         = subOp;
+  doc.kindOp           = kindOp;
+  doc.inSum            = inAmount;
+  doc.outSum           = outAmount;
+  if (ground != null)
+    doc.ground = ground;
+  else
+    depSetGround(doc);
+  end;
+
+  if (not insertDocToGDDList(doc))
+    errCode = INTERNAL_ERROR;
+  end;
+  return errCode;
+end;
+
+/*************************************************
+ *  UI sessions
+ ************************************************/
+
+private macro uiCreateSession(formName : String, inParams : TParameters) : TParameters
+  var sessionId = newSessionId;
+  uiFormManager.setInfo(sessionId, formName, inParams);
+  return singleResult("uiSessionId", sessionId);
+end;
+
+private macro uiGetSessionParams(sessionId : String)
+  uiFormManager.recallInfo;
+  if ((uiFormManager.uiSessionId == sessionId) and 
+      (uiFormManager.currentForm != null))
+    return uiFormManager.getFieldsAsParameters;
+  else
+    return null;
+  end;
+end;
+
+private macro uiGetSessionId(paramStr : String) : String
+  var inParams = TParameters(paramStr);
+  return inParams.get("uiSessionId");
+end;
+
+private macro uiSimpleCheckInputReady(paramStr : String, valNameToBePresent : String)
+  var retVal = false; 
+  var sessId = uiGetSessionId(paramStr);
+  var sessParams = uiGetSessionParams(sessId);
+  if ( sessParams != null)
+    if (sessParams.get(valNameToBePresent) != null) 
+      retVal = true;
+    end; 
+  end;
+  return singleResult("retVal", retVal).toString;
+end;
+
+private macro uiTrue
+  return singleResult("retVal", true).toString;
+end;
+
+/*************************************************
+ *  XPDL application implementations
+ ************************************************/
+
+/*
+ *  commonDone
+ *
+ */
+
+macro commonDone
+  interDesk_endDocBunch;
+  deleteGDDList;
+  closeDepFiles;
+  return handleResult(0).toString;
+end;
+
+/*
+ *  getAccountInfo
+ *
+ *  [in]  accountId
+ *
+ *  [out] accountNumber
+ *  [out] currencyId
+ *  [out] clientId
+ *  [out] notResident
+ */
+
+macro getAccountInfo(paramStr : String) : String
+  var inParams = TParameters(paramStr);
+  findAccount(inParams.get("accountId"));
+
+  var outParams = handleResult(0);
+  outParams.add("accountNumber", dep.account);
+  outParams.add("currencyId", dep.code_currency);
+  outParams.add("clientId", dep.codClient);
+  outParams.add("notResident", isNotResident(dep.codClient));
+  return outParams.toString;
+onError(e)
+  return handleResult(INTERNAL_ERROR).toString;     
+end;
+
+/*
+ *  initWithdrawParamsForm
+ *
+ *  [in]  accountId
+ *
+ *  [out] amount
+ */
+
+macro initWithdrawParamsForm_prepare(paramStr : String) : String
+  var inParams = TParameters(paramStr);
+  findAccount(inParams.get("accountId"));
+  inParams.add("accountNumber", dep.account);
+  inParams.add("currencyCode", getCurrencyCcy(dep.code_currency));
+
+  return uiCreateSession(FORM_WITHDRAW_PARAMS, inParams).toString;
+end;
+
+macro initWithdrawParamsForm_inputReady(paramStr : String) : String
+  return uiSimpleCheckInputReady(paramStr, "amount");
+end;
+
+macro initWithdrawParamsForm_getInput(paramStr : String) : String
+  var sessId = uiGetSessionId(paramStr);
+  var sessParams = uiGetSessionParams(sessId);
+  if (sessParams != null)
+    var outParams = singleResult("amount", money(uiFormManager.getFieldsAsParameters.get("amount")));
+    uiFormManager.reset;
+    return outParams.toString;
+  end;
+  return null;
+end;
+
+/*
+ *  calculateCommissionForm
+ *
+ *  [in]  accountId
+ *  [in]  tariffId
+ *  [in]  amount
+ *
+ *  [out] commAccountId
+ *  [out] commAccountNumber
+ *  [out] commCurrencyId
+ *  [out] commAmount
+ */
+
+private macro calculateCommission(inParams : TParameters)
+  var commAmount;
+
+  commonInit; 
+
+  findAccount(inParams.get("accountId"));
+  inParams.add("accountNumber", dep.account);
+  inParams.add("currencyCode", getCurrencyCcy(dep.code_currency));
+
+  var errCode = calculateTariff(inParams.get("tariffId"), dep.code_currency, {curdate}, inParams.get("amount"), commAmount);
+  var outParams = handleResult(errCode);
+  if (errCode == 0)
+    inParams.add("commAccountId", string(dep.referenc));
+    inParams.add("commAccountNumber", dep.account);
+    inParams.add("commCurrencyId", string(dep.code_currency));
+    inParams.add("commAmount", string(commAmount));
+  end;
+end;
+
+macro calculateCommissionForm_prepare(paramStr : String) : String
+  var inParams = TParameters(paramStr);
+
+  calculateCommission(inParams);
+
+  return uiCreateSession(FORM_COMM_INFO, inParams).toString;
+onError(e)
+  return handleResult(INTERNAL_ERROR, e).toString;
+end;
+
+macro calculateCommissionForm_inputReady(paramStr : String) : String
+  return uiTrue;
+end;
+
+macro calculateCommissionForm_getInput(paramStr : String) : String
+  var sessId = uiGetSessionId(paramStr);
+  var sessParams = uiGetSessionParams(sessId);
+  if (sessParams != null)
+    var outParams = handleResult(0);
+    outParams.add("commAccountId", int(uiFormManager.getFieldsAsParameters.get("commAccountId")));
+    outParams.add("commAccountNumber", uiFormManager.getFieldsAsParameters.get("commAccountNumber"));
+    outParams.add("commCurrencyId", int(uiFormManager.getFieldsAsParameters.get("commCurrencyId")));
+    outParams.add("commAmount", money(uiFormManager.getFieldsAsParameters.get("commAmount")));
+    uiFormManager.reset;
+    return outParams.toString;
+  end;
+  return null;
+end;
+
+/*
+ *  fmCheckForm
+ *
+ *  [in]  clientId
+ *
+ *  [out] result
+ */
+
+/*
+macro fmCheck(paramStr : String) : String
+  var inParams = TParameters(paramStr);
+  var outParams = handleResult(0);
+  var result;
+
+  if (getTrue(false, "У клиента есть борода?"))
+    if (getTrue(false, "Она (борода) черная?"))
+      msgBox("В соответствии с 1313-ФЗ все клиенты с черной бородой|считаются террористами.|Операция заблокирована");
+      result = FMCR_VETO;
+    else
+      msgBox("В соответствии с 1313-ФЗ все клиенты с бородой|подозреваются в терроризме.|Операция отложена");
+      result = FMCR_SUSPENDED;
+    end;
+  else
+    result = FMCR_PERMITTED;
+  end;
+  
+  outParams.add("РезультатПроверкиФМ", result);
+  return outParams.toString;
+end;
+*/
+
+macro fmCheckForm_prepare(paramStr : String) : String
+  var inParams = TParameters(paramStr);
+  return uiCreateSession(FORM_FM_CHECK, inParams).toString;
+end;
+
+macro fmCheckForm_inputReady(paramStr : String) : String
+  return uiSimpleCheckInputReady(paramStr, "result");
+end;
+
+macro fmCheckForm_getInput(paramStr : String) : String
+  var sessId = uiGetSessionId(paramStr);
+  var sessParams = uiGetSessionParams(sessId);
+  if (sessParams != null)
+    var outParams = singleResult("result", uiFormManager.getFieldsAsParameters.get("result"));
+    uiFormManager.reset;
+    return outParams.toString;
+  end;
+  return null;
+end;
+
+/*
+ *  fmResumeForm
+ *
+ *  [in]  clientId
+ *
+ *  [out] result
+ */
+
+/*
+macro fmResume(paramStr : String) : String
+  var inParams = TParameters(paramStr);
+  var outParams = handleResult(0);
+  var result;
+
+  if(getTrue(false, "ФМ разрешил операцию?"))
+    msgBox("Операция будет продолжена");
+    result = FMCR_PERMITTED;
+  else
+    msgBox("Операция заблокирована");
+    result = FMCR_VETO;
+  end;
+  
+  outParams.add("РезультатПроверкиФМ", result);
+  return outParams.toString;
+end;
+*/
+
+macro fmResumeForm_prepare(paramStr : String) : String
+  var inParams = TParameters(paramStr);
+  return uiCreateSession(FORM_FM_RESUME, inParams).toString;
+end;
+
+macro fmResumeForm_inputReady(paramStr : String) : String
+  return uiSimpleCheckInputReady(paramStr, "result");
+end;
+
+macro fmResumeForm_getInput(paramStr : String) : String
+  var sessId = uiGetSessionId(paramStr);
+  var sessParams = uiGetSessionParams(sessId);
+  if (sessParams != null)
+    var outParams = singleResult("result", uiFormManager.getFieldsAsParameters.get("result"));
+    uiFormManager.reset;
+    return outParams.toString;
+  end;
+  return null;
+end;
+
+/*
+ *  withdrawFromAccount
+ *
+ *  [in]  workflow
+ *
+ */
+
+macro withdrawFromAccount(paramStr : String) : String
+  var inParams = TParameters(paramStr);
+
+  commonInit; 
+
+  var errCode = makeDepDocument(inParams.get("ИдСчетаВклада@Плат"), 
+                                Расход, 
+                                Расход,
+                                0,
+                                D_OUT,
+                                $0,
+                                inParams.get("Сумма@Покуп"),
+                                "Снятие наличных с вкладного счета");
+  return handleResult(errCode).toString;
+end;
+
+/*
+ *  takeCommission
+ *
+ *  [in]  workflow
+ *
+ */
+
+macro takeCommission(paramStr : String) : String
+  var inParams = TParameters(paramStr);
+
+  commonInit; 
+
+  var errCode = makeDepDocument(inParams.get("ИдСчетаВклада@Плат"), 
+                                Расход, 
+                                Списание_Простое,
+                                NONCASH_COMMISSION,
+                                D_GET,
+                                $0,
+                                inParams.get("Сумма@КомиссияБезнал"),
+                                "Безналичная комиссия за выполнение операции");
+
+  return handleResult(errCode).toString;
+end;
+
+/*
+ *  transaction
+ *
+ *  [in]  workflow
+ *
+ */
+
+macro transaction(paramStr : String) : String
+  var inParams = TParameters(paramStr);
+  var errCode = carryGDDList;
+
+  setCommonVars(inParams);
+  inParams.add("Валюта@Прод", inParams.get("Валюта@Покуп"));
+  inParams.add("Клиент@Плат", inParams.get("Клиент@Вып"));
+
+  commonInit; 
+
+  if (errCode == 0)
+    var appKind, appKey;
+    interDesk_getBunchApplic(appKind, appKey);
+    initStoredProcDocBunch(appKind, appKey);
+    return createAccountingDocuments(appKind, appKey, SB_DEPOSIT, "0;Шаблонный;4;0", inParams.toString).toString;
+  else
+    return handleResult(errCode).toString;
+  end;
+end;
+
+/*
+ *  issueReports
+ *
+ */
+
+private macro readFile(name : String) : String
+  file f() txt;
+  var retVal = "";
+
+  if (open(f, name))
+    while (next(f))
+      retVal = retVal + f.str + NEW_LINE;
+    end;
+    close(f); 
+  end;
+  return retVal; 
+end;
+
+private macro makeReportText(fromDate : date, fromTime : time) : String
+  const PROCESSED_PREFIX = "_processed_";
+  const PROCESSED_PREFIX_LEN = strLen(PROCESSED_PREFIX);
+
+  private macro renameProcessedFile(name : String)
+    var oldPathName = textDir + "\\" + name;
+    var newPathName = textDir + "\\" + PROCESSED_PREFIX + name;
+
+    removeFile(newPathName);
+    renameFile(oldPathName, newPathName);
+  end;
+
+  var files = TDirList(textDir + "\\*." + string(cNum), "F");
+  var retVal = null;
+  var i;
+
+  if (files.count > 0)
+    for (i, 0, files.count - 1)
+      if (((files.fDate(i) > fromDate) or ((files.fDate(i) == fromDate) and (files.fTime(i) >= fromTime))) and
+          (subStr(files.name(i), 1, PROCESSED_PREFIX_LEN) != PROCESSED_PREFIX) and 
+          (files.size(i) > 0))
+        if (retVal != null) 
+          retVal = retVal + NEW_LINE + NEW_LINE;
+        else
+          retVal = ""; 
+        end;
+        retVal = retVal + readFile(files.name(i));
+        renameProcessedFile(files.name(i));
+      end;
+    end;
+  else
+    retVal = "";
+  end; 
+
+  return retVal;
+end;
+
+macro issueReportsForm_prepare : String
+  var inParams = TParameters;
+  var appKind, appKey;
+  commonInit; 
+
+  interDesk_getBunchApplic(appKind, appKey);
+
+  var fromDate = date, fromTime = time;
+  printReports(appKind, appKey);
+  inParams.add("reportText", makeReportText(fromDate, fromTime));
+  return uiCreateSession(FORM_REPORT_VIEWER, inParams).toString;
+end;
+
+macro issueReportsForm_inputReady(paramStr : String) : String
+  return uiSimpleCheckInputReady(paramStr, "reportText");
+end;
+
+macro issueReportsForm_getInput(paramStr : String) : String
+  var sessId = uiGetSessionId(paramStr);
+  var sessParams = uiGetSessionParams(sessId);
+  if (sessParams != null)
+    uiFormManager.reset;
+  end;
+  return null;
+end;
+
+// test
+
+/*
+var ps = selectDepAccount;
+
+printLn(ps);
+
+var ps1 = initWithdrawParams(ps);
+
+printLn(ps1);
+
+var p2 = TParameters(ps);
+p2.add("Сумма@Покуп", TParameters(ps1).get("Сумма@Покуп"));
+p2.add("НомерТарифа", 1);
+
+var ps2 = p2.toString; 
+
+var ps3 = calculateCommission(ps2);
+printLn(ps3);
+
+p2.add("Сумма@КомиссияБезнал", TParameters(ps3).get("Сумма@КомиссияБезнал"));
+ps2 = p2.toString;
+
+var ps4 = withdrawFromAccount(ps2);
+
+println(ps4);
+
+var ps5 = takeCommission(ps2);
+
+println(ps5);
+
+var ps10 = transaction;
+
+println(ps10);
+
+println(selectDepAccountForm_prepare);
+
+println(makeReportText(date, time(0, 0, 0)));
+*/

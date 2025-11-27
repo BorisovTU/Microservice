@@ -1,0 +1,13 @@
+/*Таблица для сохранения клиентов для пересчета по дефектам*/
+CREATE TABLE DNPTXDEFCLIENTS_DBT
+(
+    T_DEFNUM        VARCHAR2(15),
+    T_CLIENTID      NUMBER (10),
+    T_TAXPERIOD     NUMBER (5)
+)
+/
+
+CREATE INDEX DNPTXDEFCLIENTS_DBT_IDX0
+    ON DNPTXDEFCLIENTS_DBT (T_DEFNUM, T_CLIENTID, T_TAXPERIOD)
+/
+

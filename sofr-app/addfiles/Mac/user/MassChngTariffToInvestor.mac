@@ -1,0 +1,497 @@
+/**                                                                                                             
+ @file  MassChngTariffToInvestor.mac                                                                                           
+ @brief Сервисная операция для массовой смены тарифных планов по списку субдоговоров с ТП "Трейдер" на ТП "Инвестор" (временное запускаемое вручную решение) 
+
+ #menu 
+  - БО ЦБ\Договоры\Договоры брокерского обслуживания\Массовая смена Тарифного плана на план "Инвестор"                                                                         
+                                                                                                                
+ #tag                                                                                                          
+ - functional_block:СО                                                                             
+ - code_type:GUI 
+ - code_type:API                                                                                                                                                                                               
+                                                                                                                
+ # changeLog                                                                                                    
+ |date       |author         |tasks               |note                                                         
+ |-----------|---------------|--------------------|-------------------------------------------------------------
+ |2024.02.22 |Жиц М.В.       |BOSS-2335           |Доработки макроса смены тарифного плана с Трейдера на Инвестор                                                                                                                                                 
+ |2024.02.15 |Жиц М.В.       |DEF-61768,DEF-61771,|Округление числа обработанных договоров в протоколе,
+ |           |               |DEF-61772           |убрана провека на действие тарифа трейдер в предыдущий день до смены тарифа                                                                                                                       
+ |2024.02.14 |Жиц М.В.       |BOSS-2110           |Создание макроса сервисной операции                                                                                                                                                 
+*/ 
+
+import sfinter, RsbDataSet, rsd, sp_car, activex, or_rep_h, cb_sql, "FuncObj.mac";
+
+PRIVATE CONST NEW_TARIF_NAME = "Инвестор"; //Наименование нового тарифа
+PRIVATE CONST OLD_TARIF_NAME = "Трейдер";  //Наименование старого тарифа
+
+PRIVATE CONST SHEET_NUM = 1; //Номер страницы в файле, откуда берем информацию
+PRIVATE CONST SFCONTR_NUMBER_ROW = 2; //Номер столбца в файле, откуда берем номер субдоговора
+PRIVATE CONST START_STRNUM = 2; //Номер строки, начиная с которого начинаем чтение файла
+
+/**
+  @brief Получение идентификатора тарифного плана по наименованию 
+  @param[in] SfPlanName наименование ТП
+  @return если ТП найден, то его идентифиатор, иначе -1 
+*/
+PRIVATE MACRO GetSfPlanIDByName(SfPlanName:string):integer
+  var cmd, ds;
+
+  cmd = DL_RSDCommand("SELECT t_SfPlanID " +
+                      "  FROM dsfplan_dbt " + 
+                      " WHERE UPPER(t_Name) = UPPER(?) "
+                     ); 
+  cmd.addParam(SfPlanName);
+  ds = cmd.Execute();
+
+  if(ds.MoveNext())
+    return ds.SfPlanID;
+  else
+    MsgBox("Не удалось определить ID тарифа по наименованию " + SfPlanName);
+    return -1;
+  end;
+END;
+
+/**
+ @brief Очистка таблицы U_TARIF_DLCONTR_TMP для хранения списка ДБО
+ @return статус обработки: true - обработано без ошибок, true - обработано с ошибками 
+*/                    
+PRIVATE MACRO ClearTempTable():bool
+  SQL_Execute("DELETE FROM U_TARIF_DLCONTR_TMP;");
+  return true;
+
+OnError(erru)
+  msgbox("Не удалось очистить таблицу U_TARIF_DLCONTR_TMP");
+  return false;
+END;
+
+/**
+  @brief Получение идентификатора ДБО по номеру субдоговора 
+  @param[in] ContrNumber номер субдоговора
+  @return если ДБО найден, то его идентифиатор, иначе -1 
+*/
+PRIVATE MACRO GetDlContrIDBySfContrNumber(ContrNumber:string):integer
+  var cmd, ds;
+
+  cmd = DL_RSDCommand("SELECT mp.t_DlContrID " +
+                      "  FROM ddlcontrmp_dbt mp, dsfcontr_dbt sf " +
+                      " WHERE mp.t_SfContrID = sf.t_ID " +
+                      "   AND sf.t_Number = ? " +
+                      "   AND sf.t_DateClose = TO_DATE('01.01.0001','DD.MM.YYYY') " //Проверяем, что субдоговор в принципе открыт, т.к. нет смысла менять тариф, если у него уже проставлена дата закрытия в будущем
+                     ); 
+  cmd.addParam(ContrNumber);
+  ds = cmd.Execute();
+
+  if(ds.MoveNext())
+    return ds.DlContrID;
+  end;
+
+  return -1;
+END;
+
+/**
+ @brief Проверка тарифного плана по ДБО на дату
+ @param[in]  DlContrID     идентификатор ДБО
+ @param[in]  OldTarifID    идентификатор ТП
+ @param[in]  BegDate       дата действия ТП
+ @return true, если на ДБО установлен соответствующий ТП 
+ @return false, если ТП не соответствует
+*/
+PRIVATE MACRO CheckSfPlan(DlContrID:integer, OldTarifID:integer, BegDate:date):bool
+  var cmd, ds;
+
+  cmd = DL_RSDCommand("SELECT 1 " +
+                      "  FROM dsfcontrplan_dbt sfplan, ddlcontr_dbt dl " + 
+                      " WHERE sfplan.t_sfplanid = ? " +
+                      "   AND sfplan.t_sfcontrid = dl.t_sfcontrid " +                                         
+                      "   AND sfplan.t_begin <= ? " +                                                 
+                      "   AND sfplan.t_end = TO_DATE('01010001', 'ddmmyyyy') " +
+                      "   AND dl.t_dlcontrid = ? "
+                     );
+  cmd.addParam(OldTarifID);
+  cmd.addParam(BegDate);
+  cmd.addParam(DlContrID);
+  ds = cmd.Execute();
+
+  if(ds.MoveNext())
+    return true;
+  end;
+
+  return false;
+END; 
+
+  private macro SaveFileToAppServ(FullName:string) :string
+    var FileName = "";
+    var DirName = "";
+    var ExtName = "";
+    var Path_AppServ = "";
+    var TmpFilePath = "";
+
+    if(not isStandAlone()) // когда мы на терминале, копируем файл на СП
+      splitfile(FullName, FileName, ExtName);
+      FileName = FileName + ExtName;
+      DirName = substr(FullName, 1, index(FullName, FileName) - 1);
+      Path_AppServ = "..\\workfile\\" + FileName;
+
+      if (not copyfile("$" + DirName + FileName, Path_AppServ) )
+        msgbox("Ошибка при передаче файла на сервер приложений");
+        return "";
+      end;
+
+      TmpFilePath = Path_AppServ;
+      return TmpFilePath;
+    else
+      TmpFilePath = FullName;
+      return TmpFilePath;
+    end;
+    return "";
+  end;
+
+/**
+ @brief Получение списка ДБО из выбранного пользователем файла Exсel
+ @param[in]  OldTarifID    идентификатор старого ТП
+ @param[in]  BegDate       дата начала действия нового ТП
+ @return true, если загрузка выполнен успешно
+ @return false, если в процессе загрузки возникли ошибки
+*/                    
+PRIVATE MACRO LoadDlContrList(OldTarifID:integer, BegDate:date):bool
+  var InputDir:string = ""; //Директория входа, где по-умолчанию ищем файл
+  var FullNameFile:string = ""; //Полное имя файла, включающее путь до него
+  //var FileName:string = ""; //Имя файла
+  //var DirName:string = ""; //Путь до файла
+  var TmpFilePath:string = "";
+  var Sheet = null; //Объект страницы файла Exсel
+  var StrNum:integer = 1; //Счетчик строк файла 
+  var SfContrNumber:string = ""; //Номер субдоговора из файла
+  var DlContrID:integer = -1; //Идентификатор ДБО
+  var cmd;
+
+  InputDir = "..\\Import\\";
+  if(not SelectFile(FullNameFile, InputDir + "*.xls*", "Выберите файл для загрузки", 0, true)) //Выбор обрабатываемого файла
+    MsgBox("Отказ от загрузки");
+    return false;
+  else       
+
+    TmpFilePath = SaveFileToAppServ(FullNameFile);
+    if (TmpFilePath == "")
+      println("Ошибка при копировании файла на сервер приложений " + FullNameFile);
+      //return false;
+    end;
+
+    var jvm = CreateObject("rsjvm", "TJavaHost", "GlobalJavaHost");
+    var rc = jvm.callStaticMethod("ru.softlab.rsbank.poireports.ReportCreator", "getInstance");
+
+    var ActiveBook = rc.openWorkbook(TmpFilePath); //FullNameFile
+    if (not ActiveBook)
+      ActiveBook.close();
+      ActiveBook = null;
+      rc = null;
+      MsgBox("Ошибка при открытии файла " + filename);
+    end;
+
+    BegAction(0, "Ждите. Идет загрузка списка договоров...");
+
+    ActiveBook.setActiveSheet(0);
+    StrNum = START_STRNUM;
+    while(ValType(ActiveBook.getCellValue("B"+StrNum)) != V_UNDEF) //Цикл по строкам страницы
+
+      SfContrNumber = trim(string(ActiveBook.getCellValue("B"+StrNum):0:0)); //Получение номера субдоговора из 2-го столбца
+
+      DlContrID = GetDlContrIDBySfContrNumber(SfContrNumber); //Получение идентификатора ДБО по номеру субдоговора  
+
+      if(DlContrID > -1)  
+        if(CheckSfPlan(DlContrID, OldTarifID, BegDate)) 
+          cmd = RsdCommand("BEGIN " +
+                           "  INSERT INTO U_TARIF_DLCONTR_TMP (t_DlContrID) VALUES(?); " +
+                           "END; ");
+          cmd.AddParam("", RSDBP_IN, DlContrID);
+          cmd.Execute();
+        else
+          Println(SfContrNumber + ": ПРЕДУПРЕЖДЕНИЕ! По ДБО, определенному по номеру субдоговора " + SfContrNumber + ", текущий тарифный план не " + OLD_TARIF_NAME+". Смена тарифного плана произведена не будет"); 
+        end;
+      else
+        Println(SfContrNumber + ": ОШИБКА! Не определен ДБО с номером субдоговора " + SfContrNumber); 
+      end;
+
+      StrNum = StrNum + 1;
+    end;
+    
+    if(valtype(ActiveBook) != V_UNDEF)
+      ActiveBook.close();
+      ActiveBook = null;
+      rc = null; //Закрытие файла Exсel
+    end;
+    EndAction(0);
+  end;
+
+  return true;
+
+OnError(erru)
+  if(valtype(ActiveBook) != V_UNDEF)
+      ActiveBook.close();
+      ActiveBook = null;
+      rc = null; //Закрытие файла Exсel
+  end;
+  msgbox("Не удалось выполнить загрузку списка договоров из файла \"" + FullNameFile + "\"");
+  return false;
+END;
+
+/**
+ @brief Получение кол-ва ДБО и субдоговоров в обработке 
+ @return кол-во ДБО и субдоговоров
+*/
+PRIVATE MACRO GetCntRec():integer
+  var sqlCnt;
+  sqlCnt = DL_RSDCommand("select 1 from ddl_differentid_tmp");
+ 
+  return sqlCnt.GetCount(); //Посчитаем кол-во ДБО и субдоговоров в обработке
+END;
+
+/**
+ @brief Формирование Excel-файла с итоговым списком успешно обработанных ДБО 
+ @param[in]  BegDate       дата начала действия нового ТП
+*/
+PRIVATE MACRO FormItogList(BegDate:date);
+  var Rep, cmd, ds;
+  Rep = CMakeReport("?????????????");
+  Rep.SetDefaultFontName("Times New Roman");
+  Rep.SetDefaultFontSize(10);
+  Rep.SetFlagShowGrid(true);
+
+  Rep.AddPrintCell("Номер ДБО",         50, 0, "l:ex_FS(b)", REP_ELEM_STR);
+  Rep.AddPrintCell("Дата смены тарифа", 30, 0, "l:ex_FS(b)", REP_ELEM_STR);
+  Rep.AddStr();
+
+  cmd = DL_RSDCommand("SELECT sf.t_number " + 
+                   "  FROM ddl_differentid_tmp t, dsfcontr_dbt sf, ddlcontr_dbt dl " +
+                   " WHERE sf.t_ID = dl.t_SfContrID " +      
+                   "   AND dl.t_DlContrID IN (SELECT funcobj.t_ObjectID " +
+                   "                            FROM dfuncobj_dbt funcobj " +
+                   "                           WHERE funcobj.t_ID = t.t_ID " +
+                   "                             AND funcobj.t_State = 3 " + 
+                   "                             AND funcobj.t_ObjectType = 207 " +
+                   "                             AND NVL(funcobj.t_ErrorCode, 0) = -1 " +
+                   "                          UNION ALL " +
+                   "                          SELECT hist.t_ObjectID " +
+                   "                            FROM dfuncobj_hist_dbt hist " +
+                   "                           WHERE hist.t_FuncobjID = t.t_ID " +
+                   "                             AND hist.t_ObjectType = 207 "  +
+                   "                             AND hist.t_StartedDate IS NOT NULL " + 
+                   "                             AND NOT EXISTS (SELECT 1 " +
+                   "                                               FROM dfuncobj_dbt funcobj " + 
+                   "                                              WHERE funcobj.t_ID = t.t_ID " +
+                   "                                                AND t_ObjectType = 207) " +
+                   "                         ) "
+                  );
+
+  ds = cmd.Execute();
+  while(ds.MoveNext())
+    Rep.AddPrintCell(ds.Number, 50, 0, "l", REP_ELEM_STR);
+    Rep.AddPrintCell(BegDate,   30, 0, "l", REP_ELEM_STR);
+    Rep.AddStr();
+  end;
+
+  Rep.PrintWinRep("Успешная смена ТП по ДБО");
+  Rep.SetWinRepOutput();
+  Rep.ShowWinRep();
+END;
+
+/**
+ @brief Формирование протокола смены ТП 
+ @param[in]  BegDate       дата начала действия нового ТП
+*/
+PRIVATE MACRO FormLog(BegDate:date)
+  var cmd, ds;
+  var cntErrMsg:integer = 0; //Количество ДБО, где успешно сменился ТП, но возникли проблемы в процессе отправки письма
+
+  InitProgress(GetCntRec(), "Печать протокола", "Печать протокола");
+
+  //Необновленные ДБО
+  cmd = DL_RSDCommand("SELECT sf.t_number, NVL(funcobj.t_ErrorCode, 0) t_ErrorCode, NVL(funcobj.t_ErrorText, chr(1)) t_ErrorText " + 
+                      "  FROM ddl_differentid_tmp t, dfuncobj_dbt funcobj, dsfcontr_dbt sf, ddlcontr_dbt dl " +
+                      " WHERE funcobj.t_ID = t.t_ID " +
+                      "   AND funcobj.t_State = 3 " + 
+                      "   AND sf.t_ID = dl.t_SfContrID " +      
+                      "   AND dl.t_DlContrID = funcobj.t_ObjectID " +
+                      "   AND funcobj.t_ObjectType = 207 " +
+                      " ORDER BY t_ErrorCode DESC " 
+                     );
+  ds = cmd.Execute();
+  while(ds.MoveNext())
+    if(ds.ErrorCode == -1)
+      Println(ds.Number + ": ПРЕДУПРЕЖДЕНИЕ! " + ds.ErrorText);
+      cntErrMsg = cntErrMsg + 1;
+    else
+      Println(ds.Number + ": ОШИБКА! " + ds.ErrorText);
+    end;
+  end;
+
+  //Задания удалили руками или не работала интеграция
+  cmd = DL_RSDCommand("SELECT sf.t_number " + 
+                      "  FROM ddl_differentid_tmp t, dfuncobj_hist_dbt hist, dsfcontr_dbt sf, ddlcontr_dbt dl " +
+                      " WHERE hist.t_FuncobjID = t.t_ID " +
+                      "   AND hist.t_ObjectType = 207 "  +
+                      "   AND hist.t_StartedDate IS NULL " + 
+                      "   AND NOT EXISTS (SELECT 1 " +
+                      "                     FROM dfuncobj_dbt funcobj " + 
+                      "                    WHERE funcobj.t_ID = t.t_ID AND t_ObjectType = 207) " +
+                      "   AND sf.t_ID = dl.t_SfContrID " +      
+                      "   AND dl.t_DlContrID = hist.t_ObjectID "
+                     );
+  ds = cmd.Execute();
+  while(ds.MoveNext())
+    Println(ds.Number + ": ПРЕДУПРЕЖДЕНИЕ! Задание по смене тарифного плана не бралось в обработку");
+  end;
+
+  //Кол-во успешно обновленных ДБО
+  cmd = DL_RSDCommand("SELECT COUNT(t.t_ID) cnt " + 
+                      "  FROM ddl_differentid_tmp t, dfuncobj_hist_dbt hist " +
+                      " WHERE hist.t_FuncobjID = t.t_ID " +
+                      "   AND hist.t_ObjectType = 207 "  +
+                      "   AND hist.t_StartedDate IS NOT NULL " + 
+                      "   AND NOT EXISTS (SELECT 1 " +
+                      "                     FROM dfuncobj_dbt funcobj " + 
+                      "                    WHERE funcobj.t_ID = t.t_ID AND t_ObjectType = 207) "
+                     );
+  ds = cmd.Execute();
+  if(ds.MoveNext())
+    Println("Успешно сменен тариф и выполнена отправка писем для " + int(ds.cnt) + " договоров");
+  end;
+
+  if(cntErrMsg > 0)
+    Println("Успешно сменен тариф, но не выполнена отправка уведомления по " + cntErrMsg + " договорам");
+  end;
+
+  //FormItogList(BegDate); //Формируем итоговый список ДБО
+
+  RemProgress();
+END;
+
+/**
+ @brief Массовая смена тарифных планов по списку субдоговоров на ТП "Инвестор" 
+*/
+MACRO MassChngTariffToInvestor()
+  var cmd, sql, sqlCnt, cnt, ds;
+  var BegDate:date = {curdate}; //Дата начала действия нового тарифа
+  var NewTarifID:integer = -1; //Идентификатор нового тарифа
+  var OldTarifID:integer = -1; //Идентификатор старого тарифа
+
+  var SLEEP_TIME_MS = 15000; //Время в мс, которое выжидаем, прежде чем снова проверять результаты выполнения задач - 15 секунд    
+  var MIN_EXEC_COUNT = 3; //Минимальное количество повторных выполнений каждой из ошибочных записей, прежде чем выводить по ним отчёт 
+  var isNotFinished:bool = true; //Признак, что обработка еще не окончена
+  var MAX_FUNCOBJ_ITERATION = 960; //Количество повторов, которое мы ждем, прежде чем прервать операцию (с задержкой в 15 сек это ориентировочно 4 часа)
+  var i:integer = 0; //Счетчик повторов ожидания  
+
+  var dt = StrSubSt(string(Date():f),".",""); //Отформатированная дата запуска операции
+  var tm = StrSubSt(string(time()),":",""); //Отформатированное время запуска операции
+  var InfoLogFileName = GetTxtFileName("MassChngTariff_"+dt+"_"+StrSubst(tm," ","0")); //Лог-файл
+
+  SetOutput(InfoLogFileName, true);   
+
+  NewTarifID = GetSfPlanIDByName(NEW_TARIF_NAME);
+  OldTarifID = GetSfPlanIDByName(OLD_TARIF_NAME);
+  if((NewTarifID < 0) or (OldTarifID < 0))
+    exit(1);
+  end;
+
+  if(not GetDate(BegDate, "Введите дату начала действия нового тарифа"))
+    MsgBox("Отмена смены тарифов, не указана дата");
+    exit(1);
+  end;
+
+  if(not ClearTempTable()) //Очистка таблицы U_TARIF_DLCONTR_TMP для хранения списка ДБО
+    exit(1);
+  end;
+
+  if(not LoadDlContrList(OldTarifID, BegDate)) //Получение списка идентификаторов ДБО из выбранного пользователем файла Exсel 
+    exit(1);
+  end;
+  
+  sql = " DECLARE "
+      + "   v_FuncobjID dfuncobj_dbt.t_ID%TYPE; "   
+      + " BEGIN "
+      + "   DELETE FROM ddl_differentid_tmp; "         
+      + "   FOR c IN (SELECT 207 t_Kind, sf.t_ID, dl.t_DlContrID "
+      + "               FROM ddlcontr_dbt dl, "
+      + "                    dsfcontr_dbt sf "
+      + "              WHERE dl.t_sfcontrid = sf.t_id "
+      + "                AND dl.t_dlcontrid IN (SELECT t_dlcontrid FROM U_TARIF_DLCONTR_TMP) "
+      + "            ) "   
+      + "   LOOP "    
+      + "     INSERT INTO dfuncobj_dbt (t_ObjectType, t_ObjectID, t_FuncID, t_Param, t_Priority, t_Oper) "
+      + "                       VALUES (c.t_Kind, c.t_DlContrID, 7778, to_char(?)||';'||to_char(?)||';'|| to_char(?, 'DD.MM.YYYY'), 55, ?) " 
+      + "     RETURNING t_ID INTO v_FuncobjID; "
+      + "     INSERT INTO ddl_differentid_tmp (t_ID) VALUES (v_FuncobjID); "
+      + "   END LOOP; "   
+      + " END; ";
+ 
+  cmd = RSDCommand(sql);
+  cmd.addParam("", RSDBP_IN, NewTarifID);
+  cmd.addParam("", RSDBP_IN, OldTarifID);
+  cmd.addParam("", RSDBP_IN, BegDate);
+  cmd.addParam("", RSDBP_IN, {oper});
+
+  cmd.execute();
+
+  cnt = GetCntRec(); //Посчитаем кол-во ДБО и субдоговоров в обработке
+  
+  if(cnt > 0)
+    Println("Время старта смены ТП: " + Time());
+    InitProgress(cnt, "Перебор ДБО для смены Тарифного плана", "Перебор ДБО для смены Тарифного плана");
+   
+    //Периодически проверяем, не обработались ли еще все задачи funcobj и не привысилось ли количество итераций проверки (второе условие пока убрала, т.к. непонятно, что в этом случае делать)
+    while(isNotFinished /*and (i < MAX_FUNCOBJ_ITERATION)*/)
+   
+      RslWait(SLEEP_TIME_MS); //Ожидание
+   
+      cmd = DL_RSDCommand("SELECT count(1) cnt " + 
+                          "  FROM ddl_differentid_tmp t, dfuncobj_dbt funcobj " +
+                          " WHERE funcobj.t_ID = t.t_ID " +
+                          "   AND NOT (funcobj.t_State IN ("+FUNCOBJ_STATE_REPEAT_ERROR+") AND funcobj.t_ExecCount >= "+MIN_EXEC_COUNT+") " +
+                          "   AND funcobj.t_State NOT IN ("+FUNCOBJ_STATE_MAX_REPEAT+","+FUNCOBJ_STATE_FATAL_ERROR+") "
+                         );
+      ds = cmd.Execute();
+   
+      if(ds.MoveNext())
+        if(int(ds.cnt) == 0) 
+          isNotFinished = false;
+        end;
+   
+        UseProgress(cnt - int(ds.cnt));
+      end;
+   
+      i = i + 1;
+    end;
+   
+    if(isNotFinished)
+      //Остановим все задачи, еще не завершившие выполнение
+      cmd = RSDCommand("UPDATE dfuncobj_dbt " + 
+                       "   SET t_State = " + FUNCOBJ_STATE_MAX_REPEAT + ", " +
+                       "       t_ErrorText = case when t_ErrorText is null then 'Превышено время ожидания funcobj!' else t_ErrorText end " +
+                       " WHERE t_ID IN (SELECT t_ID FROM ddl_differentid_tmp) "
+                      );
+      cmd.Execute();
+    else
+      //Остановим очередные итерации для ошибочных записей, сменив их статус
+      cmd = RSDCommand("UPDATE dfuncobj_dbt " + 
+                       "   SET t_State = "+FUNCOBJ_STATE_MAX_REPEAT +
+                       " WHERE t_State IN ("+FUNCOBJ_STATE_REPEAT_ERROR+","+FUNCOBJ_STATE_FATAL_ERROR+") " +
+                       "   AND t_ID IN (SELECT t_ID FROM ddl_differentid_tmp) "
+                      );
+      cmd.Execute();
+    end;
+    RemProgress();
+   
+    //Формируем протокол
+    FormLog(BegDate);
+   
+    Println("Время окончания смены ТП: " + Time());
+  else
+    Println("Нет подходящих договоров");
+  end;
+
+  SetOutput(NULL, true); 
+  ViewFile(InfoLogFileName); //Выведем лог-файл на экран
+END;
+
+MassChngTariffToInvestor();
+exit(1);

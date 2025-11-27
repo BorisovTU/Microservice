@@ -1,0 +1,307 @@
+/*
+  $Name:         FnsAddClntDbl.mac
+  $Module:       Banking
+  $Description:  Процедура добавления дублеров клиента
+*/
+
+//-----------------------------------------------------------------------------
+//          Автоматизированная банковская система RS-Bank               
+//                 Copyright (c) R-Style Software Lab
+//
+// Подсистема   : Расчетный банк
+//
+// Описание     : Процедура добавления дублеров клиента
+//
+// Программист  : Чукина Т.А.
+//
+// Создан       : 22.02.2018
+//
+//-----------------------------------------------------------------------------
+
+import oralib, likepy, MesInter, PaymInter, PSInter, "bnk_common.mac", "bnk_ptlib.mac",
+       "bnk_dttmfrmt.mac";
+
+private class (PSRepMap) TPartyMap(p_ClientList : TArray)
+  InitPSRepMap(V_INTEGER);
+
+  private var 
+    ClientList = p_ClientList;
+
+  macro Add(PartyID : integer) : bool
+    return _extObj.Add(PartyID, PartyID);
+  end;
+
+  macro destructor
+    var HasElements : bool = First();
+    while(HasElements)
+      ClientList[ ClientList.size ] = Key();
+      HasElements = Next();
+    end;
+  end;
+end;
+
+private macro NeedProbableDoublers : bool
+  var RegPath : string = "PS\\СООБЩЕНИЯ ФНС\\ДУБЛИ КЛИЕНТОВ\\Предполагаемые_Дублеры";
+  var NeedProbDoubler : bool = Bnk_GetRegistryValue(RegPath, V_BOOL, false);
+
+  return NeedProbDoubler;
+end;
+
+// Поиск субъекта оригинала
+private macro GetMainParty(party) : integer
+  var PrimPartyID : integer = 0;
+
+  var NeedProbDoubler : bool = NeedProbableDoublers();
+  RECORD party1(party);
+  if(party.IsDoubler or (NeedProbDoubler and party.IsProbDoubler))
+    if(ПолучитьСубъекта(party.MainPartyID, party1) == 0)
+      PrimPartyID = GetMainParty(party1);
+    else
+      RunError("Не найден субъект с ИД=" + party.MainPartyID);
+    end;
+  else
+    PrimPartyID = party.PartyID;
+  end;
+
+  Bnk_ToRSTrace("GetMainParty", "Result", "PrimPartyID=" + PrimPartyID);
+  return PrimPartyID;
+end;
+
+// Поиск субъектов дублеров
+private macro GetDblParties(PartyID : integer, PartyList : TPartyMap)
+  Bnk_ToRSTrace("GetDblParties", "Begin", "ClientList.Size=" + PartyList.Size);
+
+  if( not PartyList.Exists(PartyID) )
+    PartyList.Add(PartyID);
+  end;
+
+  var NeedProbDoubler : bool = NeedProbableDoublers();
+  var rs = execSQLselectPrm
+  ( "Select t_PartyID "
+    "  from dparty_dbt "
+    " start with t_PartyID = :MainPartyID "
+    " connect by "
+    "   t_MainPartyID = prior t_PartyID and "
+    "   ( t_IsDoubler = 'X'" + 
+    IfThenElse(NeedProbDoubler, " or t_IsProbDoubler = 'X'", "") + 
+    "   ) ",
+    SQLParam("MainPartyID", PartyID)
+  );
+
+  while(rs and rs.moveNext())
+    PartyID = rs.value("t_PartyID");
+
+    if( not PartyList.Exists(PartyID) )
+      Bnk_ToRSTrace("GetDblParties", "AddParty", "Add doubler to ClientList: PartyID=" + PartyID);
+      PartyList.Add(PartyID);
+    end;
+  end;
+
+  Bnk_ToRSTrace("GetDblParties", "End", "ClientList.Size=" + PartyList.Size);
+end;
+
+// Значение настройки PS\СООБЩЕНИЯ ФНС\ДУБЛИ КЛИЕНТОВ\...
+private macro IsSet(RegName : string, DefaultVal : bool) : bool
+  var Path : string = "PS\\СООБЩЕНИЯ ФНС\\ДУБЛИ КЛИЕНТОВ\\" + RegName;
+
+  var Result : bool = Bnk_GetRegistryValue(Path, V_BOOL, DefaultVal);
+
+  return Result;
+end;
+
+// Определить необходимость автоматического добавления дублеров в зависимости от типа клиента
+private macro NeedAutoAddDbl(ClientType : integer) : bool
+  var NeedAdd : bool = false;
+
+  if  ( (ClientType == RO_CLIENTTYPE_INST) and IsSet("Включать_Дубли_Организация", false) )
+    NeedAdd = true;
+  elif( (ClientType == RO_CLIENTTYPE_PERSN_EMPLOYER) and IsSet("Включать_Дубли_ИП", false) )
+    NeedAdd = true;
+  elif( (ClientType == RO_CLIENTTYPE_PERSN) and IsSet("Включать_Дубли_ФИЗЛИЦО", false) )
+    NeedAdd = true;
+  end;
+
+  Bnk_ToRSTrace("NeedAutoAddDbl", "Result", "need to add doublers automatically: " + string(NeedAdd));
+  return NeedAdd;
+end;
+
+private macro ЯвляетсяИП(PersonID : integer) : bool
+  var IsIP : bool = false;
+
+  if( IsIndividualEmployer(PersonID) )
+    IsIP = true;
+  else
+    var AttrID : integer = GetPartyMainAttr_PartyType(PersonID);
+    if( InList( AttrID, PARTY_ATTR_PTTYPE_NOTARIUS,
+                        PARTY_ATTR_PTTYPE_ADVOCAT,
+                        PARTY_ATTR_PTTYPE_KFH,
+                        PARTY_ATTR_PTTYPE_MANAGPARTNER )
+      )
+      IsIP = true;
+    end;
+  end;
+
+  return IsIP;
+end;
+
+private macro NeedExcludeDoubler
+( DoublerID : integer, 
+  ClientType : integer,
+  ClientID : integer, 
+  BeginDate : date, // м.б. null
+  EndDate : date // м.б. null
+)
+  var NeedExclude : bool = false;
+
+  RECORD party(party);
+  if( not NeedExclude and (BeginDate != null) and (EndDate != null) and 
+      IsSet("Исключать_Закрытых", true) and (DoublerID != ClientID)
+    )
+    if(ПолучитьСубъекта(DoublerID, party) == 0)
+      if( (party.Locked == "X") and (party.Change_Date < BeginDate) )
+        NeedExclude = true;
+
+        Bnk_ToRSTrace( "NeedExcludeDoubler", "Exclude", 
+                       "PartyID=" + DoublerID + ", Locked='X', Change_Date=" + 
+                       DDpMMpYYYY(party.Change_Date) + ", BeginDate=" + DDpMMpYYYY(BeginDate)
+                     );
+      end;
+    else
+      RunError("Не найден субъект с ИД=" + DoublerID);
+    end;
+  end;
+
+  if( not NeedExclude and (ClientType == RO_CLIENTTYPE_PERSN_EMPLOYER) and
+      IsSet("Исключать_ФИЗЛИЦ_Для_ИП", true)
+    )
+    if(not ЯвляетсяИП(DoublerID))
+      NeedExclude = true;
+
+      Bnk_ToRSTrace( "NeedExcludeDoubler", "Exclude", 
+                     "PartyID=" + DoublerID + ", is not an employer, ClientType is " + 
+                     "EMPLOYER"
+                   );
+    end;
+  end;
+
+  if( not NeedExclude and (ClientType == RO_CLIENTTYPE_PERSN) and
+      IsSet("Исключать_ИП_Для_ФИЗЛИЦА", true)
+    )
+    if(ЯвляетсяИП(DoublerID))
+      NeedExclude = true;
+
+      Bnk_ToRSTrace( "NeedExcludeDoubler", "Exclude", 
+                     "PartyID=" + DoublerID + ", is an employer, ClientType is " + 
+                     "PERSN"
+                   );
+    end;
+  end;
+
+  return NeedExclude;
+end;
+
+private macro ExcludeUnnecessaryClients
+( ClientList : TPartyMap, 
+  ClientType : integer,
+  ClientID : integer, 
+  BeginDate : date, // м.б. null
+  EndDate : date // м.б. null
+)
+  Bnk_ToRSTrace("ExcludeUnnecessaryClients", "Begin", "ClientList.Size=" + ClientList.Size);
+
+  var ToDelete : TArray = TArray();// массив PartyID
+  var PartyID : integer = 0;
+
+  var HasElements : bool = ClientList.First();
+  while(HasElements)
+    PartyID = ClientList.Value;
+
+    if( NeedExcludeDoubler(PartyID, ClientType, ClientID, BeginDate, EndDate) )
+      ToDelete[ ToDelete.size ] = PartyID;
+    end;
+
+    HasElements = ClientList.Next();
+  end;
+
+  for(PartyID, ToDelete)
+    if(not ClientList.Remove(PartyID))
+      RunError("Ошибка при удалении элемента из списка дублеров");
+    end;
+  end;
+
+  Bnk_ToRSTrace("ExcludeUnnecessaryClients", "End", "ClientList.Size=" + ClientList.Size);
+end;
+
+// Процедура добавления дублеров клиента (Основной алгоритм)
+// Макрофункция вызывается из закрытого кода. 
+// При изменении сигнатуры нужно менять сишник
+macro FnsFillClientDoublers
+( ClientID : @integer,
+  ClientArray : TArray,
+  ClientType : integer,
+  BeginDate : date, // м.б. null
+  EndDate : date // м.б. null
+) : bool
+
+  Bnk_ToRSTrace("FnsFillClientDoublers", "Begin", "ClientID=" + ClientID + ", ClientType=" + ClientType);
+  var ClientList : TPartyMap = TPartyMap(ClientArray);
+  var FinishProc : bool = false; // завершить процедуру
+
+  if(not FinishProc)
+    ClientList.Add(ClientID);
+
+    if( not NeedAutoAddDbl(ClientType) )
+      FinishProc = true;
+    end;
+  end;
+
+  RECORD party(party);
+
+  if(not FinishProc)
+    if(ПолучитьСубъекта(ClientID, party) != 0)
+      RunError("Не найден субъект с ИД=" + ClientID);
+    end;
+
+    if(not (party.HasDoubler or party.IsDoubler or party.IsProbDoubler))
+      Bnk_ToRSTrace("FnsFillClientDoublers", "DblFlags", "Client doesn't have any doublers");
+      FinishProc = true;
+    end;
+  end;
+
+  if(not FinishProc)
+    var PrimPartyID : integer = GetMainParty(party);
+
+    GetDblParties(PrimPartyID, ClientList);
+
+    // Обработать получившийся список
+    if(ClientList.Size == 1)
+      FinishProc = true;
+    else
+      ExcludeUnnecessaryClients(ClientList, ClientType, ClientID, BeginDate, EndDate);
+    end;
+  end;
+
+  if(not FinishProc and (ClientList.Size == 0))
+    ClientList.Add(ClientID);
+    Bnk_ToRSTrace("FnsFillClientDoublers", "", "Add ClientID to ClientList");
+  end;
+  
+  if(not FinishProc and not ClientList.Exists(ClientID))
+    if(ClientList.First() == false)
+      RunError("Список дублеров клиента пуст");
+    end;
+
+    ClientID = ClientList.Value;
+    Bnk_ToRSTrace("FnsFillClientDoublers", "", "Set ClientID=" + ClientID);
+  end;
+
+  Bnk_ToRSTrace("FnsFillClientDoublers", "End", "ClientID=" + ClientID + ", ClientList.Size=" + ClientList.Size);
+  return true;
+
+OnError(er)
+  var ErrMsg : string = RsbGetErrorEx(er);
+  Bnk_ToRSTrace("FnsFillClientDoublers", "OnError", "Err: " + ErrMsg);
+  msgbox(ErrMsg);
+
+  return false;
+end;

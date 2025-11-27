@@ -1,0 +1,7 @@
+--Добавление примечания
+BEGIN
+  INSERT INTO DNOTEKIND_DBT(T_OBJECTTYPE, T_NOTEKIND, T_NOTETYPE, T_NAME, T_KEEPOLDVALUES, T_NOTINUSE, T_ISPROTECTED,
+                            T_MAXLEN, T_NOTUSEFIELDUSE, T_MACRONAME, T_DECPL, T_ISPROGONLY)
+              VALUES(117,102,25,'Сумма выплаты в национальной валюте',CHR(0),CHR(0),CHR(0),0,CHR(0),CHR(1),0,CHR(0));
+END;
+/

@@ -1,0 +1,894 @@
+/**
+  @file: 		mac\dlng\secur\nptxwrt010.mac
+  @brief: 		Ценные бумаги
+  Операция списания и зачисления денежных средств. Шаг инициализации
+
+  # menu 
+  - БО ЦБ\Сервисные операции\Операция списания и зачисления денежных средств
+  
+  # tag
+  - functional_block: Проводки
+  - functional_block: Операция списания и зачисления денежных средств
+  - functional_block: Сервисные операции
+  - code_type: GUI
+  
+  # changelog
+  |date       |author         |tasks                                       |note                                                        
+  |-----------|---------------|--------------------------------------------|-------------------------------------------------------------
+  |2025.07.27 |Велигжанин А.В.|DEF-96547                                   | CheckLegalTime().CheckReg(), получение настройки через
+  |           |               |                                            | IT_RS_INTERFACE.get_parm_varchar_path(), т.к.
+  |           |               |                                            | GetRegistryValue() работает неверно (непонятно почему)
+  |2025.07.24 |Велигжанин А.В.|BOSS-9380_BOSS-10126                        | CheckLegalTime(), Проверка времени через настройку ОКОНЧАНИЕ ПОДКРЕПЛЕНИЯ
+  |2025.07.24 |Велигжанин А.В.|BOSS-9380_BOSS-10126                        | CheckLegalTime(), Проверка на пополнение ЮЛ в вечернее время (после 19:00)
+
+*/
+
+import InsCarryDoc, "sp_categ.mac", "sp_car.mac", RsbDataSet, Enroll_Class, "nptxwrt_func.mac";
+import "Refill_Class.mac";
+import "RegvalReader.mac";
+import "cblogger2.mac";
+
+private var logger = LoggerFactory().NewItLog("NPTXWRT010.MAC").WithElapsedTime().GetLogger();
+
+private const V_SPECVAL = 26;
+
+private macro Error( ErrStr:STRING ):INTEGER
+  DL_NPTX_PutMsg( ErrStr );
+  MsgBox( ErrStr );
+  return 1;
+end;
+
+private macro getCurName(fiid:integer):String
+  var ccy:string = "";
+  var rows = execSQLselect("select t_ccy from dfininstr_dbt where t_fiid = :fiid", makeArray(SqlParam("fiid", fiid)));
+
+  if (rows.MoveNext())
+    ccy = rows.value("t_ccy");
+  end;
+
+  return ccy;
+end;
+
+private macro SetReqStateReject(operationID:integer)
+  ExecStoredFunc("nontrading_orders_utils.set_status_reject", V_UNDEF, MakeArray(SqlParam("p_nptxop_id", operationID)));
+End;
+
+private macro SetReqError(operationID:integer, errorID:integer)
+  ExecStoredFunc("nontrading_orders_utils.set_error_if_not_error", V_UNDEF, MakeArray(SqlParam("p_nptxop_id", operationID),
+                                                                                      SqlParam("p_error_id",  errorID)));
+End;
+
+private macro nvl(value, defaultValue)
+  if ( (ValType(value) == 26) or (value == null))
+    return defaultValue;
+  end;
+  return value;
+end;
+
+private class ErrorStruct(_message:string, _type:integer, _isNeedNotify:bool)
+  const STOP_OPERATION:integer  = 0;
+  const CLOSE_OPERATION:integer = 1;
+  var message:string = _message;
+  var type:integer = _type;
+  var isNeedNotify:bool = nvl(_isNeedNotify, true);
+end;
+
+//абстрактный класс, который служит лишь шаблоном.
+//Другие классы с проверками его "реализуют"
+private class CheckerTemplate()
+  macro Check(nptxop):ErrorStruct
+    return "";
+  end;
+end;
+
+private class CheckHandler()
+  private var checkList = Tarray(); //массив из наследников класса CheckerTemplate
+
+  macro Add(checker:CheckerTemplate)
+    checkList(checkList.Size) = checker;
+  end;
+
+  macro CheckAll(nptxop):ErrorStruct
+    var checker:CheckerTemplate;
+    var result:ErrorStruct;
+    for (checker, checkList)
+      result = checker.Check(nptxop);
+      if (result != null)
+        break;
+      end;
+    end;
+
+    return result;
+  end;
+end;
+
+private macro IntNvl(value, defaultValue)
+  var valueType = ValType(value);
+  
+  if (valueType == V_INTEGER)
+    return value;
+  elif ((valueType == V_UNDEF) or (valueType == V_SPECVAL))
+    return defaultValue;
+  else
+    RunError("IntNvl Неверный тип (" + String(valueType) + ") входного параметра");
+  end;
+end;
+
+private macro StrNvl(value, defaultValue)
+  var valueType = ValType(value);
+  
+  if (valueType == V_STRING)
+    return value;
+  elif ((valueType == V_UNDEF) or (valueType == V_SPECVAL))
+    return defaultValue;
+  else
+    RunError("StrNvl Неверный тип (" + String(valueType) + ") входного параметра");
+  end;
+end;
+
+private class (CheckerTemplate) CheckRefillPayment()
+
+  private macro CheckRefillPayment(nptxop, error:@string)
+    var sql, cmd, rs;
+    var sql2, cmd2, rs2;
+    var res = true;
+    sql = String("select 1                                                               \n",
+                 "  from dparty_dbt p, dsfcontr_dbt sf, ddlcontrmp_dbt mp                \n",
+                 " where p.t_partyid = :pclientid and p.t_legalform = "+PTLEGF_INST+"    \n",
+                 "   and sf.t_id = :pcontractid and sf.t_servkind = "+PTSK_STOCKDL+"     \n", 
+                 "   and sf.t_servkindsub = 8                                            \n",
+                 "   and sf.t_id = mp.t_sfcontrid                                        \n",
+                 "   and not NVL(mp.t_rcodetks, CHR(1)) in ('" + C_RCODE_NONSEPARATE + "', '" + C_RCODE_SEPARATE + "', CHR(1)) \n",
+                 "   and exists (select 1 from UPMBISCOTTO_DBT u                         \n",
+                 "                where t_dockind = 4607 and  t_pmid = :pid)              ");
+    cmd = RSDCommand(sql);
+    cmd.AddParam("pclientid", RSDBP_IN, nptxop.client);
+    cmd.AddParam("pcontractid", RSDBP_IN, nptxop.contract);
+    cmd.AddParam("pid", RSDBP_IN, nptxop.id);
+    rs = RSDRecordSet(cmd);
+    if (rs.movenext() ) // подходящий договор и клиент
+       sql2 = String("select * from UNPTXOP_PAYMENT_LINK_DBT \n",
+                     " where t_nptxopid = :pid \n",
+                     " order by t_refillid desc"); 
+       cmd2 = RSDCommand(sql2);
+       cmd2.Addparam("pid", RSDBP_IN, nptxop.id);
+       rs2 = RSDRecordSet(cmd2);
+       if (rs2.movenext())
+          var linkError = StrNvl(rs2.value("t_errortext"), "");
+
+          if (IntNvl(rs2.value("t_paymentid"), 0) > 0)
+             if (IntNvl(rs2.value("t_eventid"), 0) > 0)
+                if (IntNvl(rs2.value("t_responseid"), 0) > 0)
+                   res = true;
+                   error = "";
+                else
+                   res = false;
+                   error = "Не получен ответ";
+                end;
+             else
+                res = false;
+                error = "Не создано событие выгрузки";
+             end;
+          else
+             res = false;
+             error = "Не создан платеж подкрепления";
+          end;
+          
+          if ((StrLen(error) > 0) and (StrLen(linkError) > 0))
+            error = error + "\n" + linkError;
+          end;
+       else 
+          res = false;
+          error = "Не создан платеж подкрепления";
+       end;
+    end;
+
+    return res;
+  end;
+
+  //BOSS-1702 не начинаем выполнение операции, пока не получен ответ по выгруженному платежу покрепления в НКЦ
+  macro Check(nptxop):ErrorStruct
+    var err1702;
+
+    //Только для сабвида операии == 10
+    if (not ((nptxop.DocKind == 4607) and (nptxop.KIND_OPERATION == 2037) and  (nptxop.SUBKIND_OPERATION == 10)) )
+      return null;
+    end;
+    var stat1702 = ExecMacroFile("Refill_Class.mac", "IsRegAutoRefillOn", err1702);
+
+    if (not stat1702) //выключена настройка
+      return null;
+    end;
+
+    if (not CheckRefillPayment(nptxop, @err1702))
+      err1702 = "Ошибка подкрепления в НКЦ для ЮЛ \n " + err1702;
+      if (not GetTRUE (false, err1702 + "\n Продолжить выполнение?"))
+        return ErrorStruct(err1702, ErrorStruct.STOP_OPERATION, false);
+      end;
+    end;
+
+    return null;
+  end;
+END;
+
+//dan BIQ-12191 При исполнении операции списания необходимо проверять наличие поручения клиента на операцию.
+private class (CheckerTemplate) CheckSpGround()
+
+  macro Check(nptxop):ErrorStruct
+    var sql, cmd, ds;
+
+    //только для сабвида операции == 20
+    if (not ((nptxop.DocKind == 4607) and (nptxop.KIND_OPERATION == 2037) and  (nptxop.SUBKIND_OPERATION == 20)) )
+      return null;
+    end;
+
+    sql = String( "select spground.*\n"
+                 ,"  from dnptxop_dbt nptx, dspgrdoc_dbt spgrdoc, dspground_dbt spground\n" 
+                 ," where nptx.t_id = :opid\n"
+                 ,"   and spgrdoc.t_sourcedockind = nptx.t_dockind\n"
+                 ,"   and spgrdoc.t_sourcedocid = nptx.t_id\n"
+                 ,"   and spground.t_spgroundid = spgrdoc.t_spgroundid\n"
+                 ,"   and spground.t_kind = 251");
+    cmd = DL_RSDCommand();
+    cmd.AddParam(nptxop.ID);
+    ds = cmd.Execute(sql);
+
+    if(not ds.MoveNext)
+      return ErrorStruct("Отсутствует документ-основание для операции. Выполнение невозможно.", ErrorStruct.STOP_OPERATION);
+    end;
+
+    return null;
+  end;
+end;
+
+private class (CheckerTemplate) CheckDateAndTime()
+
+  private macro CorrectOperationTime(nptxOpID: Integer, newTime: Time): Bool
+    var timeStr: String = StrSubst(String(newTime), " ", "0");
+    var query = "UPDATE dnptxop_dbt SET t_time = to_date('01.01.0001 " + timeStr + "', 'DD.MM.YYYY HH24:MI:SS') " + 
+                 "WHERE t_id = " + String(nptxOpID);
+                 
+    return (Opr_ExecSqlQuery(query, "") == 0);
+  end;
+
+  macro Check(nptxop):ErrorStruct
+
+    if (nptxop.SubKind_Operation != DL_NPTXOP_WRTKIND_WRTOFF)
+      return null;
+    end;
+
+    if (nptxop.operDate > Date())
+      return ErrorStruct("Запрещено выполнение операции будущей датой.", ErrorStruct.STOP_OPERATION);
+    elif ( (nptxop.operDate == Date()) and (nptxop.time > Time()) )
+      if (not CorrectOperationTime(nptxop.id, Time()) )
+        return ErrorStruct("Ошибка корректировки времени операции.", ErrorStruct.STOP_OPERATION);
+      end;
+    end;
+
+    return null;
+  end;
+end;
+
+private class (CheckerTemplate) CheckRejectNote(_rejectNoteValue:string, _categ:c_categ)
+  var rejectNoteValue = _rejectNoteValue;
+  var categ = _categ;
+
+  macro Check(nptxop):ErrorStruct
+    if ((nptxop.SubKind_Operation == DL_NPTXOP_WRTKIND_WRTOFF) or (nptxop.SubKind_Operation == DL_NPTXOP_WRTKIND_TBSABC))
+      /*dan проверка отказа в исполнении*/
+      var v_fail; 
+      v_fail = rejectNoteValue;
+      if ((v_fail == null) or (v_fail == nullval) or (v_fail == strfor(1)) or (v_fail == strfor(0)) or (v_fail == "01.01.0001"))
+        v_fail = "";
+      end;         
+
+      v_fail = strsubst(v_fail, strfor(0), "");
+      v_fail = strsubst(v_fail, strfor(1), "");
+      v_fail = strsubst(v_fail, strfor(7), "");
+      v_fail = strsubst(v_fail, strfor(9), "");
+      v_fail = strsubst(v_fail, strfor(10), "");
+      v_fail = strsubst(v_fail, strfor(13), "");
+      v_fail = strsubst(v_fail, " ", "");
+      v_fail = trim(v_fail);  
+
+      if (strlen(v_fail) > 0)
+        return ErrorStruct(rejectNoteValue, ErrorStruct.CLOSE_OPERATION);
+      end;
+    elif (nptxop.SubKind_Operation == DL_NPTXOP_WRTKIND_ENROL) 
+      if ( (not categ.Allowed) and (StrLen(rejectNoteValue) > 1) )
+        return ErrorStruct(rejectNoteValue, ErrorStruct.CLOSE_OPERATION);
+      end;
+    end;
+
+    return null;
+  end;
+end;
+
+/**
+  @brief CheckAccRest - проверка наличия доступного остатка на счете в СОФР
+*/
+private class (CheckerTemplate) CheckAccRest()
+
+  macro Check(nptxop):ErrorStruct
+    if ((nptxop.SubKind_Operation == DL_NPTXOP_WRTKIND_WRTOFF) or (nptxop.SubKind_Operation == DL_NPTXOP_WRTKIND_TBSABC))
+      var accRest = GetAccRest(nptxop.Account, nptxop.Currency, nptxop.OperDate);
+      if (accRest < nptxop.outsum) 
+        var msg = "Недостаточно средств на счёте";
+        var msgBoxResult = MsgBoxEx("Внимание! " + msg +
+                                    "|Нажмите \"Да\", чтобы продолжить операцию" +
+                                    "|Нажмите \"Нет\", чтобы выполнить отказ от исполнения" +
+                                    "|Нажмите \"Отмена\", чтобы прервать операцию",
+                                    MB_YES + MB_NO + MB_CANCEL, IND_CANCEL);
+        if (msgBoxResult == IND_CANCEL)
+          return ErrorStruct(msg, ErrorStruct.STOP_OPERATION, false);
+        end;
+
+        if (msgBoxResult == IND_NO)
+          SetReqError(nptxop.ID, 7);
+          return ErrorStruct(msg, ErrorStruct.CLOSE_OPERATION, false);
+        end;
+      end;
+
+      if ((accRest == 0) and (nptxop.outsum == 0))
+        return ErrorStruct("Списание нулевого количества запрещено", ErrorStruct.CLOSE_OPERATION);
+      end;
+    end;
+
+    return null;
+  end;
+end;
+
+private class (CheckerTemplate) CheckIISDoc()
+
+  /**
+   @brief Проверка, является ли договор ИИС
+   @param[in] sfContrID идентификатор субдоговора
+   @return true - является, false - не является
+  */  
+  private macro CheckContrIIS(sfContrID:integer):bool
+     var query = "select RSI_NPTO.CheckContrIIS(?) as t_IIS from dual";
+     var queryCmd = DL_RSDCommand(query);
+     queryCmd.AddParam(sfContrID);
+     var queryDS = queryCmd.Execute();
+
+     return queryDS.MoveNext() and (queryDS.IIS == 1);
+  end;
+
+  /**
+   @brief Проверка, является ли договор ИИС с типом ИИС-III
+   @param[in] sfContrID идентификатор субдоговора
+   @return true - является, false - не является
+  */     
+  private macro CheckContrIIS3(sfContrID:integer):bool
+     var query = "select RSI_NPTO.CheckContrIIS3(?) as t_IIS3 from dual";
+     var queryCmd = DL_RSDCommand(query);
+     queryCmd.AddParam(sfContrID);
+     var queryDS = queryCmd.Execute();
+
+     return queryDS.MoveNext() and (queryDS.IIS3 == 1);
+  end;
+
+  /**
+   @brief Проверка наличия закрытых операций зачисления ц/б по всем субдоговорам с меньшей датой, чем у вводимой опрации
+   @param[in] SfContrID идентификатор субдоговора, по которому пытаемся провести зачисление д/с
+   @param[in] OperDate дата вводимой операции зачисления д/с
+   @return true - операции найдены, false - операции не найдены
+  */                    
+  private macro IsExistOperationAvrWrtIn(SfContrID:integer, OperDate:date):bool
+     var query = "select RSI_NPTO.IsExistOperationAvrWrtIn(?, ?) as cnt from dual";
+     var queryCmd = DL_RSDCommand(query);
+     queryCmd.AddParam(SfContrID);
+     queryCmd.AddParam(OperDate);
+     var queryDS = queryCmd.Execute();
+
+     return queryDS.MoveNext() and (queryDS.cnt == 1);
+  end;
+
+  /**
+   @brief Проверка наличия закрытых операций зачисления денежных средств по всем субдоговорам с меньшей датой, чем у вводимой опрации
+   @param[in] SfContrID идентификатор субдоговора, по которому пытаемся провести зачисление д/с
+   @param[in] OperDate дата вводимой операции зачисления д/с
+   @return true - операции найдены, false - операции не найдены
+  */                    
+  private macro IsExistOperationEnrol(SfContrID:integer, OperDate:date):bool
+     var query = "select RSI_NPTO.IsExistOperationEnrol(?, ?) as cnt from dual";
+     var queryCmd = DL_RSDCommand(query);
+     queryCmd.AddParam(SfContrID);
+     queryCmd.AddParam(OperDate);
+     var queryDS = queryCmd.Execute();
+
+     return queryDS.MoveNext() and (queryDS.cnt == 1);
+  end;
+
+  private macro AddMonths(StartDate:Date, Count:Integer)
+    var ResDate;
+    var day, month, year;
+    var EndDay;
+
+    DateSplit(StartDate, day, month, year);
+    month = month + Count;
+    while(month > 12)
+      month = month - 12;
+      year = year + 1;
+    end;
+
+    if((month == 1) or (month == 3) or (month == 5) or (month == 7) or (month == 8) or (month == 10) or (month == 12))
+      EndDay = 31;
+    elif((month == 4) or (month == 6) or (month == 9) or (month == 11))
+      EndDay = 30;
+    elif(month == 2)
+      if(Double(year) / 4.0 - Int(year / 4) == 0.0)
+        EndDay = 29;
+      else
+        EndDay = 28;
+      end;
+    end;
+
+    if(day > EndDay)
+       day = EndDay;
+    end;
+
+    return Date(day, month, year);
+  end;
+
+  private macro GetDtBalance(NptxopID:integer)
+    var query, cmd, DataSet;
+    var DtBalance = "";
+
+    query =   " select t_DebetAccount "
+            + "   from USR_ACC306ENROLL_DBT "
+            + "  where t_NptxopID = ? ";
+
+    cmd = DL_RSDCommand(query);
+
+    cmd.AddParam(NptxopID);
+
+    DataSet = cmd.Execute();
+    if(DataSet.moveNext())
+      DtBalance = substr(DataSet.DebetAccount, 1, 5);
+    end;  
+
+    return DtBalance;
+  end;
+
+  macro Check(nptxop):ErrorStruct
+    var MaxSumIIS = 0;
+    var DtBalance = GetDtBalance(nptxop.ID);
+    var err = 0;
+    var mes = "";
+    var errStruct:ErrorStruct = null;
+    var QueryInWrt = "";
+    var year;
+
+    // Проверяется необходимость планирования шага "Возврат ДС"
+    if(CheckContrIIS(nptxop.Contract))
+      if(nptxop.SubKind_Operation == DL_NPTXOP_WRTKIND_ENROL)
+        if(not CheckContrIIS3(nptxop.Contract))
+          GetRegistryValue("COMMON\\НДФЛ\\ПРЕДЕЛЬНАЯ СУММА ПО ИИС", V_INTEGER, MaxSumIIS, err);
+          if((nptxop.IIS != SET_CHAR) and (DtBalance != "47422"))
+            QueryInWrt = "select nvl(" +
+                         "             sum(" +
+                         "                   case" +
+                         "                      when nptxop.t_IIS = 'X'" +
+                         "                      then nptxop.t_CurrentYear_Sum " +
+                         "                      else rsb_fiinstr.ConvSum(nptxop.t_OutSum, nptxop.t_Currency, 0, nptxop.t_OperDate)" +
+                         "                   end" +
+                         "                )" +
+                         "       , 0) as t_Sum" +
+                         " from dnptxop_dbt nptxop, doproper_dbt oproper" +
+                         " where (" +
+                         "          (" +
+                         "             not exists(select 1 from ddlcontrmp_dbt where t_SfContrID = ?)" +
+                         "             and nptxop.t_Contract = ?" +
+                         "          )" +
+                         "          or " +
+                         "          (" +
+                         "             nptxop.t_Contract in (" +
+                         "                                     select /*+ NO_USE_NL(DLCONTRMP2) */ dlcontrmp2.t_SfContrID+ 0" +/*CHVA 525490*/
+                         "                                     from ddlcontrmp_dbt dlcontrmp1, ddlcontrmp_dbt dlcontrmp2" +
+                         "                                     where dlcontrmp1.t_SfContrID = ?" +
+                         "                                       and dlcontrmp2.t_DlContrID = dlcontrmp1.t_DlContrID" +
+                         "                                  )" +
+                         "          )" +
+                         "       )" +
+                         "   and nptxop.t_client = ?  " + 
+                         "   and nptxop.t_Kind_Operation = 2037" +
+                         "   and nptxop.t_SubKind_Operation = 10" +
+                         "   and extract(year from nptxop.t_OperDate) = ?" +
+                         "   and oproper.t_DocumentID = LPAD(nptxop.t_id, 34, '0')" +
+                         "   and oproper.t_DocKind = nptxop.t_DocKind" +
+                         "   and (" +
+                         "          exists(select 1 from ddlrq_dbt dlrq where dlrq.t_ID_Operation = oproper.t_ID_Operation and dlrq.t_DocKind = nptxop.t_DocKind)" +
+                         "          or exists(select 1 from dpmpaym_dbt pmpaym where pmpaym.t_DocumentID = nptxop.t_ID and pmpaym.t_DocKind = nptxop.t_DocKind)" +
+                         "       )"+
+                         "   AND not EXISTS (SELECT 1 FROM ddlrq_dbt dlrq  WHERE     dlrq.t_ID_Operation = oproper.t_ID_Operation  AND dlrq.t_DocKind = nptxop.t_DocKind and dlrq.T_TYPE = 15 ) " + /*PNV 533945 не учитываем операции с типом ТО - возврат средств*/
+                         "   and not Exists(select 1 from USR_ACC306ENROLL_DBT ua where ua.t_NptxopID = nptxop.t_ID and substr(ua.t_DebetAccount, 1, 5) = '47422') ";
+
+            var CmdInWrt = DL_RSDCommand(QueryInWrt);
+            CmdInWrt.AddParam(nptxop.Contract);
+            CmdInWrt.AddParam(nptxop.Contract);
+            CmdInWrt.AddParam(nptxop.Contract);
+            CmdInWrt.AddParam(nptxop.Client);
+
+            DateSplit(nptxop.OperDate, NULL, NULL, year);
+
+            CmdInWrt.AddParam(year);
+            var DSInWrt = CmdInWrt.Execute();
+
+            if(DSInWrt.MoveNext() and (nptxop.OutSum + DSInWrt.Sum > MaxSumIIS))
+            errStruct = ErrorStruct("Сумма зачисления на индивидуальный инвестиционный счет в течение " + string(year) + " года с учетом зачисляемой суммы равна " + string((nptxop.OutSum + DSInWrt.Sum):0:2) + ", что превышает предельную сумму, равную " + string(MaxSumIIS) + ". Выполнение операции запрещено", ErrorStruct.CLOSE_OPERATION);
+            end;
+          elif((nptxop.IIS == SET_CHAR) and (nptxop.CurrentYear_Sum > MaxSumIIS))
+            errStruct = ErrorStruct("Сумма зачисления на счет ИИС не может превышать предельную сумму, равную " + string(MaxSumIIS:0:2) + " рублей", ErrorStruct.CLOSE_OPERATION);
+          end;
+
+        elif(nptxop.IIS == SET_CHAR) // Зачисления денежных средств по договору ИИС с типом "ИИС-III" с флагом "Передача активов по ИИС"
+          if(IsExistOperationEnrol(nptxop.Contract, nptxop.OperDate) or IsExistOperationAvrWrtIn(nptxop.Contract, nptxop.OperDate))
+            mes = "На данном индивидуальном инвестиционном счете уже учитываются активы.";
+            if (not GetTRUE(true, mes + "\nВы уверены что хотите продолжить?"))
+              errStruct = ErrorStruct(mes, ErrorStruct.CLOSE_OPERATION, false);
+            end;
+          end;
+        end;
+
+        if(nptxop.Currency != NATCUR)
+          if (DtBalance != "47422") // BIQ-7910 зачисление дохода может быть в валюте
+            errStruct = ErrorStruct("Пополнение договора ИИС в валюте отличной от рублей", ErrorStruct.CLOSE_OPERATION);
+          end;
+        end;
+      elif(nptxop.SubKind_Operation == DL_NPTXOP_WRTKIND_WRTOFF)
+
+        var ContrQuery = "select sfcontr.t_DateBegin" +
+                         " from dsfcontr_dbt sfcontr" +
+                         " where sfcontr.t_ID = ?";
+
+        var ContrCmd = DL_RSDCommand(ContrQuery);
+        ContrCmd.AddParam(nptxop.Contract);
+        var ContrDS = ContrCmd.Execute();
+
+        if(ContrDS.MoveNext())
+          var DateContr:date = Date(ContrDS.DateBegin);
+          var DateDiff:date = DateAfterCalenMonths(DateContr, 12*3);
+
+          if(CheckContrIIS3(nptxop.Contract))
+            var cmd, ds;
+
+            cmd = DL_RSDCommand("SELECT dl.t_IISTransformDate "
+                               +"  FROM ddlcontr_dbt dl, ddlcontrmp_dbt mp "
+                               +" WHERE dl.t_DlContrID = mp.t_DlContrID "
+                               +"   AND mp.t_SfContrID = ? ");
+            cmd.addParam(nptxop.Contract);
+            ds = cmd.Execute();
+
+            if(ds.MoveNext())
+              if(ds.IISTransformDate != Date(0,0,0))
+                // Дата трансформации ИИС в ИИС-III задана
+                var Date_Transf_Year:integer;
+                DateSplit(ds.IISTransformDate, NULL, NULL, Date_Transf_Year);
+
+                var Date_Open_Contr = DateAfterCalenMonths(Date(1,1,Date_Transf_Year), -12*3);
+                // макс(дата открытия ДО; Date_Transf - 3 года)
+                if(dateContr > Date_Open_Contr)
+                  Date_Open_Contr = DateContr;
+                end;
+
+                dateDiff = DateAfterCalenMonths(Date_Open_Contr, 12*3);
+              else
+                var dateContrYear:integer;
+                DateSplit(dateContr, NULL, NULL, dateContrYear);
+
+                // Дата трансформации ИИС в ИИС-III не задана
+                if((dateContrYear >= 2024) and (dateContrYear <= 2026))
+                  dateDiff = DateAfterCalenMonths(dateContr, 12*5);
+                elif(dateContrYear == 2027)
+                  dateDiff = DateAfterCalenMonths(dateContr, 12*6);
+                elif(dateContrYear == 2028)
+                  dateDiff = DateAfterCalenMonths(dateContr, 12*7);
+                elif(dateContrYear == 2029)
+                  dateDiff = DateAfterCalenMonths(dateContr, 12*8);
+                elif(dateContrYear == 2030)
+                  dateDiff = DateAfterCalenMonths(dateContr, 12*9);
+                end;
+              end;
+            end;
+          end;
+
+          if((DateDiff > nptxop.OperDate) and (nptxop.IIS == UNSET_CHAR))
+            mes = "Не истек минимальный срок договора индивидуального инвестиционного счета.";
+            if (not GetTRUE (true, mes + "\nВы уверены что хотите продолжить?"))
+              errStruct = ErrorStruct(mes, ErrorStruct.CLOSE_OPERATION, false);
+            end;
+          end;
+        end;
+      end;
+    end;
+
+    return errStruct;
+  end;
+end;
+
+private class (CheckerTemplate) CheckDeath()
+
+  PRIVATE MACRO GetDeathClientDate(ClientID)
+    var sql, cmd, DS; 
+    sql = "select t_Death from dpersn_dbt where t_personid = ? ";
+    
+    cmd = DL_RSDCommand(sql);
+    cmd.AddParam(ClientID);
+    
+    DS = cmd.Execute();
+    
+    if(DS.movenext())
+      return DS.Death;
+    end; 
+
+    return ZeroDate;
+  END;
+
+  macro Check(nptxop):ErrorStruct
+    if(nptxop.SubKind_Operation == DL_NPTXOP_WRTKIND_WRTOFF) 
+      if(GetDeathClientDate(nptxop.Client) != ZeroDate)
+        return ErrorStruct("У клиента в анкете заполнена дата смерти", ErrorStruct.CLOSE_OPERATION);
+      end;
+    end;
+    return null;
+  end;
+end;
+
+private class (CheckerTemplate) CheckCurrency()
+
+  macro Check(nptxop):ErrorStruct
+    var isAllowed = ExecStoredFunc("nontrading_orders_read.check_if_cur_allowed", V_INTEGER, MakeArray(SqlParam("p_fiid", nptxop.Currency)));
+    if (not isAllowed)
+      return ErrorStruct("Для валюты " + getCurName(nptxop.Currency) + " не разрешен ввод денежных средств", ErrorStruct.CLOSE_OPERATION);
+    end;
+    return null;
+  end;
+end;
+
+/**
+ @brief 		Класс проверки на пополнение ЮЛ в вечернее время (после 19:00)
+*/
+private class (CheckerTemplate) CheckLegalTime()
+
+  private macro GetLegalForm(nptxop)
+    var sql, cmd, rs;
+    var res: integer = -1;
+    sql = String("SELECT p.t_legalform FROM dparty_dbt p WHERE p.t_partyid = :pclientid");
+    cmd = RSDCommand(sql);
+    cmd.AddParam("pclientid", RSDBP_IN, nptxop.client);
+    rs = RSDRecordSet(cmd);
+    if (rs.movenext() )
+       res = rs.value("t_legalform");
+    end;
+    return res;
+  end;
+
+  private MACRO CheckReg ( p_RegName, p_RegDef )
+    var rs, cmd, str, RegStr = p_RegDef;
+    str = "SELECT IT_RS_INTERFACE.get_parm_varchar_path(?) AS t_val FROM dual";
+
+    cmd = RSDCommand(str);
+    cmd.AddParam("1", RSDBP_IN, p_RegName);
+
+    rs = RSdRecordSet(cmd);
+    if(rs and rs.Movenext)
+      RegStr = rs.value("t_val");
+    end;
+
+    return RegStr;
+  END;
+
+  macro Check(nptxop) : ErrorStruct                                                           
+    var hh, mm, RegVal = CheckReg("РСХБ\\ИНТЕГРАЦИЯ\\НЕТОРГОВЫЕ ПОРУЧЕНИЯ\\ГРАФИК ОБРАБОТКИ\\ОКОНЧАНИЕ ПОДКРЕПЛЕНИЯ", "1930");
+    hh = int(SubStr(RegVal,1,2));
+    mm = int(SubStr(RegVal,3));
+    if( time() < time(hh,mm,0) )
+      // Не вечернее время, проверка проходит
+      return null;
+    elif (not ((nptxop.DocKind == 4607) and (nptxop.KIND_OPERATION == 2037) and  (nptxop.SUBKIND_OPERATION == 10)) )
+      // Не зачисление, проверка проходит
+      return null;
+    elif ( GetLegalForm (nptxop) != PTLEGF_INST )
+      // Не ЮРлицо, проверка проходит
+      return null;
+    elif (not GetTRUE (false, "Пополнение счета ЮЛ в вечернее время. Желаете продолжить?"))
+      return ErrorStruct("Пополнение счета ЮЛ вечером недоступно", ErrorStruct.STOP_OPERATION, false);
+    end;
+
+    return null;
+  end;
+END; // CheckLegalTime
+
+private macro СубъектЮЛ_ИП(partyID):bool
+  var query = "select t.t_legalform, p.t_isemployer "
+            + "  from dparty_dbt t "
+            + "  left join dpersn_dbt p on p.t_personid = t.t_partyid "
+            + " where t.t_partyid = :partyid "
+            + "   and (t.t_legalform = 1 or p.t_isemployer = 'X') ";
+
+  return ExecSqlSelect(query, MakeArray(SqlParam("partyid", partyID))).MoveNext();
+end;
+
+
+  private macro CheckRefill(nptxOpID)
+    var rs, cmd, str, RegStr;
+    str = "SELECT 1 FROM dnptxop_dbt op " +
+          "JOIN dparty_dbt p  ON p.t_partyid = op.t_client " +
+          "JOIN dsfcontr_dbt sf ON sf.t_id = op.t_contract " +
+          "JOIN ddlcontrmp_dbt mp ON mp.t_sfcontrid = sf.t_id " +
+          "WHERE op.t_dockind = 4607 AND op.t_subkind_operation = 10 " +
+          "AND p.t_legalform = 1 " +
+          "AND not NVL(mp.t_rcodetks, CHR(1)) in ('" + C_RCODE_OWN + "', '" + C_RCODE_SEPARATE + "', '" + C_RCODE_NONSEPARATE + "', CHR(1)) " +
+          "AND op.T_ID = ? "; 
+    cmd = RSDCommand(str);
+    cmd.AddParam("1", RSDBP_IN, nptxOpID);
+    rs = RSdRecordSet(cmd);
+    if(rs and rs.Movenext)
+       return true;
+    end;
+    return false;
+  end;
+
+    private MACRO CheckRegBool(p_RegName)
+    var rs, cmd, str, RegStr;
+    str = "SELECT IT_RS_INTERFACE.get_parm_varchar_path(?) AS t_val FROM dual";
+
+    cmd = RSDCommand(str);
+    cmd.AddParam("1", RSDBP_IN, p_RegName);
+
+    rs = RSdRecordSet(cmd);
+    if(rs and rs.Movenext)
+      if(rs.value("t_val") == "X")
+        RegStr = true;
+      else
+        RegStr = false;
+      end;
+    end;
+    return RegStr;
+  END;
+//Сначала собирается массив проверок, которые нужно выполнить
+//Каждая проверка реализована в отдельном классе
+//Таким образом можно добавить новую проверку и не писать обработчик, в случае провала этой проверки (если такой обработчик уже есть, конечно)
+//Далее процесс идёт по сформированному массиву, выполняя каждую проверку.
+//  Если проверка не пройдена, то пробег по массиву останавливается и возвращается ошибка
+macro ExecuteParamStepEx( kind_oper, DocKind, nptxop, ID_Operation, ID_Step )
+  var dlrq = TRecHandler("dlrq.dbt");
+  var categ = c_categ(nptxop.ID);
+  var notes = c_notes(nptxop.ID);
+  var v_MMVB_Code = "", v_MMVB_ID = -1;
+  var err = 0;
+  var checker:CheckHandler = CheckHandler();
+  var checkResult:ErrorStruct;
+
+  logger.Debug("Start, nptxop.ID: " + string(nptxop.ID));
+
+  //Сначала проверяется примечание, в котором указана причина отказа в исполнении
+  //Если примечание заполнено, то нет смысла делать остальные проверки, операция сразу идёт в отказ
+  //в зачислениях в паре с примечаниями работает категория. На мой взгляд, это излишне. Категорию даже нельзя посмотреть в интерфейсе
+  //Но всё равно оставлю это легаси, чтобы не ломалось в неожиданном месте
+  checker.Add(CheckRejectNote(notes.GetRejectValue(), categ));
+  checker.Add(CheckAccRest());
+  checker.Add(CheckRefillPayment());
+  checker.Add(CheckSpGround());
+  checker.Add(CheckDateAndTime());
+  checker.Add(CheckIISDoc());
+  checker.Add(CheckCurrency());
+  if(not CheckRegBool("РСХБ\\Брокерское обслуживание\\РУБИЛЬНИК AVT_BOSS-104"))
+    checker.Add(CheckLegalTime());    // BOSS-9380_BOSS-10126 Проверка на пополнение ЮЛ в вечернее время (после 19:00)
+  end;  checker.Add(CheckDeath());
+
+  checkResult = checker.CheckAll(nptxop);
+
+  if (checkResult == null)
+    logger.Debug("nptxop.ID: " + string(nptxop.ID) + ", Check = ok");
+  else
+    logger.Debug("nptxop.ID: " + string(nptxop.ID) + ", Check = " + string(checkResult.message));
+    if (checkResult.isNeedNotify)
+      DL_NPTX_PutMsg(checkResult.message);
+      MsgBox(checkResult.message);
+    end;
+
+    if (checkResult.type == ErrorStruct.STOP_OPERATION) //прерывание операции
+      return 1;
+    end;
+
+    if (checkResult.type == ErrorStruct.CLOSE_OPERATION)
+      if (not notes.SaveReject(checkResult.message))
+        return Error("Не удалось сохранить Примечание");
+      end;
+
+      if ((nptxop.SubKind_Operation == DL_NPTXOP_WRTKIND_WRTOFF) or (nptxop.SubKind_Operation == DL_NPTXOP_WRTKIND_TBSABC)) //Если списание или перевод - закрыть операцию
+        ПолучитьТОПоДокументу(nptxop.DocKind, nptxop.ID, 1, DLRQ_TYPE_PAYMENT, 0, dlrq);
+        //установим отказ в исполнении на ТО
+        if(dlrq.rec.ID > 0)
+          dlrq.rec.State = DLRQ_STATE_REJECT;
+          dlrq.rec.FactDate = {Curdate};    
+          DL_ChangeDLRQ(dlrq, {Curdate}, DLRQ_ACTION_UPDATE);
+        end;
+
+        SetReqStateReject(nptxop.ID);
+      elif (nptxop.SubKind_Operation == DL_NPTXOP_WRTKIND_ENROL) //Если зачисление - оформить возврат
+        if (not categ.SetAllowed(false)) // значение = "нет" в категории "Зачисление разрешено"
+          return Error(String("Ошибка установки категории"));
+        end;
+
+        if (not GetTrue(false, checkResult.message + "|Выполнить возврат денежных средств клиенту?" ))
+          return Error(checkResult.message);
+        end;
+
+        if (СубъектЮЛ_ИП(nptxop.Client))
+          return Error("Возвраты для ЮЛ должны выполняться вручную");
+        end;
+
+        if( not InsertOprStatus(46075, 1)) //Установить ВД = Выполнить
+          return Error( "Ошибка при установке статуса вида \"Установить ВД\" операции" );        
+        end;
+      
+        if(nptxop.FlagTax == SET_CHAR)
+          if( not InsertOprStatus(46072, 2)) //Установить УН = Закрыт
+              return Error( "Ошибка при установке статуса вида \"Установить УН\" операции" );        
+          end;
+        else
+          if( not InsertOprStatus(46073, 2)) //Установить ВН = Закрыт
+              return Error( "Ошибка при установке статуса вида \"Установить ВН\" операции" );        
+          end;
+        end;
+
+        if( not InsertOprStatus(46074, 2)) //Установить КЛ = Завершить
+          return Error( "Ошибка при установке статуса вида \"Установить КЛ\" операции" );        
+        end;
+      end;
+
+
+      //установим статус закрыта на операции
+      if( not InsertOprStatus(46071, 2)) //Документооборот = Закрыт
+        return Error( "Ошибка при установке статуса вида \"Документооборот\" операции" );        
+      end;
+      return 0;
+    end;
+  end; //if (checkResult != null)
+    if ((CheckRefill(nptxop.ID)) and(CheckRegBool("РСХБ\\Брокерское обслуживание\\АВТОПОДКРЕПЛЕНИЕ РК В НКЦ") and (CheckRegBool("РСХБ\\Брокерское обслуживание\\РУБИЛЬНИК AVT_BOSS-104") and (nptxop.SubKind_Operation == DL_NPTXOP_WRTKIND_ENROL)))) 
+         if( not InsertOprStatus(484131, 1)) //Установить ИРК = Готов к исполнению
+            return Error( "Ошибка при установке статуса вида \"Установить ИРК\" операции" );        
+         end;
+         
+        if( not InsertOprStatus(46077, 2)) //Расчет НОБ = Завершить
+          return Error( "Ошибка при установке статуса вида \"Расчет НОБ\" операции" );        
+        end;
+        return 0;
+    end;     
+        
+  if( not InsertOprStatus(46071, 1)) //Установить ДО = Открыт
+      return Error( "Ошибка при установке статуса вида \"Установить ДО\" операции" );        
+  end;
+
+  if( (nptxop.SubKind_Operation != DL_NPTXOP_WRTKIND_WRTOFF) or (nptxop.FlagTax != SET_CHAR) )
+    if( not InsertOprStatus(46073, 1)) //Формирование проводок = Выполнить
+      return Error( "Ошибка при установке статуса вида \"Расчет НОБ\" операции" );        
+    end;
+
+    if( not InsertOprStatus(46077, 2)) //Расчет НОБ = Завершить
+      return Error( "Ошибка при установке статуса вида \"Расчет НОБ\" операции" );        
+    end;
+  end;
+
+  return 0;
+end;
+
+macro ExecuteParamStep( kind_oper, DocKind, FDoc, ID_Operation, ID_Step )
+  record nptxop("nptxop");
+  SetBuff( nptxop, FDoc );
+
+  /**
+    @brief ExecuteParamStepEx - вынесено для того, чтобы можно было определить параметр nptxop. В целях разработки
+      Пример тестирования:
+      var ob = tbfile("nptxop.dbt");
+      ob.rec.id = 3724823;
+      ob.geteq();
+      record nptxop("nptxop");
+      copy(nptxop,ob);
+      ExecuteParamStepEx( 2037, 4607, nptxop, 24698100, 1 );
+  */
+  return ExecuteParamStepEx( kind_oper, DocKind, nptxop, ID_Operation, ID_Step );
+end;

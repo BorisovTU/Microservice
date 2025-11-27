@@ -1,0 +1,168 @@
+//SecurOTCCreateDeals.mac
+import "SecurDealsCreator.mac", "commonutil.mac", "cblogger2.mac", oralib, likepy;
+
+//Типы расчётов по сделке
+//Справочник dtypeac_dbt where t_inumtype = 155. номеру схемы соответствует ascii код поля t_type_account. В rsl это функция CodeFor()
+class SecurOTCDealSettlementTypes()
+  const DFP = 49; //поставка и оплата в разные дни (Поставка без платежа)
+  const DVP = 50; //поставка и оплата в один день (Поставка против платежа)
+  const PD  = 51; //Предпоставка
+  const PP  = 52; //Предоплата
+end;
+
+class SecurOTCDealsCreator(_contractorID:integer,
+                           _dealDate:date,
+                           _dealTime:time,
+                           _sellSupplydate:date,
+                           _sellPayDate:date,
+                           _buySupplyDate:date,
+                           _buyPayDate:date
+                           )
+
+  private var contractorID:integer = _contractorID;
+  private var dealDate:date        = _dealDate;
+  private var dealTime:time        = _dealTime;
+  private var sellSupplydate:date  = _sellSupplydate;
+  private var sellPayDate:date     = _sellPayDate;
+  private var buySupplyDate:date   = _buySupplyDate;
+  private var buyPayDate:date      = _buyPayDate;
+
+  private var dealID:integer;
+
+  //запросы
+  private var saveIsRedemptionCategQuery:string;
+  private var saveErrorToBufQuery:string;
+  private var saveDealIDToBufQuery:string;
+
+  private var logger = NewLogger(c_logger.PRINT_TYPE, "SecurOTCDealsCreator");
+
+  private macro Init()
+    CaptureOutput();
+    [
+    begin
+      categ_utils.save_categ(p_object_type => 101,
+                             p_group_id    => 120,
+                             p_object      => :p_object,
+                             p_attr_id     => 1,
+                             p_date        => :dt);
+    end;
+    ];
+    saveIsRedemptionCategQuery = StopCaptureOutput();
+
+    saveErrorToBufQuery = "update otc_deals_buffer set error = :err where id = :bufid";
+    saveDealIDToBufQuery = "update otc_deals_buffer set deal_id = :dealid, error = null where id = :bufid";
+  end;
+
+  private macro GetYearFromDate(dt:date):string
+    var yy;
+    datesplit(dt, null, null, yy);
+    return yy;
+  end;
+
+  private macro SaveErrorToBuf(bufID:integer, errText:string)
+    ExecSql(saveErrorToBufQuery, MakeArray(SqlParam("err", errText), SqlParam("bufid", bufID)));
+  end;
+
+  private macro SaveDealIDToBuf(bufID:integer, dealID:integer)
+    ExecSql(saveDealIDToBufQuery, MakeArray(SqlParam("dealid", dealID), SqlParam("bufid", bufID)));
+  end;
+
+  private macro SaveIsRedemptionCateg(dealID:integer, dt:date)
+    ExecSql(saveIsRedemptionCategQuery, MakeArray(SqlParam("p_object", string(dealID:o:34)), SqlParam("dt", dt)));
+  end;
+
+  macro CreateDeal(bufID:integer,
+                   clientID:integer,
+                   contractID:integer,
+                   fiid:integer,
+                   amount:money,
+                   price:money,
+                   direction:string):bool
+    var dealCreator = SecurDealsCreator();
+    var supplyDate:date = IfThenElse(direction == "BUY", buySupplyDate, sellSupplydate);
+    var payDate:date = IfThenElse(direction == "BUY", buyPayDate, sellPayDate);
+
+    dealCreator.dealDate   = dealDate;
+    dealCreator.dealType   = IfThenElse(direction == "BUY", 12183, 12193);
+    dealCreator.dealCode   = "Б/" + string(bufID) + "-" + GetYearFromDate(dealDate); //тут нужно использовать не bufID, а порядковый номер подобной сделки в текущем году. На данный момент так сделано, лишь, потому что это чуть-чуть быстрее в реализации (срочно, срочно)
+    dealCreator.dealCodeTS = dealCreator.dealCode;
+    dealCreator.partyID    = contractorID;
+    dealCreator.clientID   = clientID;
+    dealCreator.dealTime   = dealTime;
+    dealCreator.contractID = contractID;
+    dealCreator.fiid       = fiid;
+    dealCreator.cost       = amount * price;
+    dealCreator.principal  = amount;
+    dealCreator.price      = price;
+    dealCreator.supplyDate = supplyDate;
+    dealCreator.payDate    = payDate;
+    dealCreator.payFIID    = 0;
+    dealCreator.settlementType = IfThenElse(payDate == supplyDate, SecurOTCDealSettlementTypes.DVP, SecurOTCDealSettlementTypes.DFP);
+    dealCreator.totalCost = dealCreator.cost;
+    dealCreator.bofficeKind = 101;
+
+    if (not dealCreator.Create())
+      return false;
+    end;
+
+    dealID = dealCreator.GetID();
+    return true;
+  OnError(errObj)
+    logger.ErrorClob("", "Ошибка при создании сделки: " + GetFullErrMsg(errObj));
+    return false;
+  end;
+
+  macro CreateDealsByBuf()
+    logger.Info("Начало создания отложенных сделок по буферу");
+    var cntAll:integer = 0;
+    var cntSuccess:integer = 0;
+
+    CaptureOutput();
+    [
+    select b.id,
+           b.client_id,
+           b.contract_id,
+           b.instrument_id,
+           b.amount,
+           b.price,
+           b.direction
+      from otc_deals_buffer b
+     where b.deal_id is null
+    ];
+    var sql = ExecSQLSelect(StopCaptureOutput());
+    var isSuccess:bool;
+
+    InitProgress(-1, "Создание отложенных сделок", "Создание отложенных сделок");
+    while (sql.MoveNext())
+      cntAll = cntAll + 1;
+      dealID = 0;
+      isSuccess = CreateDeal(sql.value("id"),
+                             sql.value("client_id"),
+                             sql.value("contract_id"),
+                             sql.value("instrument_id"),
+                             sql.value("amount"),
+                             sql.value("price"),
+                             sql.value("direction"));
+
+      if (isSuccess)
+        logger.Info("Создана сделка. ИД = " + dealID);
+        SaveDealIDToBuf(sql.value("id"), dealID);
+        SaveIsRedemptionCateg(dealID, dealDate);
+        cntSuccess = cntSuccess + 1;
+      else
+        SaveErrorToBuf(sql.value("id"), "Ошибка при создании сделки");
+        logger.Error("Ошибка при создании сделки по записи с ИД = " + sql.value("id"));
+      end;
+
+      UseProgress(cntAll);
+    end;
+    RemProgress();
+
+    logger.Info("Конец создания отложенных сделок по буферу. Всего обработано: " + cntAll + ". Из них успешно: " + cntSuccess);
+  OnError(errObj)
+    logger.ErrorClob("", "Ошибка при создании сделок по буферу: " + GetFullErrMsg(errObj));
+    RemProgress();
+  end;
+
+  Init();
+end;

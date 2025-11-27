@@ -1,0 +1,89 @@
+IMPORT FIInter,rsexts,oralib,likepy,funk,dl_plib;
+
+    private var  i,ii,ff,ac1,ac2,que,rs51,rs5,ncat,catid,rs,dealid,{curdate},da;
+    FILE fn () txt  ;
+    ff = "..\\\\Import\\ACC\\1.txt";
+
+    da=СДАТ({curdate});
+    if (not Open(fn,ff ))
+        msgbox(" Не открыт новый файл ! ");
+        return ;
+    else
+        rewind(fn);
+        while (next(fn))
+           ii=index(fn.str,";");
+           if ( ii > 0 )
+             ac1=substr(fn.str,1,ii-1);
+             ac2=substr(fn.str,ii+1);
+             ac1=trim(ac1);
+             ac2=trim(ac2);
+
+             i=1;
+             while (i < 5 )
+               ii=index(ac2,"-");
+               if ( ii > 0 )
+                 ac2=substr(ac2,1,ii-1)+substr(ac2,ii+1);
+               end;
+               i=i+1;
+             end;
+             que="select count(*) from ddl_tick_dbt where t_dealcode='"+ac1+"'";
+             rs5 = LnGetRecordSet(que);
+             if(rs5 != null)
+               if (rs5.moveNext) 
+                  if (rs5.value(0) > 0 )
+
+                    que="select t_dealid from ddl_tick_dbt where t_dealcode='"+ac1+"'";
+                    rs51 = LnGetRecordSet(que);
+                    if(rs51 != null)
+                      if (rs51.moveNext) 
+                        dealid=rs51.value(0);
+                      end;
+                    end;
+
+// П  47426840000009901236
+// Р  47427810000006009908
+/*
+        if (tick.DealType == 12305)
+	 InsAccount(102, НомерСделки, acc9, 117, 621, 0);    //КУ +% к погашению
+      elif (tick.DealType == 12300)
+         InsAccount(102, НомерСделки, acc9, 118, 622, 0);    //КУ -% к погашению
+      end;
+        InsAccount(102, НомерСделки, acc0, 111, 601, leg.Duration); //КУ ОД
+*/
+                   if (substr(ac2,1,5) == "47410" )
+                     ncat=601;
+                     catid=111;
+                   else
+                       if (substr(ac2,1,5) == "47426" )
+                         ncat= 622;
+                         catid=118;
+                       else 
+                         ncat= 621;
+                         catid=117;
+                       end;
+                   end;
+                   que="update  dmcaccdoc_dbt set t_account='"+ac2+"'  where t_docid="+dealid+" and t_catnum="+ncat+" and t_catid="+catid;
+                   rs = LnGetRecordSet(que);
+                   if(rs5 != null)
+                      println(ac1,"=",ac2);
+                   else
+                      println("================"+ac1);
+                   end;
+
+                  else
+                     println("!!!!!!!!!!!!!!!!!!! НЕТ сделки "+ac1); 
+                  end;
+               end;
+             end;
+
+
+           end;
+        end;
+    end;
+
+
+end;
+
+
+
+

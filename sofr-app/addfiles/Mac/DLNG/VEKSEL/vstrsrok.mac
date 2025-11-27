@@ -1,0 +1,232 @@
+/*
+$Name:         vstrsrok.mac
+$Module:       Векселя банка
+$Description:  Перенос по счетам срочности
+*/
+IMPORT RsbDataSet, OprInter, VSInter, VAInter, vscateg, vsrep, vsmulty, vstrlib, vsconv,
+    mccatacf, dlvaprds;
+
+VAR srvdoc = 0; /* В эту переменную будет передан сервисный документ начисления
+               (TRecHandler, структура vssrvdoc) */
+
+PRIVATE RECORD bnr (vsbanner);
+PRIVATE const leg = TBfile ("dl_leg");
+
+PRIVATE MACRO GetLastSum(BCID, BoundDate, Sum:@money, ВалютаУчета)
+  var stat = 0;
+  var BalanceDate = date(0,0,0), BuyDealID = 0, Cost = $0, CostFI = -1, DealType = 0, DealCode = "";
+
+  if((ExecMacroFile("vamisc.mac", "УВ_НачислятьПремию")) and (ExecMacroFile("vamisc.mac", "НачальнаяПремияПоВекселю", bnr.BCID, BoundDate)))
+    Sum = VS_Convert(leg.rec.Principal, date(BoundDate), leg.rec.PFI, ВалютаУчета);
+  else
+    if(DL_VA_GetBalanceDate(BCID, BoundDate, @BalanceDate, @BuyDealID, @Cost, @CostFI, @DealType, @DealCode))
+      if(CostFI == ВалютаУчета)
+         Sum = Cost;
+      else
+         /* нужна конверсия суммы */
+         Sum = VS_Convert(Cost, date(BalanceDate), CostFI, ВалютаУчета);
+      end;
+    else
+      stat = 1;
+    end;
+  end;
+
+  return (stat == 0);
+END;
+
+/* Возвращает краткое наименование банка
+*/
+PRIVATE MACRO GetBankName(PartyID)
+var party = TBfile("party.dbt");
+
+   party.KeyNum = 0;
+   party.rec.PartyID = PartyID;
+
+   if(party.GetEQ)
+      return party.rec.ShortName;
+   end;
+
+   return "";
+END;
+
+
+// Открытие вексельного счета с опциональной актуализацией
+PRIVATE MACRO OpenBnrAccount(КатегорияУчета, fd, IsActuate)
+   if(IsActuate)
+      return MC_FindAndOpenAccountEx (КатегорияУчета, fd, srvdoc.rec.ValueDate, 0, MC_OPENACC_CHECKPERIOD, null, null, 
+                                    null, null, null, null, null, null, null, srvdoc.rec.ExecutionDate);
+   else
+      return MC_FindAndOpenAccountEx (КатегорияУчета, fd);
+   end;
+END;
+
+// Открытие вексельного счета для ПДД с опциональной актуализацией
+PRIVATE MACRO OpenBnrPDDAccount(КатегорияУчета, fd, FIRole, IsActuate)
+   if(IsActuate)
+      return MC_FindAndOpenAccountEx (КатегорияУчета, fd, srvdoc.rec.ValueDate, 0, MC_OPENACC_CHECKPERIOD, null, null,
+                               null, null, null, FIRole, null, null, null, srvdoc.rec.ExecutionDate);
+   else
+      return MC_FindAndOpenAccountEx (КатегорияУчета, fd, null, 0, MC_OPENACC_CHECKEXIST, null, null, null, null, null, FIRole);
+   end;
+END;
+
+private MACRO MakeDiscCarry(fd)
+var
+    СчетДебетД = "", СчетКредитД = "", СуммаД = 0, КатегорияУчета = "";
+    var ДПН, ДПК;
+    if (ВексельДисконтный( fd.GetLeg() ))
+      КатегорияУчета = "Дисконт, Свексель";//Дисконт
+      СчетДебетД = OpenBnrPDDAccount(КатегорияУчета, fd, FIROLE_DISCOUNT, false);
+      СчетКредитД = OpenBnrPDDAccount(КатегорияУчета, fd, FIROLE_DISCOUNT, true);
+      if (СчетДебетД == СчетКредитД)
+         return 0; //Перенос был осуществлён ранее
+      end;
+      if(not ПолучитьОстаток(СуммаД, СчетДебетД, fd.ОпределитьВалютуУчета(), srvdoc.rec.ExecutionDate))
+         return 0;
+      end;
+      if (СуммаД > $0)
+         /*Определяем период начисления*/
+         /*DEF-44137 При переносе мы берем весь переиод, ранее было требование, что брать дату + 1 для первого периода начисления*/
+         ДПН = VS_GetStartDate(fd.GetBnr(), fd.GetLeg()) + 1;
+         if( not ПолучитьДатуПоследПроводки(ДПК, СчетДебетД, fd.ОпределитьВалютуУчета()) )
+            ДПК = ПолучитьДатуПоследОперацииПоВекселю(fd.GetBnr(), fd.GetLeg(), srvdoc.rec.ExecutionDate);
+         end;
+         ДПК = ВернутьКонецПериода(ДПК);
+         if(Проводка(СчетДебетД, СчетКредитД, СуммаД,
+                     String("Перенос дисконта векселя ", fd.GetBnr().rec.IssuerName, //Simanov
+                              " серия " , fd.GetBnr().rec.BCSeries, " № ", trim(fd.GetBnr().rec.BCNumber),
+                              " за период ", ДПН, ":", ДПК, " на счет \"до востребования\""),
+                     null, null,
+                     fd.ОпределитьВалютуУчета(), null, null,
+                     srvdoc.rec.ExecutionDate))
+            return 1;
+         end;
+      end;
+    end;
+    return 0;
+end;
+
+MACRO ExecuteStep(Buffer, FirstDoc, DocKind, ID_Operation, ID_Step)
+var
+    fd, СчетДебет = "", СчетКредит = "", СуммаПр = 0, BankName = "", ok, КатегорияУчета = "";
+
+    var СуммаНачисленныхПроцентов = 0.0, СуммаНачисленногоДисконта = 0.0;
+    var Валюта_Проводки = -1, ВалютаУчета;
+    var PrDsParm, IncGroup;
+
+    SetBuff( bnr, FirstDoc );
+    
+    if( srvdoc.rec.ExecutionDate > {curdate} )
+       MsgBox ("Преждевременное выполнение шага запрещено.");
+       return 1;
+    end;
+
+     /*Simanov if(bnr.BCTermFormula != VS_TERMF_ATSIGHT)
+        /* формулировка срока не "по предъявлении" */;
+        return 0;
+    el*/if(Index(bnr.BCState, "С") != 0)
+        msgbox ("Вексель уже перенесли по сроку");
+        return 1;
+    elif(Index(bnr.BCState, "И") != 0)
+        msgbox ("Вексель уже перенесли к исполнению");
+        return 1;
+    elif(not НайтиЦеновыеУсловия(leg, bnr.BCID))
+        msgbox ("Не найдены ценовые условия векселя ", bnr.BCID,
+                "|серия ", bnr.BCSeries, " номер ", trim(bnr.BCNumber)
+        );
+        return 1;
+    end;
+    
+    fd = VSBannerFD (bnr, leg);
+    ВалютаУчета = fd.ОпределитьВалютуУчета();
+
+
+    if(not DL_IsOurBanner(bnr.Issuer))
+      IncGroup = VACollectIncome(srvdoc.rec.ExecutionDate);
+      PrDsParm = VAPrDsParm(@IncGroup, ID_Operation, ID_Step);
+      
+      if(ВалютаУчета != leg.rec.PFI) //ВУ != ВН
+        if(ExecMacroFile("vaovernvpi.mac", "ПереоценкаНВПИВекселя", bnr.BCID, srvdoc.rec.ExecutionDate, IncGroup))
+          return 1;
+        end;
+      end;
+
+      if(ExecMacroFile("vaprdslib.mac", "ВыполнитьДоначислениеОднойЦБ", fd.GetBnr(), fd.GetLeg(), null, null, null, PrDsParm))
+        return 1;
+      end;
+    end;
+
+    if(DL_IsOurBanner(bnr.Issuer))
+        КатегорияУчета = "Наш вексель";//Балансовая стоимость векселя
+        СчетДебет = OpenBnrAccount(КатегорияУчета, fd, false);
+        СчетКредит = OpenBnrAccount(КатегорияУчета, fd, true);
+        Валюта_Проводки = fd.ОпределитьВалютуУчета();
+        if(not ПолучитьОстаток(СуммаПр, СчетДебет, Валюта_Проводки, srvdoc.rec.ExecutionDate))
+          return 1;
+        end;
+        BankName = НашБанк();
+    else
+        КатегорияУчета = "Учтенные векселя";
+        СчетКредит = OpenBnrAccount(КатегорияУчета, fd, false);
+        СчетДебет = OpenBnrAccount(КатегорияУчета, fd, true);
+        if(not GetLastSum(bnr.BCID, srvdoc.rec.ExecutionDate, @СуммаПр, ВалютаУчета))
+           return 1;
+        end;
+        BankName = GetBankName(bnr.Issuer);
+        Валюта_Проводки = ВалютаУчета;
+    end;
+    
+    if((СчетКредит == "") or (СчетДебет == ""))
+        msgbox ("Ошибка при определении счета");
+        return 1;
+    elif(СчетДебет == СчетКредит)
+        msgbox ("Вексель ", bnr.BCID,
+                "|серия ", bnr.BCSeries, " номер ", trim(bnr.BCNumber),
+                "|не надо переносить по сроку");
+        return 1;
+    elif(Проводка(СчетДебет, СчетКредит, СуммаПр,
+                  String("Перенос балансовой стоимости векселя ", BankName,
+                         " серия " , bnr.BCSeries, " № ", trim(bnr.BCNumber),
+                         " на счет \"до востребования\""),
+                  null, null,
+                  Валюта_Проводки, null, null,                
+                  srvdoc.rec.ExecutionDate))
+        return 1;
+    elif (MakeDiscCarry(fd))
+        return 1;
+    else
+        if(DL_IsOurBanner(bnr.Issuer))
+           ok = ИзменитьВексель(bnr.BCID,srvdoc.rec.ValueDate, "addbcstate", "С");
+        else
+           ok = ИзменитьУчтенныйВексель(bnr.BCID, srvdoc.rec.ValueDate, "addbcstate", "С");
+        end;
+        if(not ok)
+           msgbox("Ошибка при установке для векселя ", bnr.BCID,
+                  "|серия ", bnr.BCSeries, " номер ", trim(bnr.BCNumber),
+                  "|признака переноса по срочности");
+           return 1;
+        end;
+    end;
+
+    if( not(DL_IsOurBanner(bnr.Issuer)) )
+      if(ExecMacroFile("vaprdslib.mac", "ПереносНачисленныхПроцентовИДисконтаПоВекселю", bnr, leg.rec, srvdoc.rec.ExecutionDate, srvdoc.rec.ValueDate, IncGroup))
+        return 1;
+      end;
+    end;
+
+    return 0;
+END;
+
+
+/* Макрос печати 
+*/
+MACRO PrintStepDocs (
+                ID_Operation,  /* Номер экземпляра операции */
+                ID_Step,       /* Номер шага операции */
+                Kind_Operation,/* Вид операции */
+                KindStep)      /* Вид шага операции */
+
+    Печать(false, "vsrep", ID_Operation, ID_step, isOprMultiExec, "СП"); /* Счета, Проводки */
+
+    return 1;
+END;

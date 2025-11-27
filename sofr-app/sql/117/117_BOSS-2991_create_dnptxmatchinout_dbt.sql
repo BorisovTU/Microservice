@@ -1,0 +1,157 @@
+-- Таблица "DNPTXMATCHINOUT_DBT"
+
+CREATE TABLE DNPTXMATCHINOUT_DBT (
+    T_ID NUMBER(10)
+  , T_CODE_INCOME NUMBER(5)
+  , T_KIND_INCOME NUMBER(5)
+  , T_MAIN_CODE_INCOME NUMBER(5)
+  , T_CODE_OUTCOME NUMBER(5)
+  , T_KIND_OUTCOME NUMBER(5)
+  , T_PRIORITY NUMBER(5)
+  , T_ALLNOB CHAR(1)
+  , T_ENDOFYEAR CHAR(1)
+  , T_IIS CHAR(1)
+  , T_DATEBEGIN DATE
+  , T_DATEEND DATE
+  , T_OPER NUMBER(10)
+  , T_DATEREC DATE
+)
+/
+
+COMMENT ON TABLE DNPTXMATCHINOUT_DBT IS 'Таблица соответствия кодов доходов и выч'
+/
+COMMENT ON COLUMN DNPTXMATCHINOUT_DBT.T_ID IS 'Id записи в таблице'
+/
+COMMENT ON COLUMN DNPTXMATCHINOUT_DBT.T_CODE_INCOME IS 'Код дохода'
+/
+COMMENT ON COLUMN DNPTXMATCHINOUT_DBT.T_KIND_INCOME IS 'НДР доход'
+/
+COMMENT ON COLUMN DNPTXMATCHINOUT_DBT.T_MAIN_CODE_INCOME IS 'Основной код дохода'
+/
+COMMENT ON COLUMN DNPTXMATCHINOUT_DBT.T_CODE_OUTCOME IS 'Код вычета'
+/
+COMMENT ON COLUMN DNPTXMATCHINOUT_DBT.T_KIND_OUTCOME IS 'НДР расход'
+/
+COMMENT ON COLUMN DNPTXMATCHINOUT_DBT.T_PRIORITY IS 'Приоритет в группе'
+/
+COMMENT ON COLUMN DNPTXMATCHINOUT_DBT.T_ALLNOB IS 'Признак учета по всей НОБ'
+/
+COMMENT ON COLUMN DNPTXMATCHINOUT_DBT.T_ENDOFYEAR IS 'Расчет только на конец года'
+/
+COMMENT ON COLUMN DNPTXMATCHINOUT_DBT.T_IIS IS 'Признак ИИС'
+/
+COMMENT ON COLUMN DNPTXMATCHINOUT_DBT.T_DATEBEGIN IS 'Дата начала действия записи'
+/
+COMMENT ON COLUMN DNPTXMATCHINOUT_DBT.T_DATEEND IS 'Дата окончания дейтствия записи'
+/
+COMMENT ON COLUMN DNPTXMATCHINOUT_DBT.T_OPER IS 'Пользователь'
+/
+COMMENT ON COLUMN DNPTXMATCHINOUT_DBT.T_DATEREC IS 'Дата внесения записи'
+/
+
+BEGIN
+  EXECUTE IMMEDIATE 'DROP INDEX DNPTXMATCHINOUT_DBT_IDX0';
+EXCEPTION
+  WHEN OTHERS THEN NULL;
+END;
+/
+
+CREATE UNIQUE INDEX DNPTXMATCHINOUT_DBT_IDX0 ON DNPTXMATCHINOUT_DBT (
+   T_ID ASC
+)
+/
+
+BEGIN
+  EXECUTE IMMEDIATE 'DROP INDEX DNPTXMATCHINOUT_DBT_IDX1';
+EXCEPTION
+  WHEN OTHERS THEN NULL;
+END;
+/
+
+CREATE   INDEX DNPTXMATCHINOUT_DBT_IDX1 ON DNPTXMATCHINOUT_DBT (
+   T_KIND_INCOME ASC
+  ,T_KIND_OUTCOME ASC
+  ,T_DATEBEGIN ASC
+  ,T_DATEEND ASC
+  ,T_PRIORITY ASC
+)
+/
+
+CREATE SEQUENCE DNPTXMATCHINOUT_DBT_SEQ 
+  START WITH 1
+  MAXVALUE 999999999999999999999999999
+  MINVALUE 1
+  NOCYCLE
+  NOCACHE
+  NOORDER
+/
+
+CREATE OR REPLACE TRIGGER DNPTXMATCHINOUT_DBT_T0_AINC
+  BEFORE INSERT OR UPDATE OF T_ID ON DNPTXMATCHINOUT_DBT FOR EACH ROW
+DECLARE
+  v_id INTEGER;
+BEGIN
+  IF (:NEW.T_ID = 0 OR :NEW.T_ID IS NULL) THEN
+    SELECT DNPTXMATCHINOUT_DBT_SEQ.NEXTVAL INTO :NEW.T_ID FROM DUAL;
+  ELSE
+    SELECT LAST_NUMBER INTO v_id FROM USER_SEQUENCES WHERE UPPER(SEQUENCE_NAME) = UPPER('DNPTXMATCHINOUT_DBT_SEQ');
+    IF :NEW.T_ID >= v_id THEN
+      RAISE DUP_VAL_ON_INDEX;
+    END IF;
+  END IF;
+END;
+/
+
+CREATE OR REPLACE TRIGGER DNPTXMATCHINOUT_DBT_TBIU
+  BEFORE INSERT OR UPDATE 
+  ON DNPTXMATCHINOUT_DBT
+  FOR EACH ROW
+DECLARE
+BEGIN
+
+  :NEW.T_DATEREC := TRUNC(SYSDATE);
+
+END;
+/
+
+CREATE OR REPLACE TRIGGER DNPTXMATCHINOUT_DBT_TAIU
+  AFTER INSERT OR UPDATE 
+  ON DNPTXMATCHINOUT_DBT
+  FOR EACH ROW
+DECLARE
+BEGIN
+
+  IF UPDATING THEN
+    INSERT INTO DNPTXMATCHINOUTCH_DBT (T_ID
+                                     , T_MATCHID
+                                     , T_DATEEND
+                                     , T_DATEEND_OLD
+                                     , T_OPER
+                                     , T_DATEREC
+                                     )
+                              VALUES(0, 
+                                     :NEW.T_ID, 
+                                     :NEW.T_DATEEND,       
+                                     :OLD.T_DATEEND,
+                                     :NEW.T_OPER, 
+                                     :NEW.T_DATEREC
+                                    );
+  ELSE
+    INSERT INTO DNPTXMATCHINOUTCH_DBT (T_ID
+                                     , T_MATCHID
+                                     , T_DATEEND
+                                     , T_DATEEND_OLD
+                                     , T_OPER
+                                     , T_DATEREC
+                                     )
+                              VALUES(0, 
+                                     :NEW.T_ID,
+                                     :NEW.T_DATEEND,
+                                     TO_DATE('01.01.0001','DD.MM.YYYY'),
+                                     :NEW.T_OPER, 
+                                     :NEW.T_DATEREC
+                                    );
+  END IF;
+
+END;
+/

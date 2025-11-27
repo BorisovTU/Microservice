@@ -1,0 +1,1824 @@
+/*
+$Name:             pbki.mac
+$Module:           Кредитование
+$Description:      ПБКИ
+*/
+//************************************************************************************
+//| Реализиция проэкта ПБКИ
+//|  
+//| Свириденко А. 
+//| 22.02.08
+//************************************************************************************
+import GLOBALS,CTInter,SbCrdInter,  total, "acc_crd.mac","dutysum.mac";
+
+var {GROUP_MODE};
+// Обьекты заполняемые из C-шника
+RECORD credit_rec ("credit_c.dbt"); // Текущий буфер договора
+RECORD lbki_rec   ("lbki.dbt");
+
+PRIVATE CONST LO_BKI = 30;
+PRIVATE CONST PTLEGF_PBUL  = 5;
+PRIVATE CONST REQUEST_CHNG = 1;
+PRIVATE CONST REQUEST_FULL = 2;
+PRIVATE CONST YES = TRUE;
+
+PRIVATE CONST S = "S";
+PRIVATE CONST N = "N";
+PRIVATE CONST A = "A";
+PRIVATE CONST D = "D";
+PRIVATE CONST M = "M";
+
+//////////////////////////////////
+// Базовые обьекты
+PRIVATE VAR {RSL_TOOLS_VERSION};
+
+PRIVATE VAR lbkicont = TBFile ("lbkicont.dbt", "r", 0);
+PRIVATE VAR lcourti  = TBFile ("lcourti.dbt",  "r", 1);
+PRIVATE VAR duty_crd = TBFile ("duty_crd.dbt", "r", 1);
+PRIVATE VAR type_crd = TBFile ("type_crd.dbt", "r", 0);
+
+record client("party.dbt");
+
+PRIVATE VAR party    = TBFile ("party.dbt",    "r", 0);
+PRIVATE VAR persn    = TBFile ("persn.dbt",    "r", 0);
+PRIVATE VAR credit_c = TBFile ("credit_c.dbt", "r", 0);
+PRIVATE VAR lbki     = TBFile ("lbki.dbt",     "r", 0);
+PRIVATE VAR ltr_file = TBFile ("ltr_file.dbt", "r", 0);
+PRIVATE VAR ldevbki  = TBFile ("ldevbki.dbt",  "r", 2);
+
+PRIVATE VAR rez_err  = TBFile ("rez_err.tmp",  "w", 0);
+
+// Для синхронизации с tr_file.mac
+private VAR _legalform;
+private VAR ReportDate;
+private VAR opoper;
+
+PRIVATE VAR CreditNumber : integer = 0,
+            ObjectTypeID : integer = 0,
+            ClientID     : integer = 0,
+            TypeClient   : integer = 0, // Тип клиента
+                                        // 1 - Юрик
+                                        // 2 - Физик
+                                        // 5 - ПБЮЛ
+            COUNT        : integer = 0,
+            gl_TFID              : integer = 0;
+
+PRIVATE VAR НачПерФормКи : date = {curdate};
+
+//////////////////////////////////
+///   Данные для XML обьектов
+VAR xml: object, root, newElem, R_Block = "";
+VAR TreeNodes = TArray(0),NodeDepth = 0;
+
+////////////////////////////////////////////////////////////////////////////////
+// Получить вид объекта
+PRIVATE MACRO GetCrdKind(Crd_Kind: integer)
+   VAR ObjectTypeID: integer = 0;
+
+   // Интеграция с 20м релизом
+   IF ({RSL_TOOLS_VERSION} >= 4049)
+      ObjectTypeID = Crd_kind;
+   ELSE
+      IF   (Crd_Kind == 0) ObjectTypeID = LO_CREDIT;
+      ELIF (Crd_Kind == 1) ObjectTypeID = LO_KARTA;
+      END;
+   END;
+
+   RETURN ObjectTypeID;
+END;
+
+//////////////////////////////////
+// Вспомогательные обьекты
+
+PRIVATE VAR GENERAL_FAILURE: BOOL = FALSE; // Наличие ошибки при формировании ТФ
+PRIVATE VAR ErrMes: STRING = "";
+PRIVATE VAR newBlokName;
+
+PRIVATE MACRO GetSQLDate( _date )
+   RETURN string( "TO_DATE( '",_date,"', 'DD.MM.YYYY' )" );
+END;
+
+////////////////////////////////////////////////////////////////////////////////
+// Удаляет все пробелы из строки
+MACRO FullStringTrim( Str: STRING )
+  VAR res_str;
+  res_str = StrSubst(Str," ","");
+  RETURN res_str;
+END;
+
+////////////////////////////////////////////////////////////////////////////////
+// Выделяем ИНН Первые INN_Count до /
+MACRO GetINNFromStr( Str: STRING, INN_Count )
+  VAR res_str,SlehN;
+  SlehN = Index(Str,"/");
+  IF ( SlehN > 0 )
+    IF (SlehN > INN_Count)
+      res_str = SubStr(Str,1,INN_Count);
+    ELSE
+      res_str = SubStr(Str,1,SlehN-1);
+    END;
+  ELSE
+    IF (StrLen(Str) > INN_Count)
+      res_str = SubStr(Str,1,INN_Count);
+    ELSE
+      res_str = StrSubst(Str," ","");
+    END;
+  END;
+  RETURN res_str;
+END;
+
+////////////////////////////////////////////////////////////////////////////////
+// Определить тип клиента
+PRIVATE MACRO ТипКлиента(LegalForm: integer, IsEmployer: string)
+   VAR TypeClient : integer = 0;
+
+   // Физ. лицo.
+   IF (LegalForm == 2)
+      TypeClient = PTLEGF_PERSN;
+
+      // ПБЮЛ
+      IF (Trim(IsEmployer) == "X")
+         TypeClient = PTLEGF_PBUL;
+      END;
+   ELSE
+      // Юp. лицo
+      TypeClient = PTLEGF_INST;
+   END;
+
+   RETURN TypeClient;
+END;
+
+
+// Расчет суммы к погашению
+MACRO CalcPercent_PBKI(ObjID: integer, ObjN: integer, OpDate: date)
+   VAR Sum: money = $0,
+       rs = NULL;
+
+   IF (OpDate == date(0,0,0))
+      OpDate = {curdate};
+   END;
+
+   IF ((ObjID == LO_KARTA) AND (OpDate == date(0,0,0)))
+      RETURN -1;
+   END;
+
+   LnSqlExec("DELETE FROM DPERCPAY_TMP");
+   LnSqlExec("DELETE FROM DPAYMENT_TMP");
+
+   FillFile(CF_DUTN, ObjID, ObjN, OpDate, 1, 0, OpDate, 0);
+   rs = CRSDCommand("SELECT d.T_DUTYID FROM DDUTY_CRD_DBT d WHERE " +
+                          " d.T_DUTYSTATE = ?  " +
+                      " AND d.T_CREDITNUMBER_REF = ?",
+                          "DUTYSTATE",    "О",
+                          "CREDITNUMBER", ObjN,
+                    V_GENOBJ);
+   WHILE (rs.MoveNext())
+      FillFile(CF_DUTN, LO_DUTY, SQL_NVL(RS.Value("T_DUTYID"), V_INTEGER), OpDate, 1, 0, OpDate, 0);
+   END;
+
+   //CalcPercent(OpDate, ObjID, ObjN);
+
+   Sum = CalcAllSum(ObjID, ObjN);
+
+   if({RSL_TOOLS_VERSION} >= 4049)
+        ParseSum(CF_DUTN, Sum, ObjID, ObjN, 1, OpDate);
+   else
+        ParseSum(CF_DUTN, Sum, ObjID, ObjN, 1);
+   END;
+
+/*191248
+   РасчетШтрафа(ObjID, ObjN, OpDate, Sum, 1);
+
+   РасчетШтрафов(ObjID, ObjN, OpDate, Sum, 1);
+*/
+   RETURN CalcAllSum(ObjID, ObjN);
+END;
+
+// Расчет суммы к погашению
+MACRO GetRests(ObjID: integer, ObjN: integer, OpDate: date)
+   VAR Sum: money = $0,
+       rs = NULL;
+
+   IF (OpDate == date(0,0,0))
+      OpDate = {curdate};
+   END;
+
+   IF ((ObjID == LO_KARTA) AND (OpDate == date(0,0,0)))
+      RETURN -1;
+   END;
+   
+   IF  ( ObjID == LO_GUARANTEE )
+      Sum = ОстатокРегистра (ObjID, ObjN, TDR_MAINREST, OpDate);
+      Sum = Sum+ОстатокРегистра (ObjID, ObjN, TDR_EXPREST, OpDate);
+      Sum = Sum+ОстатокРегистра (ObjID, ObjN, TDR_PAYMGUARANTEE, OpDate);
+   ELIF( ObjID == LO_KARTA )
+      Sum = GetAllRegRest(ObjID, ObjN,     TDR_MAINREST, OpDate);
+      Sum = Sum+GetAllRegRest(ObjID, ObjN, TDR_EXPREST, OpDate);
+      Sum = Sum+ОстатокРегистра (ObjID, ObjN, TDR_LIM, OpDate);
+   ELSE // LO_CREDIT и все остальные
+      Sum = GetAllRegRest(ObjID, ObjN,     TDR_MAINREST, OpDate);
+      Sum = Sum+GetAllRegRest(ObjID, ObjN, TDR_EXPREST, OpDate);
+   END;
+
+   RETURN Sum;
+END;
+
+
+////////////////////////////////////////////////////////////////////////////////
+// Возвращает сумму кредита в зависимости от типа кредита
+PRIVATE MACRO GetCrdLoanSUM()
+   VAR SUM : Money = $0;
+   IF   ((ObjectTypeID == LO_KARTA) or
+         (ObjectTypeID == LO_OVERDRAFT) or
+         ((ObjectTypeID == LO_CREDIT) and (credit_c.rec.PayType == CF_CRLINNEW)))
+       SUM = CRSDCommand("SELECT nvl (l.T_REST, 0), MAX(l.T_CREDOPERID_REF) FROM DCHLIMHIS_DBT l WHERE " +
+                                               " l.T_CREDITNUMBER_REF = ? " +
+                                           " AND l.T_TYPE             = ? " +
+                                           " AND l.T_DATE            <= ? " +
+       " GROUP BY l.T_CREDOPERID_REF, l.T_REST ORDER BY l.T_CREDOPERID_REF DESC",
+                                         "CREDITNUMBER", CreditNumber,
+                                         "TYPE1",        TDR_LIMDUTY,
+                                         "DATE1",        {curdate},
+                                         V_MONEY);
+   END;
+   IF   (ObjectTypeID == LO_CREDIT)
+       IF ((credit_c.rec.PayType == CF_CRLIN)   OR
+          (credit_c.rec.PayType == CF_CRLINNO))
+             SUM = CRSDCommand("SELECT nvl (l.T_REST, 0), MAX(l.T_CREDOPERID_REF) FROM DCHLIMHIS_DBT l WHERE " +
+                             " l.T_CREDITNUMBER_REF = ? " +
+                                           " AND l.T_TYPE             = ? " +
+                                           " AND l.T_DATE            <= ? " +
+             " GROUP BY l.T_CREDOPERID_REF, l.T_REST ORDER BY l.T_CREDOPERID_REF DESC",
+                             "CREDITNUMBER", CreditNumber,
+                             "TYPE1", TDR_LIMPAY,
+                             "DATE1", {curdate},
+                             V_MONEY);
+       elif (credit_c.rec.PayType == CF_NONREP)
+         SUM = credit_c.rec.CreditSum;
+       END;
+   END;
+   RETURN SUM;
+END;
+
+////////////////////////////////////////////////////////////////////////////////
+// Вохвращает фактическую дату погашения 
+PRIVATE MACRO GetDateFact()
+  VAR DateFact = date(0,0,0);
+  VAR Sum = $0;
+
+  // Вычисляем задолжность по договору(если не ноль дата не заполняется): 
+  //Sum = CalcPercent_PBKI(ObjectTypeID, CreditNumber, ReportDate); //123582
+  Sum = GetRests(ObjectTypeID, CreditNumber, ReportDate); //124269
+  if (Sum > 0)
+    RETURN DateFact = date(0,0,0);
+  END;
+
+  if (credit_c.rec.CreditState == CF_CLOSE ) // если договор закрыт
+    DateFact = LnSelectValue( "SELECT MAX(op.T_CREDOPERDATE) FROM DCRD_OP_DBT op WHERE "
+                              "op.T_ISDELETED = 0 AND "
+                              "op.T_STAGEID_REF = "+ CF_COMPLIT+" AND "
+                              "op.T_OPERTYPENUMBER_REF = "+CS_DUTY+" AND "
+                              "op.T_CREDITNUMBER_REF = "+CreditNumber+" AND "
+                              "op.T_CREDITNUMBER_REF NOT IN " /*по договору небыло операций списания задолжности*/
+                              "( SELECT op2.T_CREDITNUMBER_REF  FROM DCRD_OP_DBT op2 WHERE "
+                                      "op2.T_ISDELETED = 0 AND "
+                                      "op2.T_STAGEID_REF = op.T_STAGEID_REF AND "
+                                      "op2.T_SYSTEMOPERATIONID = "+CS_WRITE_OFF_VB+" AND "
+                                      "op2.T_CREDITNUMBER_REF = "+CreditNumber+" ) "
+                            , V_DATE);
+  ELSE // если договор открыт
+      IF ((credit_c.rec.PayType == CF_CRLIN)   OR  // Для кредитных линий Карт, оведравтов юр лиц
+         (credit_c.rec.PayType == CF_CRLINNO) OR
+         (credit_c.rec.PayType == CF_CRLINNEW) OR
+         ( ObjectTypeID == LO_KARTA))
+          if (ReportDate >= credit_c.rec.ReturnDate ) 
+            DateFact = LnSelectValue( "SELECT MAX(op.T_CREDOPERDATE) FROM DCRD_OP_DBT op WHERE "
+                                      "op.T_ISDELETED = 0 AND "
+                                      "op.T_STAGEID_REF = "+ CF_COMPLIT+" AND "
+                                      "op.T_OPERTYPENUMBER_REF = "+CS_DUTY+" AND "
+                                      "op.T_CREDITNUMBER_REF = "+CreditNumber
+                                    , V_DATE);
+          END;
+      ELSE // Разовый кредит
+        DateFact = LnSelectValue( "SELECT MAX(op.T_CREDOPERDATE) FROM DCRD_OP_DBT op WHERE "
+                          "op.T_ISDELETED = 0 AND "
+                          "op.T_STAGEID_REF = "+ CF_COMPLIT+" AND "
+                          "op.T_OPERTYPENUMBER_REF = "+CS_DUTY+" AND "
+                          "op.T_CREDITNUMBER_REF = "+CreditNumber
+                        , V_DATE);
+      END;
+
+  END;
+  
+  RETURN DateFact;
+END;
+
+
+
+
+////////////////////////////////////////////////////////////////////////////////
+// Тип Гарантии
+PRIVATE MACRO GetGuarType(GuarID: integer, GuarSysID: integer, GuarPBKName: @String, GuarPBKID: @INTEGER )
+  GuarPBKName = "";
+  GuarPBKID = 0;
+  
+  IF (GuarID == TE_VOUCHER)
+    GuarPBKName = "Поручительсво";
+    GuarPBKID = 1;
+  ELSE
+      IF ((GuarID >= TE_BAIL_CAPITAL) AND (GuarID <= TE_PROPERTY ) AND (GuarID != TE_GUARANT ))
+          GuarPBKName = "Залог";
+          GuarPBKID = 2;
+      ELSE
+          IF (GuarID == 8) 
+              GuarPBKName = "Право требования";
+              GuarPBKID = 3;
+          ELSE // TE_GUARANT 
+              GuarPBKName = "Гарантия";
+              GuarPBKID = 4;
+          END;
+      END;
+  END;
+END;
+
+
+/////////////////////////////////////////////////////////////////////////////////
+// Проверка сумм на регистрах просрочки КД
+// Возвращает TRUE - если регистры нулевые на дату
+// FALSE - если не нулевые
+
+PRIVATE MACRO IsClaimRegsEmpty( CheckDate , ObjId, ObjNum)
+   VAR Rest         :  moneyL; // Остаток регистра "На дату"
+   VAR AllRests     :  moneyL; // Cумма остатокв "На дату"
+   array RegisterNameArray;
+   VAR i = 1,ObjTypeId,ObjNumber,RS;
+
+
+   IF ((ValType(ObjId) == V_UNDEF) AND (ValType(ObjNum) == V_UNDEF))
+      ObjTypeId = ObjectTypeID;
+      ObjNumber = CreditNumber;
+      // Находим все СО привязанные к данному КД и проверяем в первую очередь их
+      IF ((ObjTypeId == LO_CREDIT ) OR (ObjTypeId == LO_KARTA ))
+           RS = CRSDCommand(" SELECT dcrd.T_DUTYID ObjNum FROM DDUTY_CRD_DBT dcrd "
+                            " WHERE dcrd.T_CREDITNUMBER_REF = ? AND dcrd.T_DUTYSTATE = 'О' ",
+                            "CreditNumber", CreditNumber,V_GENOBJ);
+            WHILE(RS.MoveNext())
+                ObjNum  =   SQL_NVL(RS.Value("ObjNum"),  V_INTEGER);
+                ObjId   =   LO_DUTY;
+                IF (IsClaimRegsEmpty(CheckDate , ObjId, ObjNum) == FALSE)
+                    RETURN FALSE; // На одном из СО есть остатки просрочки.
+                END;
+           END;
+      END;
+   ELSE
+      ObjTypeId  = ObjId;
+      ObjNumber = ObjNum;
+   END;
+
+   IF (ObjTypeId == LO_CREDIT )    
+      RegisterNameArray[1] = TDR_EXPREST;
+      RegisterNameArray[2] = TDR_EXPPERC;
+   END;
+
+   IF ((ObjTypeId == LO_KARTA )  OR (ObjTypeId == LO_OVERDRAFT ) OR (ObjTypeId == LO_DUTY ))
+      RegisterNameArray[1] = TDR_EXPREST;
+      RegisterNameArray[2] = TDR_EXPPERC;
+      RegisterNameArray[3] = TDR_OV;
+      RegisterNameArray[4] = TDR_EXPPERC_OV;
+   END;
+
+   IF (ObjectTypeID == LO_GUARANTEE )    
+      RegisterNameArray[1] = TDR_EXPPAYMGUARANTEE;
+      RegisterNameArray[2] = TDR_PAYMGUARANTEEEXPPERC;
+   END;
+
+   AllRests = $0;
+   while ((ValType(RegisterNameArray[i]) != V_UNDEF))
+     Rest   = ОстатокРегистра(ObjTypeId, ObjNumber, RegisterNameArray[i], CheckDate);
+     AllRests = AllRests + Rest;
+     i = i + 1;
+   END;
+   
+   IF (AllRests ==  0)
+     RETURN TRUE;
+   END; 
+   
+   RETURN FALSE;   
+END;
+
+
+//////////////////////////////////// 
+//  Получить список имен ОО для ДГ или Имя из справочника RS_LOANS
+//
+PRIVATE MACRO GetOOLongName( EndCrdID )
+    VAR Val,OObj,n;
+
+    OObj = CRSDCommand("SELECT  ensObj.T_ENSOBJECTNAME ObjName FROM DECN_EOB_DBT ecn,DENSOBJ_DBT ensObj"
+                       " WHERE ensObj.T_ENSOBJECTID = ecn.T_ENSOBJECTID_REF AND "
+                       " ecn.T_ENSCONTRACTID_REF = "+EndCrdID,V_GENOBJ);
+    n  = 0;
+    Val = "";
+    WHILE (OObj.MoveNext())
+      Val = Val + SQL_NVL(OObj.Value("ObjName"),  V_STRING);
+      IF (n > 1) 
+        Val = Val+" ";
+      END;
+      n  = n +1;
+    END;
+    Val = TRIM(Val);
+    Val = StrSubst(Val," ",",");
+    
+    IF (StrLen(Val) > 1)
+     RETURN Val;
+    END;
+
+   // Ненашли обеспечение найдем хоть имя из справочника:     
+   OObj = CRSDCommand("SELECT  tens.T_TYPEENSNAME DicName FROM DENSCONTR_DBT ens, DTYPE_ENS_DBT tens "
+                      " WHERE tens.T_TYPEENSID = ens.T_ENSSYSTYPE AND ens.T_ENSCONTRACTID = "+EndCrdID,V_GENOBJ);
+   IF (OObj.MoveNext())
+      Val = SQL_NVL(OObj.Value("DicName"),  V_STRING);
+      RETURN Val;
+   END;
+   
+   RETURN "НЕУСТОЙКА";
+END;
+
+//////////////////////////////////// 
+// Вспомогательные Ф. По Заполнению XML
+//
+//
+PRIVATE MACRO InsErrorMessage(message:  string)
+
+   rez_err.Clear();
+
+   // Сообщение об ошибке
+   IF (trim(ErrMes) != "")
+      message = message + ErrMes;
+   END;
+   
+   rez_err.rec.Error_Code   = message;
+   // Вид объекта
+   rez_err.rec.ObjectID     = ObjectTypeID;
+   // Тип объекта
+   rez_err.rec.ObjectNumber = CreditNumber;
+   // Номер клиента
+   rez_err.rec.StepID       = ClientID;
+   // Номер ТФ
+   rez_err.rec.TFID         = gl_TFID;
+
+   rez_err.Insert();
+   
+   PRINTLN("Ошибка: "+message+" ID: "+ObjectTypeID+" КД: "+CreditNumber+" Номер Клиента: "+ClientID );
+
+   GENERAL_FAILURE = TRUE;
+END;
+
+//////////////////////////////////// 
+// 
+// Создаем новый блок в ТФ
+// 
+PRIVATE MACRO ЗадатьНовыйБлок(ИмяБлока:  string)
+  newElem = xml.createElement(ИмяБлока);
+  newBlokName = ИмяБлока;
+END;
+
+
+//////////////////////////////////// 
+// Name    - Имя Свойства (если значение "" - то автоматически относим к ЗначениЮ блока)
+// Type    - Тип значения
+// Size    - Размер
+// Value   - Значение
+// Param   - Обязательный параметр
+// IsCoplexBlock - Флаг куда будет вставлятся информация (в текущий блок или в Сложный блок)
+PRIVATE MACRO ДобавитьВБлок(Name:  string, Type, Size, Value, Param, IsCoplexBlock)
+   VAR day : integer = 0,
+       mon : integer = 0,
+       year: integer = 0,
+       temp: string  ="",
+       mast_be: bool = FALSE; // Признак обязательного присутствия сегмента
+  // Проверяем Параметры
+
+   // Не задан обязательный параметр!
+   IF ( Param == YES ) // Обязательный параметр
+      IF ((ValType(Value) == V_UNDEF) OR (Trim(string(Value)) == "") or (Trim (string(Value)) == StrFor(1)))
+         IF (Name == "") Name = "'Значение блока'"; END;
+         InsErrorMessage("Блок: " + newBlokName+ ". Не заполнено поле: " + Name + " - Поле Обязательно для заполнения");
+         RETURN;
+      END;
+   END;
+
+   // Целые числа от 0..9
+   IF   (Type == "M")
+      IF (Trim(string(Value)) != "")
+         temp = Value;
+         Value = Money(Value);
+      END;
+
+      // Это не число
+      IF (((ValType(Value) != V_MONEY) OR ((Value == $0) AND (StrLen(temp) > 1))) AND (Param == YES))
+         IF (Name == "") Name = "'Значение блока'"; END;
+         InsErrorMessage("Блок: " + newBlokName+ ". Не заполнено поле: " + Name + " - Поле Обязательно для заполнения");
+         RETURN;
+      ELSE
+       Value = String(Value);
+      END;
+      
+   END;
+  
+   // Целые числа от 0..9
+   IF   (Type == "N")
+      IF (Trim(string(Value)) != "")
+         temp = Value;
+         Value = int(double(Value));
+      END;
+
+      // Это не число
+      IF (((ValType(Value) != V_INTEGER) OR ((Value == 0) AND (StrLen(temp) > 1))) AND (Param == YES))
+         IF (Name == "") Name = "'Значение блока'"; END;
+         InsErrorMessage("Блок: " + newBlokName+ ". Не заполнено поле: " + Name + " - Поле Обязательно для заполнения");
+         RETURN;
+      END;
+   // Знаковые целые числа -/+ 0..9
+   ELIF (Type == "S")
+
+      IF ((ValType(Value) == V_INTEGER) OR
+          (ValType(Value) == V_DOUBLE)  OR
+          (ValType(Value) == V_DOUBLEL) OR
+          (ValType(Value) == V_MONEY)   OR
+          (ValType(Value) == V_DECIMAL) OR
+          (ValType(Value) == V_NUMERIC))
+         Value = int(Round(double(Value), 0)); //Округление до ближайшего целого
+      ELSE
+         IF ( Param == YES ) 
+           IF (Name == "") Name = "'Значение блока'"; END;
+           InsErrorMessage("Блок: " + newBlokName+ ". Не заполнено поле: " + Name + " - Поле Обязательно для заполнения");
+           RETURN;
+         END;
+      END;
+
+
+   // Строка
+   // ЗАГЛАВНЫЕ БУКВЫ: АБВГДЕЁЖЗИЙКЛМНОПРСТУФХЦЧШЩЪЫЬЭЮЯ
+   //                  ABCDEFGHIJKLMNOPQRSTUVWYZ
+   ELIF (Type == "A")
+      // Это не строка
+      IF ((ValType(Value) != V_STRING)  AND (Param == YES))
+         IF (Name == "") Name = "'Значение блока'"; END;
+         InsErrorMessage("Блок: " + newBlokName+ ". Не заполнено поле: " + Name + " - Поле Обязательно для заполнения");
+         RETURN ;
+      END;
+
+      Value = StrUpr(string(Value));
+
+   // Дата
+   // Формат: ДДММГГГГ
+   ELIF (Type == "D")
+      IF ( (ValType(Value) != V_DATE) OR
+          (Value <= date(1,1,1900)) )
+         IF (Name == "") Name = "'Значение блока'"; END;
+         IF (Param == YES) // Необязательную ПУСТУЮ дату просто НЕ Заполняем!
+          InsErrorMessage("Блок: " + newBlokName+ ". Не заполнено поле: " + Name + " - Поле Обязательно для заполнения");
+         END;
+         RETURN ;
+      END;
+      
+      IF (Trim(string(Value)) != "")
+         DateSplit(Value, DAY, MON, YEAR);
+
+         temp = "00";
+         StrSet(temp, 3 - StrLen(string(DAY)),  string(DAY));  Value = temp+".";
+
+         temp = "00";
+         StrSet(temp, 3 - StrLen(string(MON)),  string(MON));  Value = Value + temp+".";
+
+         temp = "0000";
+         StrSet(temp, 5 - StrLen(string(YEAR)), string(YEAR)); Value = Value + temp;
+
+      END;
+
+   // Буквенно-цифровые данные
+   // а..я; А..Я; a..z; A..Z; 0..9
+   ELIF (Type == "AN")
+
+   // Любые символы
+   ELIF (Type == "P")
+
+   // Буквенные данные, включая: точка, пробел, запятая, апостроф, тире
+   ELIF (Type == "C")
+
+   END;
+
+
+   // Убираем символы табуляци и переходы на новую строку
+   //Если понадобится только для строк сделать: Value = StrSubst(string(Value), "\t", " ");
+   //Value = StrSubst(string(Value), "\n", " ");
+
+  
+  IF (IsCoplexBlock)
+      IF (Name == "")
+         TreeNodes(NodeDepth).appendChild( xml.createTextNode(Value) );
+      ELSE
+         TreeNodes(NodeDepth).setAttribute(Name, Value);
+      END;
+  ELSE
+      IF (Name == "")
+         newElem.appendChild( xml.createTextNode(Value) );
+      ELSE
+         newElem.setAttribute(Name, Value);
+      END;
+  END;
+END;
+
+//////////////////////////////////// 
+// 
+// Добавляем новый блок в ТФ (возможны варианты)
+// 
+// ИмяБлока - Имя тега 
+// 
+PRIVATE MACRO НачатьСложныйБлок( ИмяБлока )
+  NodeDepth = NodeDepth+1;
+  TreeNodes(NodeDepth)  = xml.createElement(ИмяБлока);
+END;
+
+
+//////////////////////////////////// 
+// 
+// Добавляем новый блок в ТФ (возможны варианты)
+// 
+// IsCDataBlockWrap - если параметр равен TRUE то блок будет аформлен в секцию CDATA
+// 
+PRIVATE MACRO ВставитьСложныйБлок(IsCDataBlockWrap)
+  VAR XMLElement,ParentNode; 
+  IF (ValType(TreeNodes(NodeDepth)) == V_GENOBJ)
+      XMLElement = TreeNodes(NodeDepth);
+      if (NodeDepth > 1)
+          ParentNode = TreeNodes(NodeDepth-1);
+          if (IsCDataBlockWrap == YES) // Обернуть блок в CDATA'у
+            ParentNode.appendChild(xml.createCDATASection("<?xml version='1.0' encoding='Windows-1251' standalone='no'?>"+XMLElement.XML));
+          ELSE
+            ParentNode.appendChild(XMLElement);
+          END;
+      ELSE
+          root.appendChild(XMLElement);
+      END;
+      TreeNodes(NodeDepth) = "";
+      NodeDepth = NodeDepth - 1;
+  END;
+END;
+
+
+
+
+//////////////////////////////////// 
+// 
+// Добавляем новый блок в ТФ (возможны варианты)
+// 
+PRIVATE MACRO ВставитьБлок()
+  VAR XMLElement;
+  XMLElement = TreeNodes(NodeDepth);
+  IF (ValType(XMLElement) == V_GENOBJ)
+      XMLElement.appendChild(newElem);
+  ELSE
+      root.appendChild(newElem);
+  END;
+END;
+
+
+//////////////////////////////////// 
+// Инициализация Root сегмента, заполнение базовыми данными
+//
+//
+MACRO НачалоФайлаБКИ()
+    VAR R_Block;
+
+   xml = NULL; root = NULL; newElem = NULL;
+
+    xml = ActiveX( "MSXML.DOMDocument" );
+    xml.loadXML("");
+    xml.appendChild(xml.createProcessingInstruction("xml", " version='1.0' encoding='Windows-1251' standalone='no'"));
+
+    root = xml.createElement("R");
+    GENERAL_FAILURE = FALSE;
+END;
+
+//////////////////////////////////// 
+//
+//  SENDER, CERDID, CRDATE, LIC
+//
+MACRO ЗаполнитьБлокОбщейИнформации( ИмяФайла )     // П.2
+    VAR CurTime = Time();
+    VAR DateAndTime;
+    VAR temp: string = "",
+        CertID : string = "",
+        day : integer = 0,
+        mon : integer = 0,
+        year: integer = 0;
+    
+
+    DateSplit({curdate}, DAY, MON, YEAR);
+    temp = "00";
+    StrSet(temp, 3 - StrLen(string(DAY)),  string(DAY));  DateAndTime = temp+".";
+    temp = "00";
+    StrSet(temp, 3 - StrLen(string(MON)),  string(MON));  DateAndTime = DateAndTime + temp+".";
+    temp = "0000";
+    StrSet(temp, 5 - StrLen(string(YEAR)), string(YEAR)); DateAndTime = DateAndTime + temp;
+    DateAndTime = DateAndTime +" "+CurTime;
+    
+            
+    ЗадатьНовыйБлок("SENDER");
+    temp = GetUsFieldValue(LO_BKI, lbki.rec.BkiID, 190);
+    ДобавитьВБлок("e_nm", A, 50,  temp,YES);
+    temp = GetUsFieldValue(LO_BKI, lbki.rec.BkiID, 191);
+    ДобавитьВБлок("r_nm", A, 100, temp,YES);
+    temp = GetUsFieldValue(LO_BKI, lbki.rec.BkiID, 193);
+    ДобавитьВБлок("o_nm", A, 100, temp, YES);
+    temp = GetUsFieldValue(LO_BKI, lbki.rec.BkiID, 192);
+    ДобавитьВБлок("",     N, 0,   temp,YES);
+    ВставитьБлок();
+
+    ЗадатьНовыйБлок("CERTID");
+    temp = GetUsFieldValue(LO_BKI, lbki.rec.BkiID, 194);
+    ДобавитьВБлок("",     A, 100,   temp,YES);
+    ВставитьБлок();
+
+    ЗадатьНовыйБлок("CRDATE");
+    ДобавитьВБлок("",     A, 0,   DateAndTime,YES);
+    ВставитьБлок();
+    
+    ЗадатьНовыйБлок("LIC");
+    ДобавитьВБлок("",     A, 0,   SubStr(ИмяФайла,1,Index(ИмяФайла,".")-1),YES);
+    ВставитьБлок();
+END;
+
+//////////////////////////////////// 
+//
+// DOC, DOG_START,SUM, CUR, DOC_END, SUM_DATE, FACT_DATE, PERCENT_DATE
+// PAY
+MACRO ЗаполнитьБлокИнформацииПоКД()      // П.3
+    VAR RS,CurString = "",SumDate,FactDate,PaySum;
+
+
+    ЗадатьНовыйБлок("DOGCNT");
+    ДобавитьВБлок("",     A, 0,   "0",YES);
+    ВставитьБлок(); // DOGCNT
+    
+    //ЗадатьНовыйБлок("DOG");
+    НачатьСложныйБлок("DOG");
+    ДобавитьВБлок("id",       A, 0,   "-1",FALSE,YES);
+    ДобавитьВБлок("num",      A, 20,  credit_c.rec.UsCreditNumber ,YES,YES);
+    ДобавитьВБлок("date",     D, 0,   credit_c.rec.RegDate  ,YES,YES);
+    ДобавитьВБлок("pay_pr",   A, 0,   "1",YES,YES);
+
+    
+     
+    ЗадатьНовыйБлок("DOG_START");
+    ДобавитьВБлок("",   D, 0,   credit_c.rec.RegDate,YES);
+    ВставитьБлок();
+
+    ЗадатьНовыйБлок("SUM");
+    IF ((credit_c.rec.PayType == CF_CRLIN)    OR
+        (credit_c.rec.PayType == CF_CRLINNO)  OR
+        (credit_c.rec.PayType == CF_CRLINNEW) OR
+        (ObjectTypeID == LO_KARTA) or
+        (ObjectTypeID == LO_OVERDRAFT))
+        ДобавитьВБлок("",   M, 0,   GetCrdLoanSUM());  //123555
+    ELSE
+        ДобавитьВБлок("",   M, 0,   GetCrdLoanSUM(),YES);
+    END;
+    ВставитьБлок();
+
+    ЗадатьНовыйБлок("CUR");
+    RS = CRSDCommand("SELECT cur.T_NAME FI_NAME, cur.T_FI_CODE FI_CODE "
+                    " FROM DCREDIT_C_DBT crd, DFININSTR_DBT cur "
+                    " WHERE crd.T_CREDITNUMBER = ? AND cur.T_FIID = crd.T_CURCODE ",
+                    "CreditNumber", CreditNumber,V_GENOBJ);
+    if (RS.MoveNext())
+      CurString = SQL_NVL(RS.Value("FI_NAME"),  V_STRING);
+      ДобавитьВБлок("nm",   A, 0,   CurString,YES);
+      CurString = SQL_NVL(RS.Value("FI_CODE"),  V_STRING);
+      ДобавитьВБлок("",   A, 0,   CurString,YES);
+      ВставитьБлок();
+    ELSE
+      InsErrorMessage("Блок: CUR Не найдена валюта! - Поле Обязательно для заполнения");
+    END;
+    
+    ЗадатьНовыйБлок("DOG_END");
+    ДобавитьВБлок("",   D, 0,   credit_c.rec.ReturnDate,YES);
+    ВставитьБлок();
+
+    ЗадатьНовыйБлок("SUM_DATE");
+    SumDate = LnSelectValue("SELECT MIN(op.T_CREDOPERDATE) FROM DCRD_OP_DBT op WHERE "+
+                            " op.T_ISDELETED = 0 AND op.T_STAGEID_REF = "+CF_COMPLIT+" AND "+
+                            " op.T_CREDOPERDATE >= "+GetSQLDate(НачПерФормКи) + " AND "+
+                            " op.T_SYSTEMOPERATIONID = "+CS_PAY+" AND op.T_CREDITNUMBER_REF = "+CreditNumber
+                            , V_DATE);
+    IF (SumDate > date(0,0,0))                            
+        ДобавитьВБлок("",   D, 0,   SumDate,YES);
+    ELSE
+        ДобавитьВБлок("",   A, 0,   "00.00.0000");
+    END;
+    ВставитьБлок();
+    
+    ЗадатьНовыйБлок("FACT_DATE");
+    FactDate = GetDateFact(); 
+    ДобавитьВБлок("",   D, 0,  FactDate); // Если дата пустая она не заполнится
+    ВставитьБлок();
+
+    ЗадатьНовыйБлок("PERCENT_DATE");
+    ДобавитьВБлок("",   D, 0,   credit_c.rec.ReturnDate,YES);
+    ВставитьБлок();
+
+    RS = CRSDCommand("SELECT pln.T_CREDOPERDATE PAY_DATE, SUM(pln.T_ACTUALAMOUNT) ALL_SUM "
+                     "FROM DPLANFACT_DBT pln WHERE "
+                     "pln.T_SYSTEMOPERATIONID_REF = "+CS_DUTY+" AND "
+                     "pln.T_CREDOPERDATE > = "+GetSQLDate(НачПерФормКи) +" AND "
+                     "pln.T_CREDITNUMBER = ? "
+                     "GROUP BY pln.T_CREDOPERDATE ",
+                     "CreditNumber", CreditNumber,V_GENOBJ);
+    WHILE(RS.MoveNext())
+      SumDate = SQL_NVL(RS.Value("PAY_DATE"),  V_DATE);
+      PaySum = String(SQL_NVL(RS.Value("ALL_SUM"),    V_NUMERIC));
+      ЗадатьНовыйБлок("PAY");
+      ДобавитьВБлок("id", A, 0,   "");
+      ДобавитьВБлок("percent_date", A, 0,   "");
+      ДобавитьВБлок("pay_date", D, 0,   SumDate);
+      ДобавитьВБлок("of_garant", A, 0,   "");
+      ДобавитьВБлок("status", A, 0,   "");
+      ДобавитьВБлок("summa_pan" , A, 0,   "");
+      ДобавитьВБлок("summa_real", A, 0,   PaySum);
+      ВставитьБлок();
+   END;
+
+END;
+
+
+//////////////////////////////////// 
+// 
+// Получить код Выгражемого документа в БКИ
+// RsID - ID в RS-BANK
+// RsCode - Код в справочнике
+PRIVATE MACRO  GetBKIDocID(RsID,RsCode)
+  
+  IF   ( RsCode == "21" ) RETURN 1; 
+  ELIF ( RsCode == "04" ) RETURN 3; 
+  ELIF ( RsCode == "07" ) RETURN 4; 
+  ELIF ( RsCode == "06" ) RETURN 5; 
+  ELIF ( RsCode == "03" ) RETURN 2; 
+  ELIF ( RsCode == "12" ) RETURN 9; 
+  ELIF ( RsCode == "22" ) RETURN 14; 
+  ELIF ( RsCode == "01" ) RETURN 14; 
+  ELIF ( RsCode == "02" ) RETURN 14; 
+  ELIF ( RsCode == "05" ) RETURN 14; 
+  ELIF ( RsCode == "09" ) RETURN 14; 
+  ELIF ( RsCode == "10" ) RETURN 6; 
+  ELIF ( RsCode == "11" ) RETURN 11; 
+  ELIF ( RsCode == "13" ) RETURN 12; 
+  ELIF ( RsCode == "14" ) RETURN 13; 
+  ELIF ( RsCode == "26" ) RETURN 5; 
+  ELIF ( RsCode == "27" ) RETURN 4; 
+  ELIF ( RsCode == "23" ) RETURN 14; 
+  ELIF ( RsCode == "91" ) RETURN 14; 
+  END;
+ 
+  InsErrorMessage("Блок: OINFO:DOC:GetBKIDocID - Не попределен ID документа выгрузки");
+  RETURN 0;
+END;
+
+
+//////////////////////////////////// 
+//
+// OINFO{ADDR}
+//
+MACRO ЗаполнитьБлокАдресаПоЗаемщику( PersonID, LegForm )       // П.6
+VAR CodePlace    : string = "",
+    CodeStreet   : string = "",
+    NameRegion   : string = "",
+    AdressCity   : string = "",
+    TypeDebtor   : integer = 0,
+    StreetStr    : string = "",
+    ValString = "",Val,AddrType,prefix="err",stat,
+    RS     = NULL;
+
+    RS = CRSDCommand("SELECT t_postindex,   " +
+                          " adr.T_CODEREGION,   adr.T_REGION,      " +
+                          " adr.t_CodeProvince, adr.T_PROVINCE,    " +
+                          " adr.T_CODEDISTRICT, adr.T_DISTRICT,    " +
+                          " adr.t_codeplace,    adr.t_place,       " +
+                          " adr.T_CODESTREET,   adr.T_STREET,      " +
+                          " adr.T_HOUSE,  adr.T_NUMCORPS,  RegExp_substr( adr.T_FLAT,'\\d*') FLAT,   " + 
+                          " SUBSTR(adr.T_FLAT, NVL(LENGTH(RegExp_substr( adr.T_FLAT,'\\d*'))+1,0)) LITERA, " +
+                          " adr.T_TYPE, adr.T_PHONENUMBER, adr.T_KLADR  " 
+                       " FROM DADRESS_DBT adr WHERE " +
+                          " adr.T_PARTYID = ? AND " +
+                          " ( adr.T_TYPE = 1 OR adr.T_TYPE = 2)" 
+                          " ORDER BY T_TYPE",
+                          "PARTYID", PersonID,
+                          V_GENOBJ);
+        
+    stat = RS.MoveNext();                  
+    if (stat)                          
+      ЗадатьНовыйБлок("ADDR");
+    END;
+
+    While(stat)
+        AddrType = SQL_NVL(RS.Value("T_TYPE"),      V_INTEGER);
+        IF (AddrType == 2)
+          prefix = "f"
+        ELSE
+          prefix = "";
+        END;
+        ValString = SQL_NVL(RS.Value("T_KLADR"),        V_STRING);
+        if (LegForm == 1)
+            ДобавитьВБлок(prefix+"street",   A, 19, Substr(ValString,1,19), YES);
+        else
+        ДобавитьВБлок(prefix+"street",   A, 19, Substr(ValString,1,19));
+        END;
+        StreetStr = SQL_NVL(RS.Value("T_CODEREGION"),   V_STRING)+" "+
+                    SQL_NVL(RS.Value("T_REGION"),       V_STRING)+","+
+                    SQL_NVL(RS.Value("t_CodeProvince"), V_STRING)+" "+
+                    SQL_NVL(RS.Value("T_PROVINCE"),     V_STRING)+","+
+                    SQL_NVL(RS.Value("T_CODEDISTRICT"), V_STRING)+" "+
+                    SQL_NVL(RS.Value("T_DISTRICT"),     V_STRING)+","+
+                    SQL_NVL(RS.Value("t_codeplace"),    V_STRING)+" "+
+                    SQL_NVL(RS.Value("T_PLACE"),        V_STRING)+","+
+                    SQL_NVL(RS.Value("T_CODESTREET"),   V_STRING)+" "+
+                    SQL_NVL(RS.Value("T_STREET"),       V_STRING);
+        StreetStr = StrSubst(StreetStr,", ,",",");                    
+        if (StrLen (Trim (StreetStr)) <= 3)
+            StreetStr = "";
+        END;
+        if (LegForm == 1)
+            ДобавитьВБлок(prefix+"street_nm", A, 200, StreetStr);
+        else
+            ДобавитьВБлок(prefix+"street_nm", A, 200, StreetStr,YES);
+        END;
+        Val = SQL_NVL(RS.Value("T_HOUSE"),      V_STRING);
+        ДобавитьВБлок(prefix+"house",     A, 0, Val,YES);
+        
+        ValString = SQL_NVL(RS.Value("T_NUMCORPS"), V_STRING);
+        ДобавитьВБлок(prefix+"block",     A, 10, ValString);
+        
+        Val = SQL_NVL(RS.Value("FLAT"),      V_STRING);
+        ДобавитьВБлок(prefix+"flat",      A, 0, Val,YES);
+        
+        Val = SQL_NVL(RS.Value("LITERA"),      V_STRING);
+        ДобавитьВБлок(prefix+"litera",      A, 0, Val);
+        
+        Val = SQL_NVL(RS.Value("T_POSTINDEX"),      V_STRING);
+        if (LegForm == 1)
+        ДобавитьВБлок(prefix+"post_index",A, 0,  Val);
+        else
+            ДобавитьВБлок(prefix+"post_index",A, 0,  Val, YES);
+        END;
+        stat = RS.MoveNext();        
+    END; 
+    
+    if (prefix != "err")
+      ВставитьБлок(); // ADDR
+    END;
+
+
+END;
+
+//////////////////////////////////// 
+//
+// OINFO{DATA,DOC,ADDR}
+//
+MACRO ЗаполнитьБлокИнфПоЗаемщику( PersonID )       // П.6
+VAR Person,LF,ValString = "",Val,OldClientID;
+VAR TypeClient,RSP,RSE;
+
+    IF (ValType(PersonID) != V_INTEGER)
+      PersonID = credit_c.rec.ClientID_Ref;
+    END;
+      OldClientID = ClientID;
+      ClientID = PersonID;
+
+    LF =  CRSDCommand("SELECT party.*, "
+                          "NVL ((SELECT pc.t_code FROM dpartcode_dbt pc "
+                          "WHERE pc.t_partyid = party.t_partyid AND "
+                          " pc.t_codekind = 16), CHR (0)) T_INN, "
+                          "NVL ((SELECT pc.t_code FROM dpartcode_dbt pc "
+                          "WHERE pc.t_partyid = party.t_partyid AND "
+                          " pc.t_codekind = 27), CHR (0)) T_EGRN "
+                      " FROM DPARTY_DBT party "
+                      " WHERE party.T_PARTYID = "+ PersonID,V_GENOBJ);
+
+    IF (NOT(LF.MoveNext()))
+        InsErrorMessage("Блок: OINFO Не найдена запись Заемщика/Поручителя! - Блок Обязателен для заполнения");
+        ClientID = OldClientID;
+        RETURN;
+    END;
+    
+    Val = SQL_NVL(LF.Value("T_LEGALFORM"),    V_INTEGER);
+    НачатьСложныйБлок("OINFO");
+    
+    IF (Val == 2) // Физик
+      Person =  CRSDCommand("SELECT person.*, party.* FROM DPARTY_DBT party, DPERSN_DBT person "
+                        " WHERE person.T_PERSONID = party.T_PARTYID" 
+                        " AND party.T_PARTYID = "+PersonID, V_GENOBJ);
+      IF (Person.MoveNext())
+        ДобавитьВБлок("t",       A, 0,   "1",YES,YES);
+        
+        ЗадатьНовыйБлок("DATA");
+        ValString = SQL_NVL(Person.Value("T_NAME1"),    V_STRING);
+        ДобавитьВБлок("lastname", A, 30, ValString, YES);
+        
+        ValString = SQL_NVL(Person.Value("T_NAME2"),    V_STRING);
+        ДобавитьВБлок("firstname", A, 30, ValString, YES);
+        
+        ValString = SQL_NVL(Person.Value("T_NAME3"),    V_STRING);
+        ДобавитьВБлок("patronymic", A, 30, ValString);
+        
+        ValString = SQL_NVL(LF.Value("T_INN"),    V_STRING);
+        ДобавитьВБлок("inn", A, 12, GetINNFromStr(ValString, 12)); // 123970 - YES
+        
+        ValString = SQL_NVL(Person.Value("T_BORN"),    V_DATE);
+        ДобавитьВБлок("bd", D, 0, ValString, YES);
+        
+        ValString = SQL_NVL(Person.Value("t_isemployer"), V_STRING);
+        if (ValString == "X")
+            ДобавитьВБлок("is_biz", A, 0, "1", YES);
+            // Данные о регистрации
+            RSE = CRSDCommand("SELECT * FROM DOBJRGDOC_DBT pr WHERE " +
+                                " pr.T_OBJECTID     = ? " +
+                                " AND pr.T_OBJECTTYPE   = ? " +
+                                " AND pr.T_REGPARTYKIND = ? " +
+                                " AND pr.T_REGDOCKIND   = ? "+
+                                " AND pr.T_ISMAIN = ? ",
+                              "OBJECTID", PersonID,
+                              "OBJECTTYPE",      3,
+                              "REGPARTYKIND",    7,
+                              "REGDOCKIND",     4,   // 4 - ID сивдетельсва о регистрации
+                              "ISMAIN",   "X",
+                              V_GENOBJ);
+            IF (RSE.MoveNext())
+               ValString = SQL_NVL(RSE.Value("T_NUMBER"),    V_STRING);
+               ДобавитьВБлок("biz_cert", A, 20, ValString, YES);
+            END;
+        ELSE
+            ДобавитьВБлок("is_biz", A, 0, "0", YES);
+        END;
+        
+        ValString = SQL_NVL(Person.Value("T_BIRSPLASE"),    V_STRING);
+        ДобавитьВБлок("place", A, 200, ValString, YES);
+        
+        ДобавитьВБлок("place_cd", A, 1, "");
+        
+        ValString = lbkicont.rec.AccessCode;
+        IF (OldClientID != ClientID) 
+            ДобавитьВБлок("code", A, 50, "");  // Для поручителей не заполняется
+        ELSE
+            ДобавитьВБлок("code", A, 50, ValString); // 123969 (-YES)
+        END;
+        
+        
+        //ДобавитьВБлок("add_code", A, 0, ValString);
+        ВставитьБлок(); // DATA
+        
+        ЗаполнитьБлокАдресаПоЗаемщику(PersonID, Val);
+        
+        // Определим тип клиента
+        val = SQL_NVL(Person.Value("T_LEGALFORM"),  V_INTEGER);
+        ValString =   SQL_NVL(Person.Value("T_ISEMPLOYER"), V_STRING);
+        TypeClient = ТипКлиента(val,ValString);
+
+        IF (TypeClient != PTLEGF_INST)
+           RSP = CRSDCommand("SELECT * FROM DPERSNIDC_DBT pd, DPAPRKIND_DBT pk WHERE " +
+                                   " pd.T_PAPERKIND = pk.T_PAPERKIND " +
+                               " AND pd.T_PERSONID  = ? " +
+                               " AND Nvl(pd.T_ISMAIN, ?) = ? " +
+                             " ORDER BY pd.T_PAPERKIND",
+                             "PERSONID", PersonID,
+                             "ISM",      0,
+                             "ISMAIN",   "X",
+                             V_GENOBJ);
+
+           IF (RSP.MoveNext())
+              ЗадатьНовыйБлок("DOC");
+              
+              ValString = SQL_NVL(RSP.Value("T_CODEDOCUM"),   V_STRING); // Код в справочнике
+              Val       = SQL_NVL(RSP.Value("T_PAPERKIND"),   V_INTEGER); // ID RS_Bank
+              ValString = GetBKIDocID (Val, ValString);
+              ДобавитьВБлок("t", N, 0, ValString, YES);
+              //ДобавитьВБлок("t_nm", A, 100, ValString, YES);
+              
+              ValString = SQL_NVL(RSP.Value("T_PAPERSERIES"), V_STRING); // Серия документа
+              ДобавитьВБлок("seria", A, 0, FullStringTrim(ValString), YES);
+              
+              ValString = SQL_NVL(RSP.Value("T_PAPERNUMBER"), V_STRING); // Номер документа
+              ДобавитьВБлок("number", A, 0, FullStringTrim(ValString), YES);
+              
+              ValString = SQL_NVL(RSP.Value("T_PAPERISSUEDDATE"), V_DATE); // Дата выдачи документа
+              ДобавитьВБлок("date_iss", D, 0, ValString, YES);
+
+              //SQL_NVL(RSP.Value("T_PAPERISSUERCODE"), V_STRING); // Код подразделения
+              ValString = SQL_NVL(RSP.Value("T_PAPERISSUER"),     V_STRING);
+              ДобавитьВБлок("who_iss", A, 100, ValString, YES);
+      
+              ВставитьБлок(); // DOC
+           ELSE
+              InsErrorMessage("Блок: DOC. Не найден документ, удостоверяющий личность - Блок Обязателен для заполнения");
+              // RETURN; TFS SCR 168162
+           END;
+        END;           
+       
+        ВставитьСложныйБлок(); // OINFO
+        ClientID = OldClientID;
+        RETURN;
+      END;
+    ELSE
+        IF (Val == 1) // Юрик
+            ДобавитьВБлок("t",       A, 0,   "0",YES,YES);
+            
+            ЗадатьНовыйБлок("DATA");
+
+            //ДобавитьВБлок("id", A, 0, ValString, YES);
+            ValString = SQL_NVL(LF.Value("T_INN"),    V_STRING);
+            ДобавитьВБлок("inn", A, 12, GetINNFromStr(ValString, 12),YES); // 123970 - YES
+
+            ValString = SQL_NVL(LF.Value("T_NAME"),    V_STRING);
+            ДобавитьВБлок("name", A, 100, ValString, YES);
+
+            ValString = SQL_NVL(LF.Value("T_SHORTNAME"),    V_STRING);
+            ДобавитьВБлок("snams", A, 50, ValString);
+
+            ValString = SQL_NVL(LF.Value("T_ADDNAME"),    V_STRING);
+            ДобавитьВБлок("finame", D, 100, ValString);
+
+            ValString = SQL_NVL(LF.Value("T_LATNAME"),    V_STRING);
+            ДобавитьВБлок("foname", A, 100, ValString);
+
+            Person =  CRSDCommand("SELECT adr.T_PHONENUMBER FROM DADRESS_DBT adr WHERE "
+                                  "adr.T_TYPE = 1 AND  adr.T_PARTYID =  "+PersonID, V_GENOBJ);
+            Person.MoveNext();
+
+            ValString = SQL_NVL(Person.Value("T_PHONENUMBER"),    V_STRING);
+            ДобавитьВБлок("phone", A, 100, ValString, YES);
+
+            ValString = SQL_NVL(LF.Value("T_EGRN"),    V_STRING);
+            ДобавитьВБлок("egrn", A, 13, ValString, YES);
+
+
+            Person =  CRSDCommand("SELECT person.* FROM DPARTY_DBT party, DOFFICER_DBT officer, DPERSN_DBT person WHERE " 
+                                  "officer.T_PARTYID =  party.T_PARTYID AND officer.T_ISFIRSTPERSON = ? "
+                                  " AND party.T_PARTYID = ? AND person.T_PERSONID = officer.T_PERSONID", 
+                                  "ISFIRSTPERSON","X",
+                                  "PERSONID", PersonID,V_GENOBJ);
+            ValString = "";                                  
+            IF (Person.MoveNext())
+
+                ValString = SQL_NVL(Person.Value("T_NAME1"),    V_STRING);
+                ValString = ValString+" "+SQL_NVL(Person.Value("T_NAME2"),    V_STRING);
+                ValString = ValString+" "+SQL_NVL(Person.Value("T_NAME3"),    V_STRING);
+            END;
+            ДобавитьВБлок("boss_name", A, 100, ValString);
+            
+            ValString = lbkicont.rec.AccessCode;
+            IF (OldClientID != ClientID) 
+                ДобавитьВБлок("code", A, 50, "");  // Для поручителей не заполняется
+            ELSE
+                ДобавитьВБлок("code", A, 50, ValString);// 123969 (-YES)
+            END;
+            //ДобавитьВБлок("add_code", A, 0, "", YES);
+
+            ВставитьБлок(); // DATA
+
+            ЗаполнитьБлокАдресаПоЗаемщику(PersonID, Val);
+            
+            ВставитьСложныйБлок(); // OINFO
+            ClientID = OldClientID;
+            RETURN;
+        END;
+    END;                      
+                          
+    InsErrorMessage("Блок: OINFO Не найдена форма Заемщика/Поручителя! - Блок Обязателен для заполнения");
+    ClientID = OldClientID;
+END;
+
+
+//////////////////////////////////// 
+//
+// (GUAR_TYPE, DOLSTART, DOLEND, DOL, CUR,GUARANTEE)xКолВо_ДО
+// (GUAR_TYPE, GUARANTEE {DOLSTART, DOLEND, DOL, CUR},OINFO{DATA,DOC,ADDR})xКолВо_ДПоручительсва
+MACRO ЗаполнитьБлокИнформацииПоДО()      // П.4
+    VAR RS,Val,Val2,Cur,GuarType,stat,i = 0,n = 0;
+    RS = CRSDCommand("SELECT ens.*, ens_crd.T_REZCURCODE FROM DENS_CRD_DBT ens_crd, DENSCONTR_DBT ens WHERE "
+                     "ens.T_ENSCONTRACTID =  ens_crd.T_ENSCONTRACTID_REF AND "
+                     "ens_crd.T_CREDITNUMBER_REF = ? ",
+                     "CreditNumber", CreditNumber,V_GENOBJ);
+    
+    stat = RS.MoveNext();
+    // блок PROVIDE не обязательный но в нем должны быть коскадом блоки R
+    IF (stat) 
+      НачатьСложныйБлок("PROVIDE");
+    END;
+    
+    WHILE(stat)
+        i = i + 1;
+        НачатьСложныйБлок("R");
+
+        ЗадатьНовыйБлок("GUAR_TYPE");
+        Val = SQL_NVL(RS.Value("T_ENSSYSTYPE"),V_INTEGER);
+        Val2= SQL_NVL(RS.Value("T_ENSSYSTYPE"),V_INTEGER);
+        GetGuarType(Val,Val2,@Val,@GuarType);
+        ДобавитьВБлок("nm", A, 0,   Val);
+        ДобавитьВБлок("", N, 0,  GuarType, YES);
+        ВставитьБлок();
+
+        IF ((GuarType != 1) AND (GuarType > 0)) // НЕ Поручительсво
+            ЗадатьНовыйБлок("DOLSTART");
+            Val = SQL_NVL(RS.Value("T_ENSCONTRACTFIRSTDATE"),V_DATE);
+            ДобавитьВБлок("", D, 0,  Val, YES);
+            ВставитьБлок();
+                
+            ЗадатьНовыйБлок("DOLEND");
+            Val = SQL_NVL(RS.Value("T_ENSCONTRACTLASTDATE"),V_DATE);
+            ДобавитьВБлок("", D, 0,  Val, YES);
+            ВставитьБлок();
+
+            ЗадатьНовыйБлок("DOL");
+            Val = String(SQL_NVL(RS.Value("T_ENSCONTRACTSUM"),V_MONEY));
+            ДобавитьВБлок("", A, 0,  Val, YES);
+            ВставитьБлок();
+
+            ЗадатьНовыйБлок("CUR");
+            Val = SQL_NVL(RS.Value("T_REZCURCODE"),V_INTEGER);
+            Cur = CRSDCommand("SELECT cur.T_NAME FI_NAME, cur.T_FI_CODE FI_CODE FROM DFININSTR_DBT cur WHERE cur.T_FIID = "+Val,V_GENOBJ);
+            IF (Cur.MoveNext())
+              Val = SQL_NVL(Cur.Value("FI_NAME"),  V_STRING);
+              ДобавитьВБлок("nm",   A, 0,   Val,YES);
+              Val = SQL_NVL(Cur.Value("FI_CODE"),  V_STRING);
+              ДобавитьВБлок("",   A, 0,   Val,YES);
+              ВставитьБлок();
+            ELSE
+                InsErrorMessage("Блок: CUR Не найдена валюта! - Поле Обязательно для заполнения");
+            END;
+            
+            Val = RS.Value("T_ENSCONTRACTID");
+            
+            ЗадатьНовыйБлок("GUARANTEE");
+            Val = GetOOLongName(Val);
+            IF (StrLen(Val) > 1)
+                ДобавитьВБлок("",   A, 0,   Val, YES); // Получить Длинное имя Гарантии 123584
+            ELSE
+                ДобавитьВБлок("",   A, 0,   "НЕУСТОЙКА",YES);
+            END;
+            ВставитьБлок();
+            
+        ELSE
+            IF (GuarType == 0) // Неустойка и Все Все Все
+              Val = RS.Value("T_ENSCONTRACTID");
+              ЗадатьНовыйБлок("GUARANTEE");
+              ДобавитьВБлок("",   A, 0,   GetOOLongName(Val),YES); // 123584
+              ВставитьБлок();
+            ELSE // Блоки Поручительсва
+                НачатьСложныйБлок("GUARANTEE");
+                НачатьСложныйБлок("R");
+                
+                ЗадатьНовыйБлок("ID");
+                ВставитьБлок();
+            
+                ЗадатьНовыйБлок("TYPE");
+                ДобавитьВБлок("", N, 0,  1, YES);
+                ВставитьБлок();
+
+                ЗадатьНовыйБлок("DOLSTART");
+                Val = SQL_NVL(RS.Value("T_ENSCONTRACTFIRSTDATE"),V_DATE);
+                ДобавитьВБлок("", D, 0,  Val, YES);
+                ВставитьБлок();
+                    
+                ЗадатьНовыйБлок("DOLEND");
+                Val = SQL_NVL(RS.Value("T_ENSCONTRACTLASTDATE"),V_DATE);
+                ДобавитьВБлок("", D, 0,  Val, YES);
+                ВставитьБлок();
+
+                ЗадатьНовыйБлок("DOL");
+                Val = String(SQL_NVL(RS.Value("T_ENSCONTRACTSUM"),V_MONEY));
+                ДобавитьВБлок("", A, 0,  Val, YES);
+                ВставитьБлок();
+
+                ЗадатьНовыйБлок("CUR");
+                Val = SQL_NVL(RS.Value("T_REZCURCODE"),V_INTEGER);
+                Cur = CRSDCommand("SELECT cur.T_NAME FI_NAME, cur.T_FI_CODE FI_CODE FROM DFININSTR_DBT cur WHERE cur.T_FIID = "+Val,V_GENOBJ);
+                IF (Cur.MoveNext())
+                  Val = SQL_NVL(Cur.Value("FI_NAME"),  V_STRING);
+                  ДобавитьВБлок("nm",   A, 0,   Val,YES);
+                  Val = SQL_NVL(Cur.Value("FI_CODE"),  V_STRING);
+                  ДобавитьВБлок("",   A, 0,   Val,YES);
+                  ВставитьБлок();
+                ELSE
+                    InsErrorMessage("Блок: CUR Не найдена валюта! - Поле Обязательно для заполнения");
+                END;
+                
+                Val = SQL_NVL(RS.Value("T_ENSCONTRACTPERSONID_REF"),V_INTEGER);
+                ЗаполнитьБлокИнфПоЗаемщику(Val);
+                
+                ВставитьСложныйБлок(YES); // R
+                ВставитьСложныйБлок(); // GUARANTEE
+            END;
+        END;
+
+        ВставитьСложныйБлок(); // R
+        stat = RS.MoveNext();
+    END; 
+    IF (i > 0) // Только если бы Хотябы один блок  R вставляем окончание блока
+      ВставитьСложныйБлок(); // PROVIDE
+    END;
+END;
+
+
+//////////////////////////////////// 
+//
+// DOG_ADD,SUD
+//
+MACRO ЗаполнитьБлокДопИнформацииПоКД()   // П.5
+VAR RS,RS_Pay,ExpDate = date(0,0,0),ExpSum,DyteSum,Val;
+
+  // переоформления
+  RS = CRSDCommand(" select t_rebillingdate NoteDate,t_rebillingnote Note FROM dchange_t_dbt "
+                   " where  t_creditnumber_ref = ? AND "
+                   " t_rebillingdate >= "+GetSQLDate(НачПерФормКи) +" AND "
+                   " t_rebillingdate <= "+GetSQLDate(ReportDate), 
+                   "CreditNumber", CreditNumber,V_GENOBJ);
+  WHILE(RS.MoveNext())
+    Val  =    SQL_NVL(RS.Value("Note"),  V_STRING);
+    ExpDate = SQL_NVL(RS.Value("NoteDate"),  V_DATE);
+
+    НачатьСложныйБлок("DOG_ADD");
+    ЗадатьНовыйБлок("R");
+    ДобавитьВБлок("id",   A, 1, "");
+    ДобавитьВБлок("d",   D, 0,  ExpDate,YES);
+    ДобавитьВБлок("m",   A, 0,  Val,YES);
+    ВставитьБлок();
+    ВставитьСложныйБлок(); // DOG_ADD
+  END;
+
+  // Вынос на просрочку
+  RS = CRSDCommand("SELECT pln.T_CREDOPERDATE EXP_DATE "
+                   "FROM DPLANFACT_DBT pln WHERE "
+                   "pln.T_SYSTEMOPERATIONID_REF = "+CS_EXP+" AND "
+                   "pln.T_CREDITNUMBER = ? AND "
+                   "pln.T_CREDOPERDATE >= "+GetSQLDate(НачПерФормКи) +" AND "
+                   "pln.T_CREDOPERDATE <= "+GetSQLDate(ReportDate) +
+                   "GROUP BY pln.T_CREDOPERDATE ",
+                   "CreditNumber", CreditNumber,V_GENOBJ);
+  WHILE(RS.MoveNext())
+    ExpDate = SQL_NVL(RS.Value("EXP_DATE"),  V_DATE);
+
+    НачатьСложныйБлок("DOG_ADD");
+    ЗадатьНовыйБлок("R");
+    ДобавитьВБлок("id",   A, 1, "");
+    ДобавитьВБлок("d",   D, 0,  ExpDate,YES);
+    ДобавитьВБлок("m",   A, 0,  "Допущена просрочка по договору",YES);
+    ВставитьБлок();
+    ВставитьСложныйБлок(); // DOG_ADD
+  END;
+  
+  // Погащение просрочки
+  IF ( IsClaimRegsEmpty( ReportDate ) )
+      RS_Pay=CRSDCommand("SELECT MAX(PDate) EXP_PAY_DATE From ( "
+           " SELECT T_CREDOPERDATE PDate,SUM(T_CLAIMSUM) Claim,SUM(T_UNDERPAYSUM)Rests  FROM DPLANFACT_DBT  "
+           " WHERE T_SYSTEMOPERATIONID_REF = "+CS_DUTY+" AND T_CREDITNUMBER = ? AND "
+       " (T_DUTYSTAGEID_REF In ("+DS_EXPPERC+","+DS_EXPDUTY+","+DS_NOOVCRDEXPDUTY+","+DS_NOOVCRDEXPPERC+
+       ","+DS_LOANACCOPEXPKOMISS+","+DS_CRLINEOPENLIMEXPKOMISS+
+       ","+DS_NOLIMITEXPKOMISS+","+DS_PAYEDGUAREXPKOMISS+
+       ","+DS_RESOURCERESERVEXPKOMISS+","+DS_PAYMGUAREXPPERC+
+       ","+DS_EXPPAYMGUARANTEE+") ) AND "
+       " T_CREDOPERDATE >= "+GetSQLDate(НачПерФормКи)+" AND "
+           " T_CREDOPERDATE <= "+GetSQLDate(ReportDate)+
+           " GROUP By T_CREDOPERDATE )  PayDate "
+           " WHERE PayDate.Claim > 0  AND   PayDate.Rests = 0 ",
+           "CreditNumber", CreditNumber,V_GENOBJ);
+      IF(RS_Pay.MoveNext())
+        ExpDate = SQL_NVL(RS_Pay.Value("EXP_PAY_DATE"),  V_DATE);
+        IF (ExpDate > Date(0,0,0))
+            НачатьСложныйБлок("DOG_ADD");
+            ЗадатьНовыйБлок("R");
+            ДобавитьВБлок("id",   A, 1, "");
+            ДобавитьВБлок("d",   D, 0,  ExpDate,YES);
+            ДобавитьВБлок("m",   A, 0,  "Просрочка погашена",YES);
+            ВставитьБлок();
+            ВставитьСложныйБлок(); // DOG_ADD
+        END;
+      END;
+   END;      
+  
+   RS = CRSDCommand("SELECT * FROM DLCOURTI_DBT sud_info WHERE sud_info.T_CREDITNUMBER_REF = ? AND "
+                   "(T_KINDINF = 2 OR T_KINDINF = 1)  AND "
+                   "sud_info.T_DATE >= "+GetSQLDate(НачПерФормКи),
+                   "CreditNumber", CreditNumber,V_GENOBJ);
+   WHILE(RS.MoveNext())
+      НачатьСложныйБлок("SUD");
+      ЗадатьНовыйБлок("R");
+
+      ДобавитьВБлок("id",   A, 1, "");
+      Val = SQL_NVL(RS.Value("T_DATE"),  V_DATE);
+      ДобавитьВБлок("d",   D, 0,  Val,YES);
+      Val = SQL_NVL(RS.Value("T_NOTE"),  V_STRING);
+      ДобавитьВБлок("m",   A, 200,  Val,YES);
+
+      ВставитьБлок(); // R
+      ВставитьСложныйБлок(); // SUD
+   END;
+
+   ВставитьСложныйБлок(); // DOG
+END;
+
+
+
+//////////////////////////////////// 
+//
+// GOS, BANKROT
+//
+MACRO ЗаполнитьБлокДопИнфПоЗаемщику()    // П.7
+   VAR Str,TempStr,DateStr,n = 0, k = 1;
+   VAR RS,Val;
+   VAR RetDate: date;
+   
+   RS = CRSDCommand("SELECT * FROM DLCOURTI_DBT sud_info WHERE sud_info.T_CREDITNUMBER_REF = ? AND "
+                    "T_KINDINF = 3 AND "
+                    "sud_info.T_DATE >= "+GetSQLDate(НачПерФормКи),
+                    "CreditNumber", CreditNumber,V_GENOBJ);
+   WHILE(RS.MoveNext())
+       ЗадатьНовыйБлок("GOS");
+       ДобавитьВБлок("id",   A, 1, "");
+       Val = SQL_NVL(RS.Value("T_DATE"),  V_DATE);
+       ДобавитьВБлок("d",   D, 0,  Val,YES);
+       Val = SQL_NVL(RS.Value("T_NOTE"),  V_STRING);
+       ДобавитьВБлок("m",   A, 200,  Val,YES);
+       ВставитьБлок(); // GOS
+   END;
+
+   // Получаем информацию о банкротсве
+   client.partyid = credit_c.rec.ClientID_Ref;
+   Str = readNoteForObject(OBJTYPE_PARTY, UniID(client, OBJTYPE_PARTY), 44, НачПерФормКи, RetDate);
+   IF (StrLen(Str) > 1)
+       ЗадатьНовыйБлок("BANKROT");
+       ДобавитьВБлок("id",   A, 1,  "");
+       ДобавитьВБлок("d",   D, 0,  RetDate);
+       ДобавитьВБлок("m",   A, 20, Substr(Str,1,20));
+       ВставитьБлок(); // BAKROT
+   END;
+END;
+
+
+//////////////////////////////////// 
+//
+//
+//
+MACRO КонецФайлаБКИ()
+   xml.appendChild(root);
+END;
+
+//////////////////////////////////// 
+// Сохранение файла / Отказ в сохранение (имеются ошибки)
+//
+//
+MACRO СохранитьФайлБКИ(ИмяФайла)
+   IF (NOT(GENERAL_FAILURE) OR (NOT {GROUP_MODE}))
+       xml.Save(ИмяФайла);
+   END;
+END;
+
+//////////////////////////////////// 
+// Получить Параметры которые НЕ МЕНЯЮТСЯ:
+//
+//
+MACRO ПолучитьБазовыеПараметры(BkiID: Integer, CrdNum: integer, SendKind: integer)
+   VAR stat;
+   lbki.rec.BkiID = BkiID;
+   IF (NOT lbki.GetEQ())
+      LoansError("Не найдено БКИ №" + BkiID);
+      RETURN FALSE;
+   END;
+
+   // Найдем КД
+   credit_c.rec.CreditNumber = CrdNum;
+   IF (NOT credit_c.GetEQ())
+      LoansError("Не найден договор №" + CrdNum);
+      RETURN FALSE;
+   END;
+   
+   lbkicont.AddFilter("T_CREDITNUMBER_REF = " + CrdNum +
+                 " AND T_BKIID_REF        = " + BkiID);
+   lbkicont.rec.CreditNumber_Ref = CrdNum;
+   lbkicont.rec.BkiID_Ref        = BkiID;
+   stat = lbkicont.GetEQ();
+   lbkicont.DropFilter();
+   IF ((NOT stat)                               OR
+       (lbkicont.rec.BkiID_Ref        != BkiID) OR
+       (lbkicont.rec.CreditNumber_Ref != CrdNum))
+      LoansError("Договор №"+CrdNum+" не привязан к БКИ №"+BkiID);
+      RETURN FALSE;
+   END;
+
+   ClientID = credit_c.rec.ClientID_Ref;
+   CreditNumber = credit_c.rec.CreditNumber;
+   ObjectTypeID = credit_c.rec.Crd_kind; // GetCrdKind(credit_c.rec.Crd_kind); - только для 4ки
+END;
+
+//////////////////////////////////// 
+// Получить Измененяемые праметры и все зависящеие от них данные
+// (как можно больше)
+//
+MACRO ПолучитьВсюИнформациюПоКД(BkiID: Integer, CreditNumber: integer, SendKind: integer)
+END;
+
+MACRO СформироватьИмяФайла(SendKind : INTEGER)
+   VAR rs : RsdRecordset;
+   VAR BIC : string = "000";
+   VAR BIC_temp = "BIC";
+   VAR ИмяФайла : string  = lbki_rec.TemplateName;
+   VAR CrdName = credit_rec.UsCreditNumber;
+   VAR NCount = "NNNNNNNNNNNN"; // Изходя из Шаблона: BIC-NNNNNNNNNNNN.XMC
+   VAR Achtung = "\\/:*?\x22<>|\x01";
+   VAR tempStr : string;
+   VAR tempStr2 : string;
+   VAR OldLen = 0;
+   VAR i = 0;
+   
+   IF (( ValType(opoper) == V_UNDEF ) AND      // Есди запускаем из групового режима возвращаем шаблон 123768
+       ( ValType(_legalform) == V_UNDEF ) AND 
+       (( ValType(credit_rec) == V_UNDEF ) OR
+        ( credit_rec.CreditNumber == 0 )) )
+       RETURN lbki_rec.TemplateName;
+   END;
+  
+   
+   // Определение количесва N в шаблоне 123736
+   tempStr2 = SubStr(lbki_rec.TemplateName,Index(lbki_rec.TemplateName,"N"),
+                      Index(lbki_rec.TemplateName,".")-Index(lbki_rec.TemplateName,"N"));
+   OldLen = StrLen (tempStr2);
+   tempStr2 = Trim (StrSubst (tempStr2, "N", " "));
+   tempStr = SubStr(lbki_rec.TemplateName,Index(lbki_rec.TemplateName,"N"),
+                      OldLen - StrLen (tempStr2));
+   IF (StrLen(tempStr) > 1 ) 
+      NCount = tempStr;
+   END;
+   
+   IF (credit_rec.CreditNumber == 0)
+      RETURN "";
+   END;
+   
+   // Находим BIC
+   rs = RsdRecordset("SELECT DP.T_PARENTCODE,DP.T_CODE,DP.T_NAME  FROM DDP_DEP_DBT DP WHERE DP.T_CODE = "+credit_rec.FNCASH);
+   rs.MoveNext();
+   IF ( rs.value("T_PARENTCODE") == 0)
+     BIC = rs.value("T_CODE");
+   ELSE
+     BIC = rs.value("T_NAME"); //T_PARENTCODE 123735
+   END;
+  
+   IF (Trim(BIC) == StrFor(1))
+      BIC = "";
+   END;
+   
+   IF (Trim (CrdName) == StrFor(1))
+      CrdName = "";
+   END;
+   
+   // Устанавливаем BIC
+   IF (Index(ИмяФайла,BIC_temp) != 0)
+      ИмяФайла = SubStr(ИмяФайла, 1, Index(ИмяФайла, BIC_temp) - 1) +
+                 BIC +
+                 SubStr(ИмяФайла, Index(ИмяФайла, BIC_temp) + StrLen(BIC_temp));
+   END;
+  
+   // Обрабатываем длинну договора
+   IF (Index(ИмяФайла,NCount) != 0)
+      IF (StrLen(CrdName) > StrLen(NCount)) // Обрезаем название
+         tempStr = SubStr(CrdName, StrLen(CrdName)-StrLen(NCount)+1, StrLen(NCount));  // обрезаем имя договора с начала
+    
+         ИмяФайла = SubStr(ИмяФайла, 1,Index(ИмяФайла,NCount)-1)+
+                    tempStr+ //SubStr(CrdName, 1, StrLen(NCount))+ // 122998
+                    SubStr(ИмяФайла, Index(ИмяФайла,NCount)+StrLen(NCount));
+      ELSE // Обрезаем договор до длинны шаблона
+         ИмяФайла = SubStr(ИмяФайла, 1,Index(ИмяФайла,NCount)-1)+
+                    CrdName +
+                    SubStr(ИмяФайла, Index(ИмяФайла,NCount)+StrLen(NCount));
+      END;
+   END;
+   
+   FOR (i, 1, StrLen (Achtung), 1)
+      ИмяФайла = StrSubst (ИмяФайла, SubStr(Achtung, i, 1), "");
+   END;
+   
+   IF (SendKind == REQUEST_FULL)
+     НачПерФормКи = credit_rec.RegDate;
+   END;
+   
+   IF (SendKind == REQUEST_CHNG)
+       НачПерФормКи = CRSDCommand("SELECT MAX(T_SENDDATE) + 1 FROM DLDEVBKI_DBT ld, DLTR_FILE_DBT lr WHERE " +
+                                        " ld.T_CREDITNUMBER_REF = ? " +
+                                    " AND ld.T_BKIID_REF        = ? " +
+                                    " AND LD.T_RESULT         = '+' " +
+                                    " AND LR.T_TFID = LD.T_TFID_REF " +
+                                    " AND LR.T_RESULTLOAD = 0",
+                                  "p1", credit_rec.CreditNumber,
+                                  "p2", lbki_rec.BKIID,
+                                 V_DATE);
+
+       IF (НачПерФормКи == date(0,0,0))
+          НачПерФормКи = credit_rec.RegDate;
+
+       ELIF (НачПерФормКи == (ReportDate + 1))
+          НачПерФормКи = ReportDate;
+
+       END;
+   END;
+  
+   RETURN ИмяФайла;
+END;
+
+
+////////////////////////////////////////////////////////////////////////////////
+//
+// Функция вызывается из Сишника, при индивидуальной передаче информации
+// Параметры:
+//    TFID         - ID Транспортного файла
+//    BkiID        - ID БКИ
+//    CreditNumber - ID Договора
+//    SendKind     - Вид передачи (2 - Полная    КИ)
+//    Path         - Путь
+//    FileName     - Имя файла
+//    DateStart    - Начало периода формирования КИ
+//
+MACRO СформироватьТранспортныйФайл(TFID: integer, BkiID: Integer, CreditNumber: integer, SendKind: integer, Path: string, FileName: string, DateStart: date, AutoFindStartDateFlag: bool )
+   VAR ID = 0, FLAG = "";
+
+   IF (DateStart > ReportDate)
+      InsErrorMessage("Дата начала периода не может быть больше даты отчета");
+      LoansError("Дата начала периода не может быть больше даты отчета");
+      RETURN FALSE;
+   END;
+
+   Path = TRIM(Path) + "\\" + TRIM(FileName);
+  
+   IF ((ValType (AutoFindStartDateFlag) == V_UNDEF) or (AutoFindStartDateFlag == false))
+      НачПерФормКи = DateStart;
+   END;
+  
+   IF ( ValType(ReportDate) != V_UNDEF )
+     IF (DateStart > ReportDate ) // 123582
+     ReportDate = DateStart;
+     END;
+   ELSE
+      ReportDate = DateStart;
+   END;
+  
+   IF (not {GROUP_MODE})
+       LnSqlExec("DELETE FROM DREZ_ERR_TMP");      
+   END;
+
+   IF ((SendKind != REQUEST_CHNG) AND (SendKind != REQUEST_FULL))
+      LoansError("Данный вид передачи не предусмотрен!");
+      RETURN FALSE;
+   END;
+  
+   // TFS. SCR 190724
+   IF (ReportDate < date(01,07,2014))
+      ID = CRSDCommand("SELECT MAX(T_ID) FROM DLCONSDEV_DBT WHERE T_CREDITNUMBER_REF = ? AND T_CHANGEDATE <= ?",
+                       "p1", CreditNumber,
+                       "p2", {CURDATE},
+                      V_INTEGER);
+
+      IF (ID > 0)
+         // Флаг согласия на передачу КИ
+         FLAG = CRSDCommand("SELECT T_FLAG FROM DLCONSDEV_DBT WHERE T_ID = ?",
+                            "p1", ID,
+                           V_STRING);
+
+         IF (Flag != "X")
+            LoansError("Передавать КИ нельзя, так как нет согласия заемщика");
+            RETURN FALSE;
+         END;
+      ELSE
+         LoansError("Передавать КИ нельзя, так как нет согласия заемщика!");
+         RETURN FALSE;
+      END;
+   END;
+
+   gl_TFID = TFID;
+   
+   ПолучитьБазовыеПараметры(BkiID, CreditNumber, SendKind);
+   ПолучитьВсюИнформациюПоКД(BkiID, CreditNumber, SendKind);
+         
+   НачалоФайлаБКИ();
+   ЗаполнитьБлокОбщейИнформации( FileName );
+   ЗаполнитьБлокИнформацииПоКД();
+   ЗаполнитьБлокИнформацииПоДО();
+   ЗаполнитьБлокДопИнформацииПоКД();
+   ЗаполнитьБлокИнфПоЗаемщику();
+   ЗаполнитьБлокДопИнфПоЗаемщику();
+   КонецФайлаБКИ();
+   СохранитьФайлБКИ(Path);
+  
+   RETURN TRUE;
+END;
+
+////////////////////////////////////////////////////////////////////////////////
+//
+// Функция вызывается из Сишника, при пакетной передаче информации
+// Параметры:
+//    TFID         - ID Транспортного файла
+//    BkiID        - ID БКИ
+//    PartyID      - ID Заемщика
+//    SendKind     - Вид передачи (2 - Полная    КИ)
+//    Path         - Путь
+//    FileName     - Имя файла
+//    DateStart    - Начало периода формирования КИ
+//
+MACRO СформироватьТранспортныйФайл_ГрупповойРежим(TFID: integer, BkiID: Integer, SendKind: integer, Path: string, FileName: string, DateStart: date, AutoFindStartDateFlag: bool)
+   VAR change: bool = FALSE,
+       stat  : bool = FALSE;
+   VAR RecCount = 0;
+   VAR RecNum = 0, saveNodeDepth;
+
+   IF (StrLen(FileName) > 1)    // Задаем шаблон Групогого ТФ из панели гупового режима
+      lbki_rec.TemplateName = FileName;
+   END;
+
+   IF (DateStart > ReportDate)
+      InsErrorMessage("Дата начала периода не может быть больше даты отчета");
+      LoansError("Дата начала периода не может быть больше даты отчета");
+      RETURN FALSE;
+   END;
+  
+   LnSqlExec("DELETE FROM DREZ_ERR_TMP");
+
+   RecCount = LnSelectValue("SELECT COUNT(1) FROM DOBJECT_BKI_TMP", V_INTEGER);
+   InitProgress(RecCount, "Ждите идет обработка ...", "Обработано записей" ); 
+
+   VAR RS_OBJ = CRSDCommand("SELECT * FROM DOBJECT_BKI_TMP ORDER BY T_OBJECTTYPEID, T_OBJECTNUMBER", V_GENOBJ);
+
+   WHILE (RS_OBJ.MoveNext)
+      UseProgress( RecNum = RecNum + 1 );
+
+      // Найдем КД
+      credit_c.rec.CreditNumber = RS_OBJ.Value("T_CREDITNUMBER");
+      IF (credit_c.GetEQ())
+         saveNodeDepth = NodeDepth;
+         credit_rec.CreditNumber  =  credit_c.rec.CreditNumber;
+         credit_rec.FNCASH        =  credit_c.rec.FNCASH;
+         credit_rec.RegDate       =  credit_c.rec.RegDate;
+         credit_rec.UsCreditNumber=  credit_c.rec.UsCreditNumber;
+         CreditNumber = credit_rec.CreditNumber;
+         FileName = СформироватьИмяФайла(SendKind);
+         СформироватьТранспортныйФайл(TFID, BkiID, CreditNumber, SendKind, Path, FileName, DateStart,  AutoFindStartDateFlag);
+
+         // SCR 168162
+         IF (GENERAL_FAILURE)
+            NodeDepth = saveNodeDepth;
+         END;
+      END;
+   END;
+
+   RemProgress();
+
+   RETURN TRUE;
+END;
+
+////////////////////////////////////////////////////////////////////////////////
+//
+// ФОРМИРОВАНИЕ ВИРТУАЛЬНОЙ ИСТОРИИ
+//
+// ПАРАМЕТРЫ:
+//   BkiID        - системный номер БКИ
+//   CreditNumber - номер КД
+//   TFID         - Ссылка на транспортный файл
+//   DateStart    - Начало периода формирования КИ
+//   AutoFindStartDateFlag - Заначение фалага: Автоматическое определение (даты начала формирвоание КИ)
+
+MACRO СформироватьВиртуальнуюИсторию(BkiID: Integer, CrdNum: integer, SendKind: integer, TFID: integer, DateStart: date, AutoFindStartDateFlag: integer)
+VAR RSDcmd, RSDcmd1, RSDcmd2, RSDcmd3, RSDcmd4, RSDcmd5, RSDcmd6, RSDcmd7, RSDcmd8, RSDcmd9, RSDcmd10, RSDcmd11, RSDcmd12, RSDcmd13;
+
+   НачПерФормКи = DateStart;
+   if (AutoFindStartDateFlag == 88) // "X"
+     НачПерФормКи = date(1,1,1890);
+   END;
+
+   IF (DateStart > ReportDate)
+      InsErrorMessage("Дата начала периода не может быть больше даты отчета");
+      LoansError("Дата начала периода не может быть больше даты отчета");
+      RETURN FALSE;
+   END;
+
+   SendKind = 1; // 128326 send_change 
+   
+   RSDcmd = RsdCommand(RslDefCon, "begin ? := rso_lns_bki.fillcreditlist_pbki(?,?,?,?,?,?,?); END;");
+
+   RSDcmd.addParam("retval", RSDBP_RETVAL, V_INTEGER);
+
+   RSDcmd.addParam("bkiid",        RSDBP_IN); RSDcmd.value("bkiid")        = BkiID;
+   RSDcmd.addParam("ki_startdate", RSDBP_IN); RSDcmd.value("ki_startdate") = НачПерФормКи;
+   RSDcmd.addParam("reportdate",   RSDBP_IN); RSDcmd.value("reportdate")   = ReportDate;
+   RSDcmd.addParam("sendkind",     RSDBP_IN); RSDcmd.value("sendkind")     = SendKind;
+   RSDcmd.addParam("legalform",    RSDBP_IN); RSDcmd.value("legalform")    = _legalform;
+   RSDcmd.addParam("oper",         RSDBP_IN); RSDcmd.value("oper")         = opoper;
+   RSDcmd.addParam("creditnumber", RSDBP_IN); RSDcmd.value("creditnumber") = CrdNum;
+   RSDcmd.execute();
+   RSDcmd = null;
+
+   RETURN TRUE;
+END;

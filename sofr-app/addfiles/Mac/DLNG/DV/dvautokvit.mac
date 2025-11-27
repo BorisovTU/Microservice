@@ -1,0 +1,660 @@
+/*
+$Name:             dvautokvit.mac
+$Module:           ФИСС и КО
+$Description:      Автоквитовка платежей
+*/
+IMPORT BankInter, MMarkInter, RSD, RsbDataSet, globals;
+IMPORT DVInter, "DLReport_h.mac", "dvntaxreg_form.mac", "dvRepFun.mac", "DvRepFun2.mac", "dv_categ.mac", "dldlngfun.mac", "dv_car.mac";
+IMPORT dlautokvitcmn;
+import likepy, oralib, dv_fun; //Simanov
+
+PRIVATE CONST IS_NETTING = false;/*отбирать или нет плановые платежи с признаком "Неттинг"*/
+private const CONTRACTOR_NOT_FOUND:integer = -2147483648;
+
+MACRO ClearKvit()
+    RSDCommand("TRUNCATE TABLE ddv_kvit_tmp").execute();
+END;
+
+MACRO InsKvit(DealID, PlanPaymID, FactPaymID, KvitAmount, DocKind, Auto, Stat, msg)
+    var v_Stat = 0;
+    var v_msg = "";
+
+    if(Stat != null)
+       v_Stat = Stat;
+    end;
+
+    if (msg != null) 
+       v_msg = msg;
+    end;
+
+    VAR ins = RSDCommand("INSERT INTO ddv_kvit_tmp (t_dealid, t_planpaymid, t_factpaymid, t_kvitamount, t_dockind, t_auto, t_stat, t_msg) VALUES (?,?,?,?,?,?,?,?)");
+    ins.addParam("", RSDBP_IN, DealID);
+    ins.addParam("", RSDBP_IN, PlanPaymID);
+    ins.addParam("", RSDBP_IN, FactPaymID);
+    ins.addParam("", RSDBP_IN, KvitAmount);
+    ins.addParam("", RSDBP_IN, DocKind);
+    ins.addParam("", RSDBP_IN, Auto);
+    ins.addParam("", RSDBP_IN, v_Stat);
+    ins.addParam("", RSDBP_IN, v_msg);
+    ins.execute();
+
+    //PRINTLN("DealID: " + DealID + "; PlanPaymID: " + PlanPaymID + "; FactPaymID: " + FactPaymID + "; KvitAmount: " + KvitAmount + "; Auto: " + Auto);
+END;
+
+/*Проверка платежей по счету получателя*/
+MACRO CheckAccount(Payment1, Payment2, PaymentID:@variant)
+    IF (Payment1.FutureReceiverAccount == Payment2.FutureReceiverAccount)
+       return Payment1.paymentid;
+    ELSE
+       return 0;
+    END;
+END;
+
+//Simanov. Поиск контрагента сделки по платежу
+private macro dealContractor (dealid, dockind):integer
+    var query = "", sql;
+    var params = makeArray(sqlParam("dealid", dealid), sqlParam("dockind", dockind));
+
+    if ( inList(dockind, 199, 4813, 4815) )
+        query = "select t_contractor contractor from ddvndeal_dbt where t_id = :dealid and t_dockind = :dockind";
+    elif (dockind == 140)
+        query = "select t_contractor contractor from ddl_nett_dbt where t_nettingid = :dealid and t_dockind = :dockind";
+    else
+        return CONTRACTOR_NOT_FOUND; //для других первичек пока нет необходимости
+    end;
+
+    sql = execSqlselect(query, params);
+    if (sql.moveNext() )
+        return sql.value("contractor");
+    end;
+
+    return CONTRACTOR_NOT_FOUND;
+End;
+
+/* Simanov
+ * Проверка на уникальность требования.
+ * contractor - контрагент по сделке платежа
+ * для операции расчётов с биржей пока не предусмотрено
+ */
+private macro m_planpaym_unique (paym, contractor):bool
+    var params;
+    var query = "select * "
+              + "from dpmpaym_dbt paym "
+              + "where paym.t_dockind in (199, 4813, 4815, 140, 4627) and "
+              + "      paym.t_fiid = :fiid and "
+              + "      paym.t_amount = :amount and "
+              + "      paym.t_valuedate = :valuedate and"
+              + "      RSB_Derivatives.DV_DealIsReadyForKvit(paym.t_documentid, paym.t_dockind, paym.t_purpose, paym.t_paymentid) = 1 and "
+              + "      nvl((select fin.t_FI_KIND from dfininstr_dbt fin where fin.t_fiid = paym.t_fiid),0) = 1 and "
+              + "      paym.t_receiverbankid != paym.t_payerbankid and "
+              + "      paym.t_paymstatus = :status and "
+              + "      paym.t_paymentid <> :paymid ";
+    params = makeArray(sqlParam("fiid",       paym.fiid),
+                       sqlParam("amount",     paym.amount),
+                       sqlParam("valuedate",  paym.valuedate),
+                       sqlParam("status",     paym.paymstatus),
+                       sqlParam("paymid",     paym.paymentid));
+
+/*
+    if (valtype(contractor) != V_UNDEF)
+        query = query + " and case when paym.t_dockind = 140 "
+              + "             then (select t_contractor from ddl_nett_dbt where t_nettingid = paym.t_documentid and t_dockind = paym.t_dockind) "
+              + "             else (select t_contractor from ddvndeal_dbt where t_id = paym.t_documentid and t_dockind = paym.t_dockind) "
+              + "      end = :contractor ";
+        params = join(params, makeArray(sqlParam("contractor", contractor)));
+    end;
+*/
+    if(not IS_NETTING)
+        query = query + " AND paym.t_Netting != 'X' ";
+    end;
+
+    return not execSqlselect(query, params).moveNext();
+End;
+
+MACRO prep(DealID,DocKind)
+    VAR query;
+
+    if ((not ПИ_РежимКвитовкиПлатежей()) or (not ПИ_ИнтегрРежимРаботы()))
+      return;
+    end;
+
+    ClearKvit();
+    // 2. Отбираются все планируемые незакрытые входящие платежи по сделкам
+    VAR ppr = DL_RSDCommand();
+
+    query = "SELECT *                                        " +
+          "  FROM dpmpaym_dbt pm                     " +
+          " WHERE ((pm.t_dockind in (199, 4813, 4815) and nvl((select dl.t_state from ddvndeal_dbt dl where dl.T_ID = pm.t_documentid and dl.t_dvkind != ?),0) = 1) or " +
+                          "        (pm.t_dockind in (4627) and nvl(("+
+                          "     SELECT CASE WHEN opr.T_COMPLETED = CHR (88) THEN 0 ELSE 1 END AS t_NotClosed "+
+                          "       FROM DDVCSAPM_DBT csapm, DDVCSA_DBT csa, DOPROPER_DBT opr "+
+                          "     WHERE     csapm.T_CSAID = csa.T_CSAID "+
+                          "           AND csapm.T_DIRECTION = 0 "+
+                          "           AND opr.t_DocumentID = csa.t_CSAID "+
+                          "           AND opr.t_dockind = 4626 "+
+                          "           AND opr.t_kind_operation = 2795 "+
+                          "           AND csapm.t_PMID = pm.t_documentid "+
+                          " ),0) = 1) or " +
+          "        (pm.t_dockind = 4632 and nvl((select comm.t_commstatus from ddl_comm_dbt comm where comm.t_documentid = pm.t_documentid ),0) = 1) or " +
+          "        (pm.t_dockind = 140 and                 " +
+          "          nvl((select NETT.T_IDENTPROGRAM      " +
+          "                 from DDL_NETT_DBT NETT        " +
+          "                where NETT.T_NETTINGID = pm.t_documentid  " +
+          "                  and NETT.T_DOCKIND = pm.t_dockind " +
+          "                  and NETT.T_STATUS = 10 " +
+          "              ),0) = 42)) " +
+          "   AND pm.t_paymstatus = ?                         " +
+          "   AND pm.t_futurepayeramount > 0           " +
+                          "   AND (pm.t_receiverbankid = ?              " +
+          "   AND pm.t_receiverbankid != pm.t_payerbankid        " +
+        "   OR "+CheckInCoreSchemeSubReq("pm.t_paymentid")+")"+
+          "   AND pm.t_valuedate = ? " +
+          "   AND nvl((select fin.t_FI_KIND from dfininstr_dbt fin where fin.t_fiid = pm.t_fiid),0) = 1 " +
+          "   AND pm.t_paymentid NOT IN (SELECT t_planpaymid  " +
+          "                              FROM ddv_kvit_tmp) " +
+          "   AND RSB_Derivatives.DV_DealIsReadyForKvit(pm.t_documentid,pm.t_dockind,pm.t_purpose,pm.t_paymentid) = 1";
+    
+    ppr.addParam(-1/*DV_BANKNOTE_FX*/);//Снова включаем квитовку
+    ppr.addParam(PM_READIED);
+    ppr.addParam({OurBank});
+    ppr.addParam({curdate});
+
+    if( (DealID > 0) and (DocKind > 0) )
+       query = query + 
+                       "   AND pm.t_dockind = ?                     " +
+                       "   AND pm.t_documentid = ?                  ";
+
+       ppr.addParam(DocKind);
+       ppr.addParam(DealID);
+    end;
+
+    if(not IS_NETTING)
+       query = query + " AND pm.t_Netting != 'X' ";
+    end;
+
+    query = query + " order by pm.t_paymentid";
+
+    VAR planpaym = ppr.execute(query);
+        
+    // 2.1. Проходим по планируемым платежам (требования по сделке)
+    WHILE (planpaym.MoveNext())
+
+        //Simanov - 050220202 - Квитовка нужна только для платежа той части сделки, на которой НЕ стоит признак "Наличный перевод".
+        //Другими словами - не квитуем платежи с кассовой проводкой
+        if ( DV_IsCashAccount(planpaym.PayerAccount) ) 
+            continue;
+        end;
+    
+        VAR valuedate  = Date (planpaym.valuedate);
+        VAR contragent = Int  (planpaym.payer);
+        VAR fiid       = Int  (planpaym.fiid);
+        VAR amount     = Money(planpaym.futurepayeramount);
+            
+        query = "SELECT *                                     " +
+              "  FROM dpmpaym_dbt                             " +
+              " WHERE t_isfactpaym = 'X'                      " +
+              "   AND t_paymstatus = ?                        " +
+              "   AND t_tobackoffice = 'Ю'                    " +
+                                  "   AND t_paymentid NOT IN (SELECT t_factpaymid " +
+            "                             FROM dmm_kvit_tmp) " +
+              "   AND t_valuedate = ?                          " + // шаблон
+              "   AND t_payer = ?                              " + // шаблон
+              "   AND t_fiid = ?                               " + // шаблон
+              "   AND t_futurepayeramount = ?                  ";  // шаблон
+    
+        VAR fpr = RSDCommand(query, null, RSDVAL_STATIC);                                  
+        fpr.addParam("", RSDBP_IN, PM_KVITWAIT);
+        fpr.addParam("", RSDBP_IN, valuedate);  // шаблон
+        fpr.addParam("", RSDBP_IN, contragent); // шаблон
+        fpr.addParam("", RSDBP_IN, fiid);       // шаблон
+        fpr.addParam("", RSDBP_IN, amount);     // шаблон
+        fpr.execute();
+        VAR factpaym = TRsbDataSet(fpr);
+
+        VAR qcount = RSDCommand("Select count (*) Count from (" + query +" )", null, RSDVAL_STATIC);                                  
+        qcount.addParam("", RSDBP_IN, PM_KVITWAIT);
+        qcount.addParam("", RSDBP_IN, valuedate);  // шаблон
+        qcount.addParam("", RSDBP_IN, contragent); // шаблон
+        qcount.addParam("", RSDBP_IN, fiid);       // шаблон
+        qcount.addParam("", RSDBP_IN, amount);     // шаблон
+        qcount.execute();
+        VAR count = TRsbDataSet(qcount);
+
+        // Проходим по фактическим платежам (платежи банка)
+        count.MoveFirst();
+        VAR factpaym_count = count.Count;
+        VAR stat           = factpaym.MoveFirst();
+
+        // 2.3. Если найден единственный фактический платеж
+        IF (stat AND (factpaym_count == 1))
+            VAR ppr1 = DL_RSDCommand();
+
+            query = " SELECT p.*                                   " +
+                    " FROM dpmpaym_dbt p                           " +
+                    " WHERE ((p.t_dockind in (199, 4813, 4815) and nvl((select dl.t_state from ddvndeal_dbt dl where dl.T_ID = p.t_documentid and dl.t_dvkind != ?),0) = 1) or " +
+                    "       (p.t_dockind = 4632 and nvl((select comm.t_commstatus from ddl_comm_dbt comm where comm.t_documentid = p.t_documentid ),0) = 1) or " +
+                    "        (p.t_dockind in (4627) and nvl(("+
+                    "     SELECT CASE WHEN opr.T_COMPLETED = CHR (88) THEN 0 ELSE 1 END AS t_NotClosed "+
+                    "       FROM DDVCSAPM_DBT csapm, DDVCSA_DBT csa, DOPROPER_DBT opr "+
+                    "     WHERE     csapm.T_CSAID = csa.T_CSAID "+
+                    "           AND csapm.T_DIRECTION = 0 "+
+                    "           AND opr.t_DocumentID = csa.t_CSAID "+
+                    "           AND opr.t_dockind = 4626 "+
+                    "           AND opr.t_kind_operation = 2795 "+
+                    "           AND csapm.t_PMID = p.t_documentid "+
+                    " ),0) = 1) or " +
+                    "       (p.t_dockind = 140 and                 " +
+                    "         nvl((select NETT.T_IDENTPROGRAM      " +
+                    "                from DDL_NETT_DBT NETT        " +
+                    "               where NETT.T_NETTINGID = p.t_documentid  " +
+                    "                 and NETT.T_DOCKIND = p.t_dockind " +
+                    "                 and NETT.T_STATUS = 10 " +
+                    "             ),0) = 42)) " +
+                    "     AND p.t_paymstatus = ?                      " +
+                    "     AND p.t_futurepayeramount > 0               " +
+                                        "   AND (p.t_receiverbankid = ?                  " +
+                    "     AND p.t_receiverbankid != t_payerbankid     " +
+                                        "   OR "+CheckInCoreSchemeSubReq("p.t_paymentid")+")"+
+                    "     AND p.t_paymentid != ?                      " +
+                                        "   AND t_paymentid NOT IN (SELECT t_planpaymid " +
+            "                             FROM ddv_kvit_tmp) " +
+                    "     AND p.t_valuedate = ?                        " + // шаблон
+                    "     AND p.t_payer = ?                            " + // шаблон
+                    "     AND p.t_fiid = ?                             " + // шаблон
+                    "     AND p.t_futurepayeramount = ?                " + // шаблон
+                    "     AND RSB_Derivatives.DV_DealIsReadyForKvit(p.t_documentid,p.t_dockind,p.t_purpose,p.t_paymentid) = 1 ";
+    
+            ppr1.addParam(-1/*DV_BANKNOTE_FX*/);//Снова включаем квитовку
+            ppr1.addParam(PM_READIED);
+            ppr1.addParam({OurBank});
+            ppr1.addParam(planpaym.paymentid);
+            ppr1.addParam(valuedate);  // шаблон
+            ppr1.addParam(contragent); // шаблон
+            ppr1.addParam(fiid);       // шаблон
+            ppr1.addParam(amount);     // шаблон
+
+            if( (DealID > 0) and (DocKind > 0) )
+               query = query + 
+                               "   AND p.t_dockind = ?                     " +
+                               "   AND p.t_documentid = ?                  ";
+           
+               ppr1.addParam(DocKind);
+               ppr1.addParam(DealID);
+            end;
+
+            if(not IS_NETTING)
+               query = query + " AND p.t_Netting != 'X' ";
+            end;
+
+            query = query + " order by p.t_paymentid";
+            
+            VAR planpaym_1 = ppr1.execute(query);
+            
+            VAR stat1 = planpaym_1.MoveNext();
+            // 2.3.1. Если таких плановых платежей больше не найдено,
+            //          текущий плановый и текущий фактический платеж квитуются
+            IF (NOT stat1)
+                if( valuedate == {curdate} )
+                   InsKvit(planpaym.DocumentID, planpaym.paymentid, factpaym.paymentid, amount, planpaym.dockind, SET_CHAR);
+                else
+                   InsKvit(planpaym.DocumentID, planpaym.paymentid, factpaym.paymentid, amount, planpaym.dockind, UNSET_CHAR, STAT_DATES_NOT_MATCH);
+                end;
+            // 2.3.2. Если найден еще хотя бы один подходящий по контрольным полям к текущему фактическому платежу плановый платеж,
+            //          сверяется счет получателя в найденных плановых платежах и фактическом платеже
+            ELSE
+                VAR PlanPaymentIDs = TArray;
+                
+                PlanPaymentIDs[PlanPaymentIDs.size] = CheckAccount(planpaym, factpaym);
+                
+                WHILE (stat1)
+                    PlanPaymentIDs[PlanPaymentIDs.size] = CheckAccount(planpaym_1, factpaym);
+                
+                    stat1 = planpaym_1.MoveNext();
+                END;
+                
+                // 2.3.2.1. Если найден единственный плановый платеж, совпадающий по счету получателя с фактическим платежом, эти платежи квитуются
+                IF (PlanPaymentIDs.size == 1)
+                    if( valuedate == {curdate} )
+                       InsKvit(planpaym.DocumentID, PlanPaymentIDs[0], factpaym.paymentid, amount, planpaym.dockind, SET_CHAR);
+                    else
+                       InsKvit(planpaym.DocumentID, PlanPaymentIDs[0], factpaym.paymentid, amount, planpaym.dockind, UNSET_CHAR, STAT_DATES_NOT_MATCH);
+                    end;
+                ELSE
+                    VAR i1 = 0;
+                    WHILE (i1 < PlanPaymentIDs.size)
+                        // 2.3.2.2
+                        InsKvit(planpaym.DocumentID, PlanPaymentIDs[i1], factpaym.paymentid, amount, planpaym.dockind, UNSET_CHAR);
+                        i1 = i1 + 1;
+                    END;
+                END;
+            END;
+        END;
+
+        // 2.4. Если найдено более одного фактического платежа, производится сверка по счету получателя
+        IF (stat AND (factpaym_count > 1))
+            VAR FactPaymentIDs = TArray;
+            VAR PaymentID = 0;
+            WHILE (stat)
+                PaymentID = CheckAccount(factpaym, planpaym);
+                if( PaymentID > 0 )
+                   FactPaymentIDs[FactPaymentIDs.size] = PaymentID;
+                end;
+                stat = factpaym.MoveNext();
+            END;
+        
+            // 2.4.1. Если найден  единственный фактический платеж, соответствующий по счету получателя и по контрольным полям данному плановому платежу,
+            //          проверяются все остальные несквитованные плановые платежи на предмет совпадения с данным фактическим платежом
+            IF (FactPaymentIDs.size == 1)
+                VAR ppr2 = DL_RSDCommand();
+
+                query = " SELECT p.*                                                         " +
+                        " FROM dpmpaym_dbt p                               " +
+                        " WHERE ((p.t_dockind in (199, 4813, 4815) and nvl((select dl.t_state from ddvndeal_dbt dl where dl.T_ID = p.t_documentid and dl.t_dvkind != ?),0) = 1) or " +
+                        "        (p.t_dockind = 4632 and nvl((select comm.t_commstatus from ddl_comm_dbt comm where comm.t_documentid = p.t_documentid ),0) = 1) or " +
+                                        "        (p.t_dockind in (4627) and nvl(("+
+                                        "     SELECT CASE WHEN opr.T_COMPLETED = CHR (88) THEN 0 ELSE 1 END AS t_NotClosed "+
+                                        "       FROM DDVCSAPM_DBT csapm, DDVCSA_DBT csa, DOPROPER_DBT opr "+
+                                        "     WHERE     csapm.T_CSAID = csa.T_CSAID "+
+                                        "           AND csapm.T_DIRECTION = 0 "+
+                                        "           AND opr.t_DocumentID = csa.t_CSAID "+
+                                        "           AND opr.t_dockind = 4626 "+
+                                        "           AND opr.t_kind_operation = 2795 "+
+                                        "           AND csapm.t_PMID = p.t_documentid "+
+                                        " ),0) = 1) or " +
+                        "        (p.t_dockind = 140 and                 " +
+                        "          nvl((select NETT.T_IDENTPROGRAM      " +
+                        "                 from DDL_NETT_DBT NETT        " +
+                        "                where NETT.T_NETTINGID = p.t_documentid  " +
+                        "                  and NETT.T_DOCKIND = p.t_dockind " +
+                        "                  and NETT.T_STATUS = 10 " +
+                        "              ),0) = 42)) " +
+                        "      AND p.t_paymstatus = ?                      " +
+                        "      AND p.t_futurepayeramount > 0               " +
+                                            "   AND (p.t_receiverbankid = ?                  " +
+                        "      AND p.t_receiverbankid != t_payerbankid     " +
+                                            "   OR "+CheckInCoreSchemeSubReq("p.t_paymentid")+")"+
+                        "      AND p.t_paymentid != ?                      " +
+                                            "   AND t_paymentid NOT IN (SELECT t_planpaymid " +
+                "                             FROM ddv_kvit_tmp) " +
+                        "      AND p.t_valuedate = ?                        " + // шаблон
+                        "      AND p.t_payer = ?                            " + // шаблон
+                        "      AND p.t_fiid = ?                             " + // шаблон
+                        "      AND p.t_futurepayeramount = ?                " + // шаблон
+                        "      AND RSB_Derivatives.DV_DealIsReadyForKvit(p.t_documentid,p.t_dockind,p.t_purpose,p.t_paymentid) = 1 ";
+    
+                ppr2.addParam(-1/*DV_BANKNOTE_FX*/);//Снова включаем квитовку
+                ppr2.addParam(PM_READIED);
+                ppr2.addParam({OurBank});
+                ppr2.addParam(planpaym.paymentid);
+                ppr2.addParam(valuedate);  // шаблон
+                ppr2.addParam(contragent); // шаблон
+                ppr2.addParam(fiid);       // шаблон
+                ppr2.addParam(amount);     // шаблон
+                
+                if( (DealID > 0) and (DocKind > 0) )
+                   query = query + 
+                                   "   AND p.t_dockind = ?                     " +
+                                   "   AND p.t_documentid = ?                  ";
+                
+                   ppr2.addParam(DocKind);
+                   ppr2.addParam(DealID);
+                end;
+
+                if(not IS_NETTING)
+                   query = query + " AND p.t_Netting != 'X' ";
+                end;
+
+                query = query + " order by p.t_paymentid";
+
+                VAR planpaym_2 = ppr2.execute(query);
+                
+                VAR stat2 = planpaym_2.MoveNext();
+                
+                // 2.4.1.1. Если больше подходящих по контрольным полям и по счету получателя плановых платежей не найдено - текущий плановый и текущий фактический платежи квитуются
+                IF (not stat2)
+                    if( valuedate == {curdate} )
+                       InsKvit(planpaym.DocumentID, planpaym.paymentid, FactPaymentIDs[0], amount, planpaym.dockind, SET_CHAR);
+                    else
+                       InsKvit(planpaym.DocumentID, planpaym.paymentid, FactPaymentIDs[0], amount, planpaym.dockind, UNSET_CHAR, STAT_DATES_NOT_MATCH);
+                    end;
+                // 2.4.1.2.
+                ELSE
+                    WHILE (stat2)
+                        InsKvit(planpaym.DocumentID, planpaym_2.paymentid, FactPaymentIDs[0], amount, planpaym.dockind, UNSET_CHAR);
+                        
+                        stat2 = planpaym_2.MoveNext();
+                    END;
+                END;
+            // 2.4.2.
+            ELSE    
+                VAR i2 = 0;
+                WHILE (i2 < FactPaymentIDs.size)
+                    InsKvit(planpaym.DocumentID, planpaym.paymentid, FactPaymentIDs[i2], amount, planpaym.dockind, UNSET_CHAR);
+                    i2 = i2 + 1;
+                END;
+            END;
+        END;
+        /* Simanov - 29012020
+         * Квитовка ЕД107 по счёту из примечания
+         */
+         var cmd, usr_factpaym;
+        if( not stat )
+            cmd  = DL_RSDCommand();
+            query = "SELECT count(1) over() as cnt, paym.* "
+                  + "FROM dpmpaym_dbt paym "
+                  + "WHERE      t_isfactpaym  = 'X' "
+                  + "      AND t_tobackoffice = 'Ю' "
+                  + "      AND t_dockind = 322 " //на всякий случай
+                  + "      AND t_paymentid NOT IN (SELECT t_factpaymid FROM dmm_kvit_tmp) "
+                  + "      AND SUBSTR(t_receiveraccount, 1, 5) = '47416' "
+                  + "      AND t_paymstatus = ? "
+                  + "      AND t_valuedate = ? "
+                  + "      AND t_fiid = ? "
+                  + "      AND t_futurepayeramount = ? "
+                  + "      AND (SELECT RSB_STRUCT.GETSTRING(note.t_text) "
+                  + "           FROM dnotetext_dbt note "
+                  + "           WHERE     t_objecttype = 501 "
+                  + "                 AND t_notekind = 101 "
+                  + "                 AND t_documentid = lpad(paym.t_paymentid, 10, '0') ) = ? ";
+
+            if(not IS_NETTING)
+                query = query + " AND paym.t_Netting != 'X' ";
+            end;
+
+            cmd.addParam(PM_KVITWAIT);
+            cmd.addParam(valuedate);
+            cmd.addParam(fiid);
+            cmd.addParam(amount);
+            cmd.addParam(planpaym.receiveraccount);
+
+            usr_factpaym = cmd.execute(query);
+
+            if (usr_factpaym.MoveNext() and (usr_factpaym.cnt == 1) )
+                InsKvit(planpaym.DocumentID, planpaym.paymentid, usr_factpaym.paymentid, amount, planpaym.dockind, SET_CHAR);
+                stat = true;
+            end;
+        end;
+
+        /* Simanov - 05022020
+         * Входящий платеж смаршрутизирован на ФИССИКО
+         * //Входящий счет 47416
+         * Отправитель  и контрагент по сделке совпадает
+         * Валюты платежей совпадают
+         * Сумма по требования уникальная (других требований по такой сумме в контрагента нет )
+         * Вставляем запись во временную таблицу если указанное требование и вх платеж ранее не вставлялся
+         */
+        if (not stat)
+            contragent = dealContractor(planpaym.DocumentID, planpaym.DocKind);
+
+            if (contragent != CONTRACTOR_NOT_FOUND) 
+                query = "SELECT count(1) over() as cnt, paym.* "
+                      + "FROM dpmpaym_dbt paym "
+                      + "WHERE     t_isfactpaym = 'X' "
+                      + "      AND t_dockind = 322 " //на всякий случай
+                      + "      AND t_paymstatus = ? "
+                      + "      AND t_tobackoffice = 'Ю' "
+                      + "      AND t_paymentid NOT IN (SELECT t_factpaymid FROM dmm_kvit_tmp) "
+                      //+ "      AND SUBSTR(t_receiveraccount, 1, 5) = '47416' "
+                      + "      AND t_valuedate = ?  "
+                      + "      AND t_payer = ? "
+                      + "      AND t_fiid = ? "
+                      + "      AND t_futurepayeramount = ? ";
+
+                if(not IS_NETTING)
+                    query = query + " AND paym.t_Netting != 'X' ";
+                end;
+
+                cmd = RSDCommand(query/*, null, RSDVAL_STATIC*/);
+                cmd.addParam("", RSDBP_IN, PM_KVITWAIT);
+                cmd.addParam("", RSDBP_IN, valuedate);
+                cmd.addParam("", RSDBP_IN, contragent);
+                cmd.addParam("", RSDBP_IN, fiid);
+                cmd.addParam("", RSDBP_IN, amount);
+                cmd.execute();
+
+                usr_factpaym = TRsbDataSet(cmd);
+                if (     usr_factpaym.MoveNext()  //подходящий платёж найден
+                     and (usr_factpaym.cnt == 1)  //он такой один
+                     and m_planpaym_unique(planpaym, contragent) //плановый платёж уникален
+                     and not DV_IsCashAccount(usr_factpaym.PayerAccount) //не квитуем платежи с кассовой проводкой
+                   )
+                    InsKvit(planpaym.DocumentID, planpaym.paymentid, usr_factpaym.paymentid, amount, planpaym.dockind, SET_CHAR);
+                    stat = true;
+                end;
+            end;
+        end;
+
+        /* Simanov - 05022020
+         * Входящий платеж смаршрутизирован на ФИССИКО
+         * //Входящий счет 47416
+         * Во входящем платеже нет отправителя
+         * Валюты платежей совпадают
+         * Сумма по требования уникальная (других требований по такой сумме в контрагента нет )
+         * Вставляем запись во временную таблицу если указанное требование и вх платеж ранее не вставлялся
+         */
+        if (not stat) 
+            contragent = dealContractor(planpaym.DocumentID, planpaym.DocKind);
+
+            if (contragent != CONTRACTOR_NOT_FOUND) 
+                query = "SELECT count(1) over() as cnt, paym.* "
+                      + "FROM dpmpaym_dbt paym "
+                      + "WHERE     t_isfactpaym = 'X' "
+                      + "      AND t_dockind = 322 " //на всякий случай
+                      + "      AND t_paymstatus = ? "
+                      + "      AND t_tobackoffice = 'Ю' "
+                      + "      AND t_paymentid NOT IN (SELECT t_factpaymid FROM dmm_kvit_tmp) "
+                      //+ "      AND SUBSTR(t_receiveraccount, 1, 5) = '47416' "
+                      + "      AND t_valuedate = ? "
+                      + "      AND (t_payer in (-1, 1) or t_payerbankid = t_payer) "
+                      + "       AND  t_receiver = case when t_receiver <>-1 THEN " + contragent +" ELSE  -1 END"/*CHVA 519440*/
+                      + "      AND t_fiid = ? "
+                      + "      AND t_futurepayeramount = ? ";
+
+                if(not IS_NETTING)
+                    query = query + " AND paym.t_Netting != 'X' ";
+                end;
+
+                cmd = RSDCommand(query/*, null, RSDVAL_STATIC*/);
+                cmd.addParam("", RSDBP_IN, PM_KVITWAIT);
+                cmd.addParam("", RSDBP_IN, valuedate);
+                cmd.addParam("", RSDBP_IN, fiid);
+                cmd.addParam("", RSDBP_IN, amount);
+                cmd.execute();
+
+                usr_factpaym = TRsbDataSet(cmd);
+                if (    usr_factpaym.MoveNext()  //подходящий платёж найден
+                    and (usr_factpaym.cnt == 1)  //он такой один
+                    and m_planpaym_unique(planpaym)  //плановый платёж уникален
+                    and not DV_IsCashAccount(usr_factpaym.PayerAccount) //не квитуем платежи с кассовой проводкой
+                   )
+                    InsKvit(planpaym.DocumentID, planpaym.paymentid, usr_factpaym.paymentid, amount, planpaym.dockind, SET_CHAR, null, "no_contractor");
+                    stat = true;
+                end;
+            end;
+        end;
+        IF( not stat )    
+           InsKvit(planpaym.DocumentID, planpaym.paymentid, 0, amount, planpaym.dockind, UNSET_CHAR);
+        END;
+    END;
+END;
+
+MACRO post(showData)
+  var resData = KvitResData();
+  var docKindArr = TArray();
+  var i = 0;
+
+  if (showData == true)
+    resData = KvitFillData("ddv_kvit_tmp",docKindArr);
+    
+    [Протокол выполнения автоквитовки платежей.];
+    [Бэк-офис: #](GetKvitBackOfficeName():l);
+    [Дата операции: #]({curdate}:l);
+    PrintLn();
+    /*по ТЗ: Если в результате автоквитовки не было сквитовано ни одного платежа, раздел 1 <Сквитованные платежи>  выводится пустой*/
+    if (resData.KvitSuccessArray.size or resData.KvitFailArray.size or resData.NoKvitPairArray.size)
+
+      //Simanov
+      if (resData.KvitNoContracorArray.size) 
+        KvitPrintHeaderSuccessNoContractor();
+        for (var NoContractorKvit, resData.KvitNoContracorArray)
+          KvitPrintMainNoContractor(NoContractorKvit);
+          if( i < resData.KvitNoContracorArray.size - 1 )
+            KvitPrintDelimNoContractor();
+          end;
+          i = i + 1;
+        end;
+        KvitPrintEndNoContractor();
+        PrintLn();
+      end;
+
+      i = 0;
+      KvitPrintHeaderSuccess();
+      for (var SuccessKvit, resData.KvitSuccessArray)
+        KvitPrintMainSuccess(SuccessKvit);
+        if( i < resData.KvitSuccessArray.size - 1 )
+          KvitPrintDelimSuccess();
+        end;
+        i = i + 1;
+      end;
+      KvitPrintEndSuccess();
+      PrintLn();
+    end;
+
+    i = 0;
+    if (resData.KvitFailArray.size)
+      KvitPrintHeaderFail();
+      for (var FailKvit, resData.KvitFailArray)
+        KvitPrintMainFail(FailKvit);
+        if( i < resData.KvitFailArray.size - 1 )
+          KvitPrintDelimFail();
+        end;
+        i = i + 1;
+      end;
+      KvitPrintEndFail();
+      PrintLn();
+    end;
+
+    i = 0;
+    if (resData.NoKvitPairArray.size)
+      NoKvitPairPrintHeader();
+      for (var NoKvit, resData.NoKvitPairArray)
+        NoKvitPairPrintMain(NoKvit);
+        if( i < resData.NoKvitPairArray.size - 1 )
+          NoKvitPairPrintDelim();
+        end;
+        i = i + 1;
+      end;
+      NoKvitPairPrintEnd();
+      PrintLn();
+    end;
+
+    if ((not ПИ_РежимКвитовкиПлатежей()) or (not ПИ_ИнтегрРежимРаботы()))
+      PrintLn("Квитовка платежей не предусмотрена.");
+    elif ((resData.KvitSuccessArray.size == 0) AND (resData.KvitFailArray.size == 0) AND (resData.NoKvitPairArray.size == 0))
+      PrintLn("Не найдены платежи для квитовки.");
+    end;
+  end;
+
+  ClearKvit();
+
+end;

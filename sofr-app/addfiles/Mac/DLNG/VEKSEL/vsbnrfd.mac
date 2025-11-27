@@ -1,0 +1,1461 @@
+/*
+$Name:         vsbnrfd.mac
+$Module:       Векселя банка
+$Description:  Класс документов "векселя"
+*/
+
+IMPORT FIInter, PaymInter, CTInter, OprInter, DealsInter, PTInter, VSInter, VAInter, globals, mctplprm, Календарь,
+       RsbDataSet, dlquery, dlmisc, vslib, "dlvaprds.mac";
+import role_model;
+
+/* Класс документов "векселя"
+   Параметры:
+      parm1
+      parm2
+      parm3  ContextDocKind Вид документа контекста
+      parm4  Context        Собственно контекст
+             м.б. DocID,
+                  Строка c DocID
+                  буфер документа
+*/
+CLASS VSBannerFD (parm1, parm2, parm3, parm4)
+    PRIVATE VAR
+        ParmA = TArray,
+        bnr = TBfile("vsbanner.dbt"),
+        leg = TBfile("dl_leg.dbt"),
+        lnk = TBfile("vsordlnk.dbt"),  /* связка между векселем и документом эмиссии */
+        emi = TBfile("dl_order.dbt"),  /* договор эмиссии векселя */
+        tck = TBfile("dl_tick.dbt"),   /* сделка эмиссии векселя (сделка мены) */
+        EmiFound = false,
+        TckFound = false,
+        ContextKind, Context, ContextSubKind,
+        FIRoleBArray = TArray,
+        SysTypes = "",
+        m_IsBill = NULL,
+        MargMinus = NULL,
+        MargPlus = NULL,
+        ValMinus = NULL,
+        ValPlus = NULL;
+    VAR
+        /*Основные свойства*/
+        Error = 0, kind, id;
+
+    MACRO SetParmForCateg24828(Categ:string, value)
+      var c = SubStr(Categ, 1, 1);
+      if (c == "+")
+        ValPlus = value;
+      end;
+
+      if (c == "-")
+        ValMinus = value;
+      end;
+    END;
+
+    MACRO GetParmForCateg24828(Categ:string)
+      var value = NULL;
+      var c = SubStr(Categ, 1, 1);
+      if (c == "+")
+        value = ValPlus;
+      end;
+
+      if (c == "-")
+        value = ValMinus;
+      end;
+
+      return value;
+    END;
+
+    MACRO ResetParmForCateg24828()
+      ValMinus = NULL;
+      ValPlus = NULL;
+    END;
+
+    /* Проверка контекста вызова:
+       если вызов из УВ, то true;
+       иначе - false
+    */
+    PRIVATE MACRO CheckVA()
+       if((ContextKind == DL_VEKSELACCOUNTED) OR /*сделка с учтенными векселями*/
+          (ContextKind == DL_VATRUST) OR
+          (ContextKind == DL_VAREPAY) OR         /*погашение УВ*/
+          (ContextKind == DL_VATRREPAY) OR
+          (ContextKind == DL_VAPAWN) OR          /*залог УВ*/
+          (ContextKind == DL_VAENWR) OR           /*зачисление-списание УВ*/
+          (ContextKind == DL_VARESERVE) OR        // резервирование в УВ
+          (ContextKind == TS_DOC_DECLAR) OR          //   Заявление на ввод каритала
+          (ContextKind == TS_DOC_DECLAR_OUT) )    //   Заявление на вывод каритала
+
+          return true;
+       end;
+
+       return false;
+    END;
+
+    /* Возвращает строку 's'
+       после символа 'c'
+       Например: s="abcdefg.xyz",c='.'
+       Результат   "xyz"
+    */
+    PRIVATE MACRO StrAfter( s, c )
+    var
+       p=Index(s, c);
+       if(p == 0)
+         return "";
+       else
+         return SubStr(s, p + 1);
+       end;
+    END;
+
+    /* Формирование номера документа 'n'
+       Возвращается правая часть номера, начиная со второго символа
+       справа, до первого вхождения символа '/'.
+       Если последний символ - не цифра, то она обрезается.
+       Например: n="1/2/3в"
+       Результат:      "3"
+    */
+    PRIVATE MACRO MakeNumber(n)
+    var s = String(n), c, l;
+
+        if(s == "")
+           return s;
+        end;
+
+        l = strlen(s);
+        c = SubStr(s, l, 1);        /* последний символ*/
+        if( (c < "0") or (c > "9") )     /* если не цифра */
+          s = SubStr(s, 1, l - 1);       /* обрежем */
+        end;
+
+        while( Index(s, "/") != 0 )
+          s = StrAfter(s, "/");  /* вырезаем начало строки до / */
+        end;
+
+        return s;
+    END;
+
+    PRIVATE MACRO GetSysTypes(_DealType)
+    var
+       opr = TBfile("oprkoper");
+
+       if(ValType(_DealType) == V_UNDEF)
+          opr.rec.Kind_Operation = Context.rec.DealType;
+       else
+          opr.rec.Kind_Operation = _DealType;
+       end;
+
+       if(opr.GetEQ())
+          return opr.rec.SysTypes;
+       end;
+       return "";
+    END;
+
+    /* Направление сделки "передача" ?
+    */
+    MACRO IsSale()
+        if(SysTypes == "")
+           SysTypes = GetSysTypes();
+        end;
+
+        if(Index(SysTypes, "S") > 0)
+           return true;
+        end;
+
+        return false;
+    END;
+
+    /* Это мена ?
+    */
+    PRIVATE MACRO IsBarter()
+        if(SysTypes == "")
+           SysTypes = GetSysTypes();
+        end;
+
+        if(Index(SysTypes, "X") > 0)
+           return true;
+        end;
+
+        return false;
+    END;
+
+    /* Ищет сделку.
+    */
+    PRIVATE MACRO FindTick(ID, tick)
+        tick.keyNum = 0;
+        tick.rec.DealID = ID;
+        return tick.GetEQ;
+    END;
+
+    /* Возвращает первый плановый платеж
+    */
+    PRIVATE MACRO Get1stPlanPaym(DocKind, DocID, Purpose, payms)
+    var
+        Ok, retval = false;
+
+        payms.KeyNum = 1;
+        payms.Clear();
+        payms.rec.DocKind = DocKind;
+        payms.rec.DocumentID = DocID;
+        payms.rec.Purpose = Purpose;
+        payms.rec.SubPurpose = 0;
+        payms.AddFilter(string("t_DocKind = ", DocKind, " AND  t_DocumentID = ", DocID, " AND  t_Purpose = ", Purpose));
+        Ok = payms.GetGE;
+
+        while(Ok and (retval == false))
+          if(payms.rec.IsPlanPaym == "X")
+             retval = true;
+          else
+             Ok = payms.next; /* ищем дальше */
+          end;
+        end;
+
+        payms.DropFilter();
+
+        return retval;
+    END;
+
+    MACRO IsSetAccExcludeResCalc( categ, templ )
+
+       if( (categ.rec.Code == "Учтенные векселя") or
+           (categ.rec.Code == "Просроч_вексель")
+         )
+         return true;
+       end;
+
+       return false;
+    END;
+
+    /* Шаг с символом symb выполнен?
+    */
+    PRIVATE MACRO IsPerformed(dockind, docid, dealdate, symb)
+    var DataSet,
+        cmdtxt = "SELECT ooper.t_DocumentID "
+                    "FROM doprstep_dbt ostep, doproper_dbt ooper "
+                    "WHERE ooper.t_DocKind = " + dockind +
+                         " AND ooper.t_DocumentID = " + docid +
+                         " AND ooper.t_Start_Date = " + ToDateFromDlQuery(dealdate) +
+                         " AND ooper.t_ID_Operation = ostep.t_ID_Operation " +
+                         " AND ostep.t_IsExecute = 'X' AND ostep.t_Symbol = '" + symb + "' ";
+       DataSet = TRsbDataSet(cmdtxt);
+       return DataSet.MoveNext();
+    END;
+
+    /* Возвращает владельца для сделки с учтенными векселями
+       Это есть клиент последней сделки, или иначе - Наш банк.
+    */
+    MACRO VAScanLast(kind)
+    var ClientID = -1,
+        LastDate = ZeroDate,
+        LastID = 0,
+        DealDate,
+        paym = TBfile("pmpaym.dbt"),
+        ClientContrID = -1,
+        ok;
+
+    var q = // сделки по векселю
+        "SELECT "
+        "    t.t_BofficeKind t_DocKind, t.t_DealID, t.t_DealType, t.t_DealDate, t.t_ClientContrID, "
+        "    t.t_ClientID, o.t_SysTypes "
+        "FROM "
+        "            DVSORDLNK_DBT l "
+        "    JOIN    DDL_TICK_DBT t on "
+        "        t.t_dealid = l.t_contractid and t.t_bofficekind = l.t_dockind "
+        "    JOIN    DOPRKOPER_DBT o on o.t_kind_operation = t.t_DealType "
+        "WHERE "
+        "        l.t_BCID = ? "
+        "    AND l.t_LinkKind = ? "
+        "    AND l.t_DocKind in (?, ?, ?, ?) ";
+
+    var cmd = RSDCommand(q);
+        cmd.addParam("1", RSDBP_IN, bnr.rec.BCID);
+        cmd.addParam("2", RSDBP_IN, VSORDLNK_K_BUY);
+        cmd.addParam("3", RSDBP_IN, DL_VEKSELACCOUNTED);
+        cmd.addParam("4", RSDBP_IN, DL_VATRUST);
+        cmd.addParam("5", RSDBP_IN, DL_VAENWR);
+        cmd.addParam("6", RSDBP_IN, TS_DOC_DECLAR);
+        cmd.NullConversion = true;
+        cmd.execute();
+    var ds = TRsbDataset(cmd);
+
+        ok = ds.MoveNext();
+
+        while(Ok)
+            DealDate = date(ds.DealDate);
+
+            if((LastDate == ZeroDate) OR (LastDate < DealDate))
+                LastDate = DealDate;
+                LastID = ds.DealID;
+                ClientID = ds.ClientID;
+                ClientContrID = ds.ClientContrID;
+            elif(LastDate > DealDate)
+                // пропускаем сделку
+            elif(LastID < ds.DealID) // опасно, но что делать...
+                // нашли еще более позднюю сделку
+                LastID = ds.DealID;
+                ClientID = ds.ClientID;
+                ClientContrID = ds.ClientContrID;
+            end;
+
+            if(Ok)
+                Ok = ds.MoveNext();
+            end;
+        end;
+
+        if(kind == "LastDate")
+            return LastDate;
+        elif(kind == "LastID")
+            return LastID;
+        elif(kind == "ClientContrID")
+            return ClientContrID;
+        end;
+        return ClientID;
+    END;
+
+    /* Возвращает последнюю сделку покупки (связку)
+    */
+    MACRO VAGetLastBuy(lnk, tick)
+       var
+          found = false, Ok = false, LastID = VAScanLast("LastID");
+       var query = "";
+
+       if(LastID > 0)
+          lnk.keyNum = 0;        /* Индекс BCID+LinkKind+DocKind+ContractID+Start */
+
+          query = " t_BCID = " + bnr.rec.BCID + " and t_LinkKind = " + VSORDLNK_K_BUY + " and t_ContractID = " + LastID;
+          if(bnr.rec.BackOffice == "А") //ДУ
+            query = query + " and t_DocKind in (" + DL_VATRUST + ", " + TS_DOC_DECLAR + ")";
+          else
+            query = query + " and t_DocKind in (" + DL_VEKSELACCOUNTED + ", "+ DL_VAENWR +")";
+          end;
+          lnk.AddFilter(query);
+          found = lnk.Next();
+
+          lnk.DropFilter();
+       end;
+
+       if(not found)
+         msgbox("Не найдена последняя операция покупки по векселю");
+       elif(ValType(tick) != V_UNDEF)
+         FindTick(lnk.rec.ContractID, tick);
+       end;
+
+       return found;
+    END;
+
+    /* Возвращает владельца для сделки с учтенными векселями
+       Это есть клиент последней сделки, или иначе - Наш банк.
+    */
+    PRIVATE MACRO VAOwner()
+       if(ValType(Context) != V_UNDEF)
+          return Context.rec.ClientID; // УВ
+       end;
+
+    var
+       owner = VAScanLast("ClientID");
+       if(owner == -1)
+         owner = {OurBank};
+       end;
+       return owner;
+    END;
+
+    /* Возвращает макс. дату сделки, в которой роль векселя "покупка"
+    */
+    PRIVATE MACRO VADealDate()
+       return VAScanLast("LastDate");
+    END;
+
+    // Сделка для клиента?
+    PRIVATE MACRO IsClient(ClientID)
+       return (ClientID != -1) AND (ClientID != {OurBank});
+    END;
+
+    /* Возвращает параметр II рода - Владелец
+    */
+    PRIVATE MACRO Get_II_Owner( FIRole )
+
+       if(ContextKind == DL_VEKSELORDER)
+          if(EmiFound)
+             return emi.rec.Contractor;
+          elif(TckFound)
+             return tck.rec.PartyID;
+          else
+             return {OurBank};
+          end;
+
+       elif(ContextKind == DL_VAPAWN)   /* залог учтенных векселей */
+          if(FIRole == FIROLE_SALEACTIVE)  /* Реализуемый актив */
+             if(IsSale())  /* "передача" */
+                return {OurBank};
+             else /* "прием" */
+                return Context.rec.PartyID;
+             end;
+          elif(FIRole == FIROLE_BUYACTIVE) /* Приобретаемый актив */
+             if(IsSale())  /* "передача" */
+                if(Context.rec.Flag1 == "") /* "залог" */
+                   return {OurBank};
+                else /* "заклад" */
+                   return Context.rec.PartyID;
+                end;
+             else /* "прием" */
+                if(Context.rec.Flag1 == "") /* "залог" */
+                   return Context.rec.PartyID;
+                else  /* "заклад" */
+                   return {OurBank};
+                end;
+             end;
+          end;
+
+       elif(CheckVA()) /* операции с учтенными векселями (кроме залога, см. выше) */
+            if(DL_IsOurBanner(bnr.rec.Issuer)) // собственный вексель
+               // теоретически, в Holder должен лежать к.агент по д-ру или сделке,
+               // по которой был эмитирован вексель
+               return bnr.rec.Holder;
+            else                              // учтенный вексель
+               return VAOwner();
+            end;
+
+       end;
+
+       return {OurBank};
+    END;
+
+    /* Возвращает параметр II рода - Контрагент
+    */
+    PRIVATE MACRO Get_II_Party()
+       if(ContextKind == DL_VEKSELORDER)
+          if(EmiFound)
+             return emi.rec.Contractor;
+          elif(TckFound)
+             return tck.rec.PartyID;
+          else
+             return 0;
+          end;
+       end;
+
+       return 0;
+    END;
+
+    /* Возвращает параметр II рода - Контрагент
+    */
+    PRIVATE MACRO Get_II_Contractor()
+       if(CheckVA() AND (not DL_IsOurBanner(bnr.rec.Issuer)) AND (ValType(Context) != V_UNDEF))
+          return Context.rec.PartyID; // УВ
+       end;
+
+       return bnr.rec.Holder;  // СВ
+    END;
+
+    /* Возвращает параметр II рода - Номер договора обслуживания клиента
+    */
+    PRIVATE MACRO Get_II_ClientContract()
+       if(CheckVA() AND (bnr.rec.Issuer != {OurBank}) AND (ValType(Context) != V_UNDEF))
+          return Context.rec.ClientContrID; // УВ
+       end;
+
+       return -1;  // СВ
+    END;
+
+    /* Возвращает параметр II рода - Номер вышестоящего (основного) документа
+    */
+    PRIVATE MACRO Get_II_SeniorNumber()
+       if(ContextKind == DL_VEKSELORDER)
+          if(EmiFound)
+             return MakeNumber(emi.rec.OrderNumber);
+          elif(TckFound)
+             return MakeNumber(tck.rec.DealCode);
+          end;
+       end;
+
+       return "";
+    END;
+
+    /* Возвращает параметр II рода - Дата начала документа
+    */
+    PRIVATE MACRO Get_II_BegDate()
+       var
+          BlankDate = date(0,0,0), BegDate = BlankDate;
+
+       if((bnr.rec.BCPresentationDate != BlankDate) AND
+          (bnr.rec.BCTermFormula == VS_TERMF_DURING)
+        )
+          BegDate = bnr.rec.BCPresentationDate;
+       elif(//операции с учтенными векселями и операции с СВ, приравненные к операциям с УВ
+            // upd.: Собственные векселя здесь не обрабатываются, даже если участвуют в мене УВ-СВ или СВ-УВ
+            (not DL_IsOurBanner(bnr.rec.Issuer)) //OR (CheckVA() AND IsBarter() AND (not IsClient(Context.rec.ClientID)))
+           )
+          BegDate = VADealDate();
+       end;
+
+       if(BegDate == BlankDate)
+          BegDate = leg.rec.Start;
+       end;
+
+       return BegDate;
+
+    END;
+
+    /* Возвращает параметр II рода - Базовая дата документа
+    */
+    PRIVATE MACRO Get_II_FinDate()
+       var
+          BlankDate = date(0,0,0), FinDate = BlankDate;
+
+       if(bnr.rec.BCTermFormula != VS_TERMF_DURING)
+          if( (bnr.rec.BCTermFormula == VS_TERMF_ATSIGHT) and (leg.rec.Start+1 == leg.rec.Maturity) )
+            FinDate = leg.rec.Start; /* для возможности открыть счет "до востребования" */
+          else
+            FinDate = leg.rec.Maturity;
+
+            if(FinDate != BlankDate)
+              return FinDate;
+            end;
+          end;
+       elif(bnr.rec.BCPresentationDate != BlankDate)
+          FinDate = bnr.rec.BCPresentationDate + leg.rec.Diff;
+       elif(//операции с учтенными векселями и операции с СВ, приравненные к операциям с УВ
+            // upd.: Собственные векселя здесь не обрабатываются, даже если участвуют в мене УВ-СВ или СВ-УВ
+            (not DL_IsOurBanner(bnr.rec.Issuer)) //OR (CheckVA() AND IsBarter() AND (not IsClient(Context.rec.ClientID)))
+           )
+          FinDate = VADealDate();
+       end;
+
+       if(FinDate == BlankDate)
+          FinDate = leg.rec.Start;
+       end;
+
+       FinDate = GetDateAfterWorkDays(FinDate, 0); /* #63767 Возвращаем след. рабочий день */
+       return FinDate;
+    END;
+
+    /* Возвращает платеж с совпадающим ФИ
+    */
+    PRIVATE MACRO GetPaymForTick(DocID, DocKind, Purpose, FIID, payms)
+    var Ok, Result = false;
+
+        payms.KeyNum = 1;
+        payms.rec.DocKind = DocKind;
+        payms.rec.DocumentID = DocID;
+        payms.rec.Purpose = Purpose;
+        payms.rec.SubPurpose = 0;
+        payms.AddFilter("t_DocKind = " + DocKind + " AND t_DocumentID = " + DocID + " AND t_Purpose = " + Purpose);
+        Ok = payms.GetGE;
+
+        while(Ok and (not Result))
+          if(payms.rec.BaseFIID == FIID)
+             Result = true;
+          else
+             Ok = payms.next; /* переходим к след.платежу */
+          end;
+        end;
+        payms.DropFilter();
+
+        return Result;
+    END;
+
+    /* Возвращает параметр II рода - Место хранения
+       Для сделки с учтенными векселями
+    */
+    PRIVATE MACRO Get_II_Place( FIRole )
+       var
+          payms = TBfile("pmpaym.dbt"),
+          Place = {OurBank}, DealID = -1;
+
+       if(ContextKind == DL_VAPAWN) /* "залог УВ" */
+           if(GetPaymForTick(Context.rec.DealID, ContextKind, Bai, bnr.rec.FIID, payms))
+              if(FIRole == FIROLE_SALEACTIVE)  /* Реализуемый актив */
+                 Place = payms.rec.PayerBankID;
+              elif(FIRole == FIROLE_BUYACTIVE) /* Приобретаемый актив */
+                 Place = payms.rec.ReceiverBankID;
+              end;
+           end;
+       //операции с учтенными векселями (кроме залога, см. выше) и операции с СВ, приравненные к операциям с УВ
+       // upd.: Собственные векселя здесь не обрабатываются, даже если участвуют в мене УВ-СВ или СВ-УВ
+       elif(not DL_IsOurBanner(bnr.rec.Issuer))
+           DealID = VAScanLast("LastID");
+           if(DealID > 0) /* есть сделка, ищем плановый платеж по активу  */
+              if(GetPaymForTick(DealID, ContextKind, BAi, bnr.rec.FIID, payms))
+                 Place = payms.rec.ReceiverBankID;
+              end;
+           end;
+       end;
+
+       return Place;
+    END;
+
+    /* Возвращает параметр II рода - Центр ответственности
+       Для СВ - лицо, которому выдан под отчет бланк векселя
+    */
+    PRIVATE MACRO Get_II_Centr()
+        var ds;
+        if(bnr.rec.Issuer == {OurBank})
+            ds = TRsbDataSet(" SELECT t_ResponsPerson FROM dvsform_dbt WHERE t_Number LIKE '" + bnr.rec.BCNumber + "' "
+                           + IIF(bnr.rec.BCSeries != "", " AND t_Series LIKE '" + bnr.rec.BCSeries + "' ", ""));
+            if(ds.MoveNext() and (ds.t_ResponsPerson > 0))
+                return ds.t_ResponsPerson;
+            end;
+        end;
+
+        return {OurBank};
+    END;
+
+    MACRO GetAgentIDbyRole( AgentRole )
+      var vsircag = TBfile("vsircag.dbt");
+      var AgentID = -1;
+
+      vsircag.AddFilter("t_AvoirKind = " +AVOIRISSKIND_BILL+ " and t_BCID = " + bnr.rec.BCID + " and t_AgentRole = " + AgentRole);
+      if(vsircag.next())
+        AgentID = vsircag.rec.Agent;
+      end;
+
+      return AgentID;
+    END;
+
+    PRIVATE MACRO Get_II_Issuer()
+      return this.GetAgentBillAccount();
+    END;
+
+    /* определить вид финансового инструмент */
+    PRIVATE MACRO GetFIKind( Currency : integer ) : integer
+      var FIKind : integer;
+      var rs = TRsbDataSet( "SELECT t_FI_Kind as FIKIND FROM dfininstr_dbt WHERE t_FIID = " + string(Currency) );
+    
+      FIKind = -1;
+    
+      if( rs.moveNext() )
+    
+        FIKind = rs.FIKIND;
+    
+      end;
+    
+        if( FIKind == FIKIND_CURRENCY ) FIKind = 1;
+      elif( FIKind == FIKIND_METAL    ) FIKind = 2;
+      end;
+    
+      return FIKind;
+    
+    END;
+
+    /* Параметры II рода
+    */
+    PRIVATE MACRO InitParmArray()
+        var tmp;
+        var CABS;
+        if( not VS_GetRegistryValue("ВЕКСЕЛЯ БАНКА\\РЕЖИМ РАБОТЫ\\CABS", V_BOOL, @CABS))
+          return false;
+        end;
+
+        ParmA[MC_TYPE_PARAMETR_FIID] = bnr.rec.FIID;
+        ParmA[MC_TYPE_PARAMETR_CURRENCY] =
+        ParmA[MC_TYPE_PARAMETR_PAYCURRENCY] = leg.rec.PFI;
+
+        ParmA[MC_TYPE_PARAMETR_BEGDATE]      = Get_II_BegDate(); /* Дата начала документа */
+        ParmA[MC_TYPE_PARAMETR_FINDATE]      = Get_II_FinDate(); /* Базовая дата документа */
+        ParmA[MC_TYPE_PARAMETR_PLACE]        = {OurBank};/*Get_II_Place();*/   /* Место хранения */
+        ParmA[MC_TYPE_PARAMETR_OWNER]        = {OurBank};/*Get_II_Owner();*/
+        ParmA[MC_TYPE_PARAMETR_PARTY]        = Get_II_Party();
+        ParmA[MC_TYPE_PARAMETR_NUMBER]       =
+        ParmA[MC_TYPE_PARAMETR_SENIORNUMBER] = Get_II_SeniorNumber();
+
+        ParmA[MC_TYPE_PARAMETR_VALDATE] = ParmA[MC_TYPE_PARAMETR_BEGDATE];
+
+        ParmA[MC_TYPE_PARAMETR_DOCKIND] = DL_VSBANNER;
+        ParmA[MC_TYPE_PARAMETR_DOCID] = bnr.rec.BCID;
+        ParmA[MC_TYPE_PARAMETR_CONTRACTOR] = Get_II_Contractor();//bnr.rec.Holder;
+        ParmA[MC_TYPE_PARAMETR_ISSUER] = this.GetAgentBillAccount();
+        ParmA[MC_TYPE_PARAMETR_MARKET_PLACE] = {OurBank};
+        ParmA[MC_TYPE_PARAMETR_MARKET_PLACE_OFFICE] = {OurBank};
+        if(CABS)
+           ParmA[MC_TYPE_PARAMETR_DEPARTMENT] = {NumDprt};
+        else
+           ParmA[MC_TYPE_PARAMETR_DEPARTMENT] = {OperDprt};
+        end;
+
+        if (ContextKind == DL_VEKSELPAWNORDER)
+          if(IsBankCentrMode())
+            ParmA[MC_TYPE_PARAMETR_DEPARTMENT] = {NumDprt};
+          else
+            ParmA[MC_TYPE_PARAMETR_DEPARTMENT] = {OperDprt};
+          end;
+        end;
+
+        ParmA[MC_TYPE_PARAMETR_VEKSELCODE] = bnr.rec.AccCode;
+        ParmA[MC_TYPE_PARAMETR_CONTR_CLIENT] = Get_II_ClientContract();  /*договор обслуживания клиента*/
+    END;
+
+    /* Проверка условия выдачи гарантии.
+    */
+    MACRO TestGuarantee(OnDate)
+    var
+       stat = 1, vsircag = TBfile("vsircag.dbt"), stop, found = false,
+       AgId = -1, DateOfSigning = date(0,0,0);
+
+       vsircag.KeyNum = 1; /* AvoirKind+BCID+AgentRole+DateOfSigning+Id*/
+       vsircag.rec.AvoirKind = AVOIRISSKIND_BILL;
+       vsircag.rec.BCID = bnr.rec.BCID;
+       vsircag.rec.AgentRole = IRCAG_ROLE_INDOSSANT;   /* индоссант */
+       stop = not vsircag.GetGE;
+
+       while(not stop)
+         if((vsircag.rec.BCID != bnr.rec.BCID) OR (vsircag.rec.AgentRole != IRCAG_ROLE_INDOSSANT)
+            OR (vsircag.rec.AvoirKind != AVOIRISSKIND_BILL))
+            /* в ключе пошли уже не наши записи, останавливаемся */
+            stop = true;
+         else
+            if(vsircag.rec.Agent != {OurBank})
+              /* пропускаем*/
+            elif(ValType(OnDate) == V_DATE)
+              if(vsircag.rec.DateOfSigning == OnDate)
+                 found = true;
+                 stop = true;
+              end;
+            else
+              if(DateOfSigning < vsircag.rec.DateOfSigning)
+                 AgId = vsircag.rec.Id;
+                 DateOfSigning = vsircag.rec.DateOfSigning;
+              end;
+            end;
+            if(found)
+               stop = true;
+            else
+               stop = not vsircag.next; /* ищем дальше */
+            end;
+         end;
+       end;
+
+       if(not found)
+         if(AgId > 0)
+            vsircag.KeyNum = 0; /* Id */
+            vsircag.rec.Id = AgId;   /* индоссант */
+            if(not vsircag.GetEQ())
+               return false;
+            end;
+         else
+            return false;
+         end;
+       end;
+
+       if((vsircag.rec.EndorsementKind != IRCAG_ENDORSKIND_NOTBACK) AND
+          ((bnr.rec.BCTermFormula != VS_TERMF_DURING) OR
+           (bnr.rec.BCPresentationDate == date(0,0,0)) OR
+           (bnr.rec.BCPresentationDate > vsircag.rec.DateOfSigning)
+          )
+       )
+         return true;
+       end;
+
+       return false;
+    END;
+
+    MACRO GetLeg()
+        return leg;
+    END;
+
+    MACRO GetBnr()
+        return bnr;
+    END;
+
+    MACRO IsTckFound()
+      return CheckVA();
+    END;
+
+    MACRO GetTick()
+      return Context;
+    END;
+
+    //Это вексель?
+    MACRO IsBill()
+      if(m_IsBill == NULL)
+        m_IsBill = false;
+
+        var cmd = DL_RSDCommand("select RSI_RSB_FIInstr.FI_AvrKindsGetRootByFIID(?) as RootAvrKind from dual");
+        cmd.AddParam(bnr.rec.FIID);
+
+        var DataSet = cmd.Execute();
+        if((DataSet.moveNext()) and (DataSet.RootAvrKind == AVOIRISSKIND_BILL))
+          m_IsBill = true;
+        end;
+      end;
+      return m_IsBill;
+    END;
+
+    /*Получить параметры*/
+    MACRO GetParametr(ParmKind, OperDate, CatCode, FIRole)
+        VAR Parametr = ParmA[ParmKind];
+
+        if (Parametr==null)
+            Parametr = -1;
+        end;
+
+        if(ParmKind == MC_TYPE_PARAMETR_OWNER)
+           return Get_II_Owner( FIRole );
+        elif(ParmKind == MC_TYPE_PARAMETR_PLACE) /* Место хранения */
+           return Get_II_Place( FIRole );
+        elif(ParmKind == MC_TYPE_PARAMETR_CENTR) // Подотчетное лицо
+           return Get_II_Centr();
+        elif(ParmKind == MC_TYPE_PARAMETR_FIID) //валюта
+           if( DL_IsOurBanner(bnr.rec.Issuer) )
+              return this.ОпределитьВалютуУчета();
+           else
+              if( (FIRole == FIROLE_BA) or (FIRole == FIROLE_SECURITIES) or (FIRole == FIROLE_BUYACTIVE) or (FIRole == FIROLE_SALEACTIVE) )
+                return ParmA[MC_TYPE_PARAMETR_FIID];
+              else
+                return this.ОпределитьВалютуУчета();
+              end;
+           end;
+        elif(ParmKind == MC_TYPE_PARAMETR_ISSUER)
+           return Get_II_Issuer();
+        end;
+
+        return Parametr;
+    END;
+
+    /* Установить параметр */
+    MACRO SetParametr(ParmKind, value)
+        ParmA[ParmKind] = value;
+    END;
+
+    /* Параметры I рода
+    */
+    MACRO GetParametrTemplate(
+        ObjectID,       /*   параметр - номер справочника                 */
+        Classificator,  /*   классификатор - номер классификатора, если он задан */
+        OperDate,
+        FIRole
+    )
+        var abcstatus = -1, TypeContr;
+
+        if (ObjectID==OBJTYPE_KINDCB)                   /*1101*/
+            if (Classificator==LLCLASS_KINDCB_RASHOD)
+              return 2;/*вексель*/
+            elif (Classificator==LLCLASS_KINDCB_CLS_SAVE)
+              return 2;/*вексель*/
+            elif (Classificator == LLCLASS_KINDCB_PORTF)
+              if(bnr.rec.BCFormKind == VSBANNER_FORMKIND_CERT)
+                return 5;
+              end;
+            elif (Classificator == LLCLASS_KINDCB_VA)
+              if(bnr.rec.BCFormKind == VSBANNER_FORMKIND_CERT)
+                return 5;
+              else
+                return 2;
+              end;
+            elif(Classificator == LLCLASS_KINDCB_INVESTMENT)
+               return 3;/*Долговое обязательство*/
+            end;
+        elif(ObjectID == OBJTYPE_PRODUCT) /* 1103 Продукт */
+           if(Classificator == LLCLASS_PRODUCT_ANRAS) /* 141 - продукт в других расходах */
+              return 102; /* Размещение (ссуды) */
+           end;
+
+        elif (ObjectID==OBJTYPE_RESIDENT)               /*1104*/
+            if (Classificator==LLCLASS_RESIDENT_ISS)                 /*150*/
+                return MC_IsResident(ParmA[MC_TYPE_PARAMETR_ISSUER]);
+            elif (Classificator==LLCLASS_RESIDENT_CLCB)
+                return MC_IsResident(ParmA[MC_TYPE_PARAMETR_CLIENT]);
+            end;
+        elif (ObjectID == OBJTYPE_KINDSUBJ) /* 1113 Вид субъекта */
+             if( (Classificator == LLCLASS_KINDSUBJ_ISSUER_DR) OR (Classificator == LLCLASS_KINDSUBJ_SHARE_ISSUER_DR) ) /* 120 Категория эмитента в доходах/расходах */
+               if(bnr.rec.BCFormKind == VSBANNER_FORMKIND_CERT)
+                 return 2;
+               else
+                 return MC_GetKindIssuerDR(ParmA[MC_TYPE_PARAMETR_ISSUER], false);
+               end;
+             elif (Classificator == LLCLASS_KINDSUBJ_ISSUER) /* 125 Категория эмитента */
+               return MC_GetKindIssuerBnr(ParmA[MC_TYPE_PARAMETR_ISSUER], false);
+             elif(Classificator == LLCLASS_KINDSUBJ_AGENT)
+               return MC_GetKindIssuerBnr(ParmA[MC_TYPE_PARAMETR_ISSUER], false);
+             end;
+        elif ((ObjectID==OBJTYPE_PAYMTYPE))             /*1110*/
+          if (Classificator == LLCLASS_OUT_SECURITIES)
+            if(GetParmForCateg24828("-Эмиссия, СВ") == "02")
+              return 7;
+            else
+              return 6;
+            end;
+          else
+            if(FIRole == FIROLE_PERCENT)
+                return 1; // %%
+            elif(FIRole == FIROLE_DISCOUNT)
+                return 3; // Дисконт
+            else
+                return 4; // не определен
+            end;
+          end;
+        elif (ObjectID==OBJTYPE_VALUETYPE)              /*1111*/
+            if (Classificator==LLCLASS_VALUE_CLS_SAVE)               /*155*/
+               return 1;
+            end;
+        elif (ObjectID==OBJTYPE_BACKOFFICE)             /*1118*/
+            if (Classificator==LLCLASS_BACKOFFICE)                   /*180*/
+               if(CheckVA())
+                  return 7; /* УВ - учтенные векселя */
+               else
+                  return 1; /* СВО - сектор вексельного обращения */
+               end;
+            end;
+        elif (ObjectID == OBJTYPE_KINDOWNER)  /* 1119 Вид владельца */
+            if (Classificator == LLCLASS_OWNER_AVOIR)  /* 166 Вид депонента */
+               if(ParmA[MC_TYPE_PARAMETR_OWNER] == {OurBank})
+                  return 2; /* Наш банк */
+               else
+                  return 1; /* сторонний депонент */
+               end;
+            end;
+        elif (ObjectID == OBJTYPE_SECURITY_OWN)  /* 1203 Принадлежность ц/б */
+            if (Classificator == LLCLASS_SECUR_OWNERSHIP_SEPARATE)  /* 420 Принадлежность ценных бумаг */
+               if(ParmA[MC_TYPE_PARAMETR_OWNER] == {OurBank})
+                  return 1; /* собственные ц/б */
+               else
+                  return 2; /* ц/б сторонних депонентов */
+               end;
+            end;
+        elif (ObjectID == OBJTYPE_OTNSEBEST)  /* 1117 Отнесение на себестоимость */
+            if (Classificator == LLCLASS_OTNSEBEST_SEBEST)  /* 172 Отнесение на себестоимость */
+               return 1; /* В налогооблагаемой базе */
+            end;
+        elif (ObjectID == OBJTYPE_VASTATE)  /* 1137 Состояние учтенного векселя */
+             if (Classificator == LLCLASS_VASTATE_BASIC)  /* 189 Состояние учтенного векселя для основной категории учета ценных бумаг */
+               if(Index(bnr.rec.BCState, "Ч") > 0)
+                   if(ContextSubKind == 1)
+                     return 4; /* просрочен и не опротестован*/
+                   elif(ContextSubKind == 2)
+                     return 3; /* просрочен и опротестован*/
+                   end;
+               elif (VA_GetABCStatusOnDate(bnr.rec.BCID, OperDate, abcstatus))
+                  if((abcstatus == VABANNER_STATUS_ACCOUNT) OR
+                       (abcstatus == VABANNER_STATUS_INPUT)) /* учтен или введен */
+                     return 1; /* учтен */
+                  end;
+               end;
+             end;
+        /*вид дохода (процентный/дисконтный)*/
+        elif( (ObjectID == OBJTYPE_KIND_ACCOUNT_SECUR) AND (Classificator == LLCLASS_KIND_ACC_PDD) )
+          if(bnr.rec.BCFormKind == VSBANNER_FORMKIND_CERT)
+             if(FIRole == FIROLE_BONUS)
+               return 9; //уплаченная премия по депозитным сертификатам
+             elif(FIRole == FIROLE_BONUS_ACC)
+               return 11; //начисленная премия
+             else
+               return 4; //процентный
+             end;
+          else
+             if( FIRole == FIROLE_PERCENT )
+               return 1;
+             elif( FIRole == FIROLE_DISCOUNT )
+               return 2;
+             elif( FIRole == FIROLE_BONUS )
+               return 6;
+             elif( FIRole == FIROLE_BONUS_ACC )
+               return 10;
+             end;
+          end;
+        elif (ObjectID == OBJTYPE_SIDEBALANCE)          /*1000 - справочник сторон баланса*/
+            if (Classificator == LLCLASS_SIDEBALANCE_CORACCKIND)       // 1622 - Вид корреспондирующего счета
+
+               if(FIRole == FIROLE_CORACC_PASSIVE)
+                  return 2; // Пассивный
+               elif(FIRole == FIROLE_CORACC_ACTIVE)
+                  return 1; // Активный
+               end;
+
+            end;
+        elif (ObjectID == OBJTYPE_KINDPORT)
+            if (Classificator == LLCLASS_KINDPORT)
+               if(bnr.rec.BCFormKind == VSBANNER_FORMKIND_CERT)
+                  return bnr.rec.PortfolioID;
+               end;
+            elif((Classificator == LLCLASS_DISKBILL) OR (Classificator == LLCLASS_OWNBILL))
+              return bnr.rec.PortfolioID;
+            end;
+        elif (ObjectID == OBJTYPE_BOOLEAN)
+            if (Classificator == LLCLASS_QUOTED)
+               if(bnr.rec.BCFormKind == VSBANNER_FORMKIND_CERT)
+                  return 0;
+               end;
+            elif (Classificator == LLCLASS_CONTRCREDIT_ORG)      /* 516 Контрагент-КредОрг? */
+               TypeContr = MC_GetKindParty( ParmA[MC_TYPE_PARAMETR_ISSUER]);
+               if( (TypeContr == 1) /*банк*/  OR
+                   ((TypeContr == 2)) 
+                 )
+                  return 1; /*Да*/
+               else
+                  return 0; /*Нет*/
+               end;
+            end;
+        elif(ObjectID == OBJTYPE_SERVKIND) /* 1004  вид обслуживания */
+           if(Classificator == LLCLASS_SERVKIND_INNER) /* 103  вид обслуживания во внутреннем учете */
+              return 2; /* Учтенные векселя */
+            end;
+        elif(ObjectID == OBJTYPE_IST_DOH_RASH)
+           if(Classificator == LLCLASS_KIND_MARG_FUTURES) /* 1651  вид маржи от срочных сделок */
+              return 6;
+            end;
+        elif(ObjectID == OBJTYPE_KINDRESERV) /* 1060 вид резерва по ц/б */
+           if(Classificator == LLCLASS_VEKS_KINDRESERVE) /* 507 Вид резерва по УВ */
+              if( (ContextKind == DL_VARESERVE) and (ContextSubKind == VARES_SUBKIND_AVR) )
+                return 11;
+              elif( (ContextKind == DL_VARESERVE) and (ContextSubKind == VARES_SUBKIND_OR) )
+                if(FIRole == FIROLE_PERCENT)
+                  return 12;
+                elif(FIRole == FIROLE_FIDOC)
+                return 11;
+                end;
+              elif( (ContextKind == DL_VARESERVE) and (ContextSubKind == VARES_SUBKIND_PRC) )
+                return 12;
+              elif( (ContextKind == DL_VARESERVE) and (ContextSubKind == VARES_SUBKIND_CRTUNSAFE) )
+                return 18;
+              end;
+           end;
+        elif(ObjectID == OBJTYPE_KINDFI) /* 1122 Вид финансового инструмента */
+           if(Classificator == LLCLASS_FI_KIND) /* 701 Вид финансового инструмента */
+              return GetFIKind( ParmA[MC_TYPE_PARAMETR_CURRENCY]);
+           end;
+        elif( ObjectID == OBJTYPE_SYMBOLNUMBERS )
+          if( Classificator == LLCLASS_SYMBOLNUMBERS )
+            return 0;
+          end;
+        elif (Classificator == LLCLASS_UNCS_FITYPE)
+          if (leg.rec.pfi == NATCUR)
+            return 1;
+          else
+            return 0;
+          end;
+        elif ( ObjectID == OBJTYPE_TSKIND_PROFIT )
+          if ( DL_IsOurBanner(bnr.rec.Issuer) )
+            if ((Classificator == LLCLASS_TS_REC_EXP) and (leg.rec.pfi == NATCUR))
+              if (GetParmForCateg24828("+Эмиссия, СВ") == "03")
+                return 32;
+              else
+                return 31;
+              end;
+            end;
+          else
+            if ( ((Classificator == LLCLASS_TSPROFIT_INVEST) OR ( Classificator == LLCLASS_TS_REC_EXP )) AND
+                ((bnr.rec.BCFormKind == VSBANNER_FORMKIND_CERT) OR 
+                (MC_GetKindIssuerDR(ParmA[MC_TYPE_PARAMETR_ISSUER], false) == 2) OR 
+                (MC_GetKindIssuerDR(ParmA[MC_TYPE_PARAMETR_ISSUER], false) == 9999) OR 
+                (MC_GetKindIssuerDR(ParmA[MC_TYPE_PARAMETR_ISSUER], false) == 1000) OR 
+                (MC_GetKindIssuerDR(ParmA[MC_TYPE_PARAMETR_ISSUER], false) == 3))
+              )
+                if ( Classificator == LLCLASS_TSPROFIT_INVEST )
+                  if(GetParmForCateg24828("+Маржа, вексель") == "02")
+                    return 30;
+                  else
+                    return 29;
+                  end;
+                elif ( Classificator == LLCLASS_TS_REC_EXP ) 
+                  if(GetParmForCateg24828("-Маржа, вексель") == "02")
+                    return 32;
+                  else
+                    return 31;
+                  end;
+                end;
+            end;
+          end;
+        end;
+
+        return -1;
+    END;
+    
+    /* Возвращает краткое наименование контрагента*/
+    PRIVATE MACRO GetBankName(PartyID)
+      var party = TBfile("party.dbt");
+
+      party.KeyNum = 0;
+      party.rec.PartyID = PartyID;
+
+      if(party.GetEQ)
+         return party.rec.ShortName;
+      end;
+
+      return "";
+    END;
+
+    /*Макрос корректировки открываемого счета. Account, accblnc, ORScheme можно менять*/
+    MACRO CorrectAccount(account, accblnc, ORScheme, categ, templ, accdoc,  OperDate)
+      var CatErr = 0;
+      var nameacc = "Вексель " + Trim(bnr.rec.IssuerName) + " серия " + Trim(bnr.rec.BCSeries) + " номер " + Trim(bnr.rec.BCNumber) + " - " + Trim(GetBankName(emi.rec.Contractor));
+      var note = "";
+      var bnr = GetBnr().rec;
+
+      //Simanov
+      if (Categ.rec.code == "Обяз%,СВексель")
+        nameacc = "Процент. " + nameacc;
+        note    = "КупЦБ";
+      elif (Categ.rec.code == "Дисконт, Свексель")
+        nameacc = "Дисконт. " + nameacc;
+        note    = "ДискЦБ";
+      elif (Categ.rec.code == "Резерв, вексель")
+        nameacc = "Резерв. " + nameacc;
+        note    = "РезВек";
+      elif (Categ.rec.code == "Начисл.ПДД, УВ")
+        if (leg.rec.formula == 1)
+          nameacc = "Процент. " + nameacc;
+          note    = "ПрцДУВ";
+        elif (leg.rec.formula == 0)
+          nameacc = "Дисконт. " + nameacc;
+          note    = "ДисДУВ";
+        end;
+      elif ( (Categ.rec.code == "Учтенные векселя") or (Categ.rec.code == "Наш вексель") )
+        nameacc = nameacc;
+        note    = "Вексел";
+      elif (Categ.rec.code == "СВексель к исполнению")
+        nameacc = "К исполнению. " + nameacc;
+        note    = "Вексел";
+      elif (Categ.rec.code == "КорСт_Увеличение, вексель")
+        nameacc = "Корректировка. " + nameacc;
+        note    = "КоВек";
+      elif (Categ.rec.code == "+Корр, Свексель")
+        nameacc = "Корректировка. " + nameacc;
+        note    = "КУмВЦБ";
+      elif (Categ.rec.code == "КорСт_Уменьшение, вексель")
+        nameacc = "Корректировка. " + nameacc;
+        note    = "КоВек";
+      elif (Categ.rec.code == "-Корр, Свексель")
+        nameacc = "Корректировка. " + nameacc;
+        note    = "КУвВЦБ";
+      elif (    (Categ.rec.code == "+Кор_Резерв, вексель")
+             or (Categ.rec.code == "-Кор_Резерв, вексель")
+             or (Categ.rec.code == "+Кор_РезервПроср, вексель")
+             or (Categ.rec.code == "-Кор_РезервПроср, вексель"))
+        nameacc = "Корректировка резерва. " + nameacc;
+        note    = "КоРВек";
+      end;
+
+      Account.rec.NameAccount = nameacc;
+      Account.rec.UserField3 = "1";
+      if (note != "") 
+        addnoteforobject(4, "0" + Account.rec.Chapter + "000000" + account.rec.code_currency + account.rec.account, 112, note);
+      end;
+
+      if (CheckVA())
+        Account.rec.Oper = GetMainOperInGroup(141);
+      else
+        Account.rec.Oper = GetMainOperInGroup(109);
+      end;
+
+
+      if( IsSetAccExcludeResCalc(categ, templ) == true )
+         if( not ConnectObjAttr( CatErr, OBJTYPE_ACCOUNT, UniID(account, OBJTYPE_ACCOUNT), OBJ_ACCOUNT_GROUP_EXCLUDE_RES_CALC, null,"", "1"/*Да*/, OperDate )  OR
+             ( CatErr != 0 )
+           )
+            MsgBox( "Ошибка при установке категории \"Исключить из расчета резервов\" для счета \""+account.rec.Account+"\".|"  + GetErrMsg() );
+            return false;
+         end;
+      end;
+      return true;
+    END;
+
+    MACRO GetBasisFIRole(FIRole)
+      var i = 0;
+
+      if (FIRole == FIROLE_UNDEF)
+        return FIROLE_FIDOC;
+      end;
+
+      while (i < FIRoleBArray.Size)
+        if (FIRoleBArray[i] == FIRole)
+          return FIRole;
+        end;
+        i = i + 1;
+      end;
+
+      Error = 1;
+      return FIROLE_UNDEF;
+    END;
+
+    MACRO GetFIRoleBArray()
+      return FIRoleBArray;
+    END;
+
+    PRIVATE MACRO FindLeg()
+        leg.rec.LegKind = LEG_KIND_VSBANNER;
+        leg.rec.DealID = bnr.rec.BCID;
+        leg.rec.LegID = 0;
+        return leg.GetEQ;
+    END;
+
+    /* Получить срок обращения векселя */
+    MACRO GetTermCircDate()
+       return VS_GetTermCircDate(bnr, leg);
+    END;
+
+    //получить агента ВО счета
+    MACRO GetAgentBillAccount()
+      var AgentID = bnr.rec.AgentID;
+
+      if(AgentID == -1)
+        AgentID = bnr.rec.Issuer;
+      end;
+
+      return AgentID;
+    END;
+
+    MACRO ОпределитьВалютуУчета()
+      var ВалУч = ALLFININSTR;
+      var RegVal;
+      var PayFIID = bnr.rec.PayFIID;
+      var PFI = this.GetParametr(MC_TYPE_PARAMETR_CURRENCY);
+
+      if(DL_IsOurBanner(bnr.rec.Issuer)) //Для СВ
+        ВалУч = ОпределитьВалютуУчетаВекселя(PayFIID, PFI);
+      elif(CodeFor("А") == GetIdentProgram())//Для УВ в ДУ
+        ВалУч = PFI;
+      else //УВ
+        if(bnr.rec.BCFormKind == VSBANNER_FORMKIND_CERT)
+          ВалУч = PFI; //Для БС - всегда ВН
+        else
+          if( PayFIID != ALLFININSTR )
+            ВалУч = PayFIID;
+          else
+            if( PFI == NATCUR ) /*Номинал*/
+              ВалУч = NATCUR;
+            elif( (VS_GetRegistryValue("УЧТЕННЫЕ ВЕКСЕЛЯ\\РЕЖИМ РАБОТЫ\\УЧЕТ_ВАЛ_ВЕКС_БЕЗ_ОЭП_В_РУБЛЯХ", V_BOOL, @RegVal)) and (RegVal) )
+              ВалУч = NATCUR;
+            else
+              ВалУч = PFI;
+            end;
+          end;
+        end;
+      end;
+
+      return ВалУч;
+    END;
+
+    MACRO ПолучитьКпгКтгДляДисконта(Дата, СчетДисконта, Ктг:@variant, Кпг:@variant, ДатаОплаты)
+       var ДПН = date(0,0,0);
+
+       var ДнейОбр_тг = 0;        // количество дней обращения векселя в текущем году
+       var ДнейВсего_тг = 0;  // Всего дней обращения в текущем году
+       var ДнейОбр_пг = 0;    // количество дней обращения векселя в прошлых годах
+       var ДнейОбрВсего = 0;//this.GetTermCircDate();
+       var curr_year, EndDate_year, Start_year, circ_year;
+       var EndDate = date(0,0,0);
+
+       /* Найдем последнюю дату проводки по счету дисконта.
+          Её и будем считать датой начисления дисконта */
+       if( not GetLastCarryDate( 1, ОпределитьВалютуУчета(), СчетДисконта, ДПН ) )
+         ДПН = ПолучитьДатуПоследОперацииПоВекселю( bnr.rec, leg.rec, Дата );
+       end;
+
+       if( ДатаОплаты != date(0,0,0) )
+         EndDate = ДатаОплаты;
+         if(bnr.rec.BCTermFormula == VS_TERMF_FIXEDDAY) //на определенный день
+           if(EndDate > leg.rec.Maturity)
+             EndDate = leg.rec.Maturity;
+           end;
+         end;
+       else
+         EndDate = min(date(bnr.rec.IssueDate + VS_GetTermCircDate(bnr, leg)), ДПН);
+       end;
+
+       DateSplit(EndDate, NULL, NULL, EndDate_year);
+       DateSplit(Дата, NULL, NULL, curr_year);
+       DateSplit(leg.rec.Start, NULL, NULL, Start_year);
+
+       if( EndDate_year == curr_year ) //т.е. последний раз начисляли в этом в году
+         ДнейОбр_тг = ПолучитьЧислоДнейВПериодеПоБазису( date(31,12,curr_year-1), EndDate, leg.rec.Basis);
+       end;
+
+       //за прошлые года
+       if( Start_year != curr_year )
+        ДнейОбр_пг = ПолучитьЧислоДнейВПериодеПоБазису( leg.rec.Start, date(31,12,curr_year-1), leg.rec.Basis);
+       end;
+
+       ДнейОбрВсего = ДнейОбр_тг + ДнейОбр_пг;
+
+       //рассчитать коэффициенты
+       if( ДнейОбрВсего > 0 )
+         Ктг = double(ДнейОбр_тг)/double(ДнейОбрВсего);
+         Кпг = double(ДнейОбр_пг)/double(ДнейОбрВсего);
+       end;
+
+       return true;
+    END;
+
+    macro Constructor(parm1, parm2, parm3, parm4)
+
+      if ((ValType(parm1)==V_INTEGER) AND (ValType(parm2)==V_INTEGER) AND (parm1==DL_VSBANNER))
+          /*Конструктор из DocKind, DocID*/
+          bnr.rec.BCID = parm2;
+
+          if (not bnr.GetEQ)
+              RunError ("не найден вексель с идентификатором " + parm2);
+          end;
+
+          if (not FindLeg)
+              RunError ("не найдены ценовые условия векселя");
+          end;
+      else
+          /*Конструктор из структур и дополнительных параметров*/
+          if (not copy(bnr,parm1))
+              RunError ("неверный вызов конструктора");
+          end;
+
+          if ((not copy(leg,parm2)) and
+              (not FindLeg))
+              RunError ("не найдены ценовые условия векселя");
+          end;
+      end;
+
+      /* контекст по умолчанию: договор эмиссии */
+      if (ValType(parm3) == V_INTEGER)
+        ContextKind = parm3;
+      else
+        ContextKind = DL_VEKSELORDER;
+      end;
+
+      /* разбор контекста */
+      if(ContextKind == DL_VEKSELORDER)
+         if (copy(emi, parm4))
+             EmiFound = true;
+         elif(not VS_FindOrder(bnr.rec.BCID, VSORDLNK_K_EMISSION, emi, lnk))
+             /* ничего больше не делаем, нет связки векселя с документом эмиссии */
+         elif(lnk.rec.DocKind != DL_VEKSELACCOUNTED)
+             /* документ эмиссии - договор */
+             EmiFound = true;
+         else
+             /* поиск сделки мены */
+             tck.KeyNum = 0;
+             tck.rec.DealID = lnk.rec.ContractID;
+             TckFound = tck.GetEQ;
+         end;
+      end;
+      if(ValType(parm4) == V_UNDEF)
+         /* не задали контекст -, значит не хотели */
+      else
+        if(CheckVA())   /*операции УВ*/
+          Context = TRechandler("dl_tick.dbt");
+        elif(ContextKind != DL_VEKSELORDER)
+          Context = TRechandler("dl_order.dbt");
+        end;
+        if(ContextKind != DL_VEKSELORDER)
+           if(ValType(parm4) == V_INTEGER)
+             ContextSubKind = parm4;
+           elif(ValType(parm4) == V_STRING)
+           elif(not copy(Context, parm4))
+              RunError ("не задан контекст");
+           end;
+        end;
+      end;
+    end;
+
+    MACRO InitFIRoleBArray()
+       if(ContextKind == DL_VAPAWN)
+          FIRoleBArray[0] = FIROLE_BUYACTIVE;  /* Приобретаемый актив */
+          FIRoleBArray[1] = FIROLE_SALEACTIVE; /* Реализуемый актив */
+       else
+          FIRoleBArray[0] = FIROLE_FIDOC;
+          FIRoleBArray[1] = FIROLE_PERCENT;    // ФИ учета процентов
+          FIRoleBArray[2] = FIROLE_DISCOUNT;   // ФИ учета дисконта
+          FIRoleBArray[3] = FIROLE_CORACC_PASSIVE;
+          FIRoleBArray[4] = FIROLE_CORACC_ACTIVE;
+          FIRoleBArray[5] = FIROLE_BA;
+          FIRoleBArray[6] = FIROLE_BONUS;
+          FIRoleBArray[7] = FIROLE_AVOIR_UC;
+          FIRoleBArray[7] = FIROLE_BONUS_ACC;
+       end;
+    END;
+
+    this.Constructor(parm1, parm2, parm3, parm4);
+
+    InitParmArray();
+    InitFIRoleBArray();
+
+    Kind = ParmA[MC_TYPE_PARAMETR_DOCKIND];
+    Id = ParmA[MC_TYPE_PARAMETR_DOCID];
+END;
+
+CLASS (VSBannerFD) VS_AvrHdInstrFD(m_ID:integer)
+  PRIVATE VAR m_hdgrealtion = TBFile("dlhdgrelation.dbt", "R", 0);
+
+  MACRO hdgrealtion()
+    return m_hdgrealtion;
+  END;
+
+  MACRO banner()
+    return bnr;
+  END;
+
+  MACRO dl_leg()
+    return leg;
+  END;
+
+  MACRO GetBasisFIRole( FIRole:INTEGER, NoMsgErr:BOOL )
+    var i = 0;
+    
+    if (FIRole == FIROLE_UNDEF)
+      return FIROLE_BA;
+    end;
+
+    return FIRole;
+  END;
+
+  MACRO GetParametrTemplate( ObjectID:INTEGER, Classificator:INTEGER, OperDate:DATE, FIRole:INTEGER )
+    var Parametr;
+    Parametr = GetParametrTemplate(ObjectID, Classificator, OperDate, FIRole);
+    if(Parametr == -1)
+      if( (ObjectID == OBJTYPE_BA_DV) AND (Classificator == LLCLASS_KIND_BA) )
+         if(m_hdgrealtion.rec.InstrType == HEDG_AVRHDINSTRTYPE_CURSWAP)
+            Parametr = 1; //Валюта
+         else
+            Parametr = 2; /*Процентная ставка*/
+         end;
+      elif( (ObjectID == OBJTYPE_KIND_OPER_DV) AND (Classificator == LLCLASS_KIND_DV) )
+         Parametr = 4;//Своп
+      end;
+    end;
+
+    return Parametr;
+  END;
+
+  MACRO GetParametr( ParmKind, OperDate, CatCode, FIRole )
+
+    VAR Parametr = ParmA[ParmKind];
+
+        if (Parametr==null)
+            Parametr = -1;
+        end;
+   if( ParmKind == MC_TYPE_PARAMETR_DEPARTMENT )
+      return {OperDprt};
+        elif(ParmKind == MC_TYPE_PARAMETR_OWNER)
+           return Get_II_Owner( FIRole );
+        elif(ParmKind == MC_TYPE_PARAMETR_PLACE) /* Место хранения */
+           return Get_II_Place( FIRole );
+        elif(ParmKind == MC_TYPE_PARAMETR_CENTR) // Подотчетное лицо
+           return Get_II_Centr();
+        elif(ParmKind == MC_TYPE_PARAMETR_FIID) //валюта
+           return Parametr = bnr.rec.BCID;
+        elif(ParmKind == MC_TYPE_PARAMETR_ISSUER)
+           return Get_II_Issuer();
+        end;
+
+        return Parametr;
+
+    return Parametr;
+  END;
+
+  /*конструктор класса */
+  MACRO Construct( m_ID:integer )
+
+    m_hdgrealtion.Clear();
+    m_hdgrealtion.rec.ID  = m_ID;
+
+    if(not m_hdgrealtion.GetEQ())
+      RunError( "Не найдена запись об отношениях хеджирования.|Ошибка при создании класса "+GenClassName(this) );
+    end;
+
+    if(m_hdgrealtion.rec.ObjDocKind != OBJTYPE_FICERT)
+        this.SetError("Не верный вид объекта хеджирования.|Ошибка при создании класса "+GenClassName(this));
+    end;
+    
+    
+    initVSBannerFD(DL_VSBANNER, m_hdgrealtion.rec.ObjID);
+    Kind = DL_VEKHDGRELATION;
+    ID   = m_ID;
+  END;
+
+  
+  this.Construct(m_ID);
+
+END;
+

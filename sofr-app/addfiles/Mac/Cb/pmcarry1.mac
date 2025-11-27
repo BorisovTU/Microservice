@@ -1,0 +1,1077 @@
+/*
+$Name:               pmcarry1.mac
+$Module:            РКО, ББ
+$Description:      Шаг "зачисление"
+*/
+//-----------------------------------------------------------------------------
+// Блок      : 29012 - "Зачисление"
+// Шаг       : 10    - "Зачисление"
+// Назначение: Макрос шага
+// Описание  : Макрос шага
+//-----------------------------------------------------------------------------
+import pm_common, pm_reserve, "rmtools.mac", "cbctuncs.mac", "cbsttls.mac", "pm_tools.mac", "pm_opr.mac", pmcarrymass;
+import oralib, likepy, wlinstpm; /* Запрос делать будем */
+import pmpurp, "sf_lib.mac", "sfdiscount.mac", "mpckvit.mac";
+import pmsummo;
+import "pmbencom.mac";
+
+var PaymentObj:RsbPayment;
+private const ACCLAIM_INITIATOR_TREASURY = 4; // Инициатор - казначейство
+private const ACCLAIM_INITIATOR_BANK     = 5; // Инициатор - обслуживающий банк
+private const ACCLAIM_KIND_SPECIAL       = 2; // Вид претензии - ЦИ
+private const ACCLAIM_TYPE_AMOUNT        = 3; // Тип ограничения - сумма
+private const ACCLMCNG_KIND_CHANGE       = 1; // Вид изменения - изменение
+/*методы пересчета сумм для счетов с НВПИ*/
+private const RECMETHOD_FROMFIACC = "X  "; /* Из валюты счета        */
+private const RECMETHOD_FROMFIEQ  = " X "; /* Из валюты-эквивалента  */
+private const RECMETHOD_NORECALC  = "  X"; /* Без пересчета */
+
+const PMBF_CREATEBBE = "";
+const PMBF_CREATEBBEANDDEL = "Z";
+
+
+private macro WorkWithRetail():bool
+  var Work_Retail:bool = false;
+  var err:integer = 0;
+
+  GetRegistryValue( "COMMON\\WORK_MODE\\WORK_WITH_RETAIL", V_BOOL, Work_Retail, err );
+  if( err != 0 )
+    msgbox(" Ошибка чтения настройки COMMON\\WORK_MODE\\WORK_WITH_RETAIL ");
+    return false;
+  end;
+
+  return Work_Retail;
+end;
+
+private macro CheckAccountForCreateClaim(ReceiverFIID, ReceiverAccount)
+  
+  VAR select:string = " select party.T_LEGALFORM, acc.t_Kind_Account, per.t_IsEmployer " +
+                      " from daccount_dbt acc, " +
+                      " dparty_dbt party, dpersn_dbt per"+
+                      " where acc.T_CHAPTER = :chapter " +
+                      "   and acc.T_CODE_CURRENCY = :fiid " +
+                      "   and acc.T_ACCOUNT = :account "+    
+                      "   and party.T_PARTYID = acc.T_CLIENT "+
+                      "   and per.t_PersonID(+) = acc.T_CLIENT "+
+                      "   and not exists ( select 1 "+
+                      "                      from ddp_dep_dbt dp "+
+                      "                      where dp.t_PartyID = acc.T_CLIENT "+
+                      "                  )";
+
+  VAR params:TArray = makeArray(SQLParam( "chapter", 1 ),     
+                                SQLParam( "fiid", ReceiverFIID ),     
+                                SQLParam( "account", ReceiverAccount ));
+  
+  VAR rset:RsdRecordset = execSQLselect( select, params, TRUE );
+  
+  if( rset and rset.moveNext() )
+    
+    return (    (rset.value(0) == PTLEGF_INST) 
+             or 
+                ((rset.value(0) == PTLEGF_PERSN) and (rset.value(2) == "X"))
+           )
+           and (rset.value(1) == "П");
+  end;     
+  
+  return false;
+
+  ONERROR(x)
+  MsgBox( x.Message );
+  return false;
+    
+end;      
+
+private macro Get_IsKvitInPaym( cors_num:integer, FIID:integer  ):bool
+
+  var select:string = "select cors.t_IsKvitInPaym "
+                        "from dcorschem_dbt cors "
+                       "where cors.t_Number = :p_Number "
+                         "and cors.t_FIID = :p_FIID " +
+                         "and cors.t_FI_Kind = 1";
+  var params:TArray = makeArray( SQLParam("p_Number", cors_num), SQLParam("p_FIID", FIID) );
+  var rs    :RsdRecordset = execSQLselect( select, params );
+  if( rs.moveNext() )
+    return rs.value(0) == "X";
+  else
+    return false;
+  end;
+
+end;
+
+// Вставка претензии вида "Целевое использование"
+macro InsertAcClaim_Macro( Number, ValueDate, ReceiverAccount, FuturePayerAmount ):integer
+
+  // Тут вставляем
+  if( not AddAccountClaim( ReceiverAccount,            // Account
+                           1,                          // Chapter
+                           NATCUR,                     // FIID
+                           Number,                     // ClaimNum/DocNumber
+                           ACCLAIM_INITIATOR_TREASURY, // Initiator
+                           ACCLAIM_TYPE_AMOUNT,        // ClaimType/RestrKind
+                           ACCLAIM_KIND_SPECIAL,       // ClaimKind
+                           FuturePayerAmount,          // Sum/StartAmount/CurrentAmount
+                           0, // Priority
+                           "Запись введена автоматически при зачислении платежа", // Note/Comment
+                           ValueDate,    // DocDate
+                           {curdate},    // RegDate/SysDate
+                           {curdate},    // StartDate
+                           date(0, 0, 0), // EndDate/FinishDate
+                           null,
+                           null,
+                           true           // SkipCheckRest
+                           ) )
+    msgbox("Ошибка при вставке претензии к счету: " + ReceiverAccount );
+    return 1;
+  end;
+
+  return 0;
+end;
+
+private macro isNeedFillNVPI():bool
+  return  ( ( PaymentObj.DocKind == DLDOC_MEMORIALORDER ) or ( PaymentObj.DocKind == CB_MULTYDOC ) )  and 
+            ( PaymentObj.DbRecalcMethod != "" ) and ( PaymentObj.CrRecalcMethod != "" );
+end;
+
+/* проверить свободный остаток на счете для каждой уточняющей записи с учетом претензий */
+/*macro CheckRestFreePIInList( Payment:RsbPayment, DC:integer ):bool
+
+   var pi :TRecHandler = TRecHandler( "pmaddpi.dbt" );
+   var stat:integer = 0;
+   var RestAcc = $0;
+
+   if( Payment.PIList( DC ).Size > 0 )
+     if( ( Payment.PIList( DC ).First() == 0 ) and ( Payment.PIList( DC ).Current( pi ) == 0 ) )
+       RestAcc = AccGetFreeAmount( pi.rec.Account, pi.rec.Chapter, pi.rec.FIID, PaymentObj.Priority, PaymentObj.ClaimID, {curdate} );
+       if( abs(RestAcc) < pi.rec.PmAmount )
+         return 1;
+       end;
+     
+       while( ( stat == 0 ) and ( Payment.PIList( DC ).Next() == 0 ) )
+         if( Payment.PIList( DC ).Current( pi ) == 0 )
+           RestAcc = AccGetFreeAmount( pi.rec.Account, pi.rec.Chapter, pi.rec.FIID, PaymentObj.Priority, PaymentObj.ClaimID, {curdate} );
+           if( abs(RestAcc) < pi.rec.PmAmount )
+             return 1;
+           end;
+         end;
+       end;
+     end;
+   end;
+
+   return 0;
+
+end;*/
+
+MACRO ReActuateRate()
+  if( PaymentObj.PayerAmount == $0 )
+    if( PaymentObj.IsFixPayerAmount )
+      if( not PaymentObj.BaseRate.ReActuate( PaymentObj.ValueDate ) )
+        return true;
+      end;
+    else
+      if( not PaymentObj.FactRate.ReActuate( PaymentObj.ValueDate ) )
+        return true;
+      end;
+    end;
+  end;
+  if( PaymentObj.ReceiverAmount == $0 )
+    if( not PaymentObj.IsFixPayerAmount )
+      if( not PaymentObj.BaseRate.ReActuate( PaymentObj.ValueDate ) )
+        return true;
+      end;
+    else
+      if( not PaymentObj.FactRate.ReActuate( PaymentObj.ValueDate ) )
+        return true;
+      end;
+    end;
+  end;
+  if( PaymentObj.FutureReceiverAmount == $0 )
+    if( not PaymentObj.FutureCRate.ReActuate( PaymentObj.ValueDate ) )
+      return true;
+    end;
+  end;
+  if( PaymentObj.FuturePayerAmount == $0 )
+    if( not PaymentObj.FutureDRate.ReActuate( PaymentObj.ValueDate ) )
+      return true;
+    end;
+  end;
+  return false;      
+END;
+
+//-----------------------------------------------------------------------------
+// Выполнение шага
+//-----------------------------------------------------------------------------
+MACRO ExecuteStep( doc, paymDoc, KindDoc, ID_Operation, ID_Step )
+
+   var paymtr:RsbPaymTransaction;
+
+  var stat:integer = 0, Action:integer = 0;
+  var cors:integer = 0, cFIID = 0;
+  var SumPaym = $0, SumDoc = $0, PaySumPaym = $0, PaySumDoc = $0;  
+  var accUncs, AccountCarry = PaymentObj.FutureReceiverAccount, FIIDCarry = PaymentObj.FutureReceiverFIID, _AccountCarry:string = "";
+  var aSymb = TArray;
+  var num_el_symb = 0;
+  var Direct     = GetOprStatus(OPR_PAYM_DIRECT);
+  var KvitStatus = GetOprStatus(OPR_PAYM_IN_KVIT);
+  var RestDebet = $0, Sum = $0;
+  var Result:bool = false;
+  var RestAccount = $0, RestNotBal = $0;
+  var SumArray:TArray;
+  var objFDoc;
+
+  // Надо ли вставлять всякие записи для изменения лимита?
+  var needInsertLimitUseTry_Int:bool = false;
+  var needInsertLimitUseTry    :bool = false;
+  var needInsertLimitRestoreTry:bool = false;
+  var needInsertChangeLimit    :bool = false;
+
+  var PayerFIID             = PaymentObj.PayerFIID;
+  var ReceiverFIID          = PaymentObj.ReceiverFIID;
+  var FuturePayerAccount    = PaymentObj.FuturePayerAccount;
+  var FutureReceiverAccount = PaymentObj.FutureReceiverAccount;
+  var ValueDate             = PaymentObj.ValueDate;
+  var Department     :integer = 0;
+  var Type_Account   :string;
+  var Client         :integer = 0;
+
+  var CurrPIFIID     :integer;
+  var CurrPIAcc      :string;
+  var CurrPIAmount;
+  var AddPI          :RsbPIPayment;
+  var CurrAddPI      :TRecHandler = TRecHandler( "pmaddpi.dbt" );
+  var IfNext         :integer = 0;
+
+  var IsAddedPI:bool = IfThenElse( ( PaymentObj.PIList(0).Size > 0 ) or ( PaymentObj.PIList(1).Size > 0 ), true, false );
+
+  var IsCreditAddPI:bool = IfThenElse( ( PaymentObj.PIList(1).Size > 0 ), true, false );
+
+  var DbAccIsNVPI:bool, /* счет по дебету  - с НВПИ */
+      CrAccIsNVPI:bool; /* счет по кредиту - с НВПИ */  
+
+  var SumEqPayer    ,   /* сумма в ВЭ по дебету  */
+      SumEqReceiver ;   /* сумма в ВЭ по кредиту */
+
+  var DoCarry = true,
+      CarryKind = 0;
+  Array Text;
+  Array Buttons;
+
+  RECORD wlconf( wlconf );
+  file dp_dep("dp_dep.dbt");
+  file party("party.dbt");
+
+  record AccRec("account.dbt");
+  record NotBalAccRec("account.dbt");
+  var str, depName = "", partyName = "";
+  record _wlreq( "wlreq.dbt" );
+  var query:string, param:TArray, rs:RsdRecordset;
+
+  /*Для того, чтобы при откате операции автоматически создавалась запись аннулирования платежа в dpmsend_dbt*/
+  var isNeedAnalyseCarries = 1; // Нужно проверять проводки
+  var backoutQuery = " DECLARE stat number := 0; BEGIN stat := WLD_GGPMSEND.PaymentAutomaticAnnulate( " + PaymentObj.PaymentID + ", " + isNeedAnalyseCarries + " ); END; ";
+  if( Opr_ExecSQLQuery( "", backoutQuery ) )
+    msgbox( "Ошибка при вставке SQL-запроса для отката" );
+    return 1;
+  end;
+                  
+  if( PaymentObj.StartDepartment != PaymentObj.EndDepartment )
+    if( IsExistCallBackRSL( PaymentObj.PaymentID, 60/*WLD_STATUS_REQ_RECEIV*/, ID_Operation, ID_Step ) )
+      return 1;
+    end; 
+  /*  
+    query = " select dp.t_Name, pt.t_Name from ddp_dep_dbt dp, dparty_dbt pt where dp.t_PartyID = ? and pt.t_PartyID = dp.t_PartyID " ;
+    param = makeArray( SQLParam( "", _wlreq.OriginatorID ));
+    rs = execSQLselect( query, param, TRUE );
+    rs.moveNext();
+
+    str = string("Есть необработанный запрос из филиала ", rs.value(0), " ", rs.value(1), " на отзыв документа.");
+    if(not IsOprMultiExec())
+      Text(0) = string( str,"|Провести?");
+      Buttons(0) = " Отложить "; 
+      Buttons(1) = " Провести "; 
+
+      if( ConfWin(Text,Buttons) )
+        if(PlaceReqToClose(_wlreq.ReqID, ID_Operation, ID_Step))
+          msgbox( "Ошибка при помещении отзыва в обработанные" );
+          return 1;
+        end;
+      else
+        return 1;   
+      end;
+    else
+      msgbox(str);
+      return 1;  
+    end;
+  */
+  end;
+
+  if( ReActuateRate() or 
+      PaymentObj.Actuate() )
+    // Заполнить статусы сегментов операции
+    /*
+    if( УстановитьСтатусыПлатежа( OPR_PAYM_MANUAL, OPR_PAYM_ST_MANUAL_NEED ) )
+      msgbox("Ошибка при установке сегментов статуса экземпляра операции");
+      return 1;
+    end;
+
+    // Заполнить примечание
+    if( PaymentObj.Notes.AddNote( PM_NOTEKIND_DENIALGROUND, "Не определен курс зачисления" ) != 0 )
+      msgbox( "Ошибка при вставке примечания платежа" );
+      return 1;
+    end;
+    */
+    MsgBox("Не определен курс зачисления");
+    return 1;
+  end;
+
+  if( ((PaymentObj.FutureReceiverAmount == 0) or (PaymentObj.FuturePayerAmount == 0)) and (not IsExistAddPiInCurDep(PaymentObj)) )
+    MsgBox("Не определена сумма проводки");
+    return 1;
+  end;
+  
+  if( not IsCreditAddPI ) 
+
+    // Восстановление лимита
+    if( PaymentObj.Chapter == 1 )
+      stat = OV_NeedRestoreLimit( PaymentObj.PaymentID, false, Result );
+
+      if( stat )
+        return stat;
+      end;
+
+      // Восстановление лимита
+      if( Result )
+        if( OV_GetOverdraftProcMode() == RBOV_MODE_INTEGRATED )
+          // Вставить запись восстановления лимита
+          needInsertLimitRestoreTry = true;
+        else
+          RestAccount = ПолучитьОстатокНаДату( PaymentObj.FutureReceiverAccount, CHAPT1, PaymentObj.ReceiverFIID, PaymentObj.ValueDate );
+
+          // Проверить связанные счета
+          AccRec.Account       = PaymentObj.FutureReceiverAccount;
+          AccRec.Code_Currency = PaymentObj.PayerFIID;
+          AccRec.Chapter       = CHAPT1;
+
+          // Внебалансовый счет неиспользованного лимита
+          if( GetLinkedObject( OBJROLE_ACC_OVEROBACC, OBJTYPE_ACCOUNT, UniID( AccRec, OBJTYPE_ACCOUNT ), OBJTYPE_ACCOUNT, NotBalAccRec) == 0 )
+            RestNotBal = ПолучитьОстатокНаДату( NotBalAccRec.Account, NotBalAccRec.Chapter, NotBalAccRec.Code_Currency, PaymentObj.ValueDate );
+          else
+            MsgBox("Не найден внебалансовый счет неиспользуемого лимита по овердрафту");
+            return 1;
+          end;
+
+          SumArray = makeArray( -RestAccount, RestNotBal, PaymentObj.FutureReceiverAmount );
+          Sum = -arrMin( SumArray );
+
+          // Вставить запись изменения лимита
+          needInsertChangeLimit = true;
+        end;
+      end;
+    end;
+
+  end;
+
+  // Для входящих платежей 
+  if( Direct == OPR_PM_ST_DIR_IN )
+    
+    if( not CheckPaymentObj( PaymentObj ) )
+       return 1;
+    end;
+   
+    /** Входящие платежи на СНР не проводятся
+    if( not( PaymentObj.IsCredit ) )
+      cors  = PaymentObj.InCorschem;
+      cFIID = PaymentObj.PayerFIID;
+    else
+      cors = PaymentObj.InCorschem;
+      cFIID = PaymentObj.ReceiverFIID;
+    end;
+  
+    if( PaymentObj.IsCredit )
+      if( ( PaymentObj.InTransferDate > {curdate} ) and Get_IsKvitInPaym( cors, cFIID ) )
+         accUncs = InPaymentAccUnclosed( PaymentObj );
+         AccountCarry = accUncs.FindAndOpenAccount();
+         FIIDCarry = accUncs.GetParametr( MC_TYPE_PARAMETR_FIID );
+         if( not AccountCarry )
+           return 1;
+         end;
+      end;
+    end;
+    */
+    
+  end;
+
+  CarryKind = GetPaymentCarryKind( PaymentObj );
+  if( not IsAddedPI )
+
+    // удаляем претензию резервирования
+    //if(ClaimSum > $0)
+    //  PaymentObj.FreeReserve( PaymentObj.FuturePayerAccount, CHAPT1, PaymentObj.FuturePayerFIID );
+    //end;
+    
+    // Не делаем никаких проводок если FuturePayerAccount равен СНР
+    if(
+        (ПлатежИсходящий(PaymentObj)) and 
+        (PaymentObj.OutTransferDate > PaymentObj.ValueDate) and 
+        (PaymentObj.DocKind != DLDOC_BANKCLAIM) // #153395. Требования на СНР не ходят
+      ) 
+      // Определить счет незавершенных
+      accUncs = OutPaymentAccUnclosed( PaymentObj );
+      _AccountCarry = accUncs.FindAndOpenAccount();  
+      if( _AccountCarry == PaymentObj.FuturePayerAccount )
+        DoCarry = false;
+      end;
+    end;
+
+    if( DoCarry )
+      // проверяем необходимость помещения документа на счёт незавершённых расчётов
+      if( (ПлатежИсходящий(PaymentObj)) AND (PaymentObj.OutTransferDate > PaymentObj.ValueDate) AND (not CheckUnFin(PaymentObj, false)) )
+
+        // Выполнить проводку
+        
+        paymtr = PaymentObj.MakeTransaction();
+
+        if( paymtr == NULL )
+          MsgBox("Ошибка при создании проводки по платежу");
+          return 1;
+        end;
+
+        CarryKind = ACCTRN_STATUS_DOCUMENT;
+
+        paymtr.Chapter         = PaymentObj.Chapter;
+        paymtr.Date_Carry      = PaymentObj.ValueDate;
+        paymtr.Number_Pack     = PaymentObj.NumberPack;
+        paymtr.Numb_Document   = PaymentObj.Number;
+        paymtr.ResultCarry     = 1;
+        paymtr.Kind_Oper       = " 1";
+
+        if (PaymentObj.ShifrOper != "")
+          paymtr.Shifr_Oper      = PaymentObj.ShifrOper;
+        else
+          paymtr.Shifr_Oper      = "09";
+        end;
+
+        paymtr.Ground          = PaymentObj.Ground;
+        paymtr.Department      = PaymentObj.Department;
+        paymtr.AccountPayer    = PaymentObj.FuturePayerAccount;
+        paymtr.FIIDPayer       = PaymentObj.FuturePayerFIID;
+        paymtr.SumPayer        = PaymentObj.FuturePayerAmount;
+        paymtr.AccountReceiver = _AccountCarry;
+        paymtr.FIIDReceiver    = PaymentObj.BaseFIID;
+        paymtr.SumReceiver     = PaymentObj.FutureBaseAmount;
+        paymtr.ClaimID         = GetClaimID( PaymentObj, paymtr.AccountPayer, paymtr.Chapter, paymtr.FIIDPayer );
+        paymtr.Status_After    = CarryKind;
+
+        if( not paymtr.Carry )
+          MsgBox("Ошибка при актуализации платежа");
+          return 1;
+        end;  
+
+      else
+      
+        // Выполнить проводку
+        paymtr = PaymentObj.MakeTransaction();
+
+        if( paymtr == NULL )
+          MsgBox("Ошибка при создании проводки по платежу");
+          return 1;
+        end;
+
+        paymtr.Chapter         = PaymentObj.Chapter;
+        paymtr.Date_Carry      = PaymentObj.ValueDate;
+        paymtr.Number_Pack     = PaymentObj.NumberPack;
+        paymtr.Numb_Document   = PaymentObj.Number;
+        paymtr.ResultCarry     = 1;
+        paymtr.Kind_Oper       = " 1";
+
+        if (PaymentObj.ShifrOper != "")
+          paymtr.Shifr_Oper      = PaymentObj.ShifrOper;
+        else
+          paymtr.Shifr_Oper      = "09";
+        end;
+
+        paymtr.Ground          = PaymentObj.Ground;
+        paymtr.Department      = PaymentObj.Department;
+        if( PaymentObj.FuturePayerFIID == FIIDCarry )
+          paymtr.FIID          = PaymentObj.FuturePayerFIID;
+          paymtr.Sum           = PaymentObj.FuturePayerAmount;
+        else
+          paymtr.FIIDPayer     = PaymentObj.FuturePayerFIID;
+          paymtr.FIIDReceiver  = FIIDCarry;
+          paymtr.SumPayer      = PaymentObj.FuturePayerAmount;
+          paymtr.SumReceiver   = PaymentObj.FutureReceiverAmount;
+        end;
+        paymtr.AccountPayer    = PaymentObj.FuturePayerAccount;
+        paymtr.AccountReceiver = AccountCarry;
+        paymtr.ClaimID         = GetClaimID( PaymentObj, paymtr.AccountPayer, paymtr.Chapter, paymtr.FIIDPayer );
+        if( PaymentObj.DocKind == DLDOC_MEMORIALORDER )
+          objFDoc = GenObject( "RsbMemorialOrder", PaymentObj.DocumentID );
+          paymtr.TypeDocument = objFDoc.TypeDocument;
+        elif( PaymentObj.DocKind == CB_MULTYDOC )
+          objFDoc = GenObject( "RsbMultyDoc", PaymentObj.DocumentID );
+          paymtr.TypeDocument = objFDoc.Type_Document;
+        end;
+
+        // Параметры расчета сумм для счетов с НВПИ - только для мемордеров и мультивалютных
+        if( isNeedFillNVPI() )
+          if( (( PaymentObj.DbRecalcMethod == RECMETHOD_NORECALC ) and ( PaymentObj.DbSumEq == 0 )) or
+              (( PaymentObj.CrRecalcMethod == RECMETHOD_NORECALC ) and ( PaymentObj.CrSumEq == 0 ))  )
+            paymtr.SumPayer      = PaymentObj.PayerAmount;
+            paymtr.SumReceiver   = PaymentObj.ReceiverAmount;
+            paymtr.SkipRestEQChange = true;
+          else
+            paymtr.SumPayer    = $0;
+            paymtr.SumReceiver = $0;
+            if  ( PaymentObj.DbRecalcMethod == RECMETHOD_FROMFIACC )
+              paymtr.SumPayer      = PaymentObj.PayerAmount;
+            elif( PaymentObj.DbRecalcMethod == RECMETHOD_FROMFIEQ  )
+              paymtr.SumEqPayer    = PaymentObj.DbSumEq;
+            elif( PaymentObj.DbRecalcMethod == RECMETHOD_NORECALC  )
+              paymtr.SumPayer      = PaymentObj.PayerAmount;
+              paymtr.SumEqPayer    = PaymentObj.DbSumEq;
+            end;
+            if  ( PaymentObj.CrRecalcMethod == RECMETHOD_FROMFIACC )
+              paymtr.SumReceiver   = PaymentObj.ReceiverAmount;
+            elif( PaymentObj.CrRecalcMethod == RECMETHOD_FROMFIEQ  )
+              paymtr.SumEqReceiver = PaymentObj.CrSumEq;
+            elif( PaymentObj.CrRecalcMethod == RECMETHOD_NORECALC  )
+              paymtr.SumReceiver   = PaymentObj.ReceiverAmount;
+              paymtr.SumEqReceiver = PaymentObj.CrSumEq;
+            end;
+            paymtr.SkipRestEQChange = false;
+          end;
+        end;
+
+       
+        // Копируем кассовые символы в проводку
+        if(not CopyInCarryAllCashSymbol(paymtr, PaymentObj ))
+              msgbox("Ошибка при копировании кассовых символов из платежа в проводку.");
+              return 1;
+            end;
+
+        if( not RmCopyInCarryCashSymbol( PaymentObj, paymtr ) )
+          msgbox("Ошибка при копировании кассовых символов из платежа в проводку.");
+          return 1;
+        end;
+        
+        paymtr.Status_After = CarryKind;
+
+        // передадим в проводку сумму проводки покрытия
+        if( PaymentObj.CoverAmount != $0 ) 
+          paymtr.SumEquivalentCarry = PaymentObj.CoverAmount;
+        end;
+
+        if( not paymtr.Carry() )
+          msgbox("Ошибка при актуализации платежа");
+          return 1;
+        end;
+
+        if( PaymentObj.IsPurpose == "X" )
+          if( PaymentObj.ClaimID == 0 )
+            if(CheckAccountForCreateClaim(PaymentObj.ReceiverFIID, PaymentObj.ReceiverAccount))
+
+              stat = InsertAcClaim_Macro( PaymentObj.Number,
+                                          PaymentObj.ValueDate,
+                                          PaymentObj.ReceiverAccount,
+                                          PaymentObj.FuturePayerAmount );
+              
+              // Если при вставке претензии была ошибка, вывести ошибку на экран, шаг не прерывать.
+              if(stat)
+                InitError();
+                MemoryError( stat );
+                msgbox(GetErrMsg());
+                stat = 0; 
+              end;
+
+            end;
+            if( stat )
+              return stat;
+            end;
+          end;
+
+        end;
+
+        //Если частичная оплата, то заполняем PayerBankMarkDate
+        if( PaymentObj.PartPaymNumber != 0 )  
+          PaymentObj.PayerBankMarkDate = paymtr.Date_Carry; 
+        end;
+
+      end;
+
+      // удаляем претензию резервирования
+      if( CarryKind == ACCTRN_STATUS_DOCUMENT )
+        PaymentObj.FreeReserve( PaymentObj.FuturePayerAccount, CHAPT1, PaymentObj.FuturePayerFIID );
+      end;
+
+      // Заполняем дату списания со счета плательщика датой проводки
+      if( (paymtr.AccountPayer == PaymentObj.PayerAccount) and
+          (paymtr.FIIDPayer    == PaymentObj.PayerFIID   )  ) 
+         PaymentObj.PayerChargeOffDate = paymtr.Date_Carry; 
+      end;
+
+      if( (not ПлатежИсходящий(PaymentObj)) and 
+          (paymtr.AccountReceiver == FutureReceiverAccount) and (paymtr.FIIDReceiver == FIIDCarry))
+        PaymentObj.ReceiverChargeOffDate = paymtr.Date_Carry;
+      end;
+
+      if(paymtr.AccountPayer == PaymentObj.PayerAccount) 
+         PaymentObj.PayerChargeOffDate={curdate}; //#134457
+      end;
+
+      if( (PaymentObj.ComissCharges == PM_CHRG_BEN) and (PayBenFromCorr == true) )
+        if( not IsCreditAddPI )
+          stat = PayCommisBEN( PaymentObj, paymtr.AccountReceiver, paymtr.FIIDReceiver, ID_Operation, ID_Step );
+        else
+          msgbox("Не определен плательщик комиссии");
+          return 1;
+        end;
+
+        if( stat )
+          return stat;
+        end;
+      end;
+
+    end;
+
+    // Обработаем овердрафтные примочки
+    // Делаем это ТОЛЬКО после проводки зачисления
+    if( needInsertLimitUseTry_Int )
+      if( InsertLimitUseTry_Int( PayerFIID, CHAPT1, FuturePayerAccount, Sum, PaymentObj.ValueDate ) )
+        MsgBox("Ошибка при вставке изменения лимита счета");
+        return 1;
+      end;
+    end;
+    
+    /*
+    if( needInsertLimitUseTry )
+      if( InsertLimitUseTry( PayerFIID, CHAPT1, FuturePayerAccount, Sum, {curdate} ) )
+        MsgBox("Ошибка при вставке изменения лимита счета");
+        return 1;
+      end;
+    end;*/
+
+    if( needInsertLimitRestoreTry )
+      if( InsertLimitRestoreTry( ReceiverFIID, CHAPT1, FutureReceiverAccount, PaymentObj.FuturePayerAmount, ValueDate ) )
+        MsgBox("Ошибка при восстановлении лимита счета");
+        return 1;
+      end;
+    end;
+
+    /*if( needInsertChangeLimit )
+      if( InsertChangeLimit( ReceiverFIID, CHAPT1, FutureReceiverAccount, Sum ) )
+        MsgBox("Ошибка при вставке изменения лимита счета");
+        return 1;
+      end;
+    end;*/
+
+  else
+    /* проверка свободного остатка для дебетовых уточняющих записей с учетом претензий */
+    if( ( not IsCreditAddPI ) and CheckRestAndMakeReserve(PaymentObj, true, true, true, true, GetOprStatus(OPR_PAYM_PERMISSION), false, false, false ) )
+      return 1;
+    end;
+
+    if( ( Direct == OPR_PM_ST_DIR_OUT ) or
+        ( ( Direct == OPR_PM_ST_DIR_IN ) and ( KvitStatus == OPR_PM_ST_UNKVIT ) ) ) 
+      stat = PaymentObj.MakeMultyTransaction( ACCTRN_STATUS_PLAN );
+    else
+      stat = PaymentObj.MakeMultyTransaction();
+    end;
+    if(stat)
+//      msgbox("Ошибка при формировании проводок по уточняющим записям");
+      MemoryError( stat );
+      DisplayError();
+      return 1;
+    end;
+
+    if( (not ПлатежИсходящий(PaymentObj)) and 
+        (IsExistAddPiInCurDep(PaymentObj, PRT_Credit) OR IsExistAddPiInCurDep(PaymentObj, PRT_Debet)) )
+      PaymentObj.ReceiverChargeOffDate = PaymentObj.ValueDate;
+    end;
+
+    if( not IsCreditAddPI )
+
+      if( needInsertLimitRestoreTry )
+        if( InsertLimitRestoreTry( ReceiverFIID, CHAPT1, FutureReceiverAccount, PaymentObj.FuturePayerAmount, ValueDate ) )
+          MsgBox("Ошибка при восстановлении лимита счета");
+          return 1;
+        end;
+      end;
+
+      if( CarryKind == ACCTRN_STATUS_DOCUMENT )
+        AddPI  = PaymentObj.PIList(PRT_Debet);
+        
+        IfNext = AddPI.First(0);
+        while( IfNext == 0 )
+          if( AddPI.Current( CurrAddPI ) == 0 )
+             PaymentObj.FreeReserve( CurrAddPI.rec.Account, CurrAddPI.rec.Chapter, CurrAddPI.rec.FIID, CurrAddPI.rec.PmAddPIID );
+          end;
+          IfNext = AddPI.Next();
+        end;
+      end;
+    else
+  
+      // Удаляем претензию резервирования
+      if( CarryKind == ACCTRN_STATUS_DOCUMENT )
+        PaymentObj.FreeReserve( PaymentObj.FuturePayerAccount, CHAPT1, PaymentObj.FuturePayerFIID );         
+      end;
+
+      AddPI  = PaymentObj.PIList(1);
+      
+      IfNext = AddPI.First(0);
+
+      while( IfNext == 0 )
+         if( AddPI.Current( CurrAddPI ) == 0 )
+
+           CurrPIAcc    = CurrAddPI.rec.Account;
+           CurrPIFIID   = CurrAddPI.rec.FIID;
+           CurrPIAmount = CurrAddPI.rec.Amount;
+        
+           stat = OV_NeedRestoreLimitForAccount( PaymentObj.PaymentID, CurrPIAcc, CurrPIFIID, false, Result );
+                     
+           if( stat )
+             return stat; 
+           end;
+
+           // Восстановление лимита
+           if( Result )
+             
+             if( OV_GetOverdraftProcMode() == RBOV_MODE_INTEGRATED )
+             
+               // Вставить запись восстановления лимита
+               if( InsertLimitRestoreTry( CurrPIFIID, CHAPT1, CurrPIAcc, CurrPIAmount, ValueDate ) )
+                 MsgBox("Ошибка при восстановлении лимита счета");
+                 return 1;
+               end;
+             
+             /*else
+               RestAccount = ПолучитьОстатокНаДату( CurrPIAcc, CHAPT1, CurrPIFIID, PaymentObj.ValueDate );
+
+               // Проверить связанные счета
+               AccRec.Account       = CurrPIAcc;
+               AccRec.Code_Currency = CurrPIFIID;
+               AccRec.Chapter       = CHAPT1;
+
+               // Внебалансовый счет неиспользованного лимита
+               if( GetLinkedObject( OBJROLE_ACC_OVEROBACC, OBJTYPE_ACCOUNT, UniID( AccRec, OBJTYPE_ACCOUNT ), OBJTYPE_ACCOUNT, NotBalAccRec) == 0 )
+                 RestNotBal = ПолучитьОстатокНаДату( NotBalAccRec.Account, NotBalAccRec.Chapter, NotBalAccRec.Code_Currency, PaymentObj.ValueDate );
+               else
+                 MsgBox("Не найден внебалансовый счет неиспользуемого лимита по овердрафту");
+                 return 1;
+               end;
+
+               SumArray = makeArray( -RestAccount, RestNotBal, CurrPIAmount );
+               Sum = -arrMin( SumArray );
+
+               // Вставить запись изменения лимита
+               if( InsertChangeLimit( CurrPIFIID, CHAPT1, CurrPIAcc, Sum ) )
+                 MsgBox("Ошибка при вставке изменения лимита счета");
+                 return 1;
+               end;*/
+             
+             end;
+           end;
+         end;
+
+         IfNext = AddPI.Next();
+      end;
+
+    end;
+
+  end;
+
+  var bilfDocArray = TArray();
+  var pmbflnk = TRecHandler("pmbflnk.dbt");
+  var BilBookEntryId: Integer = 0;
+  if (not PaymentObj.GetPmBfLnk.First(pmbflnk))
+    bilfDocArray[0] = TRecHandler("bilf_doc.rec");
+    if ((pmbflnk.rec.NotCreateBBE == PMBF_CREATEBBE) or (pmbflnk.rec.NotCreateBBE == PMBF_CREATEBBEANDDEL))
+      bilfDocArray[0].Clear();
+      bilfDocArray[0].rec.DocKind = PaymentObj.PrimDocKind;
+      bilfDocArray[0].rec.DocID  = PaymentObj.PaymentID;
+      bilfDocArray[0].rec.Amount = pmbflnk.rec.Amount;
+      bilfDocArray[0].rec.FIID   = pmbflnk.rec.FIID;
+      if (not CreateBilBookEntry(pmbflnk.rec.FacturaID, PaymentObj.ValueDate, bilfDocArray, pmbflnk.rec.BBEDirection))
+        MsgBox("Ошибка при вставке связи СФ");
+        return 1;
+      end;
+    end;
+    while (not PaymentObj.GetPmBfLnk.Next(pmbflnk))
+      if ((pmbflnk.rec.NotCreateBBE == PMBF_CREATEBBE) or (pmbflnk.rec.NotCreateBBE == PMBF_CREATEBBEANDDEL))
+        bilfDocArray[0].Clear();
+        bilfDocArray[0].rec.DocKind = PaymentObj.PrimDocKind;
+        bilfDocArray[0].rec.DocID  = PaymentObj.PaymentID;
+        bilfDocArray[0].rec.Amount = pmbflnk.rec.Amount;
+        bilfDocArray[0].rec.FIID   = pmbflnk.rec.FIID;
+        if(not CreateBilBookEntry(pmbflnk.rec.FacturaID, PaymentObj.ValueDate, bilfDocArray, pmbflnk.rec.BBEDirection))
+          MsgBox("Ошибка при вставке связи СФ");
+          return 1;
+        end;
+      end;
+    end;
+  end;
+
+  // Для документов ПЗО вызовем функцию учета НДС
+  if( IsSfCommPayment( PaymentObj ) )
+    if( not discountNDS( PaymentObj.PaymentID, PaymentObj.ValueDate ) )
+      MsgBox("Ошибка при учете НДС");
+      return 1;
+    end;
+  end;   
+
+  // Для документов модуля "Проценты" сообщаем о размере совершенного зачисления средств
+  if( IsPrcPayment( PaymentObj) )
+    if( PrcCorrSchedFactSum( PaymentObj.PaymentID ) )
+      return 1;
+    end;
+  end;
+  
+  if( stat != 0 )
+    msgbox( stat );
+    return 1;
+  end;
+
+
+  //если платеж был в невыясненных закрываем свойство
+  if(Paymentobj.IsPlacedToUnknown())
+     PaymentObj.CloseUnknown();
+  end;
+
+  // Для исходящих
+  if( Direct == OPR_PM_ST_DIR_OUT )
+    // Внешний платеж - в АРМ
+    PaymentObj.PaymStatus = PM_READY_TO_SEND;
+    PaymentObj.PropStatus = PM_PROP_READY;
+    if( УстановитьСтатусыПлатежа( OPR_PAYM_DO, OPR_PM_ST_DISCHARGE ) )
+      msgbox("Ошибка при установке сегментов статуса экземпляра операции");
+      return 1;
+    end;
+  end;
+
+  if( (PaymentObj.PaymStatus == PM_KVITPROCESSING) or (PaymentObj.PaymStatus == PM_KVITWAIT) )
+    PaymentObj.PaymStatus = PM_FINISHED;
+  end;
+
+  if( PaymentObj.Department == PaymentObj.StartDepartment )
+    if( InsertPmsend(PaymentObj.PaymentID, WLD_ACTION_PMSEND_EXEC) != 0 )
+      msgbox("Ошибка при вставке записи об отправке платежа во внешнюю систему");
+      return 1;
+    end;
+  end;  
+  
+  if( PaymentObj.Primdockind == WL_INDOC )
+   
+    if( (PaymentObj.VO_Accept == ACPT_CC_NEED) or (PaymentObj.VO_Accept == ACPT_CC_DEFINE) )
+      PaymentObj.PaymStatus = PM_READIED;
+    end;
+
+    if( (PaymentObj.VO_Accept == ACPT_CC_DEFINE ) or (PaymentObj.VO_Description != "" ) )
+      if( УстановитьСтатусыПлатежа( OPR_PAYM_CURCONTROL, OPR_PAYM_ST_CURCONTROL_YES, OPR_PAYM_DO, OPR_PM_ST_CONTROL ) )
+        msgbox("Ошибка при установке сегментов статуса экземпляра операции");
+        return 1;
+      end;
+    end;
+  end;
+
+  var RetPaymentID : integer = 0;
+  if( NeedGenPmCarryNotify(PaymentObj.PaymentID, @RetPaymentID) )
+    var PaymForNotify : RsbPayment = RsbPayment(RetPaymentID);
+
+    if(not PM_HasOutProp(PaymentObj))
+      PaymForNotify.NeedExecNotify = WLPM_EXECNOTIFY_SUCCESS;
+    else
+      var AnsRedir : integer = Bnk_GetRegistryValue
+        ( "МЕЖБАНКОВСКИЕ РАСЧЕТЫ\\УФЭБС\\УВЕДОМЛЕНИЯ\\ОТВЕТ ПО ПЕРЕНАПРАВЛЕННЫМ",
+          V_INTEGER,
+          1
+        );
+      if(AnsRedir == 0)
+        PaymForNotify.NeedExecNotify = WLPM_EXECNOTIFY_SUCCESS;
+      elif(AnsRedir == 1)
+        PaymForNotify.NeedExecNotify = WLPM_EXECNOTIFY_FAIL;
+      end;
+    end;
+  end;
+
+  //Формируем уведомление по срочному платежу
+  if((Direct != OPR_PM_ST_DIR_OUT) and (PaymentObj.Instancy > 0)and (PaymentObj.NeedNotify == "X")
+     and (not ФормированиеУведомленияПоСрочномуПлатежу(PaymentObj.PaymentID, TYPETEMPLINFO_OK)))
+    return 1
+  end;
+  
+
+  record Corschem( corschem );  
+    ClearRecord( wlconf );
+  var pi :TRecHandler = TRecHandler( "pmaddpi.dbt" );
+
+  if( Direct == OPR_PM_ST_DIR_INTERNAL )
+    if( not IsAddedPI )  
+      //Создание подтверждения по проводке для дебета
+      FillConfirmationParamByCarry(wlconf, PaymentObj, paymtr, 1);
+      
+      if(not GetCorsByConf(wlconf, Corschem))
+        if( (Corschem.State == 0) and (Corschem.CreateConfirmation == SET_CHAR) )
+      if( CreateConfirmation(wlconf) == FALSE )
+             msgbox("Ошибка при создании подтверждения дебета по проводке");
+         return 1;
+      end;
+      end;
+      end;
+      
+         ClearRecord( wlconf );
+      //Создание подтверждения по проводке для кредита
+      FillConfirmationParamByCarry(wlconf, PaymentObj, paymtr, 2);
+      if(not GetCorsByConf(wlconf, Corschem))
+        if( (Corschem.State == 0) and (Corschem.CreateConfirmation == SET_CHAR) )
+          if( CreateConfirmation(wlconf) == FALSE )
+             msgbox("Ошибка при создании подтверждения кредита по проводке");
+             return 1;
+          end;
+        end;
+      end;
+    else //  if( not IsAddedPI )  
+
+      //Создаём подтверждения по уточняющим записям
+      if( PaymentObj.PIList( PRT_Debet ).Size > 0 )
+        FillConfirmationParamByCarry(wlconf, PaymentObj, paymtr, 1);
+        IfNext = PaymentObj.PIList( PRT_Debet ).First();
+        while((IfNext==0) and (PaymentObj.PIList( PRT_Debet ).Current( pi ) == 0))
+          wlconf.Account = pi.rec.Account;
+          wlconf.FIID    = pi.rec.FIID;
+          wlconf.Sum     = pi.rec.Amount; 
+          if(not GetCorsByConf(wlconf, Corschem))
+            if( (Corschem.State == 0) and (Corschem.CreateConfirmation == SET_CHAR) )
+              if( CreateConfirmation(wlconf) == FALSE )
+                msgbox("Ошибка при создании подтверждения по уточняющей записи дебета");
+                return 1;
+              end;
+            end;
+          end;      
+          IfNext = PaymentObj.PIList( PRT_Debet ).Next();
+        end;
+      end;
+
+      //Создаём подтверждения по уточняющим записям
+      if( PaymentObj.PIList( PRT_Credit ).Size > 0 )
+        FillConfirmationParamByCarry(wlconf, PaymentObj, paymtr, 2);
+        IfNext = PaymentObj.PIList( PRT_Credit ).First();
+        while((IfNext==0) and (PaymentObj.PIList( PRT_Credit ).Current( pi ) == 0))
+          wlconf.Account = pi.rec.Account;
+          wlconf.FIID    = pi.rec.FIID;
+          wlconf.Sum     = pi.rec.Amount; 
+          if(not GetCorsByConf(wlconf, Corschem))
+            if( (Corschem.State == 0) and (Corschem.CreateConfirmation == SET_CHAR) )
+              if( CreateConfirmation(wlconf) == FALSE )
+                 msgbox("Ошибка при создании подтверждения по уточняющей записи кредита");
+                 return 1;
+              end;
+            end;                                   
+          end;
+          IfNext = PaymentObj.PIList( PRT_Credit ).Next();
+        end;
+      end;
+    
+    end;
+  end;  //  if( not IsAddedPI )
+  
+  if (CarryKind != ACCTRN_STATUS_PLAN) //проводка НЕ планируемая
+    if (PaymentObj.IsExternalIncoming and PaymentObj.IsCredit) //для входящих кредитовых только тут и может быть проводка
+      PaymentObj.StatusInfo = "Исполнен";
+    elif (PaymentObj.StartDepartment == PaymentObj.EndDepartment) //если платеж межфилиальный, то "Исполнен" был установлен на шаге "Перевод по счетам МФР ЦАБС"
+      PaymentObj.StatusInfo = "Исполнен";
+    end;
+  end;
+
+  // Если документ внутренний для ЦАБС
+  if( ( Direct == OPR_PM_ST_DIR_INTERNAL ) or 
+      ( Direct == OPR_PM_ST_DIR_IN       ) or 
+       not ПлатежВнешний( PaymentObj ) )
+    if (PaymentObj.DocKind == DLDOC_INOUTORDER)
+      if (WorkWithRetail())
+        if( УстановитьСтатусыПлатежа( OPR_PAYM_CONTROL, OPR_PAYM_ST_CTRL_NOTACCEPT ) )
+          msgbox("Ошибка при установке сегментов статуса экземпляра операции");
+          return 1;
+        end;
+      else
+        if( УстановитьСтатусыПлатежа( OPR_PAYM_CONTROL, OPR_PAYM_ST_CTRL_NOTINCABS ) )
+          msgbox("Ошибка при установке сегментов статуса экземпляра операции");
+          return 1;
+        end;                          
+      end;
+    else
+      if( not( (Direct == OPR_PM_ST_DIR_IN) and ( (PaymentObj.VO_Description != "") or (PaymentObj.VO_Accept == ACPT_CC_DEFINE) ) ) )
+        if(УстановитьСтатусыПлатежа(OPR_PAYM_STATE, OPR_PM_ST_CLOSE ))
+          msgbox("Ошибка при установке статуса платежа");
+          return 1;
+        end;
+      end;
+      return 0;
+    end;
+  end;
+  return stat;
+END;
+
+
+
+
+
+/* Массовое выполнение шага "Зачисление"        */
+/* Пока только для мемордеров и мультивалютных  */
+
+
+
+/* Предтранзакционные действия */
+macro PrepMassExecuteStep() 
+
+  return execStoredFunc( "PM_CARRYSTEP.MassCarryStepPrepare", V_INTEGER );
+
+onerror(x)
+  ExeptionMessage(x);
+  return 1;
+end;
+
+/* Транзакционные действия */
+macro MassExecuteStep()
+  
+  /* Серверная часть до проводки */
+  var stat:integer = execStoredFunc( "PM_CARRYSTEP.MassCarryStepExecute1", V_INTEGER );
+
+  if( not stat )
+    stat = PM_MassBilBookEntry();
+  end;
+  /* Выполнение завершающей проводки по платежам */
+  /* Сами проводки можно делать только в макросе, на сервере такой возможности нет */
+  if( not stat )
+    stat = PM_MassMakeLastCarry();
+  end;
+  
+  /* Серверная часть после проводки */
+  if( not stat )
+    stat = execStoredFunc( "PM_CARRYSTEP.MassCarryStepExecute2", V_INTEGER );
+  end;
+
+  return stat;
+
+onerror(x)
+  ExeptionMessage(x);
+  return 1;
+end;
+
+// KS Макрос постобработки шага "Исполнение обязательств"
+MACRO PostStep (    
+                CommitOrRollback, /*1-выполнение шага,2 -откат шага*/
+                errTrn,        /* Статус выполнения шага-!0-произошла ошибка */
+                FirstDoc,      /* Указатель на первичный документ */
+                ID_Operation,  /* Номер экземпляра операции */
+                Num_Step,      /* Номер шага операции(из настроек) */
+                Kind_Operation,/* Вид операции */
+                KindDoc,       /* Вид первичного документа */
+                KindStep,      /* Вид шага операции */
+                ID_Step)       /* Номер шага операции */  
+
+  if (CommitOrRollback==1)
+/*ak - Генерация SWIFT-сообщения*/
+    ExecMacroFile("paymswift_bb", "PostStepSWIFT", CommitOrRollback, errTrn, FirstDoc, ID_Operation, Num_Step, Kind_Operation, KindDoc, KindStep, ID_Step);
+/*~ak*/
+  end;
+
+  return 0;
+END;

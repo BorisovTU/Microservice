@@ -1,0 +1,657 @@
+/*
+$Name:        dvordres.mac
+$Module:      Производные инструменты
+$Description: Печать отчетов сервисных операций (по F7 из скроллингов СО) 
+*/
+import RsbDataSet,CTInter, "dvservop.mac", "dvRepFun.mac","dvserv.mac", "dv_ground.mac", "dv_categ.mac", "dvRepFun.mac", "dv_car.mac";
+
+private record DvOper( dvoper );/*документ формирования резерва*/
+private record DvOperps(dvoperps );
+private record doc( acctrn );
+
+private var FD, ObjKind, ObjID, ObjErrTitle, FDoc, FDocFI;
+
+PRIVATE VAR rFiPos = TRecHandler( "dvfipos" );
+PRIVATE VAR rNDeal = TRecHandler( "dvndeal" );
+PRIVATE VAR rDeal  = TRecHandler( "dvdeal" );
+PRIVATE CONST RESERV_CALCMODE_MARKET = 0, /* "Рассчитывать по ры-ночной цене" */
+              RESERV_CALCMODE_NO     = 1; /* "Не рассчитывать" */
+
+PRIVATE MACRO SayError( StrErr:STRING, NumErr:INTEGER )
+  
+  if( NumErr == null )
+     NumErr = 1;
+  end;
+  SvOpInsertError( DL_DVFIPOS, rFiPos, NumErr, StrErr );
+   SvOpNumInsRecord = -1;
+END;  
+
+/*Получить курс базового актива*/
+PRIVATE MACRO GetCourseBaseFIID( FI:TRecHandler, BaseFI:TRecHandler, Course:@DOUBLE )
+  var CourceSinceDate = Date(0,0,0), CourceName = "", FaceValue = 0.0, Po = 0.0;
+
+  if( BaseFI.rec.FI_Kind == FIKIND_CURRENCY )
+     CourceName = "курс ЦБР";
+     /*курс ЦБР, а если он не задан, то основной */
+     if( ПолучитьКурсЗаданногоTипа( @Po, BaseFI.rec.FIID, NATCUR, DV_RATETYPE_CBR, SvOpDvOper.rec.Date, false, @CourceSinceDate ) == false )
+        ПолучитьКурсЗаданногоTипа( @Po, BaseFI.rec.FIID, NATCUR, null, SvOpDvOper.rec.Date, false, @CourceSinceDate );
+     end;
+  elif( BaseFI.rec.FI_Kind == FIKIND_AVOIRISS )
+     CourceName = "курс вида \"Рыночная цена\"";
+     ПолучитьКурсЗаданногоTипа( @Po, BaseFI.rec.FIID, NATCUR, RATETYPE_MARKET_PRICE, SvOpDvOper.rec.Date, true, @CourceSinceDate );
+  end;
+
+  if( CourceSinceDate == SvOpDvOper.rec.Date )
+/*     if( FI_GetNominal( FI.rec.FIID, FaceValue ) )
+        SayError( "Ошибка при определении количества базового актива для <" +FI.rec.FI_Code+">" );
+        return 1;
+     end;
+*/
+     FaceValue = FI.rec.FaceValue; 
+     Course  = Po * FaceValue;
+  elif( (CourceSinceDate != Date(0,0,0)) AND (Po > 0) )/*Если курс рассматриваемого вида был задан за какую либо предыдущую дату, и он не равен 0*/
+     SayError( "Не задан "+CourceName+" для базового актива <"+BaseFI.rec.FI_Code+"> за дату операции." );
+     return 1;
+  else /*курса нет и он никогда не был задан*/
+     Course = 0.0;
+  end;
+
+  return 0;
+END;
+
+/* Сохранение информации о позиции операции резервирования в массив.
+      Carry             -  документ позиции
+      FD                -  FD операции
+      DvOper            -  сервисная операция
+      CallFromOperStep  -  флаг, вызов печати из шага операции */
+macro ОтчетОперацииРезервированияПоПозиции( Carry, FD, DvOper, CallFromOperStep )
+
+PRIVATE VAR rFiPos = TRecHandler( "dvfipos" );
+
+  VAR    FI        = TRecHandler( "fininstr" ), 
+         DV        = TRecHandler( "fideriv" ),
+         BaseFI    = TRecHandler( "fininstr" ),
+         BaseDV    = TRecHandler( "fideriv" ),
+         InsOperPS = TRecHandler( "dvoperps" ),
+         ReservAcc = TRecHandler( "account" ),  /*счет резерва*/
+         PcAcc     = TRecHandler( "account" ),
+         DvOpr     = TRecHandler( "dvoper" ); 
+
+  VAR    FITurn, OperPS, RSSet, OperPS_Last, Pc = 0.0, Pc_RUR = 0.0, Po = 0.0, TC = 0.0, T = 0.0, IsNATCUR = true,
+         ContractCost = $0, MarketCost = $0, S = $0,
+         LongPositionCostRUR, ShortPositionCostRUR, 
+         FaceValue = 0.0, Rnew = $0, Rold = $0, Delta, AccDbt, AccCred, CatCodePC;
+
+   copy( rFiPos, FD.DVPos );
+
+  var sql = RSDCommand(
+     "SELECT turn.t_State, turn.t_LongPositionCost, turn.t_ShortPositionCost, turn.t_LongPosition, turn.t_ShortPosition " +
+     "  FROM ddvfiturn_dbt turn"
+     " WHERE turn.t_FIID       = ? AND " +
+     "       turn.t_Client     = ? AND " +
+     "       turn.t_Department = ? AND " +
+     "       turn.t_Broker     = ? AND " +
+     "       turn.t_Date       = ( SELECT MAX(turn_1.t_Date) "   +
+     "                               FROM ddvfiturn_dbt turn_1 " +
+     "                              WHERE turn_1.t_FIID       = turn.t_FIID       AND "+
+     "                                    turn_1.t_Client     = turn.t_Client     AND "+
+     "                                    turn_1.t_Department = turn.t_Department AND "+
+     "                                    turn_1.t_Broker     = turn.t_Broker     AND "+
+     "                                    turn_1.t_Date       <= ? )");
+
+  sql.addParam( "", RSDBP_IN, rFiPos.rec.FIID );
+  sql.addParam( "", RSDBP_IN, rFiPos.rec.Client );
+  sql.addParam( "", RSDBP_IN, rFiPos.rec.Department );
+  sql.addParam( "", RSDBP_IN, rFiPos.rec.Broker );
+  sql.addParam( "", RSDBP_IN, DvOper.Date );
+  sql.execute();
+
+  FITurn = TRsbDataSet( sql );
+
+  if( FITurn.MoveNext() AND (FITurn.State != DVTURN_CLOSE) )
+     SayError( "Не закрыт день по позиции ПИ" );
+     return 1;
+  end;
+
+
+  var sql2 = RSDCommand(
+     "SELECT rsset.t_Persent, rsset.t_Group, rsset.t_SetDate " +
+     "  FROM ddvrsset_dbt rsset " +
+     " WHERE rsset.t_DocKind =  ? AND " +
+     "       rsset.t_DocID   =  ? AND " +
+     "       rsset.t_SetDate = ( SELECT MAX(rsset_1.t_SetDate) "   +
+     "                             FROM ddvrsset_dbt rsset_1 " +
+     "                            WHERE rsset_1.t_DocKind = rsset.t_DocKind   AND "+
+     "                                  rsset_1.t_DocID   = rsset.t_DocID     AND "+
+     "                                  rsset_1.t_SetDate <= ? )" );
+
+  sql2.addParam( "", RSDBP_IN, DL_DVFIPOS );
+  sql2.addParam( "", RSDBP_IN, rFiPos.rec.ID );
+  sql2.addParam( "", RSDBP_IN, DvOper.Date );
+  sql2.execute();
+
+  /*Настройки резервирования*/
+  RSSet = TRsbDataSet( sql2 );
+  if( not RSSet.MoveNext() )
+     SayError( "Для позиции не заданы настройки резервирования на дату " + string(DvOper.Date) );
+     return 1;
+  end; 
+
+  if( ПолучитьПИ( rFiPos.rec.FIID, @FI, @DV ) == false )
+     SayError( "Не найден финансовый инструмент позиции" );
+     return 1;
+  end;
+
+/*
+7. Если DDVFIPOS_DBT.T_FIID->DFININSTR_DBT.T_AVOIRKID == "Фьючерс":
+  7.1  Если  T_FIID->DFIDERIV.T_PRICEMODE == "В валюте шага цены" то
+     7.1.1 Ищем Рс = курс вида из настройки "Расчетная цена" для ПИ на дату операции точно (здесь 
+           и ниже - DDVOPER_DBT.T_DATE)  в валюте DFIDERIV.T_TICKFIID. Если не нашли  -  ошибка "Для 
+           фьючерса <ХХХ> не задана расчетная цена. Резерв не рассчитан"
+     7.1.2 Ищем TC = DV_TickCost (T_FIID, T_DATE). Если значение не найдено - выдаем ошибку "Курс 
+           вида <Стоимость мин. шага цены> для фьючерса  "Код" за дату опера-ции не задан"
+     7.1.3 T=T_FIID->DDFIDERIV.T_TICK
+     7.1.4 Выполняются расчет новой суммы резерва:
+          - Резервируемая сумма S=DDVFITURN.T_LONGPOSITIONCOST+(Pc*DDVFITURN.T_SHORTPOSITION*TC/T)-DDVFITURN.T_SHORTPOSITIONCOST-(Pc*DDVFITURN.T_LONGPOSITION*TC/T)
+          - Новый резерв Rnew = S* Pr / 100
+     Если T_FIID->DFININSTR.T_PARENTFI != НацВ, то перед подстановкой в формулу конвертим сумму S 
+     из T_FIID-DFININSTR.T_PARENTFI в НацВ
+  7.2.  Иначе
+     7.2.1 Ищем Рс = курс вида из настройки "Расчетная цена" для ПИ на дату операции точно (здесь и 
+           ниже - DDVOPER_DBT.T_DATE)  в валюте DFININSTR.T_PARENTFI. Если не нашли - ошибка "Для фьючерса 
+           <ХХХ> не задана расчетная цена. Резерв не рассчитан"
+     7.2.2 Выполняются расчет новой суммы резерва:
+          -  Резервируемая сумма S=DDVFITURN.T_LONGPOSITIONCOST+(Pc*DDVFITURN.T_SHORTPOSITION)-DDVFITURN.T_SHORTPOSITIONCOST-(Pc*DDVFITURN.T_LONGPOSITION)
+          -  Новый резерв Rnew = S* Pr / 100
+     Если T_FIID-> DFININSTR.T_PARENTFI != НацВ, то перед подстановкой в формулу  конвертим сумму S 
+     из T_FIID-DFININSTR.T_PARENTFI в НацВ
+
+*/
+  
+  if( FI.AvoirKind == DERIVATIVE_FUTURES ) /*для фьючерса*/
+     if( DV_SmartConvertSum( ShortPositionCostRUR, FITurn.ShortPositionCost, SvOpDvOper.rec.Date, FI.ParentFI, NATCUR, false ) == false )
+        SayError( GetCurrencyConvertErrorMsg( FI.ParentFI, NATCUR, SvOpDvOper.rec.Date ) );
+        return 1;
+     end;
+     if( DV_SmartConvertSum( LongPositionCostRUR, FITurn.LongPositionCost, SvOpDvOper.rec.Date, FI.ParentFI, NATCUR, false ) == false )
+        SayError( GetCurrencyConvertErrorMsg( FI.ParentFI, NATCUR, SvOpDvOper.rec.Date ) );
+        return 1;
+     end;
+
+     if( DV.PriceMode == DERIVATIVE_MODE_TICKFI )
+        /*7.1.1*/
+        if( ПолучитьКурсЗаданногоTипа( @Pc, FI.FIID, DV.TickFIID, RATETYPE_CALC_PRICE, SvOpDvOper.rec.Date, false ) == false )
+           SayError( "Для фьючерса <"+ FI.FI_Code +"> не задана расчетная цена. Резерв не рассчитан." );
+           return 1;
+        end;
+        /*7.1.2*/
+        TC = DV_TickCost( FI.FIID, SvOpDvOper.rec.Date );
+        if( TC == 0.0 )
+           SayError( "Курс вида <Стоимость мин. шага цены> для фьючерса <"+ FI.FI_Code +"> за дату операции не задан. Резерв не рассчитан." );
+           return 1;
+        end;
+        /*7.1.3*/
+        T = DV.Tick;
+     else
+        /*7.2.1*/
+        if( ПолучитьКурсЗаданногоTипа( @Pc, FI.FIID, FI.ParentFI, RATETYPE_CALC_PRICE, SvOpDvOper.rec.Date, false ) == false )
+           SayError( "Для фьючерса <"+ FI.FI_Code +"> не задана расчетная цена. Резерв не рассчитан." );
+           return 1;
+        end;
+        /*7.2.2*/
+        TC = 1.;
+        T = 1.;
+     end;
+/*   Если T_FIID->DFININSTR.T_PARENTFI != НацВ, то перед подстановкой в формулу  конвертим сумму S 
+     из T_FIID-DFININSTR.T_PARENTFI в НацВ */
+     if( FI.ParentFI != NATCUR )
+        if( DV_SmartConvertSum( Pc_RUR, Pc, SvOpDvOper.rec.Date, FI.ParentFI, NATCUR, false ) == false )
+           SayError( GetCurrencyConvertErrorMsg( FI.ParentFI, NATCUR, SvOpDvOper.rec.Date ) );
+           return 1;
+        end;
+     else
+        Pc_RUR = Pc;
+     end;
+
+     S = money( LongPositionCostRUR + ( Pc_RUR * FITurn.ShortPosition * TC/T ) - ShortPositionCostRUR - ( Pc_RUR * FITurn.LongPosition * TC/T ) );
+
+     Rnew = money( S * RSSet.Persent / 100. );
+
+     ContractCost = money( LongPositionCostRUR - ShortPositionCostRUR ); 
+     MarketCost = money( Pc_RUR * ( FITurn.LongPosition - FITurn.ShortPosition ) );
+
+  else /*для опциона*/
+/*
+8. Иначе (Опцион):
+  8.1. Если DDVFIPOS_DBT.T_FIID->DFININSTR_DBT.T_FACEVALUEFI->DFININSTR_DBT.T_FI_KIND=="Производный инструмент" 
+       (т.е ПИ - опцион на фьючерс) и T_FIID->DFININSTR_DBT.T_FACEVALUEFI->DFIDERIV.T_PRICEMODE=="В валюте шага цены" то
+      8.1.1 Ищем курс Рo вида из настройки "Расчетная цена" на дату операции для фьючерса 
+            T_FIID->DFININSTR_DBT.T_FACEVALUEFI за дату операции точно в валюте 
+            T_FIID->DFININSTR_DBT.T_FACEVALUEFI->DFIDERIV.T_TICKFIID. Если он не найден - ошибка "Для 
+            опциона <Код> не задана расчетная цена базового фьючерса <Код>. Резерв не рассчитан"
+      8.1.2 Ищем TC=DV_TickCost(_FIID->DFININSTR_DBT.T_FACEVALUEFI, T_DATE). Если значение не найдено 
+            - выдаем ошибку "Курс вида <Стоимость мин. шага цены> для фьючерса  "Код" за дату операции не задан"
+      8.1.3 T=T_FIID->DFININSTR_DBT.T_FACEVALUEFI->DDFIDERIV.T_TICK
+      8.1.4 Рс=Ро*DDVFIPOS_DBT.T_FIID->DFININSTR_DBT.T_FACEVALUE*TC/T
+      8.1.5 Если Т_FIID->DFININSTR_DBT.T_FACEVALUEFI->DFININSTR.T_PARENTFI != НацВ, то конвертим Рс из 
+            Т_FIID->DFININSTR_DBT.T_FACEVALUEFI->DFININSTR.T_PARENTFI в НацВ
+  8.2. Если DDVFIPOS_DBT.T_FIID->DFININSTR_DBT.T_FACEVALUEFI->DFININSTR_DBT.T_FI_KIND == "Производный инструмент" 
+       (т.е ПИ - опцион на фьючерс) и T_FIID->DFININSTR_DBT.T_FACEVALUEFI->DFIDERIV.T_PRICEMODE == "В валюте стоимости шага цены" то
+      8.2.1 Ищем курс Рo вида из настройки "Расчетная цена" на дату операции для фьючерса 
+            T_FIID->DFININSTR_DBT.T_FACEVALUEFI за дату операции точно в валюте 
+            T_FIID->DFININSTR_DBT.T_FACEVALUEFI->DFININSTR.PARENTFI. Если он не найден - ошибка "Для опциона 
+            <Код> не задана расчетная цена базового фьючерса <Код>. Резерв не рассчитан"
+      8.2.2 Рс=Ро*DDVFIPOS_DBT.T_FIID->DFININSTR_DBT.T_FACEVALUE
+      8.2.3 Если Т_FIID->DFININSTR_DBT.T_FACEVALUEFI ->DFININSTR.T_PARENTFI != НацВ, то конвертим Рс из 
+            Т_FIID->DFININSTR_DBT.T_FACEVALUEFI->DFININSTR.T_PARENTFI в НацВ
+  8.3. Иначе если DDVFIPOS_DBT.T_FIID->DFININSTR_DBT.T_FACEVALUEFI->DFININSTR_DBT.T_FI_KIND == "Валюта"
+      8.3.1 Ищем курс Ро валюты в НацВ DDVFIPOS_DBT.T_FIID->DFININSTR_DBT.T_FACEVALUEFI на дату операции вида 
+            из настройки "Курс ЦБР", а если она не задана - берем основной. Если значение не найдено - выдаем ошибку 
+            "Для опциона <Код> не задана расчетная цена базовой валюты <Код>. Резерв не рассчитан"
+      8.3.2 Рс=Ро*DDVFIPOS_DBT.T_FIID->DFININSTR_DBT.T_FACEVALUE
+  8.4. Иначе (ценная бумага)
+      8.4.1 Ищем курс Рo вида из настройки "Рыночная цена" на дату операции для ц/б T_FIID->DFININSTR_DBT.T_FACEVALUEFI 
+            за дату операции точно сначала - в НацВ, а если не нашли - в ВН. 
+            T_FIID->DFININSTR_DBT.T_FACEVALUEFI->DFININSTR_DBT.T_FACEVALUEFI Если он не найден - ошибка 
+            "Для опциона <Код> не задана рыночная цена базовой ценной бумаги <Код>. Резерв не рассчитан" 
+            /*это означает, что ненулевой курс был задан за пред. дни, см. условия отбора*/
+      8.4.2 Рс=Ро*DDVFIPOS_DBT.T_FIID->DFININSTR_DBT.T_FACEVALUE
+      8.4.3 Если курс был найден в ВН != НацВ, то конвертить Рс из  ВН в НацВ.
+*/
+     if( ПолучитьПИ( FI.FaceValueFI, @BaseFI, @BaseDV ) == true ) /*Если FaceValueFI = "Производный инструмент"*/
+        if( DV.PriceMode == DERIVATIVE_MODE_TICKFI )
+           /*8.1.1*/
+           if( ПолучитьКурсЗаданногоTипа( @Po, BaseFI.FIID, BaseDV.TickFIID, RATETYPE_CALC_PRICE, SvOpDvOper.rec.Date, false ) == false )
+              SayError( "Для опциона " + FI.FI_Code + " не задана расчетная цена базового фьючерса " + BaseFI.FI_Code + ". Резерв не рассчитан." );
+              return 1;
+           end;
+           /*8.1.2*/
+           TC = DV_TickCost( BaseFI.FIID, SvOpDvOper.rec.Date );
+           if( TC == 0.0 )
+              SayError( "Курс вида <Стоимость мин. шага цены> для фьючерса <"+ FI.FI_Code +"> за дату операции не задан. Резерв не рассчитан." );
+              return 1;
+           end;
+           /*8.1.3*/
+           T = BaseDV.Tick;
+           /*8.1.4*/
+           Pc = Po * FI.FaceValue * TC / T;
+        else
+           /*8.2.1*/
+           if( ПолучитьКурсЗаданногоTипа( @Po, BaseFI.FIID, BaseFI.ParentFI, RATETYPE_CALC_PRICE, SvOpDvOper.rec.Date, false ) == false )
+              SayError( "Для опциона " + FI.FI_Code + " не задана расчетная цена базового фьючерса " + BaseFI.FI_Code + ". Резерв не рассчитан." );
+              return 1;
+           end;
+           /*8.2.2*/
+           Pc = Po * FI.FaceValue;
+        end;
+        /*Если Т_FIID->DFININSTR_DBT.T_FACEVALUEFI->DFININSTR.T_PARENTFI != НацВ, то конвертим Рс из 
+            Т_FIID->DFININSTR_DBT.T_FACEVALUEFI->DFININSTR.T_PARENTFI в НацВ*/
+        if( BaseFI.ParentFI != NATCUR )
+           if( DV_SmartConvertSum( Pc_RUR, Pc, SvOpDvOper.rec.Date, BaseFI.ParentFI, NATCUR, false ) == false )
+              SayError( GetCurrencyConvertErrorMsg( BaseFI.ParentFI, NATCUR, SvOpDvOper.rec.Date ) );
+              return 1;
+           end;
+        else
+           Pc_RUR = Pc;
+        end;
+     else /* Если FaceValueFI = "Валюта", "Ценная бумага", "Индекс"*/
+        if( (BaseFI.FIID == FI.FaceValueFI) and
+            ( (BaseFI.FI_Kind == FIKIND_CURRENCY) or (BaseFI.FI_Kind == FIKIND_AVOIRISS) ) )
+           if( BaseFI.FI_Kind == FIKIND_CURRENCY )
+              /*8.3.1*/
+              if( ПолучитьКурсЗаданногоTипа( @Po, BaseFI.FIID, NATCUR, DV_RATETYPE_CBR, SvOpDvOper.rec.Date, true ) == false )
+                 SayError( "Для опциона " + FI.FI_Code + " не задана расчетная цена базовой валюты " + BaseFI.FI_Code + ". Резерв не рассчитан." );
+                 return 1;
+              end;
+              /*8.3.2*/
+              Pc = Po * FI.FaceValue;
+              Pc_RUR = Pc;
+           else
+              /*8.4.1*/
+              if( ПолучитьКурсЗаданногоTипа( @Po, BaseFI.FIID, NATCUR, RATETYPE_MARKET_PRICE, SvOpDvOper.rec.Date, false ) == false )
+                 IsNATCUR = false;
+                 if( ПолучитьКурсЗаданногоTипа( @Po, BaseFI.FIID, BaseFI.FaceValueFI, RATETYPE_MARKET_PRICE, SvOpDvOper.rec.Date, false ) == false )
+                    SayError( "Для опциона " + FI.FI_Code + " не задана рыночная цена базовой ценной бумаги " + BaseFI.FI_Code + ". Резерв не рассчитан." );
+                    return 1;
+                 end;
+              end;
+              /*8.4.2*/
+              Pc = Po * FI.FaceValue;
+              /*8.4.3*/
+              if( (IsNATCUR == false) and (BaseFI.FaceValueFI!=NATCUR) )
+                 if( DV_SmartConvertSum( Pc_RUR, Pc, SvOpDvOper.rec.Date, BaseFI.FaceValueFI, NATCUR, false ) == false )
+                    SayError( GetCurrencyConvertErrorMsg( BaseFI.FaceValueFI, NATCUR, SvOpDvOper.rec.Date ) );
+                    return 1;
+                 end;
+              else
+                 Pc_RUR = Pc;
+              end;
+           end;
+        else
+           SayError( "Не найден финансовый инструмент базового актива для опциона " + FI.FI_Code );
+           return 1;
+        end;
+     end;
+/*
+  8.5. Если DDVFIPOS_DBT.T_FIID->DFININSTR_DBT.T_OPTIONTYPE == "Call"
+      - Rnew=(Pc*DDVFITURN.T_SHORTPOSITION-DDVFITURN.T_SHORTPOSITIONCOST)*Pr/100
+      Если DDVFIPOS_DBT.DFININSTR.T_PARENTFI не НацВ, то при подстановке T_SHORTPOSITIONСOST конвертировать из 
+      DFININSTR.T_PARENTFI в НацВ.
+  8.6.  Иначе ("Put")
+      - Rnew = (DDVFITURN.T_SHORTPOSITIONCOST -  Pc* DDVFITURN.T_SHORTPOSITION) * Pr / 100
+      Если  DDVFIPOS_DBT.DFININSTR.T_PARENTFI не НацВ, то T_SHORTPOSITION конвертировать в НацВ.
+*/
+     if( DV_SmartConvertSum( ShortPositionCostRUR, FITurn.ShortPositionCost, SvOpDvOper.rec.Date, FI.ParentFI, NATCUR, false ) == false )
+        SayError( GetCurrencyConvertErrorMsg( FI.ParentFI, NATCUR, SvOpDvOper.rec.Date ) );
+        return 1;
+     end;
+
+     if( DV.OptionType == OPTIONKIND_CALL )
+        S = money( Pc_RUR * FITurn.ShortPosition - ShortPositionCostRUR );
+        Rnew = money( ( Pc_RUR * FITurn.ShortPosition - ShortPositionCostRUR ) * RSSet.Persent / 100. );
+     else
+        S = money( ShortPositionCostRUR - Pc_RUR * FITurn.ShortPosition );
+        Rnew = money( ( ShortPositionCostRUR - Pc_RUR * FITurn.ShortPosition ) * RSSet.Persent / 100. );
+     end;
+
+     ContractCost = money( ShortPositionCostRUR ); 
+     MarketCost = money( Pc_RUR * FITurn.ShortPosition );
+
+  end;
+ 
+  var sql3 = RSDCommand(     "SELECT operps.t_Summ " +
+                             "  FROM ddvoperps_dbt operps, ddvoper_dbt oper " +
+                             " WHERE operps.t_DocKind =  ? AND " +
+                             "       operps.t_DocID   =  ? AND " +
+                             "       oper.t_ID        =      operps.t_OperID AND "     +
+                             "       oper.t_DocKind   =  ? AND " + 
+                             "       oper.t_Date      = ( SELECT MAX(oper_1.t_Date) "   +
+                             "                             FROM ddvoper_dbt oper_1 " +
+                             "                            WHERE oper_1.t_ID      = operps.t_OperID AND "+
+                             "                                  oper_1.t_DocKind = oper.t_DocKind  AND "+
+                             "                                  oper_1.t_Date    < ? )");
+
+  sql3.addParam( "", RSDBP_IN, DL_DVFIPOS );
+  sql3.addParam( "", RSDBP_IN, rFiPos.rec.ID );
+  sql3.addParam( "", RSDBP_IN, DL_DVOPER_RESERVE );
+  sql3.addParam( "", RSDBP_IN, DvOper.Date );
+  sql3.execute();
+
+  OperPS_Last = TRsbDataSet( sql3 );
+  if( OperPS_Last.MoveNext() )
+     Rold = OperPS_Last.Summ;
+  end;
+
+  if( Rnew <= $0 )
+     if( Rold > $0 )
+        Rnew  = $0;
+        Delta = -Rold;
+     else
+        Rnew  = Delta = $0;
+     end;
+  else
+     Delta = Rnew - Rold;
+  end;
+
+  if( Delta != $0 )
+     FD = DVFirstDocPos( DL_DVFIPOS, rFiPos );
+
+     if( Delta > $0 )
+        CatCodePC = "-РС";
+     else
+        CatCodePC = "+РС";
+     end;
+
+     if( not FD.OpenAccount( "Резерв, договор", null, true, null, ReservAcc, DvOper.Date ) )
+        return SayError( "Ошибка при актуализации счета по категории " + "Резерв, договор");
+     end;
+     if( not FD.OpenAccount( CatCodePC, null, true, NULL, PCAcc, DvOper.Date ))
+        return SayError( "Ошибка при открытии счета по категории \"" + CatCodePC + "\"" );
+     end;
+
+     SvOpReportData.InsertData( abs(MarketCost), abs(ContractCost), ReservAcc.rec.Account, RSSet.Group, RSSet.Persent, S, Rnew, Rold);
+  end;
+
+     SvOpReportData.InsertData( abs(MarketCost), abs(ContractCost), ReservAcc.rec.Account, RSSet.Group, RSSet.Persent, S, Rnew, Rold);
+
+   copy( DvOpr, DvOper );
+
+   SvOpReportData.PrintLine( DvOpr, DL_DVFIPOS, FDoc, null );
+   SvOpNumInsRecord = SvOpNumInsRecord + 1;
+
+end;
+
+
+private macro ОтчетОперацииРезервирования(  oper, oprstep, FDoc )
+   var RiskGrp, ResPc, BaseAcc = "", OldReserv= $0, MarketSum, CostRUR = $0,  
+       BaseSum, dR, SinceDate, AttrID, NoteKind, CtKind;
+
+   copy( rFiPos, FDoc );
+   FD = DVFirstDocPos( DL_DVFIPOS, rFiPos );      
+
+   ClearRecord( doc );
+   while( GetDocsByOperStep( doc, oper.ID_Operation, oprstep.ID_Step ) )
+      ОтчетОперацииРезервированияПоПозиции( doc, FD, DvOper, false );
+   end;
+   return true;
+end;
+
+
+/*Получить курс ценной бумаги - Рыночная цена*/
+PRIVATE MACRO ПолучитьКурсЦеннойБумаги( BaseFI:TRecHandler, Course:@DOUBLE ) : bool
+  var CourceSinceDate:date = Date(0,0,0), CourceName:string = "";
+  var FaceValue:double = 0.0, Po:double = 0.0;
+  var find:bool = false; 
+   
+  if( BaseFI.rec.FI_Kind == FIKIND_AVOIRISS )
+     CourceName = "курс вида \"Рыночная цена\"";
+     find = ПолучитьКурсЗаданногоTипа( @Po, BaseFI.rec.FIID, BaseFI.rec.FaceValueFI, RATETYPE_MARKET_PRICE, DvOper.Date, true, @CourceSinceDate );
+     if( find == true ) 
+        Course = Po;
+     end; 
+  end;                               
+
+  if( find == false ) 
+
+     if( FI_IsQuoted( BaseFI.rec.FIID ) ) 
+        SayError( "Не задан "+CourceName+" для ценной бумаги <"+BaseFI.rec.FI_Code+"> за дату операции." );
+     else 
+        if( (CourceSinceDate != Date(0,0,0)) AND (Po > 0) )/*Если курс рассматриваемого вида был задан за какую либо предыдущую дату, и он не равен 0*/
+           SayError( "Не задан "+CourceName+" для ценной бумаги <"+BaseFI.rec.FI_Code+"> за дату операции." );
+        else /*курса нет и он никогда не был задан - буем считать, что Курс = 0*/
+           Course = 0.0;
+           find = true; 
+        end;
+       SvOpNumInsRecord = -1;  
+     end; 
+  end; 
+  return find;
+END;
+
+PRIVATE MACRO ПолучитьКурсФьючерса( FI:TRecHandler, Fideriv:variant, Course:@DOUBLE ) : bool
+  var CourceSinceDate:date = Date(0,0,0), CourceName:string = "";
+  var FaceValue:double = 0.0, Po:double = 0.0;
+  var find:bool = false; 
+  var FIID = IIF( Fideriv.rec.PriceMode == DERIVATIVE_MODE_TICKFI, Fideriv.rec.TickFIID, FI.rec.ParentFI );
+
+  CourceName = "курс вида \"Расчетная цена\"";
+  find = ПолучитьКурсЗаданногоTипа( @Po, FI.rec.FIID, FIID, ПИ_ПолучитьВидКурса(RATETYPE_CALC_PRICE), DvOper.Date, true, @CourceSinceDate );
+  if( find == true ) 
+     Course = Po;
+  end; 
+
+  if( find == false ) 
+     SayError( "Не задан "+CourceName+" для фьючерса <" + FI.rec.FI_Code + "> за дату операции." );
+  end; 
+  return find;
+END;
+
+macro ОтчетОперацииПереоценкиПоРынЦене( DvOper )
+   var DvOpr = TRecHandler( "dvoper" );
+   copy( DvOpr, DvOper );
+
+   if( (DvOper.Flag1 != DV_KIND_OVERVALUE_MARKET_PRICE) and (DvOper.Flag1 != DV_KIND_OVERVALUE_MARKET_PRICE_AR) and (DvOper.Flag1 != DV_KIND_OVERVALUE_CHANGE) and (DvOper.Flag1 != DV_KIND_OVERVALUE_SUPPLY) )
+      return;
+   end;
+
+   SvOpNumInsRecord = SvOpReportData.GetAndPtintAll(DvOpr);
+END;
+
+/* Сохранение информации о проводке операции переоценки в массив.
+      Carry             -  документ проводки
+      FD                -  FD операции
+      DvOper            -  сервисная операция */
+macro ОтчетОперацииПереоценкиССПоПроводке( Carry, FD, DvOper, oper )
+
+  VAR DvOpr = TRecHandler( "dvoper" );
+
+  SvOpReportData.InsertData( Carry.Account_Payer, Carry.Account_Receiver, Abs(Carry.Sum_Payer) );
+
+  copy( DvOpr, DvOper );
+  SvOpReportData.PrintLine( DvOpr, oper.DocKind, FDoc, null );
+
+  SvOpNumInsRecord = SvOpNumInsRecord + 1;
+end;
+
+
+/* Сохранение информации о операции переоценки в массиве. */
+private macro ОтчетОперацииПереоценки( oper, oprstep, FDoc, DvOper )
+     
+   if( oper.DocKind == DL_DVFIPOS )
+     copy( rFiPos, FDoc );
+     FD = DVFirstDocPos( DL_DVFIPOS, rFiPos );      
+   elif( (oper.DocKind == DL_DVNDEAL) or (oper.DocKind == DL_DVDEALT3) )
+      copy( rNDeal, FDoc );
+      FD = DVFirstDocNDeal( oper.DocKind, rNDeal );
+   elif( oper.DocKind == DL_DVDEAL )
+      copy( rDeal, FDoc );
+      FD = DVFirstDocDeal( DL_DVDEAL, rDeal );
+   end;
+
+   /* Перебираем позиции по операции переоценки. */
+   if( DvOper.DocKind == DL_DVOPER_OVERFRVAL )
+      ClearRecord( doc );
+      while( GetDocsByOperStep( doc, oper.ID_Operation, oprstep.ID_Step ) )
+         ОтчетОперацииПереоценкиССПоПроводке( doc, FD, DvOper, oper );
+      end;
+   end;
+   return true;
+end;
+
+macro ОтчетОперацииНачисленияCSA( DvOper )
+  var DvOpr = TRecHandler( "dvoper" );
+  copy( DvOpr, DvOper );
+  SvOpNumInsRecord = 1;
+  return SvOpReportData.GetAndPtintAll( DvOpr );
+end;
+
+/* если возвращает 0  - все нормально
+                   -1 - ошибка
+                   1  - ошибка при которой отчет не печатается
+*/
+macro ОтчетПоШагу( oper, oprstep, DvOper )
+  
+  if( oper.DocKind == DL_DVFIPOS )
+     FDoc = TRecHandler( "dvfipos" );
+  elif( (oper.DocKind == DL_DVNDEAL) or (oper.DocKind == DL_DVDEALT3) )
+     FDoc = TRecHandler( "dvndeal" );
+  elif( oper.DocKind == DL_DVDEAL )
+     FDoc = TRecHandler( "dvdeal" );
+  elif( oper.DocKind == DV_CSA )
+     FDoc = TRecHandler( "dvcsa" );
+  end;
+
+  if(ПолучитьПервичныйДокументСервОперПИ( oper, FDoc ) )
+     msgbox("Ошибка при определении первичного документа сервисной операции");
+     return -1;
+  end;
+
+  if( oper.DocKind == DL_DVFIPOS )
+     ObjErrTitle = "Для позиции " + FDoc.rec.ID;
+  elif( (oper.DocKind == DL_DVNDEAL) or (oper.DocKind == DL_DVDEALT3) or (oper.DocKind == DL_DVDEAL) )
+     ObjErrTitle = "Для сделки " + FDoc.rec.ID;
+  end;
+  
+  if( oper.DocKind == DV_CSA )
+     ObjID = FDoc.rec.CSAID;
+  else
+     ObjID = FDoc.rec.ID;
+  end;
+
+  if( DvOper.DocKind == DL_DVOPER_OVERFRVAL )
+     if( not ОтчетОперацииПереоценки( oper, oprstep, FDoc, DvOper ) )
+        return -1;
+     end;
+  elif( DvOper.DocKind == DL_DVOPER_RESERVE )
+     if( not ОтчетОперацииРезервирования( oper, oprstep, FDoc ) )
+        return -1;
+     end;
+  elif( DvOper.DocKind == DV_CSAPSO )
+     if( not ОтчетОперацииНачисленияCSA( DvOper ) )
+        return -1;
+     end;
+  end;
+
+  return 0;
+end;
+
+/* Печать отчета по сервисной операции. Вызывается по F7 из сервисной операции */
+MACRO Print_MemOrder( FirstDoc )
+  file oper( oproper );
+  var  DvOpr = TRecHandler( "dvoper" );
+  var  oprstep = TBFile( "oprstep", "R", 9 ),
+       IsContinue, CurNum = 0, PrintReport = 0;
+
+  SetBuff( DvOper, FirstDoc );
+  copy( DvOpr, DvOper );
+
+  SvOpReportData = CreateReportObject(DvOpr, false);
+
+  SvOpNumInsRecord = 0;
+
+  if (( DvOper.DocKind == DL_DVOPER_OVERVALUE ) or ( DvOper.DocKind == DL_DVOPER_FIXING ))
+     PrintReport = ОтчетОперацииПереоценкиПоРынЦене( DvOper );
+  elif( DvOper.DocKind == DV_CSAPSO )
+     PrintReport = ОтчетОперацииНачисленияCSA( DvOper );
+  else
+     oprstep.Clear;
+     oprstep.AddFilter(   "t_ServDocKind = " + string(DvOper.DocKind) 
+                        + " and t_ServDocID = " + string(DvOper.ID) );    
+
+     InitProgress( oprstep.NRecords, "Просмотр шагов операции ...", "Отчет по сервисной операции " );
+
+     IsContinue = true;
+     while( IsContinue and oprstep.Next )
+
+       if( oprstep.rec.IsRemoveStep != "" )
+          ClearRecord( oper );
+          oper.ID_Operation = oprstep.rec.ID_Operation;
+          if( not GetEQ(oper) )
+             msgbox( "Не найдена операция по шагу" );
+             IsContinue = false;
+          end;    
+        
+          PrintReport = ОтчетПоШагу( oper, oprstep.rec, DvOper );
+          if( PrintReport != 0 )
+             IsContinue = false;
+          end;
+       end;
+
+       UseProgress( CurNum = CurNum + 1 );
+     end;
+  end;
+
+  if( SvOpNumInsRecord == 0 )
+     println( " Нет выполненных операций " );
+  elif( SvOpNumInsRecord == -1 )
+     println( "  " );
+  else
+     DV_SvOpPrintFoot( DvOper );
+  end;
+
+  RemProgress;
+
+  if ( PrintReport == 1 ) 
+     exit(1); 
+  end;
+END;

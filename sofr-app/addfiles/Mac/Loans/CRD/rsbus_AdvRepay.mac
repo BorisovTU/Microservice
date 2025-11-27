@@ -1,0 +1,170 @@
+/*------------------------------------------------------------------------------
+                            Сервис досрочного погашения кредита
+
+ Filename    : rsbus_credit.mac                                              
+ Description : Реализация сервиса досрочного погашения по Кредитному договору для RS-Bus
+               
+
+ Programmer  : Melnik Andrey
+ 15.02.12    : Создан
+------------------------------------------------------------------------------*/
+
+import TOTAL, FRC_SUM, ACC_CRD, RSBUS_CHECK, RSBUS_STRUCTS,"rsbus_checkusr.mac";
+
+//номер сервиса согласно списоку сервисов описананых в rsbus_checkusr.mac
+private const NumServ:integer = NumServ_InsertAdvancedRepayment; 
+
+private const CF_DURTS = 84;          //операция погашения по умолчанию
+
+
+private var credID:integer, UsCredNumber:string, opDate:date, TypeOperNum:integer, dutySumma:money, DutFromAccFlag:integer;      //глобальные переменные для значений параметров
+private var operationID;                                                //ID операции в случае успешной транзакции
+private var ErrManager:CErrManager;
+
+record credContr(credit_c);                                                                              //запись, соответствующая кредитному договору
+
+
+
+///////////////////////////////////////////////////////////////////////////////////////////////////////////
+macro SetCredVals(creditID:integer,             // ID КД
+        usCreditNumber:string,          // Пользовательский № КД
+        typeOperNumber:integer,         // Вид операции
+        operDate:date,                            // Дата операции
+        dutySum:money,                  // Сумма погашения
+      DutyFromAccFlag:integer
+        )
+   credID      = creditID;
+   usCredNumber  = usCreditNumber;
+   opDate      = operDate;
+   typeOperNum   = typeOperNumber;
+   dutySumma       = dutySum;
+   DutFromAccFlag = DutyFromAccFlag
+end;
+///////////////////////////////////////////////////////////////////////////////////////////////////////////
+private macro CheckData()
+   var rs, RSDCmd;
+   //проверка ID КД
+   FindCrd(@credID, UsCredNumber, credContr);
+   //проверка дат       
+   if (ValType(opDate) == V_UNDEF)
+      opDate =  {curdate};
+   end; 
+   //тип операции
+   if (ValType(typeOperNum) != V_UNDEF)
+      RSDCmd = RsdCommand(RslDefCon, "SELECT * FROM dtype_op_dbt WHERE t_typeopernumber = ? AND t_systtypeop_ref = ?");
+      RSDcmd.addParam ("p1", RSDBP_IN); RSDcmd.value ("p1") = TypeOperNum;
+      RSDcmd.addParam ("p2", RSDBP_IN); RSDcmd.value ("p2") = CS_DUTY;
+
+     rs = RsdRecordset(RSDcmd);
+        
+      if (NOT rs.MoveNext)
+          RunError("Не найдено ни одной операции для данного системного типа", 18086);
+      end;                                                                   
+   else
+      typeOperNum = CF_DURTS;
+   end;
+   return true;
+end;
+
+///////////////////////////////////////////////////////////////////////////////////////////////////////////
+macro MakeRepaymentTrn
+   var opResult = 0;
+   operationID = MakeOperation(credID, LO_CREDIT, typeOperNum, credContr.CurCode, opDate, 1, "", "");
+
+   if (operationID == 0)
+      if (GetMO_ErrorID != 0)
+          RunError(GetMO_LoansError, GetMO_ErrorID);
+      else
+         RunError("Во время выполнения операции по кредитному договору произошла непредвиденная ошибка!", 18212);
+      end;
+   end;
+
+   if (GetMO_ErrorID != 0)
+      RunError(GetMO_LoansError(), GetMO_ErrorID);
+   end;
+   return true;
+
+OnError(err)
+     
+   if (ValType(err.Err) == V_INTEGER)
+      var str;
+      str = SubStr(err.Message, 26); 
+      ErrManager.SetError(err.Err, str);
+   end;
+end;
+///////////////////////////////////////////////////////////////////////////////////////////////////////////
+macro InsertAdvancedRepayment
+      (
+       creditID        : integer,   // ID КД
+       UsCreditNumber  : string,    // Пользовательский № КД
+       operDate        : date,      // Дата операции
+       TypeOperNumber  : integer,   // Вид операции
+       DutySum         : money,     // Сумма переплаты
+       DutyFromAccFlag : integer    // Признак погашения на сумму остатка счета-плательщика   
+      )
+   VAR stat = 0;
+   var totalDuty:money, curDuty:money;
+   SetCredVals(creditID, UsCreditNumber, TypeOperNumber, operDate, DutySum, DutyFromAccFlag);       // установка глобальных переменных для данного макроса
+      
+   if (NOT CheckData())      
+      RunError();                                          
+   end;
+   //очистка временных таблиц 
+   ClearTable("DPAYMENT_TMP");
+   ClearTable("DPERCPAY_TMP");
+
+   //заполнение временных таблиц, вычисления процентов по кредиту
+   IF ((stat = FillPaymentForAllOper(typeOperNum, LO_CREDIT, credID, opDate, opDate)) != 0)
+      RunError("Ошибка формирования разноски", stat);
+   END;
+
+   curDuty = CRSDCommand("SELECT SUM(T_SUM) FROM DPAYMENT_TMP WHERE T_PARENTID = 0", V_MONEY);
+   totalDuty = GetTotalDuty(LO_CREDIT, credID, opDate,0);
+   IF ( DutFromAccFlag == 1)
+      dutySumma = ОстатокНаСчете(LO_CREDIT, credID, credContr.CurCode, 117, opDate);
+      dutySumma = min(dutySumma, totalDuty);
+   ELSE
+      IF (ValType(dutySumma) == V_UNDEF)
+         dutySumma  = totalDuty;
+      ELSE
+         dutySumma = dutySumma + curDuty;
+      END;
+   END;
+
+   IF (dutySumma > totalDuty)
+      RunError("Сумма погашения превышает общую сумму задолженности", 18592);
+   END; 
+
+
+   IF (dutySumma <= 0)
+      RunError("Сумма погашения должна быть больше нуля", 18591);
+   end;
+
+   // Если нужно, то проверим пользовательской функцией
+   if(NOT skip_user_chec.InsertAdvancedRepayment)
+      if(NOT InsertAdvancedRepaymentUserCheck(NumServ,credContr,operDate,DutySum))
+         return 0;
+      end;
+   end;
+
+   // разноска по счетам
+   IF ((stat = FillPaymentCalcResSum(
+                                     typeOperNum, 
+                                     LO_CREDIT, 
+                                     credID, 
+                                     opDate, 
+                                     GetDutyPriority (LO_CREDIT, credID, CS_DUTY, typeOperNum), 
+                                     dutySumma)) != 0)
+      RunError("Ошибка разноски суммы", stat);
+   END;
+     
+   // Выполнение собственно транзакции погашения
+   IF (RtTrn("MakeRepaymentTrn"))
+      var DutyRest = ОстатокРегистра(LO_CREDIT, credID, TDR_MAINREST, opDate);      
+      return TRepaymentData(operationID, DutyRest);
+   END;
+
+   IF (ErrManager.GetErrCode() != 0)
+      ErrManager.RunErr();
+   END;
+END;

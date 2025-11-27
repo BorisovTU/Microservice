@@ -1,0 +1,262 @@
+/*Отказ(откат отказа) от второй части сделки.
+  Для вызова из пользовательского макроса ВНЕ контекта операции в режиме хранилища НУ ()*/
+import "secinter.mac", RsbDataSet;
+
+PRIVATE VAR RejectDate = {curdate};
+PRIVATE VAR Ticket   = TRecHandler( "dl_tick.dbt" );
+PRIVATE VAR dl_leg_2 = TRecHandler( "dl_leg.dbt" );
+PRIVATE VAR PmWrtSum = TBFile( "pmwrtsum.dbt", "W" );
+PRIVATE VAR PaymentsRS, sptkchng_Id = 0;
+
+PRIVATE CONST RegPath  = "SECUR\\РЕЖИМ ХРАНИЛИЩА ДАННЫХ ДЛЯ НУ";
+PRIVATE MACRO РежимХранилищаНУ( ErrorCode:@INTEGER ) :BOOL
+  VAR   RegValue = false;
+
+  GetRegistryValue( RegPath, V_BOOL, RegValue, ErrorCode );
+
+  if( ErrorCode != 0 )
+     MsgBox( "Ошибка при получении значения настройки \"" + RegPath + "\"");
+     return false;
+  end;
+  return RegValue;
+end;
+
+PRIVATE MACRO GetTicketBuffer( TickParm:VARIANT, TicketBuffer:TRecHandler ):BOOL
+  VAR DealFile;
+
+  if( (ValType(TickParm) == V_STRUC) OR (ValType(TickParm) == V_FILE) OR (ValType(TickParm) == V_GENOBJ) )
+    Copy(  TicketBuffer, TickParm );
+  elif( (ValType(TickParm) == V_INTEGER) )  
+     DealFile = TBFile( "dl_tick.dbt" );
+     DealFile.rec.DealID = TickParm;
+     if( DealFile.GetEQ() )
+        Copy( TicketBuffer, DealFile );
+     else 
+        MsgBox( "Не найдена сделка с DealID = " + string(TickParm) );
+        return false;
+     end;
+  else
+     MsgBox( "Неверный тип параметра в GetTicketBuffer." );
+     return false;
+  end;
+  return true;
+END;
+
+PRIVATE VAR Error_ExecuteRejectTrn = "";
+PRIVATE MACRO TrnError( ErrMessage:STRING )
+  Error_ExecuteRejectTrn = GetErrMsg();
+  if( Error_ExecuteRejectTrn != "" )
+     Error_ExecuteRejectTrn = ErrMessage + "\n" + Error_ExecuteRejectTrn;
+  else
+     Error_ExecuteRejectTrn = ErrMessage;
+  end;
+  AbortTrn;
+END;
+
+PRIVATE MACRO OnErrorInTrn( RslErrObj )
+  VAR Err = "Ошибка при выполнении транзакции.\n";
+
+  if( Error_ExecuteRejectTrn == "" )
+     if( RslErrObj.Module != "" )
+        Err = Err + "Модуль : " + RslErrObj.Module + "\n";
+     end;
+
+     if( RslErrObj.Line != 0 )
+        Err = Err + "Строка : " + RslErrObj.Line + "\n";
+     end;
+                            
+     if( RslErrObj.Message != "" )
+        Err = Err + RslErrObj.Message + "\n";
+     end;
+
+     TrnError( Err );
+  else
+     AbortTrn;
+  end;
+END;
+
+PRIVATE MACRO GetData( TickParm:VARIANT ):BOOL
+  VAR Error  = 0, Group;
+
+  if( РежимХранилищаНУ( @Error ) == false )
+     if( Error == 0 )
+        MsgBox( "Выполнение действия возможно только в режиме хранилища данных для НУ.\nНастройка \""+RegPath+"\"" );
+     end;
+     return false;
+  end;
+
+  if( GetTicketBuffer( TickParm, Ticket ) == false )
+     return false;
+  end;
+
+  Group = SP_GetOperationGroup( Ticket.rec ); 
+  if( (IsBACKSALE(Group) OR IsREPO(Group) OR (Ticket.rec.BofficeKind == DL_CONVAVR) ) == false )
+     MsgBox( "Выполнение действия возможно только для сделок с двумя частями." );
+     return false;
+  end;
+
+  if( FindDL_LEG( LEG_KIND_DL_TICK_BACK, Ticket.rec.DealID, 0, dl_leg_2 ) != 0 )
+     MsgBox( "Отсутствуют условия для второй части сделки (запись в ddl_leg_dbt). Код сделки=", Ticket.rec.DealCode );
+     return false;
+  end;
+
+  var sql = RSDCommand("SELECT t_PaymentID, t_PaymStatus, t_Purpose " +
+                       "  FROM dpmpaym_dbt " +
+                       " WHERE t_DocKind    = ? AND " +
+                       "       t_DocumentID = ? AND " +
+                       "       (  t_Purpose = " + string(BRi) + " OR " +
+                       "          t_Purpose = " + string(CRi) +
+                       "       ) " );
+
+  sql.addParam( "", RSDBP_IN, Ticket.rec.BofficeKind );
+  sql.addParam( "", RSDBP_IN, Ticket.rec.DealID );
+  sql.execute();
+
+  PaymentsRS = TRsbDataSet( sql );
+
+  /*Лот по второй части сделки*/
+  if( ПолучитьЛотПоСделке( Ticket.rec, -1, PmWrtSum, false, null, true ) == false )
+     PmWrtSum.Clear();
+  end;
+  return true;
+END;
+
+MACRO SC_ExecuteRejectPart2_Trn()
+  VAR PaymObj;
+
+  Error_ExecuteRejectTrn = "";
+
+  /*Обновить с отражением в истории изменений сделки*/
+  dl_leg_2.rec.RejectDate = RejectDate;
+
+  dl_leg_2.rec.BitMask = bOR( dl_leg_2.rec.BitMask, DL_LEG_NOPART2 );
+
+  if( SP_InsertSPTKCHNG( {curdate}, SPTKCHNG_REJECT2, Ticket, NULL, dl_leg_2 ) != 0 )
+     TrnError( "Ошибка при обновлении измененных данных сделки." );
+  end;
+
+  /*Закрыть все платежи по второй части сделки*/
+  while( PaymentsRS.MoveNext() )
+     if( PaymentsRS.PaymStatus != PM_CLOSED_W_M_MOVEMENT )
+        PaymObj = null;
+        PaymObj = RsbPayment( PaymentsRS.t_PaymentID );
+        PaymObj.PaymStatus = PM_CLOSED_W_M_MOVEMENT;
+        if( PaymObj.Update() != 0 ) 
+           TrnError("Ошибка при обновлении статуса платежа."); 
+        end;
+     end;
+  end;
+
+OnError( RslErrObj )
+  OnErrorInTrn( RslErrObj );
+END;
+
+MACRO SC_BackoutExecuteRejectPart2_Trn()
+  VAR PaymObj;
+
+  Error_ExecuteRejectTrn = "";
+
+  if( SP_BackoutSPTKCHNG( sptkchng_Id ) != 0 )
+     TrnError( "Ошибка при обновлении измененных данных сделки." );
+  end;
+
+  /*Закрыть все платежи по второй части сделки*/
+  while( PaymentsRS.MoveNext() )
+     if( PaymentsRS.PaymStatus != PM_PREPARING )
+        PaymObj = null;
+        PaymObj = RsbPayment( PaymentsRS.t_PaymentID );
+        PaymObj.PaymStatus = PM_PREPARING;
+        if( PaymObj.Update() != 0 ) 
+           TrnError("Ошибка при обновлении статуса платежа."); 
+        end;
+     end;
+  end;
+                  
+OnError( RslErrObj )
+  OnErrorInTrn( RslErrObj );
+END;
+
+/*Отказ от второй части сделки
+  Принимаемые параметры:
+    Tick [RECORD/TBFile/TRecHandler/INTEGER]- структура либо ID сделки для которой производится отказ
+  Возвращаемое значение:
+    true - нет ошибок, false - если отказ не выполнен
+*/
+MACRO ОтказОтВторойЧасти( TickParm:VARIANT ):BOOL
+
+  if( GetData( TickParm ) == false )
+     return false;
+  end;
+
+  if( dl_leg_2.rec.RejectDate != Date(0,0,0) )
+     MsgBox( "Для сделки " + Ticket.rec.DealCode + " отказ от второй части сделки уже выполнен." );
+     return false; 
+  end; 
+
+  if( GetDate( RejectDate, "Введите дату отказа от второй части сделки:",null,null,null,"Отказ от второй части сделки","Enter Ввод Esc Отмена " ) == false ) 
+     return false;
+  end;
+
+  if( ProcessTrn( null, "SC_ExecuteRejectPart2_Trn") != true )
+    if( Error_ExecuteRejectTrn != "" )
+       MsgBox( Error_ExecuteRejectTrn );
+    else
+       MsgBox( "Ошибка при выполнении действия. Отказ от второй части не выполнен." );
+    end;
+    return false;
+  end;
+
+  MsgBox( "Отказ от второй части сделки выполнен успешно." );
+  return true;
+END;
+
+/*Откат отказа от второй части сделки
+  Принимаемые параметры:
+    Tick [RECORD/TBFile/TRecHandler/INTEGER]- структура либо ID сделки для которой производится отказ
+  Возвращаемое значение:
+    true - нет ошибок, false - если отказ не выполнен
+*/
+MACRO ОткатОтказаОтВторойЧасти( TickParm:VARIANT ):BOOL
+  VAR sptkchngRS;
+
+  if( GetData( TickParm ) == false )
+     return false;
+  end;
+
+  /*последнее изменение условий по сделке*/
+  var sql = RSDCommand("SELECT NVL( MAX(t_ID), 0) AS ID FROM dsptkchng_dbt " +
+     " WHERE t_DealID = ? ");
+
+  sql.addParam( "", RSDBP_IN, Ticket.rec.DealID );
+  sql.execute();
+
+  sptkchngRS = TRsbDataSet( sql );
+
+  if( sptkchngRS.MoveNext() )
+     sptkchng_Id = int(sptkchngRS.ID);
+  else
+     sptkchng_Id = 0;
+  end;
+
+  if( (sptkchng_Id == 0) OR (dl_leg_2.rec.RejectDate == Date(0,0,0)) )
+     MsgBox( "Для сделки " + Ticket.rec.DealCode + " отказ от второй части не выполнялся." );
+     return false; 
+  end; 
+
+  if( Ticket.rec.ChangeKind != SPTKCHNG_REJECT2 )
+     MsgBox( "Для сделки " + Ticket.rec.DealCode + " отказ от второй части не является последним изменением условий." );
+     return false; 
+  end; 
+
+  if( ProcessTrn( null, "SC_BackoutExecuteRejectPart2_Trn") != true )
+    if( Error_ExecuteRejectTrn != "" )
+       MsgBox( Error_ExecuteRejectTrn );
+    else
+       MsgBox( "Ошибка при выполнении действия. Откат отказа от второй части сделки не выполнен." );
+    end;
+    return false;
+  end;
+
+  MsgBox( "Откат отказа от выполнения второй части сделки выполнен успешно." );
+  return true;
+END;

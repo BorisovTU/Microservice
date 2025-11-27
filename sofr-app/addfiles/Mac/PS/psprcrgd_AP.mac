@@ -1,0 +1,1183 @@
+/*
+  $Name:         psprcrgd_AP.mac
+  $Module:       РКО
+  $Description:  Процедура обработки решения рег. органа об отзыве, приостановлении, возобновлении поручения НО
+*/
+
+//-----------------------------------------------------------------------------
+//          Автоматизированная банковская система RS-Bank               
+//                 Copyright (c) R-Style Software Lab
+//
+// Подсистема   : РКО
+//
+// Описание     : Процедура обработки решения рег. органа об отзыве, приостановлении, возобновлении поручения НО
+//                APN, APO, APZ
+//
+// Программист  : Чукина Т.А.
+//
+// Создан       : 16.01.2018
+//
+//-----------------------------------------------------------------------------
+
+import MesInter, WldInter, CTInter, FIInter, BankInter, PaymInter, oralib, likepy, 
+       "AccOperations.mac", "pmlib.mac", "pm_tools.mac", "pm_common.mac", "wltools.mac",
+       "pmcarfun.mac", "wlmnstls.mac", "rsberror.mac";
+
+// все записи wlrdpm в списке связанных поручений решения со статусом wlrdpm.State in ("обработано", "включено в подтверждение")
+private macro AllOrdersProcessed(OrderList : RsbRdPm) : bool
+  var Order : TRecHandler = TRecHandler("wlrdpm.dbt");
+
+  var ExistsOrder : bool = ( OrderList.First(Order) == 0 );
+  while(ExistsOrder)
+    if(not InList(Order.rec.State, WLD_STATUS_RDPM_PROCESSED, WLD_STATUS_RDPM_ADDCONFIRM) )
+      Bnk_ToRSTrace("AllOrdersProcessed", "Result", "All wlrdpm records are processed: FALSE");
+      return FALSE;
+    end;
+
+    ExistsOrder = ( OrderList.Next(Order) == 0 );
+  end;
+
+  Bnk_ToRSTrace("AllOrdersProcessed", "Result", "All wlrdpm records are processed: TRUE");
+  return TRUE;
+end;
+
+private macro Check(rgd : TRecHandler, OrderList : RsbRdPm)
+  if( (rgd.rec.State == WLD_STATUS_DECISION_CLOSE) and
+      AllOrdersProcessed(OrderList)
+    )
+    RunError("Обработка решения выполнена полностью, повторная обработка не требуется");
+  end;
+end;
+
+private macro FindPmByFileName
+( Rdpm : TRecHandler,
+  CountPm : @integer,
+  PaymentID : @integer,
+  RmNumber : @string,
+  RmDate : @date
+)
+  Bnk_ToRSTrace( "FindPmByFileName", "Begin", "Search payment by file name: " + 
+                 "Number='" + Rdpm.rec.Number + "', Date=" + Rdpm.rec.Date + 
+                 ", FileName='" + Rdpm.rec.FileName + "'" 
+               );
+
+  CountPm = 0;
+
+  var query = 
+    "Select /*+ LEADING(sess mes meslnk wlpm) USE_NL(sess mes meslnk wlpm)*/ "
+    "       pm.t_PaymentID, rm.t_Number, rm.t_Date "
+    "  from dpmpaym_dbt pm, dpmrmprop_dbt rm, dpmlink_dbt pmlink, "
+    "       dpmpaym_dbt pm1, dwlpm_dbt wlpm, dwlmeslnk_dbt meslnk, "
+    "       dwlmes_dbt mes, dwlsess_dbt sess "
+    " where pm.t_PrimDocOrigin = " + PD_OR_FNS +
+    "   and rm.t_PaymentID = pm.t_PaymentID "
+    "   and rm.t_Number = :RdpmNumber "
+    "   and rm.t_Date = :RdpmDate "
+    "   and pm.t_BaseFIID = " + NATCUR +
+    "   and pm.t_BaseAmount = :RdpmAmount "
+    "   and pm.t_PayerAccount = :RdpmPayerAccount "
+    "   and pmlink.t_PurposePayment = pm.t_PaymentID "
+    "   and pmlink.t_LinkKind = " + PMLINK_KIND_EXECORDER +
+    "   and pm1.t_PaymentID = pmlink.t_InitialPayment "
+    "   and wlpm.t_PaymentID = pm1.t_PaymentID "
+    "   and wlpm.t_Direct = 'X' /* WLD_MES_IN */ "
+    "   and meslnk.t_ObjID = wlpm.t_WlPmID "
+    "   and meslnk.t_ObjKind = " + OBJTYPE_PAYMENT +
+    "   and mes.t_MesID = meslnk.t_MesID "
+    "   and sess.t_SessionID = mes.t_SessionID "
+    "   and sess.t_FileName like '%\' || :RdpmFileName || '.___' ";
+
+  var params : TArray = makeArray
+  ( SQLParam("RdpmNumber", Rdpm.rec.Number),
+    SQLParam("RdpmDate", Rdpm.rec.Date),
+    SQLParam("RdpmAmount", Rdpm.rec.Amount),
+    SQLParam("RdpmPayerAccount", Rdpm.rec.PayerAccount),
+    SQLParam("RdpmFileName", Rdpm.rec.FileName)
+  );
+
+  var rs = execSQLselect(query, params);
+  if(rs and rs.moveNext())
+    CountPm = 1;
+    PaymentID = rs.value("t_PaymentID");
+    RmNumber = rs.value("t_Number");
+    RmDate = rs.value("t_Date");
+
+    if(rs.moveNext())
+      CountPm = 2;
+    end;
+  end;
+
+  Bnk_ToRSTrace( "FindPmByFileName", "End", "CountPm=" + CountPm);
+end;
+
+private macro GetSubQueryInn : string
+  var SearchOldInn : bool = Fns_NeedFindClientByClosedINN();
+
+  var SubQuery : string =
+    "Select " + IfThenElse(SearchOldInn, "t_ObjectID", "t_PartyID") +
+    "  from " + IfThenElse(SearchOldInn, "dobjcode_dbt", "dpartcode_dbt") +
+    " where t_CodeKind = " + PTCK_INN +
+    IfThenElse(SearchOldInn, " and t_ObjectType = " + OBJTYPE_PARTY, "") +
+    "   and (t_Code = :ClientINN2 or t_Code like :ClientINN3 || '/%') ";
+
+  return SubQuery;
+end;
+
+private macro GetInnCondition : string
+  var cond : string = 
+    "   and ( rm.t_PayerINN = :ClientINN "
+    "         or "
+    "         rm.t_PayerINN like :ClientINN1 || '/%' "
+    "         or "
+    "         pm.t_Payer > 0 and "
+    "         pm.t_Payer in ( " + GetSubQueryInn() + " ) "
+    "       ) ";
+
+  return cond;
+end;
+
+private macro GetSubQueryKpp : string
+  var SearchOldInn : bool = Fns_NeedFindClientByClosedINN();
+
+  var SubQuery : string =
+    "Select " + IfThenElse(SearchOldInn, "t_ObjectID", "t_PartyID") +
+    "  from " + IfThenElse(SearchOldInn, "dobjcode_dbt", "dpartcode_dbt") +
+    " where t_CodeKind = " + PTCK_INN +
+    IfThenElse(SearchOldInn, " and t_ObjectType = " + OBJTYPE_PARTY, "") +
+    "   and t_Code like '%/' || :ClientKPP1 ";
+
+  return SubQuery;
+end;
+
+private macro GetKppCondition : string
+  var cond : string = 
+    "   and ( rm.t_PayerINN like '%/' || :ClientKPP "
+    "         or "
+    "         pm.t_Payer > 0 and "
+    "         pm.t_Payer in ( " + GetSubQueryKpp() + " ) "
+    "       ) ";
+
+  return cond;
+end;
+
+private macro FindPmByPaymProps
+( rgd : TRecHandler,
+  Rdpm : TRecHandler,
+  CountPm : @integer,
+  PaymentID : @integer,
+  RmNumber : @string,
+  RmDate : @date
+)
+  Bnk_ToRSTrace( "FindPmByPaymProps", "Begin", "Search payment by file name: " + 
+                 "Number='" + Rdpm.rec.Number + "', Date=" + Rdpm.rec.Date
+               );
+
+  CountPm = 0;
+
+  var ClientINN : string = rgd.rec.ClientINN,
+      ClientKPP : string = rgd.rec.ClientKPP;
+
+  var query = 
+    "Select pm.t_PaymentID, rm.t_Number, rm.t_Date "
+    "  from dpmpaym_dbt pm, dpmrmprop_dbt rm "
+    " where rm.t_PaymentID = pm.t_PaymentID "
+    "   and rm.t_Number = :RdpmNumber "
+    "   and rm.t_Date = :RdpmDate "
+    "   and pm.t_BaseFIID = " + NATCUR +
+    "   and pm.t_PayerAccount = :RdpmPayerAccount "
+    "   and pm.t_PayerBankID = :rgdRecipientID "
+    "   and rm.t_ShifrOper = '06' "
+    "   and pm.t_BaseAmount = :RdpmAmount " +
+    IfThenElse(ClientINN, GetInnCondition(), "") +
+    IfThenElse(ClientKPP, GetKppCondition(), "");
+
+  var params : TArray = makeArray
+  ( SQLParam("RdpmNumber", Rdpm.rec.Number),
+    SQLParam("RdpmDate", Rdpm.rec.Date),
+    SQLParam("RdpmPayerAccount", Rdpm.rec.PayerAccount),
+    SQLParam("rgdRecipientID", rgd.rec.RecipientID),
+    SQLParam("RdpmAmount", Rdpm.rec.Amount)
+  );
+  if(ClientINN)
+    params[ params.size ] = SQLParam("ClientINN", ClientINN);
+    params[ params.size ] = SQLParam("ClientINN1", ClientINN);
+    params[ params.size ] = SQLParam("ClientINN2", ClientINN);
+    params[ params.size ] = SQLParam("ClientINN3", ClientINN);
+  end;
+  if(ClientKPP)
+    params[ params.size ] = SQLParam("ClientKPP", ClientKPP);
+    params[ params.size ] = SQLParam("ClientKPP1", ClientKPP);
+  end;
+
+  var rs = execSQLselect(query, params);
+  if(rs and rs.moveNext())
+    CountPm = 1;
+    PaymentID = rs.value("t_PaymentID");
+    RmNumber = rs.value("t_Number");
+    RmDate = rs.value("t_Date");
+
+    if(rs.moveNext())
+      CountPm = 2;
+    end;
+  end;
+
+  Bnk_ToRSTrace( "FindPmByPaymProps", "End", "CountPm=" + CountPm);
+end;
+
+private macro FindPNO
+( rgd : TRecHandler,
+  Rdpm : TRecHandler,
+  CountPm : @integer,
+  PaymentID : @integer,
+  RmNumber : @string,
+  RmDate : @date
+)
+  CountPm = 0;
+
+  if(Rdpm.rec.FileName)
+    FindPmByFileName(Rdpm, @CountPm, @PaymentID, @RmNumber, @RmDate);
+  end;
+
+  if(CountPm == 0)
+    FindPmByPaymProps(rgd, Rdpm, @CountPm, @PaymentID, @RmNumber, @RmDate);
+  end;
+end;
+
+private macro Fns_NeedConfirmRgdOrder : bool
+  var RegPath : string = "PS\\REQOPENACC\\OPERATION\\365-П\\Подтверждать_Поручение";
+
+  var NeedConfirm : bool = Bnk_GetRegistryValue(RegPath, V_BOOL, true);
+
+  Bnk_ToRSTrace( "Fns_NeedConfirmRgdOrder", "Result", "Need confirm payment for wlrdpm: " + string(NeedConfirm));
+  return NeedConfirm;
+end;
+
+private macro UpdateRdpmByFoundPaym
+( RdpmList : RsbRdPm,
+  Rdpm : TRecHandler,
+  CountPm : integer,
+  PaymentID : integer,
+  RmNumber : string,
+  RmDate : date
+)
+  if(CountPm == 1)
+    Rdpm.rec.PaymentID = PaymentID;
+
+    if( Fns_NeedConfirmRgdOrder() )
+      Rdpm.rec.State = WLD_STATUS_RDPM_AUTO;
+      Rdpm.rec.Description = 
+        "Найдено инкассовое поручение № " + RmNumber + " от " + DDpMMpYYYY(RmDate) +
+        ", требуется подтвердить действие по документу (отзыв, приостановление или возобновление действия) в индивидуальном режиме или в списке поручений решения";
+    else
+      Rdpm.rec.State = WLD_STATUS_RDPM_CONFIRM;
+    end;
+
+  elif(CountPm > 1)
+    Rdpm.rec.Description = "Реквизиты поручения НО, указанные в решении, соответствуют нескольким платежам. Необходимо выбрать платеж вручную в списке поручений решения";
+
+  else // не найдено ни одного поручения 
+    Rdpm.rec.Description = "Не найдено инкассовое поручение, на которое распространяется действие решения. Необходимо выбрать платеж вручную в списке поручений решения или отказаться от исполнения решения";
+  end;
+
+  if( RdpmList.Update(Rdpm) != 0 )
+    RunError("Ошибка при обновлении записи в списке поручений решения");
+  end;
+end;
+
+// Поиск поручения налогового органа
+private macro FindPayments(rgd : TRecHandler, RdpmList : RsbRdPm)
+  var Rdpm : TRecHandler = TRecHandler("wlrdpm.dbt");
+
+  var ExistsRdpm : bool = ( RdpmList.First(Rdpm) == 0 );
+  while(ExistsRdpm)
+
+    if( Rdpm.rec.State == WLD_STATUS_RDPM_READY )
+      var CountPm : integer = 0, PaymentID : integer = 0, RmNumber : string = "", 
+          RmDate : date = date(0, 0, 0);
+
+      FindPNO(rgd, Rdpm, @CountPm, @PaymentID, @RmNumber, @RmDate);
+      UpdateRdpmByFoundPaym(RdpmList, Rdpm, CountPm, PaymentID, RmNumber, RmDate);
+    end;
+
+    ExistsRdpm = ( RdpmList.Next(Rdpm) == 0 );
+  end;
+
+end;
+
+private macro NeedConfirmPaymLinks(OrderList : RsbRdPm) : bool
+  var Order : TRecHandler = TRecHandler("wlrdpm.dbt");
+
+  var ExistsOrder : bool = ( OrderList.First(Order) == 0 );
+  while(ExistsOrder)
+    if( InList(Order.rec.State, WLD_STATUS_RDPM_READY, WLD_STATUS_RDPM_AUTO) )
+      Bnk_ToRSTrace("NeedConfirmPaymLinks", "Result", "RdpmList has unconfirmed orders: TRUE");
+      return TRUE;
+    end;
+
+    ExistsOrder = ( OrderList.Next(Order) == 0 );
+  end;
+
+  Bnk_ToRSTrace("NeedConfirmPaymLinks", "Result", "RdpmList has unconfirmed orders: FALSE");
+  return FALSE;
+end;
+
+private macro GetErrMsgFailConfirmPaymLinks(OrderList : RsbRdPm) : string
+  var ErrMsg : string = "";
+
+  var Order : TRecHandler = TRecHandler("wlrdpm.dbt");
+
+  var ExistsOrder : bool = ( OrderList.First(Order) == 0 );
+  while(ExistsOrder)
+    if( InList(Order.rec.State, WLD_STATUS_RDPM_READY, WLD_STATUS_RDPM_AUTO) and
+        Order.rec.Description
+      )
+      ErrMsg = ErrMsg + Order.rec.Description + "\n";
+    end;
+
+    ExistsOrder = ( OrderList.Next(Order) == 0 );
+  end;
+
+  return ErrMsg;
+end;
+
+// Подтверждение автоматической привязки
+private macro ConfirmRgdPaymLinks(rgd : TRecHandler, RdpmList : RsbRdPm, MustReject : @bool)
+  if( not NeedConfirmPaymLinks(RdpmList) )
+    return;
+  end;
+
+  if( not IsOprMultiExec() )
+    FnsScrolRgdOrders(rgd, WLRDPMSCRL_MODE_CONFIRM, RdpmList);
+
+    if( NeedConfirmPaymLinks(RdpmList) )
+      MustReject = true;
+      var ErrMsg : string = GetErrMsgFailConfirmPaymLinks(RdpmList);
+      if(ErrMsg)
+        msgbox(ErrMsg);
+      end;
+    end;
+  else
+    MustReject = true;
+  end;
+end;
+
+private class TPaymDataForRevoke(p_PaymentID : integer)
+  var PaymentID : integer = p_PaymentID,
+      DocKind : integer = 0,
+      StartDepartment : integer = 0,
+      BaseAmount : money = $0,
+      FutureBaseAmount : money = $0,
+      PaymStatus : integer = 0,
+      PspayordCurrentState : integer = 0,
+      RmNumber : string = "",
+      RmDate : date = date(0, 0, 0);
+
+  private macro Constructor
+    var rs = execSQLselectPrm
+    ( "Select pm.t_DocKind, pm.t_StartDepartment, pm.t_BaseAmount, pm.t_FutureBaseAmount, "
+      "       pm.t_PaymStatus, Nvl(payord.t_CurrentState, 0) as t_PspayordCurrentState, "
+      "       rm.t_Number, rm.t_Date "
+      "  from dpmpaym_dbt pm, dpmrmprop_dbt rm, dpspayord_dbt payord "
+      " where pm.t_PaymentID = :PaymentID "
+      "   and rm.t_PaymentID = pm.t_PaymentID "
+      "   and payord.t_OrderID(+) = pm.t_PaymentID ",
+      SQLParam("PaymentID", PaymentID)
+    );
+
+    if(rs and rs.moveNext())
+      DocKind = rs.value("t_DocKind");
+      StartDepartment = rs.value("t_StartDepartment");
+      BaseAmount = rs.value("t_BaseAmount");
+      FutureBaseAmount = rs.value("t_FutureBaseAmount");
+      PaymStatus = rs.value("t_PaymStatus");
+      PspayordCurrentState = rs.value("t_PspayordCurrentState");
+      RmNumber = rs.value("t_Number");
+      RmDate = rs.value("t_Date");
+    else
+      RunError("Не найден платеж с ИД=" + PaymentID);
+    end;
+  end;
+  Constructor();
+end;
+
+// вызвать процедуру отзыва для связанного платежа wlrdpm.PaymentID
+private macro CallRevokeProc(rgd : TRecHandler, Order : TRecHandler, ErrReject : @string)
+  var PaymentID : integer = Order.rec.PaymentID;
+  var Paym : TPaymDataForRevoke = TPaymDataForRevoke(PaymentID);
+
+  // Заполнить примечание "Причина отказа (возврата)" 
+  var DenialGround = 
+    "Распоряжение отозвано составителем (налоговым органом). Решение об отзыве № " +
+    rgd.rec.Number + " от " + DDpMMpYYYY(rgd.rec.Date);
+
+  var RecDenial : TRecHandler = TRecHandler("pmdenial");
+  RecDenial.Clear();
+
+  RecDenial.rec.DocumentKind = OBJTYPE_PMCHNDOC_KIND_REGDECISION;
+  RecDenial.rec.Date = rgd.rec.Date;
+  RecDenial.rec.Number = rgd.rec.Number;
+  RecDenial.rec.Ground = DenialGround;
+  RecDenial.rec.PaymentID = PaymentID;
+  RecDenial.rec.Department = Paym.StartDepartment;
+  RecDenial.rec.Amount = Paym.BaseAmount;
+
+  if( (Paym.DocKind == PS_PAYORDER) and (Paym.PspayordCurrentState == PSPO_ST_I1) )
+    RecDenial.rec.IndexNum = PAYMENTS_INDEX_1;
+  elif( InList(Paym.PaymStatus, PM_I2PLACED, PM_IWPPLACED) )
+    RecDenial.rec.Amount = Paym.FutureBaseAmount;
+    RecDenial.rec.IndexNum = IfThenElse(Paym.PaymStatus == PM_I2PLACED, PAYMENTS_INDEX_2, PAYMENTS_INDEX_WP);
+  end;
+
+  var stat : integer = PM_RevokeOrder(PaymentID, Paym.DocKind, CALL_SOURCE_REVOKE_ORDER_TAX_PROC, RecDenial);
+  if(not stat)
+    WldSetStateStamp(Order.rec, WLD_STATUS_RDPM_PROCESSED);
+
+    Order.rec.Description = "Отозвано инкассовое поручение № " + Paym.RmNumber +
+      " от " + DDpMMpYYYY(Paym.RmDate) + ". Первоначальная сумма поручения " + 
+      Paym.BaseAmount + ", отозванная сумма " + Paym.FutureBaseAmount;
+  else
+    ErrReject = GetErrMsgEx(stat, "Ошибка при выполнении отзыва платежа с ИД=" + PaymentID);
+
+    Order.rec.Description = ErrReject;
+  end;
+end;
+
+private macro GetRmNumberAndDate(PaymentID : integer, RmNumber : @string, RmDate : @date)
+  var rs = execSQLselectPrm
+  ( "Select t_Number, t_Date "
+    "  from dpmrmprop_dbt "
+    " where t_PaymentID = :PaymentID ",
+    SQLParam("PaymentID", PaymentID)
+  );
+
+  if(rs and rs.moveNext())
+    RmNumber = rs.value("t_Number");
+    RmDate = rs.value("t_Date");
+  else
+    RunError("Не найден платеж с ИД=" + PaymentID);
+  end;
+end;
+
+private macro IsAccClosed(Account : string) : bool
+  var Acc : TRecHandler = TRecHandler("account.dbt");
+
+  if( PM_GetAccountRecord(Account, Bnk_GetAccountFIID(Account), CHAPT1, Acc) )
+    if( (Acc.rec.Open_Close == "З" ) and (Acc.rec.Close_Date < {curdate}) )
+      return true;
+    end;
+
+    return false;
+  end;
+
+  RunError("Счет " + Account + " не найден");
+end;
+
+private macro GetRejectRevokeReason
+( PayerAccount : string,
+  PaymentID : integer,
+  rgd : TRecHandler
+)
+  var Reason : string = "";
+
+  var RmNumber : string = "", RmDate : date = date(0, 0, 0);
+  GetRmNumberAndDate(PaymentID, @RmNumber, @RmDate);
+
+  if( IsAccClosed(PayerAccount) )
+    Reason = 
+      "31;В банке (филиале) " + rgd.rec.RecipientCode + " " + rgd.rec.RecipientName + 
+      " невозможно отозвать инкассовое поручение № " + RmNumber + " от " + RmDate + 
+      ", на которое распространяется действие решения № " +
+      rgd.rec.Number + " от " + rgd.rec.Date + ", по причине закрытия счета плательщика";
+  else
+    Reason = 
+      "31;В банке (филиале) " + rgd.rec.RecipientCode + " " + rgd.rec.RecipientName + 
+      " невозможно отозвать инкассовое поручение № " + RmNumber + " от " + RmDate + 
+      ", на которое распространяется действие решения № " +
+      rgd.rec.Number + " от " + rgd.rec.Date + ", по причине наступления безотзывности средств";
+  end;
+
+  return Reason;
+end;
+
+// Отказать в отзыве поручения НО
+private macro RejectRevokeOrder(rgd : TRecHandler, Order : TRecHandler)
+  WldSetStateStamp(Order.rec, WLD_STATUS_RDPM_REJECT);
+
+  Order.rec.Description = GetRejectRevokeReason( Order.rec.PayerAccount, 
+                                                 Order.rec.PaymentID, 
+                                                 rgd );
+end;
+
+private macro RevokePayment
+( rgd : TRecHandler,
+  Order : TRecHandler, 
+  ErrReject : @string
+)
+  var PaymentID : integer = Order.rec.PaymentID;
+
+  if( IsPaymentRevocable(PaymentID, GetPaymStatus(PaymentID)) )
+    CallRevokeProc(rgd, Order, @ErrReject);
+  else
+    RejectRevokeOrder(rgd, Order);
+  end;
+
+end;
+
+private macro GetStopGroundNote(rgd : TRecHandler) : string
+  var Note : string =
+    "Действие документа приостановлено на основании решения налогового органа № " +
+    rgd.rec.Number + " от " + DDpMMpYYYY(rgd.rec.Date);
+
+  return Note;
+end;
+
+// Отказать в приостановлении поручения НО
+private macro RejectStopPayment(rgd : TRecHandler, Order : TRecHandler)
+  WldSetStateStamp(Order.rec, WLD_STATUS_RDPM_REJECT);
+
+  Order.rec.Description = GetRejectRevokeReason( Order.rec.PayerAccount, 
+                                                 Order.rec.PaymentID, 
+                                                 rgd );
+end;
+
+private macro GetPaymentDocKind(PaymentID : integer) : integer
+  var DocKind : integer = 0;
+
+  var rs = execSQLselectPrm
+  ( "Select t_DocKind "
+    "  from dpmpaym_dbt "
+    " where t_PaymentID = :PaymentID ",
+    SQLParam("PaymentID", PaymentID)
+  );
+
+  if(rs and rs.moveNext())
+    DocKind = rs.value("t_DocKind");
+  else
+    RunError("Не найден платеж с ИД=" + PaymentID);
+  end;
+
+  return DocKind;
+end;
+
+private macro CanStopPayment(PaymentID : integer) : bool
+  Bnk_ToRSTrace("CanStopPayment", "Begin", "PaymentID = " + PaymentID);
+
+  var OprStatus_INDEX : integer = -1, OprStatus_DO : integer = -1,
+      DocKind : integer = GetPaymentDocKind(PaymentID);
+
+  if(not PM_GetOprStatus(DocKind, PaymentID, OPR_PAYM_INDEX, @OprStatus_INDEX))
+    RunError("Ошибка получения статуса операции, сегмент \"Картотека\"");
+  end;
+  if(not PM_GetOprStatus(DocKind, PaymentID, OPR_PAYM_DO, @OprStatus_DO))
+    RunError("Ошибка получения статуса операции, сегмент \"Документооборот\"");
+  end;
+
+  if( InList(OprStatus_INDEX, OPR_PAYM_ST_INDEX_2,
+                              OPR_PAYM_ST_INDEX_I2MEET,
+                              OPR_PAYM_ST_INDEX_WAITEXEC,
+                              OPR_PAYM_ST_INDEX_WP,
+                              OPR_PAYM_ST_INDEX_LORO,
+                              OPR_PAYM_ST_INDEX_WP_MEET,
+                              OPR_PAYM_ST_INDEX_WAIT)
+      or
+      (OprStatus_DO == OPR_PM_ST_PRIORITY)
+    )
+    Bnk_ToRSTrace("CanStopPayment", "Result", "It is possible to stop payment: TRUE");
+    return true;
+  end;
+
+  return false;
+  Bnk_ToRSTrace("CanStopPayment", "Result", "It is possible to stop payment: FALSE");
+end;
+
+// у платежа есть связанная проводка по дебету счета плательщика
+private macro IsAccTrnFromPayerAccount(PaymentID : integer) : bool
+  Bnk_ToRSTrace("IsAccTrnFromPayerAccount", "Begin", "PaymentID = " + PaymentID);
+
+  var rs = execSQLselectPrm
+  ( "Select 1 "
+    "  from dpmpaym_dbt pmpaym, dpmdocs_dbt pmdocs, dacctrn_dbt acctrn "
+    " where pmpaym.t_PaymentID = :PaymentID "
+    "   and pmdocs.t_PaymentID = pmpaym.t_PaymentID "
+    "   and acctrn.t_AccTrnID = pmdocs.t_AccTrnID "
+    "   and acctrn.t_Account_Payer = pmpaym.t_PayerAccount ",
+    SQLParam("PaymentID", PaymentID)
+  );
+
+  if(rs and rs.moveNext())
+    Bnk_ToRSTrace("IsAccTrnFromPayerAccount", "Result", "Money transaction was made from payer account for this payment: TRUE");
+    return true;
+  end;
+
+  Bnk_ToRSTrace("IsAccTrnFromPayerAccount", "Result", "Money transaction was made from payer account for this payment: FALSE");
+  return false;
+end;
+
+// у платежа есть связанные платежные ордера на общую сумму pmpaym.BaseAmount
+private macro HasDocsForFullAmount(PaymentID : integer) : bool
+  Bnk_ToRSTrace("HasDocsForFullAmount", "Begin", "PaymentID = " + PaymentID);
+
+  var rs = execSQLselectPrm
+  ( "Select 1 "
+    "  from dpmpaym_dbt pmpaym "
+    " where pmpaym.t_PaymentID = :PaymentID "
+    "   and pmpaym.t_BaseAmount = "
+    "       ( select Sum(pmpaym1.t_BaseAmount) "
+    "           from dpmlink_dbt pmlink, dpmpaym_dbt pmpaym1 "
+    "          where pmlink.t_InitialPayment = pmpaym.t_PaymentID "
+    "            and pmlink.t_LinkKind = " + PMLINK_KIND_KVITING +
+    "            and pmpaym1.t_PaymentID = pmlink.t_PurposePayment "
+    "       ) ",
+    SQLParam("PaymentID", PaymentID)
+  );
+
+  if(rs and rs.moveNext())
+    Bnk_ToRSTrace("HasDocsForFullAmount", "Result", "Payment has linked orders of total amount = pmpaym.BaseAmount: TRUE");
+    return true;
+  end;
+
+  Bnk_ToRSTrace("HasDocsForFullAmount", "Result", "Payment has linked orders of total amount = pmpaym.BaseAmount: FALSE");
+  return false;
+end;
+
+// списания средств со счета плательщика
+private macro IsPayerAccountDebited(PaymentID : integer) : bool
+  Bnk_ToRSTrace("IsPayerAccountDebited", "Begin", "PaymentID = " + PaymentID);
+
+  if( IsAccTrnFromPayerAccount(PaymentID) or
+      HasDocsForFullAmount(PaymentID)
+    )
+    Bnk_ToRSTrace("IsPayerAccountDebited", "Result", "Money is paid from payer account: TRUE");
+    return true;
+  end;
+
+  Bnk_ToRSTrace("IsPayerAccountDebited", "Result", "Money is paid from payer account: FALSE");
+  return false;
+end;
+
+private macro StopPayment
+( rgd : TRecHandler,
+  Order : TRecHandler
+)
+  var RmNumber : string = "", RmDate : date = date(0, 0, 0);
+  GetRmNumberAndDate(Order.rec.PaymentID, @RmNumber, @RmDate);
+
+  if( CanStopPayment(Order.rec.PaymentID) )
+    var Payment : RsbPayment = RsbPayment(Order.rec.PaymentID);
+    if( Payment.Notes.AddNote(PM_NOTEKIND_INDEX_STOPDATE, rgd.rec.StartDate) != 0 )
+      RunError("Не удалось записать примечание платежа вида \"Дата приостановления в картотеке\""); 
+    end;
+    if( Payment.Notes.AddNote(PM_NOTEKIND_INDEX_STOPGROUND, GetStopGroundNote(rgd)) != 0 )
+      RunError("Не удалось записать примечание платежа вида \"Основание приостановления в картотеке\""); 
+    end;
+    if( Payment.Update() != 0 )
+      RunError("Ошибка! Не удалось приостановить платеж в картотеке");
+    end;
+
+    Order.rec.Description = 
+      "Приостановлено действие инкассового поручения № " + 
+      RmNumber + " от " + DDpMMpYYYY(RmDate) +
+      ", на которое распространяется действие решения № " + 
+      rgd.rec.Number + " от " + DDpMMpYYYY(rgd.rec.Date);
+
+    WldSetStateStamp(Order.rec, WLD_STATUS_RDPM_PROCESSED);
+  else
+    Order.rec.Description = 
+      "31;Инкассовое поручение № " + RmNumber + " от " + DDpMMpYYYY(RmDate) + 
+      ", на которое распространяется действие решения № " +
+      rgd.rec.Number + " от " + DDpMMpYYYY(rgd.rec.Date) + ", " +
+      ifThenElse( IsPayerAccountDebited(Order.rec.PaymentID), 
+                  "исполнено", 
+                  "не помещено ни в одну из очередей документов" ) + 
+      ", приостановление невозможно";
+
+    WldSetStateStamp(Order.rec, WLD_STATUS_RDPM_REJECT);
+  end;
+end;
+
+private macro CancelStopPayment
+( rgd : TRecHandler,
+  Order : TRecHandler
+)
+  var RmNumber : string = "", RmDate : date = date(0, 0, 0);
+  GetRmNumberAndDate(Order.rec.PaymentID, @RmNumber, @RmDate);
+
+  var Payment : RsbPayment = RsbPayment(Order.rec.PaymentID);
+
+  if( IsPaymentStoppedInIndex(Payment) )
+    if( Payment.Notes.DelNoteCurValue(PM_NOTEKIND_INDEX_STOPDATE) != 0 )
+      RunError("Не удалось очистить примечание платежа вида \"Дата приостановления в картотеке\""); 
+    end;
+    if( Payment.Notes.DelNoteCurValue(PM_NOTEKIND_INDEX_STOPGROUND) != 0 )
+      RunError("Не удалось очистить примечание платежа вида \"Основание приостановления в картотеке\""); 
+    end;
+    if( Payment.Update() != 0 )
+      RunError("Ошибка! Не удалось отменить приостановление платежа");
+    end;
+
+    Order.rec.Description = 
+      "Возобновлено действие инкассового поручения № " + 
+      RmNumber + " от " + DDpMMpYYYY(RmDate) +
+      ", на которое распространяется действие решения № " + 
+      rgd.rec.Number + " от " + DDpMMpYYYY(rgd.rec.Date);
+
+    WldSetStateStamp(Order.rec, WLD_STATUS_RDPM_PROCESSED);
+  else
+    Order.rec.Description = 
+      "31;Инкассовое поручение № " + RmNumber + " от " + DDpMMpYYYY(RmDate) + 
+      ", на которое распространяется действие решения № " +
+      rgd.rec.Number + " от " + DDpMMpYYYY(rgd.rec.Date) +
+      ", не приостановлено на момент обработки решения";
+
+    WldSetStateStamp(Order.rec, WLD_STATUS_RDPM_REJECT);
+  end;
+end;
+
+private macro NeedGenPB(OrderList : RsbRdPm) : bool
+  Bnk_ToRSTrace("NeedGenPB", "Begin", "Check if generation of PB is needed");
+
+  var Order : TRecHandler = TRecHandler("wlrdpm.dbt");
+
+  var ExistsOrder : bool = ( OrderList.First(Order) == 0 );
+  while(ExistsOrder)
+    if(Order.rec.State == WLD_STATUS_RDPM_REJECT)
+      Bnk_ToRSTrace("NeedGenPB", "Result", "Need generate PB: TRUE");
+      return TRUE;
+    end;
+
+    ExistsOrder = ( OrderList.Next(Order) == 0 );
+  end;
+
+  Bnk_ToRSTrace("NeedGenPB", "Result", "Need generate PB: FALSE");
+  return FALSE;
+end;
+
+private macro CreateFnsPB(DecisionID : integer, OrderList : RsbRdPm) : string
+  var ErrMsg : string = "";
+
+  RECORD wlmes(wlmes);
+  if( not FindWldMesByLink(DecisionID, OBJTYPE_DECISION, "X", wlmes) )
+    RunError("Не найдено входящее сообщение, по которому сгенерировано решение ФНС");
+  end;
+
+  var ErrCode : integer = FNS_RP_CANNOT_EXECUTED_BANK;
+  var ErrDescription : string = Bnk_GetLLValuesName(OBJTYPE_WLRESCODE_MNS, ErrCode);
+
+  var ErrList : RsbWlError = RsbWlError(0);
+  var Order : TRecHandler = TRecHandler("wlrdpm.dbt");
+  var ExistsOrder : bool = ( OrderList.First(Order) == 0 );
+  while(ExistsOrder)
+    if(Order.rec.State == WLD_STATUS_RDPM_REJECT)
+      var Descr : string = Order.rec.Description,
+          ind : integer = index(Descr, ";"),
+          wlerr : TRecHandler = TRecHandler("wlerror.dbt");
+      wlerr.Clear();
+      wlerr.rec.Code = SubStr(Descr, 1, ind - 1);
+      wlerr.rec.Description = SubStr(Descr, ind + 1);
+
+      var stat : integer = ErrList.Insert(wlerr);
+      if(stat)
+        ErrMsg = GetErrMsgEx(stat, "Не удалось сформировать список ошибок для подтверждения банка");
+        return ErrMsg;
+      end;
+    end;
+
+    ExistsOrder = ( OrderList.Next(Order) == 0 );
+  end;
+
+  if( not ВставитьПодтверждениеБанкаФНС( wlmes, ErrCode, ErrDescription, ErrList ) )
+    ErrMsg = GetErrMsgEx(null, "Ошибка при вставке подтверждения банка");
+    return ErrMsg;
+  end;
+
+  return ErrMsg;
+end;
+
+// Сменить статус записям, включенным в подтверждение
+private macro MarkOrdersAddedToConfirmation(OrderList : RsbRdPm)
+  var Order : TRecHandler = TRecHandler("wlrdpm.dbt");
+  var ExistsOrder : bool = ( OrderList.First(Order) == 0 );
+  while(ExistsOrder)
+    if(Order.rec.State == WLD_STATUS_RDPM_REJECT)
+      WldSetStateStamp(Order.rec, WLD_STATUS_RDPM_ADDCONFIRM);
+
+      if( OrderList.Update(Order) != 0 )
+        RunError("Ошибка при обновлении записи в списке поручений решения");
+      end;
+    end;
+
+    ExistsOrder = ( OrderList.Next(Order) == 0 );
+  end;
+end;
+
+private macro GetRdpmIDsToArray(OrderList : RsbRdPm) : TArray
+  var RdpmIDs : TArray = TArray();
+
+  var Order : TRecHandler = TRecHandler("wlrdpm.dbt");
+
+  var ExistsOrder : bool = ( OrderList.First(Order) == 0 );
+  while(ExistsOrder)
+    RdpmIDs[RdpmIDs.size] = Order.rec.ID;
+
+    ExistsOrder = ( OrderList.Next(Order) == 0 );
+  end;
+
+  return RdpmIDs;
+end;
+
+//========================================================================================================
+// Протокол
+//========================================================================================================
+private class TLongMessage(Msg : string)
+  var Str : string = Msg;
+
+  macro Concat(NextMsg : string)
+    Str = Str + "\n" + NextMsg;
+  end;
+end;
+
+private macro SaveRepMessageForAccount(Account : string, Msg : string, PaymMessages : PSRepMap)
+  if( PaymMessages.Exists(Account) )
+    PaymMessages.Value(Account).Concat(Msg);
+  else
+    var MsgObj : TLongMessage = TLongMessage(Msg);
+    PaymMessages.Add(Account, MsgObj);
+  end;
+end;
+
+private macro GroupPaymMessagesByAccount(OrderList : RsbRdPm, PaymMessages : PSRepMap)
+  var Order : TRecHandler = TRecHandler("wlrdpm.dbt");
+
+  var ExistsOrder : bool = ( OrderList.First(Order) == 0 );
+  while(ExistsOrder)
+    SaveRepMessageForAccount(Order.rec.PayerAccount, Order.rec.Description, PaymMessages);
+
+    ExistsOrder = ( OrderList.Next(Order) == 0 );
+  end;
+end;
+
+private macro SavePaymMessagesToTempTable(rgd : TRecHandler, PaymMessages : PSRepMap)
+
+  var HasElements : bool = PaymMessages.First();
+
+  while(HasElements)
+    var Account : string = PaymMessages.Key();
+    var Msg : string = Substr( PaymMessages.Value().Str, 1, 2000 );//размер поля wlrepclm.Message
+
+    InsertWlRepClm( rgd.rec, 0, 0, Account, Msg );
+
+    HasElements = PaymMessages.Next();
+  end;
+
+end;
+
+// По событию завершении процедуры выполнить следующее:
+//   По каждой записи wlrdpm:
+//     Записать информацию в протокол (wlregdec, 0, 0, wlrdpm.PayerAccount,  wlrdpm.description)
+private macro OnExitProc(rgd : TRecHandler, OrderList : RsbRdPm)
+
+  var PaymMessages : PSRepMap = PSRepMap(V_STRING);// (Key, Value) = (Account : string, Message : TLongMessage)
+
+  GroupPaymMessagesByAccount(OrderList, PaymMessages);
+
+  SavePaymMessagesToTempTable(rgd, PaymMessages);
+end;
+//========================================================================================================
+
+
+private class TTrnAction(p_rgd : TRecHandler, p_OrderList : RsbRdPm)
+  var rgd : TRecHandler = p_rgd,
+      OrderList : RsbRdPm = p_OrderList;
+
+  // Переменные для обмена данными между транзакционной функцией и вызывающим кодом.
+  // Нужны, т.к. ProcessTrn не передает параметры в транзакционную функцию
+  private var
+    TrnRejectReason : string = "",
+    TrnOrder : TRecHandler = TRecHandler("wlrdpm.dbt");
+
+  // этот метод нельзя сделать приватным, т.к. не сработает R2M
+  macro RejectDecision_trnfunc
+    // проверка конкурентных изменений
+    var tbf_rgd : TbFile = TbFile("wlregdec", "w");
+    tbf_rgd.rec.DecisionID = rgd.rec.DecisionID;
+    if( not tbf_rgd.GetEQ() or not IsEqualRecHandler(rgd, tbf_rgd) )
+      MemoryError(70);
+      RunError(GetErrMsg());
+    end;
+
+    if(TrnRejectReason)
+      if( AddNoteForObject(OBJTYPE_DECISION, rgd.rec.DecisionID, NOTEKIND_WLDECISION_ERRDESCRIPTION, TrnRejectReason) != 0 )
+        RunError("Ошибка при вставке примечания \"Описание ошибки\"");
+      end;
+    end;
+
+    if( WldChangeStatus(rgd.rec.DecisionID, OBJTYPE_DECISION, WLD_STATUS_DECISION_DEFECT) != 0 )
+      RunError("Ошибка! Не удалось поместить решение в отвергнутые");
+    end;
+
+    if(TrnRejectReason)
+      InsertWlRepClm( rgd.rec, 0, 0, "", TrnRejectReason );
+    end;
+  end;
+
+  macro RejectDecision(ErrReject : string)
+    Bnk_ToRSTrace("TTrnAction", "RejectDecision", "Begin. ErrReject='" + ErrReject + "'");
+
+    if(ErrReject)
+      msgbox(ErrReject);
+    end;
+    
+    TrnRejectReason = ErrReject;
+    var TrnResult : bool = ProcessTrn( null, R2M(this, "RejectDecision_trnfunc") );
+
+    if(not TrnResult)
+      RunError("Ошибка при помещении решения в отвергнутые");
+    end;
+
+    Bnk_ToRSTrace("TTrnAction", "RejectDecision", "End");
+  end;
+
+  // этот метод нельзя сделать приватным, т.к. не сработает R2M
+  macro ProcessOrder_trnfunc
+    var SaveOrder : TRecHandler = TRecHandler("wlrdpm.dbt");
+    Copy(SaveOrder, TrnOrder);
+
+    if(rgd.rec.Type == WLD_TYPE_REGDEC_APZ)// реш-е об отзыве поручения НО
+      RevokePayment(rgd, TrnOrder, @TrnRejectReason);
+    elif(rgd.rec.Type == WLD_TYPE_REGDEC_APN)// реш-е о приостановлении поручения НО
+      StopPayment(rgd, TrnOrder);
+    elif(rgd.rec.Type == WLD_TYPE_REGDEC_APO)// реш-е об отмене приостановления
+      CancelStopPayment(rgd, TrnOrder);
+    else
+      RunError("Ошибка! Неподдерживаемый тип решения");
+    end;
+
+    if( not IsEqualRecHandler(SaveOrder, TrnOrder) )
+      if( OrderList.Update(TrnOrder) or OrderList.Save() )
+        RunError("Ошибка при сохранении изменений в списке поручений решения ФНС");
+      end;
+    end;
+
+  end;
+
+  macro ProcessOrder(Order : TRecHandler, ErrReject : @string)
+    Bnk_ToRSTrace("TTrnAction", "ProcessOrder", "Begin");
+
+    TrnRejectReason = "";
+    Copy(TrnOrder, Order);
+    var TrnResult : bool = ProcessTrn( null, R2M(this, "ProcessOrder_trnfunc") );
+
+    if(not TrnResult)
+      RunError("Ошибка при обработке инкассового поручения № " + Order.rec.Number + " от " + DDpMMpYYYY(Order.rec.Date));
+    end;
+
+    ErrReject = TrnRejectReason;
+
+    Bnk_ToRSTrace("TTrnAction", "ProcessOrder", "End. ErrReject='" + ErrReject + "'");
+  end;
+
+  // этот метод нельзя сделать приватным, т.к. не сработает R2M
+  macro CloseDecision_trnfunc
+    // проверка конкурентных изменений
+    var tbf_rgd : TbFile = TbFile("wlregdec", "w");
+    tbf_rgd.rec.DecisionID = rgd.rec.DecisionID;
+    if( not tbf_rgd.GetEQ() or not IsEqualRecHandler(rgd, tbf_rgd) )
+      MemoryError(70);
+      RunError(GetErrMsg());
+    end;
+
+    if( WldChangeStatus(rgd.rec.DecisionID, OBJTYPE_DECISION, WLD_STATUS_DECISION_CLOSE) != 0 )
+      RunError("Ошибка! Не удалось поместить решение в обработанные");
+    end;
+  end;
+
+  macro CloseDecision
+    Bnk_ToRSTrace("TTrnAction", "CloseDecision", "Begin");
+
+    var TrnResult : bool = ProcessTrn( null, R2M(this, "CloseDecision_trnfunc") );
+
+    if(not TrnResult)
+      RunError("Ошибка при помещении решения в обработанные");
+    end;
+
+    Bnk_ToRSTrace("TTrnAction", "CloseDecision", "End");
+  end;
+
+  // этот метод нельзя сделать приватным, т.к. не сработает R2M
+  macro GenPB_trnfunc
+    TrnRejectReason = CreateFnsPB(rgd.rec.DecisionID, OrderList);
+    if(TrnRejectReason)
+      AbortTrn();
+    end;
+
+    MarkOrdersAddedToConfirmation(OrderList);
+    if( OrderList.IsChanged() )
+      if( OrderList.Save() != 0 )
+        RunError("Ошибка при сохранении изменений в списке поручений решения рег.органа");
+      end;
+    end;
+
+    CloseDecision_trnfunc();
+  end;
+
+  macro GenPB : string
+    Bnk_ToRSTrace("TTrnAction", "GenPB", "Begin");
+
+    TrnRejectReason = "";
+
+    var TrnResult : bool = ProcessTrn( null, R2M(this, "GenPB_trnfunc") );
+
+    if(not TrnRejectReason and not TrnResult)
+      RunError("Ошибка в транзакции формирования подтверждения");
+    end;
+
+    Bnk_ToRSTrace("TTrnAction", "GenPB", "End. TrnRejectReason='" + TrnRejectReason + "'");
+    return TrnRejectReason;
+  end;
+
+end;
+
+private class TRegDec(p_rgd : TRecHandler)
+  var rgd : TRecHandler = TRecHandler("wlregdec.dbt"); Copy(rgd, p_rgd);
+  var OrderList : RsbRdPm = RsbRdPm(p_rgd.rec.DecisionID);
+
+  private var 
+    Trn : TTrnAction = TTrnAction(rgd, OrderList);
+
+
+  // Дотранзакционные действия: проверки, поиск платежей, диалог с пользователем
+  // Все изменения сохраняются только в объектах в памяти (OrderList, MustReject)
+  macro PreProcess( MustReject : @bool )
+    Bnk_ToRSTrace("TRegDec", "PreProcess", "Begin");
+
+    Check(rgd, OrderList);
+
+    FindPayments(rgd, OrderList);
+
+    ConfirmRgdPaymLinks(rgd, OrderList, @MustReject);
+
+    Bnk_ToRSTrace("TRegDec", "PreProcess", "End. MustReject=" + string(MustReject));
+  end;
+
+  // Сохраняем изменения, внесенные пользователем
+  macro SaveResultsOfUserActions
+  ( MustReject : bool,
+    IsProcFinished : @bool
+  )
+    Bnk_ToRSTrace("TRegDec", "SaveResultsOfUserActions", "Begin");
+
+    if( OrderList.IsChanged() )
+      if( OrderList.Save() != 0 )
+        RunError("Ошибка при сохранении изменений в списке поручений решения рег.органа");
+      end;
+    end;
+
+    if(MustReject)
+      Trn.RejectDecision();
+      IsProcFinished = true;
+    end;
+
+    Bnk_ToRSTrace("TRegDec", "SaveResultsOfUserActions", "End. IsProcFinished=" + string(IsProcFinished));
+  end;
+
+  // Обработка поручений НО
+  macro ProcessOrders(IsProcFinished : @bool)
+    Bnk_ToRSTrace("TRegDec", "ProcessOrders", "Begin");
+
+    var RdpmIDs : TArray = GetRdpmIDsToArray(OrderList);
+
+    var Order : TRecHandler = TRecHandler("wlrdpm.dbt");
+
+    for(var ID : integer, RdpmIDs)
+      // Делаем обход через Find, а не через Next, т.к. у сервиса ввода после вызова Save
+      // слетает позиция, и Next сможет работать только после нового вызова First
+      if( OrderList.Find(ID, Order) != 0 )
+        RunError("Не найдено поручение с идентификатором " + ID + " в списке поручений решения");
+      end;
+
+      Bnk_ToRSTrace("TRegDec", "ProcessOrders", "Wlrdpm: ID=" + Order.rec.ID + ", PaymentID=" + Order.rec.PaymentID + ", State=" + Order.rec.State);
+      if(Order.rec.State == WLD_STATUS_RDPM_CONFIRM)
+        var ErrReject : string = "";
+
+        // По проекту "PRJ_000317_Сообщения в РО. Транспорт ФНС":
+        // Обработка по каждому поручению проходит в своей транзакции
+        Trn.ProcessOrder(Order, @ErrReject);
+
+        if(ErrReject)
+          Trn.RejectDecision(ErrReject);
+          IsProcFinished = true;
+          break;
+        end;
+      end;
+
+    end;
+
+    Bnk_ToRSTrace("TRegDec", "ProcessOrders", "End. IsProcFinished=" + string(IsProcFinished));
+  end;
+
+  // Формирование подтверждения
+  macro GenPB
+    Bnk_ToRSTrace("TRegDec", "GenPB", "Begin");
+
+    var ErrMsg : string = Trn.GenPB();
+
+    if(ErrMsg)
+      Trn.RejectDecision(ErrMsg);
+    end;
+
+    Bnk_ToRSTrace("TRegDec", "GenPB", "End");
+  end;
+
+  macro CloseDecision
+    Trn.CloseDecision();
+  end;
+end;
+
+// Обработка решений APN, APO, APZ
+macro ProcessRegDecision_AP(rgd : TRecHandler)
+  var RegDec;
+  RegDec = TRegDec(rgd);
+
+  var MustReject : bool = false;
+  var IsProcFinished : bool = false;
+
+  if(not IsProcFinished)
+
+    RegDec.PreProcess( @MustReject );
+    RegDec.SaveResultsOfUserActions( MustReject, @IsProcFinished );
+
+  end;
+
+  if(not IsProcFinished)
+    RegDec.ProcessOrders( @IsProcFinished );
+  end;
+
+  if(not IsProcFinished)
+
+    if( NeedGenPB(RegDec.OrderList) )
+      RegDec.GenPB();
+
+    elif( AllOrdersProcessed(RegDec.OrderList) )
+      RegDec.CloseDecision();
+
+    else
+      RunError("Ошибка обработки: в списке остались необработанные поручения");
+    end;
+
+    IsProcFinished = true; // GenPB всегда завершает процедуру (или RejectDecision, или CloseDecision)
+  end;
+
+
+  if(IsProcFinished)
+    OnExitProc(rgd, RegDec.OrderList);
+  end;
+
+OnError(er)
+  var ErrMsg : string = RsbGetErrorEx(er);
+  msgbox(ErrMsg);
+  InsertWlRepClm( rgd.rec, 0, 0, "", ErrMsg );
+
+  if(RegDec)
+    OnExitProc(rgd, RegDec.OrderList);
+  end;
+end;

@@ -1,0 +1,905 @@
+//Макрос расчета суммы процентов по сделке МБК на заданную дату
+
+import BankInter, CurrInter;
+import oralib, likepy, DealInfo, rsexts, DateLib, OprInter, mmcarry,dl_plib;
+var debug = false;
+private const BASIS_360_30  = 1,    
+      BASIS_360_ACT     = 2,
+      BASIS_Act_ACT   = 4,  
+      BASIS_365_ACT = 8,
+      BASIS_360_31  = 1001;
+
+
+
+macro Pfx()
+  if(debug)
+    return "DBT";
+  else
+    return "TMP";
+  end;
+end;
+
+macro DealCode_(DealID)
+  var sql = "select t_DealCode from ddl_tick_dbt where t_DealID = :DealID";
+  sql = ExecSQLSelect(sql, MakeArray(SQLParam(":DealID", DealID)), false);
+  if(sql.MoveNext())
+    return sql.value("t_DealCode");
+  else
+    return "";
+  end;
+end;
+
+private macro GetMaturity(DealID)
+   var sql = "select t_Maturity from ddl_leg_dbt where t_DealID =:DealID";
+   sql = ExecSQLSelect(sql, MakeArray(SQLParam(":DealID", DealID)), false);
+   sql.MoveNext();
+   return Date(sql.value("t_Maturity"));
+end;
+
+//Проверки по сделке
+macro CheckIssueGrafikDeal(DealID, SayError)
+  //сумма платежей по предоставленияю ОД д.б. равна сумме платежей по погашению ОД.
+  var sql = "select count(*) t_cnt from"
+       +" ("
+       +"   select sum(decode(t_purpose, 9, t_amount, 0)) t_p1, sum(decode(t_purpose, 10, t_amount, 0)) t_p2 from"
+       +"   ("
+       +"    select Sum(round(t_Amount,2)) t_Amount, t_purpose from dpmpaym_dbt where t_DocumentID = :DealID and t_DocKind = 102 and t_purpose in (9, 10)"
+       +"    group by t_purpose"
+       +"   )"
+       +" ) where t_p1 = t_p2";
+  sql = ExecSQLSelect(sql, MakeArray(SQLParam("DealID", DealID)), false);
+  if(not sql.MoveNext())
+     if(SayError)
+       MsgBox("Ошибка проверки сумм платежей по следке: "+DealCode_(DealID));
+     end;
+     return false;
+  end;
+  if(not sql.value("t_cnt"))
+     if(SayError)
+       MsgBox("По сделке: "+DealCode_(DealID)+" сумма платежей по Погашению ОД, не совпадает с платежом по Предоставлению средств.");
+     end;
+     return false;
+  end;
+  sql = "select count(*) t_cnt from dpmpaym_dbt p"
+       +" inner join dpmrmprop_dbt r on r.t_PaymentID = p.t_PaymentID"
+       +" where p.t_DocumentID = :DealID and p.t_DocKind = 102 and p.t_purpose in (9, 10, 11) and p.t_Valuedate < r.t_Date";
+  sql = ExecSQLSelect(sql, MakeArray(SQLParam("DealID", DealID)), false);
+  if(not sql.MoveNext())
+     if(SayError)
+        MsgBox("Ошибка проверки дат платежей по следке: "+DealCode_(DealID));
+     end;
+     return false;
+  end;
+  if(sql.value("t_cnt"))
+     if(SayError)
+        MsgBox("По сделке: "+DealCode_(DealID)+" у платежей некорректные даты (dpmrmprop_dbt.t_date > dpmpaym.t_valuedate).");
+     end;
+     return false;
+  end;
+  return true;
+end;
+
+macro IsOverdraftDeal(DealID)
+  var sql = "select count(*) t_cnt from ddl_tick_dbt t where t_DealID = :dealid and t_dealType in (22305, 22300)";
+  sql = ExecSQLSelect(sql, MakeArray(SQLParam("dealid",dealid)), false);
+  return (sql.MoveNext() and sql.value("t_cnt"));
+end;
+
+private macro СтавкаМенялась(DealID)
+  var sql = "select count(*) t_cnt from"
+   +" ("
+   +" select distinct(t_stav) from dstd_pls_dbt where t_id = :1"
+   +" )";
+  sql = ExecSQLSelect(sql, MakeArray(SQLParam("1", DealID)), false);
+  //Если в таблице ставок более одной различной ставки, то считаем, что она менялась
+  if(sql.MoveNext() and (sql.value("t_cnt") > 1))
+    return true;
+  else
+    return false;
+  end;
+end;
+
+private macro БазисИзменялся(DealID)
+  var sql = "select count(*) t_cnt from"
+   +" ("
+   +" select distinct(t_basis) from hbuser_basis_dbt where t_id = :1"
+   +" )";
+  sql = ExecSQLSelect(sql, MakeArray(SQLParam("1", DealID)), false);
+  //Если в таблице ставок более одной различной ставки, то считаем, что она менялась
+  if(sql.MoveNext() and (sql.value("t_cnt") > 1))
+    return true;
+  else
+    return false;
+  end;
+end;
+
+macro CalcProcentSum(DealID, CalcDate, SayError, ShowInExcel, GenerateTable)
+  var ExcelApplication, ExcelDoc, ExcelOpen = false, Sheet, i = 1, j = 1;
+  var BDate, EDate, EndPeriodDate, Summa = $0, AllSumma = $0, FixProcent = 0, Basis, IsFloatProcent;
+  var sql, cmd, upd;
+  var СходимостьПроцентовКОбщейФормуле = false, notetext = "", MDate = GetMaturity(DealID), СходимостьПринудительно = false;
+
+  private macro CloseExcel()
+    if(ExcelOpen)
+       ExcelApplication.DisplayAlerts = false;
+       ExcelDoc.Close();
+       ExcelApplication.Quit();
+       ExcelApplication = null;
+    end;
+  end;
+
+  private macro Error(Text)
+    if(SayError)
+      MsgBox(Text);
+    end;
+    CloseExcel();
+  end;
+
+  private macro ExcelError(err, SaveDoc:bool)
+
+     if (ValType(SaveDoc) != V_BOOL)
+        SaveDoc = false;
+     end;
+
+     if (ExcelApplication != null)
+         ExcelApplication.Visible = true;
+         ExcelApplication.DisplayAlerts = SaveDoc;
+         ExcelApplication.Quit;
+         ExcelApplication = null;
+     end;
+
+     MsgBoxEx("ОШИБКА: "+ Substr(err.Message, 7)+" Расчет процентов по сделке - "+DealCode_(DealID)+" на дату:"+CalcDate);
+     println(err.Message, ", строка:", err.Line, " в модуле ", err.Module);
+     println(err.AxMes);
+
+     return;
+  end;
+
+  private macro DaysBetweenFromBasis(dt1, dt2, basis)
+      if(basis == BASIS_360_30)
+        return NDays30(dt1, dt2) + 1;
+      else
+        return dt2 - dt1;
+      end;
+  end;
+
+  private macro GetDaysInBasis(basis, EDate)
+      if(basis == BASIS_360_30)
+        return 360;
+      elif(basis == BASIS_360_ACT)
+        return 360;
+      elif(basis == BASIS_Act_ACT)
+        return ПолучитьКолВоДнейВГоду(EDate);
+      elif(basis == BASIS_365_ACT)
+        return 365;
+      elif(basis == BASIS_360_31)
+        return 360;
+      end;
+  end;
+
+  private macro AddStringInExcel(BDate, EDate, Cost, Procent, Sum, basis, flag)
+    Sheet.Cells(i, 1).Value = flag;
+    Sheet.Cells(i, 2).Value = BDate;
+    Sheet.Cells(i, 3).Value = EDate;
+    if((VALTYPE(BDate) == V_DATE) and (VALTYPE(EDate) == V_DATE))
+      Sheet.Cells(i, 4).Value = DaysBetweenFromBasis(BDate, EDate, basis);
+    else
+      Sheet.Cells(i, 4).Value = "";
+    end;
+    Sheet.Cells(i, 5).Value = Cost;
+    Sheet.Cells(i, 6).Value = Procent;
+    Sheet.Cells(i, 7).Value = GetDaysInBasis(basis, EDate);
+    Sheet.Cells(i, 9).Value = Sum;
+    i = i + 1;
+  end;
+
+  private macro ProcentCount(DealID)
+    var sql = "select count(*) t_cnt from dstd_pls_dbt where t_ID = :DealID";
+    sql = ExecSQLSelect(sql, MakeArray(SQLParam("DealID", DealID)), false);
+    if(sql.MoveNext())
+      return int(sql.value("t_cnt"));
+    end;
+  end;
+
+
+  private macro BasisCount(DealID)
+     var sql = "select t_basis from ddl_leg_dbt where t_DealID =:DealID";
+     sql = ExecSQLSelect(sql, MakeArray(SQLParam(":DealID", DealID)), false);
+     sql.MoveNext();
+     return sql.value("t_basis");
+  end;
+
+
+
+  private macro GetBasis(DealID)
+     var sql = "select t_basis from ddl_leg_dbt where t_DealID =:DealID";
+     sql = ExecSQLSelect(sql, MakeArray(SQLParam(":DealID", DealID)), false);
+     sql.MoveNext();
+     return sql.value("t_basis");
+  end;
+
+  macro АгрегироватьДанныеПоПериодам(DealID, EDate, CalcEndDate)
+     var sql;
+     //Подготовка периодов расчета во временной таблице выполнена, переходим к расчетам
+     //В отдельной таблице агрегируем периоды расчета по неизменяющимся ставке, ОД и базису расчетов
+     sql = "insert into HBUSER_CALCULATE_"+Pfx()
+     +"  select * from"
+     +"   ("
+     +"       select a.t_DealID, a.t_BDate, lead(t_BDate, 1, :EDate) over (order by t_EDate) t_EDate, t_Procent, t_Cost, t_Basis from"
+     +"       ("
+     +"        select h.*,"
+     +"        lag (t_procent, 1, t_procent) over (partition by t_procent order by t_EDate) lg_procent,"
+     +"        lag (t_cost, 1, t_cost) over (partition by t_cost order by t_EDate) lg_cost,"
+     +"        lag (t_basis, 1, t_basis) over (partition by t_basis order by t_EDate) lg_basis, "
+     +"        lag (t_edate, 1) over (partition by t_procent, t_cost, t_basis order by t_EDate) lg_Edate "
+     +"        from HBUSER_PERIODCALC_"+Pfx()+" h where t_DealID = :DealID order by h.t_EDate"
+     +"       ) a where lg_procent is null or lg_cost is null or lg_basis is null or lg_Edate is null or t_EDate <> lg_Edate+1"
+     +"   ) d where (:CalcDate1 > t_EDate or :CalcDate2 between t_BDate+1 and t_EDate)"
+     +"   order by t_EDate";
+//     sql = "insert into HBUSER_CALCULATE_TMP"
+//          +" select * from"
+//          +"  ("
+//          +"      select a.t_DealID, a.t_BDate, lead(t_BDate, 1, :EDate) over (order by t_EDate) t_EDate, t_Procent, t_Cost, t_Basis from"
+//          +"      ("
+//          +"       select h.*,"
+//          +"       lag (t_procent, 1, t_procent) over (partition by t_procent order by t_EDate) lg_procent,"
+//          +"       lag (t_cost, 1, t_cost) over (partition by t_cost order by t_EDate) lg_cost,"
+//          +"       lag (t_edate, 1) over (partition by t_procent, t_cost order by t_EDate) lg_Edate "
+//          +"       from HBUSER_PERIODCALC_TMP h where t_DealID = :DealID order by h.t_EDate"
+//          +"      ) a where lg_procent is null or lg_cost is null or lg_Edate is null or t_EDate <> lg_Edate+1"
+//          +"  ) d where (:CalcDate1 > t_EDate or :CalcDate2 between t_BDate+1 and t_EDate) "
+//          +"  order by t_EDate";
+     sql = ExecSQL(sql, MakeArray(
+                                  SQLParam("EDate",     EDate), 
+                                  SQLParam("DealID",    DealID), 
+                                  SQLParam("CalcDate1", CalcEndDate), 
+                                  SQLParam("CalcDate2", CalcEndDate)
+                                 ), false);
+     if(sql == null)
+        Error("Ошибка записи агрегированных данных для расчета во временную таблицу расчетных периодов.");
+        return false;
+     end;
+     return true;
+  end;
+
+  private macro ОчисткаДанных(Таблица)
+     var sql = "delete "+Таблица;
+     sql = ExecSQL(sql, null, false);
+     if(sql == null)
+        Error("Ошибка удаления данных из временной таблицы "+Таблица);
+        return false;
+     end;
+     return true;
+  end;
+
+  private macro ПереносДанных(ТаблицаИсточник, ТаблицаПриемник)
+     var sql = "insert into "+ТаблицаПриемник+" select * from "+ТаблицаИсточник;
+     if(not ОчисткаДанных(ТаблицаПриемник))
+       return false;
+     end;
+     sql = ExecSQL(sql, null, false);
+     if(sql == null)
+        Error("Ошибка переноса данных из временной таблицы "+ТаблицаПриемник+" в таблицу "+ТаблицаИсточник);
+        return false;
+     end;
+     if(not ОчисткаДанных(ТаблицаИсточник))
+       return false;
+     end;
+     return true;
+  end;
+
+
+  //Начало макроса
+  if(SayError == null)
+     SayError = false;
+  end;
+
+  if(ShowInExcel == null)
+     ShowInExcel = false;
+  end;
+
+  if(GenerateTable == null)
+     GenerateTable = true;
+  end;
+
+  if(ShowInExcel)
+     ExcelApplication = CreateObject ("rsax", "TRsAxServer", null, IsStandAlone()).CreateComObject ("Excel.Application");
+     ExcelDoc = ExcelApplication.Workbooks.Add();
+     if(ExcelDoc != null)
+        ExcelOpen = true;
+     else
+        Error("Ошибка создания протокола расчета в EXCEL.");
+        return $0;
+     end;
+     Sheet = ExcelDoc.Sheets(1);
+     Sheet.Cells(i, j).Value   = "Расчет процентов по сделке: "+DealCode_(DealID);
+     i = i + 1;
+     Sheet.Cells(i, j).Value   = "Дата расчета:";
+     j = j + 1;
+     Sheet.Cells(i, j).Value   = CalcDate;
+     i = i + 2;
+  end;
+
+  //Для сделок овердрафта график погашения не заполнен, для них пересчет, либо расчет процентов не этой процедурой
+  if(IsOverdraftDeal(DealID))
+     Error("Для сделок офердрафта расчет процентов на дату не производится.");
+     return $0;
+  end;
+
+  private macro ПодготовкаТаблицыПериодовДляРасчета(ДополнятьПериодамиПогашенияПроцентов)
+     var CalcEndDate;
+     //Для сделки подготавливается таблица расчетов HB_USER_CALC_TMP на дату завершения сделки
+     //Дата начала и конца расчета
+     sql = "select t_basis, t_start, t_Maturity, t_TypePercent, t_price, t_point, t_Flag5, t_RejectDate from ddl_leg_dbt l inner join ddl_tick_dbt t on t.t_DealID = l.t_DealID where l.t_DealID =:DealID";
+
+     sql = ExecSQLSelect(sql, MakeArray(SQLParam(":DealID", DealID)), false);
+     if(sql.MoveNext())
+       BDate = Date(sql.value("t_start"));
+       if(sql.value("t_flag5") == "X")
+         EDate = Date(sql.value("t_RejectDate"));
+       else
+         EDate = Date(sql.value("t_Maturity"));
+       end;
+       CalcEndDate = EDate;
+       //int(sql.value("t_TypePercent")); //0 - обычная процентная ставка, 1 - плавающая процентная ставка
+       //Проверим кол-во записей в таблице проц ставок, если 1 и меньше считаем как для фиксированной ставки
+       //Если более 1-й считаем как для плавающей ставки, т.е. ставку берем из dstd_pls_dbt
+//       if(ProcentCount(DealID) > 1)
+//         IsFloatProcent = true;
+//       else
+//         IsFloatProcent = false;
+//       end;
+       Basis = GetBasis(DealID);
+       //Поле процент нужно только для фиксированной ставки
+//       if(not IsFloatProcent)
+          FixProcent = double(sql.value("t_price"))/pow(10, int(sql.value("t_point")));
+          if(FixProcent == 0)
+             Error("Для сделки: "+DealCode_(DealID)+" с фиксированной ставкой, указана ставка в % = 0");
+             return false;
+          end;
+//       end;
+       if(CalcDate > EDate)
+          Error("Для сделки: "+DealCode_(DealID)+" дата расчета процентов:"+CalcDate+" указана большая, чем дата погашения сделки:"+string(EDate:f));
+          return false;
+       end;
+     else
+       Error("Ошибка поиска условий по сделке, таблица dl_leg_dbt.");
+       return false;
+     end;
+     //Очистка временной таблицы периодов
+     sql = "begin delete HBUSER_PERIODCALC_"+Pfx()+"; delete HBUSER_CALCULATE_"+Pfx()+"; end;";
+     sql = ExecSQL(sql, null, false);
+     if(sql == null)
+       Error("Ошибка очистки временной таблицы периодов расчета процентов.");
+       return false;
+     end;
+     if(not CheckIssueGrafikDeal(DealID, SayError)) //проверки по сделке, кривые сделки дальше в расчет не пойдут
+       CloseExcel();
+       return false;
+     end;
+//     if(IsFloatProcent)
+        //Наполнение таблицы периодов расчетов для процентной ставки
+        //В таблицу записываем разбивку всего периода кредита на периоды = 1 день
+        sql = "insert into HBUSER_PERIODCALC_"+Pfx()+" (t_DealID, T_BDATE, T_EDATE, T_PROCENT, T_COST, t_Basis) "
+             +"select :DealID, :BDate1 + rownum - 1, :BDate2 + rownum, 0, 0, -1 from all_objects where rownum <= :EDate - :BDate3";
+        sql = ExecSQL(sql, MakeArray(
+
+                                     SQLParam(":DealID", DealID),
+                                     SQLParam(":BDate1", BDate ),
+                                     SQLParam(":BDate2", BDate ),
+                                     SQLParam(":EDate",  EDate ),
+                                     SQLParam(":BDate3", BDate )
+                                    ), false);
+        if(sql == null)
+          Error("Ошибка наполнения данными о периодах расчета, временной таблицы периодов расчета процентов.");
+          return false;
+        end;
+        //заносим во временную таблицу информацию об основном долге
+        sql = "update HBUSER_PERIODCALC_"+Pfx()+" h set h.t_COST = "
+             +" ("
+             +"     select d.t_ost from"
+             +"     ("
+             +"         select a.t_ValueDate t_date, a.t_eDate, od - sum(t_Amount) over (order by t_ValueDate) t_Ost from "
+             +"         ("
+             +"            select p.t_PaymentID, rownum t_rownum, r.t_Date, p.t_ValueDate, "
+             +"            LEAD(p.t_ValueDate, 1) over (order by p.t_purpose asc, p.t_ValueDate asc) t_Edate, "
+             +"            first_value(p.t_amount) over (order by t_purpose asc ) OD, "
+             +"            decode(t_purpose, 9, 0, round(p.t_Amount, 2)) t_Amount "
+             +"            from dpmpaym_dbt p  "
+             +"            inner join dpmrmprop_dbt r on r.t_PaymentID = p.t_PaymentID"
+             +"            where p.t_Dockind = 102 and p.t_DocumentID =:DealID and p.t_purpose in (9, 10) "
+             +"            order by p.t_purpose asc, p.t_ValueDate asc"
+             +"         ) a"
+             +"     ) d"
+             +"     where d.t_Ost != 0 and h.t_EDATE between d.t_Date+1 and d.t_eDate"
+             +" )";
+        sql = ExecSQL(sql, MakeArray(SQLParam(":DealID", DealID)), false);
+        if(sql == null)
+          Error("Ошибка наполнения данными об остатке основного долга, временной таблицы периодов расчета процентов.");
+          return false;
+        end;
+        if(ProcentCount(DealID)) //Есть записи в таблице проц ставок, берем ставки из неё, это учитывает в том числе доп. соглашения.
+           //заносим во временную таблицу информацию о плавающей процентной ставке
+           sql = "update HBUSER_PERIODCALC_"+Pfx()+" h set t_procent="
+           +" ("
+           +"     select t_stav from"
+           +"     ("
+           +"     select t_dizm, t_stav/1000000 t_stav,"
+           +"     lead(t_dizm-1, 1, :EDate) over (order by t_DIZM) ld_dizm"
+           +"     from dstd_pls_dbt s "
+           +"     where s.t_ID = :DealID"
+           +"     ) a "
+           +"     where h.t_EDate between a.t_dizm and a.ld_dizm"
+           +" ) where h.t_DealID = :DealID1";
+           sql = ExecSQL(sql, MakeArray(SQLParam(":EDate", EDate), SQLParam(":DealID", DealID), SQLParam(":DealID1", DealID)), false);
+        else
+           sql = "update HBUSER_PERIODCALC_"+Pfx()+" h set t_procent=:Procent where t_DealID = :DealID";
+           sql = ExecSQL(sql, MakeArray(SQLParam("procent", FixProcent), SQLParam("DealID", DealID)), false);
+        end;
+        //Проверка обновилась ли таблица
+        if(sql == null)
+          Error("Ошибка наполнения данными о плавающей процентной ставке, временной таблицы периодов расчета процентов.");
+          return false;
+        end;
+        if(BasisCount(DealID)) //Есть записи в таблице изменения базисов процентных ставок
+           sql = "update HBUSER_PERIODCALC_"+Pfx()+" h set t_basis ="
+           +"  ("
+           +"      select t_basis from"
+           +"      ("
+           +"         select t_Basis, t_Dizm t_StartDate, lead(t_dizm-1, 1, :EDate) over (order by t_Dizm) t_StopDate "
+           +"         from HBUSER_BASIS_DBT where t_Id = :DealID"
+           +"      ) a "
+           +"      where h.t_EDate between a.t_StartDate and a.t_StopDate"
+           +"  ) where h.t_DealID = :DealID1";
+           sql = ExecSQL(sql, MakeArray(SQLParam(":EDate", EDate), SQLParam(":DealID", DealID), SQLParam(":DealID1", DealID)), false);
+        end;
+        //Для сделок обычных без изменения Базиса, и для старых сделок, у которых изменение не с начала периода
+        sql = "update HBUSER_PERIODCALC_"+Pfx()+" h set t_basis=:Basis where t_DealID = :DealID and (t_basis is null or t_basis = -1)";
+        sql = ExecSQL(sql, MakeArray(SQLParam("Basis", GetBasis(DealID)), SQLParam("DealID", DealID)), false);
+
+        //Проверка обновилась ли таблица
+        if(sql == null)
+          Error("Ошибка наполнения данными о базисе сделки, временной таблицы периодов расчета процентов.");
+          return false;
+        end;
+        /*
+        //Для доп. соглашений, если таблица не заполнена полностью, дозаполним её, хвост таблицы о плав. ставке
+        sql = "update HBUSER_PERIODCALC_TMP h set t_procent="
+        +" ("
+        +"     select t_procent from"
+        +"     ("
+        +"      select t_procent, row_Number() over (order by t_EDate desc) rn "
+        +"      from HBUSER_PERIODCALC_TMP where t_procent is not null order by t_EDate desc"
+        +"     ) where rn = 1 "
+        +" ) where t_procent is null";
+        sql = ExecSQL(sql, null, false);
+        if(sql == null)
+          Error("Ошибка наполнения данными о плавающей процентной ставке, временной таблицы периодов расчета процентов.");
+          return false;
+        end;
+        */
+
+//     else
+//        //Наполнение таблицы периодов расчетов для фиксированной процентной ставки
+//        sql = "INSERT INTO HBUSER_PERIODCALC_TMP (t_DealID, T_BDATE, T_EDATE, T_PROCENT, T_COST)"
+//             +" select * from"
+//             +" ("
+//             +"     select :DealID, t_date, a.t_eDate, :procent t_procent, od - sum(t_Amount) over (order by t_ValueDate) t_Ost, -1 t_Basis from "
+//             +"     ("
+//             +"        select p.t_PaymentID, rownum t_rownum, r.t_Date, p.t_ValueDate, "
+//             +"        LEAD(r.t_Date, 1) over (order by p.t_purpose asc, r.t_Date asc) t_Edate, "
+//             +"        first_value(p.t_amount) over (order by t_purpose asc ) OD, "
+//             +"        decode(t_purpose, 9, 0, round(p.t_Amount, 2)) t_Amount "
+//             +"        from dpmpaym_dbt p  "
+//             +"        inner join dpmrmprop_dbt r on r.t_PaymentID = p.t_PaymentID"
+//             +"        where p.t_Dockind = 102 and p.t_DocumentID =:DealID and p.t_purpose in (9, 10) "
+//             +"        order by p.t_purpose asc, r.t_Date asc"
+//             +"     ) a "
+//             +" ) d where d.t_ost != 0";
+//        sql = ExecSQL(sql, MakeArray(SQLParam(":DealID", DealID), SQLParam(":Procent", Procent)), false);
+//        if(sql == null)
+//          Error("Ошибка наполнения данными о периодах расчета, временной таблицы периодов расчета процентов.");
+//          return false;
+//        end;
+     if(not АгрегироватьДанныеПоПериодам(DealID, EDate, CalcEndDate))
+        return false;
+     end;
+
+     if(ДополнятьПериодамиПогашенияПроцентов)
+        //Таблицу расчетных периодов дозаполним периодами погашения процентов.
+        sql = "select r.t_Date from dpmpaym_dbt p"
+             +" inner join dpmrmprop_dbt r on r.t_PaymentID = p.t_PaymentID"
+             +" where p.t_DocumentID = :DealID and p.t_DocKind = 102 and p.t_purpose = 11 and r.t_Date <= :CalcDate and r.t_Date not in"
+             +" (select t_EDate from HBUSER_CALCULATE_"+Pfx()+" h where h.t_Edate = r.t_Date)";
+  
+      sql = ExecSQLSelect(sql, MakeArray(SQLParam(":DealID", DealID), SQLParam("CalcDate", CalcEndDate)), false);
+        while(sql.MoveNext()) //Если есть дата погашения процентов которая не попадает на границы периода необходимо период разбить на два в таблице
+          cmd = "select * from HBUSER_CALCULATE_"+Pfx()+" h where :dt between h.T_BDATE+1 and h.T_EDATE and h.t_DealID = :DealID";
+          cmd = ExecSQLSelect(cmd, MakeArray(SQLParam(":dt", Date(sql.value("t_Date"))), SQLParam("DealID", DealID)), false);
+          if(not cmd.MoveNext())
+             Error("Ошибка поиска периода расчета включающего дату погашения процентов: "+Date(sql.value("t_date"))+" Для сделки: "+DealCode_(DealID));
+             return false;
+
+          end;
+          upd = " begin"
+               +" update HBUSER_CALCULATE_"+Pfx()+" h set t_EDate = :dt1 where :dt2 between h.T_BDATE+1 and h.T_EDATE and t_DealID = :DealID1;"
+               +" INSERT INTO HBUSER_CALCULATE_"+Pfx()+" "
+               +" select t_DealID, :dt3, :OldEDate, t_Procent, t_Cost, t_Basis from HBUSER_CALCULATE_"+Pfx()+" h where :dt4 = h.T_EDATE and t_DealID = :DealID2;"
+               +" end;";
+          upd = ExecSQL(upd, MakeArray(
+                                        SQLParam(":dt1",       Date(sql.value("t_Date"))),
+                                        SQLParam(":dt2",       Date(sql.value("t_Date"))),
+                                        SQLParam(":DealID1",   DealID),
+                                        SQLParam(":dt3",       Date(sql.value("t_Date"))),
+                                        SQLParam(":OldEDate",  Date(cmd.value("t_EDate"))),
+                                        SQLParam(":dt4",       Date(sql.value("t_Date"))),
+                                        SQLParam(":DealID2",   DealID)
+                                      ), false);
+          if(upd == null)
+             Error("Ошибка вставки во временную таблицу, периода расчета включающего дату погашения процентов: "+Date(sql.value("t_date"))+" Для сделки: "+DealCode_(DealID));
+             return false;
+          end;
+        end;
+     end;
+     /*
+     //Таблицу расчетных периодов дозаполним периодами изменения базисов.
+     sql = "select count(*) over () t_cnt, t_dizm t_BDate, lead(t_dizm-1, 1, :EDate) over (partition by t_ID order by t_DIZM) t_EBasisDate, t_basis from HBUSER_BASIS_DBT a where t_ID = :DealID";
+     sql = ExecSQLSelect(sql, MakeArray(SQLParam(":EDate", EDate), SQLParam(":DealID", DealID)), false);
+     if(sql.MoveNext() and (sql.value("t_cnt") > 1))
+       sql = 
+
+       cmd = "select * from HBUSER_CALCULATE_TMP h where :dt between h.T_BDATE+1 and h.T_EDATE and h.t_DealID = :DealID";
+       cmd = ExecSQLSelect(cmd, MakeArray(SQLParam(":dt", Date(sql.value("t_EBasisDate"))), SQLParam("DealID", DealID)), false);
+       if(not cmd.MoveNext())
+          Error("Ошибка поиска периода расчета включающего дату окончания действия базиса: "+Date(sql.value("t_EBasisDate"))+" Для сделки: "+DealCode_(DealID));
+          return false;
+       end;
+       upd = " begin"
+            +" update HBUSER_CALCULATE_TMP h set t_EDate = :dt1 where :dt2 between h.T_BDATE+1 and h.T_EDATE and t_DealID = :DealID1;"
+            +" INSERT INTO HBUSER_CALCULATE_TMP  "
+            +" select t_DealID, :dt3, :OldEDate, t_Procent, t_Cost, t_Basis from HBUSER_CALCULATE_TMP h where :dt4 = h.T_EDATE and t_DealID = :DealID2;"
+            +" end;";
+       upd = ExecSQL(upd, MakeArray(
+                                     SQLParam(":dt1",       Date(sql.value("t_Date"))),
+                                     SQLParam(":dt2",       Date(sql.value("t_Date"))),
+                                     SQLParam(":DealID1",   DealID),
+                                     SQLParam(":dt3",       Date(sql.value("t_Date"))),
+                                     SQLParam(":OldEDate",  Date(cmd.value("t_EDate"))),
+                                     SQLParam(":dt4",       Date(sql.value("t_Date"))),
+                                     SQLParam(":DealID2",   DealID)
+                                   ), false);
+       if(upd == null)
+          Error("Ошибка вставки во временную таблицу, периода расчета включающего дату погашения процентов: "+Date(sql.value("t_date"))+" Для сделки: "+DealCode_(DealID));
+          return false;
+       end;
+     else
+       //смены базисов не обнаружено, обновим таблицу базисом из сделки
+       upd = "update HBUSER_CALCULATE_DBT set t_basis = :Basis where t_DealID = :DealID";
+       upd = ExecSQL(upd, MakeArray(SQLParam("basis", GetBasis(DealID)), SQLParam("DealID", DealID)), false);
+       if(upd == null)
+          MsgBox("Ошибка установки базиса по сделке");
+       end;
+     end;
+     */
+
+     return true;
+  end;
+  //Если в табличе расчетов нет информации по данной сделке, перегенерим таблицу расчетов
+  if(not GenerateTable)
+     sql = "select * from HBUSER_CALCULATE_"+Pfx()+" h where t_DealID = :DealID order by t_EDate";
+     sql = ExecSQLSelect(sql, MakeArray(SQLParam(":DealID", DealID)), false);
+     if(not sql.MoveNext())
+       GenerateTable = true;
+     else
+       Basis = GetBasis(DealID);
+     end;
+  end;
+
+  //Если проц. ставка и базис по сделке не изменялись и расчет проводится за дату погашения сделки, то необходимо обеспечить сходимость
+  // общей суммы процентов по сделке
+//  if(not СтавкаМенялась(DealID) and not БазисИзменялся(DealID) and (CalcDate == EDate))
+  if(CalcDate == MDate)
+    СходимостьПроцентовКОбщейФормуле = true;
+  end;  
+
+  if(СходимостьПроцентовКОбщейФормуле)
+    if(ShowInExcel)
+      if(debug)
+        if(GetTrue(false, "Запуск в режиме обеспечения сходимости"))
+          СходимостьПроцентовКОбщейФормуле = true;
+        else
+          СходимостьПроцентовКОбщейФормуле = false;
+        end;
+      end;
+    end;
+  end;
+
+  if(GenerateTable)
+    if(not ПодготовкаТаблицыПериодовДляРасчета(true)) //возникли ошибки при формировании таблицы расчетов
+      return $0;
+    end;
+  end;
+
+  if(СходимостьПроцентовКОбщейФормуле) 
+    if(not ПодготовкаТаблицыПериодовДляРасчета(false)) //возникли ошибки при формировании таблицы расчетов
+      return $0;
+    end;
+    /*
+    //обеспечим сходимость путем еще одного агрегирования по ставке, од и базису
+    MsgBox("Перенос");
+    if(not ПереносДанных("HBUSER_CALCULATE_"+Pfx(), "HBUSER_PERIODCALC_"+Pfx()))
+      return false;
+    end;
+    MsgBox("Повторное агрегирование");
+    if(not АгрегироватьДанныеПоПериодам(DealID, MDate, MDate))
+       return false;
+    end;
+    */
+  end;
+
+  //Расчет по периодам
+  if(debug)
+    MsgBox("Внимание установлен флаг отладки");
+  end;
+  sql = "select * from HBUSER_CALCULATE_"+Pfx()+" h where t_DealID = :DealID and t_BDate < :CalcDate order by t_EDate";
+  sql = ExecSQLSelect(sql, MakeArray(SQLParam(":DealID", DealID), SQLParam(":CalcDate", CalcDate)), false);
+  while(sql.MoveNext())
+    if(Date(sql.value("t_EDate")) > CalcDate)
+      EndPeriodDate = CalcDate;
+    else
+      EndPeriodDate = Date(sql.value("t_EDate"));
+    end;
+    if(valtype(sql.value("t_cost")) == 26 )
+      println(DealCode_(DealID), "Ошибка в графике платежей t_cost = SpecVal");
+      return $0;
+    end;
+    if(valtype(sql.value("t_procent")) == 26 )
+      println(DealCode_(DealID), "Ошибка в графике платежей t_procent = SpecVal");
+      return $0;
+    end;
+    if(valtype(sql.value("t_Basis")) == 26 )
+      println(DealCode_(DealID), "Ошибка в графике платежей t_Basis = SpecVal");
+      return $0;
+    end;
+    if(valtype(sql.value("t_BDate")) == 26 )
+      println(DealCode_(DealID), "Ошибка в графике платежей t_BDate = SpecVal");
+      return $0;
+    end;
+
+    Summa    = РасчётПроцентнойСтавки(money(sql.value("t_cost")), Date(sql.value("t_BDate")), EndPeriodDate, Double(sql.value("t_procent")), Int(sql.value("t_Basis")));
+    AllSumma = AllSumma + Summa;
+    if(ShowInExcel)
+       if(СходимостьПроцентовКОбщейФормуле and (EndPeriodDate == MDate))
+         notetext = "Корр.";
+       else
+         notetext = "";
+       end;
+       AddStringInExcel(Date(sql.value("t_BDate")), EndPeriodDate, money(sql.value("t_Cost")), Double(sql.value("t_procent")), Summa, Int(sql.value("t_basis")), notetext);
+    end;
+  end;
+  if(ShowInExcel)
+    AddStringInExcel("", "", "", "", AllSumma, "");
+    ExcelApplication.Visible = true;
+  end;
+  if(СходимостьПроцентовКОбщейФормуле)
+    ОчисткаДанных("HBUSER_CALCULATE_"+Pfx());
+  end;
+  return AllSumma;
+//  onError (err)             
+//    ExcelError(err, false);
+//    Exit(1);
+
+end;
+
+macro GetNumInList(PartyID, Dt)
+  var NumInList = 0;
+  var sql = "select t_attrid from dobjatcor_dbt t where t_objecttype=3 and t_groupid=13 and t_object=lpad(:partyid, 10, '0') and t_validfromdate <= :dt order by t_validfromdate desc";
+  sql = ExecSQLSelect(sql, MakeArray(SQLParam("partyid", partyid), SQLParam("dt", Dt)), false);
+  if(sql.MoveNext())
+    NumInList = int(sql.value("t_attrid"));
+  end;
+  return NumInList;
+end;
+
+macro DebetA_(account, BDate, EDate, chapter, fiid)
+ var sql, sum;
+ if(fiid == 0)
+   sql = "select rsb_account.debeta(:account, :chapter, :bdate, :edate) t_sum from dual";
+   sql = ExecSQLSelect(sql, MakeArray(
+                                      SQLParam("account",  account),
+                                      SQLParam("chapter",  chapter),
+                                      SQLParam("bdate",    bdate),
+                                      SQLParam("edate",    edate)
+                                     ), false);
+ else
+   sql = "select rsb_account.debetac(:account, :chapter, :cur, :bdate, :edate) t_sum from dual";
+   sql = ExecSQLSelect(sql, MakeArray(
+                                      SQLParam("account",  account),
+                                      SQLParam("chapter",  chapter),
+                                      SQLParam("cur",      fiid),
+                                      SQLParam("bdate",    bdate),
+                                      SQLParam("edate",    edate)
+                                     ), false);
+ end;
+ if(sql.MoveNext())
+   sum = abs(round(double(sql.value("t_sum")), 2));
+ end;
+ return money(sum);
+end;
+
+macro KreditA_(account, BDate, EDate, chapter, fiid)
+ var sql, sum;
+ if(fiid == 0)
+   sql = "select rsb_account.kredita(:account, :chapter, :bdate, :edate) t_sum from dual";
+   sql = ExecSQLSelect(sql, MakeArray(
+                                      SQLParam("account",  account),
+                                      SQLParam("chapter",  chapter),
+                                      SQLParam("bdate",    bdate),
+                                      SQLParam("edate",    edate)
+                                     ), false);
+ else
+   sql = "select rsb_account.kreditac(:account, :chapter, :cur, :bdate, :edate) t_sum from dual";
+   sql = ExecSQLSelect(sql, MakeArray(
+                                      SQLParam("account",  account),
+                                      SQLParam("chapter",  chapter),
+                                      SQLParam("cur",      fiid),
+                                      SQLParam("bdate",    bdate),
+                                      SQLParam("edate",    edate)
+                                     ), false);
+ end;
+ if(sql.MoveNext())
+   sum = abs(round(double(sql.value("t_sum")), 2));
+ end;
+ return money(sum);
+end;
+
+macro RestA_(account, BDate, chapter, fiid)
+ var sql, sum=$0, r0 = $0;
+ if(fiid == 0)
+   sql = "select rsb_account.resta(:account, :bdate, :chapter, :r0) t_sum from dual";
+   sql = ExecSQLSelect(sql, MakeArray(
+                                      SQLParam("account",  account),
+                                      SQLParam("bdate",    bdate),
+                                      SQLParam("chapter",  chapter),
+                                      SQLParam("r0",       r0)
+                                     ), false);
+ else
+   sql = "select rsb_account.restac(:account, :cur, :bdate, :chapter, :r0) t_sum from dual";
+   sql = ExecSQLSelect(sql, MakeArray(
+                                      SQLParam("account",  account),
+                                      SQLParam("cur",      fiid),
+                                      SQLParam("bdate",    bdate),
+                                      SQLParam("chapter",  chapter),
+                                      SQLParam("r0",       r0)
+                                     ), false);
+ end;
+ if(sql.MoveNext())
+   sum = round(double(sql.value("t_sum")), 2);
+ end;
+ return money(sum);
+end;
+
+macro ДебетовыйОборотПереносаНаБаланс(Account, BDate, EDate, Chapter, Fiid)
+ //Ищем все проводки по дебету у который пользовательский тип документа = P
+ //P = перенос процентов по МБК с внебаланса на баланс.
+ var result = $0, sql, pref = "";
+ if(fiid)
+   pref = "$";
+ end;
+ if((VALTYPE(Account) == V_UNDEF) or (EDate < BDate))
+   return result;
+ end;
+ sql = "SELECT NVL(sum(t_sum), 0) t_sum  FROM dacctrn_dbt"
+ +"     WHERE t_state=1 and t_chapter = :chapter AND t_account_payer = :account AND t_UserTypeDocument = 'P' AND"
+ +"           t_date_carry >= Trunc(:bdate) AND t_date_carry <= TO_DATE( TO_CHAR(:edate,'DD.MM.YYYY') || ' 23:59:59', 'DD.MM.YYYY HH24:MI:SS' )";
+ sql = ExecSQLSelect(sql, MakeArray(
+                                    SQLParam("Chapter", Chapter),
+                                    SQLParam("Account", Account),
+                                    SQLParam("Fiid",    Fiid),
+                                    SQLParam("Bdate",   BDate),
+                                    SQLParam("Edate",   EDate)
+                                   ), false);
+
+ if(sql.MoveNext())
+   result = money(abs(sql.value("t_sum")));
+ end;
+ return result;
+end;
+
+
+macro GetProcentRest(Deal, Leg, RestDate, NumInList, ReturnRest:@money)
+  record AccBuf("account");
+  var СделкаПривлечения = false, Result = true, ProcAccount="", VnebAccount="", ProcOst = $0, VnebOst = $0;
+  var Perenos = $0;
+  ReturnRest = $0;
+/*
+
+  if( isBuy( getOperationGroup( Deal.DealType ) ) )
+     СделкаПривлечения = true;
+  end;
+
+  if(not СделкаПривлечения)
+     VnebAccount = ПРИКРЕПИТЬ2("СЧЕТ_91603", deal.DealID);
+     if( trim(VnebAccount) != "" )
+//       VnebOst = abs(RestA_(VnebAccount, RestDate, 3, leg.pfi));
+       //По внебалансу в ранее начисленные проценты учитываем только остаток, т.к. по внеб счету возможны
+       //многочисленные обороты при многократном изменении кат качества с 1,2,3 на 4,5 и обратно
+//       if(VnebOst != $0) 
+          //Если остаток на внебалансовом счете не равен нулю, значит в сумму начисленных процентов надо взять
+          //дебетовый оборот по внебалансу, минус кредитовый оборот по внебалансу
+          //А если = 0, то внебаланс уже списан, и не должен учитываться в начислении
+          VnebOst = DebetA_(VnebAccount, leg.start+1, RestDate, 3, leg.pfi);
+//       end;
+     end;
+  end;
+
+  ProcAccount = ПРИКРЕПИТЬ2("СЧЕТ_47427", deal.DealID);
+  if(trim(ProcAccount) != "")
+     if(СделкаПривлечения)
+        ProcOst = KreditA_(ProcAccount, leg.start+1, RestDate, 1, leg.pfi);
+     else
+        ProcOst = DebetA_ (ProcAccount, leg.start+1, RestDate, 1, leg.pfi);
+        Perenos = ДебетовыйОборотПереносаНаБаланс(ProcAccount, leg.start+1, RestDate, 1, leg.pfi);
+        ProcOst = abs(ProcOst) - Perenos;
+     end;
+  end;
+  ReturnRest = abs(ProcOst) + abs(VnebOst);
+  ReturnRest = round(ReturnRest, 2);
+*/
+  return Result;
+end;
+
+//сумма процентов суммированием всех платежей из графика погашения %%
+macro GetProcentRestFromGrafik(DealID)
+  var sum = $0;
+  var sql = " select sum(p.t_amount) t_amount from ddl_tick_dbt t "
+           +" inner join dpmpaym_dbt p on p.t_purpose = 11 and p.t_DocumentId = t.t_DealID and p.t_DocKind = t.t_BofficeKind"
+           +" where t.t_DealID = :DealID";
+  sql = ExecSQLSelect(sql, MakeArray(SQLParam("DealID", DealID)), false);
+  if(sql.MoveNext())
+     sum = money(sql.value("t_amount"));
+  end;
+  return sum;
+end;
+
+
+Macro Остаток_руб(as1,as2,as3,as4)
+  private var osrub=0,aos=0;
+
+  aos=RestA_(as1, as2, as3, as4) ;
+
+          if (as4 > 0 )
+               if ( ConvSum(osrub,aos, as2, as4, 0)  != 0 )
+                 msgbox("Ошибка конвертации валюты ", as4 );
+               end;
+
+          else
+            osrub=aos;
+          end;
+
+
+  return osrub;
+end;
+
+macro КредитПоСчетуСделки(DealID, Счет, Cur, BDate, EDate)
+  var sql, pref = "";
+  if(Cur)
+    Pref = "$";
+  end;
+  sql = "select nvl(sum(t_sum), 0) t_kredit from dacctrn_dbt a "
+  +" inner join doproper_dbt o on t_DocKind = 102 and t_DocumentID = lpad(:DealID, 34, '0')"
+  +" inner join doprdocs_dbt d on d.t_id_operation = o.T_ID_OPERATION and d.t_DocKind = 1"
+  +" where a.T_IAPPLICATIONKIND = to_number(substr(d.T_DOCUMENTID, 1, 5)) and a.t_acctrnid = d.t_acctrnid and"
+  +" a.T_ACCOUNT_RECEIVER = :account and (a.T_DATE_CARRY between :BDate and :EDate) and t_UserTypeDocument != 'P'";
+
+
+  sql = ExecSQLSelect(sql, MakeArray(
+                                     SQLParam("DealID",  DealID),
+                                     SQLParam("Account", Счет),
+                                     SQLParam("BDate",   BDate),
+                                     SQLParam("EDate",   EDate)
+                                    ), false);
+  if(sql.MoveNext())
+    return money(sql.value("t_kredit"));
+  end;
+end;

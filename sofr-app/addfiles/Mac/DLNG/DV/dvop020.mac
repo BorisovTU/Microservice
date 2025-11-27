@@ -1,0 +1,1141 @@
+/** 
+ @file  dvop020.mac
+ @brief Операция расчетов на срочном рынке. Шаг "Оплата итоговых сумм"
+
+ Исполнение шага "Оплата итоговых сумм" 
+
+ # tag
+ - functional_block:Лимиты
+ - code_type:BP_Step
+
+ # changeLog 
+ |date       |author         |tasks            |note                            
+ |-----------|---------------|-----------------|--------------------------------------------
+ |2023.09.19 |Швецов  Я. А.  |CCBO-7598        | Добавлены комментарии, отформатирован текст          
+ | ?         |Азарцов В. В.  |?                | Первоначальная реализация                 
+
+*/
+
+import InsCarryDoc, "dvinter.mac","dvserv.mac", "dv_fun.mac", "dv_carop.mac", "dv_comiss.mac", "dvoprmassexec.mac", "dlreport.mac", "dvOperSt.mac";
+import "FuncObj.mac", "execopr_funcobj.mac", "dlutils.mac";
+
+// ID операции и шага. Заполняются для генерирования ошибок в пакетном режиме обработки
+private var ID_Operation = 0;
+private var ID_Step = 0;
+
+private var ErrorStatus  = 1362; //Логическая ошибка при выполнении макроса
+private var ErrorMessage = "";
+
+//TEG
+private var acc_buf1   =  TRecHandler( "account.dbt" );  
+private var acc_buf2   =  TRecHandler( "account.dbt" );  
+
+//Record oper (dvoper) btr write; 
+
+/**
+ @brief Класс массива биржевых проводок
+  Система собирает информацию о проводках по операциям и хранит как массив элементов DSum для исполнения общих проводок урегулирования счетов
+*/
+PRIVATE CLASS (TArray) TDataSum
+  /**
+   @brief Элемент массива биржевых проводок
+  */
+  class DSum( _DebetSum:money, _CreditSum:money, _Currency:integer, _MarketSchemeID:integer, _DocID:integer )
+    var DebetSum = abs(_DebetSum);
+    var CreditSum = abs(_CreditSum);
+    var Currency = _Currency;
+    var MarketSchemeID = _MarketSchemeID;
+    var DocID           = _DocID;
+  end;
+
+  /**
+   @brief Очистка массива
+  */
+  macro ClearArray
+    this.Size = 0;
+  end;
+
+  /**
+   @brief Добавление информации о проводках в массив
+   @param[in] DebetSum        Сумма дебета
+   @param[in] CreditSum       Сумма кредита
+   @param[in] Currency        Валюта расчётов
+   @param[in] MarketSchemeID Схема расчётов с биржей
+   @param[in] DocID           В зависимости от вида учёта - ID операции расчётов или ID сделки 
+  */
+  macro AddData(DebetSum:money, CreditSum:money, Currency:integer, MarketSchemeID:integer, DocID:integer)
+    var Ex:bool = false;
+    var i:integer = 0;
+    while( i < this.Size )
+      if( (this.(i).Currency == Currency) and (this.(i).MarketSchemeID == MarketSchemeID) ) //Суммы проводок группируются по валюте и бирже
+        this.(i).DebetSum = this.(i).DebetSum + abs(DebetSum);
+        this.(i).CreditSum = this.(i).CreditSum + abs(CreditSum);
+        Ex = true;
+        break;
+      end;
+      i = i + 1;
+    end;
+
+    if( Ex == false )
+      this.(this.size) = DSum(DebetSum, CreditSum, Currency, MarketSchemeID, DocID);
+    end;
+  end;
+
+  // сохраняем данные в таблицу. T_Currency != -1 
+  macro SaveToDBT(ID_Operation)
+    var i:integer = 0;
+
+    SQL_Execute("DELETE FROM ddatasum_dbt WHERE T_CURRENCY != -1 AND T_MARKETSCHEMEID != 0 AND T_OPERID = "+ ID_Operation);
+    var cmd = RSDCommand( "INSERT INTO ddatasum_dbt (T_OPERID, T_DEBETSUM, T_CREDITSUM, T_CURRENCY, T_MARKETSCHEMEID, T_DOCID) VALUES (?, ?, ?, ?, ?, ?)");
+    while( i < this.Size )
+      cmd.addParam("", RSDBP_IN, ID_Operation);
+      cmd.addParam("", RSDBP_IN, this.(i).DebetSum);
+      cmd.addParam("", RSDBP_IN, this.(i).CreditSum);
+      cmd.addParam("", RSDBP_IN, this.(i).Currency);
+      cmd.addParam("", RSDBP_IN, this.(i).MarketSchemeID);
+      cmd.addParam("", RSDBP_IN, this.(i).DocID);
+      cmd.execute();
+      i = i + 1;
+    end;
+  end;
+
+  macro ReadFromDBT(ID_Operation)
+    var sumData = RSDRecordset("SELECT T_DEBETSUM, T_CREDITSUM, T_CURRENCY, T_MARKETSCHEMEID, T_DOCID FROM ddatasum_dbt WHERE T_CURRENCY != -1 AND T_OPERID = "+ ID_Operation);
+    this.ClearArray();
+    while( sumData.moveNext() )
+      this.AddData(sumData.value("T_DEBETSUM"), sumData.value("T_CREDITSUM"), sumData.value("T_CURRENCY"), sumData.value("T_MARKETSCHEMEID"), sumData.value("T_DOCID"));
+    end;
+    SQL_Execute("DELETE FROM ddatasum_dbt WHERE T_CURRENCY != -1 AND T_MARKETSCHEMEID != 0 AND T_OPERID = "+ ID_Operation);
+  end;
+
+END;
+private var DataSum = TDataSum();
+
+/**
+ @brief Класс информации о гарантийном обеспечении (ГО)
+ Система собирает информацию о ГО и хранит как массив элементов DSum для исполнения общих проводок возврата ГО по разным площадкам
+ Такой способ формирования используют только для посделочного учёта.
+*/
+PRIVATE CLASS (TArray) TGuarantyDataSum
+  /**
+   @brief Элемент массива информации о ГО
+  */
+  class DSum( _Sum:money, _MarketSchemeID:integer, _DocID:integer )
+    var Sum             = abs(_Sum);
+    var MarketSchemeID = _MarketSchemeID;
+    var DocID           = _DocID;
+  end;
+
+  /**
+   @brief Очистка массива
+  */
+  macro ClearArray
+    this.Size = 0;
+  end;
+
+  /**
+   @brief Занесений информации об операции в файл  */
+  macro InsOperData(ID_Operation, Object_Id);
+    SQL_Execute("DELETE FROM ddatasum_dbt WHERE T_OPERID = "+ ID_Operation);
+    var cmd = RSDCommand( "INSERT INTO ddatasum_dbt (T_OPERID, T_DEBETSUM, T_CREDITSUM, T_CURRENCY, T_MARKETSCHEMEID, T_DOCID, T_OBJECTID) VALUES (?, 0, ?, -1, 0, 0, ?)");
+    cmd.addParam("", RSDBP_IN, ID_Operation); 
+    cmd.addParam("", RSDBP_IN, 5);            //ID_Step - шаг операции, для dvop020 = 5
+    cmd.addParam("", RSDBP_IN, Object_Id );   
+    cmd.execute();
+  end;
+
+  /**
+   @brief Удаление информации об операции из файла  */
+  macro ClearOperData(ID_Operation, Object_Id)
+    SQL_Execute("DELETE FROM ddatasum_dbt WHERE T_OPERID = "+ ID_Operation+" AND T_CURRENCY = -1 AND T_MARKETSCHEMEID = 0 AND T_OBJECTID = "+Object_Id+" AND T_DEBETSUM = 0 AND T_CREDITSUM != 0" );
+  end;
+
+  /**
+   @brief Добавление информации о ГО в массив
+   @param[in] Sum             Сумма ГО
+   @param[in] MarketSchemeID Схема расчётов с биржей
+   @param[in] DocID           ID сделки 
+  */
+  macro AddData(Sum:money, MarketSchemeID:integer, DocID:integer)
+    var Ex:bool = false;
+    var i:integer = 0;
+    while( i < this.Size )
+      if( this.(i).MarketSchemeID == MarketSchemeID ) //Суммы ГО группируются по бирже
+        this.(i).Sum = this.(i).Sum + abs(Sum);
+        Ex = true;
+        break;
+      end;
+      i = i + 1;
+    end;
+
+    if( Ex == false )
+       this.(this.size) = DSum(Sum, MarketSchemeID, DocID);
+    end;
+  end;
+
+  // сохраняем данные в таблицу. T_CREDITSUM = 0, T_Currency = -1 
+  macro SaveToDBT(ID_Operation)
+    var i:integer = 0;
+
+    SQL_Execute("DELETE FROM ddatasum_dbt WHERE T_CURRENCY = -1 AND T_MARKETSCHEMEID != 0 AND T_DEBETSUM = 0 AND T_OPERID = "+ ID_Operation);
+    var cmd = RSDCommand( "INSERT INTO ddatasum_dbt (T_OPERID, T_DEBETSUM, T_CREDITSUM, T_CURRENCY, T_MARKETSCHEMEID, T_DOCID) VALUES (?, ?, 0, -1, ?, ?)");
+    while( i < this.Size )
+      cmd.addParam("", RSDBP_IN, ID_Operation);
+      cmd.addParam("", RSDBP_IN, this.(i).Sum);
+      cmd.addParam("", RSDBP_IN, this.(i).MarketSchemeID);
+      cmd.addParam("", RSDBP_IN, this.(i).DocID);
+      cmd.execute();
+      i = i + 1;
+    end;
+    this.Size = 0;
+  end;
+
+  macro ReadFromDBT(ID_Operation)
+    var sumData = RSDRecordset("SELECT T_DEBETSUM, T_CREDITSUM, T_CURRENCY, T_MARKETSCHEMEID, T_DOCID FROM ddatasum_dbt WHERE T_CURRENCY = -1 AND T_OPERID = "+ ID_Operation);
+    this.ClearArray();
+    while( sumData.moveNext() )
+      this.AddData(sumData.value("T_DEBETSUM"), sumData.value("T_MARKETSCHEMEID"), sumData.value("T_DOCID"));
+    end;
+    SQL_Execute("DELETE FROM ddatasum_dbt WHERE T_CURRENCY = -1 AND T_MARKETSCHEMEID != 0 AND T_DEBETSUM = 0 AND T_OPERID = "+ ID_Operation);
+  end;
+
+END;
+private var GuarantyDataSum = TGuarantyDataSum();
+
+/**
+ @brief Формирование проводок списания сумм по итогам торгов
+ @param[in] FD_Oper Первичный документ операции расчётов
+ @param[in] doc     Переменная doc для формирования проводок
+ @return            Флаг формирования проводок (0 - сформированы без ошибок, 1 - с ошибками)
+
+ Формируются только для расчётов с биржей (PartyKind == PTK_MARKETPLASE) 
+*/
+PRIVATE MACRO ВозвратСредств( FD_Oper, doc ):integer
+  var i:integer = 0;
+  if(УчетБиржевыхКонтрактов() == DV_ACCEXCONTR_DEAL)
+    if( FD_Oper.DVOper.rec.PartyKind == PTK_MARKETPLASE )
+      var FD_Deal:DVFirstDocDeal; 
+      var _docid;
+
+      while( i < DataSum.Size )
+        if(valtype(DataSum[i].DocID) != v_undef)
+          _docid = DataSum[i].DocID ;
+        else
+          return 0;
+        end;
+
+        FD_Deal = DVFirstDocDeal(DL_DVDEAL, DataSum[i].DocID);
+        if(FD_Oper.DVOper.rec.Flag1 == ALG_SP_MONEY_SOURCE_OWN)
+          if( ВыполнитьПроводкуВозвратаСредств(FD_Deal, FD_Oper, doc, DataSum[i]) == false )
+            RemProgress();
+            return 1;
+          end;
+        else
+          if( ВыполнитьПроводкуВозвратаСредств_CLIENT(FD_Deal, FD_Oper, doc, DataSum[i]) == false )
+            RemProgress();
+            return 1;
+          end;
+        end;
+        i = i + 1
+      end;
+    end;
+  else
+    if( FD_Oper.DVOper.rec.PartyKind == PTK_MARKETPLASE )
+      while( i < DataSum.Size )
+        if(FD_Oper.DVOper.rec.Flag1 == ALG_SP_MONEY_SOURCE_OWN)
+          if( ВыполнитьПроводкуВозвратаСредств(FD_Oper, FD_Oper, doc, DataSum[i]) == false )
+            RemProgress();
+            return 1;
+          end;
+        else
+          if( ВыполнитьПроводкуВозвратаСредств_CLIENT(FD_Oper, FD_Oper, doc, DataSum[i]) == false )
+            RemProgress();
+            return 1;
+          end;
+        end;
+        i = i + 1
+      end;
+    end;
+  end;
+
+  return 0;
+END;
+
+/**
+ @brief Формирование проводок урегулирования парных счетов
+ @param[in] FD_Oper Первичный документ операции расчётов
+ @param[in] doc     Переменная doc для формирования проводок
+ @return            Флаг формирования проводок (0 - сформированы без ошибок, 1 - с ошибками)
+
+ Формируются только для расчётов с биржей (PartyKind == PTK_MARKETPLASE) 
+*/
+MACRO УрегулирПарнБирж( FD_Oper, doc ):integer
+  var FD_Deal:DVFirstDocDeal; 
+  var i:integer = 0;
+  var _docid;
+
+  if(УчетБиржевыхКонтрактов() == DV_ACCEXCONTR_DEAL)
+    if( FD_Oper.DVOper.rec.PartyKind == PTK_MARKETPLASE )
+      while( i < DataSum.Size )
+        if(valtype(DataSum[i].DocID) != v_undef)
+          _docid = DataSum[i].DocID ;
+        else
+          return 0;
+        end;
+
+        FD_Deal = DVFirstDocDeal(DL_DVDEAL, DataSum[i].DocID);
+           
+        if( ВыполнитьПроводкуУрегулирПарнБирж(FD_Deal, FD_Oper, doc, DataSum[i]) == false )
+          RemProgress();
+          return 1;
+        end;
+        i = i + 1;       
+      end;
+    end;
+  else
+    if( FD_Oper.DVOper.rec.PartyKind == PTK_MARKETPLASE )
+      while( i < DataSum.Size )
+        if( ВыполнитьПроводкуУрегулирПарнБирж(FD_Oper, FD_Oper, doc, DataSum[i]) == false )
+          RemProgress();
+          return 1;
+        end;
+        i = i + 1;
+      end;
+    end;
+  end; 
+  return 0;
+END;
+
+/**
+ @brief  Принудительное завершение пакетного шага
+ @return Флаг выхода из пакетного шага (0 - ошибки записаны напрямую в БД, шаг должен быть завершён штатно).
+*/
+private macro ExitStep()
+   GL_DvUseCachingAccounts(false);
+
+   var QueryErr = "UPDATE doprtemp_tmp SET t_errorstatus = ?, t_errormessage = ? where t_errorstatus = 0 and t_SkipDocument = 0 and t_id_operation = ? and t_id_step = ?";
+   var cmdErr = RSDCommand(QueryErr);
+
+   ErrorMessage = IIF(ErrorMessage == "", DVOP_GetCarryError(), ErrorMessage);
+   cmdErr.addParam( "", RSDBP_IN, ErrorStatus ); 
+   cmdErr.addParam( "", RSDBP_IN, ErrorMessage ); 
+   cmdErr.addParam( "", RSDBP_IN, ID_Operation ); 
+   cmdErr.addParam( "", RSDBP_IN, ID_Step );  
+   cmdErr.NullConversion = true;
+   cmdErr.Execute();
+
+   accDvdealTrnArr.size = 0;
+   return 0;    
+end;
+
+/**
+ @brief  Подготовка к выполнению пакетного шага
+ @return Флаг подготовки испонения шага (0 - подготовка данных прошла без ошибок или ошибка была записана напрямую в БД, 1 - подготовка завершена с ошибками)
+
+ Здесь производится основная часть расчётов и формируются данные для проводок
+*/
+macro PrepMassExecuteStep()
+  //TEG 20.03.2019 Сквозной идеей всей доработки ниже это сделать обработку опционов такой же как и фьючерсов
+  var doc;
+  var FI = TRecHandler( "fininstr.dbt");
+  var turn:variant;
+  var FD_Oper:DVFirstDocOper, FD_Pos:DVFirstDocPos, FD_Deal:DVFirstDocDeal;
+  var Query:string = "", Data:variant;
+  var PaydMargin:money = $0, ReceivedMargin:money = $0, Margin:money = $0, PrevFairValue:money = $0;
+  var v_Netto:money = $0;
+  var DataSet, cmd, mainCmd, mainDataSet;
+  var Bonus:money = 0, SumTax = $0, ST = $0;
+  var q, ds;
+  var stat = 0, recs;
+  var prevClient      = -1;
+  var prevClientContr = 0; 
+  var prevFIID        = -1;
+  var prevParentFI    = -1;
+  var FD; 
+  var ReturnObj = FuncObjResult(FUNCOBJ_RESULT_OK, "", 0);
+     
+  //Для пакетного исполнения шагов информацию о них берём из таблицы doprtemp
+  Query =   " SELECT to_number(oper.t_DocumentID) DocID, oprtemp.t_ID_Operation, oprtemp.t_ID_Step " +
+            "   FROM doprtemp_view oprtemp, doproper_dbt oper " +
+            "    WHERE oper.t_ID_Operation = oprtemp.t_ID_Operation " + 
+            "      AND oprtemp.t_DocKind = " + DL_DVOPER;      
+  cmd = DL_RSDCommand(Query); 
+  DataSet = cmd.Execute();  
+  if(DataSet.moveNext())
+    ID_Operation = DataSet.ID_Operation;
+    ID_Step = DataSet.ID_Step;
+    oper.id = DataSet.DocID;
+    getEq(oper);
+  else                   
+    return ExitStep();   
+  end;
+
+  SQL_Execute("DELETE FROM dacctrn_add_dbt WHERE T_OPERID="+ID_Operation+" AND T_STEP="+ID_Step );                  
+
+  DL_MassOprDocsBegin();
+  accDvdealTrnArr.size = 0;
+
+  FD_Oper = DVFirstDocOper( DL_DVOPER, oper );
+  GL_DvUseCachingAccounts(true);
+
+  /**
+   @brief Формирование ошибок проводки
+
+   @param[in] error Текст ошибки
+   @return    Флаг выхода из пакетного шага (1 - шаг должен быть завершён с ошибкой).
+  */                
+  macro SayCarryError( error )
+    msgbox( error );
+    RemProgress();
+    GL_DvUseCachingAccounts(false);
+    return 1;
+  end;
+
+  var MinCountFuncobj:integer = 0;
+  GetRegistryValue("SECUR\\MIN_COUNT_FOR_FUNCOBJ_CURMARKET", V_INTEGER, MinCountFuncobj);
+  BegAction(1000, "Учёт по сделке");
+
+  var dvoperLock = UniConcurrentLocker("dvoperfuncobjlock", 60);
+
+  if( УчетБиржевыхКонтрактов() == DV_ACCEXCONTR_DEAL )// Учёт по сделке
+    /* Для собственных сделок */    
+    Query = " SELECT DEAL.t_ID, DEAL.t_Code, FIN.T_AvoirKind AvoirKind, "+
+            "  TO_CHAR( TURN.t_FairValue )||';'||TO_CHAR( TURN.t_Margin )||';'||TO_CHAR( TURN.t_Guaranty)||';'||TO_CHAR( TURN.t_Execution )||';'||ASCII(TURN.t_FairValueCalc)||';'||"+ 
+              "TO_CHAR( nvl((select turn.t_Margin from ddvdlturn_dbt turn where DEAL.t_id = turn.t_dealid AND"+ DLTurnByOperationDate(oper, true) +" ),0) )||';'||" +  //MarginCategory
+              "nvl((select FACEFIN.T_FI_KIND from dfininstr_dbt FACEFIN where FACEFIN.t_FIID = FIN.T_FACEVALUEFI ),0)||';'||" + //BaseFiKind
+              "ASCII( DEAL.t_Type )||';'||'"+ID_Operation+"'||';'||'"+oper.id+"' as StrParam "+ //DealType + ID_Operation + DataSet.DocID
+            "   FROM ddvdeal_dbt DEAL, ddvdlturn_dbt TURN, dfininstr_dbt FIN " +
+            "  WHERE " + DLTurnByOperationDate(oper) +
+            "    AND DEAL.t_Type in('B', 'S', 'D', 'G','E') " +
+            IIF( (FD_OPER.DVOPER.rec.Flag1 != 1),  "    AND DEAL.T_DATE_CLR = " + GetSQLDate(Oper.Date) , "" ) + 
+            "    AND FIN.t_FIID = DEAL.T_FIID " +
+            "    ORDER BY AvoirKind " ;
+    mainCmd = DL_RSDCommand(Query);
+  
+    toRsTrace("!!! PrepMassExecuteStep begin"); // отладка!!!
+    //MinCountFuncobj = 0;    // ОТЛАДКА!!! для однозадачного режима установить переменную = 0
+
+    recs = mainCmd.GetCount();  //606 сделок
+    if( recs > 0 )
+      if( (MinCountFuncobj == 0) or (MinCountFuncobj > recs) ) //делаем в один поток
+        Data = mainCmd.execute();    
+        while( Data.MoveNext() )
+          ReturnObj = ExecOprCalcExch(Data.AvoirKind, Data.ID, Data.StrParam);
+          if(ReturnObj.state == FUNCOBJ_RESULT_ERROR)
+            EndAction();
+            return ExitStep();
+          end;
+        end; //while( Data.MoveNext() )
+        FD_Deal = DVFirstDocDeal(DL_DVDEAL, Data.ID);
+      else
+        GuarantyDataSum.InsOperData(ID_Operation, oper.id);   //Заносим информацию об операции в файл
+        dvoperLock.Lock();
+        //Раздаем задачи для funcObj
+        var sqlFunkobj = 
+              " DECLARE "
+            + "   v_FuncobjID dfuncobj_dbt.t_ID%TYPE; "   
+            + " BEGIN "
+            + "   DELETE FROM ddl_funcobjbuf_tmp; "         
+            + "   FOR c IN(" + Query + ") LOOP "    
+            + "       INSERT INTO dfuncobj_dbt (t_ObjectType, t_ObjectID, t_FuncID, t_Param, t_Priority, t_Oper) "
+            + "         VALUES (c.AvoirKind, c.t_ID, 5800, c.StrParam, 60, ?) "
+            + "           RETURNING t_ID INTO v_FuncobjID; "
+            + "       INSERT INTO ddl_funcobjbuf_tmp (t_ID, t_ObjectID, t_ObjectCode) VALUES (v_FuncobjID, c.t_ID, c.t_Code); "
+            + "   END LOOP; "
+            + " END; ";
+        cmd = RSDCommand(sqlFunkobj);
+        cmd.addParam("", RSDBP_IN, {oper});
+        cmd.execute();
+        
+        Data = RSDRecordset("SELECT t_ObjectID as ID FROM ddl_funcobjbuf_tmp WHERE t_ID=(SELECT max(t_ID) FROM ddl_funcobjbuf_tmp);");
+        if(Data.moveNext())
+          FD_Deal = DVFirstDocDeal(DL_DVDEAL, Data.value("ID"));
+        end;
+
+        var isNotFinished:bool = true;
+        var i:integer = 0;
+        var MAX_FUNCOBJ_ITERATION; //Максимальное кол-во итераций по проверке
+        var SLEEP_TIME_MS = 10000; //Время в мс, которое выжидаем, прежде чем снова проверять результаты выполнения задач - 10 секунд    
+        var MIN_EXEC_COUNT = 3; //Минимальное количество повторных выполнений каждой из ошибочных записей, прежде чем выводить по ним отчёт 
+
+        MAX_FUNCOBJ_ITERATION = 10 + 4 * recs; //По минуте на сделку + время на запуск funcobj
+        while( isNotFinished and (i < MAX_FUNCOBJ_ITERATION) )
+          RslWait(SLEEP_TIME_MS); 
+          cmd = DL_RSDCommand("SELECT count(1) cnt " + //Ищем записи, которые еще обрабатываются
+                              "  FROM ddl_funcobjbuf_tmp t, dfuncobj_dbt funcobj " +
+                              " WHERE funcobj.t_ID = t.t_ID " +
+                              "   AND NOT (funcobj.t_State = "+FUNCOBJ_STATE_REPEAT_ERROR+" AND funcobj.t_ExecCount >= "+MIN_EXEC_COUNT+") " +
+                              "   AND funcobj.t_State NOT IN(  "+FUNCOBJ_STATE_FATAL_ERROR+ ", "+FUNCOBJ_STATE_MAX_REPEAT+" ) " /*300809*/ );
+          ds = cmd.Execute();
+          if( (not ds.MoveNext()) or (int(ds.cnt) == 0) )
+            isNotFinished = false;
+          end;
+          i = i + 1;
+        end;
+
+        if( isNotFinished )
+          //Остановим все задачи, еще не завершившие выполнение
+          cmd = RSDCommand("UPDATE dfuncobj_dbt " + 
+                            "   SET t_State = "+FUNCOBJ_STATE_MAX_REPEAT+", " +
+                            "       t_ErrorText = case when t_ErrorText is null then 'Превышено время ожидания funcobj!' else t_ErrorText end "
+                            " WHERE t_ID IN (SELECT t_ID FROM ddl_funcobjbuf_tmp)" );
+          cmd.Execute();
+        else
+          //Остановим очередные итерации для ошибочных записей, сменив их статус
+          cmd = RSDCommand("UPDATE dfuncobj_dbt " + 
+                            "   SET t_State = "+FUNCOBJ_STATE_MAX_REPEAT +
+                            " WHERE t_State IN ( "+FUNCOBJ_STATE_REPEAT_ERROR+","+FUNCOBJ_STATE_FATAL_ERROR+")"+ /*300809*/
+                            "   AND t_ID IN (SELECT t_ID FROM ddl_funcobjbuf_tmp)" );
+          cmd.Execute();
+        end;
+
+        //Формируем протокол
+        cmd = DL_RSDCommand("SELECT t.t_ObjectID, NVL(funcobj.t_ErrorCode, 0) t_ErrorCode, NVL(funcobj.t_ErrorText, chr(1)) t_ErrorText " + 
+                            "  FROM ddl_funcobjbuf_tmp t, dfuncobj_dbt funcobj " +
+                            " WHERE funcobj.t_ID = t.t_ID " +
+                            "   AND funcobj.t_State IN ("+FUNCOBJ_STATE_FATAL_ERROR +","+FUNCOBJ_STATE_REPEAT_ERROR+","+FUNCOBJ_STATE_MAX_REPEAT+" )" /*300809*/
+                          );
+        ds = cmd.Execute();
+        while( ds.MoveNext() )
+          EndAction();
+          ErrorMessage = "Не удалось выполнить шаг 'Обработка расчетов с биржей по клиентам'.\n Ошибка при обработке сделки ID = "+ string(ds.ObjectID) + ": " 
+                            + IIF(ds.ErrorCode > 0, " Код ошибки "+string(ds.ErrorCode)+", ", "") + ds.ErrorText;
+          return ExitStep(); 
+        end;
+      end;   // funcObj 
+      EndAction();
+      
+      GuarantyDataSum.ReadFromDBT(ID_Operation);  //прочитаем накопленную сумму
+      DataSum.ReadFromDBT(ID_Operation);          //прочитаем накопленную сумму
+      dvoperLock.Unlock();
+      GuarantyDataSum.ClearOperData(ID_Operation, oper.id);   //Удаление информации об операции из файла
+
+      //TEG учтем вармаржу по позиции по ранее открытым позициям(только для срочного рынка) и только клиентские
+      if ((1==1) and (FD_OPER.DVOPER.rec.operkind==12600) and (FD_OPER.DVOPER.rec.Flag1!=1))
+        var AvoirKind = DERIVATIVE_FUTURES, Client,ClientContr,SumFIID ,Sum ,
+            DGround="",Ground = "",OperDate  = oper.Date,
+            OperCode  = oper.Code,PartyKind = oper.PartyKind, BrokerContr:integer,
+            AccNumber:string = "", AccBuff = null, AnotherAccBuff = null, BrokerAccount= null, ClientAccount= null;
+        var ContrNum, ContrDate;
+
+        Query =  " select p.t_id ID, p.t_client client, p.t_clientcontr clientcontr ,f.t_marginday Margin from ddvfiturn_dbt f, ddvfipos_dbt p " +
+                  "  where f.t_client= p.t_client and f.t_broker= p.t_broker and f.t_fiid=p.t_fiid and f.t_clientcontr= p.t_clientcontr  " +
+                  "    and f.t_client>0  and f.t_date= ?  ";        
+        cmd = DL_RSDCommand(Query);   
+        cmd.AddParam(oper.Date); 
+        Data  = cmd.Execute();    //160
+
+        InitProgress( 20, "Выполнение проводок по утренней вармарже", "Выполнение..." );
+        while( Data.MoveNext() )// teg аналог функции ВыполнитьПроводкиПоЗачислениям 
+          FD_Pos = DVFirstDocPos( DL_DVFIPOS, Data.ID );
+          Client = Data.Client; 
+          ClientContr = Data.ClientContr;
+          SumFIID = FD_Pos.FI.rec.ParentFI; 
+          Sum = Data.Margin; 
+          if (not Get_DvContrCode(data.clientcontr, @ContrNum, @ContrDate))
+            ContrNum ="N/A";
+            ContrDate = date(0,0,0);
+          end;
+          DGround=Get_FinameDVFUN(FD_pos.V_FI.rec.Fiid)+" по Дог. N" + ContrNum+" от "+String(ContrDate)+".";
+          /*получим счета брокера и/или клиента*/
+          if( PartyKind == PTK_BROKER ) /* расчеты с брокером */
+            BrokerContr = oper.PartyContr;
+            if( BrokerContr >  0 )
+              /*счет брокера получаем из договора с брокером*/
+              if( (AccNumber = ПолучитьСчетИзДоговора( BrokerContr, SumFIID, true )) != "" )
+                if( DV_GetAccount( 1, SumFIID, AccNumber, acc_buf1 ) == true )
+                  BrokerAccount = acc_buf1;
+                end;
+              else
+                return ExitStep(ReturnObj, "Не найден счет брокера в валюте  " + ПолучитьКодФинИн(SumFIID, null, FICK_ISOSTRING ));
+              end;
+            end;
+          end;
+
+          if( Client > -1 )
+            if( ClientContr > 0 )
+              /*счет клиента получаем из договора с клиентом*/
+              if( (AccNumber = ПолучитьСчетИзДоговора( ClientContr, SumFIID, true )) != "" )
+                if( DV_GetAccount( 1, SumFIID, AccNumber, acc_buf2 ) == true )
+                  ClientAccount = acc_buf2;
+                end;
+              else
+                return ExitStep(ReturnObj, "Не найден счет клиента " + Client +" в валюте  " + ПолучитьКодФинИн(SumFIID, null, FICK_ISOSTRING ));
+              end;
+            end;
+          end;
+
+          if( Sum < $0 )
+            Ground = ОснованиеПроводкиПИ(DV_GRNUM_OUTMARGIN); 
+            Ground = Ground + " по контракту " + DGround;
+            if( PartyKind == PTK_MARKETPLASE )
+              if( not ПроводкаПоКатегориямУчета( FD_OPER,
+                                                  ClientAccount, "+Биржа", 
+                                                  OperDate, 1, 
+                                                  SumFIID, Abs(Sum), 
+                                                  doc,
+                                                  INPCARRY, "",
+                                                  "",//OperCode,
+                                                  Ground,
+                                                  null,null,null,
+                                                  0,0,
+                                                  null,null,
+                                                  null,null,null,null,null,null, 
+                                                  null,MC_PAIRACCMODE_AUTO//MANUAL
+                                                ) 
+                )                                 
+                return ExitStep();
+              end;
+            elif( PartyKind == PTK_BROKER )
+              if( not ПроводкаПоКатегориямУчета( FD_OPER,
+                                                  ClientAccount, BrokerAccount, 
+                                                  OperDate, 1, 
+                                                  SumFIID, Abs(Sum), 
+                                                  doc,
+                                                  INPCARRY, "",
+                                                  "",//OperCode,
+                                                  Ground,
+                                                  null,null,null,
+                                                  0,0
+                                                ) 
+                )
+                return ExitStep();
+              end; 
+            end;
+          elif( Sum > $0 )
+            Ground = ОснованиеПроводкиПИ(DV_GRNUM_ADDMARGIN);
+            Ground = Ground + " по контракту " + DGround;
+            if( PartyKind == PTK_BROKER )          
+              if( not ПроводкаПоКатегориямУчета( FD_OPER,
+                                                  BrokerAccount, "+Форвард, РПИ", 
+                                                  OperDate, 1, 
+                                                  SumFIID, Abs(Sum), 
+                                                  doc,
+                                                  INPCARRY, "",
+                                                  "",//OperCode,
+                                                  Ground,
+                                                  null,null,null,
+                                                  0,0,
+                                                  null,null,
+                                                  null,null,null,null,null,null, 
+                                                  null,null/* MC_PAIRACCMODE_MANUAL*/
+                                                ) 
+                )
+                  return ExitStep();
+              end;
+            elif( PartyKind == PTK_MARKETPLASE )
+              if( not ПроводкаПоКатегориямУчета( FD_OPER,
+                                                  "+Биржа", ClientAccount, 
+                                                  OperDate, 1, 
+                                                  SumFIID, Abs(Sum), 
+                                                  doc,
+                                                  INPCARRY, "",
+                                                  "",//OperCode,
+                                                  Ground,
+                                                  null,null,null,
+                                                  0,0,
+                                                  null,null,
+                                                  null,null,null,null,null,null, 
+                                                  /*MC_PAIRACCMODE_MANUAL*/MC_PAIRACCMODE_AUTO,null
+                                                ) 
+                )
+                return ExitStep();
+              end;
+            elif( PartyKind == PTK_BROKER )
+              if( not ПроводкаПоКатегориямУчета( FD_OPER,
+                                                  BrokerAccount,ClientAccount, 
+                                                  OperDate, 1, 
+                                                  SumFIID, Abs(Sum), 
+                                                  doc,
+                                                  INPCARRY, "",
+                                                  "",//OperCode,
+                                                  Ground,
+                                                  null,null,null,
+                                                  0,0
+                                                ) 
+                )
+                return ExitStep();
+              end;
+            end;
+          end; 
+          if( PartyKind == PTK_MARKETPLASE )
+            if( Sum < $0 )
+              DataSum.AddData(0, abs(Sum), SumFIID, FD_Deal.Deal.rec.MarketSchemeID, FD_Deal.Deal.rec.id);
+            elif( Sum > $0 )
+              DataSum.AddData(abs(Sum), 0, SumFIID, FD_Deal.Deal.rec.MarketSchemeID, FD_Deal.Deal.rec.id);
+            end
+          end;    
+        end;
+      end;  
+    end;
+  else // Учёт по позиции if( recs > 0 )
+    /* Выполнить проводки по оплате комиссий бирже/брокеру. Проводки Г */
+    /* с опционами */
+    if( ПроводкиПоОплатеКомиссийБиржеБрокеру(oper, doc, FD_Oper, DERIVATIVE_OPTION) != 0 )
+      return ExitStep();
+    end;
+    /* с фьючерсами */
+    if( ПроводкиПоОплатеКомиссийБиржеБрокеру(oper, doc, FD_Oper, DERIVATIVE_FUTURES) != 0 )
+      return ExitStep();
+    end;
+
+    /* Выполнить проводки по учету доходов/расходов по премиям (по опционам). Проводки Д */
+    Query = " SELECT POS.* " +
+            "   FROM ddvfipos_dbt POS " +
+            "  WHERE POS.t_Client = -1 " +
+            "    AND (select t.t_AvoirKind from dfininstr_dbt t where t.t_fiid = POS.t_FIID) = " + string(DERIVATIVE_OPTION) +
+            "    AND " + PositionByOperationDateEx(oper, true);
+    Data  = TRsbDataSet(Query);
+    if( Data )
+      while( Data.MoveNext() )
+        FD_Pos = DVFirstDocPos( DL_DVFIPOS, Data.ID );
+        if( ПолучитьИтогиПоПозицииНаДатуОперации( FD_Pos.DVPos.rec, oper, @turn, true ) == true )
+          if( (FD_Pos != null) AND (ВыполнитьПроводкиПоДоходам( doc, FD_Pos, oper, DERIVATIVE_OPTION,
+                                                                FD_Pos.FI.rec.ParentFI, turn.PaidBonus, turn.ReceivedBonus ) == false)
+            )
+            return ExitStep();
+          end;
+        end;
+      end; 
+    end;
+
+    /* Первоначальный учет и переоценка СС. Проводки Ш */
+    Query = " SELECT TURN.T_PAIDBONUS, TURN.T_RECEIVEDBONUS, TURN.T_FAIRVALUE, POS.T_ID, FIN.T_PARENTFI, FIN.T_AVOIRKIND " +
+            "   FROM ddvfiturn_dbt TURN, ddvfipos_dbt POS, dfininstr_dbt FIN " +
+            "  WHERE POS.t_Client <= 0 " +
+            "    AND FIN.T_FIID = TURN.T_FIID " +
+            "    AND TURN.t_FairValueCalc = 'X' AND " +
+                     TurnByPosition(null,null,"POS") + " AND " +
+                     TurnByOperation (oper);
+
+    Data = TRsbDataSet(Query);
+    if( Data )
+      while( Data.MoveNext() )
+        FD_Pos = DVFirstDocPos( DL_DVFIPOS, Data.ID );
+
+        cmd = DL_RsdCommand( " SELECT TURN.t_FairValue " +
+                             "   FROM ddvfiturn_dbt TURN " +
+                             "  WHERE " + TurnByPosition(FD_Pos.DVPos.rec, null, null) +
+                             "    AND TURN.T_DATE < ? " + 
+                             "    AND TURN.t_FairValueCalc = 'X' " +
+                             "  ORDER BY TURN.T_DATE DESC " );
+        cmd.AddParam(oper.Date);
+        DataSet = cmd.execute();
+
+        if( DataSet.MoveNext() )
+          PrevFairValue = money(DataSet.FairValue);
+        else
+          PrevFairValue = $0;
+        end;
+
+        if( ВыполнитьПроводкиПереоценкиСС( doc, FD_Pos, oper, Data.AvoirKind, Data.ParentFI,
+                                           money(Data.PaidBonus), money(Data.ReceivedBonus),
+                                           PrevFairValue, money(Data.FairValue)
+                                         ) == false
+          )
+          return ExitStep();
+        end;
+      end;
+    end;
+
+    /* Выполнить проводки по учету доходов/расходов по вар. марже (по фьючерсам). Проводки Ж */
+    Query = " SELECT POS.* " +
+            "   FROM ddvfipos_dbt POS " +
+            "  WHERE POS.t_Client = -1 " +
+            "    AND (select t.t_AvoirKind from dfininstr_dbt t where t.t_fiid = POS.t_FIID) = " + string(DERIVATIVE_FUTURES) +
+            "    AND " + PositionByOperationDateF( oper, true/*настройку не смотрим, всегда за дату операции*/ );
+       
+    Data  = TRsbDataSet(Query);
+    if( Data )
+      while( Data.MoveNext() )
+        FD_Pos = DVFirstDocPos( DL_DVFIPOS, Data.ID );
+        if( ПолучитьИтогиПоПозицииНаДатуОперацииF( FD_Pos.DVPos.rec, oper, @turn, true/*настройку не смотрим, всегда за дату операции*/ ) == true )
+          PaydMargin = ReceivedMargin = $0;
+          if( turn.Margin < $0 )
+            PaydMargin = turn.Margin;
+          elif( turn.Margin > $0 )   
+            ReceivedMargin = turn.Margin;               
+          end;
+
+          if( (FD_Pos != null) AND (ВыполнитьПроводкиПоДоходам( doc, FD_Pos, oper, DERIVATIVE_FUTURES,
+                                                                FD_Pos.FI.rec.ParentFI, PaydMargin, ReceivedMargin ) == false )
+            )
+            return ExitStep();
+          end;
+        end;
+      end;
+    end;
+
+    /* Выполнить проводки по зачислению/списанию премий (по опционам). Проводки З */
+    Query = "SELECT FIN.T_PARENTFI BonusFIID, sum(TURN.T_RECEIVEDBONUS) BonusIn, sum(-TURN.T_PAIDBONUS) BonusOut " + 
+            "  FROM ddvfipos_dbt POS, ddvfiturn_dbt TURN, dfininstr_dbt FIN " +
+            " WHERE " + PositionByOperationDateEx( oper, true ) +
+            "   AND " + TurnByPosition() + " AND " + TurnByDateEx( oper, true ) +
+            "   AND (select t.t_AvoirKind from dfininstr_dbt t where t.t_fiid = POS.t_FIID) = " + string(DERIVATIVE_OPTION) +
+            "   AND FIN.T_FIID = TURN.T_FIID " +
+            "   AND POS.T_CLIENT <= 0 " +
+            " GROUP BY FIN.T_PARENTFI ";
+    Data = TRsbDataSet(Query);      
+    if( Data )           
+      while( Data.MoveNext() )
+        if( ВыполнитьПроводкиПоЗачислениям( doc, FD_Oper, oper, DERIVATIVE_OPTION,
+                                            -1, -1, Data.BonusFIID, Data.BonusIn, DataSum
+                                          ) == false 
+          )
+          return ExitStep();
+        end;
+
+        if( ВыполнитьПроводкиПоЗачислениям( doc, FD_Oper, oper, DERIVATIVE_OPTION,
+                                            -1, -1, Data.BonusFIID, Data.BonusOut, DataSum
+                                          ) == false 
+          )
+          return ExitStep();
+        end;
+      end;
+    end;
+
+    Query = "SELECT POS.T_CLIENT Client, POS.T_CLIENTCONTR ClientContr, FIN.T_PARENTFI BonusFIID," +
+            "       sum(TURN.T_RECEIVEDBONUS - TURN.T_PAIDBONUS) Bonus" + 
+            "  FROM ddvfipos_dbt POS, ddvfiturn_dbt TURN, dfininstr_dbt FIN " +
+            " WHERE " + PositionByOperationDateEx( oper, true ) +
+            "   AND " + TurnByPosition() + " AND " + TurnByDateEx( oper, true ) +
+            "   AND (select t.t_AvoirKind from dfininstr_dbt t where t.t_fiid = POS.t_FIID) = " + string(DERIVATIVE_OPTION) +
+            "   AND FIN.t_FIID = TURN.T_FIID " +
+            "   AND POS.T_CLIENT > 0 " +
+            " GROUP BY POS.T_CLIENT, POS.T_CLIENTCONTR, FIN.T_PARENTFI";
+    Data  = TRsbDataSet(Query);      
+    if( Data )           
+      while( Data.MoveNext() )
+        Bonus = Data.Bonus;
+        SumTax = $0;
+        if((Data.Client > 0) and (DL_UseNUTX() == true) and (IsInstNeresForNUTX(Data.Client, oper.Date) == true))
+          q = "SELECT DISTINCT TURN.T_RECEIVEDBONUS ReceivedBonus, TURN.T_ID, TURN.T_FIID " + 
+              "  FROM ddvfipos_dbt POS, ddvfiturn_dbt TURN, dfininstr_dbt FIN " +
+              " WHERE " + PositionByOperationDateEx( oper, true ) +
+              "   AND " + TurnByPosition() + " AND " + TurnByDateEx( oper, true ) +
+              "   AND (select t.t_AvoirKind from dfininstr_dbt t where t.t_fiid = POS.t_FIID) = " + string(DERIVATIVE_OPTION) +
+              "   AND FIN.t_FIID = TURN.T_FIID " +
+              "   AND POS.T_CLIENT = ? " +
+              "   AND POS.T_CLIENTCONTR = ? " + 
+              "   AND FIN.T_PARENTFI = ? " +
+              "   AND TURN.T_RECEIVEDBONUS > 0 ";
+                    
+          cmd = DL_RSDCommand(q);
+
+          cmd.AddParam(Data.Client);
+          cmd.AddParam(Data.ClientContr);
+          cmd.AddParam(Data.BonusFIID);
+
+          ds = cmd.Execute();
+          while(ds.moveNext())
+            ST = $0;
+            if(CreateClientNUTXObjects(TXOBJ_KIND1040, ds.ID, 
+                                       0, -1, 
+                                       NUTXOBJ_DUETAX1, Data.Client, Data.ClientContr, 
+                                       ds.FIID, oper.Date, ds.ReceivedBonus, Data.BonusFIID, 
+                                       @ST, "Полученая премия") != 0)
+              return ExitStep();
+            else
+              SumTax = SumTax + ST;
+            end;
+          end;
+        end;
+
+        if( ВыполнитьПроводкиПоЗачислениям( doc, FD_Oper, oper, DERIVATIVE_OPTION,
+                                            Data.Client, Data.ClientContr, Data.BonusFIID, Data.Bonus - SumTax, DataSum
+                                          ) == false
+          )
+          return ExitStep();
+        end;
+
+        if(SumTax > 0)
+          if( ВыполнитьПроводкуПоУдержаниюНалога(doc, FD_Oper, oper, DERIVATIVE_OPTION,
+                                                 Data.Client, Data.ClientContr, Data.BonusFIID, SumTax ) == false
+            )
+            return ExitStep();
+          end;
+        end;
+      end;      
+    end;
+
+    /* Выполнить проводки по зачислению/списанию маржи (по фьючерсам). Проводки И */
+    Query = "SELECT POS.T_CLIENT Client, POS.T_CLIENTCONTR ClientContr, FIN.T_FIID FIID, FIN.T_PARENTFI ParentFI, " +
+            "       sum(TURN.T_MARGIN) Margin " +
+            "  FROM ddvfipos_dbt POS, ddvfiturn_dbt TURN, dfininstr_dbt FIN " +
+            " WHERE " + PositionByOperationDateF( oper ) +
+            "   AND " + TurnByPosition() + " AND " + TurnByDateF( oper ) +
+            "   AND (select t.t_AvoirKind from dfininstr_dbt t where t.t_fiid = POS.t_FIID) = " + string(DERIVATIVE_FUTURES) +
+            "   AND FIN.T_FIID = TURN.T_FIID " +
+            " GROUP BY POS.T_CLIENT, POS.T_CLIENTCONTR, FIN.T_FIID, FIN.T_PARENTFI ";
+   
+    Data  = TRsbDataSet(Query);      
+    if( Data )           
+      Margin          = $0;
+      SumTax          = $0;
+      prevClient      = -1;
+      prevClientContr = 0;
+      prevFIID        = -1;
+      prevParentFI    = -1;
+
+      stat = Data.MoveNext(); 
+      while( stat )     
+        Margin = Margin + Data.Margin;
+         
+        if((Data.Margin > 0) and (Data.Client > 0) and (DL_UseNUTX() == true) and (IsInstNeresForNUTX(Data.Client, oper.Date) == true))
+          ST = $0;
+          q = "SELECT DISTINCT TURN.T_MARGIN Margin, TURN.T_ID, TURN.T_FIID " + 
+              "  FROM ddvfipos_dbt POS, ddvfiturn_dbt TURN, dfininstr_dbt FIN " +
+              " WHERE " + PositionByOperationDateEx( oper, true ) +
+              "   AND " + TurnByPosition() + " AND " + TurnByDateEx( oper, true ) +
+              "   AND (select t.t_AvoirKind from dfininstr_dbt t where t.t_fiid = POS.t_FIID) = " + string(DERIVATIVE_OPTION) +
+              "   AND FIN.t_FIID = TURN.T_FIID " +
+              "   AND POS.T_CLIENT = ? " +
+              "   AND POS.T_CLIENTCONTR = ? " + 
+              "   AND FIN.T_PARENTFI = ? " +
+              "   AND TURN.T_MARGIN > 0 ";
+                   
+          cmd = DL_RSDCommand(q);
+
+          cmd.AddParam(Data.Client);
+          cmd.AddParam(Data.ClientContr);
+          cmd.AddParam(Data.ParentFI);
+
+          ds = cmd.Execute();
+              
+          while(ds.moveNext())
+            if(CreateClientNUTXObjects(TXOBJ_KIND1040, ds.ID,
+                                       //TXOBJ_KIND2030, FD_Deal.Deal.rec.ID,
+                                       0, -1,
+                                       NUTXOBJ_DUETAX, Data.Client, Data.ClientContr, 
+                                       ds.FIID, oper.Date, ds.Margin, Data.ParentFI, 
+                                       @ST, "Вариационная маржа") != 0)
+              return ExitStep();
+            else
+              SumTax = SumTax + ST;
+            end;
+          end;
+        end;
+
+        prevClient      = Data.Client;
+        prevClientContr = Data.ClientContr;
+        prevFIID        = Data.FIID;
+        prevParentFI    = Data.ParentFI;
+
+        stat = Data.MoveNext();
+
+        if((stat == 0) or 
+          (prevClient      != Data.Client) or
+          (prevClientContr != Data.ClientContr) or
+          (prevFIID        != Data.FIID) or
+          (prevParentFI    != Data.ParentFI)
+          )
+            
+          Margin = Margin - SumTax;
+          if( ВыполнитьПроводкиПоЗачислениям( doc, FD_Oper, oper, DERIVATIVE_FUTURES,
+                                              prevClient, prevClientContr, prevParentFI, Margin, DataSum
+                                            ) == false
+            )
+            return ExitStep();
+          end;
+
+          if(SumTax > 0)
+            if( ВыполнитьПроводкуПоУдержаниюНалога(doc, FD_Oper, oper, DERIVATIVE_FUTURES,
+                                                   prevClient, prevClientContr, prevParentFI, SumTax ) == false
+              )
+              return ExitStep();
+            end;
+          end;
+
+          Margin = $0;
+          SumTax = $0;
+        end;
+      end;
+    end;
+
+    /* Списание справедливой стоимости. Проводки Ч */
+    var AddWhere:string = "";
+    Query = " SELECT TURN.T_MARGIN, TURN.T_FAIRVALUE, POS.T_ID " +
+            "   FROM ddvfiturn_dbt TURN, ddvfipos_dbt POS " +
+            "  WHERE (TURN.t_LongPosition - TURN.t_ShortPosition = 0) " +
+            "    AND " + TurnByPosition(null, null, "POS") +
+            "    AND " + TurnByOperation(oper) +
+            "    AND POS.t_Client <= 0 "; 
+
+    Data  = TRsbDataSet(Query);
+    if( Data )
+      while( Data.MoveNext() )
+        FD_Pos = DVFirstDocPos( DL_DVFIPOS, Data.ID );
+
+        cmd = DL_RsdCommand( " SELECT * " +
+                             "   FROM ddvfiturn_dbt TURN " +
+                             "  WHERE " + TurnByPosition(FD_Pos.DVPos.rec, null, null) +
+                             "    AND TURN.T_DATE < ? " + 
+                             " ORDER BY TURN.T_DATE DESC "
+                           );
+        cmd.AddParam(oper.Date);
+        DataSet = cmd.execute();
+
+        if( DataSet.MoveNext() )
+          v_Netto = SQL_ConvTypeSum(DataSet.LONGPOSITION) - SQL_ConvTypeSum(DataSet.SHORTPOSITION);
+        else
+          v_Netto = $0;
+        end;
+
+        if( ВыполнитьПроводкиСписанияСС( doc, FD_Pos, oper, SQL_ConvTypeSum(Data.FairValue), v_Netto, SQL_ConvTypeSum(Data.Margin) ) == false )
+          return ExitStep();
+        end;
+      end;
+    end;
+
+    if( oper.Flag1 == ALG_SP_MONEY_SOURCE_TRUST )
+      AddWhere = " AND POS.t_IsTrust = chr(88) ";
+    end;
+
+    /*закрытие без исполнения*/
+    Query = " SELECT TURN.T_MARGIN, TURN.T_FAIRVALUE, POS.T_ID " +
+            "   FROM ddvfiturn_dbt TURN, ddvfipos_dbt POS " +
+            "  WHERE (TURN.t_LongPosition - TURN.t_ShortPosition <> 0) " +
+            "    AND " + TurnByPosition(null, null, "POS") +
+            AddWhere +
+            "    AND POS.t_Client <= 0 " +
+            "    AND TURN.T_FIID IN (SELECT FI.t_FIID FROM dfininstr_dbt FI WHERE fi.t_Avoirkind = 2 AND fi.t_drawingdate = " + GetSQLDate(oper.Date) + ") ";
+
+    Data  = TRsbDataSet(Query);
+    if( Data )
+      while( Data.MoveNext() )
+        FD_Pos = DVFirstDocPos( DL_DVFIPOS, Data.ID );
+
+        cmd = DL_RsdCommand( " SELECT * " +
+                             "   FROM ddvfiturn_dbt TURN " +
+                             "  WHERE " + TurnByPosition(FD_Pos.DVPos.rec, null, null) + 
+                             "    AND TURN.T_DATE < ? " + 
+                             " ORDER BY TURN.T_DATE DESC "
+                           );
+        cmd.AddParam(oper.Date);
+        DataSet = cmd.execute();
+
+        if( DataSet.MoveNext() )
+          v_Netto = SQL_ConvTypeSum(DataSet.LONGPOSITION) - SQL_ConvTypeSum(DataSet.SHORTPOSITION);
+        else
+          v_Netto = $0;
+        end;
+
+        if( ВыполнитьПроводкиСписанияСС_ЗакрытиеБезИсполнения( doc, FD_Pos, oper, SQL_ConvTypeSum(Data.FairValue) ) == false )
+          return ExitStep();
+        end;
+      end;
+    end;
+  end; //Конец учёта по позиции
+
+  /* Выполнить проводки по оплате комиссий банку. Проводки К */
+  Query = " SELECT  contr.t_partyid as Client, contr.t_id as ClientContr, 0 as ComFIID, contr.t_number,  " +
+          " base.t_commsum as S, base.t_ndssum as SN, sfcom.t_name as ComCode, deal.t_id as ID, pluscalc.t_account as pluscalc  " +
+          "   FROM dsfbasobj_dbt base, dsfdef_dbt sfdef, ddvdeal_dbt deal, dsfcontr_dbt contr, dsfcomiss_dbt sfcom, dsfsi_dbt pluscalc " +
+          "  WHERE sfdef.t_feetype = " + SF_FEE_TYPE_PERIOD +
+          "    AND sfdef.t_datefee = " + GetSQLDate(oper.Date) +
+          "    AND contr.t_id = sfdef.t_sfcontrid " +
+          "    AND contr.t_contractorid = " + string({OurBank}) +
+          "    AND base.t_defcommid = sfdef.t_id  " +
+          "    AND base.t_baseobjecttype = " + OBJTYPE_OPER_DV +
+          "    AND base.t_feetype = sfdef.t_feetype " +
+          "    AND base.t_baseobjectid = deal.t_id " +
+          "    AND pluscalc.t_objecttype(+) = 663 " +
+          "    AND pluscalc.t_debetcredit(+) = " + CALC_SFSI_KIND +
+          "    AND pluscalc.t_objectid(+) = LPAD (TO_CHAR (sfdef.t_id), 10, '0') " +
+          "    AND sfcom.t_ReceiverID = " + string({OurBank}) + 
+          "    AND sfcom.t_number = sfdef.t_commnumber";
+           
+  Data = TRsbDataSet(Query);    //0
+  if( Data )
+    while( Data.MoveNext() )
+      if( УчетБиржевыхКонтрактов() == DV_ACCEXCONTR_DEAL )
+        FD = DVFirstDocDeal(DL_DVDEAL, Data.ID);
+      end;
+      if( ВыполнитьПроводкиПоИтогамДляКомиссий( doc, FD, oper, 0,
+                                                Data.Client, Data.ClientContr, Data.ComFIID, Data.S, Data.SN,
+                                                "", Data.ComCode, DataSum, true, "",0//, Data.pluscalc, Data.Number
+                                              ) == false )
+        return ExitStep();
+      end;
+    end;
+  end;
+   
+  //TEG 07.12.18 для срочного рынка уберем
+  if (FD_OPER.DVOPER.rec.operkind != 12600)
+    /* Возврат гарантийного обеспечения. Проводки Л */
+    if( ПроводкиПоУчетуГарантийногоОбеспечения() == true )
+      var j = 0;
+      if( УчетБиржевыхКонтрактов() == DV_ACCEXCONTR_DEAL )
+        while( j < GuarantyDataSum.Size )
+          FD_Deal = DVFirstDocDeal(DL_DVDEAL, GuarantyDataSum[j].DocID);
+          if( ВыполнитьПроводкуУчетаВозвратаГарантий( FD_Deal, oper, doc, GuarantyDataSum[j].Sum, FD_Deal.FI().rec.Parentfi, FD_Deal.Deal.rec.ClientContr, FD_Deal.Deal.rec.Client, true ) == false )
+            return ExitStep();
+          end;
+          j = j + 1;
+        end;
+      else //DV_ACCEXCONTR_POS
+        Query = " SELECT TURN.T_CLIENT, POS.T_CLIENTCONTR, FIN.T_PARENTFI, sum(TURN.T_GUARANTY) GUARANTY " +
+                "   FROM ddvfiturn_dbt TURN, ddvfipos_dbt POS, dfininstr_dbt FIN " +
+                "  WHERE FIN.T_FIID = TURN.T_FIID " +
+                "    AND " + TurnByPosition(null, null, "POS") +
+                "    AND " + TurnByOperationPrev(oper) +
+                " GROUP BY TURN.T_CLIENT, POS.T_CLIENTCONTR, FIN.T_PARENTFI ";
+        Data  = TRsbDataSet(Query);  
+        if( Data )
+          while( Data.MoveNext() )
+            if( Data.Guaranty > 0 )
+              if( ВыполнитьПроводкуУчетаВозвратаГарантий( FD_Oper, oper, doc, Data.Guaranty, Data.Parentfi, Data.ClientContr, Data.Client, true ) == false )
+                return ExitStep();
+              end;
+            end;
+          end;
+        end;
+      end; 
+    end;
+  end;
+   
+  if(oper.Flag1 == ALG_SP_MONEY_SOURCE_OWN)
+    if (УрегулирПарнБирж(FD_Oper, oper) != 0 )
+      return ExitStep();
+    end;  
+  end;
+
+  // Возврат средств. Проводки М 
+  if( ВозвратСредств(FD_Oper, doc) != 0 )
+    return ExitStep();
+  end;
+  GL_DvUseCachingAccounts(false);
+  toRsTrace("!!! PrepMassExecuteStep end"); // отладка!!!
+  return 0;
+end;
+
+/**
+ @brief Исполнение пакетного шага
+ @param[in] oper Файл базы данных dvoper.dbt
+ @return         Флаг исполнения пакетного шага (0 - исполнен без ошибок, 1 - с ошибками)
+*/
+MACRO MassExecuteStep(oper)
+  var stat = 0;
+  var FD_Oper = DVFirstDocOper( DL_DVOPER, oper );
+  DL_CalendMassPlanAccTrn(accTrnBatch, FD_Oper.ПолучитьКалендТип(), FD_Oper.ПолучитьКалендБиржа(), FD_Oper.ПолучитьКалендКонтрагент());
+
+  if( DV_MassSaveRecoilDvdealTrnLink() != 0 )
+    MsgBox("Ошибка при сохранении информации о связи проводок со сделками срочного рынка");
+    accDvdealTrnArr.size = 0;
+    return 1;
+  end;
+
+  stat = DL_MassOprDocsExecute( ID_Operation, ID_Step );
+  //Исполнение проводок, которые сформировались в процедуре подготовки
+  if (stat == 0)
+      //debugbreak;         
+    if ( МассоваяОбработкаПроводок(ID_Operation, ID_Step) == false)
+      stat = 1;
+    else
+      stat = 0;
+    end;
+  end;
+  return stat;
+END;          
+
+//PrepMassExecuteStep();       // отладка!!!

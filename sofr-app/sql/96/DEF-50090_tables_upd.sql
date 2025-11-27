@@ -1,0 +1,44 @@
+--Добавление поля
+DECLARE
+   e_exist_field EXCEPTION;
+
+   PRAGMA EXCEPTION_INIT( e_exist_field, -1430);
+
+BEGIN
+   EXECUTE IMMEDIATE 'ALTER TABLE DLIMIT_MONEY_REVISE_DBT ADD T_SOFR_BANKEXP_COMIS NUMBER (32,12)';
+   EXCEPTION WHEN e_exist_field THEN NULL;
+END;
+/
+
+DECLARE
+   e_exist_field EXCEPTION;
+
+   PRAGMA EXCEPTION_INIT( e_exist_field, -1430);
+
+BEGIN
+   EXECUTE IMMEDIATE 'ALTER TABLE DLIMIT_MONEY_REVISE_DBT ADD T_SOFR_PLAN_COMIS NUMBER (32,12)';
+   EXCEPTION WHEN e_exist_field THEN NULL;
+END;
+/
+
+DECLARE
+   e_exist_field EXCEPTION;
+
+   PRAGMA EXCEPTION_INIT( e_exist_field, -1430);
+
+BEGIN
+   EXECUTE IMMEDIATE 'ALTER TABLE DLIMIT_MONEY_REVISE_DBT ADD T_ISDEL CHAR';
+   EXCEPTION WHEN e_exist_field THEN NULL;
+END;
+/
+
+declare
+ cnt number;
+begin
+  select count(*) into cnt from user_indexes i where i.TABLE_NAME='DLIMIT_MONEY_REVISE_DBT' and i.INDEX_NAME='DLIMIT_MONEY_REVISE_DBT_IDX2' ;
+  if cnt =1 then
+    execute immediate 'drop index DLIMIT_MONEY_REVISE_DBT_IDX2';
+  end if;
+  execute immediate 'CREATE INDEX DLIMIT_MONEY_REVISE_DBT_IDX2 ON DLIMIT_MONEY_REVISE_DBT (T_ISDEL)';
+end;
+/

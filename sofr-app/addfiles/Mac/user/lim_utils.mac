@@ -1,0 +1,1243 @@
+/*
+$Name:         lim_utils.mac
+$Module:       Лимиты
+$Description:  Общие функции для расчёта лимитов
+
+
+  # changelog
+  |date       |author         |tasks                                                   |note                                                        
+  |-----------|---------------|--------------------------------------------------------|-------------------------------------------------------------
+  |2024.05.21 |Зыков М.В.     |BOSS-2461.3,BIQ-16667                                   | Перевод процедуры расчета лимитов на обработчик сервисов QManager  
+
+*/
+
+import "AutoProcess.mac","dlutils.mac","dlcontrfunc.mac","it_utils.mac","limout.mac";
+
+const REVISE_KIND_NORMAL = 1; //выпустить сверку в обычном режиме
+const REVISE_KIND_ADDITIONAL = 2; //выпустить сверку в дополнительном режиме
+const REVISE_KIND_ABORT = 3; //прервать выпуск сверки
+
+
+class ExclusiveLimCalcLocker()
+
+  private var _locker = UniConcurrentLocker("LIMITCALCPROCESS");
+
+  macro Lock()
+    return _locker.Lock();
+  end;
+
+  macro Destructor()
+    _locker = null;
+  end;
+end;
+
+private macro LimitDataQueryWhere(alias, secur_checked, cur_checked, first_cond)
+   const MICEX_CODE_CURMARKET   = "MB0134700000";
+   const MICEX_CODE_STOCKMARKET = "MC0134700000";
+   var query_where = "";
+   if (ValType(first_cond) == V_UNDEF)
+      first_cond = false;
+   end;
+
+   if (alias != "")
+      alias = alias + ".";
+   end;
+
+   if (( secur_checked ) and (cur_checked))
+      query_where = " ("+alias+"t_firm_id = '"+MICEX_CODE_CURMARKET+"' or "+alias+"t_firm_id = '"+MICEX_CODE_STOCKMARKET+"') ";
+   elif( secur_checked )
+      query_where = " "+alias+"t_firm_id = '"+MICEX_CODE_STOCKMARKET+"' ";
+   elif(cur_checked)
+      query_where = " "+alias+"t_firm_id = '"+MICEX_CODE_CURMARKET+"' ";
+   else
+      query_where = "  1 = 1  ";
+   end;
+
+   return iif(first_cond, " where ", " and ") +  query_where;
+end;
+
+macro CalcLimDates(BaseDate)
+  execSQL( "begin rshb_limit_util.FillBaseDateForLimit(:bsdt); end;", makeArray(SQLParam("bsdt", BaseDate)), true );
+end;
+
+macro GetPrevTradeDateFromLim(secur_checked, cur_checked)
+  var retDate = date(0,0,0);
+  var dt1 = TRsbDataSet(" select t_date from DDL_LIMITSECURITES_DBT " + LimitDataQueryWhere("", secur_checked, cur_checked, true) );
+  if (dt1.movenext())
+    CalcLimDates(date(dt1.date));
+    var dt2 = execSQLselect( "select T_SETTLEDATEFROM from DLIMIT_BSDATE_DBT where T_BASEDATE = :bsdt and T_LIMITKIND = -1", makeArray(SQLParam("bsdt", date(dt1.date))), true);
+    if (dt2.moveNext())
+      retDate = SQL_ConvTypeDate(dt2.value("t_settledatefrom"));
+    end;
+  end;
+  return retDate;
+end;
+
+macro AddLimitLogMessage(Message:string, Action:integer, DT, MainSess, SessId, RootSess, ExcepSql)
+  if (ValType(DT) == V_UNDEF)
+    DT = date();
+  end;
+  Message = SubStr(Message, 1, 250);
+  execSQL( "INSERT INTO DCALCLIMITLOG_DBT (T_DATE,T_LABEL,T_START,"
+          +"T_END,T_ACTION) VALUES (?,?,SYSTIMESTAMP,SYSTIMESTAMP,?)",
+          makeArray(SQLParam("date", DT), SQLParam("label", Message), SQLParam("action", Action)));
+end;
+
+
+macro AddLimitLogMessage_calc_direct(calc_direct:string, Message:string, group_action:integer, Action:integer, DT)
+  if (ValType(DT) == V_UNDEF)
+    DT = date();
+  end;
+  
+  Message = SubStr(Message, 1, 250);
+
+  execSQL( " begin it_limit.CALCLIMITLOG(p_calc_direct  => ? "+
+                      "  ,p_CalcDate     => ? "+
+                      "  ,p_action       => ? "+
+                      "  ,p_label        => ? "+
+                      "  ,p_group        => ? "+
+                      "  ,p_dtstart      => systimestamp ); end;",
+          makeArray(SQLParam("", calc_direct),SQLParam("", DT), SQLParam("", Action), SQLParam("", Message), SQLParam("", group_action)));
+end;
+
+macro AddLimitLogInfo_calc_direct(calc_direct, Message:string, group_action:integer, Action:integer, DT,EXCEPSQLCODE) 
+  if (ValType(calc_direct) != V_STRING)
+    return;
+  end;
+  if (ValType(DT) == V_UNDEF)
+    DT = date();
+  end;
+  
+  Message = SubStr(Message, 1, 250);
+  
+  if (ValType(EXCEPSQLCODE) == V_UNDEF)
+    EXCEPSQLCODE = 0 ;
+  end;
+
+  execSQL( " begin it_limit.CALCLIMITLOG(p_calc_direct  => ? "+
+                      "  ,p_CalcDate     => ? "+
+                      "  ,p_action       => ? "+
+                      "  ,p_label        => ? "+
+                      "  ,p_group        => ? "+
+                      "  ,p_EXCEPSQLCODE => ?); end;",
+          makeArray(SQLParam("", calc_direct),SQLParam("", DT), SQLParam("", Action), SQLParam("", Message), SQLParam("", group_action), SQLParam("", EXCEPSQLCODE)));
+end;
+
+macro GetLimitEmptyMarketCodeErrors(calc_direct, MarketID, ByStockMB, ByStockSPB, ByCurMarket, ByFutureMarket, ByEDP, UseListClients):TArray
+  var cmd, DataSet;
+  var retArr = TArray ();
+  var bufArr = null;
+  var actionsPair = makeArray(
+    DL_KeyPair(10161,10199),//ошибки
+    DL_KeyPair(10131,10160),//предупреждения
+    DL_KeyPair(10100,10130)//информационные
+  );
+  for (var curAction, actionsPair)
+    bufArr = TArray();
+    cmd = DL_RSDCommand(
+      "   SELECT T_LABEL "
+     +"     FROM dcalclimitlog_dbt "
+     +"    WHERE T_CALC_DIRECT = ? and t_action BETWEEN ? AND ? " 
+     +" ORDER BY t_action ASC "
+    );
+    cmd.AddParam(calc_direct);
+    cmd.AddParam(curAction.Key);
+    cmd.AddParam(curAction.Value);
+    DataSet = cmd.Execute();
+    while (DataSet.MoveNext())
+      var text = SQL_ConvTypeStr(DataSet.Label);
+      if (text != "")
+        bufArr[bufArr.size] = text;
+      end;
+    end;
+    if (bufArr.size > 0) //в конце секции ошибок, если есть элементы, ставим пустую строку
+      bufArr[bufArr.size] = "";
+      retArr = joinArrays(retArr, bufArr);
+    end;
+  end;
+  if ((ByStockMB==1) or (ByStockSPB==1) or (ByEDP==1))
+    cmd = DL_RSDCommand(
+                        "   SELECT q1.*, "
+                       +"          (SELECT T_NAME "
+                       +"             FROM DOBJKCODE_DBT kcode "
+                       +"            WHERE kcode.T_CODEKIND = q1.t_CodeKind AND T_OBJECTTYPE = "+OBJTYPE_FININSTR+") "
+                       +"             AS t_CodeKindName "
+                       +"     FROM (SELECT DISTINCT "
+                       +"                  sec.T_CLIENT_CODE, "
+                       +"                  fin.T_FI_CODE, "
+                       +"                  fin.T_NAME, "
+                       +"                  fin.T_FIID, "
+                       +"                  RSHB_RSI_SCLIMIT.GETKINDMARKETCODEORNOTE (sec.t_market, 1, 0) "
+                       +"                     AS t_CodeKind "
+                       +"             FROM DDL_LIMITSECURITES_DBT sec, dfininstr_dbt fin "
+                       +"            WHERE (   sec.t_seccode IS NULL "
+                       +"                   OR sec.t_seccode = CHR (0) "
+                       +"                   OR sec.t_seccode = CHR (1)) "
+                       +"                  AND fin.t_fiid = sec.T_SECURITY) q1 "
+                       +" ORDER BY T_CODEKIND, T_NAME ");
+    DataSet = cmd.Execute();
+    while(DataSet.MoveNext())
+       retArr[retArr.size] = "Для клиента с кодом \""+SQL_ConvTypeStr(DataSet.Client_Code)+"\" по ЦБ \""+DataSet.Name
+                            +"\" с кодом \""+DataSet.Fi_Code+"\" (ID - "+SQL_ConvTypeInteger(DataSet.Fiid)+") не задан вид кода \""
+                            +SQL_ConvTypeStr(DataSet.CodeKindName)+"\" (ID - "+SQL_ConvTypeInteger(DataSet.CodeKind)+")";
+    end;
+  end;
+  return retArr;
+end;
+
+macro IsCalcWaPositionPrice(): bool
+  const pathCalcWaPos = "РСХБ\\БРОКЕРСКОЕ ОБСЛУЖИВАНИЕ\\CALC_WA_POSITION_PRICE";
+  var res, err;
+
+  GetRegistryValue( pathCalcWaPos, V_INTEGER, res, err );
+  if ( err != 0 )
+    RunError("Ошибка при получении значения настройки \"" + pathCalcWaPos + "\"")
+  end;
+  //выполнит автоматически приведение типов, где все != 0 равны true, а == 0 равно false
+  return res == true;
+end;
+
+macro GetQuikInAutoFolder():String
+  const pathQuikInAuto = "РСХБ\\ДИРЕКТОРИИ\\QUIK_IN_AUTO";
+  var res = "", err;
+
+  GetRegistryValue( pathQuikInAuto, V_STRING, res, err );
+  if ( err != 0 )
+    RunError("Ошибка при получении значения настройки \"" + pathQuikInAuto + "\"")
+  end;
+  return res;
+end;
+
+macro QuikFilesExists(path:string): bool
+  return TDirList(mergeFile(path, "Limit_*.lim"), "F").count > 0;
+end;
+
+macro QuikFortsFilesExists(path:string): bool
+  return TDirList(mergeFile(path, "Forts_*.lim"), "F").count > 0;
+end;
+
+macro QuikFilesAutoExists(): bool
+  return QuikFilesExists(GetQuikInAutoFolder());
+end;
+
+macro QuikFortsFilesAutoExists(): bool
+  return QuikFortsFilesExists(GetQuikInAutoFolder());
+end;
+
+macro GetAdmRateOfZeroPrice(): double
+  const pathRateOfZeroPrice = "РСХБ\\БРОКЕРСКОЕ ОБСЛУЖИВАНИЕ\\ДОПУСТИМЫЙ ПРОЦЕНТ НУЛЕВЫХ ЦЕН";
+  var res = 0.0, err;
+
+  GetRegistryValue( pathRateOfZeroPrice, V_DOUBLE, res, err );
+  if ( err != 0 )
+    RunError("Ошибка при получении значения настройки \"" + pathRateOfZeroPrice + "\"")
+  end;
+  return res;
+end;
+
+macro GetLastSymbolIdxFromString(Str:string, FindSymb:string)
+  var curIdx = 0;
+  var resultIdx = -1;
+  while ((curIdx = index(Str,FindSymb,curIdx+1)) > 0)
+    resultIdx = curIdx;
+  end;
+  return resultIdx;
+end;
+
+macro ExtractFileNameFromFilePath(FilePath:string)
+  var result = StrSubst(FilePath,"/","\\");
+  var idx = GetLastSymbolIdxFromString(result, "\\");
+  if (idx > 0)
+    result = SubStr(result, idx + 1);
+  end;
+  return result;
+end;
+
+macro ExtractFolderFromFilePath(FilePath:string)
+  var result = StrSubst(FilePath,"/","\\");
+  var idx = GetLastSymbolIdxFromString(result, "\\");
+  if (idx > 0)
+    result = SubStr(result, 1, idx - 1);
+  end;
+  return result;
+end;
+
+private macro ProcessPathForLimits( p_path )
+  var l_str, l_p, l_path = "";
+
+  p_path = trim( p_path );
+  if( substr( p_path, 1, 2 ) == ".." ) /* ссылка на вышестоящий каталог */
+    p_path = substr( p_path, 3 );
+
+    l_str  = getCWD(false);    
+    l_p    = strbrk( l_str, "\\" );
+    while( l_p != 0 )
+      l_path = l_path + substr( l_str, 1, l_p - 1 ) + "\\";
+      l_str  = substr( l_str, l_p + 1 );
+      l_p    = strbrk( l_str, "\\" );
+    end;
+    return ( substr( l_path, 1, strlen( l_path ) - 1 ) + p_path );
+
+  elif( substr( p_path, 1, 1 ) == "." ) /* ссылка на текущий каталог */
+    return ( getCWD + substr( p_path, 2 ) );
+  end;
+
+  return p_path;
+end;
+
+macro GetFullPathForLimits(FilePath:string, isRemote:bool)
+  FilePath = StrSubst(FilePath,"/","\\");
+  var Path = "", pLen = strlen(FilePath);
+
+  if((pLen > 4) and (substr(FilePath, 1, 2) == "\\\\"))
+    Path = FilePath;
+  else
+    if(isRemote)
+      if( substr( FilePath, 1, 2 ) == ".." ) /* ссылка на вышестоящий каталог */
+        FilePath = substr(FilePath, 3 );
+      end;
+
+      if( substr( FilePath, 1, 1 ) == "\\" ) /* ссылка на вышестоящий каталог */
+        FilePath = substr(FilePath, 2 );
+      end;
+
+      Path = GetCurDir(true) + "\\" + FilePath; 
+    else
+      Path = ProcessPathForLimits(FilePath);
+
+      if( substr( FilePath, 1, 1 ) == "\\" )
+        Path = GetCurDir(true) + Path;
+      end;
+    end;
+  end;
+
+  if (substr(Path, pLen, 1) == "\\")
+    Path = substr(Path, 1, pLen - 1);
+  end;
+
+  // получить полный путь
+  return Path;
+end;
+
+MACRO GetTxtPathForLimits()
+  const txtRegPath = "BANK_INI\\ОБЩИЕ ПАРАМЕТРЫ\\ДИРЕКТОРИИ\\TEXTDIR";
+  var Path = "";
+  var err = 0;
+
+  GetRegistryValue(txtRegPath, V_STRING, Path, err);
+  if(err != 0) 
+    RunError("Ошибка при получении значения настройки \"" + txtRegPath + "\"");
+  end;
+  return Path;
+END;
+
+//При вызове не использовать в пути "$"!
+macro CopyFileToAppServTxtFilePath(FilePath:string, FileIsRemote:bool)
+  var toPath = GetFullPathForLimits(GetTxtPathForLimits(), FileIsRemote);
+  var fromPath = GetFullPathForLimits(GetTxtPathForLimits(), not FileIsRemote);
+  var fileName = ExtractFileNameFromFilePath(FilePath);
+    //проверяем, а не копируем ли мы с того же самого пути
+    //если это так, возвращаем true, без копирования
+    //иначе CopyFile вернёт false от копирования того же самого файла
+  if (StrLwr(toPath) == StrLwr(fromPath))
+    return true;
+  end;
+  if(index(strlwr(toPath), "obj") and (not FileIsRemote) )
+    return true;    //файл уже на СП, терминала нет
+  end;
+
+  fromPath = fromPath +"\\"+ fileName;
+  toPath = toPath + "\\"+fileName;
+  //если пошли не тем путем
+  var existsFrom = or_existfile(fromPath);
+  var existsTo = or_existfile(toPath);
+  if( (not existsFrom) and existsTo)
+    var tmp = fromPath;
+	  fromPath = toPath;
+	  toPath = tmp;
+  end;
+
+  if (FileIsRemote)
+    if (existsFrom)
+      toPath = "$" + toPath;
+    else
+      fromPath = "$" + fromPath;
+    end;
+  end;
+
+  return CopyFile(fromPath, toPath);
+end;
+
+macro GetStringRegValueWithThrowError(regPath:string)
+  var value = "";
+  var err = 0;
+
+  GetRegistryValue(regPath, V_STRING, value, err);
+  if(err != 0) 
+    RunError("Ошибка при получении значения настройки \"" + regPath + "\"")
+  end;
+  return value;
+end;
+
+macro GetADORSHBBrokerConnectionString()
+  return 
+    "DSN="+GetStringRegValueWithThrowError("РСХБ\\ИНТЕГРАЦИЯ\\INTEGR_SERV_PRM\\RSHBBROKER\\DSN")+
+    ";UID="+GetStringRegValueWithThrowError("РСХБ\\ИНТЕГРАЦИЯ\\INTEGR_SERV_PRM\\RSHBBROKER\\USER")+
+    ";PWD="+GetStringRegValueWithThrowError("РСХБ\\ИНТЕГРАЦИЯ\\INTEGR_SERV_PRM\\RSHBBROKER\\PASSWORD");
+end;
+
+class QuikDealsLoaderBase
+  private class QuikFieldsMapping(_OurField, _QuikField, _ConverterPtr)
+    var QuikField = _QuikField;
+    var OurField = _OurField;
+    var ConverterPtr = _ConverterPtr;
+  end;
+
+  private var FieldMappingArr = TArray();
+  private var QuikConnection = null;
+  private var IsConnected = false;
+  private var SepConnectionIsOpen = false;
+
+  private var InsertSQLBuf = "";
+  private const PACK_SIZE = 100;
+
+  private macro GetFieldMapping()
+    if (FieldMappingArr.size == 0)
+      FieldMappingArr[FieldMappingArr.size] = QuikFieldsMapping("T_TRADENUM", "TradeNum", R2M(this, "StringConverter"));
+      FieldMappingArr[FieldMappingArr.size] = QuikFieldsMapping("T_TRADETIME", "TradeTime", R2M(this, "TimeConverter"));
+      FieldMappingArr[FieldMappingArr.size] = QuikFieldsMapping("T_ACCOUNT", "Account", R2M(this, "StringConverter"));
+      FieldMappingArr[FieldMappingArr.size] = QuikFieldsMapping("T_OPERATION", "Operation", R2M(this, "StringConverter"));
+      FieldMappingArr[FieldMappingArr.size] = QuikFieldsMapping("T_SECCODE", "SecCode", R2M(this, "StringConverter"));
+      FieldMappingArr[FieldMappingArr.size] = QuikFieldsMapping("T_PRICE", "Price", null);
+      FieldMappingArr[FieldMappingArr.size] = QuikFieldsMapping("T_QTY", "Qty", null);
+      FieldMappingArr[FieldMappingArr.size] = QuikFieldsMapping("T_VALUE", "Value", null);
+      FieldMappingArr[FieldMappingArr.size] = QuikFieldsMapping("T_TSCOMMMISSION", "TSCommission", null);
+      FieldMappingArr[FieldMappingArr.size] = QuikFieldsMapping("T_ACCRUEDINT", "AccruedInt", null);
+      FieldMappingArr[FieldMappingArr.size] = QuikFieldsMapping("T_YIELD", "Yield", null);
+      FieldMappingArr[FieldMappingArr.size] = QuikFieldsMapping("T_CPFIRMNAME", "CPFirmName", null);
+      FieldMappingArr[FieldMappingArr.size] = QuikFieldsMapping("T_FIRMNAME", "FirmName", R2M(this, "StringConverter"));
+      FieldMappingArr[FieldMappingArr.size] = QuikFieldsMapping("T_CPFIRMID", "CPFirmId", R2M(this, "StringConverter"));
+      FieldMappingArr[FieldMappingArr.size] = QuikFieldsMapping("T_REPOTERM", "RepoTerm", null);
+      FieldMappingArr[FieldMappingArr.size] = QuikFieldsMapping("T_REPORATE", "RepoRate", null);
+      FieldMappingArr[FieldMappingArr.size] = QuikFieldsMapping("T_PRICE2", "Price2", null);
+      FieldMappingArr[FieldMappingArr.size] = QuikFieldsMapping("T_REPOVALUE", "RepoValue", null);
+      FieldMappingArr[FieldMappingArr.size] = QuikFieldsMapping("T_DISCOUNT", "Discount", null);
+      FieldMappingArr[FieldMappingArr.size] = QuikFieldsMapping("T_REPO2VALUE", "Repo2Value", null);
+      FieldMappingArr[FieldMappingArr.size] = QuikFieldsMapping("T_CLIENTCODE", "ClientCode", R2M(this, "StringConverter"));
+      FieldMappingArr[FieldMappingArr.size] = QuikFieldsMapping("T_SETTLECODE", "SettleCode", R2M(this, "StringConverter"));
+      FieldMappingArr[FieldMappingArr.size] = QuikFieldsMapping("T_CLASSCODE", "ClassCode", R2M(this, "StringConverter"));
+      FieldMappingArr[FieldMappingArr.size] = QuikFieldsMapping("T_FIRMID", "FirmId", R2M(this, "StringConverter"));
+      FieldMappingArr[FieldMappingArr.size] = QuikFieldsMapping("T_TRADECURRENCY", "TradeCurrency", R2M(this, "StringConverter"));
+      FieldMappingArr[FieldMappingArr.size] = QuikFieldsMapping("T_BROKERCOMMISSION", "BrokerCommission", null);
+      FieldMappingArr[FieldMappingArr.size] = QuikFieldsMapping("T_SETTLEDATE", "SettleDate", R2M(this, "DateConverter"));
+      FieldMappingArr[FieldMappingArr.size] = QuikFieldsMapping("T_VALUECCY", "ValueCCY", null);
+      FieldMappingArr[FieldMappingArr.size] = QuikFieldsMapping("T_PRICECURRENCY", "PriceCurrency", R2M(this, "StringConverter"));
+      FieldMappingArr[FieldMappingArr.size] = QuikFieldsMapping("T_QUIKTRADESID", "QuikTradesId", null);
+      FieldMappingArr[FieldMappingArr.size] = QuikFieldsMapping("T_TRADEDATE", "TradeDate", R2M(this, "DateConverter"));
+      FieldMappingArr[FieldMappingArr.size] = QuikFieldsMapping("T_ORDERNUM", "OrderNum", R2M(this, "StringConverter"));
+      FieldMappingArr[FieldMappingArr.size] = QuikFieldsMapping("T_COMMCURRENCY", "CommCurrency", R2M(this, "StringConverter"));
+    end;
+    return FieldMappingArr;
+  end;
+
+  macro TimeConverter(InpData)
+    return "TO_DATE('01.01.0001 "+Time(SQL_ConvTypeStr(InpData))+"','DD.MM.YYYY HH24:MI:SS')";
+  end;
+
+  macro StringConverter(InpData)
+    return GetSQLString(SQL_ConvTypeStr(InpData));
+  end;
+
+  macro DateConverter(InpData)
+    return GetSQLDate(SQL_ConvTypeDate(InpData));
+  end;
+
+  private macro GetInsertStatement(ADORecSetObj)
+    var fields = "", values = "";
+    var i = -1;
+    var fldMap = GetFieldMapping();
+    while ((i=i+1) < fldMap.size)
+      if (i)
+        fields = fields + ",";
+        values = values + ",";
+      end;
+      fields = fields + fldMap[i].OurField;
+      var quikVal = ADORecSetObj.fields.item(fldMap[i].QuikField).value;
+      if (fldMap[i].ConverterPtr != null)
+        values = values + CallR2M(fldMap[i].ConverterPtr, quikVal);
+      else
+        if ((ValType(quikVal) == V_UNDEF) or (quikVal == null) or (ValType(quikVal) == 26))
+          values = values + "NULL";
+        else
+          values = values + string(quikVal);
+        end;
+      end;
+    end;
+
+    return "INSERT INTO DQUIK_DEALS_DBT (" + fields + ") VALUES (" + values + ");\n";
+
+  end;
+
+  private macro Init()
+    QuikConnection = ActiveX("ADODB.Connection");
+    QuikConnection.ConnectionString = GetADORSHBBrokerConnectionString();
+  end;
+
+  private macro DateToQuikStr(dt:date)
+    var y, m, d;
+    DateSplit(dt, d, m, y);
+    return string(y:o:4, m:o:2, d:o:2);
+  end;
+
+  private macro getSepDBConnection()
+    return RsdConnection(RsdEnvironment( "RDDrvO", "RDDrvO.dll" ), GetIniString("CONNSTRING", "rsreq.ini"));
+  end;
+
+  private macro ExecMassSQL(sql:string, con:RsdConnection)
+    execSQLSepCon("BEGIN\n"+sql+"END;", con);
+  end;
+
+  private macro GetDeleteCondition(baseData:date)
+    return "T_TradeDate < " + GetSQLDate((baseData - 30));
+  end;
+
+  private macro ClearOldData(baseData:date, con:RsdConnection)
+    BegAction(2000, "Удаление старых буферных данных QUIK", false);
+    execSQLSepCon( "SELECT 1 FROM DQUIK_DEALS_DBT WHERE " + GetDeleteCondition(baseData) + " for update nowait", con);
+    execSQLSepCon( "DELETE FROM DQUIK_DEALS_DBT WHERE " + GetDeleteCondition(baseData), con);
+    EndAction();
+  OnError(err)
+    var errMsg = GetFullErrorMessage(err);
+    if (Index(errMsg, "ORA-00054") > 0)
+      RunError("Таблица DQUIK_DEALS_DBT заблокирована другим процессом.")
+    end;
+    RunError();
+  end;
+
+  private macro GetQuikDealsCount (fromDate, toDate)
+    var sql = " select count(*) as t_count from DQUIK_DEALS_DBT where T_TRADEDATE BETWEEN ? AND ? ";
+    var params = MakeArray(SQLParam("fromDate", fromDate), SQLParam("toDate", toDate)); 
+    var rs = ExecSQLSelect(sql, params, true);
+    rs.MoveNext();
+  
+    return SQL_ConvTypeInteger(rs.value("t_count"));
+  end;
+
+  private macro ClearPrevData(con:RsdConnection, fromDate:date, toDate:date)
+    execSQLSepCon( "SELECT 1 FROM DQUIK_DEALS_DBT WHERE T_TRADEDATE BETWEEN ? AND ? for update nowait", con,
+            makeArray(SQLParam("dfrom", fromDate), SQLParam("dto", toDate)));
+    execSQLSepCon( "DELETE FROM DQUIK_DEALS_DBT WHERE T_TRADEDATE BETWEEN ? AND ?", con,
+            makeArray(SQLParam("dfrom", fromDate), SQLParam("dto", toDate)));
+  OnError(err)
+    var errMsg = GetFullErrorMessage(err);
+    if (Index(errMsg, "ORA-00054") > 0)
+      RunError("Таблица DQUIK_DEALS_DBT заблокирована другим процессом.")
+    end;
+    RunError();
+  end;
+
+
+  macro LoadPeriod(fromDate:date, toDate:date, logPrefix:string)
+    var con = getSepDBConnection();
+    AddLimitLogMessage(logPrefix+": Старт загрузки сделок QUIK", 10200);
+    var oldPrec = SetDefMoneyPrec(8);
+    var sqlCommand = "EXEC sofr.getQuikTrades '"+DateToQuikStr(fromDate)+"','"+DateToQuikStr(toDate)+"'";
+    if (QuikConnection == null)
+      this.Init();
+    end;
+    if (QuikConnection == null)
+      RunError("Нет объекта соединения");
+    end;
+    if (not IsConnected)
+      QuikConnection.Open();
+      IsConnected = true;
+    end;
+    var v_logger_obj = uws_exchng_logger(null, null, NULL, "QuikDealsLoader", modulename(), NULL, sqlCommand);
+    var v_log_id = v_logger_obj.get_log_id();
+    if ((toDate - fromDate) > 10)
+      RunError("Диапазон выборки не может превышать 10 дней");
+    end;
+    InsertSQLBuf = "";
+    con.Open();
+    con.BeginTrans();
+    ClearOldData(fromDate, con);
+    ClearPrevData(con, fromDate, toDate);
+    var packCounter = 0;
+    var dealCounter = 0;
+    var recSet=QuikConnection.Execute(sqlCommand);
+    v_logger_obj.add_response(null, null, null, v_log_id);
+    v_logger_obj.add_error_info(0, "OK");
+    BegAction(2000, "Загрузка данных из QUIK", false);
+    while (not recSet.EOF)
+      InsertSQLBuf = InsertSQLBuf + GetInsertStatement(recSet);
+      packCounter = packCounter + 1;
+      if (packCounter >= PACK_SIZE)
+        ExecMassSQL(InsertSQLBuf, con);
+        InsertSQLBuf = "";
+        packCounter = 0;
+      end;
+      recSet.moveNext();
+      dealCounter = dealCounter + 1;
+    end;
+    if (InsertSQLBuf != "")
+      ExecMassSQL(InsertSQLBuf, con);
+    end;
+    SetDefMoneyPrec(oldPrec);
+    con.CommitTrans();
+    con = null;
+    if (dealCounter > 0)
+      AddLimitLogMessage(logPrefix+": Сделок к загрузке "+dealCounter, 10201);
+    else
+      AddLimitLogMessage(logPrefix+": нет данных по сделкам за даты от "+fromDate + " до "+toDate, 10300);
+    end;
+    var loadedCount = GetQuikDealsCount(fromDate, toDate);
+    AddLimitLogMessage(logPrefix+": Загрузка завершена. Загружено: "+loadedCount, 10299);
+    EndAction();
+    return loadedCount;
+  OnError( err )
+    if(con.IsInTrans)
+      con.RollbackTrans();
+    end;
+    con = null;
+    EndAction();
+    var errMsg = GetFullErrorMessage(err);
+    if (v_logger_obj != null)
+      v_logger_obj.add_error_info(err.Code, errMsg);
+    end;
+    AddLimitLogMessage(logPrefix+": Error: "+errMsg, 10299);
+    SetDefMoneyPrec(oldPrec);
+    RunError();
+  end;
+
+  macro AutoProcessStart(prevTradeDate:date)
+    var logPrefix = "getQuikTradesAutoProcess";
+    var loadDate = prevTradeDate;
+    if (IsNoInterfaceRun())
+      if (GetQuikDealsCount(loadDate, loadDate) == 0)
+        return REVISE_KIND_NORMAL;
+      else
+        return REVISE_KIND_ADDITIONAL;
+      end;
+    else
+      //включаем диалоговый режим, т.к. мы не безинтерфейсе
+      var prevDialogFlag = SetDialogFlag(1);
+      var retVal = this.PanelStart(prevTradeDate, logPrefix);
+      SetDialogFlag(prevDialogFlag);
+      return retVal;
+    end;
+  end;
+
+  macro PanelStart(prevTradeDate:date, forcePrefix)
+    var logPrefix = "getQuikTradesManual";
+    if (ValType(forcePrefix) == V_STRING)
+      logPrefix = forcePrefix;
+    end;
+    var loadDate = prevTradeDate;
+    if (GetQuikDealsCount(loadDate, loadDate) == 0)
+      if (GetTRUE(true, "Не обнаружено данных по сделкам за дату "+loadDate
+          +".|Загрузить данные для выпуска расширенной сверки?"))
+        if (not this.ManualStart(logPrefix))
+          if (GetTRUE(true, "Данные для загрузки не обнаружены, либо произошла ошибка. Сформировать сверку в обычном режиме?"))
+            return REVISE_KIND_NORMAL;
+          else
+            AddLimitLogMessage(logPrefix+": Отмена загрузки пользователем ", 10202);
+            return REVISE_KIND_ABORT;
+          end;
+        else
+          return REVISE_KIND_ADDITIONAL;
+        end;
+      else
+        return REVISE_KIND_NORMAL;
+      end;
+    else
+      return REVISE_KIND_ADDITIONAL;
+    end;
+  end;
+
+  macro ManualStart(forcePrefix)
+    var logPrefix = "getQuikTradesManual";
+    if (ValType(forcePrefix) == V_STRING)
+      logPrefix = forcePrefix;
+    end;
+    var loadDate = date() - 1;
+    if (not GetDate(loadDate, "Введите дату загрузки сделок"))
+      return;
+    end;
+    if (GetQuikDealsCount(loadDate, loadDate) > 0)
+      if (not GetTRUE(true, "В системе уже есть сделки за дату "+loadDate
+          +".|При продолжении ранее загруженные сделки будут удалены. Продолжить?"))
+        return false;
+      end;
+    end;
+    var loadedCount = LoadPeriod(loadDate, loadDate, logPrefix);
+    if (loadedCount > 0)
+      MsgBox("Загрузка завершена. Загружено: " + loadedCount);
+      return true;
+    else
+      MsgBox("Нет данных по сделкам за дату " + loadDate);
+      return false;
+    end;
+  OnError( err )
+    MsgBox(GetFullErrorMessage(err));
+    return false;
+  end;
+
+  macro AutoStart()
+    var logPrefix = "getQuikTradesAuto";
+    var loadDate = date() - 1;
+    LoadPeriod(loadDate, loadDate, logPrefix);
+  end;
+
+  macro Destructor()
+    if ((QuikConnection != null) and (IsConnected))
+      QuikConnection.close();
+    end;
+  end;
+end;
+
+macro IsReviseAdditional(): bool
+  const addRevisePath = "РСХБ\\БРОКЕРСКОЕ ОБСЛУЖИВАНИЕ\\СВЕРКА ЛИМИТОВ С ДОП ДАННЫМИ";
+  var res = false, err;
+
+  GetRegistryValue( addRevisePath, V_BOOL, res, err );
+  if ( err != 0 )
+    RunError("Ошибка при получении значения настройки \"" + addRevisePath + "\"")
+  end;
+  return res;
+end;
+
+class (QuikDealsLoaderBase) QuikDealsLoader
+  initQuikDealsLoaderBase();
+
+  macro AutoProcessStart(prevTradeDate:date)
+    return IIF(IsReviseAdditional(),REVISE_KIND_ADDITIONAL,REVISE_KIND_NORMAL);
+  end;
+
+  macro PanelStart()
+    return IIF(IsReviseAdditional(),REVISE_KIND_ADDITIONAL,REVISE_KIND_NORMAL);
+  end;
+
+  macro ManualStart()
+    MsgBox("Загрузка сделок QUIK из РСХБ Брокер временно отключена.");
+  end;
+
+  macro AutoStart()
+  end;
+end;
+
+macro CalcLimitUseQManager(): bool
+  const addRevisePath = "РСХБ\\БРОКЕРСКОЕ ОБСЛУЖИВАНИЕ\\РАСЧЕТ_ЛИМИТОВ_QUIK\\ИСПОЛЬЗОВАТЬ QMANAGER";
+  var res = false, err;
+
+  GetRegistryValue( addRevisePath, V_BOOL, res, err );
+  if ( err != 0 )
+    RunError("Ошибка при получении значения настройки \"" + addRevisePath + "\"")
+  end;
+  return res;
+end;
+
+macro WaitLimits_calc_direct(ProcessWait,ProcessDesc,calc_direct, ErrorCode:@integer, ErrorDesc:@string)
+  var UseQManager,sql,cmd,DataSet ;
+  UseQManager = CalcLimitUseQManager();
+
+  var flag = true ;
+  var sql_log,sql_work,str2 ;
+  sql_log = " select t_label , tme, nvl(t_excepsqlcode,0) excepsqlcode "+
+            " from  (select * from table(it_limit.select_calc_log(p_calc_direct => ?)) order by abs(nvl(t_excepsqlcode,0)) desc, t_end desc ) "+
+            " where  rownum < 2 " ;
+
+  if (UseQManager)
+    sql_work = "select count(*) as work from table(it_q_message.select_answer_msg(p_msgid => ? , p_queuetype => 'OUT')) "+
+               " where status in (select * from table(it_q_message.select_status('WORK'))) "
+  else
+    sql_work = " select count(*) as work from user_scheduler_jobs where job_name in ('RUN_LIMIT', 'JOB_LIM_1','JOB_LIM_2') and state in ('RUNNING','SCHEDULED')" ;
+  end;
+  RslWait(2000);
+  while (flag)
+     RslWait(ProcessWait);
+     DataSet = null;
+     cmd = RsdCommand(sql_log);
+     cmd.AddParam("",RSDBP_IN,calc_direct);
+     cmd.Execute();
+     DataSet = TRsbDataSet(cmd);
+     while (DataSet.movenext)
+       if ((ErrorCode == 0) and (int(DataSet.excepsqlcode) != 0))
+          ErrorCode =int(DataSet.excepsqlcode);
+          ErrorDesc = DataSet.Label ;
+          flag = false;
+       end;
+       RemProgress ;
+       InitProgress(-1,ProcessDesc,DataSet.Label);
+     end;
+     DataSet = null;
+     cmd = RsdCommand(sql_work);
+     if (UseQManager)
+       cmd.AddParam("",RSDBP_IN,calc_direct);
+     end;
+     cmd.Execute();
+     DataSet = TRsbDataSet(cmd);
+     if (DataSet.movenext() and (int(DataSet.work)==0))
+          flag = false;
+     end;
+  end;
+ end;
+
+macro GetCountFinish_calc_direct(calc_direct): Integer
+  var cmd = RsdCommand("select count(*) cnt from dcalclimitlog_dbt where t_calc_direct = ? and t_action = 999");
+  cmd.AddParam("",RSDBP_IN,calc_direct);
+  cmd.Execute();
+  var DataSet = TRsbDataSet(cmd);
+  if (DataSet.movenext())
+    return int(DataSet.cnt)
+  else
+    return 0;
+  end ;
+end;
+
+macro CreateLimits_calc_direct(CalcDate, MarketID, ByStockMB, ByStockSPB, ByCurMB, ByFortsMB, ByEDP, UseListClients, ErrorCode:@integer, ErrorDesc:@string)
+  ErrorDesc = " ";
+  var UseQManager, sql, cmd ,DataSet, group_action = 0, Action = 0, flag,calcPart ;
+  var calc_direct ;
+  var zeroPriceCount = 0, notZeroPriceCount = 0, totalCount = 0;
+  CONST CALCPRICE_PACK       = 2000; //размер пачки для задания джоба
+  CONST CALCPRICE_DELAY      = 500; //Ожидание между запусками заданий джоба в ms 
+
+  RemProgress ;
+  InitProgress(-1,"Подготовка данных","Подготовка данных");
+  UseQManager = CalcLimitUseQManager();
+
+  if (UseQManager)
+    sql = "begin it_limit.CreateLimits(p_CalcDate => ?, "+
+                       " p_ByStockMB => ?,  "+
+                       " p_ByStockSPB => ?, "+
+                       " p_ByCurMB => ?,    "+
+                       " p_ByFortsMB => ?,  "+
+                       " p_ByEDP => ?,      "+
+                       " o_calc_direct => ?,"+
+                       " o_ErrorCode => ?,  "+
+                       " o_ErrorDesc => ?,  "+
+                       " p_MarketID => ?,   "+
+                       " p_UseListClients => ?); end;"; 
+
+    cmd = RsdCommand(sql);
+    cmd.AddParam("",RSDBP_IN,CalcDate);  ///Дата
+    cmd.AddParam("",RSDBP_IN,ByStockMB);
+    cmd.AddParam("",RSDBP_IN,ByStockSPB);
+    cmd.AddParam("",RSDBP_IN,ByCurMB);
+    cmd.AddParam("",RSDBP_IN,ByFortsMB);
+    cmd.AddParam("",RSDBP_IN,ByEDP);
+    cmd.AddParam("o_calc_direct",RSDBP_OUT,V_STRING, 200);
+    cmd.AddParam("o_ErrorCode",RSDBP_OUT,V_INTEGER);
+    cmd.AddParam("o_ErrorDesc",RSDBP_RETVAL,V_STRING, 3000);
+    cmd.AddParam("",RSDBP_IN,MarketID);
+    cmd.AddParam("",RSDBP_IN,UseListClients);
+    cmd.Execute();
+    calc_direct = cmd.Value("o_calc_direct") ;
+    ErrorCode = cmd.Value("o_ErrorCode") ;
+    ErrorDesc = SQL_ConvTypeStr(cmd.Value("o_ErrorDesc")) ;
+    if (ErrorCode==0)
+      WaitLimits_calc_direct(3000,"Расчет лимитов по всем рынкам (QManager)",calc_direct,@ErrorCode,@ErrorDesc);
+    end;
+    if (ErrorCode == 0)
+      cmd = RsdCommand("begin ? := it_limit.get_sevice_calc_error(p_msgid => ?, o_messerror => ?); end;");
+      cmd.AddParam("o_ErrorCnt",RSDBP_OUT,V_INTEGER);
+      cmd.AddParam("",RSDBP_IN,calc_direct);
+      cmd.AddParam("o_ErrorDesc",RSDBP_RETVAL,V_STRING, 3000);
+      cmd.Execute();
+      if (cmd.Value("o_ErrorCnt") > 0 )
+        ErrorCode = 100 ;
+        ErrorDesc = "ОШИБКА работы сервиса "+SQL_ConvTypeStr(cmd.Value("o_ErrorDesc")) ;
+      end;
+    end;
+    if (ErrorCode==0)
+      cmd = RsdCommand("begin ? := it_limit.chk_finish_calc_direct(?); end;");
+      cmd.AddParam("o_CHK",RSDBP_OUT,V_INTEGER);
+      cmd.AddParam("",RSDBP_IN,calc_direct);
+      cmd.Execute();
+      if (cmd.Value("o_CHK") == 0 )
+        ErrorCode = 100 ;
+        ErrorDesc = "ОШИБКА !! Расчет лимитов не закончен !!!" ;
+      end;
+    end;
+  else
+    sql = " begin ? := it_limit.get_calc_direct(p_CalcDate => :p_CalcDate, "+
+                       " p_ByStockMB => ?,  "+
+                       " p_ByStockSPB => ?, "+
+                       " p_ByCurMB => ?,    "+
+                       " p_ByFortsMB => ?,  "+
+                       " p_ByEDP => ?,      "+
+                       " o_ErrorCode => ?,  "+
+                       " o_ErrorDesc => ?,  "+
+                       " p_MarketID => ?,   "+
+                       " p_UseListClients => ?); end;"; 
+    cmd = RsdCommand(sql);
+    cmd.AddParam("o_calc_direct",RSDBP_OUT,V_STRING, 200);
+    cmd.AddParam("",RSDBP_IN,CalcDate);  ///Дата
+    cmd.AddParam("",RSDBP_IN,ByStockMB);
+    cmd.AddParam("",RSDBP_IN,ByStockSPB);
+    cmd.AddParam("",RSDBP_IN,ByCurMB);
+    cmd.AddParam("",RSDBP_IN,ByFortsMB);
+    cmd.AddParam("",RSDBP_IN,ByEDP);
+    cmd.AddParam("o_ErrorCode",RSDBP_OUT,V_INTEGER);
+    cmd.AddParam("o_ErrorDesc",RSDBP_OUT,V_STRING, 3000);
+    cmd.AddParam("",RSDBP_IN,MarketID);
+    cmd.AddParam("",RSDBP_IN,UseListClients);
+    cmd.Execute();
+    calc_direct = cmd.Value("o_calc_direct") ;
+    ErrorCode = cmd.Value("o_ErrorCode") ;
+    ErrorDesc = SQL_ConvTypeStr(cmd.Value("o_ErrorDesc")) ;
+
+    if ((ErrorCode == 0) and ((MarketID == MMVB_ID()) or (MarketID == -1) ) and (ByStockMB or byCurMB or byFortsMB or ByEDP))
+      sql = " begin it_limit.CreateLimits_market(p_calc_direct => ?, "+
+                              "   p_CalcDate => ?,  "+
+                              "   p_ByStockMB => ?, "+
+                              "   p_ByStockSPB => 0,"+
+                              "   p_ByCurMB => ?,   "+
+                              "   p_ByFortsMB => ?, "+
+                              "   p_ByEDP => ?,     "+
+                              "   p_MarketID => ?,  "+
+                              "   o_ErrorCode => ?, "+
+                              "   o_ErrorDesc => ?, "+
+                              "   p_UseListClients => ?); end;";
+      cmd = RsdCommand(sql);
+      cmd.AddParam("",RSDBP_IN,calc_direct);  
+      cmd.AddParam("",RSDBP_IN,CalcDate);  ///Дата
+      cmd.AddParam("",RSDBP_IN,ByStockMB);
+    //  cmd.AddParam("",RSDBP_IN,ByStockSPB);
+      cmd.AddParam("",RSDBP_IN,ByCurMB);
+      cmd.AddParam("",RSDBP_IN,ByFortsMB);
+      cmd.AddParam("",RSDBP_IN,ByEDP);
+      cmd.AddParam("",RSDBP_IN,MMVB_ID());
+      cmd.AddParam("o_ErrorCode",RSDBP_OUT,V_INTEGER);
+      cmd.AddParam("o_ErrorDesc",RSDBP_OUT,V_STRING, 3000);
+      cmd.AddParam("",RSDBP_IN,UseListClients);
+      cmd.Execute();
+      ErrorCode = cmd.Value("o_ErrorCode") ;
+      ErrorDesc = SQL_ConvTypeStr(cmd.Value("o_ErrorDesc")) ;
+      if (ErrorCode==0)
+        WaitLimits_calc_direct(3000,"Расчет лимитов по ММВБ",calc_direct,@ErrorCode,@ErrorDesc);
+      end;
+      if ((ErrorCode==0) and ((GetCountFinish_calc_direct(calc_direct)) != 1))
+        ErrorCode = 100 ;
+        ErrorDesc = "ОШИБКА !! Расчет лимитов по ММВБ не закончен !!!" ;
+      end;
+    end;
+    if ((ErrorCode == 0) and ((MarketID == SPB_ID()) or (MarketID == -1) ) and (ByStockSPB or ByEDP))
+      sql = " begin it_limit.CreateLimits_market(p_calc_direct => ?, "+
+                              "   p_CalcDate => ?,  "+
+                              "   p_ByStockMB => 0, "+
+                              "   p_ByStockSPB => ?,"+
+                              "   p_ByCurMB => 0,   "+
+                              "   p_ByFortsMB => 0, "+
+                              "   p_ByEDP => ?,     "+
+                              "   p_MarketID => ?,  "+
+                              "   o_ErrorCode => ?, "+
+                              "   o_ErrorDesc => ?, "+
+                              "   p_UseListClients => ?); end;";
+      cmd = RsdCommand(sql);
+      cmd.AddParam("",RSDBP_IN,calc_direct);  
+      cmd.AddParam("",RSDBP_IN,CalcDate);  ///Дата
+     // cmd.AddParam("",RSDBP_IN,ByStockMB);
+      cmd.AddParam("",RSDBP_IN,ByStockSPB);
+     // cmd.AddParam("",RSDBP_IN,ByCurMB);
+     // cmd.AddParam("",RSDBP_IN,ByFortsMB);
+      cmd.AddParam("",RSDBP_IN,ByEDP);
+      cmd.AddParam("",RSDBP_IN,SPB_ID());
+      cmd.AddParam("o_ErrorCode",RSDBP_OUT,V_INTEGER);
+      cmd.AddParam("o_ErrorDesc",RSDBP_OUT,V_STRING, 3000);
+      cmd.AddParam("",RSDBP_IN,UseListClients);
+      cmd.Execute();                      
+      ErrorCode = cmd.Value("o_ErrorCode") ;
+      ErrorDesc = SQL_ConvTypeStr(cmd.Value("o_ErrorDesc")) ;
+      if (ErrorCode==0)
+        WaitLimits_calc_direct(3000,"Расчет лимитов по ПАО СПБ",calc_direct,@ErrorCode,@ErrorDesc);
+      end;     
+      if ((ErrorCode==0) and ((GetCountFinish_calc_direct(calc_direct)) != 2))
+        ErrorCode = 100 ;
+        ErrorDesc = "ОШИБКА !! Расчет лимитов по ПАО СПБ не закончен !!!" ;
+      end;
+    end;
+    RemProgress ;
+    InitProgress(-1,"Контроль данных","Контроль данных");
+    if (ErrorCode == 0)
+    
+       sql = " begin RSHB_RSI_SCLIMIT.SetLogErrContr(p_calc_direct => ?, "+
+                              "   p_CalcDate => ?, "+
+                              "   p_ByStockMB => ?, "+
+                              "   p_ByStockSPB => ?,"+
+                              "   p_ByCurMB => ?,   "+
+                              "   p_ByFortsMB => ?, "+
+                              "   p_ByEDP => ?,     "+
+                              "   p_MarketID => ?,  "+
+                              "   p_UseListClients => ?); end;";
+      cmd = RsdCommand(sql);
+      cmd.AddParam("",RSDBP_IN,calc_direct);  
+      cmd.AddParam("",RSDBP_IN,CalcDate);  ///Дата
+      cmd.AddParam("",RSDBP_IN,ByStockMB);
+      cmd.AddParam("",RSDBP_IN,ByStockSPB);
+      cmd.AddParam("",RSDBP_IN,ByCurMB);
+      cmd.AddParam("",RSDBP_IN,ByFortsMB);
+      cmd.AddParam("",RSDBP_IN,ByEDP);
+      cmd.AddParam("",RSDBP_IN,MarketID);
+      cmd.AddParam("",RSDBP_IN,UseListClients);
+      cmd.Execute();                      
+    end;                                              
+    if ((ErrorCode == 0) and (ByStockSPB or ByStockMB))
+       group_action = 2000 ;
+       Action = 100 ;
+       ///РСХБ\БРОКЕРСКОЕ ОБСЛУЖИВАНИЕ\CALC_WA_POSITION_PRICE
+       //EndAction;
+       //BegAction(0, "Расчет WA_POSITION_PRICE");
+
+       AddLimitLogMessage_calc_direct(calc_direct,"Расчет цен приобретения ",group_action, Action, CalcDate) ;
+
+       var cnt = 0 , id_first = 0, id_last = 0;
+       sql = 
+           "    SELECT t_id  " +
+             "   FROM DDL_LIMITSECURITES_DBT " +
+             "  WHERE  t_date = "+GetSQLDate(CalcDate)+" and t_market_kind = 'фондовый' " +
+               "   AND t_limit_kind = 2 " +
+               "   and t_client_code <> chr(1)  " + 
+               "  AND t_open_balance <> 0 " +
+             "  ORDER BY t_id";
+       DataSet = null;
+       DataSet = TRsbDataSet(sql);
+       flag = false;
+       while (DataSet.movenext())
+          if ((cnt == 0 ) or flag)
+            id_first = DataSet.id;
+            flag = false;
+          end;
+          cnt = cnt + 1;
+          id_last = DataSet.id;
+          if (mod(cnt, CALCPRICE_PACK) == 0)
+             CalcPrice_RunJob(calc_direct,id_first, id_last, (not UseListClients));
+             RslWait(CALCPRICE_DELAY);
+             flag = true;
+          end;
+       end;
+       if (id_last != 0)
+          CalcPrice_RunJob(calc_direct,id_first, id_last, (not UseListClients));
+       end;
+
+       RslWait(1000);///новый лог может еще не успеть создаться, и тогда может подхватиться предыдущий лог и все закроется .. поэтому немного подождем.
+       flag = true;
+       while (flag)
+         DataSet = null;
+         DataSet = TRsbDataSet(" select 1 from user_scheduler_jobs where job_name like 'JOB%' and state in ( 'RUNNING', 'SCHEDULED')");
+         if (not DataSet.movenext())                                                                                              
+             ///Если наши джобы все завершили работу, то вываливаемся
+             flag = false;
+         end;
+         InitProgress(-1,"");
+         RslWait(3000);
+         UseProgress(1);
+         RemProgress;
+         RslWait(50);
+       end;
+
+      sql = "begin  RSHB_RSI_SCLIMIT.SetWAPositionPrice365(p_CalcDate => ?); end;";
+      cmd = RsdCommand(sql);
+      cmd.AddParam("",RSDBP_IN,CalcDate);  ///Дата
+      cmd.Execute();
+
+      sql = "begin  RSHB_RSI_SCLIMIT.CheckWAPositionPrice(p_calc_direct => ? , p_CalcDate => ?); end;";
+      cmd = RsdCommand(sql);
+      cmd.AddParam("",RSDBP_IN,calc_direct);  
+      cmd.AddParam("",RSDBP_IN,CalcDate);  ///Дата
+      cmd.Execute();
+      DataSet = null;
+      DataSet = TRsbDataSet(" select job_name from user_scheduler_jobs where job_name like 'JOB%' and failure_count > 0");
+      if (DataSet.movenext())
+         AddLimitLogInfo_calc_direct(calc_direct,"!!! Есть ошибки расчета цены. Необходимо обратиться в поддержку (USER_SCHEDULER_JOB_RUN_DETAILS)",group_action, (-Action), CalcDate);
+        //wrnrecs = wrnrecs + 1;
+      else
+         AddLimitLogMessage_calc_direct(calc_direct,"Цены рассчитаны",group_action, Action, CalcDate);
+      end;
+
+      DataSet = null;
+      DataSet = TRsbDataSet(" select job_name from user_scheduler_jobs where job_name like 'JOB%'");
+      while ( DataSet.movenext())
+          sql = "BEGIN " +
+                "   BEGIN " +
+                "      DBMS_SCHEDULER.drop_job ('"+DataSet.job_name+"', TRUE); " +
+                "   EXCEPTION " +
+                "      WHEN OTHERS " +
+                "      THEN " +
+                "         NULL; " +
+                "   END; " + 
+                "END; " ; 
+          cmd = RsdCommand(sql);
+          cmd.Execute();
+      end;
+
+    end;
+    if (ErrorCode == 0) 
+      sql = "begin  RSHB_RSI_SCLIMIT.SetLogItog(p_calc_direct => ?, "+
+                            "  p_CalcDate => ?, "+
+                            "  p_ByStockMB => ?, "+
+                            "  p_ByStockSPB => ?, "+
+                            "  p_ByCurMB => ?, "+
+                            "  p_ByFortsMB => ?, "+
+                            "  p_ByEDP => ?, "+
+                            "  p_MarketID => ?, "+
+                            "  p_UseListClients => ?); end;";
+      cmd = RsdCommand(sql);
+      cmd.AddParam("",RSDBP_IN,calc_direct);  
+      cmd.AddParam("",RSDBP_IN,CalcDate);  ///Дата
+      cmd.AddParam("",RSDBP_IN,ByStockMB);
+      cmd.AddParam("",RSDBP_IN,ByStockSPB);
+      cmd.AddParam("",RSDBP_IN,ByCurMB);
+      cmd.AddParam("",RSDBP_IN,ByFortsMB);
+      cmd.AddParam("",RSDBP_IN,ByEDP);
+      cmd.AddParam("",RSDBP_IN,MarketID);
+      cmd.AddParam("",RSDBP_IN,UseListClients);
+      cmd.Execute();
+
+
+      AddLimitLogMessage_calc_direct(calc_direct,"Расчет лимитов QUIK завершён",4000, Action, CalcDate);
+    end;
+
+    sql = " begin it_limit.set_calc_status(p_calc_direct => ?,"+
+                         " p_ErrorCode => ?,"+
+                         " p_ErrorDesc => ?); end;";
+    cmd = RsdCommand(sql);
+    cmd.AddParam("",RSDBP_IN,calc_direct);  
+    cmd.AddParam("",RSDBP_IN,ErrorCode);
+    cmd.AddParam("",RSDBP_IN,ErrorDesc);
+    cmd.Execute();
+  end;
+  group_action = 5000 ;
+  Action = 999 ;
+  if (ErrorCode != 0)
+      AddLimitLogInfo_calc_direct(calc_direct,"!!! ОШИБКА РАСЧЕТА ЛИМИТОВ QUIK #"+string(ErrorCode,": ",ErrorDesc),group_action, (-Action), CalcDate,ErrorCode); 
+  else
+    if (quikFilesExists)
+         AddLimitLogInfo_calc_direct(calc_direct,"!!!ПРЕДУПРЕЖДЕНИЕ!!! В директории \""+GetQuikInAutoFolder()+"\" обнаружен необработанный вечерний файл QUIK по фондовому и валютному рынкам.",group_action, (-Action), CalcDate);
+         AddLimitLogInfo_calc_direct(calc_direct," Влияние на корректность цен приобретения и сверку лимитов",group_action, (-Action), CalcDate);
+    end;
+
+    if (QuikFortsFilesAutoExists())
+        AddLimitLogInfo_calc_direct(calc_direct,"!!!ПРЕДУПРЕЖДЕНИЕ!!! В директории \""+GetQuikInAutoFolder()+"\" обнаружен необработанный вечерний файл ",group_action, (-Action), CalcDate);
+        AddLimitLogInfo_calc_direct(calc_direct,"QUIK по срочному рынку. Влияние на сверку лимитов",group_action, (-Action), CalcDate);
+    end;
+  end;
+
+  RemProgress ;
+  return calc_direct;
+end;
+
+macro GetProtocol_calc_direct(calc_direct, MarketID, ByStockMB, ByStockSPB, ByCurMarket, ByFutureMarket, ByEDP, UseListClients,
+                               recs:@integer, wrnrecs:@integer, ErrorCode:@integer, ErrorDesc:@string  ):TStrCollector
+  if (ValType(recs) == V_UNDEF)
+      recs = 0;
+  end;
+  if (ValType(wrnrecs) == V_UNDEF)
+      wrnrecs = 0;
+  end;
+  if (ValType(ErrorCode) == V_UNDEF)
+      ErrorCode = 0;
+  end;
+  var logErrorCode = 0 , logErrorDesc ;
+  var result_protocol = TStrCollector;
+  var sql_log,cmd,DataSet ;
+  if (ValType(calc_direct) == V_STRING)
+    sql_log = "select t_label, tme, isinfo, nvl(t_action,0) t_action,t_excepsqlcode from table(it_limit.select_calc_log(p_calc_direct => ?))" ;
+    cmd = RsdCommand(sql_log);
+    cmd.AddParam("",RSDBP_IN,calc_direct);
+    cmd.Execute();
+    DataSet = TRsbDataSet(cmd);
+    while (DataSet.movenext)
+      if ((DataSet.excepsqlcode !=0) or (DataSet.action < 0) )
+         wrnrecs = wrnrecs + 1;
+         if ((DataSet.excepsqlcode !=0) and (logErrorCode == 0))
+            logErrorCode = DataSet.excepsqlcode ;
+            logErrorDesc = DataSet.Label ;
+         elif ((DataSet.excepsqlcode == 0) and ((result_protocol.Size == 0) or (result_protocol(result_protocol.Size-1)!= DataSet.Label)))
+           result_protocol.AddString(DataSet.Label);
+         end;
+      elif (DataSet.isinfo == 1)
+         result_protocol.AddString(DataSet.Label);
+      else
+         result_protocol.AddString(string(DataSet.Label:l:55) + " " + DataSet.tme);
+      end;
+    end;
+    sql_log = "select nvl(t.t_recs,0) t_recs  from DDL_LIMITOP_DBT t where t.t_calc_direct = ? " ;
+    cmd = RsdCommand(sql_log);
+    cmd.AddParam("",RSDBP_IN,calc_direct);
+    cmd.Execute();
+    DataSet = TRsbDataSet(cmd);
+    if (DataSet.movenext)
+      recs = Int(DataSet.recs);
+    end;
+  end;
+  if (ValType(calc_direct) != V_STRING)
+      ErrorCode = 500 ;
+      ErrorDesc = "Ошибка старта расчета " ;
+  elif ((ErrorCode == 0) and (logErrorCode != 0) )
+      ErrorDesc = logErrorDesc ;
+      ErrorCode = logErrorCode ;
+  else
+    DataSet = null;
+    DataSet = TRsbDataSet(" select job_name from user_scheduler_jobs where job_name like 'RUN_LIMIT' and failure_count > 0");
+    if (DataSet.movenext())
+      result_protocol.AddString("!!! Ошибка расчета лимитов. Необходимо обратиться в поддержку (USER_SCHEDULER_JOB_RUN_DETAILS)");
+      wrnrecs = wrnrecs + 1;
+      if (ErrorCode == 0)
+        ErrorDesc = "Ошибка расчета лимитов. Необходимо обратиться в поддержку (USER_SCHEDULER_JOB_RUN_DETAILS)" ;
+        ErrorCode = 400 ;
+      end;
+      DataSet = null;
+      DataSet = TRsbDataSet(" select nvl(errors,chr(1)) errors from USER_SCHEDULER_JOB_RUN_DETAILS where job_name = 'RUN_LIMIT' order by log_id desc ");
+      if (DataSet.movenext())
+         result_protocol.AddString(DataSet.errors);
+      end;
+    end;
+    if (result_protocol.size > 0) //в конце секции ставим пустую строку
+       result_protocol.AddString(" ");
+    end;
+    if (ErrorCode == 0 )
+       /*список исключенных из расчета клиентов*/
+      var LogText = IT_GetClobData("T_CONTRLOG",("DDL_LIMITOP_DBT where T_CALC_DIRECT = '"+calc_direct+"'")) ;                 
+      result_protocol.AddString(LogText);
+      var errors = GetLimitEmptyMarketCodeErrors(calc_direct, MarketID, ByStockMB, ByStockSPB, ByCurMarket, ByFutureMarket, ByEDP, UseListClients);
+      if (errors.size > 0) 
+        LogText = "\nОбновление биржевых кодов по ценным бумагам:\n\n";
+        for (var _er, errors)
+            LogText = LogText + _er + "\n";
+        end;
+        LogText = StrSubst ( LogText, StrFor(1), StrFor(0) );
+        result_protocol.AddString(LogText);
+      end;
+    end;
+  end;
+  if (ErrorCode != 0 )
+      result_protocol.AddString("");
+      result_protocol.AddString("!!! Ошибка расчета лимитов. Необходимо обратиться в поддержку !");
+      result_protocol.AddString(ErrorDesc);
+  end;
+  return result_protocol ;
+end;
+
+macro SetProtocol_calc_direct(calc_direct,ErrorCode,ErrorDesc,calc_protocol:TStrCollector);
+  if (ValType(calc_direct) != V_STRING)
+    return;
+  end;
+  var LogText = "";
+  if (calc_protocol == null)
+    return ;
+  end;
+  for (var _LT, calc_protocol)
+    LogText = LogText + _LT + "\n";
+  end;
+  IT_SetClobBufer(LogText);
+  var sql = " begin it_limit.set_calc_status(p_calc_direct => ?,"+
+                         "  p_ErrorCode => ?,"+
+                         "  p_ErrorDesc => ?,"+
+                         "  p_log => it_rsl_string.get_clob); end;" ;
+   var cmd = RsdCommand(sql);
+   cmd.AddParam("",RSDBP_IN,calc_direct);  
+   cmd.AddParam("",RSDBP_IN,ErrorCode);
+   cmd.AddParam("",RSDBP_IN,ErrorDesc);
+   cmd.Execute();
+end;

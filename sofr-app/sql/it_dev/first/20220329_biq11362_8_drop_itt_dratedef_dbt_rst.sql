@@ -1,0 +1,1 @@
+drop table itt_dratedef_dbt_rst;

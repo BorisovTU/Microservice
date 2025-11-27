@@ -1,0 +1,14 @@
+BEGIN
+  UPDATE DSCSRVREP_DBT
+     SET T_AUTOSENDKIND =
+            CASE
+               WHEN T_AUTOSEND IS NOT NULL AND T_AUTOSEND = CHR (88) THEN 2
+               ELSE 1
+            END
+   WHERE T_AUTOSENDKIND IS NULL OR T_AUTOSENDKIND = 0;
+
+  UPDATE DSCSRVREP_DBT
+     SET t_excludeuk = CHR(0)
+   WHERE t_excludeuk is null;
+END;
+/

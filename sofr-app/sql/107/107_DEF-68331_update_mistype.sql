@@ -1,0 +1,3 @@
+BEGIN 
+  UPDATE DMCCATEG_DBT SET T_CODE = '-Бюджет, ф.налоги, ULN' WHERE T_ID = 886;
+END;

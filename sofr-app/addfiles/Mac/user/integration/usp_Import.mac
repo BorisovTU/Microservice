@@ -1,0 +1,1361 @@
+/*-----------------------------------------------------*/
+/* Регистрация Клиента в РСХБ-Брокер                   */
+/*                                                     */
+/* Автор: Гераськина Т.                                */
+/* 17.04.2023 Geraskina def-33954 меняем условие: если у какого-то договора СКП, 
+              то это не повод блокировать, нужно ориентироваться на последнюю дату
+*/
+/*----------------------------------------------*/
+import rsd/*Simanov. избавляемся от библиотеки, CommonInter*/;
+import cb_sql;
+import BankInter; // Cherdnichenko 2020-06-18 для OemToUtf8()
+import "uws_exchng_log.mac";           /* Функционал логирования */
+import "global_utils_intgr.mac";
+import func_lib;
+import dlcontrfunc; // BIQ-7041 для кода биржи Спб
+
+var env, con;
+private var v_logger_obj, v_log_id;
+private file attr("objattr.dbt") key 0;
+private file attrcor("objatcor.dbt") key 0;
+
+// BIQ-7785, в настройке дата начала ЕПД
+private var vg_flag_edp = false;
+private var marketid_spb;
+
+private const STATE_OK = 0;
+private const STATE_ERROR = -1;
+private const STATE_REPEATE = 10;
+
+private const TYPE_NEW_USER = 101;
+
+
+//Определить идентификатор биржив по виду кода ДБО
+//Вызывается из исходного кода
+private macro ПолучитьБиржуПоВидуКодаДБО(CodeKind)
+  var MarketCode = "";
+  var err = 0;
+
+  var MarketID = -1;
+
+  if(CodeKind == DLCCK_USC)
+    GetRegistryValue("SECUR\\MICEX_CODE", V_STRING, MarketCode, err);
+    if(err != 0)
+      msgbox("Ошибка при получении значения настройки SECUR\\MICEX_CODE");
+    elif(MarketCode == "")
+      msgbox("Не задано значение настройки SECUR\\MICEX_CODE");
+    else
+      MarketID = GetCodeParty(MarketCode,PTCK_CONTR);
+    end;
+
+  elif(CodeKind == DLCCK_SPB_BIDCODE)
+    GetRegistryValue("SECUR\\SPBEX_CODE", V_STRING, MarketCode, err);
+    if(err != 0)
+      msgbox("Ошибка при получении значения настройки SECUR\\SPBEX_CODE");
+    elif(MarketCode == "")
+      msgbox("Не задано значение настройки SECUR\\SPBEX_CODE");
+    else
+      MarketID = GetPartyID_byPartyCode(PTCK_CONTR, MarketCode);
+    end;
+  end;
+
+  return MarketID;
+end;
+
+
+class c_Contract()
+   var Contr_number  : string;
+   var Contr_name    : string;
+   var Contr_id      : integer;
+   var Contr_date    : date;
+   var IIS           : string;
+   var Contr_date_close : date;
+end;
+
+MACRO m_GetSQLString( str )
+    if ( ( str=="" )   or (ValType(str) == V_UNDEF) or (ValType(str) == 26)  or (str == StrFor(0)) or (str == StrFor(1)) )
+         return "' '";
+     else
+        return string("'", strsubst(String(str), "'", "''"), "'");
+    end;
+end;
+
+macro CheckExistSpb(p_client_id)
+   var sql_str, rs, cmd;
+   var res = 0;
+   
+   sql_str = "select count(*) cnt from "+
+            "    ddlcontrmp_dbt mp, "+
+            "    dsfcontr_dbt sf, "+
+            "    dsfcontr_dbt cntr, "+
+            "    ddlcontr_dbt dl "+
+            " where sf.t_id = mp.t_sfcontrid and "+
+            "    mp.t_dlcontrid = dl.t_dlcontrid and sf.t_servkind = 1 and sf.t_servkindsub = 8 "+
+            "    and mp.t_marketid = :p_market_id "+
+            "    and dl.t_sfcontrid = cntr.t_id "+
+            "    and cntr.t_partyid = :p_client_id "+
+            "    and cntr.t_dateclose = to_date('01.01.0001','dd.mm.yyyy')  ";
+   cmd = RSDCommand(sql_str);
+   cmd.AddParam("p_market_id", RSDBP_IN, marketid_spb);
+   cmd.AddParam("p_client_id", RSDBP_IN, p_client_id);
+   rs = RSDRecordSet(cmd);
+   if (rs.movenext)
+      res = rs.value("cnt");
+   end;
+   return res;
+end;
+
+macro getDLContr(p_client_id, p_dlid)
+   var sql_str, rs, cmd;
+   var contr;
+   var res = TArray;
+   
+   sql_str = "SELECT cntr.t_id cntr_id, dl.t_dlcontrid dl_id, cntr.t_number, cntr.t_name, dl.t_iis, cntr.t_datebegin, cntr.t_dateclose "+
+             " FROM dsfcontr_dbt cntr, "+
+             "      ddlcontr_dbt dl "+
+             "WHERE dl.t_sfcontrid = cntr.t_id "+
+             "  AND cntr.t_partyid = :p_client_id "+
+             "  AND cntr.t_dateclose = to_date('01.01.0001','dd.mm.yyyy') ";
+   if (ValType(p_dlid) != V_UNDEF)
+      if (p_dlid > 0)
+         sql_str = sql_str+ " AND dl.t_dlcontrid = :p_dlid ";
+      end;
+   end;
+   cmd = RSDCommand(sql_str);
+   cmd.AddParam("p_client_id", RSDBP_IN, p_client_id);
+   if (ValType(p_dlid) != V_UNDEF)
+      cmd.AddParam("p_dlid", RSDBP_IN, p_dlid);
+   end;
+   rs = RSDRecordSet(cmd);
+   contr = null;
+   res.size = 0;
+   while (rs.movenext)
+      contr = c_Contract;
+      contr.Contr_number   = rs.value("t_number");
+      contr.Contr_name     = rs.value("t_name");
+      contr.Contr_id       = rs.value("dl_id");
+      contr.Contr_date     = rs.value("t_datebegin");
+      contr.IIS            = rs.value("t_iis");
+      contr.Contr_date_close = rs.value("t_dateclose");
+
+      res.value(res.size) = contr;
+      contr = null;
+   end;
+   return res;
+end;
+
+
+macro getDLContr_Close(p_client_id, p_dlid)
+   var sql_str, rs, cmd;
+   var contr;
+   var res = TArray;
+   
+   sql_str = "SELECT cntr.t_id cntr_id, dl.t_dlcontrid dl_id, cntr.t_number, cntr.t_name, dl.t_iis, cntr.t_datebegin, cntr.t_dateclose "+
+             " FROM dsfcontr_dbt cntr, "+
+             "      ddlcontr_dbt dl "+
+             "WHERE dl.t_sfcontrid = cntr.t_id "+
+             "  AND cntr.t_partyid = :p_client_id "+
+             "  AND cntr.t_dateclose > to_date('01.01.0001','dd.mm.yyyy') ";
+   if (ValType(p_dlid) != V_UNDEF)
+      sql_str = sql_str+ " AND dl.t_dlcontrid = :p_dlid ";
+   end;
+   cmd = RSDCommand(sql_str);
+   cmd.AddParam("p_client_id", RSDBP_IN, p_client_id);
+   if (ValType(p_dlid) != V_UNDEF)
+      cmd.AddParam("p_dlid", RSDBP_IN, p_dlid);
+   end;
+   rs = RSDRecordSet(cmd);
+   contr = null;
+   res.size = 0;
+   while (rs.movenext)
+      contr = c_Contract;
+      contr.Contr_number   = rs.value("t_number");
+      contr.Contr_name     = rs.value("t_name");
+      contr.Contr_id       = rs.value("dl_id");
+      contr.Contr_date     = rs.value("t_datebegin");
+      contr.IIS             = rs.value("t_iis");
+      contr.Contr_date_close = rs.value("t_dateclose");
+
+      res.value(res.size) = contr;
+      contr = null;
+   end;
+   return res;
+end;
+
+        
+
+macro getContact(p_client_id, p_kind, p_type)
+   var sql_str, rs, cmd;
+   var res = "";
+   
+   sql_str = "SELECT t_value "+
+             "  FROM dcontact_dbt "+
+             " WHERE t_partyid = :p_client_id "+
+             "   AND t_addresstype in ( 0,1) "+ // юр.адрес или не указан
+             "   AND t_ismain = 'X' "+    // основной
+             "   AND t_contactkind = :p_kind "+ 
+             "   AND t_contacttype = :p_type "; 
+   cmd = RSDCommand(sql_str);
+   cmd.AddParam("p_client_id", RSDBP_IN, p_client_id);
+   cmd.AddParam("p_kind", RSDBP_IN, p_kind);
+   cmd.AddParam("p_type", RSDBP_IN, p_type);
+   rs = RSDRecordSet(cmd);
+
+   if (rs.movenext)  // считаем, что основной контакт один
+      res = rs.value(0);
+   end;
+   
+   return res;
+end;
+
+
+macro getPersonInfoNames(p_client_id, p_name:@string, p_surname:@string, p_patronomyc:@string)
+   var sql_str, rs, cmd;
+   
+   p_name = ""; p_surname = ""; p_patronomyc = "";
+
+   sql_str = "SELECT t_name1, t_name2, t_name3 "+
+             "  FROM dpersn_dbt "+
+             " WHERE t_personid = :p_client_id ";
+   cmd = RSDCommand(sql_str);
+   cmd.AddParam("p_client_id", RSDBP_IN, p_client_id);
+   rs = RSDRecordSet(cmd);
+
+   if (rs.movenext)  
+// 2020-07-15 Cherednichenko Из базы может приходить строковый rs-null (ascii(1)), это вызывает проблемы при кодировке
+//      p_name = rs.value(0);
+//      p_surname = rs.value(1);
+//      p_patronomyc = rs.value(2);
+      if (CodeFor(rs.value(0)) != 1)
+      p_name = rs.value(0);
+      else
+        p_name = "";
+      end;
+      if (CodeFor(rs.value(1)) != 1)
+      p_surname = rs.value(1);
+      else
+        p_surname = "";
+      end;
+      if (CodeFor(rs.value(2)) != 1)
+      p_patronomyc = rs.value(2);
+      else
+        p_patronomyc = "";
+      end;
+// 2020-07-15 Cherednichenko /Из базы может приходить строковый rs-null (ascii(1)), это вызывает проблемы при кодировке
+   end;
+   
+end;
+
+class ClientData_all_c(p_client_id)
+   var phone;
+   var email;
+   var firstname;
+   var surname;
+   var patronomyc;
+
+   private macro uInitPrime(p_client_id)
+      private var err_txt;
+      phone = getContact(p_client_id, CV_CONTACT_KIND_PHONE, CV_CONTACT_TYPE_MOBILE);
+      email = getContact(p_client_id, CV_CONTACT_KIND_EMAIL, CV_CONTACT_TYPE_REPORT);
+      getPersonInfoNames(p_client_id, @surname, @firstname, @patronomyc);
+   end; /* macro uInitPrime() */
+
+   uInitPrime(p_client_id);
+end;
+
+
+macro GetClientData(p_client_id, p_IsRegisteredOnSpb)
+   var res = "";
+
+   var  ClientData_all = ClientData_all_c(p_client_id);
+
+   res = "<Fields ";
+   if (ClientData_all.firstname)
+      res = res + " FirstName=\""+ClientData_all.firstname+"\"";
+   end;
+   if (ClientData_all.surname)
+      res = res + " SurName=\""+ClientData_all.surname+"\"";
+   end;
+   if (ClientData_all.patronomyc)
+     if ((valtype(ClientData_all.patronomyc) != V_UNDEF) and (valtype(ClientData_all.patronomyc) == 6)) // != 6 )) Cherednichenko 2020-06-16 т.о. сохраняем отчество, если определено и тип == string
+        res = res + " MiddleName=\""+ClientData_all.patronomyc+"\"";
+     else
+        res = res + " MiddleName=\"""\"";
+     end;
+   end;
+   if (ClientData_all.phone)
+      res = res + " Phone=\""+ClientData_all.phone+"\"";
+   end;
+   if (ClientData_all.email)
+      res = res + " EMail=\""+ClientData_all.email+"\"";
+   end;
+   if (p_IsRegisteredOnSpb > 0)
+      res = res + " IsRegisteredOnSpb=\"1\"";
+   end;
+   
+   res = res + "/>";
+
+   return res;
+end;
+
+
+macro GetAuth(ppartyid)
+   var res = "";
+   res = String("<data> \n"+
+                "   <Logins> \n"+
+                "     <i Provider=\"EFTR.RSHB\" ProviderUserId=\""+ppartyid+"\" /> \n"+
+                "   </Logins> \n"+
+                " </data>");
+   return res;
+end;
+
+
+// Данные Клиента "поток А8"
+class c_usp_ImportUsers(ppartyid, type_action:@integer, _manual, _type)
+   var Login      : integer;      // Логин (идентификатор) пользователя  Да
+   var Password   : string;      // Временный пароль                    Да
+   var Client     : string;      // Идентификатор договора. Если у Клиента несколько договоров, то значения передаются через запятую.  Да
+   var IsEnabled  : integer;     // 0 - пользователь будет заблокирован (со всеми счетами и договорами), 1 - пользователь будет создан или отредактирован   Константа = 1  Да
+   var UserGroup  : string;      // Группа, которая определяет права пользователя   Константа = "пользователи"                Да
+   var w3rdAuthUserId : string;   // xml???   Список альтернативных провайдеров и логинов в системе провайдера.	Не заполняем   Нет
+   var IsMustChangePassword   :integer;   // 0 - при первом входе надо сменить пароль, 1 - при первом входе не нужно сменять пароль    Константа = 0  Да
+   var cw_status = -1; //статус текущего временного пароля
+   var Data       : string;      // Дополнительная информация по пользователю в виде xml     Да
+   var c_ar_close; // DEF-30604 список закрытых договров
+
+   CONST CV_TYPE_CODE_TMP_PWD = 1;
+
+   /*---------------------------------------*/
+   /* Поиск значения временного пароля в БД */
+   /*---------------------------------------*/
+   private macro m_check_code(ppartyid, status:@integer)
+      var v_ret = true;
+      var v_sql, v_cmd, v_rs;
+
+      v_sql =         "SELECT t_cw_client, t_cw_type, t_code_word, t_cw_accept_try, t_cw_status ";
+      v_sql = v_sql + "  FROM usr_clnt_cdwrd_buf_dbt ";
+      v_sql = v_sql + " WHERE t_cw_type = :p_cw_type ";
+      v_sql = v_sql + "   AND t_cw_client = :p_cw_client ";
+      v_cmd = RSDCommand(v_sql);
+      v_cmd.addParam("p_cw_type", RSDBP_IN, CV_TYPE_CODE_TMP_PWD);
+      v_cmd.addParam("p_cw_client", RSDBP_IN, ppartyid);
+      v_rs = RSDRecordSet(v_cmd);
+      if(v_rs.movenext())
+         v_ret = true;
+         status = v_rs.value("t_cw_status");
+      else
+         v_ret = false;
+         status = -1;
+      end;
+
+      v_rs.close(); v_cmd.close(); v_rs = NULL; v_cmd = NULL; v_sql = NULL;
+
+      return v_ret;
+
+   onError(err)
+      v_ret = false;
+      return v_ret;
+   end; /* macro m_make_sms_message() */
+
+
+   
+   /* Кратность параметров в соответствии со спецификацией */
+   private macro uInitPrime(ppartyid, type_action:@integer, _manual, _type)
+      private var err_txt;
+      var ai;
+      var c_ar, c_ar_id;
+      //var FoundBad = false;  //def-33954 СКП больше не имеет исключительных прав
+      private var ObjCat, Attrcode = 0, Attrdate = date(0,0,0), Notetext, Objecttype, Objectid;
+      private var FAKT2_date;
+      private var NeedUpdate = false, NeedAdd = false, NeedUpdatePass = false;
+      //BIQ-7041 если есть площадка Спб у какого-нибудь из договоров, то ставим признак IsRegisteredOnSpb
+      private var IsRegisteredOnSpb = 0;
+      // DEF-33954 
+      private var actual_date, actual_contr, cnt_equal = 0;
+
+      type_action = 1;
+
+      c_ar = GetDLContr(ppartyid);
+      c_ar_close = GetDLContr_close(ppartyid);
+      if (c_ar.size == 0)
+         if (c_ar_close.size == 0)   // нет ни открытых, ни закрытых
+            err_txt = "Не найден договор БО";
+            RunError(err_txt);
+         else
+            type_action = 2;
+            if (c_ar_close.size == 1)
+               Client = c_ar_close.value(0).Contr_number;
+            elif (c_ar_close.size > 1)
+               Client = c_ar_close.value(0).Contr_number;
+               ai = 1;
+               while (ai < c_ar_close.size)
+                  Client = Client + "," + c_ar_close.value(ai).Contr_number;
+                  ai = ai + 1;
+               end;
+            end;
+         end;
+      elif (c_ar.size == 1)
+         Client = c_ar.value(0).Contr_number;
+      elif (c_ar.size > 1)
+         Client = c_ar.value(0).Contr_number;
+         ai = 1;
+         while (ai < c_ar.size)
+            Client = Client + "," + c_ar.value(ai).Contr_number;
+            ai = ai + 1;
+         end;
+      end;
+
+      //def-33954 СКП больше не имеет исключительных прав
+      /*if (type_action == 1)
+         FoundBad = CheckCategory_SKP(ppartyid);
+         if (FoundBad)
+            type_action = 2;
+         end;
+      end;*/
+
+      if (type_action == 1)
+         //IsRegisteredOnSpb    = CheckExistSpb(ppartyid);
+         if (vg_flag_edp)
+            IsRegisteredOnSpb    = 1;
+         else
+            IsRegisteredOnSpb    = 0;
+         end;
+
+         Login                = ppartyid;   
+         IsEnabled            = 1; 
+         UserGroup            = "Пользователи";       
+         w3rdAuthUserId       = GetAuth(ppartyid);
+         Data                 = GetClientData(ppartyid, IsRegisteredOnSpb);
+
+         //var err, AttrCode;
+         //GetMainObjAttr(err, 3, string(ppartyid:10:o), CV_CATEGORY_UNLOAD_BROKER, AttrCode);
+
+         ObjCat = RsbObjCategories(3, string(ppartyid:10:o));
+         if (ObjCat.GetMainAttr( CV_CATEGORY_UNLOAD_BROKER, date(), attr, attrcor ) == 0)
+           Attrcode = attrcor.attrid;
+           Attrdate = attrcor.validfromdate;
+         end;
+         ObjCat = NULL;
+         if ( (Attrcode == 1) or (Attrcode == 2) )   // если выгрузке уже прошла удачно. DEF-33954 теперь для ошибки те же условия
+            NeedAdd = false;
+            // DEF-51201 для ручных и авто-выгрузок все-таки следует сначала проверить категории СКП для опредения type_action, а потом задать NeedUpdate =true 
+
+            ai = 0;
+            Objecttype = 207;
+            // DEF-33954 не перебираем договора, а берем категорию 170 того договора, который имеет 
+            // более позднюю дату изменения (примечание 170. Дата изменения в исходной системе), 
+            // если даты изменения для договоров клиента одинаковы, то имеет более позднюю дату заключения
+
+            actual_date = date(0,0,0);
+            cnt_equal = 1;
+
+            while (ai < c_ar.size)
+               Objectid = String(c_ar.value(ai).Contr_id:o:34);
+               Notetext = readNoteForObject( Objecttype, ObjectID, CV_CONTRACT_NOTEKIND_UPDATE, date() );
+               if (Notetext == date(0,0,0))
+                  Notetext = c_ar.value(0).Contr_date;
+               end;
+               if (Notetext > actual_date)
+                 actual_date = Notetext;
+                 actual_contr = c_ar.value(ai).Contr_id;
+               elif (actual_date == Notetext)
+                 cnt_equal = cnt_equal+1;
+               end;
+               ai = ai+1;
+            end;
+
+            if ( (cnt_equal > 1) and (cnt_equal == c_ar.size) ) // все даты одинаковые, берем самый свежий договор
+               ai = 1;
+               actual_date = c_ar.value(0).Contr_date;
+               while (ai < c_ar.size)
+                  if (c_ar.value(ai).Contr_date > actual_date)
+                     actual_date = c_ar.value(ai).Contr_date;
+                     actual_contr = c_ar.value(ai).Contr_id;
+                  end;
+                  ai =ai+1;
+               end;
+            end;
+
+            ClearRecord(attrcor);
+            ClearRecord(attr);
+            Objectid = String(actual_contr:o:34);
+            ObjCat = RsbObjCategories(Objecttype, Objectid);
+            ObjCat.GetMainAttr( 170, date(), attr, attrcor );
+            FAKT2_date = attrcor.validfromdate;
+            NeedUpdate = false; 
+
+            if ( (attr.attrid == 2) or (attr.attrid == 1) )  // двухфакторная или СКП
+               if (actual_date <= Attrdate) // дата изменения меньше даты выгрузки
+                  if (FAKT2_date >= Attrdate) // дата типа подключения больше даты выгрузки
+                     if (attr.attrid == 2) // двухфакторная
+                        NeedUpdate = true;
+                     else    // СКП
+                        type_action = 2; // блокировка
+                     end;
+                  end;
+               else   // дата изменения больше даты выгрузки
+                  if (FAKT2_date >= actual_date)  // дата типа подключения больше даты изменения
+                     if (attr.attrid == 2)  // двухфакторная                   
+                        NeedUpdate = true;
+                     else  // СКП
+                        type_action = 2;   // блокировка
+                     end;
+                  end;
+               end;
+            end;
+
+            // для массовых запусков и ручной выгрузки зададим принудительную выгрузку
+            if (_manual)
+               NeedUpdate = true;
+            elif (_type == 3) 
+               NeedUpdate = true;
+            elif (_type == 11) 
+               NeedUpdate = true;
+            elif (_type == TYPE_NEW_USER) // новый клиент, ошибка была "Недопустимый (пустой) пароль нового пользователя"
+               NeedAdd = true;
+               NeedUpdate = false;
+            elif (m_check_code(ppartyid, @cw_status))
+               NeedUpdatePass = true;
+            else
+            end;
+
+         else
+            NeedAdd = true;
+            NeedUpdate = false;
+            if ( (_manual) and (Attrcode==0) )  // если это новый клиент при массовый выгрузке, ничего не делаем
+               NeedAdd = false;
+               NeedUpdate = false;
+            end;
+         end;
+
+         if (NeedUpdate)    
+            Password = "";
+            IsMustChangePassword = 0;
+         elif (NeedUpdatePass)
+            Password             = m_GetPasswordForClient(ppartyid, CV_TYPE_CODE_TMP_PWD); 
+            IsMustChangePassword = 1;
+         elif (NeedAdd)
+            Password             = m_GetPasswordForClient(ppartyid, CV_TYPE_CODE_TMP_PWD); 
+            IsMustChangePassword = 1;
+         else 
+            Login = -1*ppartyid;
+         end;
+      end;
+
+      if (type_action == 2)
+         Login                = ppartyid;    
+         Password             = ""; 
+         IsEnabled            = 0; 
+         UserGroup            = "Пользователи";      
+         //w3rdAuthUserId       = GetAuth(ppartyid);
+         //IsMustChangePassword = 1;
+         //Data                 = GetClientData(ppartyid);
+      end;
+      
+   end; /* macro uInitPrime() */
+
+   uInitPrime(ppartyid, @type_action, _manual, _type);
+
+end;
+
+
+class c_usp_ImportCtptFromExcel_contract(ppartyid, pdlid)
+   var Contr_arr;
+   var ClientData_all;
+   
+   private macro uInitPrime(ppartyid, pdlid)
+      private var err_txt;
+
+      if (ValType(pdlid) != V_UNDEF)
+         Contr_arr = GetDLContr_Close(ppartyid, pdlid);
+      else 
+         Contr_arr = GetDLContr(ppartyid);
+      end;
+      ClientData_all  = ClientData_all_c(ppartyid);
+      
+   end; /* macro uInitPrime() */
+
+   uInitPrime(ppartyid, pdlid);
+end;
+
+// Данные по договорам и счетам Клиента "поток А9" 
+class c_usp_ImportCtptFromExcel(p_req_obj, p_clientdata_param, p_Account, p_clientid, p_edp, p_action)
+   var Client        : string;      // Идентификатор договора во внешней системе  Да
+   var ClientName    : string;      // Наименование договора  Да
+   var Account       : string;      // Счет, как правило используется код клиента на бирже  Да
+   var AccountName   : string;      // Наименование счета. Не заполняем  Нет
+   var Branch        : string;      // Филиал, в котором открыт счет. Не заполняем  Нет
+   var BranchName    : string;      // Название филиала для отображения в отчетах. Не заполняем  Нет
+   var IsStrategy    : integer;     // Да	Признак того является ли данный счет стратегией. 0 - Клиентский счет 1 - Стратегия. Константа = 0  Да ?
+   var ClientData    : string;      // Дополнительные параметры клиента, которые могу использоваться в программе  Да
+   var Action        : integer;     // Действие со счетом. 0 - удаляем счет, 1 - добавляем счет, 2 - делаем счет неактивным для торгов. Константа = 1  Да
+   
+   /* Кратность параметров в соответствии со спецификацией */
+   private macro uInitPrime(p_req_obj, p_clientdata_param, p_Account, p_clientid, p_edp, p_action)
+      private var err_txt;
+      private var IIS;
+
+      if (p_req_obj.IIS == "X")
+         IIS = 1;
+      else
+         IIS = 0;
+      end;
+
+      Client        = p_req_obj.Contr_number;
+      ClientName    = p_req_obj.Contr_number; //p_req_obj.Contr_name;
+      if (substr(p_Account,1,1) == "F")
+         Account       = "CL"+p_Account;
+      else
+         Account       = p_Account;
+      end;
+      /*if (p_edp)
+         Account = "edp"+Account;
+      end; */
+
+      AccountName   = NULL;
+      Branch        = NULL;
+      BranchName    = NULL;
+      IsStrategy    = 0;
+      ClientData    = "<Fields AgreementNo=\""+p_req_obj.Contr_number+"\" Phone=\""+p_clientdata_param.Phone+"\" Email=\""+p_clientdata_param.Email+"\" MasterId=\""+p_clientid+"\" IIS=\""+IIS+"\" />";
+      Action        = p_action;
+      
+   end; /* macro uInitPrime() */
+
+   uInitPrime(p_req_obj, p_clientdata_param, p_Account, p_clientid, p_edp, p_action);
+
+end;
+
+class c_usp_ImportTradeAccountMap_mp
+   var Account    : string;
+   var TradeFloor : string;
+   var AccType    : string;
+   var ClientCode : string;
+   var TradeAccount: string;
+   var Firm       : string;
+end;
+
+// Данные по торговым счетам Клиента "поток А10"
+class c_usp_ImportTradeAccountMap(p_req_obj, p_edp, p_TradeAccount) 
+   var Account      : string; //  Внешнее название счета. должно соответствовать @Account которое передается в usp_ImportCtptFromExcel  Да
+   var TradeFloor   : string; //  Внешнее название торговой площадки  Да
+                                  /*'КЦБ ММВБ' - для фондового рынка
+                                  'Фортс' - для срочного рынка
+                                  'Cets' - для валютного рынка (если он не совмещен с фондовым)
+                                  'OTC' - для внебиржевого рынка	*/
+/* AccType 'cur' - если счет на валютной секции
+'forts' - если счет на срочной секции
+'OTC' - если счет внебиржевой
+'other'/null - в остальных случаях */
+
+   var TradeAccount :string;  // Структура по торговым счетам  Да  '<data><TradeAccount><i TradeAccount="L01-00000F00" ClientCode="E3" AccType="forts" /></TradeAccount></data>'
+
+   /* Кратность параметров в соответствии со спецификацией */
+   private macro uInitPrime(p_req_obj, p_edp, p_TradeAccount)
+      private var err_txt;
+      private var temp;
+      
+      if (substr(p_req_obj.Account,1,1) == "F")
+         Account       = "CL"+p_req_obj.Account;
+      else
+         Account       = p_req_obj.Account;
+      end;
+    /*  if (p_edp)
+         if (Account == StrFor(1))
+         else
+            Account = "edp"+ Account;
+         end;
+      end;*/
+
+      /*if ( (not p_edp) or (p_TradeAccount.size == 0) )
+
+         TradeAccount  = "<data><TradeAccount><i TradeAccount=\""+p_req_obj.TradeAccount+"\" ClientCode=\""+p_req_obj.ClientCode+"\" AccType=\""+p_req_obj.AccType+"\" Firm=\""+p_req_obj.Firm+"\" /></TradeAccount></data>";
+      else
+         TradeAccount = "<data>";
+         for (temp, p_TradeAccount)
+            TradeAccount = TradeAccount+"<TradeAccount><i TradeAccount=\""+temp.TradeAccount+"\" ClientCode=\""+temp.ClientCode+"\" AccType=\""+temp.AccType+"\" Firm=\""+temp.Firm+"\" /></TradeAccount>";
+         end;
+         TradeAccount = TradeAccount+ "</data>";
+      end; */
+      if (not p_edp)
+         TradeFloor    = p_req_obj.TradeFloor;
+         TradeAccount  = "<data><TradeAccount><i TradeAccount=\""+p_req_obj.TradeAccount+"\" ClientCode=\""+p_req_obj.ClientCode+"\" AccType=\""+p_req_obj.AccType+"\" Firm=\""+p_req_obj.Firm+"\" /></TradeAccount></data>";
+      else
+         TradeFloor    = p_TradeAccount.TradeFloor;
+         TradeAccount = "<data>";
+         TradeAccount = TradeAccount+"<TradeAccount><i TradeAccount=\""+p_TradeAccount.TradeAccount+"\" ClientCode=\""+p_req_obj.ClientCode+
+                                       "\" AccType=\""+p_TradeAccount.AccType+"\" Firm=\""+p_req_obj.Firm+"\" /></TradeAccount>";
+         TradeAccount = TradeAccount+ "</data>";
+      end;
+      
+
+   end; /* macro uInitPrime() */
+
+   uInitPrime(p_req_obj, p_edp, p_TradeAccount);
+
+end;
+
+/*
+@brief Запуск процедуры usp_ImportUsers через ODBC
+@param[in] cUser класс параметров клиента
+@param[in] login_user логин юзера
+@param[in] type_action тип запуска, используется при обработке ошибки, чтобы не войти в бесконечный цикл
+*/
+
+macro usp_ImportUsers(cUser, login_user:@integer, type_action)
+   var sql_str, cmd, rs;
+
+   login_user = cUser.Login;
+
+   if (cUser.Login > 0)
+      sql_str = String(" EXEC [dbo].[usp_ImportUsers]                                   \n"+
+                       "   @Login                  = "+m_GetSQLString(cUser.Login)    +", \n"+
+                       "   @Password               = "+m_GetSQLString(cUser.Password) +", \n"+
+                       "   @Client                 = "+m_GetSQLString(cUser.Client)   +", \n"+
+                       "   @IsEnabled              = "+cUser.IsEnabled              );
+
+      if (valType(cUser.UserGroup) != V_UNDEF)
+         sql_str = sql_str+ String(", \n   @UserGroup              = "+m_GetSQLString(cUser.UserGroup));
+      end;
+      if (valType(cUser.w3rdAuthUserId) != V_UNDEF)
+         sql_str = sql_str+ String(", \n   @3rdAuthUserId          = "+m_GetSQLString(cUser.w3rdAuthUserId));
+      end;
+      if (valType(cUser.IsMustChangePassword) != V_UNDEF)
+         sql_str = sql_str+ String(", \n   @IsMustChangePassword   = "+cUser.IsMustChangePassword  );
+      end;
+      if (valType(cUser.Data) != V_UNDEF)
+         sql_str = sql_str+ String(", \n   @Data                   = "+m_GetSQLString(cUser.Data) );
+      end;
+
+      v_logger_obj = uws_exchng_logger(null, null, NULL, "usp_ImportUsers", modulename(), NULL, sql_str);
+      v_log_id = v_logger_obj.get_log_id();
+
+// Cherednichenko 2020-06-17 В РСХБ-Брокер Utf-8, перевод в ansi приводит к кракозябрам
+// Cherednichenko 2020-06-22 Временно вернем,т.к. вызывает массовую проблемы
+      sql_str = ToAnsi(sql_str,true);
+// Cherednichenko 2020-06-18 Все-равно кракозябры. Принудительно переведем в utf-8
+//      sql_str = OemToUtf8(sql_str);
+      cmd = RsdCommand(con,sql_str);
+      cmd.execute;
+      cmd.close;
+
+      v_logger_obj.add_response(null, null, null, v_log_id);
+      v_logger_obj.add_error_info(0, "OK");
+
+      v_logger_obj = NULL;
+      v_log_id = NULL;
+   else
+   //   RunError("Регистрация была выполнена ранее "+cUser.Login);
+   end;
+   return STATE_OK;
+onError(er)
+   var env_error = "", i = 0;
+
+   while( i < env.ErrorCount)
+      env_error = env_error + env.Error(i).Descr + " ";
+      i = i+1;
+   end;
+   env_error = ToOEM (env_error, true);
+   if (env_error)
+      if ( (Index(env_error,"Недопустимый (пустой) пароль нового пользователя") > 0) and (type_action != TYPE_NEW_USER) )
+         return STATE_REPEATE;
+      else 
+         RunError(er.message);
+      end;
+   else 
+      RunError(er.message);
+   end;
+
+   return STATE_ERROR; // не подразумевается, что до сюда дойдет
+end;
+
+macro usp_ImportCtptFromExcel(ppartyid, pdlid)
+
+   private var v_logger_obj;    /* Объект для работы с журналом */
+   private var v_log_id;        /* Идентификатор записи в журнале (если требуется что-то добавить) */
+
+   var cCtpt;
+  
+   var ClientData, ClientData_param;
+   var sql_str, rs, cmd;
+   var sql_str_env, cmd_env;
+   var contr;
+
+   var vedp_contr;
+   var v_action = 1;
+
+   if (valType(pdlid) != V_UNDEF) // DEF-30604 закрытие
+      v_action = 0;
+   end;
+
+   ClientData = c_usp_ImportCtptFromExcel_contract(ppartyid, pdlid); // для закрытия площадки выгружаем только тот договор БО, где было закрытие
+   ClientData_param = ClientData.ClientData_all;
+   
+   for (contr, ClientData.Contr_arr)
+      sql_str = "SELECT cntr.t_id cntr_id, cntr.t_servkind, cntr.t_servkindsub, mp.t_id mp_id, mp.t_mpcode, mp.t_marketid, cntr.t_partyid, "+
+                "    cntr.t_dateclose, "+
+                "    ( select count(*) from dobjatcor_dbt o "+
+                "       where o.t_objecttype = 659 and o.t_groupid = :groupid "+
+                "         and (o.t_validtodate >= :dt or o.t_validtodate = to_date('01.01.0001','dd.mm.yyyy')) "+
+                "         and o.t_object = lpad(cntr.t_id,10,'0') and o.t_attrid = 1 ) edp "+
+                "  FROM dsfcontr_dbt cntr, "+
+                "       ddlcontrmp_dbt mp "+
+                "WHERE cntr.t_id = mp.t_sfcontrid "+
+                "  AND mp.t_dlcontrid = :p_dlcontrid ";
+      if (v_action == 0) // DEF-30604 закрытие
+      else
+         sql_str = sql_str + "  AND cntr.t_dateclose = to_date('01.01.0001','dd.mm.yyyy')";
+      end;
+      cmd = RSDCommand(sql_str);
+      cmd.AddParam("groupid", RSDBP_IN, SUBCONTRACT_CATEGORY_EDP);
+      cmd.AddParam("dt", RSDBP_IN, date());
+      cmd.AddParam("p_dlcontrid", RSDBP_IN, contr.contr_id);
+
+      rs = RSDRecordSet(cmd);
+      while (rs.movenext)
+         vedp_contr = false;
+         if (vg_flag_edp)
+            if (rs.value("edp") > 0)
+               vedp_contr = true;
+            else 
+               vedp_contr = false;
+            end;
+         end;
+         
+         if (vedp_contr)      // выгружаем только биржу ММВБ
+            if ( (rs.value("t_servkind") == 1) and (rs.value("t_marketid") != marketid_spb) )
+            else
+               continue;
+            end;
+         end;
+
+         cCtpt = c_usp_ImportCtptFromExcel(contr, ClientData_param, rs.value("t_mpcode"), rs.value("t_partyid"), vedp_contr, v_action);
+
+         if (rs.value("t_servkind") == 21)
+            //BIQ-4152 защита от выгрузки
+//            cCtpt.account = StrFor(1);
+         end;
+
+         if  ( (not cCtpt.Account) or (cCtpt.Account == StrFor(1)) ) 
+            cCtpt.Account="Внебиржа_без_кода";
+             continue;
+         end;
+
+         sql_str_env = String(" EXEC [dbo].[usp_ImportCtptFromExcel]                  \n"+
+                              "   @Client     = "+m_GetSQLString(cCtpt.Client)      +", \n"+
+                              "   @ClientName = "+m_GetSQLString(cCtpt.ClientName)  +", \n"+
+                              "   @Account    = "+m_GetSQLString(cCtpt.Account)     +", \n"+
+                              "   @IsStrategy = "+cCtpt.IsStrategy                +", \n"+
+                              "   @ClientData = "+m_GetSQLString(cCtpt.ClientData)  +", \n"+
+                              "   @Action     = "+cCtpt.Action);
+
+         v_logger_obj = uws_exchng_logger(null, null, NULL, "usp_ImportCtptFromExcel", modulename(), NULL, sql_str_env);
+         v_log_id = v_logger_obj.get_log_id();
+
+// Cherednichenko 2020-06-17 В РСХБ-Брокер Utf-8, перевод в ansi приводит к кракозябрам
+// Cherednichenko 2020-06-22 Временно вернем,т.к. вызывает массовую проблемы
+         sql_str_env = ToAnsi(sql_str_env,true);
+// Cherednichenko 2020-06-18 Все-равно кракозябры. Принудительно переведем в utf-8
+//         sql_str = OemToUtf8(sql_str);
+         cmd_env = RsdCommand(con,sql_str_env);
+         cmd_env.execute;
+         cmd_env.close;
+
+         v_logger_obj.add_response(null, null, null, v_log_id);
+         v_logger_obj.add_error_info(0, "OK");
+
+         v_logger_obj = NULL;
+         v_log_id = NULL;
+
+      end;
+   end;
+
+   v_logger_obj = NULL;
+   v_log_id = NULL;
+
+end;
+
+// BIQ-7041 классы для биржи Спб
+macro usp_ImportUsersClasses(plogin_user, pspb)
+   private var v_logger_obj;    /* Объект для работы с журналом */
+   private var v_log_id;        /* Идентификатор записи в журнале (если требуется что-то добавить) */
+
+   var sql_str_env, cmd_env;
+
+
+   if (pspb)
+      sql_str_env = String(" EXEC [dbo].[usp_ImportUsersClasses]              \n"+
+                           "   @Login     = "+m_GetSQLString(plogin_user) +", \n"+
+                           "   @Classes    = 'SPBXM, SPBDE, SPBFUT, SPBOTC'   ");
+
+      v_logger_obj = uws_exchng_logger(null, null, NULL, "usp_ImportUsersClasses", modulename(), NULL, sql_str_env);
+      v_log_id = v_logger_obj.get_log_id();
+
+      cmd_env = RsdCommand(con,sql_str_env);
+      cmd_env.execute;
+      cmd_env.close;
+
+      v_logger_obj.add_response(null, null, null, v_log_id);
+      v_logger_obj.add_error_info(0, "OK");
+
+      v_logger_obj = NULL;
+      v_log_id = NULL;
+   end;
+
+end;
+
+
+macro usp_ImportTradeAccountMap(ppartyid, spb:@bool)
+   private var v_logger_obj;    /* Объект для работы с журналом */
+   private var v_log_id;        /* Идентификатор записи в журнале (если требуется что-то добавить) */
+
+   const REG_TRADEACCOUNT_CUR_DEFAULT = "РСХБ\\ИНТЕГРАЦИЯ\\РСХБ-БРОКЕР\\MMVB";
+   const REG_TRADEACCOUNT_CUR_DEFAULT_EPO = "РСХБ\\ИНТЕГРАЦИЯ\\РСХБ-БРОКЕР\\MMVB_ЕПО";
+   const REG_TRADEACCOUNT_MMVB_DEFAULT = "РСХБ\\ИНТЕГРАЦИЯ\\РСХБ-БРОКЕР\\ММВБ";
+   const REG_EPO = "SECUR\\БИРЖЕВЫЕ ОПЕРАЦИИ\\КЛИРИНГ.ОБЕСП.ДЛЯ СОБСТВ.СДЕЛОК";
+   const REG_TRADEACCOUNT_SPB_DEFAULT = "РСХБ\\ИНТЕГРАЦИЯ\\РСХБ-БРОКЕР\\СПБ";
+   
+   var Cur_Default, Cur_Default_epo;
+   var Mmvb_Default;
+   var epo = 0;
+
+   var cMap;
+  
+   var ClientData;
+   var sql_str, rs, cmd;
+   var contr;
+   var acc;
+   var sql_str_env, cmd_env;
+   var notes;
+   var ErrCode;
+
+   // BIQ-7041 биржевые коды Спб
+   spb = false;
+   var edp_contr = false;
+   var spb_contr;
+   var SPB_Default;
+   var acc_temp;
+   
+   var sql_str2, acc_main, TradeAccount = TArray;
+
+   private macro GetFirmID(MarketID, MarketKind, ImplKind, FirmID:@string, DepoAcc:@string)
+     var query, cmd, DataSet;
+
+     FirmID  = "";
+     DepoAcc = "";
+
+     query =    " select PRM.T_FIRMCODE as FirmID, PRM.T_DEPOACC as DepoAcc"
+              + "   from ddl_limitprm_dbt prm "
+              + "  where PRM.T_MARKETID = ? "
+              + "    and PRM.T_MARKETKIND = ? "
+              + "    and PRM.T_IMPLKIND = ? ";
+
+     cmd = DL_RSDCommand(query);
+
+     cmd.AddParam(MarketID);
+     cmd.AddParam(MarketKind);
+     cmd.AddParam(ImplKind);
+
+     DataSet = cmd.Execute();
+     if(DataSet.moveNext())
+       FirmID  = DataSet.FirmID;
+       DepoAcc = DataSet.DepoAcc;
+     end;
+   end;
+   
+   private macro FillAcc(_rs)
+      var acc;
+      acc = c_usp_ImportTradeAccountMap_mp;
+      acc.account = _rs.value("t_mpcode");
+      acc.TradeFloor = "";
+      acc.AccType = "";
+      acc.TradeAccount = "";
+      acc.ClientCode = _rs.value("t_mpcode");
+      if (_rs.value("t_servkind") == 1)
+         if (_rs.value("t_marketid") == marketid_spb) // спб
+            spb_contr = true;
+            spb = true;
+         else 
+            spb_contr = false;
+         end;
+
+         if(_rs.value("t_servkindsub") == 8)
+           var FirmID = "";
+           var DepoAcc = "";
+           var ImplKind = 1;
+
+           var ObjCat = RsbObjCategories(659, String(_rs.value("cntr_id"):o:10));
+           if((ObjCat.GetMainAttr(7 /*Перевод активов на новый номер ТКС произведен*/, date(), attr, attrcor ) == 0) and (attrcor.attrid == 1))
+             ImplKind = 2;
+           end;
+           ObjCat = NULL;
+
+           GetFirmID(_rs.value("t_marketid"), 1/*фондовый*/, ImplKind, @FirmID, @DepoAcc);
+
+           acc.Firm = "MC0134700000"; //Всегда этот!!!
+
+           if(not spb_contr)
+              acc.TradeFloor = "КЦБ ММВБ";
+              acc.AccType = "other";
+              notes = readNoteForObject( 659, String(_rs.value("cntr_id"):o:10), 5, date());
+              if (notes)
+                 acc.TradeAccount = notes;
+              else
+                 if(DepoAcc != "")
+                   acc.TradeAccount = DepoAcc;
+                 else
+                   acc.TradeAccount = Mmvb_Default;
+                 end;
+              end;
+           else
+              acc.TradeFloor = "СПБ(USD)";
+              acc.AccType = "spb";
+              notes = readNoteForObject( 659, String(_rs.value("cntr_id"):o:10), 10, date());
+              if (notes)
+                acc.TradeAccount = notes;
+              else
+                if(DepoAcc != "")
+                  acc.TradeAccount = DepoAcc;
+                else
+                  acc.TradeAccount = SPB_Default;
+                end;
+              end;
+           end;
+         end;
+      elif (_rs.value("t_servkind") == 15)
+         acc.TradeFloor = "Фортс";
+         acc.AccType = "forts";
+         notes = readNoteForObject( 659, String(_rs.value("cntr_id"):o:10), 6);
+         if (notes)
+            acc.TradeAccount = notes;
+         else
+            //acc.TradeAccount = "CL" + acc.account;
+            acc.TradeAccount = "CL" + _rs.value("t_mpcode");
+            acc.clientcode = "CL" + acc.clientcode;
+            //acc.TradeAccount = "";
+         end;
+// dan> BIQ-7571            
+         if ( (_rs.value("t_firmid") == "") or (_rs.value("t_firmid") == StrFor(1)) )   // chr(1) не допустим
+           acc.Firm =  "SPBFUTF502";
+         else
+           acc.Firm = string("SPBFUT", _rs.value("t_firmid"));
+         end;  
+// <dan            
+      elif (_rs.value("t_servkind") == 21)
+         acc.TradeFloor = "Cets";
+         acc.AccType = "cur";
+         notes = readNoteForObject( 659, String(_rs.value("cntr_id"):o:10), 6);
+         if (notes)
+            acc.TradeAccount = notes;
+         else
+            if (epo == 1)
+               acc.TradeAccount = Cur_Default_epo;
+            else
+               acc.TradeAccount = Cur_Default;
+            end;
+         end;
+         acc.Firm =  "MB0134700000";
+      end;
+      return acc;
+   
+   end;
+
+   //значения по умолчанию
+   GetRegistryValue(REG_TRADEACCOUNT_CUR_DEFAULT, V_STRING, Cur_Default, ErrCode);
+   if( ( ErrCode > 0 ) or (not Cur_Default) )
+      RunError("Не задано значение по умолчанию "+REG_TRADEACCOUNT_CUR_DEFAULT);
+   end;
+   GetRegistryValue(REG_TRADEACCOUNT_MMVB_DEFAULT, V_STRING, Mmvb_Default, ErrCode);
+   if( ( ErrCode > 0 ) or (not Mmvb_Default) )
+      RunError("Не задано значение по умолчанию "+REG_TRADEACCOUNT_MMVB_DEFAULT);
+   end;
+   // значения по умолчанию для ЕПО
+   GetRegistryValue(REG_EPO, V_INTEGER, epo, ErrCode);
+   if( ( ErrCode > 0 ) or (not epo) )
+      // не задано и ладно
+   else 
+      // задано
+      GetRegistryValue(REG_TRADEACCOUNT_CUR_DEFAULT_EPO, V_STRING, Cur_Default_epo, ErrCode);
+      if( ( ErrCode > 0 ) or (not Cur_Default_epo) )
+         RunError("Не задано значение по умолчанию "+REG_TRADEACCOUNT_CUR_DEFAULT_EPO);
+      end;
+   end;
+   // значение по умолчанию для СПБ
+   GetRegistryValue(REG_TRADEACCOUNT_SPB_DEFAULT, V_STRING, SPB_Default, ErrCode);
+   if( ( ErrCode > 0 ) or (not SPB_Default) )
+      RunError("Не задано значение по умолчанию "+REG_TRADEACCOUNT_SPB_DEFAULT);
+   end;
+   
+   ClientData = c_usp_ImportCtptFromExcel_contract(ppartyid);
+   
+   for (contr, ClientData.Contr_arr)
+      TradeAccount.size = 0;
+      sql_str = "SELECT cntr.t_id cntr_id, cntr.t_servkind, cntr.t_servkindsub, mp.t_id mp_id, mp.t_mpcode, mp.t_firmid, mp.t_marketid, "+
+                "    ( select count(*) from dobjatcor_dbt o "+
+                "       where o.t_objecttype = 659 and o.t_groupid = :groupid "+
+                "         and (o.t_validtodate >= :dt or o.t_validtodate = to_date('01.01.0001','dd.mm.yyyy')) "+
+                "         and o.t_object = lpad(cntr.t_id,10,'0') and o.t_attrid = 1 ) edp "+
+                "  FROM dsfcontr_dbt cntr, "+
+                "       ddlcontrmp_dbt mp "+
+                "WHERE cntr.t_id = mp.t_sfcontrid "+
+                "  AND mp.t_dlcontrid = :p_dlcontrid "+
+                "  AND cntr.t_dateclose = to_date('01.01.0001','dd.mm.yyyy') ";
+      edp_contr = false;
+      if (vg_flag_edp)
+         sql_str2 = "select count(*) cnt from ("+sql_str+") where edp > 0"; 
+         cmd = RSDCommand(sql_str2);
+         cmd.AddParam("groupid", RSDBP_IN, SUBCONTRACT_CATEGORY_EDP);
+         cmd.AddParam("dt", RSDBP_IN, date());
+         cmd.AddParam("p_dlcontrid", RSDBP_IN, contr.contr_id);
+         rs = RSDRecordSet(cmd);
+         if (rs.movenext)
+            if (rs.value("cnt") > 0)
+               edp_contr = true;
+            end;
+         end;
+         rs.close; cmd.close; rs = null; cmd = null;
+      end;
+      cmd = RSDCommand(sql_str);
+      cmd.AddParam("groupid", RSDBP_IN, SUBCONTRACT_CATEGORY_EDP);
+      cmd.AddParam("dt", RSDBP_IN, date());
+      cmd.AddParam("p_dlcontrid", RSDBP_IN, contr.contr_id);
+      rs = RSDRecordSet(cmd);
+         
+      while (rs.movenext)
+         acc = FillAcc(rs);
+         if  ( (not acc.Account) or (acc.Account == StrFor(1)) ) 
+            acc.Account="Внебиржа_без_кода";
+            continue;
+         end;
+
+         if (not edp_contr)
+            cMap = c_usp_ImportTradeAccountMap(acc, edp_contr, /*TradeAccount*/ acc);   
+
+            sql_str_env = String(" EXEC [dbo].[usp_ImportTradeAccountMap]                  \n"+
+                                 "   @Account       = "+m_GetSQLString(cMap.Account)     +", \n"+
+                                 "   @TradeFloor    = "+m_GetSQLString(cMap.TradeFloor)  +", \n"+
+                                 "   @TradeAccount  = "+m_GetSQLString(cMap.TradeAccount));
+
+            v_logger_obj = uws_exchng_logger(null, null, NULL, "usp_ImportTradeAccountMap", modulename(), NULL, sql_str_env);
+            v_log_id = v_logger_obj.get_log_id();
+
+   // Cherednichenko 2020-06-17 В РСХБ-Брокер Utf-8, перевод в ansi приводит к кракозябрам
+   // Cherednichenko 2020-06-22 Временно вернем,т.к. вызывает массовую проблемы
+            sql_str_env = ToAnsi(sql_str_env,true);
+   // Cherednichenko 2020-06-18 Все-равно кракозябры. Принудительно переведем в utf-8
+   //         sql_str = OemToUtf8(sql_str);
+            cmd_env = RsdCommand(con,sql_str_env);
+            cmd_env.execute;
+            cmd_env.close;
+
+            v_logger_obj.add_response(null, null, null, v_log_id);
+            v_logger_obj.add_error_info(0, "OK");
+
+            v_logger_obj = NULL;
+            v_log_id = NULL;
+         else
+            if (acc.TradeFloor == "КЦБ ММВБ")
+               acc_main = acc;
+            end;
+            TradeAccount.value(TradeAccount.size) = acc;
+           
+         end;
+      end;
+
+      if (edp_contr)
+         for (acc_temp, TradeAccount)
+            cMap = c_usp_ImportTradeAccountMap(acc_main, edp_contr, /*TradeAccount*/ acc_temp);
+
+            sql_str_env = String(" EXEC [dbo].[usp_ImportTradeAccountMap]                  \n"+
+                                 "   @Account       = "+m_GetSQLString(cMap.Account)     +", \n"+
+                                 "   @TradeFloor    = "+m_GetSQLString(cMap.TradeFloor)  +", \n"+
+                                 "   @TradeAccount  = "+m_GetSQLString(cMap.TradeAccount));
+
+            v_logger_obj = uws_exchng_logger(null, null, NULL, "usp_ImportTradeAccountMap", modulename(), NULL, sql_str_env);
+            v_log_id = v_logger_obj.get_log_id();
+
+            sql_str_env = ToAnsi(sql_str_env,true);
+            cmd_env = RsdCommand(con,sql_str_env);
+            cmd_env.execute;
+            cmd_env.close;
+
+            v_logger_obj.add_response(null, null, null, v_log_id);
+            v_logger_obj.add_error_info(0, "OK");
+
+            v_logger_obj = NULL;
+            v_log_id = NULL;
+         end;
+      end;
+   end;
+
+end;
+
+private macro SetCategories(_partyid, _groupid, _attrid)
+   var ObjCat;
+   var IsAttr, stat;
+   var ObjID = String(_partyid:o:10);
+
+   ObjCat = RsbObjCategories( OBJTYPE_PARTY, ObjID);
+
+   stat = ObjCat.DisConnectAttr(_groupid, 0 );
+   stat = ObjCat.ConnectAttr(_groupid, _attrid, "",  "", {curdate} );
+
+   if(stat == 0)
+      stat = ObjCat.Save(ObjID);
+   end;
+
+end;
+
+
+macro usr_sendrequest(_partyid, _manual, _type)
+   private var sql_str, cmd, rs;
+   private var DSN, USER, PASSWORD;
+   private var CV_ODBS_CONSTRING;
+   private var type_action, login_user, spb;
+   private var cUsert;
+   private var pdlid;
+
+   GetRegistryValue("РСХБ\\ИНТЕГРАЦИЯ\\INTEGR_SERV_PRM\\RSHBBROKER\\DSN", V_STRING, DSN);
+   GetRegistryValue("РСХБ\\ИНТЕГРАЦИЯ\\INTEGR_SERV_PRM\\RSHBBROKER\\USER", V_STRING, USER);
+   GetRegistryValue("РСХБ\\ИНТЕГРАЦИЯ\\INTEGR_SERV_PRM\\RSHBBROKER\\PASSWORD", V_STRING, PASSWORD);
+
+   CV_ODBS_CONSTRING = "dsn="+DSN+";user id="+USER+";password="+PASSWORD;
+
+   env = RsdEnvironment("RDDrvO","RDDrvO.dll");
+   con = RsdConnection(env,CV_ODBS_CONSTRING);
+   
+   // BIQ-7785, в настройке дата начала ЕПД
+   var Attrcode;
+   var EdpDate = "", getreg = GetRegistryValue ("РСХБ\\БРОКЕРСКОЕ ОБСЛУЖИВАНИЕ\\ДАТА ВКЛЮЧЕНИЯ ЕДП", V_STRING, EdpDate );
+   if (ValType(getreg) != V_UNDEF)
+      if ((EdpDate != "00.00.0000") and ({curdate} >= date(EdpDate)))
+         vg_flag_edp = true;
+      end;
+   end;
+
+   // BIQ-7041 биржевые коды Спб
+   marketid_spb = ПолучитьБиржуПоВидуКодаДБО(DLCCK_SPB_BIDCODE); 
+
+   if (ValType(_type) == V_UNDEF)
+      _type = 0;
+   end;
+
+   cUsert = c_usp_ImportUsers(_partyid, @type_action, _manual, _type);
+
+   if (cUsert.login < 0) // не выгружаем
+      return true;
+   end;
+
+   if (_type == 3)  //DEF-30604 при закрытии договора вызываем usp_ImportCtptFromExcel только для закрытых
+      for (pdlid,cUsert.c_ar_close) 
+         usp_ImportCtptFromExcel(_partyid, pdlid.Contr_id);
+      end;
+      if (type_action == 1) // если есть еще договора, то ничего больше не делаем
+         type_action = 4;
+      end;
+   elif (_type == 11) // вызвана ручная выгрузка, выгружаем и открытые, и закрытые
+      for (pdlid,cUsert.c_ar_close) 
+         usp_ImportCtptFromExcel(_partyid, pdlid.Contr_id);
+      end;
+      if (type_action == 1)
+         usp_ImportCtptFromExcel(_partyid);
+      end;
+   else 
+      if (type_action == 1)
+         usp_ImportCtptFromExcel(_partyid);
+      end;
+   end;
+
+   if ( type_action == 4 ) //DEF-30604 если остались открытые договора, то больше ничего не выгружаем
+   else 
+     var state_users = usp_ImportUsers(cUsert, @login_user, _type);
+     if (state_users == STATE_REPEATE)
+        cUsert = c_usp_ImportUsers(_partyid, @type_action, _manual, TYPE_NEW_USER);
+        state_users = usp_ImportUsers(cUsert, @login_user, TYPE_NEW_USER);
+     end;
+   end;
+
+   if (type_action == 1)
+      usp_ImportTradeAccountMap(_partyid, @spb);
+      //usp_ImportUsersClasses(login_user, spb);
+      SetCategories(_partyid, CV_CATEGORY_UNLOAD_BROKER, CV_CATEGORY_UNLOAD_OK);
+//      var err, AttrCode;
+//      GetMainObjAttr(err, 3, string(_partyid:10:o), CV_CATEGORY_UNLOAD_QUIK, AttrCode);
+               sql_str =
+                     " DECLARE "
+                   + "   v_state   usr_clnt_cdwrd_buf_dbt.t_cw_status%TYPE := -1; "
+                   + "   p_cw_client NUMBER(10) := :p_cw_client; "
+                   + "BEGIN "
+                   + "   BEGIN "
+                   + "      SELECT t_cw_status "
+                   + "        INTO v_state "
+                   + "        FROM usr_clnt_cdwrd_buf_dbt "
+                   + "       WHERE t_cw_type = 1 AND t_cw_client = p_cw_client; "
+                   + "   EXCEPTION "
+                   + "      WHEN NO_DATA_FOUND "
+                   + "      THEN "
+                   + "         v_state := -1; "
+                   + "   END; "
+                   + " "
+                   + "   IF v_state = 6 "
+                   + "   THEN "
+                   + "      DELETE FROM usr_clnt_cdwrd_buf_dbt "
+                   + "            WHERE t_cw_type = 1 AND t_cw_client = p_cw_client; "
+                   + "   ELSIF v_state <> -1 "
+                   + "   THEN "
+                   + "      UPDATE usr_clnt_cdwrd_buf_dbt "
+                   + "         SET t_cw_status = 6 "
+                   + "       WHERE t_cw_type = 1 AND t_cw_client = p_cw_client; "
+                   + "   END IF; "
+                   + "END; ";
+ 
+         cmd = RSDCommand(sql_str);
+         cmd.AddParam("p_cw_client", RSDBP_IN, _partyid);
+         cmd.execute;
+         cmd.close;
+   elif ( type_action == 4 )
+      SetCategories(_partyid, CV_CATEGORY_UNLOAD_BROKER, CV_CATEGORY_UNLOAD_OK);
+   else
+      SetCategories(_partyid, CV_CATEGORY_UNLOAD_BROKER, CV_CATEGORY_UNLOAD_CLOSE);
+   end;
+
+   return true;
+onError(er)
+   var env_error = "", i = 0;
+
+   while( i < env.ErrorCount)
+      env_error = env_error + env.Error(i).Descr + " ";
+      i = i+1;
+   end;
+   env_error = ToOEM (env_error, true);
+   if (not env_error)
+      env_error = er.message;
+   end;
+
+   if (ValType(v_logger_obj) == V_UNDEF)
+      v_logger_obj = uws_exchng_logger(null, null, NULL, "usp_Import", modulename(), NULL, " ");
+      v_log_id = v_logger_obj.get_log_id();
+   end;
+
+   v_logger_obj.add_response(env_error, null, null, v_log_id);
+   v_logger_obj.add_error_info(-1001, env_error);
+
+   v_logger_obj = NULL;
+   v_log_id = NULL;
+
+   if (type_action == 1)
+      if (Index(env_error,"Регистрация была") > 0)
+      else
+         SetCategories(_partyid, CV_CATEGORY_UNLOAD_BROKER, CV_CATEGORY_UNLOAD_ERROR);
+      end;
+   else
+      SetCategories(_partyid, CV_CATEGORY_UNLOAD_BROKER, CV_CATEGORY_UNLOAD_CLOSE_ERROR);
+   end;
+   //SetParm(1, env_error);  //нигде не используется
+   return false;
+end;
+
+// пример вызова - входящий параметр t_partyid
+//usr_sendrequest(148796);
+//usr_sendrequest(126708);/*Кабалкина*/
+ 
+//end;

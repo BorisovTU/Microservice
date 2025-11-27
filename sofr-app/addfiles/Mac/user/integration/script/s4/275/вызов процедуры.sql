@@ -1,0 +1,3 @@
+begin
+    rsFillPortfolio(:pdate);
+end;

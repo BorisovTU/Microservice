@@ -1,0 +1,1065 @@
+/*
+$Name:         vadepo.mac
+$Module:       Учтенные векселя
+$Description:  Интерфейс с депозитарием.
+*/
+IMPORT RsbDataSet, vadpkind, valib, va4each, vsbnrfd, vamisc, vadpgrp;
+
+// Макрос _НЕ_ рассчитан на то, что часть векселей, по которым генерится поручение,
+// уже хранится у нас, а часть - еще нет! 
+// (т.е. по части векселей должно сгенериться внутридепозитарное поручение(800),
+//  а по остальным - прием(840))
+// при попытке провести одно из таких поручений в Депозитарии выскочит ошибка 8598
+
+PRIVATE VAR GlobalGrp = null; // Объект класса, использовавшийся для группировки векселей.
+                              // можно использовать только в MakeDepoDraftProc
+                              // и функциях, вызываемых из нее!!! (с обязательной проверкой на null)
+
+PRIVATE CONST DOCKIND_DEAL_AVOIR = 6; /* Вид документа-основания: сделка с ц/б */
+
+
+/* класс: ФИ, номер инв.карточки
+*/
+PRIVATE CLASS DataClass (TheFiid, TheAnyCard) 
+var 
+   FIID, anycard;
+
+   FIID    = TheFiid;
+   anycard = TheAnyCard;
+END;
+
+
+/* Определить режим работы с депозитарием
+*/
+MACRO VA_WorkWithDepositary(state : @variant)
+var stat;
+
+    GetRegistryValue("УЧТЕННЫЕ ВЕКСЕЛЯ\\РЕЖИМ РАБОТЫ\\ВЕДЕНИЕ ДЕПОЗИТАРНОГО УЧЁТА",
+                     V_BOOL, state, stat);
+ 
+    if(stat != 0) 
+        VA_Err("Ошибка при определении настройки| \"УЧТЕННЫЕ ВЕКСЕЛЯ\\РЕЖИМ РАБОТЫ\\ВЕДЕНИЕ ДЕПОЗИТАРНОГО УЧЁТА\"");
+    end;
+
+    return (stat == 0);
+END;
+
+/* Учет УВ ведется в Депозитарии по принципам, аналогичным депозитарному учету
+*/
+MACRO VA_OurBannersInDepository(state : @variant)
+var stat;
+
+    GetRegistryValue("УЧТЕННЫЕ ВЕКСЕЛЯ\\РЕЖИМ РАБОТЫ\\УВ В ДЕПОЗИТАРИИ",
+                     V_BOOL, state, stat);
+ 
+    if(stat != 0) 
+        VA_Err("Ошибка при определении настройки| \"УЧТЕННЫЕ ВЕКСЕЛЯ\\РЕЖИМ РАБОТЫ\\УВ В ДЕПОЗИТАРИИ\"");
+    end;
+
+    return (stat == 0);
+END;
+
+/* Возвращает тип связки договор-вексель
+*/
+PRIVATE MACRO GetLinkKind(tick, paym_Purpose)
+var
+   stat = 0;
+
+   if(tick.BofficeKind == DL_VAREPAY)      /* погашение УВ */
+      return VSORDLNK_K_SALE;
+   elif(tick.BofficeKind == DL_VAPAWN)     /* залог УВ */
+      return VSORDLNK_K_PAWN;
+   elif(VA_IsSale(tick.DealType))          /* продажа */
+      return VSORDLNK_K_SALE;
+   elif(VA_IsBuy(tick.DealType))           /* покупка */
+      return VSORDLNK_K_BUY;
+   elif(VA_IsExchange(tick.DealType)) /* мена */
+      if(paym_Purpose == BAi)
+         return VSORDLNK_K_SALE;
+      elif(paym_Purpose == CAi)
+         return VSORDLNK_K_BUY;
+      end;
+   end;
+
+   return VSORDLNK_K_ALL;
+END;
+
+
+/* Поля платежа необходимые для заполнения поручений
+*/
+PRIVATE CLASS FillParams
+var
+    PaymentID,
+    Purpose,
+    ValueDate,
+    Payer,
+    Receiver,
+    BaseFIID,
+    BaseAmount,
+    ReceiverAccount;
+
+    MACRO InitByPaym(paym)
+        PaymentID       = paym.PaymentID;
+        Purpose         = paym.Purpose;
+        ValueDate       = paym.ValueDate;
+        Payer           = paym.Payer;
+        Receiver        = paym.Receiver;
+        BaseFIID        = paym.BaseFIID;
+        BaseAmount      = paym.BaseAmount;
+        ReceiverAccount = paym.ReceiverAccount;
+    END;
+
+    MACRO InitByID(paym_id)
+    var paym = RSBPayment(paym_id);
+
+        InitByPaym(paym);
+    END;
+END;
+
+
+PRIVATE MACRO GetDealKind(tick)
+  var sql, sel, rsd;
+
+  if(tick.RequestID) // Траст. Операция ВВК.
+    sql = " SELECT sp.t_Kind" +
+          " FROM dspground_dbt sp, dtsiorqst_dbt ts " +
+          " WHERE ts.t_ID = ? /*1*/" +
+          " AND sp.t_SpGroundId = ts.t_DocumentID" ;
+  
+    sel = RSDCommand( sql );
+
+    sel.AddParam("TsID", RSDBP_IN, tick.RequestID );  /*1*/
+
+    sel.Execute();
+
+    rsd = TRsbDataSet(sel);
+    if( rsd.MoveNext() )
+      return rsd.t_Kind;
+    end;
+
+    msgbox("Не найден вид документа для заявления на ввод/вывод капитала|(запись в dtsiorqst_dbt) с ID = ", tick.RequestID);
+    return 0;
+  else
+    return DOCKIND_DEAL_AVOIR; /* Вид документа-основания: сделка с ц/б */
+  end;
+END;
+
+/* Заполнение параметров поручения для 840: прием ц/б на хранение
+*/
+PRIVATE MACRO Fill_840(Draft, tick, paym, dbtprop, crdprop, DwAccCode, BnAccCode)
+
+   Draft.SignedDate         = paym.ValueDate;        /* Дата подписания */
+   Draft.RegisterDate       = paym.ValueDate;        /* Дата ввода документа */
+   Draft.DwPartyID          = {OurBank};           /* Отправитель */
+   Draft.DwAccPurp          = OBJTYPE_DEPOKINDTYPE_PLACESAVE; //тип счета отправителя по назначению "Хранилище"
+   Draft.Unblock            = OBJTYPE_DEPOACC_BLOCK_STANDART; /* Блокировка по счету отправителя */
+   Draft.BnPartyID          = paym.Receiver;
+   if(paym.Receiver == {OurBank}) 
+      Draft.BnAccPurp       = OBJTYPE_DEPOKINDTYPE_DEPONENT; //тип счета получателя по назначению "Счет владельца"      
+   end;
+   Draft.Block              = OBJTYPE_DEPOACC_BLOCK_STANDART; /* Блокировка по счету получателя */
+   Draft.FIID               = paym.BaseFIID;
+   Draft.Amount             = paym.BaseAmount;
+   Draft.ValueDate          = paym.ValueDate;
+   Draft.IsDVP              = "";                  /* ППП */
+   Draft.DealKind           = GetDealKind(tick);   /* Вид документа-основания */
+   Draft.Agreed             = tick.DealDate;       /* Дата документа-основания */
+   Draft.DealXid            = tick.DealCode;       /* Номер документа-основания */
+   Draft.Product            = 1;                   /* Содержание транзакции: купля-продажа */
+   Draft.FromTransitAccount = "";                  /* С транзитного счета */
+   Draft.IndoorStorage      = "X";                 /* Режим хранения */
+   Draft.Oper               = {oper};              /* Операционист */
+   Draft.Initiator          = -1;                  /* инициатор */
+   Draft.CreateDwReport     = "X";                 /* Создавать отчет по счету отправителя */
+   Draft.CreateBnReport     = "X";                 /* Создавать отчет по счету получателя */
+   Draft.DealParty          = tick.PartyID;        /* Составитель документа-основания */
+   Draft.AutoSendReport     = "X";                 /* Автоматическая отправка отчетов об исполнении*/
+END;
+
+
+/* Заполнение параметров поручения для 845: списание ц/б с хранения
+*/
+PRIVATE MACRO Fill_845(Draft, tick, paym, dbtprop, crdprop, DwAccCode, BnAccCode)
+
+   Draft.SignedDate         = paym.ValueDate;      /* Дата подписания */
+   Draft.RegisterDate       = paym.ValueDate;      /* Дата ввода документа */
+   Draft.DwPartyID          = paym.Payer;   /* Отправитель */
+   if(paym.Payer == {OurBank}) 
+     Draft.DwAccPurp        = OBJTYPE_DEPOKINDTYPE_DEPONENT; //тип счета отправителя по назначению "Счет владельца"
+   end;
+
+   Draft.Unblock            = OBJTYPE_DEPOACC_BLOCK_STANDART; /* Блокировка по счету отправителя */
+   Draft.BnPartyID          = {OurBank};
+   Draft.BnAccPurp          = OBJTYPE_DEPOKINDTYPE_PLACESAVE; //тип счета получателя по назначению "Хранилище"
+   Draft.Block              = OBJTYPE_DEPOACC_BLOCK_STANDART; /* Блокировка по счету получателя */
+   Draft.FIID               = paym.BaseFIID;
+   Draft.Amount             = paym.BaseAmount;
+   Draft.ValueDate          = paym.ValueDate;
+   Draft.IsDVP              = "";                  /* ППП */
+   Draft.DealKind           = GetDealKind(tick);   /* Вид документа-основания */
+   Draft.Agreed             = tick.DealDate;       /* Дата документа-основания */
+   Draft.DealXid            = tick.DealCode;       /* Номер документа-основания */
+   Draft.Product            = 1;                   /* Содержание транзакции: купля-продажа */
+   Draft.FromTransitAccount = "";                  /* С транзитного счета */
+   Draft.IndoorStorage      = "X";                 /* Режим хранения */
+   Draft.Oper               = {oper};              /* Операционист */
+   Draft.Initiator          = -1;                  /* инициатор */
+   Draft.CreateDwReport     = "X";                 /* Создавать отчет по счету отправителя */
+   Draft.CreateBnReport     = "X";                 /* Создавать отчет по счету получателя */
+   Draft.DealParty          = tick.PartyID;        /* Составитель документа-основания */
+   Draft.AutoSendReport     = "X";                 /* Автоматическая отправка отчетов об исполнении*/
+END;
+
+
+/* Заполнение параметров поручения для 800: внутридепозитарный перевод
+*/
+PRIVATE MACRO Fill_800(Draft, tick, paym, dbtprop, crdprop, DwAccCode, BnAccCode)
+
+   Draft.SignedDate         = paym.ValueDate;      /* Дата подписания */
+   Draft.RegisterDate       = paym.ValueDate;      /* Дата ввода документа */
+   Draft.DwPartyID          = paym.Payer;   /* Отправитель */
+   if(paym.Payer == {OurBank}) 
+     Draft.DwAccPurp        = OBJTYPE_DEPOKINDTYPE_DEPONENT; //тип счета отправителя по назначению "Счет владельца"
+   end;
+   Draft.Unblock            = OBJTYPE_DEPOACC_BLOCK_STANDART; /* Блокировка по счету отправителя */
+   Draft.BnPartyID          = paym.Receiver;
+   if(paym.Receiver == {OurBank}) 
+     Draft.BnAccPurp        = OBJTYPE_DEPOKINDTYPE_DEPONENT; //тип счета получателя по назначению "Счет владельца"
+   end;
+
+   Draft.Block              = OBJTYPE_DEPOACC_BLOCK_STANDART; /* Блокировка по счету получателя */
+   Draft.FIID               = paym.BaseFIID;
+   Draft.Amount             = paym.BaseAmount;
+   Draft.ValueDate          = paym.ValueDate;
+   Draft.IsDVP              = "";                  /* ППП */
+   Draft.DealKind           = GetDealKind(tick);   /* Вид документа-основания */
+   Draft.Agreed             = tick.DealDate;       /* Дата документа-основания */
+   Draft.DealXid            = tick.DealCode;       /* Номер документа-основания */
+   Draft.Product            = 1;                   /* Содержание транзакции: купля-продажа */
+   Draft.FromTransitAccount = "";                  /* С транзитного счета */
+   Draft.IndoorStorage      = "X";                 /* Режим хранения */
+   Draft.Oper               = {oper};              /* Операционист */
+   Draft.PaymentID          = paym.PaymentID; 
+   Draft.Initiator          = -1;                  /* инициатор */
+   Draft.CreateDwReport     = "X";                 /* Создавать отчет по счету отправителя */
+   Draft.CreateBnReport     = "X";                 /* Создавать отчет по счету получателя */
+   Draft.DealParty          = tick.PartyID;        /* Составитель документа-основания */
+   Draft.AutoSendReport     = "X";                 /* Автоматическая отправка отчетов об исполнении*/
+END;
+
+PRIVATE MACRO CheckDepoAcntSideBalbyPurp(PurpType, SideBal)
+   var llclsv = TBFile("llclsval.dbt");
+
+   if(SideBal == 1/*SIDEBALANCE_ACTIVE*/)
+     llclsv.AddFilter(" t_Classificator = "+LLCLASS_DEPOKINDTIPE_ACTIVE+" and t_Element = "+PurpType);
+   else
+     llclsv.AddFilter(" t_Classificator = "+LLCLASS_DEPOKINDTIPE_PASSIVE+" and t_Element = "+PurpType);                                               
+   end;
+
+   return llclsv.next();
+
+END;
+
+// Заполнение счетов в отложенном поручении в депозитарий
+MACRO FillAccounts(Draft, tick, payms, grp)
+var
+   DwAccCode = Draft.DwAccCode,
+   BnAccCode = Draft.BnAccCode,
+   dpac = Tbfile("depoac.dbt"),
+   dpacc = Tbfile("depoacnt.dbt");       
+
+   // Если в платеже явно задан корректный счет депо, то подставляем в поручение именно его.
+   if(VA_GetDepoAcnt(payms.rec.PayerAccount, tick.Department, dpacc))
+      dpac.KeyNum = 0;
+      dpac.rec.Id = dpacc.rec.Type;
+      if(dpac.GetEQ() AND (dpac.rec.Type == Draft.DwAccPurp))
+         // Только, если тип счета в платеже совпадает с типом счета, указанном в поручении
+         DwAccCode = payms.rec.PayerAccount;
+      end;
+   end;
+
+   // В grp хранятся номера счетов, на которых сейчас учитывается вексель:
+   // счет хранилища - активный (grp.DwAccCode)
+   // и счет собственника - пассивный (grp.BnAccCode)
+   if((DwAccCode == "") and (ValType(grp) != V_UNDEF))
+      if(CheckDepoAcntSideBalbyPurp(Draft.DwAccPurp, 2/*SIDEBALANCE_PASSIVE*/))
+         // только, если нужен пассивный счет!!!
+         DwAccCode = grp.DwAccCode;
+      end;
+   end;
+
+   if(VA_GetDepoAcnt(payms.rec.ReceiverAccount, tick.Department, dpacc))
+      dpac.KeyNum = 0;
+      dpac.rec.Id = dpacc.rec.Type;
+      if(dpac.GetEQ() AND (dpac.rec.Type == Draft.BnAccPurp))
+         // Только, если тип счета в платеже совпадает с типом счета, указанном в поручении
+         BnAccCode = payms.rec.ReceiverAccount;
+      end;
+   end;
+   if((BnAccCode == "") and (ValType(grp) != V_UNDEF))
+      if(CheckDepoAcntSideBalbyPurp(Draft.BnAccPurp, 1/*SIDEBALANCE_ACTIVE*/))
+         // только, если нужен активный счет!!!
+         BnAccCode = grp.BnAccCode;
+      end;
+   end;
+   
+   Draft.DwAccCode = DwAccCode;
+   Draft.BnAccCode = BnAccCode;
+END;
+
+
+/* Создает инв.карточку векселя
+*/
+PRIVATE MACRO MakeInvCard(bnr, leg, tick, data:@variant)
+var 
+   pm = RSBPayment(data.paymID),
+   stat = 0;
+   record invcprm("invcprm.rec");
+
+   data.InvCardID = 0;
+
+   ExecMacroFile("vadputl.mac", "VADP_InitParmInvCrd", invcprm);
+
+   invcprm.FiCertID      = DL_GetBnrFiCertID(bnr.rec.BCID);
+   invcprm.Department    = bnr.rec.Department; 
+   invcprm.Branch        = bnr.rec.Branch;
+   invcprm.RegistrDate   = pm.ValueDate;
+   invcprm.Oper          = {oper};
+   invcprm.IsEnter       = UNSET_CHAR;
+
+   stat = ExecMacroFile("vadputl.mac", "VADP_InsertInventoryCard", data.InvCardID, invcprm);
+   
+   return (stat == 0);
+END;
+
+
+/* Копирует агентов в депозитарий.
+*/
+PRIVATE MACRO MakeInvList(InvCardID, draftID)
+var 
+    stat = 0;
+
+    if(ExecMacroFile("vadputl.mac", "VADP_InsertInvList", InvCardID, 0, 0, DraftID) != 0)
+      stat = VA_Err("Ошибка при занесении инв.карточки в опись");
+    end;
+
+    return (stat == 0);
+END;
+
+
+/* Создает ИК векселя.
+*/
+MACRO BindBanner(bnr, leg, tick, i, lnk, data:@variant)
+var
+   stat = 0;
+
+   data.bnr = bnr;
+
+   if((GlobalGrp != null) and (not GlobalGrp.filter(bnr, leg, tick, i, lnk)))
+      // фильтр задан и вексель через него не прошел
+   elif(bnr.rec.FIID != data.FIID)
+      /* вексель не входит в текущую группу */;
+   elif(not MakeInvCard(bnr, leg, tick, @data))
+      stat = VA_Err("Ошибка при создании инв.карточки"); 
+   elif(not MakeInvList(data.InvCardID, data.draftID))
+     stat = 1;
+   end;
+
+   return stat;
+END;
+
+
+/* класс: ФИ, вексель
+*/
+CLASS DataClass2 (TheFiid, TheDraftID, ThePaymID) 
+var 
+   FIID, draftID, paymID, bnr, InvCardID = 0;
+
+   FIID    = TheFiid;
+   draftID = TheDraftID;
+   paymID  = ThePaymID;
+END;
+
+
+/* Создает ИК для векселей, которые входят в текущую группу
+*/
+PRIVATE MACRO BindBanners(Draft, tick, payms)
+var
+   data = null, stat = 0;
+
+   data = DataClass2(payms.rec.BaseFIID, Draft.draftID, payms.rec.PaymentID);
+   stat = VA_ForEachBanner(tick, @BindBanner, GetLinkKind(tick, payms.rec.Purpose), @data);
+
+   return (stat == 0);
+END;
+
+
+/* Изменяет ИК векселя.
+*/
+MACRO ModiBanner(bnr, leg, tick, i, lnk, data:@variant)
+var
+   stat = 0;
+
+   data.bnr = bnr;
+
+   var name = "";
+   var fininstr = Tbfile("fininstr.dbt", "R", 0);
+
+   if((GlobalGrp != null) and (not GlobalGrp.filter(bnr, leg, tick, i, lnk)))
+      // фильтр задан и вексель через него не прошел
+   elif(bnr.rec.FIID != data.FIID)
+      /* вексель не входит в текущую группу */;
+   elif((data.InvCardID = VA_FindInvCard(bnr, leg)) != 0)
+     if(not MakeInvList(data.InvCardID, data.draftID))
+       stat = 1;
+     end;
+   else /* Не нашли ИК */
+             
+        fininstr.rec.FIID = bnr.rec.FIID;
+        if(fininstr.GetEQ)
+           if(FI_AvrKindsEQ( FIKIND_AVOIRISS, AVOIRISSKIND_BILL, fininstr.rec.AvoirKind ))
+             name = "векселя";
+           else name = "БС";
+           end;
+        end;
+
+        stat = VA_Err("Не найдена инвентарная карточка "+name+" серия ",
+                    bnr.rec.BCSeries, " N ",  trim(bnr.rec.BCNumber));
+   end;
+
+   return stat;
+END;
+
+
+/* Изменяет ИК для векселей, которые входят в текущую группу
+*/
+PRIVATE MACRO ModiBanners(Draft, tick, payms)
+var
+   data = null, stat = 0;
+
+   data = DataClass2(payms.rec.BaseFIID, Draft.draftID);
+   stat = VA_ForEachBanner(tick, @ModiBanner, GetLinkKind(tick, payms.rec.Purpose), @data);
+
+   return (stat == 0);
+END;
+
+
+/*************************** Упрощенный вариант ModiBanners ***********************************/
+/* Изменяет ИК векселя.
+*/
+PRIVATE MACRO ModiBanner2(InvCardID, draftID)
+var
+   stat = 0;
+
+   if(not MakeInvList(InvCardID, draftID))
+     stat = 1;
+   end;
+
+   return stat;
+END;
+
+
+/* Изменяет ИК для векселей, которые входят в текущую группу
+*/
+MACRO ModiBanners2(Draft, grp)
+var
+   stat = 0, i = 0;
+
+   while((stat == 0) AND (i < grp.ICs.size))
+      stat = ModiBanner2(grp.ICs[i].InvCardID, Draft.draftID);
+      i = i + 1;
+   end;
+
+   return (stat == 0);
+END;
+/*************************** Упрощенный вариант ModiBanners ***********************************/
+
+
+// Передать все документы приложения операции/сделки поручению депо
+PRIVATE MACRO CreateAllAddDocs(deal, DraftID, Kind)
+  var stat = 0;
+  var sql, spground, DEPO_SelfDivision, ErrCode, GroundPrm;
+
+  sql = RSDCommand(" SELECT spground.*" +
+                   "   FROM dspground_dbt spground, dspgrdoc_dbt spgrdoc " +
+                   "  WHERE spgrdoc.t_sourcedockind = ? AND " +
+                   "        spgrdoc.t_sourcedocid   = ? AND " + 
+                   "        spgrdoc.t_spgroundid    = spground.t_spgroundid " );
+
+  sql.addParam( "", RSDBP_IN, deal.BOfficeKind );
+  sql.addParam( "", RSDBP_IN, deal.DealID );
+  sql.execute();
+
+  spground = TRSBDataSet( sql );
+
+  if( spground == NULL )
+    stat = VA_Err("Ошибка при определении документов по сделке.")
+  else     
+     /*Подразделение депозитария*/
+     GetRegistryValue( "DEPO\\OURDEPOSITOFFICE", V_INTEGER, DEPO_SelfDivision, ErrCode );
+     if( ErrCode != 0 )
+       stat = VA_Err("Ошибка при чтении настройки \"" + "DEPO\\OURDEPOSITOFFICE" + "\"");
+     end;
+
+     if( not stat )
+        GroundPrm = TRecHandler( "spgroundprm.rec" );
+        while( spground.MoveNext() )
+           GroundPrm.Clear();
+           GroundPrm.rec.DocLog    = 300; /*Журнал документов*/
+           GroundPrm.rec.Kind      = spground.rec.Kind;
+           GroundPrm.rec.Direction = DIRECT_ANY;  
+           GroundPrm.rec.PartyID   = spground.rec.Party;
+           GroundPrm.rec.PartyName = spground.rec.PartyName;
+           if( (spground.rec.Direction == ENTERING) OR (spground.rec.Direction == DIRECT_ANY) )
+              GroundPrm.rec.AltXld     = spground.rec.AltXld;
+              GroundPrm.rec.SignedDate = spground.rec.SignedDate;
+              GroundPrm.rec.SignedTime = spground.rec.SignedTime;
+           else
+              GroundPrm.rec.AltXld     = spground.rec.Xld;
+              GroundPrm.rec.SignedDate = spground.rec.RegistrDate;
+              GroundPrm.rec.SignedTime = spground.rec.RegistrTime;
+           end;
+           GroundPrm.rec.Proxy    = spground.rec.Proxy;
+           if( GroundPrm.rec.Proxy <= 0 )
+              GroundPrm.rec.Proxy = -1;
+           end;
+           GroundPrm.rec.Division     = DEPO_SelfDivision;
+           GroundPrm.rec.Receptionist = {Oper};
+           GroundPrm.rec.DeliveryKind = spground.rec.DeliveryKind;
+           GroundPrm.rec.BackOffice   = "Z"; /*Депозитарий*/
+           GroundPrm.rec.Comment      = spground.rec.Comment;
+           GroundPrm.rec.BeginningDate= spground.rec.BeginningDate;
+           GroundPrm.rec.TerminateDate= spground.rec.TerminateDate;
+           /*после вставки DepoDraftParm в поле ID будет отриц. значение - ID поручения во врем. базе операций*/
+           GroundPrm.rec.PrimaryDocID  = DraftID;
+           GroundPrm.rec.PrimaryDocKind= Kind;
+           stat = ExecMacroFile("dpdrutl.mac", "SP_InsertGroundDocument", GroundPrm, true);
+        end;
+     end;
+  end;
+
+  return stat;
+END;
+
+
+/* Формирование отложенного распоряжения в депозитарий 
+   по соответствующему платежу
+
+   При (paym_asis = false) в Fill_800/Fill_840/Fill_845 подкачивается актуальный платёж из базы
+*/
+MACRO MakeDepoDraftProc(tick, payms, DraftKind, grp, fillproc, ActionDate, bindproc, paym_asis, ParentDocID, AltXid, SignedDate)
+var
+   DwAccCode = null, BnAccCode = null,
+   paym_fill = FillParams(),
+   stat = 0;
+var query, DataSet;
+
+   VA_ByDefault(paym_asis, false);
+   
+record pmrec("pmpaym");
+record dbtprop("pmprop") key 0;
+record crdprop("pmprop") key 0;
+record Draft("draftprm.rec");
+record spgrdoc("spgrdoc");
+
+   ClearRecord(pmrec);
+   ClearRecord(Draft);
+   ClearRecord(dbtprop);
+   ClearRecord(crdprop);
+
+   dbtprop.PaymentID = payms.rec.PaymentID;
+   dbtprop.DebetCredit = 0;
+   GetEQ(dbtprop);
+
+   crdprop.PaymentID = payms.rec.PaymentID;
+   crdprop.DebetCredit = 1;
+   GetEQ(crdprop);
+
+   if(ValType(DraftKind) == V_INTEGER)
+     Draft.Kind = DraftKind;
+   elif(not VA_GetDepoKind(tick, payms, @Draft.Kind))
+     return 1;
+   end;
+
+   if (paym_asis)
+       paym_fill.InitByPaym(payms.rec);
+   else
+       paym_fill.InitByID(payms.rec.PaymentID);
+   end;
+
+   if(Draft.Kind == SP_DEPOPER_RECORDER)        /* 840 прием ц/б на хранение */
+      Fill_840(Draft, tick, paym_fill, dbtprop, crdprop, DwAccCode, BnAccCode);
+   elif(Draft.Kind == SP_DEPOPER_WITHDRORDER)   /* 845 списание ц/б с хранения */
+      Fill_845(Draft, tick, paym_fill, dbtprop, crdprop, DwAccCode, BnAccCode);
+   elif(Draft.Kind == SP_DEPOPER_BOOKORDER)     /* 800 внутридепозитарный перевод */
+      Fill_800(Draft, tick, paym_fill, dbtprop, crdprop, DwAccCode, BnAccCode);
+   else
+      return VA_Err("Неверный вид поручения в депозитарий ", Draft.Kind)
+   end;
+
+   if(ValType(fillproc) != V_UNDEF)
+     if(ExecMacro2(@fillproc, Draft, tick, payms, dbtprop, crdprop, grp, ActionDate) != 0)
+        return 1;
+     end;
+   end;
+
+   FillAccounts(Draft, tick, payms, grp);
+
+   if( ParentDocID != null)
+     Draft.ParentDocID = ParentDocID;
+   end;
+   if( AltXid != null)
+     Draft.AltXid      = AltXid;
+   end;
+   if( SignedDate != null)
+     Draft.SignedDate  = SignedDate;
+   end;
+
+   if(ExecMacroFile("vadputl.mac", "VADP_InsertDeferDraft", Draft, payms) != 0)
+     stat = VA_Err("Ошибка при вставке отложенного поручения в депозитарий ", Draft.Kind);
+   elif(ValType(bindproc) != V_UNDEF)
+     if(ExecMacro2(@bindproc, Draft, tick, payms, grp) != 0)
+        stat = 1;
+     end;
+   elif(Draft.Kind == SP_DEPOPER_RECORDER)  /* 840 прием ц/б на хранение */
+     if(not BindBanners(Draft, tick, payms))
+        stat = 1;
+     end;
+   elif(ValType(grp) != V_UNDEF) // ИК уже найдены
+     if(not ModiBanners2(Draft, grp))
+        stat = 1;
+     end;
+   else // ИК нужно искать отдельно
+     if(not ModiBanners(Draft, tick, payms))
+        stat = 1;
+     end;
+   end;
+
+   if(not stat)
+     CreateAllAddDocs(tick, Draft.DraftID, Draft.Kind);
+   end;
+
+   GlobalGrp = null;
+
+   return stat;
+END;
+
+
+/* Формирование отложенного распоряжения в депозитарий 
+   по соответствующему платежу
+*/
+MACRO VA_MakeDepoDraft(tick, payms, DraftKind, fillproc, Date, Bindproc, ParentDocID, AltXid, SignedDate)
+   return MakeDepoDraftProc(tick, payms, DraftKind, NULL, fillproc, Date, Bindproc, true, ParentDocID, AltXid, SignedDate); // , Bindproc, true - по запоросу #97537;
+END;
+
+
+/* Ищет свой платеж по сделке
+*/
+PRIVATE MACRO findOurPaym(tick, Purpose, FIID, paym)
+var
+    Ok, DocID, DocKind, ttype, stat = 0;
+
+    ttype = ValType(tick);
+    if(ttype == V_GENOBJ)
+      if(tick.rec.RequestID) // Траст. Операция ВВК.
+        DocID   = tick.rec.RequestID;
+      else
+        DocID   = tick.rec.DealID;
+      end;
+      DocKind = tick.rec.BofficeKind;
+    else
+      if(tick.RequestID) // Траст. Операция ВВК.
+        DocID   = tick.RequestID;
+      else
+        DocID   = tick.DealID;
+      end;
+      DocKind = tick.BofficeKind;
+    end;                   
+
+    paym.KeyNum = 1;
+    paym.rec.DocKind = DocKind;
+    paym.rec.DocumentID = DocID;
+    paym.rec.Purpose = Purpose;
+    paym.rec.SubPurpose = 0;
+    paym.AddFilter("t_DocKind = " + DocKind + " AND t_DocumentID = " + DocID + " AND t_Purpose = " + Purpose);
+    Ok = paym.GetGE;
+
+    while(Ok and (stat == 0)) 
+      if(paym.rec.BaseFIID == FIID)
+         /* нашли свой платеж */
+         stat = 1;
+      else
+         Ok = paym.next; /* переходим к след.платежу */
+      end;
+    end;
+    paym.DropFilter();
+
+    return (stat == 1);
+end;
+
+
+/* Формирование отложенных распоряжений в депозитарий по списанию ц/б
+*/
+MACRO doDepoDraft(tick, grp, Purpose, FIID, DraftKind, fillproc, ActionDate, ParentDocID, AltXid, SignedDate)
+var
+   paym = TBfile("pmpaym"), 
+   stat = 0;
+
+   if(FindOurPaym(tick, Purpose, FIID, paym))
+      stat = MakeDepoDraftProc(tick, paym, DraftKind, grp, fillproc, ActionDate, null, null, ParentDocID, AltXid, SignedDate);
+   end;
+
+   return stat;
+END;
+
+
+/* Класс: группы номеров счета владельца ИК
+*/
+PRIVATE CLASS (VA_ICGroups) ICWriteOffGroups (_Purpose, _fillproc, _FIID)
+var Purpose = _Purpose;
+var fillproc = _fillproc;
+var FIID = _FIID;
+  VA_ByDefault(Purpose, BAi);
+
+  InitVA_ICGroups();
+
+  MACRO doDraftFunc(tick, grp, ActionDate, ParentDocID, AltXid, SignedDate)
+    return doDepoDraft(tick, grp, Purpose, grp.FIID,
+                       null, fillproc, null, ParentDocID, AltXid, SignedDate);
+  END;
+
+  MACRO do(tick, ActionDate, ParentDocID, AltXid, SignedDate)
+    var i = 0, stat = 0;
+    while((stat == 0) AND (i < ArrGrp.size))
+      stat = doDraftFunc(tick, ArrGrp[i], ActionDate, ParentDocID, AltXid, SignedDate);
+      i = i + 1;
+    end;
+    return stat;
+  END;
+
+  MACRO filter(bnr, leg, tick, numOrd, lnk)
+    if((ValType(FIID) == V_UNDEF) or 
+       (FIID == -1) or
+       (bnr.rec.FIID == FIID)
+      )
+      return true;
+    end;
+
+    return false;
+  END;
+
+END;
+
+
+MACRO Travel800fill(Draft, tick, payms, dbtprop, crdprop, grp, ValueDate)
+  VA_ByDefault(ValueDate, {curdate});
+
+  Draft.DwPartyID = {OurBank};
+  Draft.DwAccPurp = OBJTYPE_DEPOKINDTYPE_FROMPLACESAVE;
+  Draft.DwAccCode = "";
+  Draft.UnBlock = OBJTYPE_DEPOACC_BLOCK_TRANSMITTED;
+  Draft.BnPartyID = {OurBank};
+  Draft.BnAccPurp = OBJTYPE_DEPOKINDTYPE_PLACESAVE;
+  Draft.BnAccCode = grp.BnAccCode;
+  Draft.Block = OBJTYPE_DEPOACC_BLOCK_STANDART;
+  Draft.FIID = grp.FIID;
+  Draft.ValueDate = ValueDate;
+  Draft.Product = 9; /* погашение - см. llvalues 1200 (содержание транзакции) */
+  return 0;
+END;
+
+
+/* Класс: группы номеров счета владельца ИК
+*/
+CLASS (VA_ICGroups) Travel800Groups (_Purpose)
+var Purpose = _Purpose;
+  VA_ByDefault(Purpose, BAi);
+
+  InitVA_ICGroups();
+
+  MACRO filter(bnr, leg, tick, numOrd, lnk)
+  var
+     fd, stat = 1, payms = TBfile("pmpaym.dbt"),
+     lnkLast = TBfile("vsordlnk"), tickLast = TBfile("dl_tick");
+  var DealID = 0;
+
+     fd = VSBannerFD (bnr, leg, tick.BofficeKind, tick);
+
+     if(fd.VAGetLastBuy(lnkLast, tickLast))
+        DealID = tickLast.rec.DealID;
+        if(tickLast.rec.RequestID)
+          DealID = tickLast.rec.RequestID;
+        end;
+        if(VA_Get1stPlanPaym(tickLast.rec.BofficeKind, DealID, BAi, payms))
+           if(payms.rec.ReceiverBankID == {OurBank})
+              stat = 0;
+           end;
+        end;
+     end;
+     return (stat == 0);
+  END;
+
+  MACRO doDraftFunc(tick, grp, ActionDate)
+    return doDepoDraft(tick, grp, Purpose, grp.FIID,
+                       SP_DEPOPER_BOOKORDER,            /* 800 внутридепозитарный перевод */
+                       @Travel800fill, ActionDate
+           );
+  END;
+
+END;
+
+
+MACRO WorkOff845fill(Draft, tick, payms, dbtprop, crdprop, grp, ValueDate)
+  VA_ByDefault(ValueDate,  {curdate});
+
+  if(VA_IsClient(tick))
+    Draft.DwPartyID = tick.ClientID;
+  else
+    Draft.DwPartyID = {OurBank};
+  end;
+  Draft.DwAccPurp = OBJTYPE_DEPOKINDTYPE_DEPONENT;
+  Draft.FIID = grp.FIID;
+  Draft.ValueDate = ValueDate;
+  Draft.Product = 9; /* погашение - см. llvalues 1200 (содержание транзакции) */
+  return 0;
+END;
+
+
+/* Класс: группы номеров счета владельца ИК
+*/
+CLASS (VA_ICGroups) WorkOff845Groups (_Purpose, _fillproc)
+var Purpose = _Purpose;
+var fillproc = _fillproc;
+  VA_ByDefault(Purpose, BAi);
+
+  InitVA_ICGroups();
+
+  MACRO filter(bnr, leg, tick, numOrd, lnk)
+  var
+     fd, stat = 1, payms = TBfile("pmpaym.dbt"),
+     lnkLast = TBfile("vsordlnk"), tickLast = TBfile("dl_tick");
+  var DealID = 0;
+
+     fd = VSBannerFD (bnr, leg, tick.BofficeKind, tick);
+
+     if(fd.VAGetLastBuy(lnkLast, tickLast))
+        DealID = tickLast.rec.DealID;
+        if(tickLast.rec.RequestID)
+          DealID = tickLast.rec.RequestID;
+        end;
+        if(VA_Get1stPlanPaym(tickLast.rec.BofficeKind, DealID, BAi, payms))
+           if(payms.rec.ReceiverBankID != {OurBank})
+              stat = 0;
+           end;
+        end;
+     end;
+     return (stat == 0);
+  END;
+
+  MACRO doDraftFunc(tick, grp, ActionDate)
+    if(ValType(fillproc) != V_UNDEF)
+      return doDepoDraft(tick, grp, Purpose, grp.FIID,
+                         SP_DEPOPER_WITHDRORDER, /* 845 - Поручение на списание документарных ц/б */
+                         fillproc, ActionDate
+             );
+    else
+      return doDepoDraft(tick, grp, Purpose, grp.FIID,
+                         SP_DEPOPER_WITHDRORDER, /* 845 - Поручение на списание документарных ц/б */
+                         @WorkOff845fill, ActionDate
+             );
+    end;
+  END;
+
+END;
+
+
+MACRO Travel845fill(Draft, tick, payms, dbtprop, crdprop, grp, ValueDate)
+  VA_ByDefault(ValueDate,  {curdate});
+
+  if(VA_IsClient(tick))
+    Draft.DwPartyID = tick.ClientID;
+  else
+    Draft.DwPartyID = {OurBank};
+  end;
+  Draft.DwAccPurp = OBJTYPE_DEPOKINDTYPE_DEPONENT;
+  Draft.BnPartyID = {OurBank};
+  Draft.BnAccPurp = OBJTYPE_DEPOKINDTYPE_FROMPLACESAVE;
+  Draft.BnAccCode = grp.BnAccCode;
+  Draft.Block = OBJTYPE_DEPOACC_BLOCK_TRANSMITTED;
+  Draft.FIID = grp.FIID;
+  Draft.ValueDate = ValueDate;
+  Draft.Product = 9; /* погашение - см. llvalues 1200 (содержание транзакции) */
+  return 0;
+END;
+
+
+/* Класс: группы номеров счета владельца ИК
+*/
+CLASS (VA_ICGroups) Travel845Groups (_Purpose, _fillproc)
+var Purpose = _Purpose;
+var fillproc = _fillproc;
+  VA_ByDefault(Purpose, BAi);
+
+  InitVA_ICGroups();
+
+  MACRO filter(bnr, leg, tick, numOrd, lnk)
+  var
+     fd, stat = 1, payms = TBfile("pmpaym.dbt"),
+     lnkLast = TBfile("vsordlnk"), tickLast = TBfile("dl_tick");
+  var DealID = 0;
+
+     fd = VSBannerFD (bnr, leg, tick.BofficeKind, tick);
+
+     if(fd.VAGetLastBuy(lnkLast, tickLast))
+        DealID = tickLast.rec.DealID;
+        if(tickLast.rec.RequestID)
+          DealID = tickLast.rec.RequestID;
+        end;
+        if(VA_Get1stPlanPaym(tickLast.rec.BofficeKind, DealID, BAi, payms))
+           if(payms.rec.ReceiverBankID == {OurBank})
+              stat = 0;
+           end;
+        end;
+     end;
+     return (stat == 0);
+  END;
+
+  MACRO doDraftFunc(tick, grp, ActionDate)
+    if(ValType(fillproc) != V_UNDEF)
+      return doDepoDraft(tick, grp, Purpose, grp.FIID,
+                         SP_DEPOPER_WITHDRORDER, /* 845 - Поручение на списание документарных ц/б */
+                         fillproc, ActionDate
+             );
+    else 
+      return doDepoDraft(tick, grp, Purpose, grp.FIID,
+                         SP_DEPOPER_WITHDRORDER, /* 845 - Поручение на списание документарных ц/б */
+                         @Travel845fill, ActionDate
+             );
+    end;
+  END;
+
+END;
+
+
+MACRO Back800fill(Draft, tick, payms, dbtprop, crdprop, grp, ValueDate)
+  VA_ByDefault(ValueDate,  {curdate});
+
+  Draft.DwPartyID = {OurBank};
+  Draft.DwAccPurp = OBJTYPE_DEPOKINDTYPE_PLACESAVE;
+  Draft.DwAccCode = "";
+  Draft.UnBlock = OBJTYPE_DEPOACC_BLOCK_STANDART;
+  Draft.BnPartyID = {OurBank};
+  Draft.BnAccPurp = OBJTYPE_DEPOKINDTYPE_FROMPLACESAVE;
+  Draft.BnAccCode = grp.BnAccCode;
+  Draft.Block = OBJTYPE_DEPOACC_BLOCK_TRANSMITTED;
+  Draft.FIID = grp.FIID;
+  Draft.ValueDate = ValueDate;
+  Draft.Product = 9; /* погашение - см. llvalues 1200 (содержание транзакции) */
+  return 0;
+END;
+
+
+/* Класс: группы номеров счета владельца ИК
+*/
+CLASS (VA_ICGroups) Back800Groups (_Purpose)
+var Purpose = _Purpose;
+  VA_ByDefault(Purpose, BAi);
+
+  InitVA_ICGroups();
+
+  MACRO filter(bnr, leg, tick, numOrd, lnk)
+  var
+     fd, stat = 1, payms = TBfile("pmpaym.dbt"),
+     lnkLast = TBfile("vsordlnk"), tickLast = TBfile("dl_tick");
+
+  var DealID = 0;
+
+     fd = VSBannerFD (bnr, leg, tick.BofficeKind, tick);
+
+     if(fd.VAGetLastBuy(lnkLast, tickLast))
+        DealID = tickLast.rec.DealID;
+        if(tickLast.rec.RequestID)
+          DealID = tickLast.rec.RequestID;
+        end;
+        if(VA_Get1stPlanPaym(tickLast.rec.BofficeKind, DealID, BAi, payms))
+           if(payms.rec.ReceiverBankID == {OurBank})
+              stat = 0;
+           end;
+        end;
+     end;
+     return (stat == 0);
+  END;
+
+  MACRO doDraftFunc(tick, grp, ActionDate)
+    return doDepoDraft(tick, grp, Purpose, grp.FIID,
+                       SP_DEPOPER_BOOKORDER,            /* 800 внутридепозитарный перевод */
+                       @Back800fill, ActionDate
+           );
+  END;
+
+END;
+
+
+/* Группирует векселя по однородным номерам счетов владельца 
+      соответствующей инвентарной карточки.
+*/
+MACRO doGroups(bnr, leg, tick, numOrd, lnk, data:@variant)
+
+   GlobalGrp = data; // сохраняем в GlobalGrp, чтобы иметь возможность применить фильтр при поиске ИК
+
+   if(data.filter(bnr, leg, tick, numOrd, lnk))
+     data.group(bnr, leg);
+   end;
+
+   return 0;
+END;
+
+
+/* Формирование отложенного распоряжения в депозитарий
+*/
+MACRO VA_MakeDepoDrafts(tick, ICGrp, ActionDate, Role, ParentDocID, AltXid, SignedDate)
+var
+   stat = 0;
+
+   VA_ByDefault(ActionDate,  {curdate});
+   VA_ByDefault(Role,  VSORDLNK_K_ALL);
+
+   stat = VA_ForEachBanner(tick, @doGroups, Role, @ICGrp);
+   if(stat == 0)
+      stat = ICGrp.do(tick, ActionDate, ParentDocID, AltXid, SignedDate);
+   end;
+
+   return (stat == 0);
+END;
+
+
+// Проверить наличие ИК для векселя
+PRIVATE MACRO CheckIC(bnr, leg, tick, numOrd, lnk, BnrStr:@variant)
+   if(VA_FindInvCard(bnr, leg) == 0)
+      BnrStr = string(bnr.rec.BCSeries + " № " + trim(bnr.rec.BCNumber));
+      return 1;
+   end;
+   return 0;
+END;
+
+
+/* Формирование отложенного распоряжения в депозитарий по списанию ц/б
+*/
+MACRO VA_MakeOutDepoDrafts(tick, Purpose, fillproc, ParentDocID, AltXid, SignedDate, FIID)
+var
+   ICGrp = null, stat = 0, BnrStr = "";
+
+   VA_ByDefault(Purpose, BAi);
+
+   if(VA_IsClient(tick))
+      // Проверим наличие ИК для клиентских векселей (#66209, #72117)
+      stat = VA_ForEachBanner(tick, @CheckIC, VSORDLNK_K_SALE, @BnrStr);
+      if(stat != 0)
+         return GetTrue(false,"Отсутствует ИК для векселя " + BnrStr + "."
+                              "|Шаг будет выполнен без формирования поручения в Депозитарий.|Продолжить?");
+      end;
+   end;
+
+   ICGrp = ICWriteOffGroups(Purpose, fillproc, FIID);
+   return VA_MakeDepoDrafts(tick, ICGrp, null, VSORDLNK_K_SALE, ParentDocID, AltXid, SignedDate);
+END;

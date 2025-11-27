@@ -1,0 +1,13 @@
+/*Удаление настройки*/
+DECLARE
+  v_ID       NUMBER := 0;
+
+BEGIN
+
+  SELECT T_KEYID INTO v_ID FROM DREGPARM_DBT WHERE LOWER(T_NAME) = LOWER('АВТОМАТ_ОТМЕНА_ВЫПЛАТ_ДИАС');
+
+  DELETE FROM DREGVAL_DBT WHERE T_KEYID = v_ID;
+  DELETE FROM DREGPARM_DBT WHERE T_KEYID = v_ID;
+
+END;
+/

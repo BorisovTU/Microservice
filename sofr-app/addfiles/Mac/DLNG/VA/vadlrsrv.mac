@@ -1,0 +1,195 @@
+/*
+$Name:         vadlrsrv.mac
+$Module:       Учтенные векселя
+$Description:  Макрос шага формирования резерва по сделке
+*/
+
+IMPORT RsbDataSet, BankInter, VAInter,
+       va4each, vacateg, vaacc, vatickfd, varsrvbk, vareslib, vaservop;
+
+VAR
+    reserve_sum = $0,          /* Сумма созданного резерва */
+    delta = $0,                /* Изменение резерва */
+    ErrMsg = "",
+    OprDate = ZeroDate;        /* Дата операции */
+
+PRIVATE RECORD tick(dl_tick);
+
+PRIVATE MACRO SayDlReserveError( tick, stat, Err )
+  SvOpInsertError( DL_VEKSELACCOUNTED, OprServDoc, tick, stat, err );
+  return stat;
+end;
+
+PRIVATE MACRO ФормРезерва(fd, Сумма, role)
+var
+    ok = false, stat = 0, Purpose, КатегДебет, КатегКредит,
+    СчетДебет, СчетКредит, РольДебет = null, РольКредит = null;
+
+    if(Сумма == 0)
+       return stat;
+    end;
+
+    if(Сумма > 0)
+       Purpose = String("Создание/увеличение резерва");
+       КатегДебет = "-РС, д/с";
+       КатегКредит = "Резерв, договор";
+       РольКредит = role;
+    else
+       Purpose = String("Уменьшение резерва");
+       КатегДебет = "Резерв, договор";
+       КатегКредит = "+РС, д/с";
+       РольДебет = role;
+    end;
+
+    if(not VA_GetAccount(КатегДебет, fd, СчетДебет, MC_OPENACC_CREATE, NATCUR, РольДебет, null, OprDate))
+       stat = SayDlReserveError( tick, 1, string("Ошибка при поиске/открытии счета \""+КатегДебет+"\"") );
+    elif(not VA_GetAccount(КатегКредит, fd, СчетКредит, MC_OPENACC_CREATE, NATCUR, РольКредит, null, OprDate))
+       stat = SayDlReserveError( tick, 1, string("Ошибка при поиске/открытии счета \""+КатегКредит+"\"") );
+    else
+       stat = VA_Bookpass(СчетДебет,
+                      СчетКредит,
+                      Abs( Сумма ),
+                      Purpose,
+                      0, 0,               /* Платеж */
+                      NATCUR,
+                      NULL, NULL,
+                      OprDate   /* дата проводки */
+                     );
+    end;
+
+    return stat;
+END;
+
+MACRO ExecuteStep(Buffer, FirstDoc)
+var AttrID = 0, ReserveKind = 0, fd,
+    stat = 0, ErrMsg = "", СуммаСделки = $0,
+    f_overdue = false, // флаг переноса на просрочку
+    have_reslnk = true,
+    DataSet,
+    reslnk = TBfile("dlreslnk.dbt", "W", 0),
+    FstBai = TBfile("pmpaym.dbt"),  /* первый платеж по активу сделки */
+    FstCai = TBfile("pmpaym.dbt");  /* первый платеж по контрактиву сделки */
+var Rold = 0, ResLnkId = 0, КатегКачества = -1, ПроцРезерва = -1;
+
+    SetBuff( tick, FirstDoc );
+
+    OprDate = OprServDoc.ValueDate;
+
+    // всё основные проверки отрабатывают в VA_SvOpFilter
+
+    if(not VA_Get1stPlanPaym(tick.BofficeKind, tick.DealID, BAi, FstBai))
+       return SayDlReserveError( tick, 1, "Не найден платеж по базовому активу сделки" );
+    elif(not VA_Get1stPlanPaym(tick.BofficeKind, tick.DealID, CAi, FstCai))
+       return SayDlReserveError( tick, 1, "Не найден платеж по контрактиву сделки" );
+    end;
+
+     // 1. Определяем необходимость создания и вид резерва.
+     if(VA_IsBuy(tick.DealType))    // покупка
+        ReserveKind = RVKIND_PAYM;
+        if(FstBai.rec.PaymStatus == PM_OVERDUE)
+            f_overdue = true;
+        end;
+     elif(VA_IsSale(tick.DealType))   // продажа
+        ReserveKind = RVKIND_PAYM;
+        if(FstCai.rec.PaymStatus == PM_OVERDUE)
+           f_overdue = true;
+        end;
+     else
+        return stat; // мену не учитываем
+     end;
+
+     stat = VA_GetReserveParamDeal(tick, OprDate, 0, @КатегКачества, @ПроцРезерва, @ResLnkId, @ErrMsg);
+     if(stat != 0)
+        if(ErrMsg != "")
+           SayDlReserveError(tick, stat, ErrMsg);
+        end;
+        return stat;
+     end;
+
+     // 3. Рассчитывается новая сумма резерва Rnew - в валюте расчетов сделки
+     if(ReserveKind == RVKIND_PAYM)
+        stat = VA_CalcNewReserveDeal(tick, ПроцРезерва, FstCai.rec.PayFIID, OprDate, @reserve_sum, @ErrMsg);
+     end;
+     if(stat != 0)
+        if(ErrMsg != "")
+           SayDlReserveError(tick, stat, ErrMsg);
+        end;
+        return stat;
+     end;
+
+     // 5. Определяется Rold
+     DataSet = TRsbDataSet("SELECT t_ReserveAmount " +
+        " FROM ddlreslnk_dbt " +
+        " WHERE t_Type = 1 AND t_ParentID = " + tick.DealID + " AND t_ChildID > -1 "
+          " AND t_LnkDate <= to_date('" + OprDate + "', 'DD.MM.YYYY')" +
+        " ORDER BY t_Id DESC ");
+     if(DataSet.MoveNext())
+        Rold = DataSet.ReserveAmount;
+     end;
+
+     // 6. Определяется сумма корректировки резерва
+     delta = reserve_sum - Rold;
+     if(delta == 0)
+        return stat;
+     end;
+
+     // 7/10. Обновление/вставка связи со сделкой
+     reslnk.KeyNum = 0;
+     reslnk.clear();
+     reslnk.rec.Id = ResLnkId;
+     if(not reslnk.GetEQ)
+         have_reslnk = false;
+     end;
+
+     reslnk.rec.ReserveKind = ReserveKind;       // Вид резерва
+     reslnk.rec.ReserveAmount = reserve_sum;     // Сумма резерва
+//     reslnk.rec.ReserveDate = OprDate;           // Дата расчета резерва
+
+     if(have_reslnk AND (reslnk.rec.ChildID == -1) AND //!!!
+             (КатегКачества == reslnk.rec.QualityCategory) AND
+             (ПроцРезерва == reslnk.rec.ReservePercent))
+        reslnk.rec.ChildID = OprServDoc.Id;
+        VA_ChangeDLRESLNK(reslnk.rec.Id, reslnk.rec.ChildID, reslnk.rec.ReserveKind, reslnk.rec.ReserveAmount, OprDate);
+     else
+        reslnk.rec.Id = 0;
+        reslnk.rec.ParentID         = tick.DealID;
+        reslnk.rec.ChildID          = OprServDoc.Id;
+        reslnk.rec.Type             = RSRV_TYPE_VADEAL;
+        reslnk.rec.LnkDate          = OprDate;
+        reslnk.rec.QualityCategory  = КатегКачества;
+        reslnk.rec.ReservePercent   = ПроцРезерва;
+        reslnk.rec.ReserveDate      = OprDate;            // Дата расчета резерва
+        VA_InsertDLRESLNK(reslnk);
+     end;
+
+     fd = VATickFD(tick);
+     // 8. Проводка по списанию резерва
+     if(reserve_sum == 0)
+        if(Rold > 0)
+           stat = СписРезерваПоСделке(fd, Rold, OprDate, @ErrMsg);
+        end;
+        if(stat != 0)
+            if(ErrMsg != "")
+               SayDlReserveError(tick, stat, ErrMsg);
+            end;
+        end;
+     else // (reserve_sum != 0)
+     // 9. Проводки по изменению
+        if(f_overdue == true)
+           if(Rold > 0)
+              stat = СписРезерваПоСделке(fd, Rold, OprDate, @ErrMsg);
+           end;
+           if(stat != 0)
+              if(ErrMsg != "")
+                 SayDlReserveError(tick, stat, ErrMsg);
+              end;
+              return stat;
+           end;
+           stat = ФормРезерва(fd, Abs(reserve_sum), FIROLE_DEALS_OVERDUE);
+        else
+           stat = ФормРезерва(fd, delta, FIROLE_DEALS_TERMREQ);
+        end;
+     end;
+
+     return stat;
+END;

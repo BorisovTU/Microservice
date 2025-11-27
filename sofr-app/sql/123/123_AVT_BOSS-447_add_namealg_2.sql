@@ -1,0 +1,10 @@
+/*Добавление в справочник*/
+BEGIN
+   INSERT INTO DNAMEALG_DBT(T_ITYPEALG, T_INUMBERALG, T_SZNAMEALG, T_ILENNAME, T_IQUANTALG, T_RESERVE)
+   VALUES(7360,1,'Связь КП. Сделки реализации и погашения',40,1,CHR(1));
+
+EXCEPTION 
+   WHEN DUP_VAL_ON_INDEX THEN NULL;
+END;
+/
+

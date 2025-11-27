@@ -1,0 +1,305 @@
+/* Закрытие счетов 306 47423 и ВУ по закрытым договоарм*/
+import RSD, globals;
+import BankInter, dlquery, cb_sql, oralib, likepy;
+
+private class CLog;
+   private macro PrepareLog()
+      if ( execSqlSelect ("select 1 from user_tables where upper(table_name) = upper('RSHB_CloseAccLog')").moveNext () )
+        /*  if ( not execSql ("truncate table RSHB_CloseAccLog") )
+              return false;
+          end;*/
+      else
+          if ( not execSql ("create table RSHB_CloseAccLog (t_kind number not null, t_account varchar2(25),  t_text varchar2(4000), t_timestamp timestamp, t_oper number, t_operdate date) ") )
+              return false;
+          end;
+      end;
+      return true;
+   end;
+
+   Macro add ( kind, account, text )
+       execSql ("insert into RSHB_CloseAccLog values (:1, :2, :3, systimestamp, :4, :5)", makeArray (sqlParam ("1", kind), sqlParam ("2", account), sqlParam ("3", text),sqlParam ("4", {oper}),sqlParam ("5", {curdate})));
+   End;
+
+   if (not PrepareLog() );
+      msgbox("Ошибка инициализации логирования");
+      exit(1);
+   end;
+end;
+
+/**
+@brief Функция проверяет необходимость корректировки рублевого эквивалента валютного счета
+@param[in] AccountID ID счета таблицы daccount_dbt
+@param[out] onDate Дата на которую необходима коррекция
+@param[out] errMessage Сообщение об ошибке ( == "" если ошибок при выполнении не обнаружено)
+
+Предполагается, что проверка запускается для валютного счета. Для счета в нац. валюте получим true, что неправильно.
+
+@return true В случае если остатки валютного счета = 0, а на рублевом эквиваленте != 0
+@return false Если коррекция не нужна, или произошла ошибка
+*/
+macro IsAccountNeedCorrect(AccountID: Integer, onDate: @Date, errMessage: @String): Bool
+  /**
+  @brief Функция получения даты последнего обновления остатков в таблице drestdate_dbt по ID счета
+  @param[in] AccountID ID счета таблицы daccount_dbt
+  @return Date Последняя дата обновления или date(0,0,0) в случае отсутствия записей
+  */
+  macro GetLastRestDate(AccountID: Integer): Date
+    var params =  makeArray(SQLParam("AccountID",    AccountID),
+                            SQLParam("CodeCurrency", 0),  ///< нац. валюта
+                            SQLParam("OnDate",       date(31, 12, 9999)));
+    var result = ExecStoredFunc("RSI_RSB_Account.GetAccLastRestDate", V_DATE, params);
+    
+    if (ValType(result) != V_DATE)
+      result = date(0, 0, 0);
+    end;
+    
+    return result;     
+  end;
+
+  errMessage = "";  
+  onDate = GetLastRestDate(AccountID);
+
+  if (onDate != date(0, 0, 0))
+    var params = makeArray(SQLParam("", AccountID),
+                           SQLParam("", onDate),
+                           SQLParam("", V_INTEGER, RSDBP_OUT),
+                           SQLParam("", V_INTEGER, RSDBP_OUT),
+                           SQLParam("", v_INTEGER, RSDBP_OUT));
+  
+    ExecStoredFunc("RSI_RSB_Account.CheckAccountRest", V_UNDEF, params);     
+
+    var curZeroCount = params.value(2).value;       ///< Количество записей счета в валюте в которых остатки ==0
+    var natcurNonZeroCount = params.value(3).value; ///< Количество записей счета в нац.валюте в которых остатки != 0
+    var totalRecsOnDate = params.value(4).value;    ///< Общее количество записей по счету в дату onDate
+  
+    if ((totalRecsOnDate > 2) or (natcurNonZeroCount > 1) or (curZeroCount > 1)) ///< За одну дату может быть не более двух записей (в нац.валюте и (опционально) в валюте)
+      errMessage = "Для AccountID = " + String(AccountID) + " на дату " + String(onDate) + " некорректное количество записей остатков в таблице DRESTDATE_DBT";
+    else
+      /// Если на дату 2 записи по остаткам (валютный счет) и в валюте счета нулевой остаток и в нац.валюте остаток !=0
+      if ( ((totalRecsOnDate == 2) and (curZeroCount == 1) and (natcurNonZeroCount == 1))
+        or ((totalRecsOnDate == 1) and (curZeroCount == 0) and (natcurNonZeroCount == 1)) ) // на случай, если для валютного счета последняя запись только по нац.валюте
+        return true;
+      end;
+    end;
+
+  end;
+
+  return false;
+
+onerror (err)
+  errMessage = err.Module + " on line " + String(err.Line) + " " + err.Message;
+  return false;  
+end;
+
+/**
+@brief Процедура обновляет запись остатков счета в таблице drestdate_dbt
+@param[in] AccountID ID счета таблицы daccount_dbt
+@param[in] restDate Дата на которую необходима коррекция
+@param[in] currency ID валюты (0 для нац.валюты)
+@param[in] restValue новое значение для поля "остаток" (t_Rest)
+@param[in] planRestValue новое значение для поля "плановый остаток" (t_PlanRest)
+*/
+macro UpdateAccountRest(AccountID: Integer, restDate: Date, currency: Integer, restValue: Money, planRestValue: Money)
+  var query = "UPDATE dRestDate_dbt " +
+                 "SET t_Rest = ?, t_PlanRest = ? "
+               "WHERE t_Accountid = ? "
+                 "AND t_RestCurrency = ? "
+                 "AND t_RestDate = ? ";
+  var params = makeArray(SQLParam("", restValue),
+                         SQLParam("", planRestValue),
+                         SQLParam("", AccountID),
+                         SQLParam("", currency),
+                         SQLParam("", restDate));
+  ExecSQL(query, params, false);
+end;
+
+class CCloseContrAccounts(_dlcontrid, _sfcontrid, _curr)
+
+   private var dlcontrid = -1, sfcontrid = -1, curr = -1;
+
+   private class ErrRec(_acc,_rest, _err)
+      var err,rest,acc;
+         acc  = _acc;
+         err  = _err;
+         rest = _rest;
+   end;
+
+
+   private  macro _doCloseAcc( acc, chapter, currency, CloseDate, ErrMsg)
+      var stat, mes;
+      var IsError = false;
+
+      if( (stat=CB_CloseAccount(chapter, currency, acc, CloseDate , mes)) != 0 )
+         if (strlen(mes) == 0)
+            InitError();
+            MemoryError(stat);
+            mes = GetErrMsg();
+         end;
+         IsError = true;
+      end;
+      SetParm(5, mes);
+      return not IsError;
+
+      onError(er)
+        SetParm(5, er.message);
+        return not IsError;
+   end;
+
+
+   macro CloseAcc(ArErr:@TArray, ArLog:@TArray)
+      var sql, cmd, rs, err;
+      var Log = CLog();
+      ArErr = TArray();
+      ArLog = TArray();
+         sql = 
+             "  SELECT ROWNUM, t.*, RSB_ACCOUNT.RESTALL (t.t_account, t.t_chapter, " +
+             "                              t.t_code_currency, "+GetSQLDate({curdate})+") rest, " +
+             "         rsi_rsb_account.planrestac(t.t_account, t.t_code_currency, "+GetSQLDate({curdate})+", t.t_chapter) planrest " +
+             "    FROM (  SELECT *  " +
+             "              FROM (SELECT a.t_open_close, " +
+             "                           a.t_close_date, " +
+             "                           a.t_accountid, " +
+             "                           (SELECT t_ccy FROM dfininstr_dbt WHERE t_fiid = a.t_code_currency) t_ccy, " +
+             "                           a.t_code_currency, " +
+             "                           sf.t_dateclose, " +
+             "                           s.t_account, " +
+             "                           s.t_chapter, " +
+             "                           DECODE (s.t_chapter,1, 'БУ',21, 'ВУ ДС',22, 'ВУ ЦБ') kind " +
+             "                      FROM dsettacc_dbt s, " +
+             "                           dsfssi_dbt ss, " +
+             "                           dsfcontr_dbt sf, " +
+             "                           daccount_dbt a " +
+             "                     WHERE     s.t_settaccid = ss.t_setaccid " +
+             "                           AND ss.t_objecttype = 659 " +
+             "                           AND ss.t_objectid = sf.t_id " +
+             "                           AND a.t_account = s.t_account " +
+             "                           AND a.t_chapter = s.t_chapter ";
+         if (sfcontrid > 0)
+            sql = sql + "                AND sf.t_id = " + string(sfcontrid);
+         else
+            sql = sql +  "               AND sf.t_id IN (SELECT t_sfcontrid " +
+             "                                             FROM ddlcontrmp_dbt " +
+             "                                            WHERE t_dlcontrid = " + string(dlcontrid) + ") ";
+         end;
+         if (curr >= 0)
+            sql = sql + "                AND a.t_code_currency = " + string(curr);
+         end;
+         sql = sql +    "                UNION ALL " +
+             "                    SELECT a.t_open_close, " +
+             "                           a.t_close_date, " +
+             "                           a.t_accountid, " +
+             "                           (SELECT DECODE (t_ccy, CHR (1), t_definition, t_ccy) t_ccy FROM dfininstr_dbt WHERE t_fiid = a.t_code_currency) t_ccy, " +
+             "                           a.t_code_currency, " +
+             "                           sf.t_dateclose, " +
+             "                           mc.t_account, " +
+             "                           mc.t_chapter, " +
+             "                           DECODE (a.t_chapter, 1, 'БУ', 21, 'ВУ ДС', 22, 'ВУ ЦБ') kind " +
+             "                      FROM dmcaccdoc_dbt mc, dsfcontr_dbt sf, daccount_dbt a " +
+             "                     WHERE     mc.t_chapter IN (21, 22) " +
+             "                           AND mc.t_iscommon = CHR (88) " +
+             "                           AND sf.t_id = mc.t_clientcontrid " +
+             "                           AND a.t_account = mc.t_account " +
+             "                           AND a.t_chapter = mc.t_chapter ";
+         if (sfcontrid > 0)
+            sql = sql + "                AND sf.t_id = " + string(sfcontrid);
+         else
+            sql = sql +  "               AND sf.t_id IN (SELECT t_sfcontrid " +
+             "                                             FROM ddlcontrmp_dbt " +
+             "                                            WHERE t_dlcontrid = " + string(dlcontrid) + ") ";
+         end;
+         if (curr >= 0)
+            sql = sql + "                AND a.t_code_currency = " + string(curr);
+         end;
+         sql = sql +     "               UNION ALL " +
+             "                    SELECT a.t_open_close, " +
+             "                           a.t_close_date, " +
+             "                           a.t_accountid, " +
+             "                           (SELECT t_ccy FROM dfininstr_dbt WHERE t_fiid = a.t_code_currency) t_ccy, " +
+             "                           a.t_code_currency, " +
+             "                           sf.t_dateclose, " +
+             "                           mc.t_account, " +
+             "                           mc.t_chapter, " +
+             "                           DECODE (a.t_chapter, 1, 'БУ', 21, 'ВУ ДС', 22, 'ВУ ЦБ') kind " +
+             "                      FROM dmcaccdoc_dbt mc, dsfcontr_dbt sf, daccount_dbt a " +
+//             "                     WHERE     t_catnum = 5087 " +
+             "                     WHERE    t_catid in (818, 1055, 1056) " +
+             "                           AND mc.t_iscommon = CHR (88) " +
+             "                           AND sf.t_id = mc.t_clientcontrid " +
+             "                           AND a.t_account = mc.t_account " +
+             "                           AND a.t_chapter = mc.t_chapter ";
+         if (sfcontrid > 0)
+            sql = sql + "                AND sf.t_id = " + string(sfcontrid);
+         else
+            sql = sql +  "               AND sf.t_id IN (SELECT t_sfcontrid " +
+             "                                             FROM ddlcontrmp_dbt " +
+             "                                            WHERE t_dlcontrid = " + string(dlcontrid) + ") ";
+         end;
+         if (curr >= 0)
+            sql = sql + "                AND a.t_code_currency = " + string(curr);
+         end;
+         sql = sql +     " )  GROUP BY t_open_close, t_close_date, t_code_currency, t_account, t_accountid, t_chapter, t_ccy, kind, t_dateclose) t " +
+             "   WHERE t.t_open_close <> 'З' " +
+             "ORDER BY t.t_chapter, t_code_currency " ;
+
+    
+         cmd = RSDCommand(sql);
+         rs = RSDRecordset(cmd);
+         while ( rs.movenext() )
+            if ((rs.Value("rest") != 0) or (rs.Value("planrest") != 0))
+               ArErr(ArErr.size) = ErrRec(rs.Value("t_account"), rs.Value("rest"), "Ненулевой остаток");
+            end;
+         end;
+
+         rs  = cmd = null;
+         cmd = RSDCommand(sql);
+         rs = RSDRecordset(cmd);
+         if ( ArErr.size == 0 )
+            while ( rs.movenext() )
+               /// Для валютных счетов внутреннего учета обнулим остатки на записи рублевого эквивалента, в случае если остатки на валютном счете = 0 / DEF-49039
+               if ( (rs.Value("t_chapter") == 21) and (rs.Value("t_code_currency") != 0) )
+                  var correctionDate: date;
+
+                  if ( IsAccountNeedCorrect(rs.Value("t_accountid"), @correctionDate, @err) )
+                     UpdateAccountRest(rs.Value("t_accountid"), correctionDate, 0, $0, $0);
+                  else
+                     if ( StrLen(err) > 0 )
+                        Log.add(1, rs.Value("t_account"), err);
+                        ArErr(ArErr.size) = ErrRec(rs.Value("t_account"), 0, err);
+                     end;
+                  end;
+               end;
+                   
+               if ( not _doCloseAcc (rs.Value("t_account"), rs.Value("t_chapter"), rs.Value("t_code_currency"), SQL_ConvTypeDate(rs.Value("t_dateclose")),err) )
+                  if (index(err,"уже закрыт") > 0 )
+                     Log.add(0, rs.Value("t_account"), "Закрыт");
+                     ArLog(ArLog.size) = ErrRec(rs.Value("t_account"), 0, " Счет закрыт");
+                  else
+                     Log.add(1, rs.Value("t_account"), err);
+                     ArErr(ArErr.size) = ErrRec(rs.Value("t_account"), rs.Value("rest"), err);
+                  end;
+               else
+                  Log.add(0, rs.Value("t_account"), "Закрыт");
+                  ArLog(ArLog.size) = ErrRec(rs.Value("t_account"), 0, " Счет закрыт");
+               end;
+            end;
+         end;
+
+      rs = null;
+
+      return ArErr.size;
+
+   end;
+
+  /*init*/
+
+  if  ((ValType(_dlcontrid) != V_UNDEF) and (_dlcontrid > 0))
+     dlcontrid = _dlcontrid;
+  end;
+  if  ((ValType(_sfcontrid) != V_UNDEF) and (_sfcontrid > 0))
+     sfcontrid = _sfcontrid;
+  end;
+  if  ((ValType(_curr) != V_UNDEF) and (_curr >= 0))
+     curr = _curr;
+  end;
+
+end;

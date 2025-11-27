@@ -1,0 +1,886 @@
+/*
+$Name:        dlreestrel_Report.mac
+$Module:      Ценные бумаги
+$Description: Электр анкета ФСФР. Отчет "Сведения о сделках"
+*/
+
+/*
+ PROGRAMMED BY:   Леонов И. Е.
+ CREATION DATE:   08.07.03
+*/
+import "dl_elank.mac", "dlreestrel_form.mac";
+import "spRepFun.mac", "globals.mac", DealsInter, DVInter, "dlmisc.mac";
+import "or_rep_h.mac";
+import RsbDataSet;
+
+private var pmwrtsum = TBfile("pmwrtsum", "R", 6);
+private var deals    = TBfile("dl_tick", "R", 8); 
+
+private var rq       = TRecHandler("dlrq");
+
+private var fininstr = TRecHandler("fininstr");
+private var avoiriss = TRecHandler("avoiriss");
+private var Issuer   = TRecHandler("party");
+private var Market   = TRecHandler("party");
+private var dl_leg   = TRecHandler("dl_leg");
+
+private const RoundN = 5;   /*точность округления*/
+
+private const ПЕРВЫЙ_КВАРТАЛ = 13;
+private const ALG_NUM_FOR_PERIOD = 2263;
+
+
+
+private class MarketData( _MarketID:Integer, _SumBuy:Money, _SumSale:Money )
+  var MarketID = _MarketID, 
+      SumBuy   = _SumBuy,
+      SumSale  = _SumSale; 
+end;
+
+
+
+private class SourceData( m_form )
+   
+   var PeriodNum=0,
+       Period = m_form.GetFieldValue(PNFLD_DLREESTREL_Period),
+       Year   = m_form.GetFieldValue(PNFLD_DLREESTREL_Year),
+       IsApp  = m_form.GetFieldValue(PNFLD_DLREESTREL_APOSTROPHE),
+       IsSecur= m_form.GetFieldValue(PNFLD_DLREESTREL_Secur),
+       IsDeriv  = m_form.GetFieldValue(PNFLD_DLREESTREL_Deriv),
+       IsVeksAcc= m_form.GetFieldValue(PNFLD_DLREESTREL_VeksAcc);
+
+   var DateBeg,
+       DateEnd,
+       AllAmountBuy = $0,
+       AllAmountSale = $0,
+       AllAmountBuy_Market = $0,
+       AllAmountSale_Market = $0,
+       MarketData = TArray(), /*биржи на которых были сделки, попавшие в отчет*/
+       AllAmountBuy_Out = $0,
+       AllAmountSale_Out = $0,
+       Group,
+       NumSpec    = IIF( IsApp, "a", "" ),
+       ReportRun  = false,    /*Отчет был распечатан*/
+       PeriodName = PeriodName_GetMonthsAndQuart( Period, Year );
+
+   Period_GetInterval( Period, Year, @DateBeg, @DateEnd );
+
+   macro GetPeriod()
+     var NumQuartal, Month;
+     if(Period < ПЕРВЫЙ_КВАРТАЛ)   /*Задан месяц*/
+       DateBeg = Date(1, Period, Year);
+       DateEnd = DateAfterCalenMonths(DateBeg, 1) - 1;
+     else                   /*Задан квартал*/
+       NumQuartal = Period - 12;
+       Month = (NumQuartal - 1) * 3 + 1;
+       DateBeg = Date(1, Month, Year);
+       DateEnd = DateAfterCalenMonths(DateBeg, 3) - 1;
+     end;
+     PeriodName = "за " + DL_GetNameAlg(ALG_NUM_FOR_PERIOD, Period) + " "+ string(Year) + " года";
+     PeriodNum =  Period - 12;
+   end;
+
+   GetPeriod();
+end;
+
+var TableHead = "┌────┬───────────────────────────────────────────────────┬─────────────────────────┬─────────────────────────┐\n" +
+                "│ №  │              Наименование показателя              │    Сделки по покупке    │    Сделки по продаже    │\n" +
+                "│    │                                                   │       (тыс." + {CCYNatCur} + ".)        │        (тыс." + {CCYNatCur} + ".)       │\n" +
+                "├────┼───────────────────────────────────────────────────┼─────────────────────────┼─────────────────────────┤";
+
+
+//var Rep = CMakeReport(TableHead);
+const FontStyleTitel =  "ex_FS(b)";
+
+PRIVATE CLASS (ADataSource) DLREESTREL_DataSource(_Form)
+
+  private macro БумагаПодходит(FIID, AvrKind )
+     /* Депозитарная расписка нужна. */
+     return   (ПолучитьФинИн(FIID, fininstr, avoiriss) == 0)
+              AND (FI_IsShare(fininstr, true) OR FI_IsBond( fininstr ) OR FI_IsInvestmentShare(fininstr));
+  end;
+
+  private macro GetSumID(dealID);
+     var sqlQuery;
+     var SumID;
+
+     sqlQuery = RSDCommand(
+          "SELECT t_sumid "+
+        "FROM dpmwrtsum_dbt "+
+        "WHERE t_dealid = ? "
+     );
+     
+     sqlQuery.addParam( "", RSDBP_IN, dealID );
+     sqlQuery.execute();
+
+     var ds=TRsbDataSet( sqlQuery);
+     
+     ds.MoveFirst();
+     
+     SumID=ds.SumID;
+     
+     if(ValType(SumID)== V_INTEGER)
+          return ds.SumID; //sqlQuery.Value()
+     else
+       return 0;
+     end;
+  end;
+
+  private macro InsertMarketToArray( MarketID:Integer, SumBuy:Money, SumSale:Money );
+     var i = 0;
+
+     while( i < Data.MarketData.Size )
+        if( Data.MarketData[i].MarketID == MarketID )
+           Data.MarketData[i].SumBuy  = Data.MarketData[i].SumBuy + SumBuy;
+           Data.MarketData[i].SumSale = Data.MarketData[i].SumSale + SumSale;
+           return;
+        end;
+        i = i + 1;
+     end;
+     Data.MarketData[Data.MarketData.Size ] = MarketData(MarketID, SumBuy, SumSale);
+  end;
+
+  /* Сохраняем данные сделки для отчета.
+        Ticket      -  буфер сделки
+        rq          -  требование/обязательство
+        FI          -  финансовый инструмент бумаги
+        IsBack      -  флаг, обрабатываем вторую часть сделки
+        DealCh      -  параметры сделки на окончание отчетного периода */
+  private macro СохранитьДляОтчетаБОЦБ(   Ticket:TBfile, rq:TRecHandler,          
+                                          IsBack:bool, DealCh, dlleg)
+
+     var
+        Summa = $0, LegKind, NKD, AgentID,
+        CFI, Cost, TotalCost, PlanDate = Date(0,0,0), fiidTo = 0.0;
+
+     var sumID;
+
+     fiidTo = NATCUR;
+
+     if( dlleg == NULL )
+        if( IsBack == true )
+           LegKind = LEG_KIND_DL_TICK_BACK;
+        else
+           LegKind = LEG_KIND_DL_TICK;
+        end;
+
+        if( FindDL_LEG( LegKind, Ticket.rec.DealID, 0, dl_leg ) != 0 )
+           MsgBox( "Не найдены условия сделки dl_leg.dbt (код сделки=", Ticket.rec.DealCode,")" );
+           return;
+        end;
+        dlleg = dl_leg.rec;
+     end;
+
+     /* Если до окончания отчетного периода был выполнен отказ от сделки, то
+        такая сделка не включается в отчет,
+        Если по сделке РЕПО или покупки/продажи до окончания отчетного периода
+        был выполнен отказ от исполнения второй части, то такая сделка входит
+        в отчет как обычная сделка покупки/продажи. */
+     if( WasRejectDealPart(dlleg, Data.DateEnd) )
+        return;
+     end;
+
+     CFI         = IIF( IsBack, DealCh.OldCFI2, DealCh.OldCFI1 );
+     Cost        = IIF( IsBack, DealCh.OldCost2, DealCh.OldCost1 );
+     TotalCost   = IIF( IsBack, DealCh.OldTotalCost2, DealCh.OldTotalCost1 );
+
+     /*Сумма сделки включает НКД и рассчитывается в тыс. рублей:
+
+       - для всех собственных сделок и для тех клиентских сделок, 
+         по которым поставка была произведена ранее даты окончания 
+         отчетного периода - по курсу на фактическую дату поставки,
+
+       - для клиентских сделок, по которым на дату окончания 
+         отчетного периода поставки еще не было - на дату заключения сделки.
+
+       - НКД рассчитывается на фактическую дату поставки 
+         (если поставка была ранее окончания отчетного периода), 
+         или на плановую дату поставки (если на дату окончания 
+         отчетного периода поставки не было).
+     */
+     /*уже была поставка, ранее даты окончания отчетного периода*/
+     if( ТОЗакрыто( rq ) and (rq.rec.FactDate < Data.DateEnd) )
+        NKD = СуммаКупона( dlleg.PFI, DealCh.OldPrincipal, rq.rec.FactDate );            
+
+        if( ПолучитьФинИн( dlleg.PFI, fininstr ) ) 
+           msgbox("Отсутствует финансовый инструмент (FIID=", dlleg.PFI,")" );
+        end;
+
+        if (fininstr.rec.FaceValueFI != CFI)
+           if( not SmartConvertSum( NKD, NKD, rq.rec.FactDate, fininstr.rec.FaceValueFI, CFI, true) )        
+              return;
+           end;
+        end;
+
+        Summa = Cost + NKD;
+
+        if (CFI != NATCUR)
+           if( not SmartConvertSum( Summa, Summa, rq.rec.FactDate, CFI, fiidTo, true) )                      
+              return;
+           end;
+        end;
+     else
+        /*(в TotalCost нкд сидит на дату поставки)*/
+        /*плановая дата поставки*/
+
+        PlanDate = GetDealSetAvPlanDate(dlleg, DealCh);
+        NKD = СуммаКупона( dlleg.PFI, DealCh.OldPrincipal, PlanDate );
+
+        if( ПолучитьФинИн( dlleg.PFI, fininstr ) ) 
+           msgbox("Отсутствует финансовый инструмент (FIID=", dlleg.PFI,")" );
+        end;
+
+        if (fininstr.rec.FaceValueFI != NATCUR)
+           if( not SmartConvertSum( NKD, NKD, Ticket.rec.DealDate, fininstr.rec.FaceValueFI, fiidTo, true) )
+              return;
+           end;
+        end;
+
+        if (CFI != NATCUR)
+           if( not SmartConvertSum( Summa, Cost, Ticket.rec.DealDate, CFI, fiidTo, true) )
+              return;
+           end;
+        end;
+
+        Summa = Summa + NKD;
+     end;
+
+   AgentID = ОпределитьПосредникаСделки( Ticket.rec );    
+
+     /*Для сделок с участием контрагента Д Buy и Sale увеличиваются на одну и ту же сумму*/
+     if ((Ticket.rec.IsPartyClient == SET_CHAR) AND (Ticket.rec.PartyContrID != 0))
+        Data.AllAmountBuy = Data.AllAmountBuy + Summa;
+        Data.AllAmountSale = Data.AllAmountSale + Summa;
+        if( IsEXCHANGE(Data.Group) )
+           Data.AllAmountBuy_Market = Data.AllAmountBuy_Market + Summa;
+           Data.AllAmountSale_Market = Data.AllAmountSale_Market + Summa;
+           InsertMarketToArray( Ticket.rec.MarketID, Summa, Summa );
+        else
+           Data.AllAmountBuy_Out = Data.AllAmountBuy_Out + Summa;
+           Data.AllAmountSale_Out = Data.AllAmountSale_Out + Summa;
+        end;
+     else
+
+        if( (IsBUY(Data.Group) AND (not IsBack)) OR
+            (IsSALE(Data.Group) AND IsBack)
+          )
+           Data.AllAmountBuy = Data.AllAmountBuy + Summa;
+         
+        if( (IsEXCHANGE(Data.Group)) OR 
+           (IsOUTEXCHANGE(Data.Group) AND (AgentID != -1) AND (ВидСубъекта( AgentID, PTK_MARKETPLASE ) == true))
+          )
+              Data.AllAmountBuy_Market = Data.AllAmountBuy_Market + Summa;
+              InsertMarketToArray( AgentID, Summa, $0 );
+           else
+              Data.AllAmountBuy_Out = Data.AllAmountBuy_Out + Summa;
+           end;
+        end;
+
+        if( (IsBUY(Data.Group) AND IsBack) OR
+           (IsSALE(Data.Group) AND (not IsBack))
+          )
+           Data.AllAmountSale = Data.AllAmountSale + Summa;
+
+        if( IsEXCHANGE(Data.Group)  OR
+           (IsOUTEXCHANGE(Data.Group) AND (AgentID != -1) AND (ВидСубъекта( AgentID, PTK_MARKETPLASE ) == true))
+          )
+              Data.AllAmountSale_Market = Data.AllAmountSale_Market + Summa;
+              InsertMarketToArray( Ticket.rec.MarketID, $0, Summa );
+           else
+              Data.AllAmountSale_Out = Data.AllAmountSale_Out + Summa;
+           end;
+        end;
+     end;
+
+  /*MAG 24.03.2005 - Операции конвертации:*/
+  /*Для клиентских сделок балансовая стоимость нулевая, поэтому для них 
+  стоимость списанных ц/б равна стоимости покупки списываемых ц/б,
+  стоимость зачисленных ц/б равна стоимости списанных ц/б*/
+     if (IsCONVERT_SHARE(Data.Group) OR IsCONVERT_RECEIPT(Data.Group)) 
+  /*по первой части - продажа*/ 
+        if (not IsBack)
+           if (Ticket.rec.ClientID == -1)
+              if (ПолучитьЦеновыеУсловияСделки( Ticket, rq.rec.FactDate, false,                
+                  null, null, null, Summa ) == false)
+                 return;
+              end;
+           else
+              sumID=GetSumID(Ticket.rec.DealID);
+              if ( WRT_GetSaleFinResult (sumID, Ticket.rec.portfolioid, 0, 
+                                         Summa, null, null, null, null, null, null, null, null, null, null, 
+                                         null, null, null, null, null, null, null ) == false)
+                 return;
+              end;
+           end;
+
+           if( not SmartConvertSum( Summa, Summa, Ticket.rec.DealDate, CFI, fiidTo, true) )
+              return;
+           end;
+           Data.AllAmountSale = Data.AllAmountSale + Summa;
+           Data.AllAmountSale_Out = Data.AllAmountSale_Out + Summa;
+           if (Ticket.rec.ClientID != -1)
+              Data.AllAmountBuy = Data.AllAmountBuy + Summa;
+              Data.AllAmountBuy_Out = Data.AllAmountBuy_Out + Summa;
+           end;
+        else
+  /*по второй части - покупка - только для своих сделок. Для клиентских - учтена выше*/ 
+           if (Ticket.rec.ClientID == -1)
+              if (ПолучитьЦеновыеУсловияСделки( Ticket, rq.rec.FactDate, true,                 
+                  null, null, null, Summa ) == false)
+                 return;
+              end;
+           end;
+
+           if( not SmartConvertSum( Summa, Summa, Ticket.rec.DealDate, CFI, fiidTo, true) )
+              return;
+           end;
+           Data.AllAmountBuy = Data.AllAmountBuy + Summa;
+           Data.AllAmountBuy_Out = Data.AllAmountBuy_Out + Summa;
+        end;
+     end;
+     Data.ReportRun  = true; 
+  end;
+
+  private macro ПросмотрБиржПФИ()
+     var  dvdeal, query, SQLquery, NRec, NRecquery, NumRec = 0, count = 0, Summa;
+  /* В запросе не должны попадать сделки исполнения */
+     query = "  SELECT MarketDVDeal.T_AMOUNT," +
+             "         MarketDVDeal.T_DATE," +
+             "         DECODE( Deriv.T_PriceMode, 1, Deriv.T_TickFIID, ContrFI.T_ParentFI ) AS PriceFIID, "  
+             "         (case when ContrFI.t_AvoirKind = 2 /*Опцион*/ then MarketDVDeal.t_PositionBonus else MarketDVDeal.t_PositionCost end) CostDeal, " +
+             "         (Rsb_Secur.check_GroupStr( Rsb_Secur.get_OperationGroup( (SELECT T_SYSTYPES FROM doprkoper_dbt WHERE T_KIND_OPERATION = MarketDVDeal.T_KIND) ), '400' )) IsBuy," +
+             "         ContrFI.T_ISSUER" +
+             "    FROM ddvdeal_dbt MarketDVDeal, dfininstr_dbt ContrFI, dfideriv_dbt Deriv, dfininstr_dbt BaseFI1 " +
+             "   WHERE MarketDVDeal.T_STATE = 2 and" +
+             "         ContrFI.T_FIID = MarketDVDeal.T_FIID and" +
+             "         Rsb_Secur.check_GroupStr( Rsb_Secur.get_OperationGroup( (SELECT T_SYSTYPES FROM doprkoper_dbt WHERE T_KIND_OPERATION = MarketDVDeal.T_KIND) ), '400000' ) != 1" +
+             "         and Deriv.T_FIID = ContrFI.T_FIID "
+             "         and MarketDVdeal.T_DATE >= " + GetSQLDate( Data.DateBeg ) +
+             "         and MarketDVdeal.T_DATE <= " + GetSQLDate( Data.DateEnd ) + 
+             "         and BaseFI1.T_FIID = ( case when NVL((select BaseFinFut.t_FI_KIND from dfininstr_dbt BaseFinFut " +
+             "                                                where BaseFinFut.t_FIID = ContrFI.T_FACEVALUEFI),0) = 4 " +
+             "                                     then NVL((select BaseFIN.t_FACEVALUEFI from dfininstr_dbt BaseFIN " +
+             "                                                where BaseFIN.t_FIID = ContrFI.T_FACEVALUEFI),-1) " +
+             "                                     else  ContrFI.T_FACEVALUEFI end ) " +
+             "         and (BaseFI1.T_FI_KIND = 2 or " + 
+             "             (BaseFI1.T_FI_KIND = 3 and 0 = (case when BaseFI1.T_FACEVALUEFI = -1 then 0 " +
+             "                                             else (case when Nvl((select BaseFI2.T_FI_KIND  from dfininstr_dbt BaseFI2 " +
+             "                                                                   where BaseFI2.T_FIID = BaseFI1.T_FACEVALUEFI),0) = 2 " +
+             "                                                        then 0 else 1 end) end) ))" +
+             "  ORDER BY ContrFI.T_ISSUER";
+
+     SQLquery = RSDCommand(query);
+     SQLquery.execute();
+
+     NRecquery = RSDCommand("select count(1) NRec from (" +query +")");
+     NRecquery.execute();
+
+     dvdeal = TRsbDataSet( SQLquery );
+     NRec = TRsbDataSet( NRecquery );
+
+     if( NRec.MoveNext() )
+        NumRec = int(NRec.NRec); 
+     end;
+
+     if( NumRec > 0 )
+        Data.ReportRun  = true; 
+     end;
+
+     InitProgress( NumRec, "Просмотр биржевых сделок с ПИ", "Просмотр биржевых сделок с ПИ" );
+
+     while( dvdeal.MoveNext() )
+
+       if( not SmartConvertSum( Summa, Money(dvdeal.CostDeal), Date(dvdeal.Date), int(dvdeal.PriceFIID), NATCUR, true) )
+          return;
+       end;
+       if( dvdeal.IsBuy == 1)
+          Data.AllAmountBuy = Data.AllAmountBuy + Summa;
+          Data.AllAmountBuy_Market = Data.AllAmountBuy_Market + Summa;
+          InsertMarketToArray( dvdeal.Issuer , Summa, $0 );
+       else
+          Data.AllAmountSale = Data.AllAmountSale + Summa;
+          Data.AllAmountSale_Market = Data.AllAmountSale_Market + Summa;
+          InsertMarketToArray( dvdeal.Issuer , $0, Summa );
+       end;
+
+       UseProgress( count = count + 1 );
+     end;
+
+     RemProgress();
+  end;
+
+  private macro ПросмотрВНЕБиржПФИ()
+     var dvdeal, query, SQLquery, NRec, NRecquery, NumRec = 0, count = 0, Summa = $0, SummFIID;
+
+     query = " SELECT DVDeal.T_ID, DVDeal.T_Date, DECODE(DVDeal.t_Type,"+ALG_DV_BUY+",1,0) IsBuy, " +
+             "        DECODE(DVDeal.t_DVKind,"+DV_OPTION+",DVDeal.t_Bonus,nfi.t_Price*nfi.t_Amount) Summa, " +
+             "        DECODE(DVDeal.t_DVKind,"+DV_OPTION+",DVDeal.t_BONUSFIID,nfi.t_PriceFIID) SummFIID " +
+             "   FROM ddvndeal_dbt DVDeal, dfininstr_dbt fin, ddvnfi_dbt nfi " +
+             "  WHERE nfi.T_DealID = DVDeal.T_ID " +
+             "    and DVDeal.T_DocKind in(" +string(DL_DVNDEAL)+ ","+string(DL_DVDEALT3)+ ")"+
+             "    and nfi.T_TYPE = case when (DVDeal.T_DVKIND = ? and DVDeal.T_FORVARD = 'X') then 1 else 0 end " +
+             "    and fin.t_fiid = nfi.T_fiid " +/* отбираем сделки, кот. совершены с исходным активом - фондовым индексом или ценной бумагой */
+             "    and (case when fin.t_FI_KIND = ? then fin.t_Settlement_Code else fin.t_FI_KIND end) = ? " +
+             "    and DVDeal.T_IsTrust = chr(0) " +
+             "    and DVDeal.T_DVKIND != ? "+
+             "    and DVDeal.T_State > 0 " +
+             "    and DVDeal.T_Date >= ? " +
+             "    and DVDeal.T_Date <= ? ";
+
+     SQLquery = RSdCommand(query);
+     NRecquery= RSdCommand( "select count(1) NRec from ("+query+")" );
+
+     SQLquery.addParam("", RSDBP_IN, DV_OPTION);
+     SQLquery.addParam("", RSDBP_IN, FIKIND_INDEX);
+     SQLquery.addParam("", RSDBP_IN, FIKIND_AVOIRISS);
+     SQLquery.addParam("", RSDBP_IN, DV_CURSWAP);
+     SQLquery.addParam("", RSDBP_IN, Data.DateBeg);
+     SQLquery.addParam("", RSDBP_IN, Data.DateEnd);
+     NRecquery.addParam("", RSDBP_IN, DV_OPTION);
+     NRecquery.addParam("", RSDBP_IN, FIKIND_INDEX);
+     NRecquery.addParam("", RSDBP_IN, FIKIND_AVOIRISS);
+     NRecquery.addParam("", RSDBP_IN, DV_CURSWAP);
+     NRecquery.addParam("", RSDBP_IN, Data.DateBeg);
+     NRecquery.addParam("", RSDBP_IN, Data.DateEnd);
+
+     SQLquery.execute();
+     NRecquery.execute();
+                                                                                                                  
+     dvdeal = TRsbDataSet( SQLquery );
+     Nrec = TRsbDataSet( NRecquery );
+
+     if( Nrec.MoveNext() )
+        NumRec = int(Nrec.NRec);
+     end;
+
+     if( NumRec > 0 )
+        Data.ReportRun = true; 
+     end;
+
+     InitProgress( NumRec, "Просмотр внебиржевых сделок с ПИ", "Просмотр внебиржевых сделок с ПИ" );
+
+     while( dvdeal.MoveNext() )
+
+       Summa    = dvdeal.Summa;
+       SummFIID = dvdeal.SummFIID;
+
+       if( not SmartConvertSum( Summa, money(Summa), SQL_ConvTypeDate(dvdeal.Date), int(SummFIID), NATCUR, true) )
+          return;
+       end;
+
+       if( dvdeal.IsBuy )
+          Data.AllAmountBuy = Data.AllAmountBuy + Summa;
+          Data.AllAmountBuy_Out = Data.AllAmountBuy_Out + Summa;
+       else
+          Data.AllAmountSale = Data.AllAmountSale + Summa;
+          Data.AllAmountSale_Out = Data.AllAmountSale_Out + Summa;
+       end;
+
+       UseProgress( count = count + 1 );
+     end;
+
+     RemProgress();
+  end;
+
+  private macro ПросмотрСделокБОПИ()
+     ПросмотрБиржПФИ();
+     ПросмотрВНЕБиржПФИ();
+  end;
+
+  /*по дате поставки (только если она была)*/
+  private macro ПросмотрСвоихСделокБОЦБ()
+     var
+        DealCh   = TRecHandler( "sptkchng" ),
+        continue_cicle, Num = 0, query, count, pmwrtsum, SaveKeyNum = deals.KeyNum;
+     deals.KeyNum = 0;
+
+     query = " SELECT lot.FIID, lot.DocID, dlleg.t_DealID, dlleg.t_PFI, " +
+                    " dlleg.t_REJECTDATE, dlleg.t_LegKind, rq.t_DealPart, " +
+                    " dlleg.t_Maturity, dlleg.t_Expiry, dlleg.t_MaturityIsPrincipal " + 
+              " FROM  ("
+                  + "   select t_FIID FIID, t_DocID DocID, t_DealID DealID from dpmwrtsum_dbt  "
+                  + "    where t_DocKind     = " + string(DLDOC_PAYMENT)
+                  + "      and t_Date BETWEEN " + GetSQLDate(Data.DateBeg) + " and " + GetSQLDate(Data.DateEnd) 
+                  + "      and t_DealID      > 0 "
+                  + "      and t_Department  = " + string({OperDprt})
+                  + "      and t_Party       = -1 "
+                  + "      and t_kind != 210 "
+                  + " union all "
+                  + "   select t.t_FIID, t.t_DocID, wrtsum1.t_DealID "
+                  + "     from v_scwrthistex t, dpmwrtsum_dbt wrtsum1 "
+                  + "    where t.t_DocKind     = " + string(DLDOC_PAYMENT)
+                  + "      and wrtsum1.t_SumID = t.t_Parent " 
+                  + "      and t.t_instance = (SELECT MIN (t_instance) " 
+                  + "                                          FROM v_scwrthist " 
+                  + "                                         WHERE t_sumid = t.t_sumid " 
+                  + "                                           AND t_Action = 10) "
+                  + "      and t.t_changedate BETWEEN " + GetSQLDate(Data.DateBeg) + " and " + GetSQLDate(Data.DateEnd)
+                  + "      and t.t_kind = 210 "
+                  + "      and t.t_Department  = " + string({OperDprt})
+                  + "      and t.t_Party       = -1 "
+                  + "   group by t.t_FIID, t.t_DocID, wrtsum1.t_DealID "
+                  +   ") lot, ddlrq_dbt rq, ddl_leg_dbt dlleg " +
+              " WHERE "
+                  + " lot.DealID = dlleg.t_DealID " 
+                  + " and dlleg.t_LegID = 0 " 
+                  + " and dlleg.t_LegKind =DECODE(rq.t_DealPart, " + String(2) + ", " + String(LEG_KIND_DL_TICK_BACK) + ", " + String(LEG_KIND_DL_TICK) + ") " /*??? Подумать*/
+                  + " and lot.DocID = rq.t_ID and " 
+                  +  " (    (rq.t_DocKind     = " + string(DL_SECURITYDOC)
+                  +  "   or  rq.t_DocKind     = " + string(DL_INVESTSHARE)
+                  +  "   or  rq.t_DocKind     = " + string(DL_CONVAVR) + ") and "
+                  +  "      rq.t_State = " + string(DLRQ_STATE_EXEC)
+                  +  " ) ";
+     /*До оптимизации pmwrtsum перебирался по 6-му ключу, но необходимости в такой 
+       сортировке нет, содержимое отчета после оптимизации не изменилось*/
+
+
+     pmwrtsum = TRsbDataSet( query, RSDVAL_CLIENT, RSDVAL_STATIC );
+     pmwrtsum.MoveLast();
+     count = pmwrtsum.GetRecCount();
+     continue_cicle = pmwrtsum.MoveFirst(); 
+
+     InitProgress( count, "Просмотр лотов собственных сделок", "Просмотр лотов собственных сделок" );
+
+     Num = 0;
+     while( continue_cicle )   
+        if( БумагаПодходит(pmwrtsum.FIID) AND (not DL_DealAsResultDVExe(pmwrtsum.DealID))
+          )
+           rq.Clear();                                      
+           rq.rec.ID = pmwrtsum.DocID; 
+           if( ПолучитьТО(rq.rec.ID, rq) )
+
+              /* Получим сделку по лоту */
+              deals.Clear(); 
+              deals.rec.DealID = pmwrtsum.DealID;
+              if( deals.GetEQ() ) 
+                  /* Получаем параметры сделки на конец отчетного периода. */
+                  SP_GetDealParmsByDate( deals, Data.DateEnd, DealCh, false, false);
+
+                  Data.Group = GetOpGroup( deals.rec ); 
+                  СохранитьДляОтчетаБОЦБ( deals, rq,                        
+                                          rq.rec.DealPart == 2,
+                                          DealCh.rec, pmwrtsum );
+               else
+                  continue_cicle = false;
+               end;
+           end;
+        end;
+        UseProgress( Num = Num + 1 );
+        if( continue_cicle )
+           continue_cicle = pmwrtsum.MoveNext();
+        end;
+     end;
+
+     deals.KeyNum = SaveKeyNum;
+     RemProgress();
+  end;
+
+  /*по дате сделки (даже если поставки еще не было)*/
+
+  private macro ПросмотрКлиентскихСделокБОЦБ()
+     var
+        DealCh   = TRecHandler( "sptkchng" ),
+        continue_cicle, Num = 0;
+
+     deals.Clear();
+     deals.AddFilter(" t_DealDate    >= " + GetSQLDate(Data.DateBeg)
+               + " and t_DealDate    <= " + GetSQLDate(Data.DateEnd)
+               + " and (t_BofficeKind = " + string(DL_SECURITYDOC)
+               + "  or  t_BofficeKind = " + string(DL_INVESTSHARE)
+               + "  or  t_BofficeKind = " + string(DL_CONVAVR) + ")"
+               + " and t_DealStatus  >= " + string(DL_READIED)
+               + " and t_Department   = " + string({OperDprt})
+               + " and t_ClientID    != -1 " );
+
+     deals.Rewind;
+     InitProgress( deals.NRecords, "Отчет \"Сведения о сделках\"", "Просмотр клиентских сделок ...");
+     continue_cicle = deals.Next;
+
+     while( continue_cicle )
+          if( ПолучитьТОпоДокументу(DL_SECURITYDOC, deals.rec.dealId, 1 , DLRQ_TYPE_DELIVERY, 0, rq))
+              if( БумагаПодходит( rq.rec.FIID) AND (not DL_DealAsResultDVExe(deals.rec.DealID)) )        
+
+                 /* Получаем параметры сделки на конец отчетного периода. */
+                 SP_GetDealParmsByDate( deals, Data.DateEnd, DealCh, false, false );
+
+                 Data.Group = GetOpGroup( deals.rec ); 
+                 СохранитьДляОтчетаБОЦБ( deals, rq, false, DealCh.rec, NULL );                                
+                 /*по второй части*/
+                 if( (IsBACKSALE(Data.Group) == true) OR (IsREPO(Data.Group) == true) OR 
+                     (IsCONVERT_SHARE(Data.Group) == true) OR 
+                     (IsCONVERT_RECEIPT(Data.Group) == true))
+                    if( ПолучитьТОпоДокументу(DL_SECURITYDOC, deals.rec.dealId, 2 , DLRQ_TYPE_DELIVERY, 0, rq) )
+                       СохранитьДляОтчетаБОЦБ( deals, rq, true, DealCh.rec, NULL );                         
+                    end;
+                 end;
+              end;
+           end;
+
+        UseProgress( Num = Num + 1 );
+        continue_cicle = deals.Next();
+     end;
+
+     RemProgress();
+  end;
+
+  private macro ПросмотрСвоихСделокБОУВ()
+    var query, ds,
+        i = 0, 
+        count = 0;
+
+    query = "SELECT TICK.T_DEALTYPE, LEG.T_COST " +
+            "FROM DDL_TICK_DBT TICK " +
+            "       INNER JOIN DDL_LEG_DBT LEG " +
+            "          ON LEG.T_DEALID = TICK.T_DEALID " +
+            "       INNER JOIN DPMPAYM_DBT PMPAYM" +
+            "          ON PMPAYM.T_DOCUMENTID = TICK.T_DEALID AND PMPAYM.T_DOCKIND = TICK.T_BOFFICEKIND " +
+            "WHERE TICK.T_BOFFICEKIND = " + String(DL_VEKSELACCOUNTED) +        //Учтеные векселя
+            "   AND TICK.T_DEALTYPE IN (2401, 2411) " +                         //Покупка/Продажа 
+            "   AND PMPAYM.T_VALUEDATE >= " + GetSQLDate(Data.DateBeg) +
+            "   AND PMPAYM.T_VALUEDATE <= " + GetSQLDate(Data.DateEnd) +
+            "   AND PMPAYM.T_PURPOSE = 1 " +
+            "   AND PMPAYM.T_SUBPURPOSE = 1 " +
+            "   AND TICK.T_DEPARTMENT  = " + String({OperDprt}) +
+            "   AND TICK.T_CLIENTID = -1";                                      // Собственные сделки
+
+     ds = TRsbDataSet( query, RSDVAL_CLIENT, RSDVAL_STATIC );
+     ds.MoveLast();
+     count = ds.GetRecCount();
+     ds.MoveFirst(); 
+     ds.Prev();
+     if(count > 0)
+        Data.ReportRun = true;
+     end;
+     InitProgress( count, "Просмотр собственных сделок по учтенным векселям", "Просмотр собственных сделок по учтенным векселям" );
+     while(ds.Next())
+       if(ds.DealType == 2401)
+          Data.AllAmountBuy_Out = Data.AllAmountBuy_Out + ds.Cost;
+          Data.AllAmountBuy = Data.AllAmountBuy + ds.Cost;
+       end;
+       if(ds.DealType == 2411)
+          Data.AllAmountSale_Out = Data.AllAmountSale_Out + ds.Cost;
+          Data.AllAmountSale = Data.AllAmountSale + ds.Cost;
+       end;
+       i = i + 1;
+       UseProgress(i)
+     end;
+
+     RemProgress();
+  end;
+
+  private macro ПросмотрКлиентскихСделокБОУВ()
+    var query, ds,
+        i = 0, 
+        count = 0;
+
+    query = "SELECT TICK.T_DEALTYPE, LEG.T_COST " +
+            "FROM DDL_TICK_DBT TICK " +
+            "       INNER JOIN DDL_LEG_DBT LEG " +
+            "          ON LEG.T_DEALID = TICK.T_DEALID " +
+            "WHERE TICK.T_BOFFICEKIND = " + String(DL_VEKSELACCOUNTED) +       //Учтеные векселя
+            "   AND TICK.T_DEALTYPE IN (2401, 2411) " +                        //Покупка/Продажа 
+            "   AND TICK.T_DEALDATE >= " + GetSQLDate(Data.DateBeg) +
+            "   AND TICK.T_DEALDATE <= " + GetSQLDate(Data.DateEnd) +
+            "   AND TICK.T_DEPARTMENT  = " + String({OperDprt}) +
+            "   AND TICK.T_CLIENTID != -1";                                    // Клиентские сделки
+
+     ds = TRsbDataSet( query, RSDVAL_CLIENT, RSDVAL_STATIC );
+     ds.MoveLast();
+     count = ds.GetRecCount();
+     ds.MoveFirst(); 
+     ds.Prev();
+     if(count > 0)
+        Data.ReportRun = true;
+     end;
+     InitProgress( count, "Просмотр клиентских сделок по учтенным векселям", "Просмотр клиентских сделок по учтенным векселям" );
+     while(ds.Next())
+       if(ds.DealType == 2401)
+          Data.AllAmountBuy_Out = Data.AllAmountBuy_Out + ds.Cost;
+          Data.AllAmountBuy = Data.AllAmountBuy + ds.Cost;
+       end;
+       if(ds.DealType == 2411)
+          Data.AllAmountSale_Out = Data.AllAmountSale_Out + ds.Cost;
+          Data.AllAmountSale = Data.AllAmountSale + ds.Cost;
+       end;
+       i = i + 1;
+       UseProgress(i)
+     end;
+
+     RemProgress();
+  end;
+
+
+  MACRO Create()
+  
+   Message( "Формирование исходных данных" );
+
+   Data = SourceData( m_form); 
+
+   if( Data.IsSecur )
+      ПросмотрСвоихСделокБОЦБ();  
+      ПросмотрКлиентскихСделокБОЦБ();  
+   end;
+
+   if( Data.IsDeriv )
+      ПросмотрСделокБОПИ();  
+   end;
+
+   if(  Data.IsVeksAcc )
+      ПросмотрСвоихСделокБОУВ();
+      ПросмотрКлиентскихСделокБОУВ(); 
+   end;
+
+
+  END;
+  initADataSource(_form);
+END;
+
+
+PRIVATE CLASS CPrintOut_Excel( Report:OBJECT )
+  VAR m_Report = Report;
+
+  macro PrintLine( Str:string, Name:string, SumBuy, SumSale, Frmt:string )
+
+      m_Report.PrintTableLine( "A0_1",   Str,                      null,
+                               "A0_2",   Name,                     null,
+                               "A0_3",   m_Report.PrintSum(SumBuy),         null,
+                               "A0_4",   m_Report.PrintSum(SumSale),        null
+                             );                           
+
+
+  end;
+
+  macro ПечатьЗаголовка(ReportData)
+     m_Report.AddPrintCell("СВЕДЕНИЯ О СДЕЛКАХ С ЦЕННЫМИ БУМАГАМИ, СОВЕРШЕННЫХ ПРОФЕССИОНАЛЬНЫМ УЧАСТНИКОМ", m_Report.GetHeaderWidth(), 0, "c:" + FontStyleTitel, REP_ELEM_STR);
+     m_Report.AddStr();
+     m_Report.AddPrintCell("за " + ReportData.PeriodName , m_Report.GetHeaderWidth(), 0, "c:" + FontStyleTitel, REP_ELEM_STR);
+     m_Report.AddStr();
+
+  end;
+
+  macro ПечатьОтчета(ReportData)
+     var i;
+     PrintLine(" ", "Совершенные сделки - всего", ReportData.AllAmountBuy, ReportData.AllAmountSale, "l" + FontStyleTitel );
+     PrintLine("1", "     Сделки, совершенные через организатора\n" +
+                    "     торговли, - всего", ReportData.AllAmountBuy_Market, ReportData.AllAmountSale_Market, "l");
+     PrintLine(" ", "          - в том числе по организаторам\n" +
+                    "          торговли", 0.0, 0.0, "l" );
+
+       i = 0;
+       while( i < ReportData.MarketData.Size )
+          if( not ПолучитьСубъекта( ReportData.MarketData[i].MarketID, Market ) )
+            PrintLine("1."+String(i+1), Market.rec.Name , ReportData.MarketData[i].SumBuy, ReportData.MarketData[i].SumSale, "l:w" );
+          end;
+          i = i + 1;
+       end;
+     PrintLine("2", "Сделки, совершенные на внебиржевом рынке" , ReportData.AllAmountBuy_Out, ReportData.AllAmountSale_Out, "l:w" );
+  end;                                                                                     
+
+END;
+
+PRIVATE CLASS (CVisitorExcel) CVisitor_RepExcel(_Form)
+  
+  MACRO ExecuteReport( Data )
+
+     Dl_CallInsertStat(DL_OUTREPORT_EXCEL);
+     if( Data.ReportRun == false) 
+        ErrorLog("\nНет данных, удовлетворяющих параметрам отчета.");
+     else
+
+       ObjReport.ПечатьЗаголовка(Data);
+       ObjReport.ПечатьОтчета(Data);
+
+       after_44_footer(this);   
+
+     end;
+    
+     PrintLog();
+     PrintWinRep();
+     ShowWinRep();
+
+
+  END;
+
+  macro ReInitObject(_mForm)
+     initCVisitorExcel(_mForm,CPrintOut_Excel(this),TableHead);
+  end;
+
+  ReInitObject(_Form);
+END;
+
+
+PRIVATE CLASS (DL_ELANK_XML) DLREESTREL_XML(repObj: object)
+
+  PRIVATE MACRO GetFileName()
+    var RefID, Num;
+    if(m_FileName == NULL)
+      if( GetReferenceIDByType( 134, 1, RefID) )
+         ErrLog.LogError( "Не найден описатель референса" );
+      elif( GenerateReference( RefID, Num ) )
+         ErrLog.LogError( "Ошибка при генерации референса по описателю " + string(RefID) );
+      end;
+      
+      m_FileName = "SdelkiZaPeriod";
+     
+    end;
+    
+     return m_FileName;
+  END;
+
+  InitDL_ELANK_XML(repObj);
+END;
+
+
+PRIVATE CLASS (CPrintOut_Excel) CPrintOut_XML( Report:OBJECT )
+
+
+  macro PrintLine( Str:string, Name:string, SumBuy, SumSale, Frmt:string )
+
+      m_Report.PrintTableLine( "av:Col02",   Str,                      null,
+                               "av:Col03",   Name,                     null,
+                               "av:Col04",   m_Report.PrintSum(SumBuy),         null,
+                               "av:Col05",   m_Report.PrintSum(SumSale),        null
+                             );                           
+
+
+  end;
+
+  initCPrintOut_Excel(Report);
+end;
+
+
+private class (CVisitorXML) CVisitor_RepXML(_form)
+
+
+  MACRO ExecuteReport( Data )
+
+     Dl_CallInsertStat(DL_OUTREPORT_XML);
+     if( Data.ReportRun == false) 
+        ErrorLog("\nНет данных, удовлетворяющих параметрам отчета.");
+     else
+        objXml.CreateInstance("av:Отчет1408Р6Т4","av:Форма1100","av:ПакетСООУРЦБ1408",Data.PeriodNum,Data.Year); 
+
+        ObjReport.ПечатьОтчета(Data);
+        objXml.PrintLog(Errors);
+
+       objXml.DisposeInstance(); 
+     end;
+
+   END;
+
+  macro ReInitObject(_mForm)
+     initCVisitorXML(_mform, DLREESTREL_XML(CMakeReport(TableErrors)), CPrintOut_XML(this));
+  end;
+
+  ReInitObject(_Form);
+end;
+
+macro RunReport(form,_With_XML:bool)
+  VAR With_XML = DL_IIF(_With_XML==NULL,false,_With_XML);
+
+  if( With_XML )
+     CApp(form, DLREESTREL_DataSource(form), CVisitor_RepExcel(form), CVisitor_RepXML(form) ).Run();
+  else
+     CApp(form, DLREESTREL_DataSource(form), CVisitor_RepExcel(form) ).Run();
+  end;
+end;

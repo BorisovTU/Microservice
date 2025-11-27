@@ -1,0 +1,510 @@
+/*
+  $Name:         mfrstepmass.mac
+  $Module:       РКО
+  $Description:  Выполнение массовой проводки по счетам МФР
+*/
+//-----------------------------------------------------------------------------
+// Блок      : 29001 - "Межфилиальные расчеты ЦАБС"
+// Шаг       : 10    - "Перевод по счетам МФР ЦАБС"
+// Назначение: Выполнение шага в массовом режиме
+// Описание  : 
+//-----------------------------------------------------------------------------
+import oralib, batchemins, mfr_acc, PSInter, PaymInter, InsCarryDoc;
+import "pm_tools.mac", "SetPaymTrnDef.mac";
+
+PRIVATE CLASS (TRsdRecordReader) TMassDelCarryData
+  var AppKind      : integer
+     ,AppKey       : string
+     ,ID_Operation : integer
+     ,ID_Step      : integer;
+END;
+
+PRIVATE CLASS (TRsdRecordReader) TMassMFRCarryData
+  var PaymentID : integer
+     ,DbFlag : string
+     ,Department : integer
+     ,DepartmentFrom : integer
+     ,DepartmentTo : integer
+     ,StartDepartment : integer
+     ,BaseFIID : integer
+     ,FutureBaseAmount : money
+     ,ID_Operation : integer
+     ,ID_Step : integer
+     ,PmAddPIID : integer
+     ,FIID_FuturePayAcc : integer
+     ,FuturePayerAccount : string
+     ,FuturePayerAmount : money
+     ,FIID_futurerecAcc : integer
+     ,FutureReceiverAccount : string
+     ,FutureReceiverAmount : money
+     ,Payer : integer
+     ,Receiver : integer
+     ,ValueDate : date
+     ,ShifrOper : string
+     ,Chapter : integer
+     ,Number : string
+     ,NumberPack : integer
+     ,CashSymbolDebet : string
+     ,CashSymbolCredit : string
+     ,SymbNotBalDebet : string
+     ,SymbNotBalCredit : string
+     ,ClaimID : integer
+     ,CoverAmount : money
+     ,PmFPAcc_FIID : integer
+     ,PmFPAcc : string
+     ,PmFRAcc_FIID : integer
+     ,PmFRAcc : string
+     ,OperInitiator: integer
+     ,OFRSymbol:string
+     ,PIOFRSymbol:string
+     ;
+END;
+
+
+/* Класс для накопления данных и последующего пакетного
+   изменения Future-полей платежа
+*/
+PRIVATE CLASS ( PSRepMap ) TMassMFRFutureFieldsChanger
+
+  InitPSRepMap( V_INTEGER );
+
+  MACRO Add( pmcarryacc : TRecHandler, carryData : TMassMFRCarryData )
+    var v:TRecHandler = Value( pmcarryacc.rec.PaymentID );
+    if( v == NULL )
+      _extObj.Add( pmcarryacc.rec.PaymentID, pmcarryacc )
+    else
+      if( not carryData.DbFlag )
+        v.rec.PayerFIID       = carryData.PmFPAcc_FIID;
+        v.rec.PayerAccount    = carryData.PmFPAcc;
+      else
+        v.rec.ReceiverFIID    = carryData.PmFRAcc_FIID;
+        v.rec.ReceiverAccount = carryData.PmFRAcc;
+      end;
+      v.rec.PayerAmount    = v.rec.PayerAmount    + pmcarryacc.rec.PayerAmount;
+      v.rec.ReceiverAmount = v.rec.ReceiverAmount + pmcarryacc.rec.ReceiverAmount;
+    end;
+  END;
+
+  MACRO ChangeFutureFields( ErrorMessage : @string ) : integer
+
+    if( not Size )
+      return 0;
+    end;
+    
+    var ins : RsbBatchEmuInsert = RsbBatchEmuInsert( "pmcarryacc.tmp", Size, Size );
+    var ok:bool = First();
+    while( ok )
+      ins.AddRecord( Value() );
+      ok = Next();
+    end;
+
+    execSQL( "delete from dpmcarryacc_tmp" );
+    
+    if( not ins.Transfer() )
+      ErrorMessage = "Ошибка пакетной вставки в dpmcarryacc_tmp";
+      return 1;
+    end;
+
+    return execStoredFunc( "PM_CARFUN.ChangePMFutureFields", V_INTEGER );
+
+  END;
+
+END;
+
+/* Массовое удаление проводок на СНР.
+   Требуется, если проводка выполнялась в тот же день, когда делается дальнейшая проводка по МФР.
+   В этой ситуации
+*/
+MACRO PM_MassDeleteLastCarryToDPP( ErrorMessage : @string ):integer
+
+
+  /* Действия перед удалением проводок на СНР делаются полностью на сервере.
+     Поиск проводок на СНР в сегодняшний день и откат связанных с проводками данных.
+  */
+  var stat:integer = execStoredFunc( "PM_MFRSTEP.MassExecuteBeforeDelCarry", V_INTEGER );
+
+  /* Удаление сегодняшних проводок на СНР
+  */
+  var carryData : TMassDelCarryData;
+  if( not stat )
+    var query:string = "select t.t_DPPAccTrnID as t_AccTrnID "
+                             ",t.t_ID_Operation "
+                             ",t.t_ID_Step "
+                         "from V_PMMFRSTEPDOCS t "
+                              "where t_DPPAccTrnID > 0";
+    var rs:RsdRecordSet = execSQLselect( query );
+    while( rs.moveNext() )
+      carryData.Read( rs );
+      if( not Opr_DeleteCarry( carryData.AccTrnID, carryData.ID_Operation, carryData.ID_Step ) )
+        stat = 1;
+        ErrorMessage = string( "Ошибка удаления проводки AccTrnID = ", carryData.AccTrnID );
+        break;
+      end;
+    end;
+
+  end;
+
+  return stat;
+
+END;
+
+/* Перемещение платежей по счетам МФР
+*/
+MACRO PM_MassMoveMFRPayments( ErrorMessage : @string ) : integer
+  var mfracc_cache : TRsbMfrAccountCache = TRsbMfrAccountCache();
+
+  var carriesQuery:string = string(
+    "select v.t_PaymentID "
+          ",v.t_DbFlag "
+          ",v.t_DepartmentFrom "
+          ",v.t_DepartmentTo "
+          ",v.t_StartDepartment "
+          ",v.t_BaseFIID "
+          ",v.t_ID_Operation "
+          ",v.t_ID_Step "
+          ",v.t_PmAddPIID "
+          ",v.t_FIID_FuturePayAcc "
+          ",v.t_FuturePayerAccount "
+          ",v.t_FuturePayerAmount "
+          ",v.t_FIID_futurerecAcc "
+          ",v.t_FutureReceiverAccount "
+          ",v.t_FutureReceiverAmount "
+          ",v.t_FutureBaseAmount "
+          ",v.t_PmFPAcc_FIID "
+          ",v.t_PmFPAcc "
+          ",v.t_PmFRAcc_FIID "
+          ",v.t_PmFRAcc "
+          ",v.t_Payer "
+          ",v.t_Receiver "
+          ",v.t_ValueDate "
+          ",v.t_ShifrOper "
+          ",v.t_Chapter "
+          ",v.t_Number "
+          ",v.t_NumberPack "
+          ",v.t_CashSymbolDebet "
+          ",v.t_CashSymbolCredit "
+          ",v.t_SymbNotBalDebet "
+          ",v.t_SymbNotBalCredit "
+          ",v.t_CoverAmount "
+          ",v.t_Department "
+          ",PM_CARFUN.GetClaimForCarry( nvl(v.db_PmAddPIID, v.t_PaymentID), nvl2(v.db_PmAddPIID, 251, v.t_PaymDocKind), "//PMDOC_ADDPI
+                                       "v.t_Chapter, v.t_FIID_FuturePayAcc, v.t_FuturePayerAccount, "
+                                       "v.t_PmClaimID, v.t_Chapter, v.t_FIID, v.t_PayerAccount ) as t_ClaimID "
+          ",PM_COMMON.GetOperInitiatorCtg( nvl(v.db_PmAddPIID, v.t_PaymentID) ) as t_OperInitiator "
+          ",PM_COMMON.GetPaymNoteTextStr( v.t_PaymentID, 67/*PM_COMMON.NOTEKIND_PM_OFRSYMBOL*/, v.t_ValueDate ) as t_OFRSymbol "
+          ",v.t_PIOFRSymbol "
+     ,"from ( "
+    "select t.t_PaymentID "
+        ",t.t_ID_Operation "
+        ",t.t_ID_Step "
+        ",t.t_DbFlag "
+        ",m.t_DepartmentFrom "
+        ",m.t_DepartmentTo "
+        ",t.t_StartDepartment "
+        ",t.t_BaseFIID "
+        ",t.t_FIID "
+        ",t.t_PayFIID "
+        ",t.t_PaymDocKind "
+        ",t.t_Chapter "
+        ",t.t_PmClaimID "
+        ",t.t_PayerAccount "
+        ",t.t_ReceiverAccount "
+        ",nvl( picr.t_PmAddPIID, nvl( pidb.t_PmAddPIID, 0 ) ) as t_PmAddPIID "
+        ",pidb.t_PmAddPIID as db_PmAddPIID"
+        ",nvl( pidb.t_FIID, t.t_FIID_FuturePayAcc ) as t_FIID_FuturePayAcc "
+        ",nvl( pidb.t_Account, t.t_FuturePayerAccount ) as t_FuturePayerAccount "
+        ",nvl( pidb.t_FuturePayerAmount, t.t_FuturePayerAmount) as t_FuturePayerAmount "
+        ",nvl( picr.t_FIID, t.t_FIID_FutureRecAcc ) as t_FIID_FutureRecAcc "
+        ",nvl( picr.t_Account, t.t_FutureReceiverAccount ) as t_FutureReceiverAccount "
+        ",nvl( picr.t_FutureReceiverAmount, t.t_FutureReceiverAmount ) as t_FutureReceiverAmount "
+        ",t.t_FIID_FuturePayAcc as t_PmFPAcc_FIID "
+        ",t.t_FuturePayerAccount as t_PmFPAcc "
+        ",t.t_FIID_FutureRecAcc as t_PmFRAcc_FIID "
+        ",t.t_FutureReceiverAccount as t_PmFRAcc "
+        ",t.t_FutureBaseAmount "
+        ",t.t_Payer "
+        ",t.t_Receiver "
+        ",t.t_valuedate "
+        ",rm.t_shifroper "
+        ",rm.t_number "
+        ",t.t_numberpack "
+        ",t.t_Department "
+        ",nvl( picr.t_CashSymbol, rm.t_CashSymbolDebet )  as t_CashSymbolDebet "
+        ",nvl( pidb.t_CashSymbol, rm.t_CashSymbolCredit ) as t_CashSymbolCredit "
+        ",nvl( pidb.t_NotBalSymbol, rm.t_SymbNotBalDebet ) as t_SymbNotBalDebet "
+        ",nvl( picr.t_NotBalSymbol, rm.t_SymbNotBalCredit ) as t_SymbNotBalCredit "
+        ",nvl( nvpi.t_CoverAmount, 0 ) as t_CoverAmount "
+        ",nvl( pidb.t_OFRSymbol, nvl( picr.t_OFRSymbol, CHR(0) ) ) as t_PIOFRSymbol "
+   ,"from V_PMMFRSTEPDOCS t, "
+         "dpmmfrmove_tmp m, "
+         "dpmrmprop_dbt rm, "
+         "dpmaddpi_dbt pidb, "
+         "dpmaddpi_dbt picr, "
+         "dpmnvpi_dbt nvpi "
+    "where m.t_PaymentID = t.t_PaymentID "
+      "and rm.t_PaymentID = m.t_PaymentID "
+      "and pidb.t_PaymentID(+) = t.t_PaymentID "
+      "and pidb.t_DebetCredit(+) = 0 "
+      "and pidb.t_Department(+) = t.t_Department "
+      "and picr.t_PaymentID(+) = t.t_PaymentID "
+      "and picr.t_DebetCredit(+) = 1 "
+      "and picr.t_Department(+) = t.t_Department "
+      "and nvpi.t_PaymentID(+) = t.t_PaymentID ) v "
+    "order by v.t_PaymentID, v.t_PmAddPIID" );
+  
+  var params:TArray;
+  var Status_After = ACCTRN_STATUS_DOCUMENT;
+
+  var ErrorStatus = 0;
+  
+  var carryData : TMassMFRCarryData = TMassMFRCarryData();
+  var rs : RsdRecordset;
+  var accTrnData : RsbAccTransactionData;
+  var pmcarryacc : TRecHandler;
+  var futureFields : TMassMFRFutureFieldsChanger;
+  var batchTrn : RsbBatchPaymTrn;
+  var IsKlient:integer;
+  /* В цикле "послойно" двигаем платежи к следующему филиалу. 
+     Пока на очередной итерации не получим пустое множество "двигаемых" платежей
+  */
+  while( not ErrorStatus )
+    
+    futureFields = TMassMFRFutureFieldsChanger();
+
+    /* Заполнение множества "двигаемых" на итерации платежей с проверками
+    */
+    params = makeArray( SQLParam( "MovPaymCount", 0, RSDBP_OUT ) );
+    ErrorStatus = execStoredFunc( "PM_MFRSTEP.MassExecuteBeforeCarry", V_INTEGER, params );
+
+    var MovPaymCount : integer = params.value(0).value;
+
+    if( ( not ErrorStatus ) and ( MovPaymCount <= 0 ) )
+      /* Больше нет платежей для обработки */
+      break;
+    end;
+
+    if( not ErrorStatus )
+
+      ErrorStatus = 0;
+      ErrorMessage = ""; 
+
+      /* Выполнение проводок МФР
+      */
+      rs = execSQLselect( carriesQuery );
+
+      while( rs.moveNext() )
+
+        carryData.read( rs );
+
+        // Инициатор операции
+      
+      if(carryData.OperInitiator == 1)
+        IsKlient = 1;
+      end;
+      if( carryData.OperInitiator == 2)
+        IsKlient = 0;
+      end;
+
+        accTrnData.Chapter         = carryData.Chapter;
+        accTrnData.Date_Carry      = carryData.ValueDate;
+        accTrnData.Number_Pack     = carryData.NumberPack;
+        accTrnData.Numb_Document   = carryData.Number;
+        accTrnData.ResultCarry     = 1;
+        accTrnData.Shifr_Oper      = carryData.ShifrOper;
+        accTrnData.Ground          = "Проводка по счетам МФР внутри ЦАБС";
+        accTrnData.Department      = carryData.Department;
+        accTrnData.ClaimID         = carryData.ClaimID;
+        if( ( carryData.PmAddPIID <= 0 ) and carryData.CoverAmount )
+          accTrnData.SumEquivalentCarry = carryData.CoverAmount;
+        end;
+
+        /* обычные платежи */
+        if( not carryData.DbFlag )
+          /* в первом филиале может быть конверсия */
+          if( carryData.DepartmentFrom == carryData.StartDepartment )
+            carryData.FIID_FutureRecAcc = carryData.BaseFIID;
+            carryData.FutureReceiverAccount = mfracc_cache.GetAccountPassive( carryData.DepartmentFrom, carryData.DepartmentTo, carryData.BaseFIID, IsKlient );
+            carryData.FutureReceiverAmount = carryData.FutureBaseAmount;
+          /* дальше проводки в валюте текущего дебета */
+          else
+            carryData.FIID_FutureRecAcc = carryData.FIID_FuturePayAcc;
+            carryData.FutureReceiverAccount = mfracc_cache.GetAccountPassive( carryData.DepartmentFrom, carryData.DepartmentTo, carryData.FIID_FuturePayAcc, IsKlient );
+            carryData.FutureReceiverAmount = carryData.FuturePayerAmount;
+          end;
+        /* дебетовые требования */
+        else
+          /* в первом филиале может быть конверсия */
+          if( carryData.DepartmentFrom == carryData.StartDepartment )
+            carryData.FIID_FuturePayAcc = carryData.BaseFIID;
+            carryData.FuturePayerAccount = mfracc_cache.GetAccountActive( carryData.DepartmentFrom, carryData.DepartmentTo, carryData.BaseFIID, IsKlient );
+            carryData.FuturePayerAmount = carryData.FutureBaseAmount;
+          /* дальше проводки в валюте текущего кредита */
+          else
+            carryData.FIID_FuturePayAcc = carryData.FIID_FutureRecAcc;
+            carryData.FuturePayerAccount = mfracc_cache.GetAccountActive( carryData.DepartmentFrom, carryData.DepartmentTo, carryData.FIID_FuturePayAcc, IsKlient );
+            carryData.FuturePayerAmount = carryData.FutureReceiverAmount;
+          end;
+        end;
+
+        accTrnData.FIIDPayer       = carryData.FIID_FuturePayAcc;
+        accTrnData.AccountPayer    = carryData.FuturePayerAccount;
+        accTrnData.SumPayer        = carryData.FuturePayerAmount;
+
+        accTrnData.FIIDReceiver    = carryData.FIID_FutureRecAcc;
+        accTrnData.SumReceiver     = carryData.FutureReceiverAmount;
+        accTrnData.AccountReceiver = carryData.FutureReceiverAccount;
+        
+        if (PM_CheckAccount_Type( accTrnData.AccountPayer, accTrnData.Chapter, accTrnData.FIIDPayer, "А" ) or 
+            PM_CheckAccount_Type( accTrnData.AccountReceiver, accTrnData.Chapter, accTrnData.FIIDReceiver, "А" ))
+            accTrnData.Kind_Oper       = " 3";
+          else
+            accTrnData.Kind_Oper       = " 1";
+          end;
+
+        if( not RmCopyInCarryCashSymbol( carryData, accTrnData) )
+          ErrorMessage = "Ошибка при копировании кассовых символов из платежа в проводку.";
+          ErrorStatus = 1;
+        end;
+
+        if( not ErrorStatus )
+          ErrorStatus = SetPaymTransactionDef(accTrnData, CarryData.PaymentID, CarryData.PmAddPIID, CarryData );
+        end;
+        
+        if(ErrorStatus)
+          ErrorMessage = GetErrMsg();
+
+          if(not ErrorMessage)
+            ErrorMessage = "Ошибка при установке атрибутов проводки по платежу";                
+          end;
+        end;
+
+        if( batchTrn.AddTransaction( CarryData.PaymentID, accTrnData, Status_After, PM_CARRY_REASON_EXECUTION, CarryData.PmAddPIID, CarryData.ID_Operation, CarryData.ID_Step ) < 0 )
+          ErrorMessage = "Ошибка при исполнении проводки";
+          ErrorStatus = 1;
+        end;        
+
+        /* Накопление информации для изменения технических полей платежей после проводок
+        */
+        if( not ErrorStatus )
+          
+          pmcarryacc = TRecHandler( "pmcarryacc.tmp" );
+          pmcarryacc.rec.PaymentID = carryData.PaymentID;
+          if( not carryData.DbFlag )
+            pmcarryacc.rec.PayerAccount    = accTrnData.AccountPayer;
+            pmcarryacc.rec.ReceiverAccount = mfracc_cache.GetAccountActive( carryData.DepartmentTo, carryData.DepartmentFrom, accTrnData.FIIDReceiver, IsKlient );
+          else
+            pmcarryacc.rec.PayerAccount    = mfracc_cache.GetAccountPassive( carryData.DepartmentTo, carryData.DepartmentFrom, accTrnData.FIIDPayer, IsKlient );
+            pmcarryacc.rec.ReceiverAccount = accTrnData.AccountReceiver;
+          end;
+          pmcarryacc.rec.PayerAmount    = accTrnData.SumPayer;
+          pmcarryacc.rec.PayerFIID      = accTrnData.FIIDPayer;
+          pmcarryacc.rec.ReceiverAmount = accTrnData.SumReceiver;
+          pmcarryacc.rec.ReceiverFIID   = accTrnData.FIIDReceiver;
+          pmcarryacc.rec.Chapter        = carryData.Chapter;
+
+          futureFields.Add( pmcarryacc, carryData );
+
+        end;
+
+        if( ErrorStatus )
+          SetErrorOprTemp( CarryData.PaymentID, ErrorStatus, ErrorMessage );
+        end;
+
+      end;
+
+      if( not batchTrn.Execute( false ) )
+        batchTrn = NULL;        
+      end;
+
+      var errPaymentID:TArray;
+      var errCode:TArray;
+      var errMsg:TArray;
+
+      if(not batchTrn.GetErrors(errPaymentID, errCode, errMsg) )
+        batchTrn = NULL;        
+      end;     
+
+      if( not batchTrn )
+        SetErrorsOprTemp(errPaymentID, errCode, errMsg);  
+      end;
+
+  /* Изменение технических полей платежей после проводок
+  */
+      
+  if( not ErrorStatus )
+    ErrorStatus = futureFields.ChangeFutureFields( ErrorMessage );
+  end;
+    
+  /* Транзакционные действия с платежами после проводок
+  */
+  if( not ErrorStatus )
+    ErrorStatus = execStoredFunc( "PM_MFRSTEP.MassExecuteAfterCarry", V_INTEGER );
+  end;  
+
+    end;
+  end;
+
+  return ErrorStatus;
+
+ONERROR( x )
+
+  ErrorMessage = x.Message;
+  return 1;
+
+end;
+
+/* Предтранзакционные действия на шаге
+*/
+MACRO PrepMassExecuteStep() 
+
+  var stat : integer = execStoredFunc( "PM_MFRSTEP.MassPrepare", V_INTEGER );
+
+  if( stat )
+    MemoryError( stat );
+    //DisplayError();
+  end;
+
+  return stat;
+
+ONERROR(x)
+  MemoryError( 1, x.Message );
+  //DisplayError();
+  return 1;
+END;
+
+/* Транзакционные действия на шаге
+*/
+MACRO MassExecuteStep()
+
+  var ErrorMessage : string = "";
+
+  var stat : integer = PM_MassDeleteLastCarryToDPP( @ErrorMessage );
+  if( stat )
+    MemoryError( stat, ErrorMessage );
+    //DisplayError();
+  end;
+
+  if( not stat )
+    stat = PM_MassMoveMFRPayments( @ErrorMessage );
+    if( stat )
+      MemoryError( stat, ErrorMessage );
+      //DisplayError();
+    end;
+  end;
+
+  if( not stat )
+    stat = execStoredFunc( "PM_MFRSTEP.MassExecuteAfterAll", V_INTEGER );
+    if( stat )
+      MemoryError( stat );
+      //DisplayError();
+    end;
+  end;
+
+  return stat;
+
+ONERROR(x)
+  MemoryError( 1, x.Message );
+  //DisplayError();
+  return 1;
+END;
+

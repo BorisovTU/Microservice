@@ -1,0 +1,7 @@
+begin
+
+  UPDATE doprostep_dbt SET T_DATEKINDID=460700000 WHERE T_BLOCKID=203702 AND T_NUMBER_STEP=107;
+
+  commit;
+
+end;

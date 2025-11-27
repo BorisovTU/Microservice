@@ -1,0 +1,465 @@
+/*
+$Name:        dvnop150.mac
+$Module:      Производные инструменты
+$Description: Внебиржевая операция. Шаг: Исполнение без поставки
+*/
+import InsCarryDoc, "dv_categ.mac", "dv_car.mac";
+import dv_carchng;
+
+var EDate:date;
+var SDate:date;
+var PDate:date;
+var nacdl = TRecHandler("dvnacdl");
+
+PRIVATE MACRO ExistZeroFairVal(FD, ДатаИсполненияШага)
+    var que, rs;  
+
+    que = "SELECT * " +
+    "  FROM dgtrecprm_dbt dc_sum " +
+    " WHERE     dc_sum.t_recordid IN " +
+    "               (SELECT dc.t_recordid " +
+    "                  FROM dgtcode_dbt    gc, " +
+    "                       dgtrecord_dbt  rec, " +
+    "                       dgtobject_dbt  obj, " +
+    "                       dgtrecprm_dbt  dc " +
+    "                 WHERE     dc.t_recordid = rec.t_recordid " +
+    "                       AND rec.t_objectid = obj.t_objectid " +
+    "                       AND dc.t_koprmid IN " +
+    "                               (SELECT kopr_ext.t_koprmid " +
+    "                                  FROM dgtkoprm_dbt kopr_ext " +
+    "                                 WHERE kopr_ext.t_name = 'RGDVNDL_EXTCODE') " +
+    "                       AND obj.t_objectkind = 98 " +
+    "                       AND OBJ.T_OBJECTID = gc.t_objectid " +
+    "                       AND dc.T_STRINGVAL = ? " +
+    "                       AND EXISTS " +
+    "                               (SELECT * " +
+    "                                  FROM dgtrecprm_dbt dc_date " +
+    "                                 WHERE     dc_date.t_recordid = dc.t_recordid " +
+    "                                       AND dc_date.t_koprmid IN " +
+    "                                               (SELECT kopr_date.t_koprmid " +
+    "                                                  FROM dgtkoprm_dbt kopr_date " +
+    "                                                 WHERE kopr_date.t_name = " +
+    "                                                       'RGDVNDL_FAIRVAL_DATE') " +
+    "                                       AND dc_date.t_dateval = ?)) " +
+    "       AND dc_sum.t_koprmid IN " +
+    "               (SELECT kopr_ext.t_koprmid " +
+    "                  FROM dgtkoprm_dbt kopr_ext " +
+    "                 WHERE kopr_ext.t_name = 'RGDVNDL_FAIRVAL_AMOUNT') " +
+    "       AND dc_sum.T_MONEYVAL = 0 ";
+    rs = RSDCommand(que);
+    rs.addParam( "", RSDBP_IN, FD.Deal.rec.ExtCode );
+    rs.addParam( "", RSDBP_IN, ДатаИсполненияШага );
+    rs.execute();
+    var DataSet = TRsbDataSet(rs);
+    if( DataSet.movenext )    
+        return true;   
+    end;
+    return false;
+END;
+
+private macro ПроводкиСпсССОпционаВДатуИсп(FD:DVFirstDocNDeal,Doc,nacdl:TRecHandler,ПФИКатегория:string)
+   var СчетПФИ = TRecHandler("account"),
+       ОстатокПФИ = $0,
+       debet:variant, credit:variant;
+
+   if( not FD.OpenAccount( ПФИКатегория, null, false, FIROLE_UNDEF, СчетПФИ, nacdl.rec.Date, NATCUR, null, null, MC_PAIRACCMODE_MANUAL ) )
+      return 1;
+   end;
+   ОстатокПФИ = GetRestAccountTRH(СчетПФИ, nacdl.rec.Date);
+
+   if( ОстатокПФИ > $0. )
+      debet  = СчетПФИ;
+      credit = "Выбытие ПФИ";
+   elif( ОстатокПФИ < $0. )
+      debet  = "Выбытие ПФИ";
+      credit = СчетПФИ;
+   end;
+
+   if( abs(ОстатокПФИ) > $0. )
+      if( not ПроводкаПоКатегориямУчета( FD, 
+                                         debet,                                                                     /* Деб */
+                                         credit,                                                                    /* Кредит */
+                                         nacdl.rec.Date,                                                            /* Дата */
+                                         1,                                                                         /* Глава */
+                                         NATCUR,                                                                    /* Валюта */
+                                         abs(ОстатокПФИ),                                                           /* Сумма */
+                                         Doc,                                                                       /* Документ */
+                                         INPCARRY,                                                                  /* Result_Carry */
+                                         "",                                                                        /* Kind_Oper */
+                                         "",                                                                        /* Numb_Document */
+                                         FD.GetGround(1014),                                                        /* Ground */                                         
+                                         NULL, NULL, NULL,
+                                         NATCUR, NATCUR
+                                       )
+        )
+          return 1;
+      end;
+   end;
+
+   return 0;
+end;
+
+PRIVATE MACRO УчетВариационнойМаржиПФИ( FD:DVFirstDocNDeal, Doc, nacdl:TRecHandler, IsExec:bool ):INTEGER
+  VAR СчетФорвардРПИ = TRecHandler("account"),
+      СчетПФИ = TRecHandler("account"),
+      СчетБиржа = TRecHandler("account"),
+      AccNalog = TRecHandler("account"),
+      PaySumRUR = $0, SumRUR = $0, PaymentObj:RsbPayment, PaymentNalog:RsbPayment,
+      SubPurpose:integer = 0, TmpPaymentID:integer = -1,
+      ExTax:bool = ((not FD.IsAgent()) and (nacdl.rec.TaxSum > 0)),
+      NotPFI:bool = ((FD.IsForwardDealT3() or FD.IsSWAPDealT3()) and FD.КонтрагентБиржа()),
+      КонтрагентБиржа:bool = FD.КонтрагентБиржа(),
+      ОплатаМаржи:bool = (nacdl.rec.Direction == DV_CALCOP_DIRECTION_PAYMENT),
+      DebMcAccDoc = NULL, CredMcAccDoc = NULL,
+      SumTax = $0;
+
+  /*PNV i-support 492010*/
+  var ОснованиеПолучениеВариационнойМаржи_usr = ОснованиеПолучениеВариационнойМаржи;
+  var ОснованиеСписаниеВариационнойМаржи_usr = ОснованиеСписаниеВариационнойМаржи;
+
+  if (nacdl.rec.AccFiid == NATCUR) 
+      ОснованиеПолучениеВариационнойМаржи_usr = ОснованиеСписаниеВариационнойМаржи_usr = "ПЕРЕВОД СРЕДСТВ ПО СДЕЛКЕ " + FD.DealCode() + " ОТ " + StrSubSt(String(FD.ДатаСделки():f), ".", "/")  + " С " + GetPartyNames(FD.GetContractorID(), 2)[0] + ". НДС НЕ ОБЛАГАЕТСЯ ";
+  else
+      ОснованиеПолучениеВариационнойМаржи_usr = ОснованиеСписаниеВариационнойМаржи_usr = "TRANSFER OF FUNDS UNDER FOREX DEAL " + FD.DealCode() + " VALUE DATE " + StrSubSt(String(nacdl.rec.Date:f), ".", "/");
+  end;
+  /*PNV 492010*/
+
+  if( not FD.IsClient() )
+     if( not DV_SmartConvertSum(PaySumRUR, nacdl.rec.PaySum, nacdl.rec.Date, nacdl.rec.AccFiid, NATCUR, true) )
+        return 1;
+     end;
+
+     if( not DV_SmartConvertSum(SumRUR, nacdl.rec.Sum, nacdl.rec.Date, nacdl.rec.AccFiid, NATCUR, true) )
+        return 1;
+     end;
+  end;
+
+  if( ОплатаМаржи ) // оплата
+     if( not FD.IsClient() )
+        if( nacdl.rec.Sum > 0 )
+           
+           DebMcAccDoc = TRecHandler("mcaccdoc");
+           if( not FD.OpenAccount(ПИ_КатегорияМнФорвардРПИ(), null, null, FIROLE_FICOM, СчетФорвардРПИ, nacdl.rec.Date, nacdl.rec.AccFiid, null, DebMcAccDoc, MC_PAIRACCMODE_MANUAL) )
+              return 1;
+           end;
+
+           if( not ПроводкаПоКатегориямУчета( FD, 
+                                              "Выбытие ПФИ",                                  /* Деб */
+                                              СчетФорвардРПИ,                                 /* Кредит */
+                                              nacdl.rec.Date,                                 /* Дата */
+                                              1,                                              /* Глава */
+                                              nacdl.rec.AccFiid,                              /* Валюта */
+                                              nacdl.rec.Sum,                                  /* Сумма */
+                                              Doc,                                            /* Документ */
+                                              INPCARRY,                                       /* Result_Carry */
+                                              "",                                             /* Kind_Oper */
+                                              "",                                             /* Numb_Document */
+                                              FD.GetGround(1012),                             /* Ground */
+                                              NULL, NULL, NULL,
+                                              NATCUR, nacdl.rec.AccFiid
+                                            )
+             )
+               return 1;
+           end;
+        end;
+      end;
+
+     if( nacdl.rec.Sum > 0 )
+
+        if( (not FD.IsAgent()) and КонтрагентБиржа )
+           CredMcAccDoc = TRecHandler("mcaccdoc");
+           if( not FD.OpenAccount("-Биржа", null, null, null, СчетБиржа, nacdl.rec.Date, nacdl.rec.AccFiid, null, CredMcAccDoc) )
+              return 1;
+           end;
+        end;
+
+        if( DVND_CreatePayment( FD, 70/*маржа*/, FD.Kind, FD.Deal.rec.ID,
+                                nacdl.rec.Date,
+                                IIF(FD.IsClient(), FD.Deal.rec.Client, {ourbank}), {ourbank},
+                                IIF(FD.IsAgent(), FD.Deal.rec.Agent, FD.Deal.rec.Contractor), IIF((not FD.IsAgent()) and КонтрагентБиржа, {ourbank}, -1),
+                                IIF(ExTax, nacdl.rec.PaySum, nacdl.rec.Sum), nacdl.rec.AccFiid,
+                                ОснованиеСписаниеВариационнойМаржи_usr,
+                                IIF(FD.IsClient(), NULL, СчетФорвардРПИ),
+                                IIF((not FD.IsAgent()) and КонтрагентБиржа, СчетБиржа, NULL),
+                                FD.Deal.rec.Department, SubPurpose,
+                                NULL,
+                                @PaymentObj, TmpPaymentID
+                              ) != 0 )
+            return 1;
+        end;
+        TmpPaymentID = TmpPaymentID - 1;
+        SubPurpose   = SubPurpose + 1;
+
+        if( ExTax )
+           if( not FD.OpenAccount( "-Бюджет, ф.налоги", null, null, FIROLE_UNDEF, AccNalog, nacdl.rec.Date, NATCUR ) )
+              return 1;
+           end;
+
+           if( DVND_CreatePayment( FD, PM_PURP_TAXINCOME_NJ, FD.Kind, FD.Deal.rec.ID,
+                                   nacdl.rec.Date,
+                                   IIF(FD.IsClient(), FD.Deal.rec.Client, {ourbank}), {ourbank},
+                                   {ourbank}, {ourbank},
+                                   nacdl.rec.TaxSum, NATCUR,
+                                   "Удержание налога",
+                                   IIF(FD.IsClient(), NULL, СчетФорвардРПИ), AccNalog,
+                                   FD.Deal.rec.Department, SubPurpose,
+                                   NULL,
+                                   @PaymentNalog, TmpPaymentID
+                                 ) != 0 )
+               return 1;
+           end;
+           TmpPaymentID = TmpPaymentID - 1;
+           SubPurpose   = SubPurpose + 1;
+        end;
+     end;
+
+  else // получение
+     if( not FD.IsClient() )
+        if( nacdl.rec.Sum > 0 )
+           CredMcAccDoc = TRecHandler("mcaccdoc");
+           if( not FD.OpenAccount(ПИ_КатегорияПлФорвардРПИ(), null, null, FIROLE_FIREQ, СчетФорвардРПИ, nacdl.rec.Date, nacdl.rec.AccFiid, null, CredMcAccDoc, MC_PAIRACCMODE_MANUAL) )
+              return 1;
+           end;
+
+           if( not ПроводкаПоКатегориямУчета( FD, 
+                                              СчетФорвардРПИ,                                    /* Деб */
+                                              "Выбытие ПФИ",                                     /* Кредит */
+                                              nacdl.rec.Date,                                    /* Дата */
+                                              1,                                                 /* Глава */
+                                              nacdl.rec.AccFiid,                                 /* Валюта */
+                                              nacdl.rec.Sum,                                     /* Сумма */
+                                              Doc,                                               /* Документ */
+                                              INPCARRY,                                          /* Result_Carry */
+                                              "",                                                /* Kind_Oper */
+                                              "",                                                /* Numb_Document */
+                                              FD.GetGround(1013),                                /* Ground */
+                                              NULL, NULL, NULL,
+                                              nacdl.rec.AccFiid, NATCUR
+                                            )
+             )
+               return 1;
+           end;
+        end;
+     end;
+
+     if( nacdl.rec.Sum > 0 )
+
+        if( (not FD.IsAgent()) and КонтрагентБиржа )
+           DebMcAccDoc = TRecHandler("mcaccdoc");
+           if( not FD.OpenAccount("+Биржа", null, null, null, СчетБиржа, nacdl.rec.Date, nacdl.rec.AccFiid, null, DebMcAccDoc) )
+              return 1;
+           end;
+        end;
+
+        if( DVND_CreatePayment( FD, 70/*маржа*/, FD.Kind, FD.Deal.rec.ID,
+                                nacdl.rec.Date,
+                                IIF(FD.IsAgent(), FD.Deal.rec.Agent, FD.Deal.rec.Contractor), IIF((not FD.IsAgent()) and КонтрагентБиржа, {ourbank}, -1),
+                                IIF(FD.IsClient(), FD.Deal.rec.Client, {ourbank}), {ourbank},
+                                nacdl.rec.PaySum, nacdl.rec.AccFiid,
+                                ОснованиеПолучениеВариационнойМаржи_usr,
+                                IIF((not FD.IsAgent()) and КонтрагентБиржа, СчетБиржа, NULL),
+                                IIF(FD.IsClient(), NULL, СчетФорвардРПИ),
+                                FD.Deal.rec.Department, SubPurpose,
+                                NULL,
+                                @PaymentObj, TmpPaymentID
+                              ) != 0 )
+            return 1;
+        end;
+        TmpPaymentID = TmpPaymentID - 1;
+        SubPurpose   = SubPurpose + 1;
+
+       if(CreateNDealClientNUTXObjects(FD, nacdl.rec.Date, nacdl.rec.PaySum, nacdl.rec.AccFiid, @SumTax, "Вариационная маржа") != 0)
+         return 1;
+       end;
+
+     end;
+  end;
+
+  if( nacdl.rec.Netting == SET_CHAR )
+    PaymentObj.Netting = SET_CHAR; /* устанавливаем признак участия в неттинге */
+  end;
+
+  return 0;
+END;
+
+
+macro ExecuteStep( doc, FDoc, DocKind, ID_Operation, ID_Step )
+
+  record ndeal(dvndeal);
+  SetBuff( ndeal, FDoc );
+  var FD = DVFirstDocNDeal(DocKind, ndeal);
+  var ДатаПланируемаяШага = DV_GetPlanDateStep(ID_Operation, ID_Step);
+  if (FD.ОтказОтИсполнения())
+     return 0;
+  end;
+  var ДатаИсполненияШага:date;
+  var ПлатежТреб:RsbPayment;
+  var CloseOper:bool = true;
+
+  if( (FD.IsOptionAmerican() or FD.IsForwardOpenDate()) and ((EDate == NULL) or (EDate == date(0,0,0))) )
+     MsgBox("Вставка шага должна выполняться из скроллинга операций по Alt-E.");
+     return 1;
+  end;
+
+  if( (EDate != NULL) and (EDate != date(0,0,0)) )
+     ДатаИсполненияШага = EDate;
+  else
+     ДатаИсполненияШага = FD.ДатаИстеченияСрокаДействия();
+     if ( (ДатаИсполненияШага == null) or  (ДатаИсполненияШага == ZeroDate) )
+        ДатаИсполненияШага = {curdate};
+     end;
+  end;
+  
+  if( FD.ПоставочныйКонтракт() and (FD.ПлатежТреб.rec.PaymentID > 0) and (FD.ВидБазовогоАктива(true) != FIKIND_ARTICLE) )
+       ПлатежТреб = RsbPayment( FD.ПлатежТреб.rec.PaymentID );
+       if ( ПИ_ПроверкаПередИсполнениемБезПоставки( ПлатежТреб ) != 0  )
+          return 1;
+       end;
+    end;
+
+  if ( NOT ВстроенныйПФИ(FD) )
+    if( (not FD.IsClient()) and (not FD.БиржеваяСделкаКромеВнебиржСПФИ()) )
+     if(( not FD.ВыполненаПереоценкаСС( ДатаИсполненияШага ) ) and (not ExistZeroFairVal(FD, ДатаИсполненияШага)))
+        if( MsgBoxEx( "Не выполнена переоценка справедливой стоимости!|Продолжить?", MB_YES+MB_NO, IND_NO ) == IND_NO )
+           return 1;
+        end;
+     end;
+  end;
+
+    if( (not FD.БиржеваяСделка()) or (FD.Deal.rec.MarketKind == 3) ) 
+       if( nacdl.rec.DealID > 0 )
+          nacdl.rec.PayKind = DV_CALCOP_PAYKIND_MARGIN;
+       else
+          nacdl.rec.DealID  = FD.Deal.rec.Id;
+          nacdl.rec.Date    = ДатаИсполненияШага;
+          nacdl.rec.AccFIID = FD.nFI_BaseActiv.rec.PriceFIID;
+          nacdl.rec.PayKind = DV_CALCOP_PAYKIND_MARGIN;
+          if ((FD.IsOption() or FD.IsForward()) and (FD.ПоставочныйКонтракт() == false))
+            if (FD.IsBuy())
+              nacdl.rec.Direction = 2;
+            else
+              nacdl.rec.Direction = 1;
+            end;
+          end;
+          if( DV_InsCalcOpPanel(nacdl) == 0 )
+             if( DV_InsertCalcOp(nacdl) != 0 )
+                MsgBox("Ошибка при вставке записи расчётов по сделке.");
+                return 1;
+             end;
+          else
+             return 1;
+          end;
+       end;
+    else
+       if( nacdl.rec.DealID > 0 )   // Итоговую маржу ввели из скроллинга расчетов с ПФИ
+          if( DV_InsertCalcOp(nacdl) != 0 )
+             MsgBox("Ошибка при вставке записи расчётов по сделке.");
+             return 1;
+          end;
+       end;
+    end;
+
+  if (nacdl.rec.sum <= 0)
+    if( MsgBoxEx("Введена нулевая сумма платежа. Продолжить?", MB_YES + MB_NO, IND_YES) == IND_NO )
+      return 1;
+    end;
+  end;
+
+  /*
+    if( nacdl.rec.DealID > 0 )
+       if( УчетВариационнойМаржи( FD, doc, nacdl, true ) != 0 )
+            return 1;
+       end;
+    end;
+*/
+    if( nacdl.rec.DealID > 0 )
+        if( УчетВариационнойМаржиПФИ( FD, doc, nacdl, true ) != 0 )
+           return 1;
+       end;
+    end;
+
+    if( ВозвратПолучениеДепозитнойМаржи(FD, doc, ДатаИсполненияШага) != 0 )
+      return 1;
+    end;
+
+    //if ((nacdl.rec.sum != 0) and FD.Биржевая())
+    //  if( ОтнесениеФинРезультата( FD, doc, ДатаИсполненияШага ) != 0 )
+    //    return 1;
+    //  end;
+    //end;
+  end;
+
+  if( СписаниеТребованияИОбязательства( FD, doc, ДатаИсполненияШага ) != 0 )
+     return 1;
+  end;
+  if(((FD.IsOption()) or (FD.IsForwardNDeal())) and (РАБОТА_С_РЕПОЗИТАРИЕМ()) and (ДатаПланируемаяШага > {curdate}))
+    if(nacdl.rec.Date < FD.ДатаИсполнения())
+    if(ИзменениеСостоянияОбязательств_ДосрочноеИсполнение(FD, nacdl.rec.Date, DocKind) )
+       return 1;
+   end;
+  end;
+  end;
+
+/*
+  if( FD.ПоставочныйКонтракт() and (FD.ПлатежТреб.rec.PaymentID > 0) )
+     if( ПИ_УстановитьСтатусПлатежа( ПлатежТреб, PM_CLOSED_W_M_MOVEMENT ) )
+        MsgBox( "Ошибка при утановке платежу статуса \"Закрыт без движения\"" );
+        return 1;
+     end;
+  end;
+
+  if( FD.ПоставочныйКонтракт() and (FD.ПлатежОб.rec.PaymentID > 0) )
+     var ПлатежОб   = RsbPayment( FD.ПлатежОб.rec.PaymentID );
+     if( ПИ_УстановитьСтатусПлатежа( ПлатежОб, PM_CLOSED_W_M_MOVEMENT ) )
+        MsgBox( "Ошибка при утановке платежу статуса \"Закрыт без движения\"" );
+        return 1;
+     end;
+  end;*/
+
+  if( FD.IsOptionAmerican() )
+     if( ДатаИсполненияШага < FD.ДатаИсполнения() )
+        /* вставить документ "Уведомление об исполнении" и распечатать */
+     end;
+  end;
+
+  if( not InsertOprStatus(FD.DV_OPERSTATUS_DEMAND(), DV_OPERSTATUS_DL_COMPLETE) )
+     MsgBox("Ошибка при установке статуса <Требования> по операции.");
+     return 1;
+  end;
+
+  if( not InsertOprStatus(FD.DV_OPERSTATUS_LIABILITY(), DV_OPERSTATUS_DL_COMPLETE) )
+     MsgBox("Ошибка при установке статуса <Обязательства> по операции.");
+     return 1;
+  end;
+
+  if( FD.IsForward() )
+     var Дк = DL_GetMinComPlanDateByOper(DocKind, FD.Deal.rec.ID);
+
+     if( Дк != date(0,0,0) )
+        if( not InsertOprStatus(FD.DV_OPERSTATUS_COMISS(), DV_OPERSTATUS_PAYM_EX) )
+           MsgBox("Ошибка при установке статуса <Оплата комиссий> по операции.");
+           return 1;
+        end;
+        DL_CalendDefineOprDate(FD,DV_NDEAL_OPRDATE_COMISS, Дк);
+        CloseOper = false;
+     else
+        if( not InsertOprStatus(FD.DV_OPERSTATUS_COMISS(), DV_OPERSTATUS_PAYM_NOTEX) )
+           MsgBox("Ошибка при установке статуса <Оплата комиссий> по операции.");
+           return 1;
+        end;
+     end;
+  end;
+
+  if( GetOprStatus(FD.DV_OPERSTATUS_NETTING_PAYM_VM()) == DV_OPERSTATUS_PAYM_EX )
+     CloseOper = false; // если будет квитовка или неттинг вариационной маржи, то операцию не закрываем
+  end;
+
+  if( CloseOper )
+     if( not InsertOprStatus(FD.DV_OPERSTATUS_DOC(), DV_OPERSTATUS_DOC_CLOSE) )
+        MsgBox("Ошибка при установке статуса <Документооборот> по операции.");
+        return 1;
+     end;
+  end;
+
+    return 0;
+end;

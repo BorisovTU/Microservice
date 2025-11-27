@@ -1,0 +1,2996 @@
+/*
+$Name:        dlcontrfunc.mac
+$Module:      Ядро Securities
+$Description: Функции работы с ДБО
+*/
+import DealsInter, "mccatacc.mac", "mctplprm.mac", "sfcommon.mac", "dlquery.mac", "dl_xml.mac", osfile, "dlreport.mac", "spserv.mac";
+import "padej.mac";
+
+const DOC_PASSPORT          = 0;  // Паспорт гражданина  РФ
+const DOC_BIRTH_CERTIFICATE = 4;  // Свидетельство о рождении
+const DOC_RESPERMIT         = 5;  // Вид на жительство
+const DOC_USSRPASS          = 7;  // Паспорт гражданина СССР
+const DOC_FORPASS           = 11; // Паспорт иностранного гражданина 
+
+const V_SPECVAL = 26;
+
+const CATEG_SUBCONTRACT               = "ДС клиента, ц/б";           /* Категории для открытия/актуализации счетов */
+const CATEG_SUBCONTRACT_COM           = "+РасчетыКомисс1";           /* Клиентские счета, открываемые по площадкам */
+const CATEG_SUBCONTRACT_VU            = "ДС Клиента, ВУ";            /* Денежные средства клиентов (по местам хранения и договорам) */
+const CATEG_SUBCONTRACT_VU_CALC       = "ДС, Расч. с клиентом, ВУ";  /* Расчеты с клиентами по денежным средствам */
+const CATEG_SUBCONTRACT_SECUR_VU_CALC = "ЦБ, Расч. с клиентом, ВУ";  /* Расчеты с клиентами по ценным бумагам */
+const CATEG_SUBCONTRACT_DEBT          = "Треб. с н.с. брок";         /* Просроченная задолженность по брокерским операциям */
+const CATEG_SUBCONTRACT_DEBT_RESERVE  = "Треб. с н.с. брок. резерв"; /* Резерв по просроченной задолженности по брокерским операциям */
+
+const CATEG_PARTY_SEGM          = 115; // DEF-28868, пересечение категорий с категориями тестов НКИ
+const CATEG_TARIFF_SEGM         = 102; /* Категория 'Сегмент корпоративного бизнеса' на тарифе*/
+
+const V_DLCONTR_ERR_CODE                = 13400;
+
+var vg_outFileArrayForIntegration;
+
+private class c_account(_account:string, _currencyID:integer, _category:string)
+   var account:string = _account,
+       CurrencyID:integer = _currencyID,
+       category:string = _category;
+end;
+
+private class c_accounts_cache
+  var accounts = Tarray(c_account);
+
+  macro Add(Account, CurrencyID, Category)
+    accounts.value(accounts.size()) = c_account(Account, CurrencyID, Category);
+  end;
+
+  macro Get(CurrencyID, Category):string
+    var acc;
+    for(acc, accounts)
+      if ((acc.CurrencyID == CurrencyID) and (acc.category == Category))
+        return acc.account;
+      end;
+    end;
+
+    return "";
+  end;
+
+  macro Clear()
+    accounts = TArray(c_account);
+  end;
+end;
+
+private var g_accountsCache = c_accounts_cache();
+
+private macro log(p_func:string, p_text:string)
+  var query = "begin " +
+              " it_log.log_handle(p_object   => 'dlcontrfunc.mac.' || :func, " +
+              "                   p_msg      => :msg, " +
+              "                   p_msg_type => it_log.c_msg_type__debug); " +
+              "end;";
+  execSQL(query, makeArray(SQLParam("func", p_func),
+                           SQLParam("msg", SubStr(p_text,1,4000))
+                           ));
+end;
+
+private macro logError(p_text:string)
+  var query = "begin " +
+              " it_log.log_error(p_object => 'dlcontrfunc.mac.', " +
+              "                  p_msg    => :msg); " +
+              "end;";
+  execSQL(query, makeArray(SQLParam("msg", SubStr(p_text,1,4000))
+                           ));
+end;
+
+private macro logWithTime(p_func:string, p_text:string, p_time:time)
+  var hh, min, sec;
+
+  timeSplit(p_time, hh, min, sec);
+  log(p_func, p_text + ". elapsed time: " +string(hh:o:2)+":"+string(min:o:2)+":"+string(sec:o:2));
+end;
+
+private macro L_Z( num, len )
+    var str1, len1;
+    str1 = trim( string( num ) );
+    len1 = strlen( str1 );
+    if ( len1 >= len ) return str1;
+    else  return  mkstr("0", len-len1 ) + str1;
+    end;
+end;
+
+Macro CheckClientCateg(Client)
+   var err, SubAttr = 0;
+   var cmd, DataSet;
+
+   cmd = DL_RSDCommand("select RSB_SECUR.GetMainObjAttrNoDate("+OBJTYPE_PARTY+", LPAD(?, 10, '0'), "+CATEG_PARTY_SEGM+") as Res from dual");
+
+   cmd.AddParam(Client.rec.partyid);
+
+   DataSet = cmd.Execute();
+   if(DataSet.moveNext())
+     SubAttr = DataSet.Res;
+   end;
+   If(SubAttr != 0)
+      return true;
+   else
+      return false;
+   end;
+End;
+
+Private macro IIF(condition, value_true, value_false)
+    If(condition)
+       return value_true;
+    else
+       return value_false;
+    end;
+end;
+
+macro CheckDlContrAccCollision(DlContrId:integer, IsEDP:bool, CurAccountId:integer, servSubKind, OutMsg:@string)
+   var result = true;
+   var cmd = null;
+   var currentAccountQuery = "", currentAccountQueryAll = "", servSubKindQuery = " 1 = 1 ";
+   if (ValType(IsEDP) == V_BOOL)
+      if ((ValType(DlContrId) == V_INTEGER) and (DlContrId > 0))
+         if (ValType(servSubKind) == V_INTEGER)
+           servSubKindQuery = 
+                    " (select T_SERVKINDSUB from DSFCONTR_DBT sf, DDLCONTRMP_DBT mp where SF.T_ID = MP.T_SFCONTRID and MP.T_ID = AC.T_MPID) = "
+                    + servSubKind + " ";
+         end;
+         if ((ValType(CurAccountId) == V_INTEGER) and (CurAccountId > 0))
+            currentAccountQuery = " UNION SELECT " + CurAccountId + " as T_ACCOUNTID FROM DUAL ";
+            currentAccountQueryAll = " UNION ALL SELECT " + CurAccountId + " as T_ACCOUNTID FROM DUAL ";
+         end;
+         cmd = DL_RSDCommand(
+            " SELECT * "
+           +"   FROM (  SELECT cacc.T_ACCOUNTID, acc.t_account, COUNT (*) AS t_count "
+           +"             FROM (SELECT T_ACCOUNTID "
+           +"                     FROM DDLCONTRACC_DBT ac"
+           +"                    WHERE " + servSubKindQuery
+           +"                      AND T_ACCOUNTID IN "
+           +"                             (SELECT T_ACCOUNTID "
+           +"                                FROM DDLCONTRACC_DBT "
+           +"                               WHERE     T_DLCONTRID = ? "
+           +"                                     AND T_ACCOUNTID IS NOT NULL "
+           +"                                     AND T_ACCOUNTID > 0 "
+           +                               currentAccountQueryAll 
+           +"                              UNION ALL "
+           +"                              SELECT T_ACCOUNTID FROM DDLCONTRACC_TMP WHERE T_ACCOUNTID > 0) "
+           +"                          AND T_DLCONTRID != ? "
+           +"                   UNION ALL "
+           +"                   (  SELECT T_ACCOUNTID "
+           +"                        FROM DDLCONTRACC_TMP "
+           +"                       WHERE     (t_action IS NULL OR t_action NOT IN (0/*DLCONTR_NOACTION*/, 3 /*DLCONTR_CLOSE*/, 4 /*DLCONTR_DELETE*/, 5 /*DLCONTR_CLOSEDEL*/)) "
+           +"                             AND T_ACCOUNTID IS NOT NULL "
+           +"                             AND T_ACCOUNTID > 0 "
+           +"                    UNION "+IIF(IsEDP, "", " ALL ")
+           +"                      SELECT T_ACCOUNTID "
+           +"                        FROM DDLCONTRACC_DBT AC "
+           +"                       WHERE " + servSubKindQuery
+           +"                         AND T_DLCONTRID = ? "
+           +                    IIF(IsEDP, currentAccountQuery, currentAccountQueryAll)+")) cacc, "
+           +"                  daccount_dbt acc "
+           +"            WHERE acc.T_ACCOUNTID = cacc.T_ACCOUNTID "
+           +"         GROUP BY cacc.T_ACCOUNTID, acc.t_account) mainq1 "
+           +"  WHERE mainq1.t_count > 1 "
+         );
+         cmd.AddParam(DlContrId);
+         cmd.AddParam(DlContrId);
+         cmd.AddParam(DlContrId);
+      else
+         cmd = DL_RSDCommand(
+            "SELECT * "
+           +"  FROM (  SELECT cacc.T_ACCOUNTID, acc.t_account, COUNT (*) AS t_count "
+           +"            FROM (SELECT T_ACCOUNTID "
+           +"                    FROM DDLCONTRACC_DBT AC "
+           +"                   WHERE " + servSubKindQuery
+           +"                     AND T_ACCOUNTID IN "
+           +"                            (SELECT DISTINCT T_ACCOUNTID "
+           +"                               FROM DDLCONTRACC_TMP "
+           +"                              WHERE     T_ACCOUNTID IS NOT NULL "
+           +"                                    AND T_ACCOUNTID > 0 "
+           +"                                    AND (t_action IS NULL "
+           +"                                     OR t_action NOT IN (3/*DLCONTR_CLOSE*/, 4 /*DLCONTR_DELETE*/, 5 /*DLCONTR_CLOSEDEL*/))) "
+           +"                  UNION ALL "
+           +"                  SELECT T_ACCOUNTID "
+           +"                    FROM DDLCONTRACC_TMP "
+           +"                   WHERE (t_action IS NULL "
+           +"                          OR t_action NOT IN (3/*DLCONTR_CLOSE*/, 4 /*DLCONTR_DELETE*/, 5 /*DLCONTR_CLOSEDEL*/)) "
+           +"                         AND T_ACCOUNTID IS NOT NULL "
+           +"                         AND T_ACCOUNTID > 0 "
+           +IIF(IsEDP, " GROUP BY T_ACCOUNTID ", "")
+           +"                                             ) cacc, "
+           +"                 daccount_dbt acc "
+           +"           WHERE acc.T_ACCOUNTID = cacc.T_ACCOUNTID "
+           +"        GROUP BY cacc.T_ACCOUNTID, acc.t_account) mainq1 "
+           +" WHERE mainq1.t_count > 1 "
+         );
+      end;
+   end;
+   if (cmd != null)
+      var dataSet = cmd.Execute();
+      if (dataSet.MoveNext())
+         result = false;
+         var msg = "Счет \"" + dataSet.Account +"\" уже используется в другом договоре обслуживания";
+         MsgBox(msg);
+         if (ValType(OutMsg) == V_STRING)
+           OutMsg = msg;
+         end;
+      end;
+   end;
+   return result;
+end;
+
+Macro CheckClientAndTariffCateg(ObjSfContr, SfPlanId)
+   var SubAttr = 0, PlanAttr = 0;
+   var SfContr = TRecHandler("sfcontr.dbt");
+   var Client = TRecHandler("party.dbt");
+   var cmd, DataSet, cmd_tariff, DS_tariff, cmd_sfplan, DS_sfplan;
+
+   SetBuff(SfContr, ObjSfContr);
+
+   ПолучитьСубъекта(SfContr.rec.partyid, Client);
+   If(Client.rec.legalform == 1)
+      cmd = DL_RSDCommand("select RSB_SECUR.GetMainObjAttrNoDate("+OBJTYPE_PARTY+", LPAD(?, 10, '0'), "+CATEG_PARTY_SEGM+") as Res from dual");
+
+      cmd.AddParam(Client.rec.partyid);
+
+      DataSet = cmd.Execute();
+      if(DataSet.moveNext())
+        SubAttr = DataSet.Res;
+      end;
+
+      if (SfPlanId != 0)
+
+        cmd_tariff = DL_RSDCommand("select RSB_SECUR.GetMainObjAttrNoDate("+OBJTYPE_SFPLAN+", LPAD(?, 10, '0'), "+CATEG_TARIFF_SEGM+") as Res from dual");
+
+        cmd_tariff.AddParam(SfPlanId);
+
+        DS_tariff = cmd_tariff.Execute();
+        if(DS_tariff.moveNext())
+          PlanAttr = DS_tariff.Res;
+        end;
+
+        if(PlanAttr == 0)
+          MsgBox("Тарифы с незаполненной категорией 'Сегмент корпоративного рынка' недоступны для установки клиентам, для которых Форма субъекта = Организация. | Договор брокерского обслуживания не может быть сохранен.");
+          return 1;
+        end;
+
+        if( (PlanAttr != 0) and (SubAttr != 0) and (SubAttr != PlanAttr) )
+          MsgBox("Значение категории 'Сегмент корпоративного бизнеса' для клиента не соответствует значению категории 'Сегмент корпоративного рынка' для Тарифного плана. | Договор брокерского обслуживания не может быть сохранен.");
+          return 1;
+        end;
+      end;
+   else
+      if (SfPlanId != 0)
+
+        cmd_tariff = DL_RSDCommand("select RSB_SECUR.GetMainObjAttrNoDate("+OBJTYPE_SFPLAN+", LPAD(?, 10, '0'), "+CATEG_TARIFF_SEGM+") as Res from dual");
+
+        cmd_tariff.AddParam(SfPlanId);
+
+        DS_tariff = cmd_tariff.Execute();
+        if(DS_tariff.moveNext())
+          PlanAttr = DS_tariff.Res;
+        end;
+
+        if(PlanAttr != 0)
+          MsgBox("Тарифы с заполненной категорией 'Сегмент корпоративного рынка' недоступны для установки клиентам, для которых Форма субъекта = Физ. лицо | Договор брокерского обслуживания не может быть сохранен.");
+          return 1;
+        end;
+      end;
+   end;
+
+   return 0;
+End;
+
+/*ZMV BIQ-8258 блокировка операций для договоров, у которых категория "Сведения о наличии или отсутствии ИИС у другого ПУ" = "Да" И категория "Предоставлены подтвержд. документы о расторжении ИИС у другого ПУ" на дату операции равно "Нет" или не заполнено*/ 
+macro ДоговорИИСуДругогоПУ(ContrID:integer, DealDate:date):bool
+  var cmd, ds;
+  cmd = DL_RSDCommand("SELECT sfcontr.t_Number CntrNumber " +
+                      "  FROM ddlcontrmp_dbt contrmp, ddlcontr_dbt dlcontr, dsfcontr_dbt sfcontr " +
+                      " WHERE contrmp.t_SfContrID = ? " +
+                      "   AND dlcontr.t_DlContrID = contrmp.t_DlContrID " +
+                      "   AND dlcontr.t_IIS = 'X' " +
+                      "   AND rsb_secur.GetMainObjAttr(207, LPAD(dlcontr.t_DlContrID, 34, '0'), 121/*Сведения о наличии или отсутствии ИИС у другого ПУ*/, ?) = 1 " +
+                      "   AND rsb_secur.GetMainObjAttr(207, LPAD(dlcontr.t_DlContrID, 34, '0'), 122/*Предоставлены подтвержд. документы о расторжении ИИС у другого ПУ*/, ?) <> 1 " +
+                      "   AND sfcontr.t_ID = dlcontr.t_SfContrID "
+                     );  
+                  
+  cmd.addParam(ContrID);
+  cmd.addParam(DealDate);
+  cmd.addParam(DealDate);
+  ds = cmd.Execute();
+  
+  if(ds.MoveNext() AND (ds.CntrNumber != ""))
+    MsgBox("По Договору " + ds.CntrNumber + " клиентом не предоставлены документы о расторжении договора ИИС, заключенного с другим ПУ. Выполнение операции запрещено");
+    return true;
+  end;
+
+  return false;
+end;
+
+macro ДоговорЕДП(dlcontrid, sfcontrid)
+   var cmd, DataSet;
+   var sql = "";
+
+   sql =  " SELECT 1 \n" +
+          "  FROM dsfcontr_dbt s, dobjatcor_dbt a \n" +
+          " WHERE     s.t_servkindsub = 8 \n" +
+          "       AND a.t_objecttype = 659 \n" +
+          "       AND a.t_groupid = 102 \n" +
+          "       AND a.t_attrid = 1 \n" +
+          "       AND a.t_object = LPAD (s.t_id, 10, '0') \n" ;
+
+   if ((ValType(dlcontrid) != V_UNDEF) and (dlcontrid > 0))
+      sql = sql + "       AND s.t_id IN (SELECT t_sfcontrid \n" +
+             "                        FROM ddlcontrmp_dbt \n" +
+             "                       WHERE t_dlcontrid = ?) \n";
+      cmd = DL_RSDCommand(sql); 
+      cmd.AddParam(dlcontrid);
+
+   else
+      sql = sql +  "       AND s.t_id = ?  \n";
+      cmd = DL_RSDCommand(sql); 
+      cmd.AddParam(sfcontrid);
+   end;
+
+   DataSet = cmd.Execute();
+   if(DataSet.moveNext())
+      return true;
+   else
+      return false
+   end;
+end;
+
+macro СубъектЮЛ_ИП(partyid)
+   var sql = "";    var cmd, DataSet;
+
+   sql =  " select t.t_legalform, p.t_isemployer from dparty_dbt t left join dpersn_dbt p on p.t_personid = t.t_partyid where t.t_partyid = ? " ;
+
+   cmd = DL_RSDCommand(sql); 
+   cmd.AddParam(partyid);
+
+   DataSet = cmd.Execute();
+   if(DataSet.moveNext())
+      if ((DataSet.LegalForm == 1) or (DataSet.IsEmployer == StrFor(88)))
+         return true;
+      end;
+   end;
+   return false
+
+end;
+
+macro СубъектИП(partyid)
+   var sql = "";    var cmd, DataSet;
+
+   sql =  " select p.t_isemployer from dpersn_dbt p where p.t_personid = ? " ;
+
+   cmd = DL_RSDCommand(sql); 
+   cmd.AddParam(partyid);
+
+   DataSet = cmd.Execute();
+   if(DataSet.moveNext())
+      if (DataSet.IsEmployer == StrFor(88))
+         return true;
+      end;
+   end;
+   return false;
+end;
+
+macro ДатаВключенияЕДП()
+   var EdpDate = "";
+   var getreg = GetRegistryValue ("РСХБ\\БРОКЕРСКОЕ ОБСЛУЖИВАНИЕ\\ДАТА ВКЛЮЧЕНИЯ ЕДП", V_STRING, EdpDate );
+   return date(EdpDate); //если настройки нет или она = 00.00.0000, то вернется одинаково пустая дата
+end;
+
+macro ДатаВключенияСПБ()
+   var SpdDate = "";
+   var getreg = GetRegistryValue ("РСХБ\\БРОКЕРСКОЕ ОБСЛУЖИВАНИЕ\\ДАТА ВКЛЮЧЕНИЯ СПБ", V_STRING, SpdDate );
+   return date(SpdDate); //если настройки нет или она = 00.00.0000, то вернется одинаково пустая дата
+end;
+
+macro РежимРаботыЕДП(dat)
+   var EdpDate = "", getreg = GetRegistryValue ("РСХБ\\БРОКЕРСКОЕ ОБСЛУЖИВАНИЕ\\ДАТА ВКЛЮЧЕНИЯ ЕДП", V_STRING, EdpDate );
+   if (ValType(getreg) != V_UNDEF)
+      if ((EdpDate != "00.00.0000") and (dat >= date(EdpDate)))
+         return true;
+      end;
+   end;
+   return false;
+end;
+
+macro УчетДоговоровНаСПБ(dat)
+   var SpbDate = "", getreg = GetRegistryValue ("РСХБ\\БРОКЕРСКОЕ ОБСЛУЖИВАНИЕ\\ДАТА ВКЛЮЧЕНИЯ СПБ", V_STRING, SpbDate );
+   if (ValType(getreg) != V_UNDEF)
+      if ((SpbDate != "00.00.0000") and (dat >= date(SpbDate)))
+         return true;
+      end;
+   end;
+   return false;
+end;
+
+macro ВедениеЕДП_ЮЛ()
+   var EdpUL = false, getreg = GetRegistryValue ("РСХБ\\БРОКЕРСКОЕ ОБСЛУЖИВАНИЕ\\ВЕДЕНИE ЕДП ЮЛ", V_BOOL, EdpUL );
+   if (ValType(getreg) != V_UNDEF)
+      if (EdpUL)
+         return true;
+      end;
+   end;
+   return false;
+end;
+
+// Идентификатор биржи ММВБ
+macro MMVB_ID()
+  var stat = 0;
+  var MMVB_Code = "", _MMVB_ID = -1;
+
+  GetRegistryValue("SECUR\\MICEX_CODE", V_STRING, MMVB_Code, stat);
+  if(stat != 0)
+    msgbox("Ошибка при получении значения настройки SECUR\\MICEX_CODE");
+  elif(MMVB_Code == "")
+    stat = 1;
+    msgbox("Не задано значение настройки SECUR\\MICEX_CODE");
+  else
+    _MMVB_ID = GetCodeParty(MMVB_Code,PTCK_CONTR);
+  end;
+
+  return _MMVB_ID;
+end;
+
+// Идентификатор биржи СПБ
+macro SPB_ID()
+  var stat = 0;
+  var SPB_Code = "", _SPB_ID = -1;
+
+  GetRegistryValue("SECUR\\SPBEX_CODE", V_STRING, SPB_Code, stat);
+  if(stat != 0)
+    msgbox("Ошибка при получении значения настройки SECUR\\SPBEX_CODE");
+  elif(SPB_Code == "")
+    stat = 1;
+    msgbox("Не задано значение настройки SECUR\\SPBEX_CODE");
+  else
+    _SPB_ID = GetCodeParty(SPB_Code,PTCK_CONTR);
+  end;
+
+  return _SPB_ID;
+end;
+
+
+/*
+@brief Поиск операциниста для владельца счета
+@param[in] error_text текст ошибки
+@return Oper_num номер операциониста
+Номер операциониста для счетов, открываемых по категории учета берется из заданной настройки
+Если настройка отсутствует или задан несуществующий / заблокированный опер, возвращается 0 и текст ошибки
+*/
+macro GetOperForAccount(error_text:@string)
+  var Oper_num = 0;
+  var stat;
+  var C_REGISTRY_NAME = "РСХБ\\БРОКЕРСКОЕ ОБСЛУЖИВАНИЕ\\ОПЕРАЦИОНИСТ ПО СЧЕТУ";
+  var sql_str, rs, cmd;
+  error_text = "";
+                    
+  GetRegistryValue(C_REGISTRY_NAME, V_INTEGER, Oper_num, stat);
+  if(stat != 0)
+    error_text = "Ошибка при получении значения настройки "+C_REGISTRY_NAME;
+    Oper_num = 0;
+  else
+    sql_str = "select count(*) cnt from dperson_dbt where t_userblocked = chr(0) and t_userclosed = chr(0) and t_oper = :poper";
+    cmd =  RSDCommand(sql_str);
+    cmd.AddParam("poper", RSDBP_IN, Oper_num);
+    rs = RSDRecordset(cmd);
+    if (rs.movenext())
+       if (rs.value("cnt") != 1)
+          error_text = "Операционист из настройки "+C_REGISTRY_NAME+" с номером "+Oper_num+" на найден в списке активных операционистов";
+          Oper_num = 0;
+       end;
+    end;
+  end;
+
+  return Oper_num;
+end;
+
+
+//Класс для открытия счетов под ДО (субдоговором)
+class DL_SubContrFD(SubContrID:integer)
+  private var subcontr = TBFile("sfcontr.dbt");
+  private var maincontr = TBFile("sfcontr.dbt");
+  private var dlcontr = TRecHandler("dlcontr.dbt");
+  private var party     = TRecHandler("party.dbt");
+  private var FIRoleBArray = TArray;
+  private var m_MarketID = NULL;
+
+  var Error = 0, Kind, ID;
+  var currencyAcc47423=-1;/*CHVA 515749*/
+
+
+  macro UpdateAcccodeByEDP()
+    /*BIQ-7785 ЕДП*/
+    /*колдуем с Кодом в номере счета только по биржевым плоащдкам*/
+    if (subcontr.rec.servkindsub == 8 )
+       /*Если стоит признак на субдоговоре, то колдуем с кодами, даже если дата открытия меньше даты начала работы с ЕДП*/
+
+       /*Сначала ищем есть ли открытые биржевые субдговоры кроме текущего.*/
+       var dt = TRsbDataSet("select * from dsfcontr_Dbt where t_servkindsub = 8 and T_ID <> "+SubContr.rec.ID+" and t_id in (select t_sfcontrid from ddlcontrmp_Dbt where t_dlcontrid = "+dlcontr.rec.dlcontrid+") order by t_servkind");
+       var acccode = subcontr.rec.acccode;
+       if (dt.movenext())
+         acccode = dt.acccode;
+       end;
+       /* если открытых не нашли, значит новое открытие и*/ 
+       if (acccode != "")
+         Sql_Execute(" update dsfcontr_dbt set t_acccode = '" + acccode + "' where t_servkindsub = 8 and t_id in (select t_sfcontrid from ddlcontrmp_Dbt where t_dlcontrid = "+dlcontr.rec.dlcontrid+")");
+       end;
+    end;
+  end;
+
+
+  // DEF-35472 Смена наименования при изменении персональных данных клиента
+  // Вынесено из CorrectAccount
+  macro MakeNameAccount(account, categ, OperDate)
+    /*GAA: 496117*/
+    private var PartyOwner = this.GetParty();
+    private var MainContr = this.GetMainContr();
+    private var PartyClientShName = "";
+    private var clientName = "";
+    private var DogNum = "", DogDate = date(0,0,0), ЕКК = "", KindAcc = "";
+    private var subKindContr = "";
+    
+    PartyClientShName = PartyOwner.rec.shortname;
+   
+    /*25.03.2020 RAS 507377*/
+    private var Gender = 1;//Мужской
+    private var sqlGen, sqlDataGen;
+    if( PartyOwner.rec.legalform == 2 )
+      sqlGen = RSDCommand("select t_ismale as gen from dpersn_dbt where t_personid = ?");
+      sqlGen.addParam("", RSDBP_IN, PartyOwner.rec.partyid);
+      sqlGen.execute();
+      sqlDataGen = TRsbDataSet(sqlGen);
+      if( sqlDataGen.movenext )
+        if( sqlDataGen.gen != "X" )
+          Gender = 2;//Женский
+        end;
+      end;
+    end;
+    /*~RAS 507377*/
+   
+    if(categ.rec.Code == "+РасчетыКомисс1")
+      
+      ClientName = PartyOwner.rec.shortname;
+      DogNum = MainContr.rec.number;
+      DogDate = MainContr.rec.datebegin;
+      ЕКК = DL_GetDlObjCodeOnDate(OBJTYPE_BROKERCONTR_DL, DLCCK_USC, int(this.GetDlContr.rec.DlContrID));
+      
+      if(PartyOwner.rec.legalform == 2)
+        if (index(account.rec.usertypeaccount,"Е") > 0)
+          KindAcc = "ЕДП";
+        elif(subcontr.rec.servkindsub == 9)
+          KindAcc = "внебиржевой рынок";
+        end;
+      else
+        if(subcontr.rec.servkindsub == 9)
+          KindAcc = "внебиржевой рынок";
+        else
+          if(subcontr.rec.servkind == 1)
+            if(this.GetMarketID() == MMVB_ID())
+              KindAcc = "ФР ММВБ";
+            elif(this.GetMarketID() == SPB_ID())
+              KindAcc = "ФР СПБ";
+            end;
+          elif(subcontr.rec.servkind == 21)
+            KindAcc = "ВР ММВБ";
+          elif(subcontr.rec.servkind == 15)
+            KindAcc = "СР ММВБ";
+          end;
+        end;
+      end;
+
+      account.rec.nameaccount = "Треб. по брокерским операциям. "+ClientName+" Дог. № "+DogNum+" от "+string(DogDate:f)+". ЕКК - "+ЕКК+" ("+KindAcc+")";
+    
+    elif((categ.rec.Code == "ДС клиента, ц/б"))
+      
+      if (РежимРаботыЕДП(OperDate))
+        if (ДоговорЕДП(null, SubContr.rec.ID))
+          if (index(account.rec.usertypeaccount,"Е")==0)
+            account.rec.usertypeaccount = account.rec.usertypeaccount + "Е";
+          end;
+        end;
+      end;
+
+      if(PartyOwner.rec.legalform == 2)
+      /*25.03.2020 RAS 507377*/
+        clientName = Падеж(PartyOwner.rec.shortname, 2, Gender);
+      /*~RAS 507377*/
+      else
+        clientName = PartyOwner.rec.shortname;
+      end;
+
+      //Golovkin 03.07.2019 ID : 489695 "30601 счет юрика на внебирже открылся с наименованием фондовый рынок (IM2881498)"
+      if (index(account.rec.usertypeaccount,"Е") > 0)
+        subKindContr = "(ЕДП)";
+      else
+        if(subcontr.rec.servkind == 1)
+          if(subcontr.rec.servkindsub == 9) 
+            subKindContr = "(внебиржевой рынок)";
+          else
+            subKindContr = "(фондовый рынок ПАО Московская биржа)";
+          end;
+        elif(subcontr.rec.servkind == 21)
+          subKindContr = "(валютный рынок ПАО Московская биржа)";
+        elif(subcontr.rec.servkind == 15)
+          subKindContr = "(срочный рынок ПАО Московская биржа)";
+        end;
+      end;
+
+      if(dlcontr.rec.IIS == SET_CHAR)
+        //Индивидуальный инвестиционный счет <ФИО клиента> по брокерским операциям дог. <N ДО> от <ДАТАг.>.(фондовый рынок ПАО Московская биржа)
+        account.rec.nameaccount = "Индивидуальный инвестиционный счет "+clientName+" по брокерским операциям дог. "+MainContr.rec.number+" от "+MainContr.rec.datebegin+"."+subKindContr;
+      else
+        //Средства <ФИО клиента> по брокерским операциям дог. <N ДО> от <ДАТАг.>(фондовый рынок ПАО Московская биржа)
+        account.rec.nameaccount = "Средства " + IIF (СубъектИП(subcontr.rec.partyid), "ИП ", "") +clientName+" по брокерским операциям дог. "+MainContr.rec.number+" от "+MainContr.rec.datebegin+"."+subKindContr;
+      end;
+/*GAA: 499082  изменения в наименованиях счетов ВУ: 
+по клиенту ООО "РСХБ Управления Активами" вместо сокр. наим-я вставлять наизвание ДБО, а если название ДБО = "", то сокр. наим-е */
+    elif (subcontr.rec.partyid == 114800)
+      if (categ.rec.Code == "ДС, Расч. с клиентом, ВУ")
+        if (MainContr.rec.name != "") 
+          account.rec.nameaccount = MainContr.rec.name + " (ДС-3 Клиента, ВУ)";
+        else 
+          account.rec.nameaccount = PartyClientShName + " (ДС-3 Клиента, ВУ)";
+        end;
+      elif  (categ.rec.Code == "ДС Клиента, ВУ")
+        if (MainContr.rec.name != "")
+          account.rec.nameaccount = MainContr.rec.name + " (ДС-3 Технический счет, ВУ)";
+        else
+          account.rec.nameaccount = PartyClientShName + " (ДС-3 Технический счет, ВУ)";
+        end;
+      elif (categ.rec.Code == "ЦБ Клиента, ВУ")
+        if (MainContr.rec.name != "")
+          account.rec.nameaccount = MainContr.rec.name + " (ЦБ-3 Места хранения ЦБ клиентов, ВУ)";
+        else
+          account.rec.nameaccount = PartyClientShName + " (ЦБ-3 Места хранения ЦБ клиентов, ВУ)";
+        end;
+      elif (categ.rec.Code == "ЦБ, Расч. с клиентом, ВУ")
+        if (MainContr.rec.name != "")
+           account.rec.nameaccount = MainContr.rec.name + " (ЦБ-3 Клиента, ВУ)";
+        else
+           account.rec.nameaccount = PartyClientShName + " (ЦБ-3 Клиента, ВУ)";
+        end;
+      elif (categ.rec.Code == "ФО Клиента, ВУ")
+        if (MainContr.rec.name != "")
+          account.rec.nameaccount = MainContr.rec.name + " (ЦБ-3 ФО Клиента, ВУ)";
+        else
+          account.rec.nameaccount = PartyClientShName + " (ЦБ-3 ФО Клиента, ВУ)";
+        end;
+      elif (categ.rec.Code == "ФО, Расч. с клиентом, ВУ")
+        if (MainContr.rec.name != "")
+          account.rec.nameaccount = MainContr.rec.name + " (ЦБ-3 ФО, Расч. с клиентом, ВУ)";
+        else
+          account.rec.nameaccount = PartyClientShName + " (ЦБ-3 ФО, Расч. с клиентом, ВУ)";
+        end;
+      end;/**/
+/*GAA: 496117 изменения в наименованиях счетов ВУ */
+    elif ( (categ.rec.Code == "ДС, Расч. с клиентом, ВУ") and (PartyClientShName != "") )
+      account.rec.nameaccount = PartyClientShName + " (ДС-3 Клиента, ВУ)";
+    elif ( (categ.rec.Code == "ДС Клиента, ВУ") and (PartyClientShName != "") )
+      account.rec.nameaccount = PartyClientShName + " (ДС-3 Технический счет, ВУ)";
+    elif ( (categ.rec.Code == "ЦБ Клиента, ВУ") and (PartyClientShName != "") )
+      account.rec.nameaccount = PartyClientShName + " (ЦБ-3 Места хранения ЦБ клиентов, ВУ)";
+    elif ( (categ.rec.Code == "ЦБ, Расч. с клиентом, ВУ") and (PartyClientShName != "") )
+      account.rec.nameaccount = PartyClientShName + " (ЦБ-3 Клиента, ВУ)";
+    elif ( (categ.rec.Code == "ФО Клиента, ВУ") and (PartyClientShName != "") )
+      account.rec.nameaccount = PartyClientShName + " (ЦБ-3 ФО Клиента, ВУ)";
+    elif ( (categ.rec.Code == "ФО, Расч. с клиентом, ВУ") and (PartyClientShName != "") )
+      account.rec.nameaccount = PartyClientShName + " (ЦБ-3 ФО, Расч. с клиентом, ВУ)";
+/*GAA: 501667*/
+    elif (categ.rec.Code == "+РасчетыКомисс1")
+      if(PartyOwner.rec.legalform == 2)
+      /*25.03.2020 RAS 507377*/
+        clientName = Падеж(this.GetParty().rec.shortname, 3, Gender);
+      /*~RAS 507377*/
+      else
+        clientName = this.GetParty().rec.shortname;
+      end;
+
+      if(subcontr.rec.servkind == 1)
+        if(subcontr.rec.servkindsub == 9) 
+          subKindContr = "внебиржевом рынке";
+        else
+          subKindContr = "биржевом рынке";
+        end;
+      elif(subcontr.rec.servkind == 21)
+        subKindContr = "валютном рынке";
+      elif(subcontr.rec.servkind == 15)
+        subKindContr = "срочном рынке";
+      end;
+
+      //Требования к <клиент> по уплате комиссий по дог. № <ДБО> от <дата ДБО> по операциям на <биржевом/внебиржевом/срочном> рынке
+      account.rec.nameaccount = "Требования к "+clientName+" по уплате комиссий по дог. № "+MainContr.rec.number+" от "+MainContr.rec.datebegin+" по операциям на "+subKindContr;
+
+    elif (categ.rec.Code == "Треб. с н.с. брок")
+      if(PartyOwner.rec.legalform == PTLEGF_PERSN)
+        clientName = Trim(Падеж(this.GetParty().rec.ShortName, 2, Gender)); 
+        if(not СубъектИП(subcontr.rec.partyid))
+          Account.rec.UserField2 = "1"; //Не выгружать проводку 
+        end;
+      else
+        clientName = this.GetParty().rec.ShortName;
+      end;
+
+      Account.rec.NameAccount = "Просроченная задолженность "+clientName+" по брокерским операциям дог. "+MainContr.rec.Number+" от "+string(MainContr.rec.DateBegin:f);
+
+    elif (categ.rec.Code == "Треб. с н.с. брок. резерв")
+      if(PartyOwner.rec.legalform == PTLEGF_PERSN)
+        clientName = Trim(Падеж(this.GetParty().rec.ShortName, 2, Gender));
+      else
+        clientName = this.GetParty().rec.ShortName;
+      end;
+
+      Account.rec.NameAccount = "Резерв по просроченной задолженности "+clientName+" по брокерским операциям дог. "+MainContr.rec.Number+" от "+string(MainContr.rec.DateBegin:f);
+    end;
+    
+    return true;
+   
+  end;
+
+
+  MACRO CorrectAccount(account, accblnc, ORScheme, categ, templ, accdoc, OperDate)
+    /*BPV IS : 515306*/
+    if((categ.rec.Code == "ДС клиента, ц/б") or (categ.rec.Code == "+РасчетыКомисс1") or (categ.rec.Code == "Треб. с н.с. брок") or (categ.rec.Code == "Треб. с н.с. брок. резерв"))
+      //DEF-70512 номер операциониста вынесен в настройку
+      var err_txt = "";
+      var OperForAccount = GetOperForAccount(@err_txt);
+      if (OperForAccount == 0)
+         SetGlobalParameter("CorrectAccount_Error", err_txt);
+         RunError(err_txt);
+      else 
+         if(account.rec.oper != OperForAccount)
+            account.rec.oper = OperForAccount;
+         end;
+      end;
+    end;
+    /*~BPV IS : 515306*/
+
+    if((categ.rec.Code == "ДС клиента, ц/б") or (categ.rec.Code == "+РасчетыКомисс1") or (categ.rec.Code == "Треб. с н.с. брок") or (categ.rec.Code == "Треб. с н.с. брок. резерв"))
+       if (РежимРаботыЕДП(OperDate))
+         if (ДоговорЕДП(null, SubContr.rec.ID))
+           if (index(account.rec.usertypeaccount,"Е")==0)
+             account.rec.usertypeaccount = account.rec.usertypeaccount + "Е";
+           end;
+         end;
+       end;
+    end;
+    
+    MakeNameAccount(account,categ,OperDate);
+
+    return true;
+  END;
+
+  macro GetParametr( ParmKind, OperDate, CatCode, FIRole )
+    var Parametr = -1;
+
+    if( ParmKind == MC_TYPE_PARAMETR_DEPARTMENT )
+      Parametr = subcontr.rec.Department;
+    elif( ParmKind == MC_TYPE_PARAMETR_OWNER )
+      Parametr = subcontr.rec.PartyID;
+    elif( ParmKind == MC_TYPE_PARAMETR_CONTR_CLIENT )
+      Parametr = subcontr.rec.ID;
+    elif( ParmKind == MC_TYPE_PARAMETR_PLACE )
+      Parametr = {OurBank};
+    elif( ParmKind == MC_TYPE_PARAMETR_MARKET_PLACE )
+      Parametr = 0;
+    elif( ParmKind == MC_TYPE_PARAMETR_MARKET_PLACE_OFFICE )
+      Parametr = 0
+    end;
+
+    return Parametr;
+  end;
+
+  macro GetParametrTemplate( ObjectID, Classificator, OperDate, FIRole )
+    var Parametr = -1;
+    
+    if( Classificator == LLCLASS_RESIDENT_CLCB ) //резидентность клиента
+      Parametr = MC_IsResident(subcontr.rec.PartyID);
+    elif( Classificator == LLCLASS_KINDCLCB ) //вид клиента
+      Parametr = 1; /*клиент*/
+      if (subcontr.rec.ServKindSub == 10) //BIQ-5485, если подвид ДО - андеррайтинг
+        Parametr = 2; /*эмитент*/
+      end;  
+      if (subcontr.rec.ServKindSub == 11) //BIQ-8720, если подвид ДО - услуги агента, счет 30603
+        Parametr = 2; /*эмитент*/
+      end; 
+    elif( Classificator == LLCLASS_ISIIS ) //является ИИС
+      Parametr = 0; /*Нет*/
+      if(dlcontr.rec.IIS == SET_CHAR)
+        Parametr = 1; /*Да*/
+      end;
+    elif( Classificator ==  LLCLASS_CAT_CONTR) //1826 Категория контракта
+        Parametr = MC_GetKindSecurCatContr(subcontr.rec.Partyid);
+    elif( Classificator ==  LLCLASS_UNCS_FITYPE) //505 НацВалютный?
+       if (currencyAcc47423 == 0)/*CHVA 505649*/
+        Parametr = -1;//для субдоговоров ФИССиКО безразлично, в них нет валюты
+       else
+        Parametr = 0; 
+       end;
+    end;
+
+    if( (ObjectID == OBJTYPE_SERVKIND) AND (Classificator == LLCLASS_SERVKIND_INNER) )
+       if (ДоговорЕДП(null, subcontr.rec.id))
+          Parametr = 7;// ЕДП
+       else
+          if (subcontr.rec.ServKind == PTSK_STOCKDL)
+            Parametr = 1;// Фондовый дилинг
+          elif(subcontr.rec.ServKind == PTSK_VEKSACC)
+            Parametr = 2; // Учтенные векселя
+          elif(subcontr.rec.ServKind == PTSK_DV)
+            Parametr = 3; // Срочные контракты
+          elif(subcontr.rec.ServKind == PTSK_CM)
+            Parametr = 6; // Валютный рынок
+          end;
+       end;
+    end;
+   /*вид субъекта - Категория дебитора/кредитора в сделках ц/б */
+    if( (ObjectID == OBJTYPE_KINDSUBJ) AND (Classificator == LLCLASS_KINDSUBJ_DEBETSECUR) )
+         Parametr = MC_GetKindSecurDebet( subcontr.rec.PartyID );
+    end;
+
+    return Parametr;
+  end;
+
+  macro GetBasisFIRole(FIRole)
+    return FIROLE_UNDEF;
+  end;
+
+  macro GetFIRoleBArray()
+    return FIRoleBArray;
+  end;
+
+  MACRO OpenAccount( CatCode:STRING, FindAccount:STRING, NoErrMes:BOOL, AccBuf:VARIANT, ActionDate:DATE, FIID:INTEGER, p_OpenDate, p_Role )
+    var BackOutAccount = false, ChangeOpenDate  = false, IsMass;
+    var ret = true;
+    var vOpenDate, vRole;
+
+    if( (NoErrMes == null) OR (NoErrMes == false) )
+       IsMass = 0;
+    else 
+       IsMass = 1;
+    end;
+
+    //gtv: необходимо передавать дату открытия счета в рамках открытия ЕД
+    if (ValType(p_OpenDate) == V_DATE)
+       vOpenDate = p_OpenDate;
+    else
+       vOpenDate = NULL;
+    end;
+
+    if (РежимРаботыЕДП(IIF(ValType(ActionDate) ==V_UNDEF, {curdate}, ActionDate)))
+       if (not СубъектЮЛ_ИП(this.GetParty().rec.PartyID) or (ВедениеЕДП_ЮЛ())) 
+          UpdateAcccodeByEDP();
+       end;
+    end;
+
+    //gtv: роль для счетов ВУ в рамках открытия ЕД
+    if (ValType(p_Role) == V_DATE)
+       vRole = p_Role;
+    else
+       vRole = FIROLE_BA;
+    end;
+
+       
+    MC_GetAccountOpenParms( CatCode, @BackOutAccount, @ChangeOpenDate );
+
+    FindAccount = MC_FindAndOpenAccount (
+        CatCode,
+        this,
+        ActionDate,
+        IsMass,
+        MC_OPENACC_CREATE,
+        AccBuf, FIID, null, NULL, null, vRole, NULL, NULL, NULL, NULL, vOpenDate,
+        BackOutAccount,
+        ChangeOpenDate
+    );
+
+    if( FindAccount=="" ) 
+      if( IsMass == 0 ) 
+         MsgBox("Счет категории \"" + CatCode + "\" неопределен или недоступен в данной операции");
+      end;
+      ret = false;
+    end;
+
+    return ret;
+  END;
+
+  /*актуализация счета (без открытия)*/  
+  MACRO RecreateAccount( CatCode:STRING, FindAccount:STRING, NoErrMes, AccBuf:VARIANT, ActionDate:DATE, FIID:INTEGER )
+    var BackOutAccount = false, ChangeOpenDate  = false, IsMass;
+    var ret = true;
+
+    if( (NoErrMes == null) OR (NoErrMes == false) )
+       IsMass = 0;
+    else 
+       IsMass = 1;
+    end;
+       
+    if (РежимРаботыЕДП(IIF(ValType(ActionDate) ==V_UNDEF, {curdate}, ActionDate)))
+       if (not СубъектЮЛ_ИП(this.GetParty().rec.PartyID) or (ВедениеЕДП_ЮЛ())) 
+    UpdateAcccodeByEDP();
+       end;
+    end;
+       
+    MC_GetAccountOpenParms( CatCode, @BackOutAccount, @ChangeOpenDate );
+
+    FindAccount = MC_FindAndOpenAccount (
+        CatCode,
+        this,
+        ActionDate,
+        IsMass,
+        MC_OPENACC_RECREATE,
+        AccBuf, FIID, null, NULL, FindAccount, FIROLE_BA, NULL, NULL, NULL, NULL, NULL,
+        BackOutAccount,
+        ChangeOpenDate
+    );
+
+    if( FindAccount=="" ) 
+      if( IsMass == 0 ) 
+         MsgBox("Счет категории \"" + CatCode + "\" неопределен или недоступен в данной операции");
+      end;
+      ret = false;
+    end;
+
+    return ret; 
+  END;
+
+  MACRO GetDlcontr()
+     if (dlcontr.rec.dlcontrid == 0)
+        var query =   " select dlc.* "
+                + "   from ddlcontr_dbt dlc, ddlcontrmp_dbt mp "
+                + "  where mp.t_SfContrID = ? "
+                + "    and dlc.t_DlContrID = mp.t_DlContrID ";
+        var cmd = DL_RSDCommand(query);
+        cmd.AddParam(this.GetSubContr.rec.id);
+        var DataSet = cmd.Execute();
+        if(DataSet.moveNext())
+          DataSet.GetRecord().CopyTo(dlcontr.rec);
+        else
+          RunError( "Не найден ДБО.|Ошибка при создании класса "+GenClassName(this) );
+        end;
+     end;
+     return dlcontr;
+  END;
+
+  MACRO GetMainContr()
+     if (maincontr.rec.id == 0);
+       var Query = " SELECT *                                                                " +
+               "   FROM dsfcontr_dbt                                                     " +
+               "  WHERE t_id = (SELECT t_sfcontrid                                       " +
+               "                  FROM ddlcontr_dbt                                      " +
+               "                 WHERE t_dlcontrid = (SELECT t_dlcontrid                 " +
+               "                                        FROM ddlcontrmp_dbt              " +
+               "                                       WHERE t_sfcontrid = :subcontrid)) " ;
+
+       var cmd = DL_RSDCommand(query);
+       cmd.AddParam(this.GetSubContr.rec.id);
+       var DataSet = cmd.Execute();
+       if(DataSet.moveNext())
+         DataSet.GetRecord().CopyTo(MainContr.rec);
+       else
+         RunError( "Не найден sfcontr для ДБО.|Ошибка при создании класса "+GenClassName(this) );
+       end;
+     end;
+     return maincontr;
+  END;
+
+  MACRO GetSubContr()
+    return subcontr;
+  END;
+
+  MACRO GetParty()
+     if (party.rec.partyid == 0)
+        if(ПолучитьСубъекта(this.GetSubContr().rec.partyid, party) != 0)
+           RunError( "Не найден плательщик по договору обслуживания.|Ошибка при создании класса "+GenClassName(this) );
+        end;
+     end;
+     return party;
+  end;
+
+  MACRO GetMarketID()
+    var query, cmd, DataSet;
+
+    if(m_MarketID == NULL)
+      m_MarketID = -1;
+
+      query = "select t_MarketID from ddlcontrmp_dbt where t_SfContrID = ? ";
+
+      cmd = DL_RSDCommand(query);
+
+      cmd.AddParam(this.GetSubContr.rec.id);
+
+      DataSet = cmd.Execute();
+      if(DataSet.moveNext())
+        m_MarketID = DataSet.MarketID;
+      end;
+    end;
+
+    return m_MarketID;
+  END;
+
+  macro IsEDP():bool
+    return (РежимРаботыЕДП({curdate}) and ДоговорЕДП(null, subcontr.rec.ID) and (ВедениеЕДП_ЮЛ() or (not СубъектЮЛ_ИП(GetParty().rec.PartyID))));
+  end;
+
+  MACRO ВУ_СкорректироватьРесчетнуюОперацию(ВидРО, InnAcc:@VARIANT)
+    InnAcc.PartyID = this.GetParty().rec.PartyID;
+    InnAcc.PartyContrID = subcontr.rec.ID;
+
+    return 0;
+  END;
+
+  MACRO Construct( SubContrID:integer )
+    var query, cmd, DataSet;
+    
+    subcontr.Clear();
+
+    subcontr.rec.ID = SubContrID;
+
+    if(subcontr.GetEQ() == 0)
+      RunError( "Не найден субдоговор.|Ошибка при создании класса "+GenClassName(this) );
+    end;
+
+    dlcontr.Clear();
+    MainContr.Clear();
+    Party.Clear();
+
+    Kind = SFCONTR_DOC;
+    Id   = SubContrID;
+
+    FIRoleBArray[0] = 0;
+    dlcontr = this.GetDlcontr();
+
+  END;
+
+  this.Construct( SubContrID );
+end;
+
+
+//Класс для открытия счетов под ДБО 
+class DL_DlContrFD(DlContrID:integer)
+  private var sfcontr = TBFile("sfcontr.dbt");
+  private var dlcontr = TBFile("dlcontr.dbt");
+  private var FIRoleBArray = TArray;
+
+  var Error = 0, Kind, ID;
+
+  MACRO CorrectAccount(account, accblnc, ORScheme, categ, templ, accdoc,  OperDate)
+     return true;
+  END;
+
+  macro GetParametr( ParmKind, OperDate, CatCode, FIRole )
+    var Parametr = -1;
+
+    if( ParmKind == MC_TYPE_PARAMETR_DEPARTMENT )
+      Parametr = sfcontr.rec.Department;
+    elif( ParmKind == MC_TYPE_PARAMETR_OWNER )
+      Parametr = sfcontr.rec.PartyID;
+    elif( ParmKind == MC_TYPE_PARAMETR_CONTR_CLIENT )
+      Parametr = sfcontr.rec.ID;
+    end;
+
+    return Parametr;
+  end;
+
+  macro GetParametrTemplate( ObjectID, Classificator, OperDate, FIRole )
+    var Parametr = -1;
+
+    if( Classificator == LLCLASS_RESIDENT_CLCB ) //резидентность клиента
+      Parametr = MC_IsResident(sfcontr.rec.PartyID);
+    elif( Classificator == LLCLASS_ISIIS ) //является ИИС
+      Parametr = 0; /*Нет*/
+      if(dlcontr.rec.IIS == SET_CHAR)
+        Parametr = 1; /*Да*/
+      end;
+    end;
+
+    return Parametr;
+  end;
+
+  macro GetBasisFIRole(FIRole)
+    return FIROLE_UNDEF;
+  end;
+
+  macro GetFIRoleBArray()
+    return FIRoleBArray;
+  end;
+
+  MACRO OpenAccount( CatCode:STRING, FindAccount:STRING, NoErrMes:BOOL, AccBuf:VARIANT, ActionDate:DATE, FIID:INTEGER )
+    var BackOutAccount = false, ChangeOpenDate  = false, IsMass;
+    var ret = true;
+
+    if( (NoErrMes == null) OR (NoErrMes == false) )
+       IsMass = 0;
+    else 
+       IsMass = 1;
+    end;
+       
+    MC_GetAccountOpenParms( CatCode, @BackOutAccount, @ChangeOpenDate );
+
+    FindAccount = MC_FindAndOpenAccount (
+        CatCode,
+        this,
+        ActionDate,
+        IsMass,
+        MC_OPENACC_CREATE,
+        AccBuf, FIID, null, NULL, null, FIROLE_BA, NULL, NULL, NULL, NULL, NULL,
+        BackOutAccount,
+        ChangeOpenDate
+    );
+
+    if( FindAccount=="" ) 
+      if( IsMass == 0 ) 
+         MsgBox("Счет категории \"" + CatCode + "\" неопределен или недоступен в данной операции");
+      end;
+      ret = false;
+    end;
+
+    return ret;
+  END;
+
+  /*актуализация счета (без открытия)*/  
+  MACRO RecreateAccount( CatCode:STRING, FindAccount:STRING, NoErrMes, AccBuf:VARIANT, ActionDate:DATE, FIID:INTEGER )
+    var BackOutAccount = false, ChangeOpenDate  = false, IsMass;
+    var ret = true;
+
+    if( (NoErrMes == null) OR (NoErrMes == false) )
+       IsMass = 0;
+    else 
+       IsMass = 1;
+    end;
+       
+    MC_GetAccountOpenParms( CatCode, @BackOutAccount, @ChangeOpenDate );
+
+    FindAccount = MC_FindAndOpenAccount (
+        CatCode,
+        this,
+        ActionDate,
+        IsMass,
+        MC_OPENACC_RECREATE,
+        AccBuf, FIID, null, NULL, FindAccount, FIROLE_BA, NULL, NULL, NULL, NULL, NULL,
+        BackOutAccount,
+        ChangeOpenDate
+    );
+
+    if( FindAccount=="" ) 
+      if( IsMass == 0 ) 
+         MsgBox("Счет категории \"" + CatCode + "\" неопределен или недоступен в данной операции");
+      end;
+      ret = false;
+    end;
+
+    return ret; 
+  END;
+
+  MACRO GetContr()
+    return sfcontr;
+  END;
+
+  MACRO Construct( DlContrID:integer )
+    
+    dlcontr.Clear();
+
+    dlcontr.rec.DlContrID = DlContrID;
+
+    if(dlcontr.GetEQ() == 0)
+      RunError( "Не найден договор брокерского обслуживания.|Ошибка при создании класса "+GenClassName(this) );
+    end;
+
+    sfcontr.Clear();
+
+    sfcontr.rec.ID = dlcontr.rec.SfContrID;
+
+    if(sfcontr.GetEQ() == 0)
+      RunError( "Не найден договор брокерского обслуживания.|Ошибка при создании класса "+GenClassName(this) );
+    end;
+
+    Kind = DL_BROKER_SERVICE;
+    Id   = DlContrID;
+
+    FIRoleBArray[0] = 0;
+
+  END;
+
+  this.Construct( DlContrID );
+end;
+
+//Открытие закрытого счета, если счет закрыт, DEF-32928
+private macro ОткрытьЗакрытыйСчет( CatCode, Chapter, Currency, ClientContrID, Owner)
+    var err = 0, ErrorDescription = "";
+    var rs_acc = RsdCommand("  select acc.t_open_close, mcacc.t_account from dmcaccdoc_dbt mcacc " +
+    " inner join daccount_dbt acc on mcacc.t_account = acc.t_account and mcacc.t_chapter = acc.t_chapter and mcacc.t_currency = acc.t_code_currency " +
+    " inner join dmccateg_dbt categ on categ.t_id = mcacc.t_catid " +
+    " where mcacc.t_dockind = 0 and mcacc.t_docid = 0 and mcacc.t_iscommon = 'X' " +
+       " and mcacc.t_disablingdate = to_date('01010001', 'ddmmyyyy') and categ.t_code = ? and mcacc.t_clientcontrid = ? and mcacc.t_currency = ? and mcacc.t_owner = ? and mcacc.t_chapter = ?" );
+    rs_acc.addParam("",RSDBP_IN,CatCode);    
+    rs_acc.addParam("",RSDBP_IN,ClientContrID); 
+    rs_acc.addParam("",RSDBP_IN,Currency);
+    rs_acc.addParam("",RSDBP_IN,Owner);
+    rs_acc.addParam("",RSDBP_IN,Chapter);
+    rs_acc = RsdRecordSet(rs_acc);
+    if (rs_acc.movenext() and (rs_acc.value("t_open_close") == "З"))
+      if(CB_OpenClosedAccount(Chapter,Currency,rs_acc.value("t_account"),ErrorDescription) != 0)
+        msgbox("Ошибка при открытии закрытого счета по категории " + CatCode + ": " + ErrorDescription);
+        err = 1;
+      end;
+    end;
+
+    return err;
+end;
+
+//Открыть счет по КУ "Брокерский счет ДБО" для ДБО или субдоговора
+//Вызывается из закрытого кода 
+macro ОткрытьБрокерскийСчет(DlContrID:integer, SubContrID:integer, Currency:integer, OpenDate:date, AccAddr)
+  var FD = NULL;
+  record ClientAcc( account );
+  record InnAcc( account );
+  record ComAcc( account );
+  var accrec = TRecHandler("account.dbt");
+  var err = 0;
+  var ComAccount = "";
+  var rs_attr = NULL;
+  var isEdp = true;
+  var servSubKind = null;
+  SetBuff(ClientAcc, AccAddr);
+  
+  BegAction(2000, "Открытие счетов");
+  if(SubContrID > 0)
+    FD = DL_SubContrFD(SubContrID);
+    servSubKind = FD.GetSubContr().rec.servkindsub;
+    var rs_sf, rs_acc;
+    var ObjCat, stat, attrid;
+    if ( (РежимРаботыЕДП({curdate})) and (FD.GetSubContr().rec.servkindsub == 8))
+       /*проверим наличие категории Ведение счетов ЕДП. если заполнена, то значит заполнили на предыдущем шаге и открываем счета. */
+       rs_attr = TRsbDataSet(" select a.t_attrid, s.t_id, s.t_partyid from dsfcontr_dbt s, dobjatcor_dbt a where lpad(s.t_id,10,'0')=a.t_object and a.t_objecttype = 659 and a.t_groupid = 102 and s.t_servkindsub = 8 " + 
+                                 " and s.t_id in (select t_sfcontrid from ddlcontrmp_dbt where t_dlcontrid = (select t_dlcontrid from ddlcontrmp_dbt where t_sfcontrid = " + SubContrID+ ")) " );
+       if (not rs_attr.movenext())
+          rs_sf = TRsbDataSet(" select t_id, t_DateBegin from dsfcontr_dbt s where  s.t_servkindsub = 8 " + 
+                                 " and s.t_id in (select t_sfcontrid from ddlcontrmp_dbt where t_dlcontrid = (select t_dlcontrid from ddlcontrmp_dbt where t_sfcontrid = " + SubContrID+ ")) " );
+          if ((not СубъектЮЛ_ИП(FD.GetParty().rec.PartyID)) or (ВедениеЕДП_ЮЛ())) 
+             isEdp = true;
+             attrid = 1;/*Да*/
+          else
+             isEdp = false;
+             attrid = 2;/*Нет*/
+          end;
+          while (rs_sf.movenext())
+             ObjCat = RsbObjCategories(659, string(rs_sf.id:o:10));
+             stat = ObjCat.ConnectAttr(102, attrid, NULL, NULL, rs_sf.DateBegin );
+             if(stat == 0)
+                stat = ObjCat.Save(string(rs_sf.id:o:10));
+             end;
+             ObjCat = null;
+          end;
+       else  /*категория ЕДП уже хотя бы у одного заполнена, но проверим у всех ли. Перестраховка. Иногда категория добавлялась не по всем договорам*/
+          isEdp = rs_attr.attrid == 1; /*Да*/
+          rs_sf = TRsbDataSet(" select t_id, t_DateBegin from dsfcontr_dbt s where  s.t_servkindsub = 8 " + 
+                                 " and s.t_id in (select t_sfcontrid from ddlcontrmp_dbt where t_dlcontrid = (select t_dlcontrid from ddlcontrmp_dbt where t_sfcontrid = " + SubContrID+ ")) " 
+                                 " and s.t_id not in ( select ss.t_id from dsfcontr_dbt ss, dobjatcor_dbt a where lpad(ss.t_id,10,'0')=a.t_object and a.t_objecttype = 659 and a.t_groupid = 102 and ss.t_servkindsub = 8 " + 
+                                 "                     and ss.t_id in (select t_sfcontrid from ddlcontrmp_dbt where t_dlcontrid = (select t_dlcontrid from ddlcontrmp_dbt where t_sfcontrid = " + SubContrID+ "))) " );
+          while (rs_sf.movenext())
+             ObjCat = RsbObjCategories(659, string(rs_sf.id:o:10));
+             stat = ObjCat.ConnectAttr(102, rs_attr.attrid, NULL, NULL, rs_sf.DateBegin );
+             if(stat == 0)
+                stat = ObjCat.Save(string(rs_sf.id:o:10));
+             end;
+             ObjCat = null;
+          end;
+          
+             /*KD Найдем счет комиссии 47423 уже открытый по ЕДП*/
+          If(isEdp)
+       // DEF-25449 перевод на параметризованный запрос
+             rs_acc = RsdCommand("select * " +
+                                 "  from dmcaccdoc_dbt " +
+                                 " where t_catid = 818 " +
+                                 "   and t_dockind = 0 " +
+                                 "   and t_docid = 0 " +
+                                 "   and t_iscommon = 'X' " +
+                                 "   and t_disablingdate = to_date('01010001', 'ddmmyyyy') " +
+                                 "   and t_clientcontrid = ? " +
+                                 "   and t_currency = ? " +
+                                 "   and t_owner = ? " );
+             rs_acc.addParam("",RSDBP_IN,rs_attr.id); 
+             rs_acc.addParam("",RSDBP_IN,Currency);
+             rs_acc.addParam("",RSDBP_IN,rs_attr.partyid);
+             rs_acc = RsdRecordSet(rs_acc);
+             while (rs_acc.movenext())
+                ComAccount = rs_acc.value("t_account");
+             end;
+          end;
+       end;
+    else
+       isEdp = false;
+       ObjCat = RsbObjCategories(659, string(FD.GetSubContr().rec.id:o:10));
+       stat = ObjCat.ConnectAttr(102, 2/*Нет*/, NULL, NULL, FD.GetSubContr().rec.DateBegin );
+       if(stat == 0)
+          stat = ObjCat.Save(string(FD.GetSubContr().rec.id:o:10));
+       end;
+       ObjCat = null;
+    end;
+
+    if((FD.GetSubContr().rec.servkind == 1) and (FD.GetSubContr().rec.servkindsub == 8))
+      ObjCat = RsbObjCategories(659, string(FD.GetSubContr().rec.id:o:10));
+      stat = ObjCat.ConnectAttr(6/*Предоставлять брокеру право использования ценных бумаг в его интересах*/, 1/*Да*/, NULL, NULL, FD.GetSubContr().rec.DateBegin );
+      if(stat == 0)
+         stat = ObjCat.Save(string(FD.GetSubContr().rec.id:o:10));
+      end;
+      ObjCat = null;
+
+      ObjCat = RsbObjCategories(659, string(FD.GetSubContr().rec.id:o:10));
+      stat = ObjCat.ConnectAttr(7/*Перевод активов на новый номер ТКС произведен*/, 2/*Нет*/, NULL, NULL, FD.GetSubContr().rec.DateBegin );
+      if(stat == 0)
+         stat = ObjCat.Save(string(FD.GetSubContr().rec.id:o:10));
+      end;
+      ObjCat = null;
+      
+      ObjCat = RsbObjCategories(659, string(FD.GetSubContr().rec.id:o:10));
+      stat = ObjCat.ConnectAttr(8/*Заявление клиента о переводе на обособленный учет*/, 2/*Нет*/, NULL, NULL, FD.GetSubContr().rec.DateBegin );
+      if(stat == 0)
+         stat = ObjCat.Save(string(FD.GetSubContr().rec.id:o:10));
+      end;
+      ObjCat = null;
+    end;
+  else
+    FD = DL_DlContrFD(DlContrID);
+  end;
+  
+  if(ClientAcc.Account != "")
+    //Привязать счет к КУ
+    if(false == FD.RecreateAccount( "ДС клиента, ц/б", ClientAcc.Account, NULL, ClientAcc, OpenDate, ClientAcc.Code_Currency ))
+      msgbox("Ошибка при привязке счета к категории Брокерский счет ДБО");
+      err = 1;
+    end;
+  else
+    ClearRecord(ClientAcc);
+
+    if (rs_attr)
+      err = ОткрытьЗакрытыйСчет( "ДС клиента, ц/б", 1, Currency, rs_attr.id, rs_attr.partyid);
+    end;
+    if (not err)
+      if(false == FD.OpenAccount( "ДС клиента, ц/б", NULL, NULL, ClientAcc, OpenDate, Currency ))
+        msgbox("Ошибка при открытии счета по категории Брокерский счет ДБО");
+        err = 1;
+      end;
+    end;
+
+    ClearRecord(ComAcc);
+/*KD*/
+    If(ComAccount == "")
+      if(false == FD.OpenAccount( "+РасчетыКомисс1", NULL, NULL, ComAcc, {curdate}, Currency ))
+          msgbox("Ошибка при открытии счета по категории +РасчетыКомисс1");
+        err = 1;
+      end;
+    else
+      if (rs_attr)
+        err = ОткрытьЗакрытыйСчет( "+РасчетыКомисс1", 1, NATCUR, rs_attr.id, rs_attr.partyid);
+      end;
+      if (not err)
+        if(false == FD.RecreateAccount( "+РасчетыКомисс1", ComAccount, NULL, ComAcc, {curdate}, Currency ))
+          msgbox("Ошибка при привязке счета к категории +РасчетыКомисс1");
+          err = 1;
+        end;
+      end;
+    end;
+  end;
+
+  //открыть счета ВУ
+  if((not err) and (SubContrID > 0))
+    ClearRecord(InnAcc);
+
+    if (rs_attr)
+      err = ОткрытьЗакрытыйСчет( "ДС Клиента, ВУ", 1, ClientAcc.Code_Currency, rs_attr.id, rs_attr.partyid);
+    end;
+    if (not err)
+      if(false == FD.OpenAccount( "ДС Клиента, ВУ", NULL, NULL, InnAcc, OpenDate, ClientAcc.Code_Currency ))
+        msgbox("Ошибка при открытии счета по категории ДС Клиента, ВУ");
+        err = 1;
+      end;
+    end;
+
+    if(not err)
+      ClearRecord(InnAcc);
+      if (rs_attr)
+        err = ОткрытьЗакрытыйСчет( "ДС, Расч. с клиентом, ВУ", 1, ClientAcc.Code_Currency, rs_attr.id, rs_attr.partyid);
+      end;
+      if (not err)
+        if(false == FD.OpenAccount( "ДС, Расч. с клиентом, ВУ", NULL, NULL, InnAcc, OpenDate, ClientAcc.Code_Currency ))
+          msgbox("Ошибка при открытии счета по категории ДС, Расч. с клиентом, ВУ");
+          err = 1;
+        end;
+      end;
+    end;
+  end;
+
+  if(not err)
+    var cmd, DataSet;
+
+    cmd = DL_RSDCommand(  "select * from daccount_dbt"
+                        + " where t_Account = ? "
+                        + "   and t_Code_Currency = ? "
+                        + "   and t_Chapter = ?"
+                       ); 
+    cmd.AddParam(ClientAcc.Account);
+    cmd.AddParam(ClientAcc.Code_Currency);
+    cmd.AddParam(ClientAcc.Chapter);
+
+    DataSet = cmd.Execute();
+    if(DataSet.moveNext())
+      DataSet.GetRecord().CopyTo( accrec.rec );
+    else
+      err = 1;
+    end;
+
+    if(not err)
+      copy(ClientAcc, accrec);
+    end;
+  end;
+
+  if (not err)
+    var outMsg = "";
+    if (not CheckDlContrAccCollision(DlContrID, isEdp, ClientAcc.AccountID, servSubKind, @outMsg))
+      RunError(outMsg);
+    end;
+  end;
+
+  EndAction();
+  return err;
+end;
+
+macro ОтправлятьСообщенияНаБиржу()
+  var ErrCode, RetMode;
+  GetRegistryValue("SECUR\\ОТПРАВЛЯТЬ СООБЩЕНИЯ НА БИРЖУ", V_BOOL, RetMode, ErrCode);
+  return RetMode and (ErrCode == 0);
+end;
+
+macro PathNoticeSvod()
+  var RegistryPath = "SECUR\\PATH_NOTICE_SVOD";
+  var Path = "", stat = 0;
+ 
+  GetRegistryValue(RegistryPath, V_STRING, Path, stat);
+  if(stat) 
+     msgbox("Не задана настройка в реестре банка:|", RegistryPath);      
+  end;
+
+  return Path;
+end;
+
+macro ОнлайнРегистрацияКлиентовНаБирже()
+  var ErrCode, RetMode;
+  GetRegistryValue("SECUR\\ОНЛАЙН РЕГИСТРАЦИЯ КЛ НА БИРЖЕ", V_BOOL, RetMode, ErrCode);
+  return RetMode and (ErrCode == 0);
+end;
+
+macro ИспользоватьСправочникКодов()
+  var ErrCode, RetMode;
+  GetRegistryValue("SECUR\\EXCHANGECODES\\ИСПОЛЬЗОВАТЬ СПРАВОЧНИК КОДОВ", V_BOOL, RetMode, ErrCode);
+  return RetMode and (ErrCode == 0);
+end;
+
+macro НеиспКодDeleteDays()
+  var ErrCode, Ret = 0;
+  GetRegistryValue("SECUR\\EXCHANGECODES\\DELETE_DAYS", V_INTEGER, Ret, ErrCode);
+  return Ret;
+end;
+
+//Получить имя папки текстовых файлов
+macro DlGetTxtFileDir()
+  var RegistryPath = "BANK_INI\\ОБЩИЕ ПАРАМЕТРЫ\\ДИРЕКТОРИИ\\TEXTDIR";
+  var Path = "";
+  var stat = 0;
+ 
+  GetRegistryValue(RegistryPath, V_STRING, Path, stat);
+  if(stat) 
+     msgbox("Не задана настройка в реестре банка:|", RegistryPath);      
+  end;
+
+  return Path;
+end;
+
+//Определить идентификатор биржив по виду кода ДБО
+//Вызывается из исходного кода
+macro ПолучитьБиржуПоВидуКодаДБО(CodeKind)
+  var MarketCode = "";
+  var err = 0;
+
+  var MarketID = -1;
+
+  if(CodeKind == DLCCK_USC)
+    GetRegistryValue("SECUR\\MICEX_CODE", V_STRING, MarketCode, err);
+    if(err != 0)
+      msgbox("Ошибка при получении значения настройки SECUR\\MICEX_CODE");
+    elif(MarketCode == "")
+      msgbox("Не задано значение настройки SECUR\\MICEX_CODE");
+    else
+      MarketID = GetCodeParty(MarketCode,PTCK_CONTR);
+    end;
+
+  elif(CodeKind == DLCCK_SPB_BIDCODE)
+    GetRegistryValue("SECUR\\SPBEX_CODE", V_STRING, MarketCode, err);
+    if(err != 0)
+      msgbox("Ошибка при получении значения настройки SECUR\\SPBEX_CODE");
+    elif(MarketCode == "")
+      msgbox("Не задано значение настройки SECUR\\SPBEX_CODE");
+    else
+      MarketID = GetCodeParty(MarketCode,PTCK_CONTR);
+    end;
+  end;
+
+  return MarketID;
+end;
+
+//Определить вид кода ДБО по идентификатору биржи
+//Вызывается из исходного кода
+macro ПолучитьВидКодаДБОДляБиржи(MarketID)
+  var MarketCode = "";
+  var CodeKind = 0;
+  var err = 0;
+
+  GetRegistryValue("SECUR\\MICEX_CODE", V_STRING, MarketCode, err);
+  if(err != 0)
+    msgbox("Ошибка при получении значения настройки SECUR\\MICEX_CODE");
+  elif((MarketCode != "") and (MarketID == GetCodeParty(MarketCode,PTCK_CONTR)))
+    CodeKind = DLCCK_USC;
+  end;
+
+  if((not err) and (CodeKind == 0))
+    GetRegistryValue("SECUR\\SPBEX_CODE", V_STRING, MarketCode, err);
+    if(err != 0)
+      msgbox("Ошибка при получении значения настройки SECUR\\SPBEX_CODE");
+    elif((MarketCode != "") and (MarketID == GetCodeParty(MarketCode,PTCK_CONTR)))
+      CodeKind = DLCCK_SPB_BIDCODE;
+    end;
+  end;
+
+  return CodeKind;
+end;
+
+private macro SplitString(str, delim)
+  var arr = TArray();
+  var idx = 0;
+  var len = StrLen(delim);
+
+  while(str != "")
+    idx = Index(str, delim);
+
+    if(idx == 0)
+      arr[arr.size] = str;
+      return arr;
+    end;
+
+    arr[arr.size] = substr(str, 1, idx - 1);
+    str = substr(str, idx + len);
+  end;
+
+  return arr;
+end;
+
+private macro processPath( p_path )
+  var l_str, l_p, l_path = "";
+
+  p_path = trim( p_path );
+  if( substr( p_path, 1, 2 ) == ".." ) /* ссылка на вышестоящий каталог */
+    p_path = substr( p_path, 3 );
+
+    l_str  = getCWD(false);    
+    l_p    = strbrk( l_str, "\\" );
+    while( l_p != 0 )
+      l_path = l_path + substr( l_str, 1, l_p - 1 ) + "\\";
+      l_str  = substr( l_str, l_p + 1 );
+      l_p    = strbrk( l_str, "\\" );
+    end;
+    return ( substr( l_path, 1, strlen( l_path ) - 1 ) + p_path );
+
+  elif( substr( p_path, 1, 1 ) == "." ) /* ссылка на текущий каталог */
+    return ( getCWD + substr( p_path, 2 ) );
+  end;
+
+  return p_path;
+end;
+
+macro DL_GetFullPath(txtPath, isRemote:bool)
+  var Path = "", pLen = strlen(txtPath);
+
+  if((pLen > 4) and (substr(txtPath, 1, 2) == "\\\\"))
+    // ожидается сетевой путь в виде (должен быть доступен на чтение/запись):
+    /*
+       \\192.168.121.139\SofrSPBin\
+       \\MARYCHEVAT\SofrSPBin\
+       \\MARYCHEVAT.bryansk.softlab.ru\SofrSPBin\
+    */
+    Path = txtPath;
+
+    if(index(Path, "\\", pLen) == 0)
+      Path = Path + "\\";
+    end;
+  else
+    if(isRemote)
+      if( substr( txtPath, 1, 2 ) == ".." ) /* ссылка на вышестоящий каталог */
+        txtPath = substr(txtPath, 3 );
+      end;
+
+      if( substr( txtPath, 1, 1 ) == "\\" ) /* ссылка на вышестоящий каталог */
+        txtPath = substr(txtPath, 2 );
+      end;
+
+      Path = GetCurDir(true) + "\\" + txtPath + "\\"; 
+    else
+      Path = processPath(txtPath) + "\\";
+
+      if( substr( txtPath, 1, 1 ) == "\\" )
+        Path = GetCurDir(true) + Path;
+      end;
+    end;
+  end;
+
+  // получить полный путь
+  return Path;
+end;
+
+macro DL_CreateDirIfNotExists(path)
+  var stat = 0, CheckDirResult:integer;
+
+  if(strlen(path) > 0)
+    CheckDirResult = ExistDir(path);
+
+    if( CheckDirResult == 2 ) // каталог с указанным именем не существует
+      var dirs = SplitString(path, "\\"),
+          dir = "", i = 0, skipHostName = false;
+      while((i < dirs.Size) and (stat == 0))
+        if(dir == "\\\\")
+          skipHostName = true;
+        end;
+
+        dir = dir + dirs[i] + "\\";            
+
+        if((dirs[i] != ".") and (dirs[i] != "..") and (dirs[i] != "") and (not skipHostName))
+          CheckDirResult = ExistDir(dir);
+          if( CheckDirResult == 2)
+            if(MakeDir(ToANSI(dir, true))!=true)
+              stat = 1;
+            end;
+          end;
+        end;
+        skipHostName = false;
+        i = i + 1;
+      end;
+    elif( CheckDirResult == 1 ) // недоступен для записи
+      stat = 1;
+    end;
+  end;
+
+  return stat;
+end;
+
+// Субъект является квалифицированным инвестором
+macro IsQI( partyID:integer, sfContrID:integer ):bool
+  var ret:bool = false;
+  var sql = RSDCommand(" SELECT 1             " +
+                       "   FROM DSCQINV_DBT   " +
+                       "  WHERE T_STATE   = ? " +
+                       "    AND T_PARTYID = ? " +
+                       "    AND T_SFCONTRID = ? " );
+
+  sql.AddParam("", RSDBP_IN, DSCQINV_State_INCLUDED);
+  sql.AddParam("", RSDBP_IN, partyID);
+  sql.AddParam("", RSDBP_IN, sfContrID);
+  sql.execute();
+
+  var ds = TRsbDataSet(sql);
+  if( ds.MoveNext() )
+    ret = true;
+  end;
+
+  return ret;
+end;
+
+/*
+@brief Получить значение из параметра по пути. РУБИЛЬНИК.BOSS-5689
+@return Значение параметра
+*/
+macro DL_GetRegValueSwitchQI()
+   var VALUE_BOSS_5689 = False,  stat;
+    GetRegistryValue("РСХБ\\БРОКЕРСКОЕ ОБСЛУЖИВАНИЕ\\РУБИЛЬНИК.BOSS-5689", V_BOOL, VALUE_BOSS_5689, stat);
+   
+    if(stat)
+       VALUE_BOSS_5689 = False;
+    end;
+    return VALUE_BOSS_5689;
+end;
+
+// Субъект является квалифицированным инвестором
+macro IsQIClient ( partyID:integer):bool
+  var ret:bool = false;
+  var sql = RSDCommand(" SELECT 1             " +
+                       "   FROM DSCQINV_DBT   " +
+                       "  WHERE T_STATE   = ? " +
+                       "    AND T_PARTYID = ? ");
+
+  sql.AddParam("", RSDBP_IN, DSCQINV_State_INCLUDED);
+  sql.AddParam("", RSDBP_IN, partyID);
+  sql.execute();
+
+  var ds = TRsbDataSet(sql);
+  if( ds.MoveNext() )
+    ret = true;
+  end;
+
+  return ret;
+end;
+
+private macro SelectPartClobData(field, FromWhere, substrsize, offset)
+  var PartClobData = "", cmd, DataSet;
+
+  cmd = RSDCommand("select NVL(DBMS_LOB.SUBSTR("+field+", ?, ?), CHR(1)) PartClobData " + FromWhere);
+  cmd.AddParam("", RSDBP_IN, substrsize );
+  cmd.AddParam("", RSDBP_IN, offset );
+  cmd.Execute();
+
+  DataSet = TRsbDataSet(cmd);
+  if(DataSet.moveNext())
+    PartClobData = DataSet.PartClobData;
+  end;
+
+  return PartClobData;
+end;
+
+macro DL_GetClobData(field, FromWhere)
+  var substrsize = 4000; //!!!Больше нельзя
+  var cmd, ClobData = "", PartClobData = "", i = 0;
+
+  PartClobData = SelectPartClobData(field, FromWhere, substrsize, i*substrsize+1);
+  while(PartClobData != "")
+    ClobData = ClobData + PartClobData;
+    i = i + 1;
+    PartClobData = SelectPartClobData(field, FromWhere, substrsize, i*substrsize+1);
+  end;
+
+  return ClobData;
+end;
+
+macro DL_ОчиститьНеотправленныеСообщения(Kind, DlContrID, MarketID)
+  var stat = 0, query, cmd, ds;
+
+  query =  " SELECT t_ImageID " +
+             " FROM dimgdata_dbt " +
+            " WHERE t_ObjectType = " + OBJTYPE_BSCMSG_DL +
+              " AND t_ObjectID IN (SELECT LPAD(t_ID, 34, '0') " +
+                                   " FROM ddlcontrmsg_dbt " +
+                                  " WHERE t_DlContrID = ? " +
+                                    " AND t_Kind = ? " +
+                                    " AND t_MarketID = ? " +
+                                    " AND t_SendDate = TO_DATE('01.01.0001', 'DD.MM.YYYY')) " +
+              " AND t_ImageType = 1 ";
+
+  cmd = RsdCommand(query);
+  cmd.NullConversion = true;
+  cmd.AddParam("", RSDBP_IN, DlContrID);
+  cmd.AddParam("", RSDBP_IN, Kind);
+  cmd.AddParam("", RSDBP_IN, MarketID);
+  cmd.Execute();
+
+  ds = RsdRecordset(cmd);
+  while((stat == 0) and (ds.MoveNext()))
+    if(not WEB_DeleteImage(ds.Value("t_ImageID")))
+      stat = 1;
+    end;
+  end;
+
+  if(stat == 0)
+    query = " DELETE FROM ddlcontrmsg_dbt " +
+             " WHERE t_DlContrID = ? " +
+               " AND t_Kind = ? " +
+               " AND t_MarketID = ? " +
+               " AND t_SendDate = TO_DATE('01.01.0001', 'DD.MM.YYYY') ";
+
+    cmd = RsdCommand(query);
+    cmd.NullConversion = true;
+    cmd.AddParam("", RSDBP_IN, DlContrID);
+    cmd.AddParam("", RSDBP_IN, Kind);
+    cmd.AddParam("", RSDBP_IN, MarketID);
+    cmd.Execute();
+  end;
+
+  return stat;
+end;
+
+/*1. Других открытых ДБО нет. Посылаем CLIENTS-DELETE и FATCA-DELETE
+  2. Есть другие открытые ДБО. Посылаем только CLIENTS-DELETE.
+  3. Есть другие ДБО с датой закрытия сегодня. По ним сформированы только CLIENTS-DELETE. Других открытых нет. Посылаем CLIENTS-DELETE + FATCA-DELETE.
+     При этом если статус CLIENTS-DELETE по другим закрытым сегодня ДБО <Ожидает формирования уведомления для отправки на биржу>, то считаем,
+     что Биржа еще не получила сообщения и включаем <ClientCode> по таким закрытым договорам в FATCA.
+     Если CLIENTS-DELETE имеет статус <Ожидает подтверждения биржи> или <Подтверждено биржей>, то считаем, что такие ClientCode уже удалены на бирже и не включаем их в FATCA-DELETE,
+     а указываем только последний закрываемый.
+*/
+macro DL_NeedFatcaD(mp:TRecHandler, subSfContr:TRecHandler) // вызывается из закрытого кода
+  var query = "SELECT 1 "+
+               " FROM DSFCONTR_DBT SFC, DDLCONTRMP_DBT MP "+
+              " WHERE SFC.T_PARTYID = ? "+
+                " AND SFC.T_SERVKIND = "+PTSK_STOCKDL+
+              //" AND SFC.T_SERVKINDSUB = 8 "+
+                " AND MP.T_SFCONTRID = SFC.T_ID "+
+                " AND MP.T_MARKETID = ? "+
+                " AND MP.T_DLCONTRID != ? "+//другие ДБО
+                " AND SFC.T_DATECLOSE = TO_DATE('01.01.0001', 'DD.MM.YYYY') ";
+
+  var cmd = RSDCommand(query);
+  cmd.AddParam("", RSDBP_IN, subSfContr.rec.PartyID);
+  cmd.AddParam("", RSDBP_IN, mp.rec.MarketID);
+  cmd.AddParam("", RSDBP_IN, mp.rec.DlContrID);
+
+  if(TRsbDataSet(cmd).moveNext())
+    return false;
+  end;
+  return true;
+end;
+
+macro DL_GetDlContrRH(rh:TRecHandler, dlContrID:integer) :bool
+  return DL_GetRecHandler(rh, "SELECT * FROM DDLCONTR_DBT WHERE T_DLCONTRID = ?", dlContrID);
+end;
+
+macro DL_GetSfContrRH(rh:TRecHandler, sfContrID:integer) :bool
+  return DL_GetRecHandler(rh, "SELECT * FROM DSFCONTR_DBT WHERE T_ID = ?", sfContrID);
+end;
+
+private class TMessTypeData(_MessType, _Text)
+  var MessType:string;
+  var Text:string;
+
+  macro Construct(_MessType, _Text)
+    MessType = _MessType;
+    Text = _Text;
+  end;
+  this.Construct(_MessType, _Text);
+end;
+
+// Данные протокола формирования/ обработки биржевых сообщений
+private class TMsgProtocolData()
+  var Code:String;        // Код
+  var Name:String;        // Краткое наименование субъекта
+  var arrMessType:TArray; // Типы сообщений TMessTypeData
+
+ macro Construct()
+   arrMessType = TArray();
+ end;
+
+ this.Construct();
+end;
+
+// Протокол формирования/ обработки биржевых сообщений
+class (TArray) TDlMsgProtocol
+  // Очистить массив
+  macro ClearArray()
+    this.Size = 0;
+  end;
+
+  macro Add(Code, Name, MessType, Text)
+    var Counter = 0, i = 0,
+        IsExistElem = false;
+
+    // ищем в массиве нужный договор
+    while( (Counter < this.Size) and (IsExistElem == false) )
+      if((this.(Counter).Code == Code) and (this.(Counter).Name == Name))
+        IsExistElem = true;
+        break;
+      else
+        Counter = Counter + 1;
+      end;
+    end;
+
+    if( IsExistElem and (Counter < this.Size) )
+      this.(Counter).arrMessType[this.(Counter).arrMessType.size] = TMessTypeData(MessType, Text);
+    else
+      // Запись не нашли. Нужно вставить запись в конец массива
+      this.(this.Size) = TMsgProtocolData();
+      this.(this.Size - 1).Code = Code;
+      this.(this.Size - 1).Name = Name;
+      this.(this.Size - 1).arrMessType[this.(this.Size - 1).arrMessType.size] = TMessTypeData(MessType, Text);
+    end;
+  end;
+end;
+
+class (DL_XML)Dl_XmlReader()
+  private var _xml;
+  macro Load_xml(xml_str) : bool
+    _xml = CreateXMLObj();
+    if(_xml != null)
+      _xml.appendChild(_xml.createProcessingInstruction("xml", "version='1.0' encoding='utf-8'" ));
+      return _xml.loadXML(xml_str);
+    end;
+    return false;
+  end;
+
+  macro Load_file(pathName) : bool
+    _xml = CreateXMLObj();
+    if(_xml != null)
+      _xml.appendChild(_xml.createProcessingInstruction("xml", "version='1.0' encoding='utf-8'" ));
+      return _xml.load(pathName);
+    end;
+    return false;
+  end;
+
+  macro GetXml()
+    return _xml;
+  end;
+
+  macro Construct();
+    //CreateXML("utf-8");
+    _xml = NULL;
+  end;
+
+  this.Construct();
+end;
+
+class TDlArchivator()
+  private var m_stat = 0, m_erStr = "", m_IsFullPathArch = false,
+    m_arch_type = 0, // тип используемого архиватора (1 - winrar.exe; 2 - 7z.exe; 3 - unzip.exe)
+    m_arch_exe = ""; // exe-файл архиватора (если путь задан в переменных средах), либо полный путь до exe-файла
+
+  macro GetStat(erStr:@string)
+    erStr = m_erStr;
+    return m_stat;
+  end;
+
+  private macro WrapQuote(str)
+    return "\"" + str + "\"";
+  end;
+
+  private macro CheckEPath(ePath:string)
+    if(substr(ePath, strlen(ePath), 1) != "\\")
+      return ePath + "\\\\";
+    elif(substr(ePath, strlen(ePath)-1, 1) != "\\")
+      return ePath + "\\";
+    end;
+    return ePath;
+  end;
+
+  macro Extract(fullPathNameArch:string, toFullPath:string, erStr:@string):integer
+    var stat = m_stat; erStr = m_erStr;
+
+    if(stat == 0)
+      if(TDirList(fullPathNameArch, "f").Count == 0)
+        stat = 1;
+        erStr = ("Не найден файл для разархивации: " + fullPathNameArch);
+      end;
+    end;
+
+    if(stat == 0)
+      var aFile = WrapQuote(fullPathNameArch);
+      var ePath = WrapQuote(CheckEPath(toFullPath));
+      var arch = m_arch_exe;
+
+      if(m_IsFullPathArch)
+        arch = WrapQuote(arch);
+      end;
+
+      var cmd = "";
+      if(m_arch_type == 1) // WinRAR
+        cmd = (" x " + aFile + /*" -IBCK " + тихий режим*/ " -y " + ePath);
+      elif(m_arch_type == 2) // 7-Zip
+        cmd = (" x " + aFile + " -y -o" + ePath);
+      elif(m_arch_type == 3) // unzip
+        cmd = (" -o " + aFile + " -d " + ePath);
+      end;
+
+      // Варианты запуска:
+      // 1:
+      stat = startProg(arch, cmd, false);
+      // 2 (если указан абсолютный путь до архиватора, можно еще так):
+      //cmd = arch + cmd;
+      //stat = run(getEnv("COMSPEC"), " /C " + WrapQuote(cmd));
+
+      if(stat != 0)
+        erStr = ("Не удалось выполнить разархивирование <" + fullPathNameArch + "> в <" + toFullPath + ">");
+      end;
+    end;
+
+    return stat;
+  end;
+  
+  macro Zip(FullPath:string, fullPathNameArch:string, delFiles:bool, erStr:@string):integer
+    var stat = m_stat; erStr = m_erStr;
+
+    if(stat == 0)
+      var aFile = fullPathNameArch;
+      var ePath = WrapQuote(FullPath);
+      var arch = m_arch_exe;
+      var toDelFiles = "";
+
+      if(m_IsFullPathArch)
+        arch = WrapQuote(arch);
+      end;
+
+      if (delFiles)
+         toDelFiles = " -df ";
+      end;
+
+      var cmd = "";
+      if(m_arch_type == 1) // WinRAR
+        cmd = (" a -ep1 -r -afzip " +toDelFiles+" "+ aFile +" " + ePath);   //-ep1 игнорировать пути, -r вложенные папки -af* тип архива
+      elif(m_arch_type == 2) // 7-Zip
+        cmd = (" a " + aFile + " -y -o" + ePath);
+      end;
+
+      stat = startProg(arch, cmd, false);
+
+      if(stat != 0)
+        erStr = ("Не удалось выполнить архивирование <" + FullPath + "> в <" + fullPathNameArch + ">");
+      end;
+    end;
+
+    return stat;
+  end;  
+
+  private macro Init()
+    var reg_str,
+    err_msg = "Ошибка при получении значения настройки ";
+
+    reg_str = "SECUR\\ВНЕШНИЕ_ПРОГРАММЫ\\АРХИВАТОР\\ТИП_АРХИВАТОРА";
+    GetRegistryValue(reg_str, V_INTEGER, m_arch_type, m_stat);
+    if((m_stat != 0) or (m_arch_type <= 0))
+      m_erStr = (err_msg + reg_str);
+    end;
+
+    if(m_stat == 0)
+      reg_str = "SECUR\\ВНЕШНИЕ_ПРОГРАММЫ\\АРХИВАТОР\\ИСПОЛНЯЕМЫЙ_ФАЙЛ";
+      GetRegistryValue(reg_str, V_STRING, m_arch_exe, m_stat);
+      if((m_stat != 0) or (m_arch_exe == ""))
+        m_erStr = (err_msg + reg_str);
+      end;
+    end;
+
+    // проверим в каком виде указан исполняемый файл
+    if(m_stat == 0)
+      if(index(m_arch_exe, "\\") > 0) // указали полный путь
+        m_IsFullPathArch = true;
+        // на всякий случай проверим правильность пути
+        if(TDirList(m_arch_exe, "f").Count == 0)
+          m_stat = 1;
+          m_erStr = ("Не найден исполняемый файл: " + m_arch_exe);
+        end;
+      end;
+
+      if(m_stat == 0)
+        var arch_exe = StrLwr(m_arch_exe);
+        if(m_IsFullPathArch)
+          var strName, strExt;
+          SplitFile(m_arch_exe, strName, strExt);
+          arch_exe = StrLwr(strName + strExt);
+        end;
+
+        if(m_arch_type == 1)
+          if(arch_exe != "winrar.exe")
+            m_stat = 1;
+          end;
+        elif(m_arch_type == 2)
+          if(arch_exe != "7z.exe")
+            m_stat = 1;
+          end;
+        elif(m_arch_type == 3)
+          if(arch_exe != "unzip.exe")
+            m_stat = 1;
+          end;
+        else
+          m_stat = false;
+        end;
+        if(m_stat != 0)
+          m_erStr = ("Исполняемый файл не соответствует типу архиватора");
+        end;
+      end;
+    end;
+  end;
+
+  Init();
+end;
+
+MACRO DL_GenerateNumberByReference( ObjType:INTEGER, RefType:INTEGER, RefID:@INTEGER, RefNum:@STRING )
+  if( GetReferenceIDByType( ObjType, RefType, RefID) )
+     MsgBox( "Не найден описатель референса" );
+     return false;
+  elif( GenerateReference( RefID, RefNum ) )
+     MsgBox( "Ошибка при генерации референса по описателю " + string(RefID) );
+     return false;
+  end;
+  return true;
+END;
+
+// получить описание ошибки
+macro GetErrDescr(er:variant) :string
+  var errStr = "", i = 0;
+
+  if(IsEqClass("TrslError", er))
+    errStr = er.module + " "+er.line + " " + er.message;
+
+    if(IsEqClass("TDbError", er.err))
+      errStr = errStr + "\n:|" + er.err.Stat + "-" + er.err.Oper + "-" + er.err.Table + "-" + er.err.Message;
+
+    elif(isEqClass("TRsdError", er.err))
+      while(i < er.err.environment.ErrorCount)
+        errStr = errStr + "\n" + er.err.environment.Error(i).Descr;
+        i = i + 1;
+      end;
+    end;
+  end;
+
+  return errStr;
+end;
+
+// Найти, существует ли такой счет 
+private macro FindAcc(currency, contrid, accrec)
+   var accfile = TBFile("account.dbt", "r", 0);
+
+   var Dt = TRsbDataSet("select * from dmcaccdoc_Dbt where t_catnum = 201 and t_clientcontrid = " + contrid + " and t_currency = " + currency);
+   Dt.movenext();
+   accfile.rec.chapter = 1;
+   accfile.rec.account = Dt.account;
+   accfile.rec.code_currency = currency;
+
+   if (accfile.getEQ())
+     copy(accrec, accfile);
+   else
+     accrec.rec.account = "";
+     accrec.rec.code_currency = currency;
+   end;
+end;
+
+
+// Открыть счет для субдоговора 
+// акутализация макроса - привязка договоров БО к закрытым счетам
+private macro usrIntgr_ОткрытьСубсчетДляСубдоговора(category:string, SubContrID:integer, inAccrec, ErrStr)
+
+// Найти, существует ли такой счет 
+private macro FindExistAcc(currency, accnumber, accrec)
+   var accfile = TBFile("account.dbt", "r", 0);
+
+   accfile.rec.chapter = 1;
+   accfile.rec.account = accnumber;
+   accfile.rec.code_currency = currency;
+
+   if (accfile.getEQ())
+     copy(accrec, accfile);
+   else
+     accrec.rec.account = "";
+     accrec.rec.code_currency = 0;
+   end;
+end;
+
+  var FD = DL_SubContrFD(SubContrID);
+  record ClientAcc( account );
+  var accrec = TRecHandler("account.dbt");
+  var err = 0;
+  var err_txt = "";
+  var SubIsNew = false;
+  var SContr;
+  
+  ClearRecord(ClientAcc);
+
+  if (ValType(inAccrec.rec.account) != V_UNDEF)
+     FindExistAcc(inAccrec.rec.code_currency, inAccrec.rec.account, accrec);
+  end;
+
+  if ( accrec.rec.account != "" ) // запуск из ReOpenAccAndBindToContract
+    Copy (clientacc, accrec);
+    if(false == FD.RecreateAccount( category, ClientAcc.Account, NULL, clientacc, ClientAcc.Open_date, ClientAcc.Code_Currency )) 
+      ErrStr = "Ошибка при актуализации счета по категории " + category;
+      err = 1;
+    end;
+  else
+    // из интеграции старый код содержал только открытие 
+    if(false == FD.OpenAccount( category, NULL, NULL, ClientAcc, inAccrec.rec.Open_date, inAccrec.rec.Code_Currency, inAccrec.rec.Open_date ))
+      ErrStr = "Ошибка при открытии счета по категории " + category+" "+GetGlobalParameter("CorrectAccount_Error",true);
+      err = 1;
+    end;
+  end;
+  println(clientacc.account);
+  if(not err)
+    // структура clientacc и так содержит все, что надо, поиск не нужен
+    // DEF-23895 в структуре нет accountid, что прискорбно
+    ClearRecord(accrec);
+    //Copy (accrec,clientacc);
+    //SetParm(2, accrec);
+
+    var cmd, DataSet;
+    cmd = DL_RSDCommand(  "select * from daccount_dbt"
+                        + " where t_Account = ? "
+                        + "   and t_Code_Currency = ? "
+                        + "   and t_Chapter = ?"
+                       ); 
+    cmd.AddParam(ClientAcc.Account);
+    cmd.AddParam(ClientAcc.Code_Currency);
+    cmd.AddParam(ClientAcc.Chapter);
+
+    DataSet = cmd.Execute();
+    if(DataSet.moveNext())
+      DataSet.GetRecord().CopyTo( accrec.rec );
+      SetParm(2, accrec);
+      if (accrec.rec.open_close == "З") // подобранный счет закрыт
+         err = 1;
+         ErrStr = "Счет "+accrec.rec.account+" по категории "+category+" закрыт";
+      end;
+    else
+      err = 1;
+    end; 
+
+  end;
+
+  SetParm(3, ErrStr);
+  return err;
+end;
+
+// наименование длинное или короткое
+private macro GetPartyName(_partyid, _isshort)
+   var res = NULL;
+   var sql_str, cmd, rs;
+   sql_str = " select t_shortname, t_name "+
+             " from dparty_dbt where t_partyid = :partyid";
+   cmd = RSDCommand(sql_str);
+   cmd.AddParam("partyid", RSDBP_IN, _partyid);
+   rs = RSDRecordSet(cmd);
+   if (rs.movenext)
+      if (_isshort)
+         res = rs.value("t_shortname");
+      else
+         res = rs.value("t_name");
+      end;
+   end;
+   rs.close; cmd.close; rs = NULL; cmd = NULL;
+   return res;
+end;
+
+
+// Привязка счета к субдоговору
+macro AddAccToSubContr(category, contractid, accrec, errstr, settaccid)
+   var stat = 0, cmd, rs, sqltext, servkind, partyid, bankid, order;
+   var bank_code;
+   
+   record sfspi("sfspiins.rec");
+   ClearRecord(sfspi);
+
+
+   sqltext = "select s.* from dsettacc_dbt a, dsfssi_dbt s  where t_account = ? and s.t_setaccid = a.t_settaccid and s.t_objecttype = 659 and t_objectid = ?";
+   cmd = RsdCommand(sqltext);
+   cmd.AddParam("", RSDBP_IN, accrec.rec.account);
+   cmd.AddParam("", RSDBP_IN, contractid);
+   cmd.Execute();
+   rs = RsdRecordset(cmd);
+   if (rs and rs.MoveNext())
+      return 0;
+   end;
+   
+   sqltext = "select t_servkind from dsfcontr_dbt where t_id = ?";
+   cmd = RsdCommand(sqltext);
+   cmd.AddParam("", RSDBP_IN, contractid);
+   cmd.Execute();
+   rs = RsdRecordset(cmd);
+   if (rs and rs.MoveNext())
+      servkind= rs.value(0);
+   else
+      SetParm(2, string("Нет данных о договоре ID = ", contractid));
+      return -1;
+   end;
+
+   sqltext = "select c.t_partyid, "
+             "       d.t_partyid "
+             "  from dsfcontr_dbt c, "
+             "       ddp_dep_dbt d "
+             " where d.t_code = c.t_department "
+             "   and c.t_id = ?";
+   cmd = RsdCommand(sqltext);
+   cmd.AddParam("", RSDBP_IN, contractid);
+   cmd.Execute();
+   rs = RsdRecordset(cmd);
+   if (rs and rs.MoveNext())
+      partyid = rs.value(0);
+      bankid = rs.value(1);
+   else
+      SetParm(2, string("Нет данных о субъекте и/или банке по договору ID = ", contractid));
+      return -1;
+   end;
+
+   sqltext = "select to_char(nvl(max(t_order), 0) + 1) "
+             " from dsfssi_dbt where t_objecttype = 659 "+
+             "  and t_objectid = lpad(?, 10, chr(48))";
+   cmd = RsdCommand(sqltext);
+   cmd.AddParam("", RSDBP_IN, contractid);
+   cmd.Execute();
+   rs = RsdRecordset(cmd);
+   if (rs and rs.MoveNext())
+      order = rs.value(0);
+   else
+      order = 1;
+   end;
+   
+   /*
+   Как-будто что-то удаляли, но удалили не всё
+   cmd = RsdCommand(sqltext);
+   cmd.AddParam("1", RSDBP_IN, partyid);
+   cmd.AddParam("2", RSDBP_IN, partyid);
+   cmd.AddParam("3", RSDBP_IN, bankid);
+   cmd.AddParam("4", RSDBP_IN, partyid);
+   cmd.AddParam("5", RSDBP_IN, bankid);
+   cmd.Execute();
+   rs = RsdRecordset(cmd);
+   if ( (not (rs and rs.MoveNext())) )
+      SetParm(2, string("Нет данных о субъекте и/или банке по договору ID = ", contractid));
+      return -1;
+   end;
+   */
+   
+   sfspi.ServiceKind      = servkind;
+   sfspi.Order            = order;
+   sfspi.FeeType          = 0;
+   sfspi.FeeNumber        = 0;
+   sfspi.FIID             = accrec.rec.code_currency;
+   sfspi.Branch           = 0;
+   if (category == CATEG_SUBCONTRACT)
+      sfspi.ShortName        = "ДС клиента";
+   elif (category == CATEG_SUBCONTRACT_COM)
+      sfspi.ShortName        = "Расчеты по комиссии";
+   else
+      sfspi.ShortName        = order;
+   end;
+   sfspi.RecName          = GetPartyName(partyid, true);
+   sfspi.CodeKind         = PTCK_CONTR;
+   sfspi.Code             = ПолучитьКодСубъекта(partyid, PTCK_CONTR);
+   sfspi.INN              = ПолучитьКодСубъекта(partyid, PTCK_INN);;
+   sfspi.Account          = accrec.rec.account;
+   sfspi.Chapter          = accrec.rec.chapter;
+   sfspi.BankID           = bankid;
+   sfspi.BankName         = GetPartyName(bankid, true);
+   bank_code = ПолучитьКодСубъекта(bankid, PTCK_BIC);
+   if (bank_code)
+      sfspi.BankCodeKind     = PTCK_BIC ;
+      sfspi.BankCode         = ПолучитьКодСубъекта(bankid, PTCK_BIC);
+   else
+      sfspi.BankCodeKind     = PTCK_SWIFT ;
+      sfspi.BankCode         = ПолучитьКодСубъекта(bankid, PTCK_SWIFT);
+   end;
+   sfspi.CorrAcc          = "";
+   sfspi.BankCorrName     = "";
+   sfspi.BankCorrCodeKind = 3;
+   sfspi.BankCorrCode     = "";
+   sfspi.BankCorrID       = -1;
+   sfspi.NoAccept         = "";
+   sfspi.Description      = sfspi.ShortName;
+
+   stat = SFSaveSfSSI(contractid, sfspi);
+   if (stat != 0)
+      SetParm(3, GetErrMsg());
+   end;
+
+   if (category == CATEG_SUBCONTRACT)
+      // DEF-44609 unique constrait, если связка уже есть, а СПИ еще не было
+      sqltext = 
+        "DECLARE "+
+        "   vsfid       number(10) := :psfid; "+
+        "   vaccountid  number(10) := :paccountid; "+
+        "   vcodecur    number(10) := :pcodecur; "+
+        "   vdlcontrid  number(10); "+
+        "   vmpid       number(10); "+
+        "   vcnt        number(10); "+
+        "BEGIN "+
+        "   /* договор уже есть, но если что, то выпадем в ошибку наверх */ "+
+        "   SELECT t_dlcontrid, t_id INTO vdlcontrid, vmpid "+
+        "     FROM ddlcontrmp_dbt "+
+        "    WHERE t_sfcontrid = vsfid; "+
+        "   SELECT count(*) INTO vcnt "+
+        "     FROM DDLCONTRACC_DBT "+
+        "    WHERE T_DLCONTRID = vdlcontrid AND T_ACCOUNTID = vaccountid AND T_MPID = vmpid AND T_FIID = vcodecur; "+
+        "   IF vcnt = 0 THEN "+
+        "      INSERT INTO DDLCONTRACC_DBT "+
+        "         (T_ID, T_DLCONTRID, T_ACCOUNTID, T_VERSION, T_MPID, T_FIID) "+
+        "      VALUES (0, vdlcontrid, vaccountid, null, vmpid, vcodecur); "+
+        "   END IF; "+
+        "END; ";
+      cmd = RsdCommand(sqltext);
+      cmd.AddParam("psfid", RSDBP_IN, contractid);
+      cmd.AddParam("paccountid", RSDBP_IN, accrec.rec.accountid);
+      cmd.AddParam("pcodecur", RSDBP_IN, accrec.rec.code_currency);
+      cmd.Execute();
+   end;
+   if((settaccid != NULL) and (not stat))
+     SetParm(4, sfspi.settaccid);
+   end;
+   return stat;
+end;
+
+macro DeleteBindAcc(contrid, currency, acc)
+
+   var sql = 
+   "DECLARE " +
+   "   contrid   NUMBER (10) := "+contrid+"; " +
+   "   acc       VARCHAR2 (20) := '"+acc+"'; " +
+   "   fiid   NUMBER (10) := "+currency+"; " +
+   "   curdate DATE := " +GetSQLDate({curdate})+ ";" +
+   "BEGIN " +
+   "   DELETE " +
+   "     FROM dsettacc_dbt t " +
+   "    WHERE t_settaccid IN " +
+   "             (SELECT t_setaccid " +
+   "                FROM dsfssi_dbt " +
+   "               WHERE t_fiid = fiid AND t_objecttype = 659 AND t_objectid = LPAD (contrid, 10, '0')); " +
+   " " +
+   "   DELETE " +
+   "     FROM dpmautoac_dbt " +
+   "    WHERE t_settaccid = " +
+   "             (SELECT t_setaccid " +
+   "                FROM dsfssi_dbt " +
+   "               WHERE t_fiid = fiid AND t_objecttype = 659 AND t_objectid = LPAD (contrid, 10, '0')); " +
+   " " +
+   "   DELETE " +
+   "     FROM dsfssi_dbt " +
+   "    WHERE t_objecttype = 659 AND t_fiid = fiid AND t_objectid = LPAD (contrid, 10, '0'); " +
+   " " +
+   "     UPDATE dmcaccdoc_dbt " +
+   "        SET t_iscommon = chr(0), t_disablingdate = curdate " + /*иначе с этим счетом не выгрузится проводка, связку удалять нельзя, iscommon сбрасываем чтоб нигде функционал не отломался*/
+   "    WHERE t_clientcontrid = contrid AND t_catnum = 201 AND t_currency = fiid and t_account = acc; " +
+   " " +
+   "   DELETE " +
+   "     FROM dpmautoac_dbt " +
+   "    WHERE t_settaccid IN (SELECT T.T_SETTACCID " +
+   "                            FROM dsettacc_dbt t " +
+   "                           WHERE     t_partyid = (SELECT t_partyid " +
+   "                                                    FROM dsfcontr_dbt " +
+   "                                                   WHERE t_id = contrid) " +
+   "                                 AND t_fiid = fiid " +
+   "                                 AND t_account = acc); " +
+   " " +
+   "   DELETE " +
+   "     FROM dsettacc_dbt " +
+   "    WHERE     t_partyid = (SELECT t_partyid " +
+   "                             FROM dsfcontr_dbt " +
+   "                            WHERE t_id = contrid) " +
+   "          AND t_fiid = fiid " +
+   "          AND t_account = acc; " +
+   " DELETE   " + 
+   "  FROM ddlcontracc_dbt " + 
+   " WHERE t_accountid =       " + 
+   "          (SELECT t_accountid  " + 
+   "             FROM daccount_dbt     " + 
+   "            WHERE t_account = acc AND t_code_currency = fiid) " + 
+   "       AND t_mpid = (SELECT t_id                                              " + 
+   "                       FROM ddlcontrmp_dbt                                    " + 
+   "                      WHERE t_sfcontrid = contrid);                              " + 
+   "END; " ;
+   SQl_Execute(sql);
+   return true;
+OnError(e);
+  return false;
+end;
+
+
+// Открыть и привязать счет к договору
+macro OpenAccAndBindToContract(category, contractid, in_accrec, error):integer
+   var stat, errstr;
+   var accrec = TRecHandler("account.dbt");
+
+   ClearRecord(accrec);
+   Copy (accrec,in_accrec);
+
+   //открытие счета
+   stat = usrIntgr_ОткрытьСубсчетДляСубдоговора(category, contractid, accrec, errstr);
+      
+   if (stat != 0)
+      SetParm(3,errstr);
+      return stat;
+   end;
+
+   if (category == CATEG_SUBCONTRACT)
+      //привязка счета к договору
+      stat = AddAccToSubContr(category, contractid, accrec, errstr);   // в accnumber структура
+      if (stat != 0)
+         SetParm(3, errstr);
+      end;
+   end;
+   SetParm(2,accrec);
+
+   return stat;
+end;
+
+// Открыть и привязать счет к договору с перепривязкой
+macro ReOpenAccAndBindToContract(category, contractid, currency, accnumber, error, _dateED):integer
+   var stat, errstr;
+   var accrec = TRecHandler("account.dbt");
+   var accrec_new = TRecHandler("account.dbt");
+   var dt = TRsbDataSet("select t_ccy from dfininstr_dbt where t_fiid = " + currency);
+   Dt.movenext();
+   var currccy = dt.ccy;
+
+   if (category == CATEG_SUBCONTRACT) 
+      // поиск и заполнение структуры
+      FindAcc(currency, contractid, accrec);
+      if (accrec.rec.accountid != 0)
+         /*предложим удалить все старые привязки, тогда дальнейший код все переоткроет и привяжет заново. */
+         /* При этом по мигрированным договорам откроется новый счет, по новым сгенерируется точно такой как и был и привяжется заново. */
+         /* если же по клиенту изменился признак резидентства, то счет так же откроется новый */
+         if (GetTrue(false, "По данному рынку и валюте "+currccy+" уже есть привязанный счет " +accrec.rec.account+". | Удалить все привязки и переоткрыть счет?"))
+           /*Удалить СПИ с ДО, удалить СПИ и параметры выбора СПИ с клиента, удалить привязку с КУ*/
+           if (not DeleteBindacc(contractid, currency, accrec.rec.account))
+              SetParm(4,"Ошибка отвязки счета");
+              return 1;
+           end;
+         end;
+      end;
+   end;
+
+   ClearRecord(accrec_new);
+   accrec_new.rec.code_currency = currency;
+   accrec_new.rec.account = accnumber;
+   accrec_new.rec.open_date = _dateED;
+
+   //открытие счета
+   stat = usrIntgr_ОткрытьСубсчетДляСубдоговора(category, contractid, accrec_new, errstr);
+
+   if (stat != 0)
+      SetParm(4,errstr);
+      return stat;
+   end;
+
+   if (category == CATEG_SUBCONTRACT)
+      //привязка счета к договору
+      stat = AddAccToSubContr(category, contractid, accrec_new, errstr); // в accnumber возвращается структура
+      if (stat != 0)
+         SetParm(4, errstr);
+      end;
+   end;
+
+   return stat;
+end;
+
+/*
+@brief функция для вставки во временную таблицу ошибок, полученных во время отправки сообщений ДБО
+@param[in] код ошибки
+@param[in] текст ошибки
+*/
+macro msgErrAdd(errCode:Integer,errMsg:String)
+  var sql:String, 
+      cmd;
+  
+  MsgBox(errMsg);
+  
+  SQL_Execute("delete from dlcontrerrmsg_tmp");
+
+  sql =  "insert into dlcontrerrmsg_tmp " +  
+          " values(:err_code,:err_msg) "; 
+
+   cmd = RsdCommand(sql);
+   cmd.addParam("err_code", RSDBP_IN, errCode );
+   cmd.addParam("err_msg" , RSDBP_IN, errMsg );
+   cmd.execute();
+
+end;
+
+class TOutData_forIntegration(_MessType, _FullFileName, _ErrorCode, _ErrorText)
+  var MessType:string;
+  var FullFileName:string;
+  var ErrorCode;
+  var ErrorText;
+
+  macro Construct(_MessType, _FullFileName, _ErrorCode, _ErrorText)
+    MessType = _MessType;
+    FullFileName = _FullFileName;
+    ErrorCode = _ErrorCode;
+    ErrorText = _ErrorText;
+  end;
+  this.Construct(_MessType, _FullFileName, _ErrorCode, _ErrorText);
+end;
+
+class (TArray) TOutData_forIntegration_arr
+  // Очистить массив
+  macro ClearArray()
+    this.Size = 0;
+  end;
+
+  macro Add(MessType, FullFileName, ErrorCode, ErrorText)
+    var Counter = 0;
+
+    Counter = this.Size;
+    this.(Counter) = TOutData_forIntegration(MessType, FullFileName, ErrorCode, ErrorText);
+  end;
+end;
+
+// DEF-35472
+macro ChangeNameAccount(partyid)
+  var sql_str, cmd, rs;
+  var sql_str2, cmd2, rs2;
+  var sql_upd, cmd_upd;
+
+  var contrid;
+  var FD;
+  
+  var accfile = TBFile("account.dbt", "w", 1);
+  var categ = TBFile("mccateg.dbt", "r", 1);
+  
+  sql_str = " select sf.t_id "+
+            "   from dsfcontr_dbt sf, ddlcontrmp_dbt mp "+
+            "  where sf.t_id = mp.t_sfcontrid "+
+            "    and sf.t_dateclose = to_date('01010001','ddmmyyyy') "+
+            "    and sf.t_partyid = :partyid ";
+  sql_str2 =  "SELECT distinct ac.t_account, ac.t_currency, ac.t_catnum,ac.t_templnum,ac.t_chapter, ac.t_clientcontrid, "+
+              "       cat.t_id, cat.t_number, cat.t_code, cat.t_leveltype, "+
+              "    a.t_nameaccount, a.t_accountid "+
+              "  FROM dmcaccdoc_dbt ac, daccount_dbt a, dmccateg_dbt cat "+
+              " WHERE ac.t_owner = :partyid AND ac.t_clientcontrid = :contr AND ac.t_iscommon = CHR (88) AND ac.t_catid = cat.t_id "+
+              "   AND ac.t_chapter = a.t_chapter AND ac.t_currency = a.t_code_currency AND ac.t_account = a.t_account "+
+              "   AND a.t_open_close = chr(0) "+
+              "   AND upper(cat.t_code) in ( "+
+              "        upper( 'ДС клиента, ц/б'), "+
+              "        upper('+РасчетыКомисс1'), "+
+              "        upper('ДС Клиента, ВУ'), "+
+              "        upper('ЦБ Клиента, ВУ'), "+
+              "        upper('НЦБ Клиента, ВУ'), "+
+              "        upper('ФО Клиента, ВУ'),"+
+              "        upper('ДМ клиента, ВУ'),"+
+              "        upper('ДС, Расч. с клиентом, ВУ'),"+
+              "        upper('ЦБ, Расч. с Клиентом, ВУ'), "+
+              "        upper('НЦБ, Расч. с Клиентом, ВУ'), "+
+              "        upper('ФО, Расч. с Клиентом, ВУ'), "+
+              "        upper('ДМ, Расч. с Клиентом, ВУ'), "+
+              "        upper('Треб. с н.с. брок'), "+
+              "        upper('Треб. с н.с. брок. резерв') "+
+              "       )";
+  sql_upd = "update daccount_dbt set t_nameaccount = :n where t_accountid = :id";
+            
+  cmd = RSDCommand(sql_str);
+  cmd.AddParam("partyid", RSDBP_IN, partyid);
+  rs = RSDRecordSet(cmd);
+  while (rs.movenext)
+    contrid = rs.value(0);
+    FD = DL_SubContrFD(contrid);
+    cmd2 = RSDCommand(sql_str2);
+    cmd2.AddParam("partyid", RSDBP_IN, partyid);
+    cmd2.AddParam("contr", RSDBP_IN, contrid);
+    rs2 = RSDRecordSet(cmd2);
+    while(rs2.movenext)
+      accfile.clear();
+      accfile.rec.accountid = rs2.value("t_accountid");
+      if (accfile.getEQ())
+        categ.rec.code = rs2.value("t_code");
+        categ.rec.leveltype = rs2.value("t_leveltype");
+        if (categ.getEQ())
+          FD.MakeNameAccount(accfile, categ, {curdate});
+          //accfile.update();
+          cmd_upd = RSDCommand(sql_upd);
+          cmd_upd.AddParam("n", RSDBP_IN, accfile.rec.nameaccount);
+          cmd_upd.AddParam("id", RSDBP_IN, accfile.rec.accountid);
+          cmd_upd.execute;
+        end;
+      end;
+    end;
+  end;
+  
+
+end;
+
+private macro ExistsDBOAccounts(sfContrID:integer, fiid:integer)
+  var query : string;
+  var params : TArray;
+  var rows : RsdRecordset;
+
+  query = "select 1 " +
+          "  from ddlcontrmp_dbt m " +
+          "  join ddlcontracc_dbt d on d.t_dlcontrid = m.t_dlcontrid and " +
+          "                            d.t_mpid = m.t_id " +
+          " where m.t_sfcontrid = :contrID " +
+          "   and d.t_fiid = :fiid ";
+  params = makeArray(SQLParam("contrID", sfContrID)
+                    ,SQLParam("fiid",    fiid));
+  rows = execSQLselect(query, params);
+  return rows.MoveNext();
+end;
+
+private macro getSfContrWithService(sfContrIdBase:integer, serviceKind:integer, servKindSub:integer):TArray
+  var sfContrIdList = TArray();
+  var query : string;
+  var rows : RsdRecordset;
+
+  query = "select sf_srv.t_id " +
+          "  from dsfcontr_dbt sf " +
+          "  join ddlcontrmp_dbt mp on mp.t_sfcontrid = sf.t_id " +
+          "  join ddlcontrmp_dbt mp_srv on mp_srv.t_dlcontrid = mp.t_dlcontrid " +
+          "  join dsfcontr_dbt sf_srv on sf_srv.t_id = mp_srv.t_sfcontrid " +
+          " where sf.t_id = :sfcontrid " +
+          "   and sf_srv.t_servkind = :servkind " +
+          "   and sf_srv.t_servkindsub = :servkindsub " +
+          "   and sf_srv.t_dateclose = to_date('01.01.0001', 'dd.mm.yyyy')";
+  rows = execSQLselect(query, makeArray(SQLParam("sfcontrid",   sfContrIdBase)
+                                       ,SQLParam("servkind",    serviceKind)
+                                       ,SQLParam("servkindsub", servKindSub)));
+  while (rows.MoveNext())
+    sfContrIdList.value(sfContrIdList.size()) = rows.value("t_id");
+  end;
+
+  return sfContrIdList;
+end;
+
+private macro OpenAccountByCategory(categ, sfContrID, fiid, dt:date, useCache)
+  var acc = TRecHandler("account.dbt");
+  var account:string;
+  private var stat, err_txt;
+
+  if (useCache)
+    account = g_accountsCache.Get(fiid, categ);
+    acc.rec.account = account; 
+  end;
+  acc.rec.code_currency = fiid;
+  acc.rec.open_date = dt;
+
+  stat = OpenAccAndBindToContract(categ, sfContrID, acc, err_txt);
+  if(stat != 0)
+    logError("OpenAccountByCategory. Error. sfcontrid = " + sfContrID + " fiid = " + fiid + "; categ = " + categ + "; errtext: " + err_txt);
+    return;
+  end;
+
+  if (useCache and (account == ""))
+    g_accountsCache.Add(acc.rec.account, fiid, categ);
+  end;
+end;
+
+private macro OpenDBOAccounts(sfContrID:integer, fiid:integer, useCashe:bool, dt:date)
+  var startTime = Time();
+  var err : integer = 0;
+  if (ExistsDBOAccounts(sfContrID, fiid))
+    return;
+  end;
+
+  OpenAccountByCategory(CATEG_SUBCONTRACT, sfContrID, fiid, dt, useCashe);
+  OpenAccountByCategory(CATEG_SUBCONTRACT_COM, sfContrID, fiid, dt, useCashe);
+  OpenAccountByCategory(CATEG_SUBCONTRACT_VU, sfContrID, fiid, dt, useCashe);
+  OpenAccountByCategory(CATEG_SUBCONTRACT_VU_CALC, sfContrID, fiid, dt, useCashe);
+  logWithTime("OpenDBOAccounts", "End. sfcontrid = " + sfContrID + " fiid = " + fiid, Time() - startTime);  
+end;
+
+//Кеш нужен, чтобы к разным договорам привязать одни и те же счета, если работа в режиме ЕДП (Единая денежная позиция)
+//Это работает пока счета по одной валюте и по всем категориям открваются тут, в одном месте.
+//Если случиться так, что часть счетов будет открыта в другом месте и здесь мы захотим только лишь привязывать уже открытые счета с других субдоговоров
+//То есть два очевидных пути:
+//1 - Сначала проинициализировать кеш всеми актуальными счетами по договору
+//2 - избавиться от кеша и напрямую искать счёт по договору каждый раз
+macro OpenDBOAccountsFX(sfContrID:integer, fiid:integer, dt:date)
+  var FD = DL_SubContrFD(sfContrID);
+  var isEDP:bool = FD.IsEDP();
+  var sfContrIDList = TArray();
+  var sfContrIdStock:integer;
+  var servKindSubStock:integer = 8;
+  var useCashe:bool = isEDP;
+
+  if (useCashe)
+    g_accountsCache.Clear();
+  end;
+
+  OpenDBOAccounts(sfContrID, fiid, useCashe, dt);
+
+  if (isEDP)
+    sfContrIDList = getSfContrWithService(sfContrID, PTSK_STOCKDL, servKindSubStock);
+    for (sfContrIdStock, sfContrIDList)
+      OpenDBOAccounts(sfContrIdStock, fiid, useCashe, dt);
+    end;
+    g_accountsCache.Clear();
+  end;
+onerror(errObj)
+  logError("OpenDBOAccountsFX. Error. sfContrID = " + sfContrID + " fiid = " + fiid + "; msg: " + errObj.Message);
+end;
+
+
+private macro AddSkipOpFuncObj(DocKind:integer, Client:integer, OperDate:date, Code:string)
+  var query, Ins;
+
+  query = "insert into dnptxopskipfo_tmp (t_DocKind, t_Client, t_OperDate, t_Code) values(?, ?, ?, ?)";
+
+  Ins = DL_RSDCommand(query);
+
+  Ins.AddParam(DocKind);
+  Ins.AddParam(Client);
+  Ins.AddParam(OperDate);
+  Ins.AddParam(Code);
+
+  Ins.ExecuteCMD();
+
+  return 0;
+OnError(er)
+  return 1;
+end;
+
+private macro DelSkipOpFuncObj(DocKind:integer, Client:integer, OperDate:date, Code:string)
+  var query, Del;
+
+  query =   " delete from dnptxopskipfo_tmp "
+          + " where t_DocKind = ? "
+          + "   and t_Client  = ? "
+          + "   and t_OperDate = ? "
+          + "   and t_Code = ?";
+
+  Del = DL_RSDCommand(query);
+
+  Del.AddParam(DocKind);
+  Del.AddParam(Client);
+  Del.AddParam(OperDate);
+  Del.AddParam(Code);
+
+  Del.ExecuteCMD();
+
+  return 0;
+OnError(er)
+  return 1;
+end;
+
+macro ActionBeforeIISClose(DlContrID:integer, IISCloseByTransf:bool, CloseDate:date)
+  var query, cmd, DataSet;
+  var dlcontr = TRecHandler("dlcontr.dbt");
+  var sfcontr = TRecHandler("sfcontr.dbt");
+  var err = 0;
+
+  //если на ДБО установлена отметка <Договор ИИС> И установлен флаг <Закрыт с переводом> в закладке <Параметры ИИС>.
+  //Проверяется наличие расчета НОБ.
+  //Если по закрываемому договору ИИС на дату закрытия отсутствует технический расчет НОБ с типом расчета <Окончание года> в статусе <закрыт>, 
+  //то, пользователю выводится сообщение <Расчет НОБ с типом <Окончание года> по договору ИИС не производился. Запустить расчет НОБ? ДА / НЕТ>.
+  if(IISCloseByTransf == true)
+    query = " select * from ddlcontr_dbt where t_DlContrID = ?";
+    cmd = DL_RSDCommand(query);
+    cmd.AddParam(DlContrID);
+    DataSet = cmd.Execute();
+    if(DataSet.moveNext())
+      DataSet.GetRecord().CopyTo(dlcontr.rec);
+    else
+      msgbox("Не найден ДБО ИИС с идентификатором " + DlContrID);
+      err = 1;
+    end;
+
+    if(not err)
+      query = " select * from dsfcontr_dbt where t_ID = ?";
+      cmd = DL_RSDCommand(query);
+      cmd.AddParam(dlcontr.rec.SfContrID);
+      DataSet = cmd.Execute();
+      if(DataSet.moveNext())
+        DataSet.GetRecord().CopyTo(sfcontr.rec);
+      else
+        msgbox("Не найден ДБО ИИС с идентификатором " + DlContrID);
+        err = 1;
+      end;
+    end;
+
+    if(not err)
+      query =   " select t_ID "
+              + "   from dnptxop_dbt "
+              + "  where t_DocKind = " + DL_CALCNDFL
+              + "    and t_Client = ? "
+              + "    and t_Contract = ? "
+              + "    and t_OperDate <= ? "
+              + "    and t_SubKind_Operation = " + DL_TXBASECALC_OPTYPE_ENDYEAR
+              + "    and t_Status = " + DL_TXOP_Close
+              + "    and RSB_SECUR.GetMainObjAttr(132 /*OBJTYPE_NPTXCALC*/, LPAD(t_ID, 34, '0'), 1, t_OperDate) = 1 ";
+
+      cmd = DL_RSDCommand(query);
+
+      cmd.AddParam(SfContr.rec.PartyID);
+      cmd.AddParam(DlContrID);
+      cmd.AddParam(CloseDate);
+      DataSet = cmd.Execute();
+      if(not DataSet.moveNext())
+        if(GetTrue(true, "Расчет НОБ с типом <Окончание года> по договору ИИС не производился. Запустить расчет НОБ?"))
+          var prm = TRecHandler("nptxcalctaxprm.rec");
+          var OldDialogFlag;
+          var RefID;
+          var ErrStr = "";
+
+          prm.Clear();
+          
+          GenerateNumberByReference( 132/*OBJTYPE_NPTXCALC*/, 1 /*REFOBJ_NPTXCALC*/, @RefID, @prm.rec.Code );
+
+          err = AddSkipOpFuncObj(DL_CALCNDFL, sfcontr.rec.PartyID, date(CloseDate), prm.rec.Code);
+          if(not err)
+
+            prm.rec.SubKind_Operation = DL_TXBASECALC_OPTYPE_ENDYEAR;              // Подвид операции
+            prm.rec.OperDate          = date(CloseDate);                           // Дата операции
+            prm.rec.Client            = sfcontr.rec.PartyID;                       // Клиент
+            prm.rec.IIS               = SET_CHAR;                                  // Признак Индивидуального инвестиционного счета (ИИС)
+            prm.rec.Oper              = {oper};                                    // Операционист
+            prm.rec.Department        = {OperDprt};                                // Филиал
+            prm.rec.Recalc            = UNSET_CHAR;
+            prm.rec.Kvit              = UNSET_CHAR;
+            prm.rec.Contract          = DlContrID;
+            prm.rec.Technical         = SET_CHAR;
+
+            err = DL_CreateOpNptxCalcTax(prm, ErrStr);
+            if(not err)
+              err = DelSkipOpFuncObj(DL_CALCNDFL, sfcontr.rec.PartyID, date(CloseDate), prm.rec.Code);
+            end;
+            if(not err)
+              OldDialogFlag = SetDialogFlag(0);
+              
+              err = DL_ExecuteNptxOp(prm.rec.ID, true, ErrStr);
+
+              SetDialogFlag(OldDialogFlag);
+
+              if((err) and (GetTrue(true, "При расчете НОБ возникли ошибки. НОБ не рассчиталась. Закрывать договор НЕ рекомендуется! Продолжить закрытие договора?")))
+                err = 0;
+              end;
+            end;
+          end;
+        else
+          err = 1; //Прерываем закрытие
+        end;
+      end;
+    end;
+
+  end;
+
+  return err;
+end;
+
+macro ActionAfterIISClose(DlContrID:integer)
+  var query, cmd, DataSet;
+  var dlcontr = TRecHandler("dlcontr.dbt");
+  var sfcontr = TRecHandler("sfcontr.dbt");
+  var err = 0;
+
+  query = " select * from ddlcontr_dbt where t_DlContrID = ?";
+  cmd = DL_RSDCommand(query);
+  cmd.AddParam(DlContrID);
+  DataSet = cmd.Execute();
+  if(DataSet.moveNext())
+    DataSet.GetRecord().CopyTo(dlcontr.rec);
+  else
+    msgbox("Не найден ДБО ИИС с идентификатором " + DlContrID);
+    err = 1;
+  end;
+
+  if(not err)
+    query = " select * from dsfcontr_dbt where t_ID = ?";
+    cmd = DL_RSDCommand(query);
+    cmd.AddParam(dlcontr.rec.SfContrID);
+    DataSet = cmd.Execute();
+    if(DataSet.moveNext())
+      DataSet.GetRecord().CopyTo(sfcontr.rec);
+    else
+      msgbox("Не найден ДБО ИИС с идентификатором " + DlContrID);
+      err = 1;
+    end;
+  end;
+  
+  //Если по закрываемому договору ИИС на дату закрытия имеется технический расчет НОБ с типом расчета <Окончание года> в статусе <закрыт>, то запускается формирование Справки Сведения о ФЛ и его ИИС
+  if((not err) and (dlcontr.rec.IISCloseByTransf == SET_CHAR))
+    query =   " select t_ID "
+            + "   from dnptxop_dbt "
+            + "  where t_DocKind = " + DL_CALCNDFL
+            + "    and t_Client = ? "
+            + "    and t_Contract = ? "
+            + "    and t_OperDate <= ? "
+            + "    and t_SubKind_Operation = " + DL_TXBASECALC_OPTYPE_ENDYEAR
+            + "    and t_Status = " + DL_TXOP_Close
+            + "    and RSB_SECUR.GetMainObjAttr(132 /*OBJTYPE_NPTXCALC*/, LPAD(t_ID, 34, '0'), 1, t_OperDate) = 1 ";
+
+
+    cmd = DL_RSDCommand(query);
+
+    cmd.AddParam(SfContr.rec.PartyID);
+    cmd.AddParam(DlContrID);
+    cmd.AddParam(SfContr.rec.DateClose);
+    DataSet = cmd.Execute();
+    if(DataSet.moveNext())
+
+      var ExcelFullRepPath = "", PDFFullRepPath = "";
+
+      var DocNum = "";                                               
+      GenerateNumberByReference( OBJTYPE_PERSN, 1, null, @DocNum);                 
+
+      ExecMacroFile("nptxphysiisinfo_report.mac", "CreateNpTxPhysIISInfoRep", {curdate},       
+                                                                              sfcontr.rec.PartyID,      
+                                                                              dlcontr.rec.DlContrID,     
+                                                                              UNSET_CHAR, 
+                                                                              UNSET_CHAR,       
+                                                                              SET_CHAR,         
+                                                                              1559,     
+                                                                              SET_CHAR,  
+                                                                              SET_CHAR,
+                                                                              DocNum,
+                                                                              @ExcelFullRepPath,
+                                                                              @PDFFullRepPath,
+                                                                              true
+                                                                             );
+    end;
+  end;
+
+  return err;
+end;

@@ -1,0 +1,211 @@
+DECLARE
+   v_cnt                 NUMBER := 0;
+   v_NumberPoint         NUMBER := 0;
+
+   C_IDENTPROGRAM_CODE   NUMBER := 83; --Подсистема
+   C_CASEITEM            NUMBER := 20262; --Номер модуля
+   C_NAME                VARCHAR2(255) := 'Формирование Справок по НДФЛ (динамический шаблон)';
+   V_NUMBERFATHER        NUMBER := 0;
+   C_NUMBERLINE          NUMBER := 10;
+
+   PROCEDURE InsertMenu (p_numberoper IN NUMBER, p_istemplate IN CHAR)
+   IS
+      v_cnt           NUMBER := 0;
+      v_NumberPoint   NUMBER := 0;
+   BEGIN
+      
+      V_NUMBERFATHER := 0;
+
+      SELECT NVL (
+                (SELECT NVL(MAX(T_INUMBERPOINT), 0)
+                   FROM dmenuitem_dbt
+                  WHERE     replace(trim(t_sznameitem), '~', '') = 'Формирование Справок по НДФЛ'
+                        AND T_IPROGITEM = C_IDENTPROGRAM_CODE
+                        AND T_ISTEMPLATE = p_istemplate
+                        AND T_OBJECTID = p_numberoper),
+                0)
+        INTO V_NUMBERFATHER
+        FROM DUAL;
+      
+      SELECT COUNT (1)
+        INTO v_cnt
+        FROM dmenuitem_dbt
+       WHERE     t_objectid = p_numberoper
+             AND t_istemplate = p_istemplate
+             AND t_iidentprogram = C_IDENTPROGRAM_CODE
+             AND t_icaseitem = C_CASEITEM
+             AND t_inumberfather = V_NUMBERFATHER;
+
+      IF v_cnt = 0 
+      THEN
+         SELECT NVL (MAX (t_inumberpoint), 0)
+           INTO v_NumberPoint
+           FROM dmenuitem_dbt
+          WHERE     t_objectid = p_numberoper
+                AND t_istemplate = p_istemplate
+                AND t_iidentprogram = C_IDENTPROGRAM_CODE;
+
+         v_NumberPoint := v_NumberPoint + 1;
+
+         INSERT INTO dmenuitem_dbt (t_objectid,
+                                    t_istemplate,
+                                    t_iidentprogram,
+                                    t_inumberpoint,
+                                    t_inumberfather,
+                                    t_inumberline,
+                                    t_icaseitem,
+                                    t_csystemitem,
+                                    t_sznameitem,
+                                    t_sznameprompt,
+                                    t_ihelp,
+                                    t_iprogitem)
+              VALUES (p_numberoper,
+                      p_istemplate,
+                      C_IDENTPROGRAM_CODE,
+                      v_NumberPoint,
+                      V_NUMBERFATHER,
+                      C_NUMBERLINE,
+                      C_CASEITEM,
+                      CHR (88),
+                      ' ' || C_NAME,
+                      ' ' || C_NAME,
+                      0,
+                      C_IDENTPROGRAM_CODE);
+      END IF;
+   END;
+
+  PROCEDURE InsertMenuStep (p_numberoper IN NUMBER, p_istemplate IN CHAR)
+   IS
+      v_cnt           NUMBER := 0;
+      v_NumberPoint   NUMBER := 0;
+   BEGIN
+      
+      V_NUMBERFATHER := 0;
+
+      SELECT NVL (
+                (SELECT NVL(MAX(T_INUMBERPOINT), 0)
+                   FROM dmenuitem_dbt
+                  WHERE     replace(trim(t_sznameitem), '~', '') = 'Отчеты для НДФЛ'
+                        AND T_IPROGITEM = C_IDENTPROGRAM_CODE
+                        AND T_ISTEMPLATE = p_istemplate
+                        AND T_OBJECTID = p_numberoper),
+                0)
+        INTO V_NUMBERFATHER
+        FROM DUAL;
+      
+      SELECT COUNT (1)
+        INTO v_cnt
+        FROM dmenuitem_dbt
+       WHERE     t_objectid = p_numberoper
+             AND t_istemplate = p_istemplate
+             AND t_iidentprogram = C_IDENTPROGRAM_CODE
+             AND t_icaseitem = C_CASEITEM
+             AND t_inumberfather = V_NUMBERFATHER;
+
+      IF v_cnt = 0 
+      THEN
+         SELECT NVL (MAX (t_inumberpoint), 0)
+           INTO v_NumberPoint
+           FROM dmenuitem_dbt
+          WHERE     t_objectid = p_numberoper
+                AND t_istemplate = p_istemplate
+                AND t_iidentprogram = C_IDENTPROGRAM_CODE;
+
+         v_NumberPoint := v_NumberPoint + 1;
+
+         INSERT INTO dmenuitem_dbt (t_objectid,
+                                    t_istemplate,
+                                    t_iidentprogram,
+                                    t_inumberpoint,
+                                    t_inumberfather,
+                                    t_inumberline,
+                                    t_icaseitem,
+                                    t_csystemitem,
+                                    t_sznameitem,
+                                    t_sznameprompt,
+                                    t_ihelp,
+                                    t_iprogitem)
+              VALUES (p_numberoper,
+                      p_istemplate,
+                      C_IDENTPROGRAM_CODE,
+                      v_NumberPoint,
+                      V_NUMBERFATHER,
+                      270,
+                      0,
+                      CHR (88),
+                      'Формирование Справок по НДФЛ' ,
+                      'Формирование Справок по НДФЛ' ,
+                      0,
+                      C_IDENTPROGRAM_CODE);
+      END IF;
+   END;
+
+  PROCEDURE DelOldMenu (p_numberoper IN NUMBER, p_istemplate IN CHAR)
+  IS
+   BEGIN
+      DELETE FROM  dmenuitem_dbt 
+        where t_sznameitem like 'Формирование Справок по НДФЛ' 
+           and t_objectid = p_numberoper
+           and t_istemplate = p_istemplate
+           and t_iidentprogram = C_IDENTPROGRAM_CODE;
+   END;
+
+  PROCEDURE UpdateOldMenu (p_numberoper IN NUMBER, p_istemplate IN CHAR)
+  IS
+   BEGIN
+      V_NUMBERFATHER := 0;
+
+      SELECT NVL (
+                (SELECT NVL(MAX(T_INUMBERPOINT), 0)
+                   FROM dmenuitem_dbt
+                  WHERE     replace(trim(t_sznameitem), '~', '') = 'Формирование Справок по НДФЛ'
+                        AND T_IPROGITEM = C_IDENTPROGRAM_CODE
+                        AND T_ISTEMPLATE = p_istemplate
+                        AND T_OBJECTID = p_numberoper),
+                0)
+        INTO V_NUMBERFATHER
+        FROM DUAL;
+   
+      UPDATE dmenuitem_dbt SET t_inumberline = 0, t_inumberfather = V_NUMBERFATHER, t_sznameitem = 'Формирование Справок по НДФЛ (2024 год)'
+        where t_sznameitem = 'Формирование Справок по НДФЛ (2025 год)' 
+           and t_objectid = p_numberoper
+           and t_istemplate = p_istemplate
+           and t_iidentprogram = C_IDENTPROGRAM_CODE;
+   END;
+
+BEGIN
+   INSERT INTO DITEMSYST_DBT(T_CIDENTPROGRAM,T_ICASEITEM,T_IKINDMETHOD,T_IKINDPROGRAM,T_IHELP,T_RESERVE,T_SZNAMEITEM,T_PARM)
+               VALUES('S',C_CASEITEM,1,2,0,CHR(1),C_NAME,'000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000006E7074786374726C5F72656673656E64323032362E6D6163000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000');
+
+   --Для пользователей ролей
+   FOR i IN (SELECT DISTINCT rol.T_OPER
+               FROM DACSOPROLE_DBT rol
+              WHERE rol.T_ROLEID IN (1/*[1] Администратор*/,
+                                     10010/*[10] Прикладной администратор*/,
+                                     10014/*[14] Специалист БО*/,
+                                     10036/*[36] Ответственный сотрудник НДФЛ*/                                       
+                                    ))
+   LOOP
+     DelOldMenu(i.t_oper, CHR(0));
+     InsertMenuStep (i.t_oper, CHR(0));
+     UpdateOldMenu (i.t_oper, CHR(0));
+     InsertMenu (i.t_oper, CHR(0));
+   END LOOP;
+
+   --Для образцов меню ролей
+   FOR i IN (SELECT DISTINCT rol.T_MENUID
+               FROM DACSROLETREE_DBT rol
+              WHERE rol.T_ROLEID IN (1/*[1] Администратор*/,
+                                     10010/*[10] Прикладной администратор*/,
+                                     10014/*[14] Специалист БО*/,
+                                     10036/*[36] Ответственный сотрудник НДФЛ*/
+                                    )
+                AND rol.T_MENUID > 0)
+   LOOP
+     DelOldMenu(i.t_MenuID, CHR(88));
+     InsertMenuStep (i.t_MenuID, CHR(88));
+      UpdateOldMenu (i.t_MenuID, CHR(88));
+     InsertMenu (i.t_MenuID, CHR(88));
+   END LOOP;
+END;
+/

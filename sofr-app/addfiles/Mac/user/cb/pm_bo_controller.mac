@@ -1,0 +1,289 @@
+/* pm_bo_controller.mac
+
+  Макрос для контроля платежей. Контроль нужен для последующей выгрузки в другие системы банка
+
+  шаблон "Шаблонный метод"
+  Основной класс, который содержит в себе базовую логику контроля платежей.
+  Остальные классы наследуются от основного и могут переопределить у себя реализация того или иного метода.
+
+  Почему такой шаблон:
+    Есть стандартный контроль платежа, который делается так:
+      1)  delete from dpmrunopr_tmp;
+          insert into dpmrunopr_tmp values(?,?,0,chr(1));
+
+      2) res = PM_MassExecuteOperation(true);
+         select t_state, t_errormessage from dpmrunopr_tmp where t_state != 0 //Поиск ошибок
+    Но бывают случаи, когда между (1) и (2) нужно сделать ещё ряд действий. По правильному, эти действия нужно реализовывать в своих классах.
+
+  TODO:
+    можно сделать ещё 2 класса, которые инкапсулируют в себя логику из if'ов функции pm_bo_scroll.mac - macro ExecuteControl()
+*/
+
+import oralib, likepy, payminter;
+
+//Основной класс для контроля платежа
+//заполняет dpmrunopr_tmp
+//выполняет контроль через PM_MassExecuteOperation
+//методы:
+//  Control - непосредственно, выполняется контроль платежа
+//  GerError - возвращает текст полученный во время выполнения ошибки
+//  ProcessPayment - пустой метод дополнительной обработки платежа. Должен переопределяться внутри наследников
+//
+//остальные методы - вспомогательные. 
+class PaymentController(_paymID:integer, _docKind:integer)
+  private var paymID = _paymID;
+  private var docKind = _docKind;
+  private var errorText = "";
+
+  private macro Prepare()
+    //Добавляем платеж для исполнения
+    ExecSql("begin "
+          + "  delete from dpmrunopr_tmp; "
+          + "  insert into dpmrunopr_tmp values(:paymentid, :dockind, 0, chr(1)); "
+          + "end;"
+           ,MakeArray(SqlParam("paymentid", paymID), SqlParam("dockind", docKind)));
+  end;
+
+  macro ProcessPayment():bool
+    return true;
+  end;
+
+  macro Control():bool
+    Prepare();
+
+    if (not ProcessPayment() )
+      return false;
+    end;
+
+    var res = PM_MassExecuteOperation(true);
+    if(res != 0)
+      errorText = "Ошибка при выполеннии операции " + res;
+    else
+      var sql = ExecSqlSelect("select t_state, t_errormessage from dpmrunopr_tmp where t_state != 0");
+      if(sql.MoveNext())
+        errorText = "Ошибка при выполнении контроля: " + sql.value("t_errormessage") + " (" + sql.value("t_state") + ")";
+      end;
+    end;
+    return (errorText == "");
+  end;
+
+  macro GerError()
+    return errorText;
+  end;
+
+  //Вспомогательные методы
+
+  //поставить платежу признак выгрузки
+  macro SetPaymentReadyToUnload(paymentid:integer)
+    ExecSql("update dpmpaym_dbt set t_userfield2=chr(1), t_userfield3='1' where t_paymentid = :paymid", MakeArray(SqlParam("paymid", paymentid)));
+  end;
+
+  //Поставить платежу запрет выгрузки
+  macro BanPaymentUnloading(paymentid:integer)
+    ExecSql("update dpmpaym_dbt set t_userfield2='1', t_userfield3=chr(1) where t_paymentid = :paymid", MakeArray(SqlParam("paymid", paymentid)));
+  end;
+
+  //Поставить проводке признак выгрузки
+  macro SetAccTrnReadyToUnload(acctrnid:integer)
+    ExecSql("update dacctrn_dbt set t_userfield3='1' where t_acctrnid = :acctrn ", MakeArray(SqlParam("acctrn", acctrnid)));
+  end;
+
+  //Поставить проводке запрет выгрузки
+  macro BanAccTrnUnloading(acctrnid:integer)
+    ExecSql("update dacctrn_dbt set t_userfield2='1' where t_acctrnid = :acctrn ", MakeArray(SqlParam("acctrn", acctrnid)));
+  end;
+
+  //удалить связь проводки и платежа
+  macro UnlinkPaymentAcctrn(paymentid:integer)
+    ExecSql("update dpmdocs_dbt set t_acctrnid=0 where t_paymentid = :paymid", MakeArray(SqlParam("paymid", paymentid)));
+  end;
+
+  macro GetAccTrnID(paymentid)
+    var query = "select d.t_acctrnid "
+              + "  from dpmdocs_dbt d "
+              + "  join dacctrn_dbt t on t.t_acctrnid = d.t_acctrnid "
+              + " where d.t_paymentid = :paymID";
+
+    var sql = execSQLselectPrmDyn(query, paymentid);
+    if (sql.MoveNext() ) 
+      return sql.value("t_acctrnid");
+    end;
+
+    return null;
+  end;
+
+  //Методы ниже имеют слабую связь с алгоритмом контроля платежей.
+  //По-хорошему, их стоит вынести за пределы этого класса
+
+  macro IsOverDraftMBK (paymentid)
+    var query = "select 1 from dpmpaym_dbt paym where exists (select 1 from ddl_tick_dbt where t_bofficekind = paym.t_dockind and t_dealtype = 12301 and paym.t_documentid = t_dealid) and t_paymentid = :paymid";
+    var sql = execSQLselectPrmDyn(query, paymentid);
+    return sql.MoveNext();
+  end;
+
+  //Определяет, что платёж внутренний, создан по операции списания ДС и не налоговый
+  macro IsWriteOffMoney (paymentid)
+    var query = "select 1 from dpmpaym_dbt pm "
+              + "join dnptxop_dbt n on n.t_dockind = pm.t_dockind and "
+              + "                      n.t_id = pm.t_documentid and "
+              + "                      n.t_subkind_operation = 20  "//списание
+              + "where pm.t_purpose = 2 and "
+              + "      pm.t_paymentid = :paymid ";
+    var sql = execSQLselectPrmDyn(query, paymentid);
+    return sql.MoveNext();
+  onerror()
+    return false;
+  end;
+
+  //Определяет, что платёж создан по операции РОВУ
+  macro IS_ROVU (paymentid)
+    var query = "select 1 from dpmpaym_dbt pm "
+              + "join ddl_acc_dbt dl_acc ON pm.t_dockind = dl_acc.t_dockind and "
+              + "                           pm.t_documentid = dl_acc.t_id and "
+              + "                           dl_acc.t_dockind = 159 and "
+              + "                           dl_acc.t_opertype = 1 "
+              + "where pm.t_purpose = 2 and "
+              + "      pm.t_paymentid = :paymid ";
+    var sql = execSQLselectPrmDyn(query, paymentid);
+    return sql.MoveNext();
+  onerror()
+    return false;
+  end;
+END;
+
+//контроллер платежей для операций списания денежных средств.
+class (PaymentController) WriteOffMoneyPaymentController (_paymID:integer, _docKind:integer)
+  //переменные родительского класса
+  paymID = _paymID;
+  docKind = _docKind;
+  errorText = "";
+
+  //почему именно такая логика - неизвестно
+  private macro CheckTrnState(acctrnid:integer)
+    var query = "select e.t_status "
+              + "  from utableprocessevent_dbt e "
+              + " where e.t_objectid = :acctrnid "
+              + "   and e.t_objecttype = 1 "
+              + "   and e.t_recid = (select max(b.t_recid) "
+              + "                      from utableprocessevent_dbt b "
+              + "                     where b.t_objecttype = 1 "
+              + "                       and B.t_objectid = :acctrnid2) ";
+    var sql = execSQLselectPrmDyn(query, acctrnid, acctrnid);
+    if (not sql.Movenext()) 
+      return false;
+    end;
+
+    return (sql.value("t_status") != 2);
+  end;
+
+  //Платёж по счетам внутри головного офиса
+  private macro IsInternalPayment(paymentID)
+    var query = "select 1 from dpmpaym_dbt pm "
+              + "where pm.t_receiverbankid = RsbSessionData.OurBank "
+              + "  and pm.t_paymentid = :paymentid";
+    var sql = execSQLselectPrmDyn(query, paymentID);
+    return sql.MoveNext();
+  onerror()
+    return false;
+  end;
+
+  //Разрывается связь проводки и платежа
+  //платежу ставится запрет на выгрузку
+  //проводке ставится признак выгрузки
+  private macro ProcessInternalPayment(paymentid, acctrnid):bool
+    RslDefCon.BeginTrans();
+
+    BanPaymentUnloading(paymentid);
+    SetAccTrnReadyToUnload(acctrnid);
+    UnlinkPaymentAcctrn(paymentid);
+
+    if (RslDefCon.IsInTrans())
+       RslDefCon.CommitTrans();
+    end;  
+    return true;  
+  onError(e)
+    if (RslDefCon.IsInTrans())
+       RslDefCon.RollbackTrans();
+    end;
+    return false;
+  end;
+
+  //платежу ставится признак выгрузки
+  //проводке ставится запрет на выгрузку
+  private macro ProcessExternalPayment(paymentid:integer, acctrnid:integer):bool
+    RslDefCon.BeginTrans();
+
+    SetPaymentReadyToUnload(paymentid);
+    BanAccTrnUnloading(acctrnid);
+
+    if (RslDefCon.IsInTrans())
+       RslDefCon.CommitTrans();
+    end;  
+    return true;  
+  onError(e)
+    if (RslDefCon.IsInTrans())
+       RslDefCon.RollbackTrans();
+    end;
+    return false;
+  end;
+
+  macro ProcessPayment():bool
+    var acctrnid = GetAccTrnID(paymID);
+
+    if (IsInternalPayment(paymID))
+
+      if (acctrnid == null)
+        return true;
+      end;
+
+      if (not CheckTrnState(acctrnid))
+        errorText = "\nПлатеж находится в состоянии обработки,\nдождитесь окончания.";
+        return false;
+      end;
+
+      if (not ProcessInternalPayment(paymID, acctrnid))
+        errorText = "Ошибка при контроле платежа";
+      end;
+    else
+      if (not ProcessExternalPayment(paymID, acctrnid))
+        errorText = "Ошибка при контроле платежа";
+      end;
+    end;
+
+    return (errorText == "");
+  end;
+END;
+
+//контроллер платежей для операций зачисления денежных средств
+class (PaymentController) EnrollMoneyPaymentController (_paymID:integer, _docKind:integer)
+  //переменные родительского класса
+  paymID = _paymID;
+  docKind = _docKind;
+  errorText = "";
+
+  //платежу ставится признак выгрузки
+  //проводке ставится запрет на выгрузку
+  macro ProcessPayment():bool
+    var acctrnid = GetAccTrnID(paymID);
+
+    if (acctrnid == null)
+      return true;
+    end;
+
+    RslDefCon.BeginTrans();
+
+    SetPaymentReadyToUnload(paymID);
+    BanAccTrnUnloading(acctrnid);
+
+    if (RslDefCon.IsInTrans())
+       RslDefCon.CommitTrans();
+    end;  
+    return true;  
+  onError(e)
+    if (RslDefCon.IsInTrans())
+       RslDefCon.RollbackTrans();
+    end;
+    errorText = "\nПлатеж находится в состоянии обработки,\nдождитесь окончания.";
+    return false;
+  end;
+END;

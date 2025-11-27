@@ -1,0 +1,2970 @@
+/*
+$Name:        spreserv.mac
+$Module:      Ценные бумаги
+$Description: Формирование/восстановление резерва для ценных бумаг
+*/
+import InsCarryDoc, "sp_car.mac", "scservop.mac", "sp_class.mac", "spRepFun.mac";
+
+PRIVATE VAR AccDbt, AccCred; /*Счета проводки резерва*/
+
+PRIVATE VAR rsvprm    = TRecHandler( "rsvprm" );
+PRIVATE VAR InAcc     = TRecHandler( "account" );      /*счет вложений*/
+PRIVATE VAR ReservAcc = TRecHandler( "account" );  /*счет резерва*/
+PRIVATE VAR PcAcc     = TRecHandler( "account" );
+
+/*Группы резервирования по ценным бумагам*/
+PRIVATE CONST Гр_ППР     = 0,
+              Гр_ППР_БПП = 1,
+              Гр_ПУДП    = 2,
+              Гр_ПДО     = 3,
+              Гр_ПКУ     = 4,
+              Гр_ПКУ_БПП  = 5,
+              Гр_ПУДП_БПП = 6;
+
+PRIVATE const BPP = 0,
+              PVO = 1,
+              BPP_CONTR = 2;
+
+private var ОбъединятьПроводки = false;
+
+PRIVATE MACRO SayReservError( stat, Err, Data )
+  if( Data.Update )
+     ScOpInsertError( Data.DocKind, Data.ScOprServDoc, Data.ReservObj, stat, err );
+  end;
+  return false;
+END;
+
+//Данные для проводок по резервам
+PRIVATE CLASS CAtrnReservData(AccDeb, AccCred, Sum, Curr, Ground)
+  var m_AccDeb  = TRecHandler("account.dbt");
+  var m_AccCred = TRecHandler("account.dbt");
+  var m_Sum     = $0;
+  var m_Curr    = -1;
+  var m_Ground  = "";
+
+  copy(m_AccDeb,  AccDeb);
+  copy(m_AccCred, AccCred);
+  m_Sum    = Sum;
+  m_Curr   = Curr;
+  m_Ground = Ground;
+
+END;
+
+//Работа с проводками по резервам
+PRIVATE CLASS CAtrnReserv()
+  var m_arr = TArray();
+
+  macro Add(AccDeb, AccCred, Sum, Curr, Ground)
+    var find_i = -1;
+
+    if(m_arr.size > 0)
+      var i = 0;
+
+      while(i < m_arr.size)
+        if((m_arr[i].m_AccDeb.rec.Account        == AccDeb.rec.Account)        and
+           (m_arr[i].m_AccDeb.rec.Code_Currency  == AccDeb.rec.Code_Currency)  and
+           (m_arr[i].m_AccDeb.rec.Chapter        == AccDeb.rec.Chapter)        and
+           (m_arr[i].m_AccCred.rec.Account       == AccCred.rec.Account)       and
+           (m_arr[i].m_AccCred.rec.Code_Currency == AccCred.rec.Code_Currency) and
+           (m_arr[i].m_AccCred.rec.Chapter       == AccCred.rec.Chapter)       and
+           (m_arr[i].m_Curr                      == Curr)
+          )
+          find_i = i;
+          break;
+        end;
+
+        i = i + 1;
+      end;
+    end;
+
+    if(find_i == -1)
+      m_arr[m_arr.size] = CAtrnReservData(AccDeb, AccCred, Sum, Curr, Ground);
+    else
+      m_arr[find_i].m_Sum = m_arr[find_i].m_Sum + Sum;
+    end;
+  end;
+
+  macro Execute(Data)
+    var i = 0;
+    
+    while(i < m_arr.size)
+      if( not ПроводкаПоКатегориямУчета( Data.FD, 
+                                         m_arr[i].m_AccDeb, m_arr[i].m_AccCred,  /* Деб , КатегКредит*/
+                                         Data.DateReserv,       /* Дата */
+                                         1,                     /* Глава */
+                                         m_arr[i].m_Curr,       /* Валюта */
+                                         ABS(m_arr[i].m_Sum),   /* Сумма */
+                                         Data.Doc,              /* Документ */
+                                         INPCARRY,              /* Result_Carry */
+                                         " 1",                  /* Kind_Oper */
+                                         " 1",                  /* Numb_Document */
+                                         m_arr[i].m_Ground      /* Ground */
+                                       )
+        )
+         return SayReservError(1, SC_GetCarryError(), Data);
+      end;
+
+      i = i + 1;
+    end;
+
+    m_arr.size = 0;
+
+    return true;
+  end;
+
+  m_arr.size = 0;
+END;
+
+/* данные для расчета резерва */
+CLASS CReservData( _DateReserv:DATE, _Doc, _ID_Operation:INTEGER, _ID_Step:INTEGER, _ScOprServDoc_, _DocKind_, _ObjKind_, _FD_, _ReservObj_, _Update_  )
+  VAR DateReserv      = _DateReserv, 
+      Doc             = _Doc,
+      ID_Operation    = _ID_Operation,
+      ID_Step         = _ID_Step,
+
+      ExistNOSS      = false, /*наличие признака ТСС*/
+      PcRate         = 0,  /* % риска на дату расчета*/
+      RiskAttrID     = 0,  /* ID и номер группы риска на дату расчета*/
+      RiskNum        = 0, 
+      WithOutGuarant = false, // без учета обеспечения (нужно для отчета)
+      Guarant        = 0, 
+      CalcReserv     = 0,
+
+      UPDATE           = _Update_,   // если false, то только расчет резервов в параметры, без обновлений (нужно для отчета)
+      ScOprServDoc     = _ScOprServDoc_,
+      DocKind          = _DocKind_,
+      ObjKind          = _ObjKind_,  //вид объект, по которому считается резерв
+      FD               = _FD_,
+      ReservObj        = _ReservObj_, //объект, по которому считается резерв
+      // Суммы расчетного резерва (нужно для отчета)
+      SumReserv_ЦБ     = $0,
+      SumReserv_РВЦННД = $0,
+      SumReserv_ПДД    = $0,
+      РезервПоПросроченнымТребованиям = $0,
+      РезервПоТребованиямСОтсрочкойПлатежа = $0,
+      РОРЕПО = $0,
+      РОРПОР = $0,
+      РезервПоРепоОбр2ч = $0,
+      РезервПоПроцентнымТребованиям = $0,
+      РезервПоПросроченнымПроцентнымТребованиям = $0,
+      РезервПоНеотнРасхПоСущЗатр = $0,
+      РезервПоТекКоррПроцПоЭПС = $0,
+      ОцРезервПоПросроченнымТребованиям = $0,
+      ОцРезервПоПросроченнымПроцентнымТребованиям = $0;
+
+      var AtrnReserv = CAtrnReserv();
+
+      //РезервПоРепоПрм2ч = $0;
+END;
+
+/* получить часть строки, описывающую объект резервирования.*/
+PRIVATE MACRO GetOpKindString(Data:CReservData):STRING
+  if( Data.ObjKind == OBJTYPE_AVOIRISS )
+      return "Для выпуска ц/б";
+  elif( Data.ObjKind == OBJTYPE_SECDEAL )
+      return "Для сделки с кодом \"" + Data.ReservObj.rec.DealCode + "\"";
+  elif( Data.ObjKind == OBJTYPE_NETTING )
+      return "Для сделки неттинга с кодом \"" + Data.ReservObj.rec.DealNumber + "\"";
+  end;
+  return "";
+END;
+
+/*Получить примечание "Процент резерва" */ 
+PRIVATE MACRO GetReservPersent( Data:CReservData, SubKindReserv:INTEGER, ПроцентМеньшеЕдиницы, DealID ) 
+  var NoteKind;
+  Data.PcRate = 0;
+  if( Data.ScOprServDoc.OperationKind == KINDRES_REQ ) /*РТ  Резерв по требованиям сделок*/ 
+     if( SubKindReserv == KINDRES_EXPREQ ) /*По просроченным требованиям*/
+        NoteKind = NOTEKIND_SECDEAL_RSKPERC;   /*Процент резерва по просроченным требованиям*/
+     else
+        NoteKind = NOTEKIND_SECDEAL_RSKREQ;    /*Процент резерва по требованиям*/
+     end;
+  else /*РЦБ  Резерв по ц/б*/
+     if( SubKindReserv == KINDRES_ROCB )
+        NoteKind = NOTEKIND_AVOIR_ROCB;
+     else
+        NoteKind = NOTEKIND_RSK_PERCENT; /*Процент риска*/
+     end;
+  end;
+
+//  if (ValType(ПроцентМеньшеЕдиницы) != V_UNDEF)
+     if(NoteKind != NOTEKIND_AVOIR_ROCB)
+        Data.PcRate = double( readNoteForObject( Data.ObjKind, UniID( Data.ReservObj, Data.ObjKind), NoteKind, Data.DateReserv ) );
+     else
+        Data.PcRate = double( readNoteForObject( Data.ObjKind, UniID( Data.ReservObj, Data.ObjKind), NoteKind ) );
+     end;
+     if( Data.PcRate < 0 ) 
+        return GetOpKindString() + " не задано примечание |\"" + ИмяПримечания( Data.ObjKind, NoteKind ) + "\" на дату " + string(Data.DateReserv);
+     end;
+     Data.PcRate = Data.PcRate/100;
+//  end;
+
+  return "";
+END;
+
+/*Получить примечание "сумма обеспечения" */
+PRIVATE MACRO GetReservGuarant( Data:CReservData, flagOUTBAL )
+  var flag;
+
+  if(not Data.WithOutGuarant)
+    if(flagOUTBAL)
+      flag = NOTEKIND_SECDEAL_SUMGUARANT_OUTBAL;
+    else
+      flag = NOTEKIND_SECDEAL_SUMGUARANT;
+    end;
+
+    Data.Guarant = readNoteForObject( Data.ObjKind, UniID( Data.ReservObj, Data.ObjKind), flag, Data.DateReserv );
+    if( Data.Guarant < 0 ) 
+       return GetOpKindString() + " не задано примечание |\"" + ИмяПримечания( Data.ObjKind, flag ) + "\" на дату " + string(Data.DateReserv);
+    end;
+  end;
+
+  return "";
+END;
+
+/*Получить категорию "Группа риска" */
+PRIVATE MACRO GetReservRisk( Data:CReservData, SubKindReserv:INTEGER ) 
+  var CtKind;
+
+  if( Data.ScOprServDoc.OperationKind == KINDRES_REQ ) /*РТ  Резерв по требованиям сделок*/ 
+     if( SubKindReserv == KINDRES_EXPREQ ) /*По просроченным требованиям*/
+        CtKind = OBJGROUP_TICKGRPRISKREQ; /*Группа риска по просроч.треб.*/
+     else
+        CtKind = OBJGROUP_TICKQUALITY;    /*Категория качества по требованиям сделки*/
+     end;
+  else
+     CtKind = OBJ_ACCOUNT_GROUP_RISK137;
+  end;
+  /*Получить "Группа риска" */
+  if( not GetMainObjAttr( null, Data.ObjKind, UniID( Data.ReservObj, Data.ObjKind), CtKind, Data.RiskAttrID, null, Data.RiskNum, Data.DateReserv ) )
+     return GetOpKindString() + " не задана категория |\"" + ИмяКатегории( Data.ObjKind,CtKind ) + "\"";
+  end;
+  return "";
+end;
+
+/*Проверить соответствие Risk и Percent */
+PRIVATE MACRO CheckRiskAndPercent( Data:CReservData, SubKindReserv:INTEGER, ПроцентМеньшеЕдиницы )
+  var err = "", Percent = Data.PcRate * 100;
+  if(ValType(ПроцентМеньшеЕдиницы) == V_UNDEF)
+    if(  ( (Data.RiskNum == 1) AND (Percent != 0) ) OR
+         ( (Data.RiskNum == 2) AND ( (Percent < 1 ) OR (Percent > 20)) ) OR
+         ( (Data.RiskNum == 3) AND ( (Percent < 21) OR (Percent > 50)) ) OR
+         ( (Data.RiskNum == 4) AND ( (Percent < 51) OR (Percent > 99)) ) OR
+         ( (Data.RiskNum == 5) AND (Percent != 100) )
+      )
+       if( (Data.ScOprServDoc.OperationKind == KINDRES_REQ) AND (SubKindReserv != KINDRES_EXPREQ) ) 
+          /*РТ  Резерв по требованиям сделок, кроме "По просроченным требованиям"*/ 
+          err = GetOpKindString() + " процент резервирования "+string(Percent)+"% не соответствует заданной категории качества "+string(Data.RiskNum)+".";
+       else
+          err = GetOpKindString() + " процент резервирования "+string(Percent)+"% не соответствует заданной  группе риска "+string(Data.RiskNum)+".";
+       end;
+    end;
+  else
+    Percent = Round(Data.PcRate * 100,5);
+    if(  ( (Data.RiskNum == 1) AND (Percent >= 1) ) OR
+         ( (Data.RiskNum == 2) AND ( (Percent < 1 ) OR (Percent > 20)) ) OR
+         ( (Data.RiskNum == 3) AND ( (Percent < 21) OR (Percent > 50)) ) OR
+         ( (Data.RiskNum == 4) AND ( (Percent < 51) OR (Percent > 99)) ) OR
+         ( (Data.RiskNum == 5) AND (Percent != 100) )
+      )
+       if( (Data.ScOprServDoc.OperationKind == KINDRES_REQ) AND (SubKindReserv != KINDRES_EXPREQ) ) 
+          /*РТ  Резерв по требованиям сделок, кроме "По просроченным требованиям"*/ 
+          err = GetOpKindString() + " процент резервирования "+string(Percent)+"% не соответствует заданной категории качества "+string(Data.RiskNum)+".";
+       else
+          err = GetOpKindString() + " процент резервирования "+string(Percent)+"% не соответствует заданной  группе риска "+string(Data.RiskNum)+".";
+       end;
+    end;
+  end;
+  return err;
+end;
+
+PRIVATE MACRO GetRiskAndPercent( Data:CReservData, SubKindReserv:INTEGER, ПроцентМеньшеЕдиницы )
+
+  var error = GetReservRisk( Data, SubKindReserv );
+
+  if( error == "" )
+     error = GetReservPersent( Data, SubKindReserv, ПроцентМеньшеЕдиницы );
+  end;
+
+  if( error == "" )
+     error = CheckRiskAndPercent( Data, SubKindReserv, ПроцентМеньшеЕдиницы );
+  end;
+
+  return error;
+END;
+
+
+PRIVATE MACRO НачислитьРезерв( CodePC:string, RolePC:integer, Data:CReservData, Reserv:MONEY, SubKindReserv:INTEGER )
+   var CatCodePC, Ground;
+   if( Reserv > 0 )
+      CatCodePC = "-" + CodePC;
+   else
+      CatCodePC = "+" + CodePC;
+   end;
+
+   if( not Data.FD.OpenAccount(CatCodePC, null, false, RolePC, PCAcc, Data.DateReserv) )
+      return false;
+   end;
+
+   if( Reserv > 0 )
+      AccDbt  = PCAcc;
+      AccCred = ReservAcc;
+   else  
+      AccDbt  = ReservAcc;
+      AccCred = PCAcc;
+   end;
+
+   if( Data.ScOprServDoc.OperationKind == KINDRES_RCB ) /* РВЦБ Резерв по вложениям в ЦБ*/
+      /* ВР. */ 
+      /*18.06.2020 RAS 510917 Вернул f.t_name в запрос и добавил fiName*/
+      var fiName;
+      var query, DataSet, cmd, AvName;
+      query = "select f.t_Name, f.t_definition as AvName from dfininstr_dbt f where f.t_fiid = ?";
+      cmd = DL_RSDCommand(query);
+      cmd.AddParam(Data.ReservObj.rec.FIID);
+      DataSet = cmd.Execute();
+      if(DataSet.moveNext)
+         AvName = DataSet.AvName;
+         fiName = DataSet.Name;
+      end;
+
+/* ВР.
+      Ground = "Расчет/корректировка резерва по вложениям в ц/б";
+*/
+      
+      Ground = "Расчет/корректировка резерва по вложениям в ц/б" + ". Выпуск " + Data.ReservObj.rec.ISIN + " " + AvName;
+      If(RolePC == 84)
+         Ground = "Расчет/корректировка резерва по процентам по ц/б" + ". Выпуск " + Data.ReservObj.rec.ISIN + " " + AvName;
+      end;
+      
+     /*18.06.2020 RAS 510917*/
+      if( (AccDbt == ReservAcc) and (Data.PCRATE == 0) )
+        Ground = "Восстановление резерва по вложениям в ц/б " + fiName;
+      end;
+     /*~RAS*/
+
+   elif( Data.ScOprServDoc.OperationKind == KINDRES_REQ) /* РПТ  Резерв по просроченным требованиям */
+      if( SubKindReserv == KINDRES_EXPREQ ) /*По просроченным требованиям*/
+         Ground = "Расчет/корректировка резерва по просроченным требованиям";
+      else
+         Ground = "Расчет/корректировка резерва по требованиям";
+      end;
+   end;
+
+   if(ОбъединятьПроводки == true)
+     Data.AtrnReserv.Add(AccDbt, AccCred, Reserv, NATCUR, Ground);
+   else
+   if( not ПроводкаПоКатегориямУчета( Data.FD, 
+                                      AccDbt, AccCred,       /* Деб , КатегКредит*/
+                                      Data.DateReserv,       /* Дата */
+                                      1,                     /* Глава */
+                                      NATCUR,                /* Валюта */
+                                      ABS(Reserv),           /* Сумма */
+                                      Data.Doc,              /* Документ */
+                                      INPCARRY,              /* Result_Carry */
+                                      " 1",                  /* Kind_Oper */
+                                      " 1",                  /* Numb_Document */
+                                      Ground                 /* Ground */
+                                    )
+     )
+      return SayReservError(1, SC_GetCarryError(), Data);
+   end;
+   end;
+
+   return true;
+END;
+
+PRIVATE MACRO CreateReserveAccLink(AccountUniID:string, ReserveDate)
+  var Query, DataSet;
+  var ReservAccUniID  = UniID( ReservAcc, OBJTYPE_ACCOUNT);
+
+  Query = RSDCommand(  " Select t_ObjectID "
+                          + "   From dobjlink_dbt "
+                          + "  Where t_ObjectType = " + OBJTYPE_ACCOUNT
+                          + "    and t_GroupID = " + OBJROLE_ACC_RESERV137
+                          + "    and t_ObjectID = ? "
+                          + "    and t_AttrType = " + OBJTYPE_ACCOUNT
+                          + "    and t_AttrID = ? "
+                          + "    and t_ValidToDate >= ? " 
+                         );
+
+  Query.addParam( "", RSDBP_IN, AccountUniID );
+  Query.addParam( "", RSDBP_IN, ReservAccUniID );
+  Query.addParam( "", RSDBP_IN, ReserveDate );
+  Query.execute();
+
+  DataSet = TRsbDataSet(Query);
+  if(not DataSet.moveNext())
+    if( not InsertObjectLink( OBJTYPE_ACCOUNT, OBJROLE_ACC_RESERV137, 
+                              AccountUniID, false, 
+                              OBJTYPE_ACCOUNT, 
+                              ReservAccUniID,
+                              false) )
+
+      return false;
+    end;
+  end;
+
+  return true;
+END;
+
+PRIVATE MACRO ИсключитьИзРасчетаРезервов(InAcc:variant)
+  return ( DL_GetObjAttrName( OBJTYPE_ACCOUNT, OBJ_ACCOUNT_GROUP_EXCLUDE_RES_CALC_BO_CB,                                                   
+           DL_GetMainObjAttr(InAcc,OBJ_ACCOUNT_GROUP_EXCLUDE_RES_CALC_BO_CB,OBJTYPE_ACCOUNT) ) == "Да" );
+END;
+
+MACRO AddReportLineData(_ObjID, _ResPc, _RiskGrp, _BaseSum, _OldReserv, _BaseAcc, _ReservAcc, _AccDbt, _AccCred, _IsDealNtg, _CostRUR, _MarketSum, _IsBiVal,
+                               _GuarantSum, _ResKind, _CorrectSum, _IsSetting, _ReqAcc, _ResPcSec, _RiskGrpSec, _AccRest_BPP, _AccRest_OD, _KindPortf, _FIRole, _DateReserv)
+   var i = 0;
+   while(i < ScOpReportLineData.Size)
+      if(_KindPortf == ScOpReportLineData[i].KindPortf)
+         var j = ScOpReportLineData.Size;
+         while(j > i + 1)
+            ScOpReportLineData[j] = ScOpReportLineData[j-1];
+            j = j - 1;
+         end;
+         ScOpReportLineData[i + 1] = SvOpReserve(_ObjID, _ResPc, _RiskGrp, _BaseSum, _OldReserv, _BaseAcc, _ReservAcc, _AccDbt, _AccCred, _IsDealNtg, _CostRUR,
+                                                 _MarketSum, _IsBiVal, _GuarantSum, _ResKind, _CorrectSum, _IsSetting, _ReqAcc, _ResPcSec, _RiskGrpSec,
+                                                 _AccRest_BPP, _AccRest_OD, _KindPortf, _FIRole, _DateReserv);
+         break;
+      end;
+      i = i + 1;
+   end;
+
+   if(i == ScOpReportLineData.Size)
+      ScOpReportLineData[i] = SvOpReserve(_ObjID, _ResPc, _RiskGrp, _BaseSum, _OldReserv, _BaseAcc, _ReservAcc, _AccDbt, _AccCred, _IsDealNtg, _CostRUR,
+                                          _MarketSum, _IsBiVal, _GuarantSum, _ResKind, _CorrectSum, _IsSetting, _ReqAcc, _ResPcSec, _RiskGrpSec,
+                                          _AccRest_BPP, _AccRest_OD, _KindPortf, _FIRole, _DateReserv);
+   end;
+END;
+
+PRIVATE MACRO РезервПоВложениямДляГруппы( Data:CReservData, Group:INTEGER ):BOOL
+  var  errorPC_RISK, NeedCalc, cmd, L, LotStatus, err,
+       D = $0, B = $0, Dпдд = 0, Rnew, Rnewпдд, Roldпдд, Rold, Вппд,
+       BaseSum = $0, BaseSum_пдд = $0, SumRold = $0, SumRold_пдд = $0,
+       NoteRes2732 = $0, R2732new = $0, R2732old = $0, R2732 = $0,
+       KindPortf, FIRole, FIRolePDD,
+       i = 0, FD_Deal, AccStr = "",
+       InAccCateg, 
+       InAccAccount = DL_AccCollector,
+       InAccPDDAccount = TRecHandler( "account" ),
+       wrtcalc = TRecHandler( "pmwrtsum.dbt" ),
+       CatCor = "";
+
+  if( Group == Гр_ППР )
+     KindPortf     = KINDPORT_SSSD;
+     FIRole        = FIROLE_BA_PPR;
+     FIRolePDD     = FIROLE_PD_PPR;
+     LotStatus     = PM_WRTSUM_FORM;
+  elif( Group == Гр_ППР_БПП )
+     KindPortf     = KINDPORT_SSSD;
+     FIRole        = FIROLE_BA_SSSD_BPP;
+     FIRolePDD     = FIROLE_PD_PPR;
+     LotStatus     = PM_WRTSUM_SALE_BPP;
+  elif( Group == Гр_ПУДП )
+     KindPortf     = KINDPORT_ASCB;
+     FIRole        = FIROLE_BA_PUDP;
+     FIRolePDD     = FIROLE_PD_PUDP;
+     LotStatus     = PM_WRTSUM_FORM;
+  elif( Group == Гр_ПДО )
+     KindPortf     = KINDPORT_PROMISSORY;
+     FIRole        = FIROLE_BAINPROMISSORY;
+     FIRolePDD     = FIROLE_PD_PDO;
+     LotStatus     = PM_WRTSUM_FORM;
+  elif( Group == Гр_ПКУ )
+     KindPortf     = KINDPORT_CONTR;
+     FIRole        = FIROLE_BAINCONTR;
+     FIRolePDD     = FIROLE_PD_PKU;
+     LotStatus     = PM_WRTSUM_FORM;
+  elif( Group == Гр_ПКУ_БПП )
+     KindPortf     = KINDPORT_CONTR;
+     FIRole        = FIROLE_BA_CONTR_BPP;
+     FIRolePDD     = FIROLE_PD_PKU;
+     LotStatus     = PM_WRTSUM_SALE_BPP;
+  elif( Group == Гр_ПУДП_БПП )
+     KindPortf     = KINDPORT_ASCB;
+     FIRole        = FIROLE_BA_ASCB_BPP;
+     FIRolePDD     = FIROLE_PD_PUDP;
+     LotStatus     = PM_WRTSUM_SALE_BPP;
+  else
+     return false;
+  end;
+
+  if( (Group == Гр_ППР_БПП) OR (Group == Гр_ПКУ_БПП) OR (Group == Гр_ПУДП_БПП) )
+     if( FI_AvrKindsEQ(FIKIND_AVOIRISS, AVOIRISSKIND_INVESTMENT_SHARE, Data.FD.fininstr.rec.AvoirKind) )
+//        SayReservError( 0, "Вложения в паи паевых инвестиционных фондов, переданные по операциям, совершаемым на возвратной основе без прекращения признания, из перечня элементов расчетной базы резерва исключаются.", Data);
+        return true; /*перейти к след. группе*/
+     end;
+  end;
+
+  if( not WRT_Calc( Data.ScOprServDoc.Division, Data.ReservObj.rec.FIID, -1, 0,
+                    KindPortf, Data.DateReserv, wrtcalc,
+                    IIF( LotStatus == PM_WRTSUM_FORM, true,false),
+                    IIF( LotStatus == PM_WRTSUM_SALE_BPP, true,false))
+                  )
+     return false;
+  end;
+  if( wrtcalc.rec.Amount <= 0)
+     return true;
+  end;
+
+  if( Data.DateReserv < {curdate} )
+     /*не было изменений по группе после даты операции*/
+     if( WRTAreGlobalChangesAfterDate( Data.ScOprServDoc.Division, Data.ReservObj.rec.FIID, -1, 0, 
+                                       KindPortf, -1, -1, -1, -1, 
+                                       Data.DateReserv, 
+                                       IIF( LotStatus == PM_WRTSUM_FORM, true,false), 
+                                       false, 
+                                       IIF( LotStatus == PM_WRTSUM_SALE_BPP, true,false)
+                                     )
+       )
+        return SayReservError( 1, "Для лотов, участвующих в резервировании, есть операции за более позднюю дату.", Data);
+     end;
+  end;
+
+  if( (Data.ScOprServDoc.Flag2 == SET_CHAR) AND FI_IsBond(Data.FD.Fininstr) AND
+      ( (Group == Гр_ППР) OR
+        (Group == Гр_ППР_БПП) OR
+        (Group == Гр_ПУДП) OR 
+        (Group == Гр_ПУДП_БПП)
+      )
+    )
+    InAccCateg = "Начисл.ПДД, ц/б";
+
+    var InAccFiRole = FIRolePDD;
+
+    if(Group == Гр_ППР_БПП)
+      InAccFiRole = FIROLE_PD_PPR_BPP;
+    elif(Group == Гр_ПУДП_БПП)
+      InAccFiRole = FIROLE_PD_PUDP_BPP;
+    end;
+
+    if( Data.FD.IsExistAccount(InAccCateg, null, true, InAccFiRole, InAcc, null, Data.DateReserv) )
+      copy(InAccPDDAccount, InAcc);
+    end;
+  end;
+
+  /*для Гр_ППР_БПП определим ниже*/
+  if( (Group != Гр_ППР_БПП) and (Group != Гр_ПКУ_БПП) and (Group != Гр_ПУДП_БПП) )
+
+    if( Group == Гр_ПКУ )
+        InAccCateg = "Наш портфель ПКУ, ц/б";
+    else
+        InAccCateg = "Наш портфель ц/б";
+    end;
+
+    if( not Data.FD.IsExistAccount(InAccCateg, null, true, FIRole, InAcc, null, Data.DateReserv) )
+       return SayReservError(1, "Ошибка при определении счета по категории " + InAccCateg, Data);
+    end;
+
+    if( ИсключитьИзРасчетаРезервов(InAcc) )
+       SayReservError( 0, "Для ц/б по счету " + InAcc.rec.Account + " установлена категория \"Исключить из расчета резервов по вложениям в ц/б в бэк-офисе\" ", Data);
+       return true; /*перейти к след. группе*/
+    end;
+
+    InAccAccount.AddAcc(UniID( InAcc, OBJTYPE_ACCOUNT), InAcc.rec.Account, InAcc.rec.Code_Currency, InAcc.rec.Chapter);
+  end;
+
+  errorPC_RISK = GetRiskAndPercent(Data, KINDRES_AVOIR);
+  if( errorPC_RISK != "" )
+     return SayReservError(1, errorPC_RISK, Data);
+  end;
+
+  // Выполнить формирование резервов во временную таблицу
+  cmd = RsdCommand("{CALL RSB_PMWRTOFF.RSI_WRTReservePortfolioLotsTMP(?, ?, ?, ?, ?, ?, ?) }");
+
+  cmd.addParam("p_CalcDate",         RSDBP_IN, Data.DateReserv );
+  cmd.addParam("p_FIID",             RSDBP_IN, Data.ReservObj.rec.FIID );
+  cmd.addParam("p_Department",       RSDBP_IN, Data.ScOprServDoc.Division );
+  cmd.addParam("p_Portfolio",        RSDBP_IN, KindPortf );
+  cmd.addParam("p_State",            RSDBP_IN, LotStatus );
+  cmd.addParam("p_CalcIncomeReserv", RSDBP_IN, IIF(Data.ScOprServDoc.Flag2 == SET_CHAR, 1, 0) );
+  cmd.addParam("p_ByLnk",            RSDBP_IN, 0 );
+
+  cmd.execute();
+
+ // Получить суммы доначисления резерва
+  cmd = RSDCommand("SELECT nvl(SUM(TMP.T_RESERVAMOUNTADD),0) AS S_RESERVAMOUNTADD, " +
+                   "       nvl(SUM(TMP.T_INCOMERESERVADD),0) AS S_INCOMERESERVADD " +
+                   " FROM dpmwrtsum_tmp TMP " +
+                   "WHERE TMP.t_Portfolio = ? " +
+                   "  AND TMP.t_State     = ? ");
+
+  cmd.NullConversion = true;
+  cmd.addParam("", RSDBP_IN, KindPortf );
+  cmd.addParam("", RSDBP_IN, LotStatus );
+  cmd.execute();
+
+  L = TRsbDataSet( cmd );
+  if( L.MoveNext() )
+     D    = L.S_RESERVAMOUNTADD;
+     Dпдд = L.S_INCOMERESERVADD;
+  end;
+
+  cmd = RSDCommand("select L.t_Cost, L.t_CostPFI, L.t_NKDAmount, L.t_InterestIncome, L.t_DiscountIncome, L.t_NotCarryInterest, L.t_ReservAmount, L.t_IncomeReserv, L.t_NotCarryDiscount, L.t_Bonus, L.t_FIID, L.T_Corrvalue, L.T_Estreserve, L.T_Corrinttoeir, L.T_Portfolio, L.T_OverAmount," +
+                   IIF((Group == Гр_ППР_БПП) or (Group == Гр_ПКУ_БПП) or (Group == Гр_ПУДП_БПП),
+                       " (select dlrq.t_DocID from ddlrq_dbt dlrq where dlrq.t_ID = L.t_DocID) ",
+                       " 0 "
+                      ) + " as RDealID " +
+                   " from dpmwrtsum_dbt L, dpmwrtsum_tmp TMP " +
+                   "where L.t_SumID      = TMP.t_SumID " +
+                    " and TMP.t_State    = ? AND TMP.t_Portfolio = ? ");
+
+  cmd.NullConversion = true;
+  cmd.addParam("", RSDBP_IN, LotStatus );
+  cmd.addParam("", RSDBP_IN, KindPortf );
+  cmd.execute();
+
+  L = TRsbDataSet( cmd );
+  while( L.MoveNext() )
+     Rold = Roldпдд = $0;
+
+     if( (Group == Гр_ППР_БПП) or (Group == Гр_ПКУ_БПП) or (Group == Гр_ПУДП_БПП) )
+        FD_Deal = SPFirstDoc(LEG_KIND_DL_TICK, int(L.RDealID));
+        FD_Deal.SetCurPFI(L.FIID);
+
+        if(ВедениеСчетовБПППоВыпуску() == true)
+          if( Group == Гр_ПКУ_БПП )
+             InAccCateg = "Наш портфель ПКУ, ц/б";
+          else
+             InAccCateg = "Наш портфель ц/б";
+          end
+        else
+        if( Group == Гр_ПКУ_БПП )
+           InAccCateg = IIF(IsBasket(FD_Deal.Group), "Ц/б, Корзина ПКУ БПП", "Ц/б, ПКУ БПП");
+        else
+           InAccCateg = IIF(IsBasket(FD_Deal.Group), "Ц/б, Корзина БПП", "Ц/б, БПП");
+        end;
+        end;
+
+        if( not FD_Deal.IsExistAccount(InAccCateg, null, true, FIRole, InAcc, null, Data.DateReserv) )
+           return SayReservError(1, "Ошибка при определении счета по категории "+ InAccCateg, Data);
+        end;
+
+        if( ИсключитьИзРасчетаРезервов(InAcc) )
+           SayReservError(0, "Для ц/б по счету " + InAcc.rec.Account + " установлена категория \"Исключить из расчета резервов по вложениям в ц/б в бэк-офисе\" ", Data);
+           continue;
+        end;
+
+        InAccAccount.AddAcc(UniID( InAcc, OBJTYPE_ACCOUNT), InAcc.rec.Account, InAcc.rec.Code_Currency, InAcc.rec.Chapter);
+     end;
+
+     if( Group == Гр_ПКУ_БПП )
+        B = L.Cost + L.CostPFI + L.NKDAmount;
+     else
+        //в рублях
+        if( not SmartConvertSum(B, L.Cost + L.CostPFI + L.NKDAmount, Data.DateReserv, Data.FD.fininstr.rec.FaceValueFI, NATCUR, false)   )
+           return SayReservError(1, "Ошибка при конвертации суммы балансовой стоимости из " + ПолучитьКодФинИн(Data.FD.fininstr.rec.FaceValueFI) + " в " + ПолучитьКодФинИн(NATCUR), Data);
+        end;
+     end;
+     BaseSum = BaseSum + B;
+     Rold    = L.ReservAmount;
+     SumRold = SumRold + Rold;
+
+     if( (Data.ScOprServDoc.Flag2 == SET_CHAR) AND
+         FI_IsBond( Data.FD.Fininstr ) AND
+         ( (Group == Гр_ППР) OR
+           (Group == Гр_ППР_БПП) OR
+           (Group == Гр_ПУДП) OR 
+           (Group == Гр_ПУДП_БПП)
+         )
+       )
+        //в рублях
+        if( not SmartConvertSum( Вппд, L.InterestIncome - L.NotCarryInterest + L.DiscountIncome - L.NotCarryDiscount /*- L.Estreserve -L.Corrinttoeir - L.Corrvalue*/,
+                                 Data.DateReserv, Data.FD.fininstr.rec.FaceValueFI, NATCUR, false) 
+          )
+           return SayReservError(1,  "Ошибка при конвертации суммы балансовой стоимости из " + ПолучитьКодФинИн(Data.FD.fininstr.rec.FaceValueFI) + " в " + ПолучитьКодФинИн(NATCUR), Data);
+        end;
+        BaseSum_пдд = BaseSum_пдд + Вппд;
+        Roldпдд     = L.IncomeReserv;
+        SumRold_пдд = SumRold_пдд + Roldпдд;
+     end;
+  end;
+
+  if( (D != 0) and (Data.Update) )
+
+     if( not Data.FD.OpenAccount("Резерв ц/б", null, false, FIRole, ReservAcc, Data.DateReserv) )
+        return false;
+     end;
+
+     if( (KindPortf == KINDPORT_CONTR) or (KindPortf == KINDPORT_PROMISSORY) or (KindPortf == KINDPORT_SSSD) and (not FI_IsAvrKindBond(Data.FD.fininstr.rec.AvoirKind)))
+        if( not НачислитьРезерв("РС, д/с", FIROLE_BA, Data, D) )
+           return false;
+        end;
+     else
+        if( not НачислитьРезерв("РС,ц/б", FIRole, Data, D) )
+           return false;
+        end;
+     end;
+
+     i = 0;
+     while( i < InAccAccount.size )
+        if( not CreateReserveAccLink(InAccAccount[i].AccObject, Data.DateReserv) )
+           return SayReservError( 1, "Ошибка при привязке счета резерва\""+ ReservAcc.Account +"\" к счету вложений \"" + InAccAccount[i].Account + "\"", Data);
+        end;
+
+        i = i + 1;
+     end;
+
+     If( (valtype(AccDbt) != v_undef) and (valtype(AccCred) != v_undef) ) 
+        AddReportLineData(
+           Data.ReservObj.rec.FIID,
+           Data.PcRate*100, Data.RiskNum,
+           BaseSum,
+           SumRold,
+           NULL, NULL, AccDbt.rec.Account, AccCred.rec.Account,
+           null, null, null, null, null,
+           KINDRES_RCB, D,
+           null, null, null, null, null, null,
+           KindPortf, FIRole, Data.DateReserv
+        );
+     end;
+     if( (KindPortf == KINDPORT_SSSD) and (not FI_IsAvrKindBond(Data.FD.fininstr.rec.AvoirKind)) ) // СССД и долевая (не долговая)
+       
+       if( D > 0 )
+          CatCor = "+Кор_Резерв, ЦБ";
+       else
+          CatCor = "-Кор_Резерв, ЦБ";
+       end;
+
+       if( not Data.FD.OpenAccount(CatCor, null, false, FIRole, ReservAcc, Data.DateReserv) )
+          return false;
+       end;
+
+       if( not НачислитьРезерв("КОР_РС, д/с", FIROLE_BA, Data, -D) )   // именно минус 
+          return false;
+       end;
+
+       i = 0;
+       while( i < InAccAccount.size )
+          if( not CreateReserveAccLink(InAccAccount[i].AccObject, Data.DateReserv) )
+             return SayReservError( 1, "Ошибка при привязке счета резерва\""+ ReservAcc.Account +"\" к счету вложений \"" + InAccAccount[i].Account + "\"", Data);
+          end;
+     
+          i = i + 1;
+       end;
+
+        If( (valtype(AccDbt) != v_undef) and (valtype(AccCred) != v_undef) ) 
+
+           AddReportLineData(
+              Data.ReservObj.rec.FIID,
+              Data.PcRate*100, Data.RiskNum,
+              BaseSum,
+              SumRold,
+              NULL, NULL, AccDbt.rec.Account, AccCred.rec.Account, 
+              null, null, null, null, null,
+              KINDRES_RCB, D,
+              null, null, null, null, null, null,
+              KindPortf, FIRole, Data.DateReserv
+           );
+        end;
+     end;
+  end;
+
+  if( Data.ScOprServDoc.Flag3 == SET_CHAR ) // выполнить резервирование РВЦННД
+     NoteRes2732 = money( readNoteForObject(OBJTYPE_AVOIRISS, UniID( Data.ReservObj, OBJTYPE_AVOIRISS), NOTEKIND_AVOIR_RESERV2732, Data.DateReserv) );
+     if( NoteRes2732 > $0 )
+       R2732new = $0;
+       if(NoteRes2732 > (SumRold + D))
+         R2732new = NoteRes2732 - (SumRold + D);
+       end;
+
+       if( Data.FD.IsExistAccount("Резерв ц/б", null, true, FIROLE_AVOIR_UC, ReservAcc, null, Data.DateReserv) == true )
+         R2732old = ABS(GetRestAccount(ReservAcc.rec, Data.DateReserv));
+       end;
+
+       R2732 = R2732new - R2732old;
+       if((R2732 != 0) and (Data.Update))
+          if( not Data.FD.OpenAccount("Резерв ц/б", null, false, FIROLE_AVOIR_UC, ReservAcc, Data.DateReserv) )
+            return false;
+          end;
+
+          if( (KindPortf == KINDPORT_CONTR) or (KindPortf == KINDPORT_PROMISSORY) or (KindPortf == KINDPORT_SSSD) and (not FI_IsAvrKindBond(Data.FD.fininstr.rec.AvoirKind)) )
+             if( not НачислитьРезерв("РС, д/с", FIROLE_BA, Data, R2732) )
+                return false;
+             end;
+          else
+             if( not НачислитьРезерв("РС,ц/б", FIRole, Data, R2732) )
+                return false;
+             end;
+          end;
+
+         i = 0;
+         while(i < InAccAccount.size)
+           if( not CreateReserveAccLink(InAccAccount[i].AccObject, Data.DateReserv) )
+             return SayReservError( 1, "Ошибка при привязке счета резерва\""+ ReservAcc.Account +"\" к счету вложений \"" + InAccAccount[i].Account + "\"", Data);
+           end;
+
+           i = i + 1;
+         end;
+
+         If( (valtype(AccDbt) != v_undef) and (valtype(AccCred) != v_undef) ) 
+
+             AddReportLineData(
+               Data.ReservObj.rec.FIID, 
+               double(50), "",
+               NoteRes2732,
+               R2732old, 
+               NULL, NULL, AccDbt.rec.Account, AccCred.rec.Account,
+               null, null, null, null, null,
+               KINDRES_RCBUC, R2732,
+               null, null, null, null, null, null,
+               KindPortf, FIRole, Data.DateReserv
+            );
+         end;
+
+         if( (KindPortf == KINDPORT_SSSD) and (not FI_IsAvrKindBond(Data.FD.fininstr.rec.AvoirKind)) ) // СССД и долевая (не долговая)
+           
+           if( R2732 > 0 )
+              CatCor = "+Кор_Резерв, ЦБ";
+           else
+              CatCor = "-Кор_Резерв, ЦБ";
+           end;
+       
+           if( not Data.FD.OpenAccount(CatCor, null, false, FIRole, ReservAcc, Data.DateReserv) )
+              return false;
+           end;
+           if( not НачислитьРезерв("КОР_РС, д/с", FIROLE_BA, Data, - R2732) )   // именно минус 
+              return false;
+           end;
+       
+           i = 0;
+           while( i < InAccAccount.size )
+              if( not CreateReserveAccLink(InAccAccount[i].AccObject, Data.DateReserv) )
+                 return SayReservError( 1, "Ошибка при привязке счета резерва\""+ ReservAcc.Account +"\" к счету вложений \"" + InAccAccount[i].Account + "\"", Data);
+              end;
+         
+              i = i + 1;
+           end;
+
+            If( (valtype(AccDbt) != v_undef) and (valtype(AccCred) != v_undef) ) 
+       
+               AddReportLineData(
+                 Data.ReservObj.rec.FIID, 
+                 double(50), "",
+                 NoteRes2732,
+                 R2732old, 
+                 NULL, NULL, AccDbt.rec.Account, AccCred.rec.Account, 
+                 null, null, null, null, null,
+                 KINDRES_RCBUC, R2732,
+                 null, null, null, null, null, null,
+                 KindPortf, FIRole, Data.DateReserv
+               );
+            end;
+         end;
+
+       end;
+     end;
+  end;
+
+  if( (Dпдд != 0) and (Data.Update) )
+     if( not Data.FD.OpenAccount("Резерв ц/б", null, false, FIRolePDD, ReservAcc, Data.DateReserv) )
+        return false;
+     end;
+
+     if( not НачислитьРезерв("РС,ц/б", FIRolePDD, Data, Dпдд) )
+        return false;
+     end;
+
+     if( not CreateReserveAccLink( UniID( InAccPDDAccount, OBJTYPE_ACCOUNT), Data.DateReserv ) )
+       return SayReservError( 1, "Ошибка при привязке счета резерва\""+ ReservAcc.Account +"\" к счету вложений \"" + InAccPDDAccount.rec.Account + "\"", Data);
+     end;
+
+     If( (valtype(AccDbt) != v_undef) and (valtype(AccCred) != v_undef) ) 
+
+        AddReportLineData(
+           Data.ReservObj.rec.FIID, 
+           Data.PcRate*100,  Data.RiskNum,
+           BaseSum_пдд,
+           SumRold_пдд, 
+           NULL, NULL, AccDbt.rec.Account, AccCred.rec.Account,
+           null, null, null, null, null,
+           KINDRES_RVPCB, Dпдд,
+           null, null, null, null, null, null,
+           KindPortf, FIRole, Data.DateReserv
+        );
+     end;
+  end;
+
+  // Запишем рассчитанные суммы
+  Data.SumReserv_ЦБ = Data.SumReserv_ЦБ + D;
+  Data.SumReserv_РВЦННД = Data.SumReserv_РВЦННД + R2732;
+  Data.SumReserv_ПДД = Data.SumReserv_ПДД + Dпдд;
+
+  return true;
+END;
+
+PRIVATE MACRO РезервПоВложениям( Data:CReservData , ID_Operation, ID_Step)
+
+  var FIRole = 0;
+
+  ОбъединятьПроводки = true;
+
+  Data.ExistNOSS = ExistNOSS( Data.ReservObj, Data.DateReserv );
+  SQL_Execute("DELETE FROM DPMWRTSUM_TMP", "", false );   // очищаем временную таблицу
+  /*Группа ППР*/
+  if( not РезервПоВложениямДляГруппы( Data, Гр_ППР ) )
+     return false;
+  end;
+
+  /*Группа ППР БПП*/
+  if( not РезервПоВложениямДляГруппы( Data, Гр_ППР_БПП ) )
+     return false;
+  end;
+
+  if( FI_IsBond( Data.FD.Fininstr ) ) /* ПУДП или ПДО со статусом Поставлен и ц/б - ДО*/
+
+     /*Группа ПУДП*/
+     if( not РезервПоВложениямДляГруппы( Data, Гр_ПУДП ) )
+        return false;
+     end;
+
+     /*Группа ПУДП БПП*/
+     if( not РезервПоВложениямДляГруппы( Data, Гр_ПУДП_БПП ) )
+        return false;
+     end;
+
+     /*Группа ПДО*/
+     if( not РезервПоВложениямДляГруппы( Data, Гр_ПДО ) )
+        return false;
+     end;
+     
+  elif( FI_IsShare( Data.FD.Fininstr ) or FI_IsInvestmentShare(Data.FD.Fininstr) ) /* ПКУ со статусом Поставлен и ц/б - Акция и паи тоже*/
+     /*Группа ПКУ*/
+     if( not РезервПоВложениямДляГруппы( Data, Гр_ПКУ ) )
+        return false;
+     end;
+  end;
+
+  /*Группа ПКУ БПП*/
+  if( not РезервПоВложениямДляГруппы( Data, Гр_ПКУ_БПП ) )
+     return false;
+  end;
+
+  if(not Data.AtrnReserv.Execute(Data))
+    return false;
+  end;
+
+  ОбъединятьПроводки = false;
+
+  if((Data.ScOprServDoc.Flag4 == SET_CHAR) and (Data.Update))  //оценочный резерв
+    var cmd_InsTmp, DataSet_InsTmp;
+    //beg N.E.
+    var EstMode = 1; //0 - проводка на сумму начисления, иначе проводка на сумму коррекции счета до значений с лота  
+    var CarrySum = $0;
+    //end N.E.
+    // Формирование резерва во временной таблице 
+    cmd_InsTmp = RSDCommand( " begin \n RSB_PMWRTOFF.RSI_WRTEstReserveLotsTMP(?, ?, ?); \n end;" );
+    cmd_InsTmp.AddParam( "", RSDBP_IN,Data.DateReserv);
+    cmd_InsTmp.AddParam( "", RSDBP_IN,Data.ReservObj.rec.FIID);
+    cmd_InsTmp.AddParam( "", RSDBP_IN,Data.ScOprServDoc.Division);
+    cmd_InsTmp.Execute();
+
+    var Query, QueryData;
+        Query = " SELECT NVL(SUM(TMP.T_ESTRESERVEADD), 0) as EstReserveAdd, "+
+                " NVL(SUM(TMP.T_CORRESTRESERVEADD), 0) as CorrEstReserveAdd, "+
+                "        NVL(SUM(LOT.T_ESTRESERVE), 0) as EstReserveOld, "
+                "        NVL(SUM(LOT.T_CORRESTRESERVE), 0) as CorrEstReserveOld, "
+                " TMP.T_PORTFOLIO as Portfolio "+
+                "   FROM DPMWRTSUM_TMP TMP, DPMWRTSUM_DBT LOT "+
+                "  WHERE LOT.T_SUMID = TMP.T_SUMID "
+                " GROUP BY TMP.T_PORTFOLIO "
+                ;
+   
+    var cmd = RsdCommand(Query);
+    cmd.execute();
+    QueryData = TRsbDataSet(cmd);
+
+    var AddReserv = 0;
+    while( QueryData.MoveNext() )
+      FIRole = GetFIRoleByPortfolio(QueryData.Portfolio, false, false, false, false, false);
+      GetRiskAndPercent(Data, KINDRES_ROCB);
+      if( (QueryData.Portfolio == KINDPORT_SSSD) and (QueryData.EstReserveAdd != 0))
+
+         if( not Data.FD.OpenAccount(IIF(QueryData.EstReserveAdd > 0,"-Кор_Резерв, ЦБ","+Кор_Резерв, ЦБ"), null, false, GetFIRoleByPortfolio( QueryData.Portfolio), ReservAcc, Data.DateReserv) )
+           return false;
+         end;
+
+         //beg N.E.
+         if(EstMode == 0)
+           CarrySum = QueryData.EstReserveAdd;
+         else
+           CarrySum = QueryData.EstReserveOld + QueryData.EstReserveAdd - GetRestAccount( ReservAcc.rec, Data.DateReserv );
+         end;
+         //end N.E.
+         AddReserv = QueryData.EstReserveAdd;
+
+         if( not НачислитьРезерв("КорОР_ЦБ", FIROLE_BA_PPR, Data, CarrySum) )
+            return false;
+         end;
+      
+        AddReportLineData(
+           Data.ReservObj.rec.FIID,       //бумага
+           Data.PcRate*100, Data.RiskNum,     //ставка,
+           QueryData.EstReserveOld + AddReserv,
+           QueryData.EstReserveOld, 
+           IIF(AddReserv > 0, AccDbt.rec.Account, AccCred.rec.Account ), ReservAcc.rec.Account,
+           AccDbt.rec.Account, AccCred.rec.Account,
+           null, null, null, null, null,
+           KINDRES_ROCB, AddReserv,
+           null, null, null, null, null, null,
+           QueryData.Portfolio, FIRole, Data.DateReserv
+      );
+      end;
+
+      if( ((QueryData.Portfolio == KINDPORT_ASCB) or (QueryData.Portfolio == KINDPORT_PROMISSORY) or (QueryData.Portfolio == KINDPORT_CONTR)) and (QueryData.CorrEstReserveAdd != 0))
+         var Role = 0, Acc = "";
+         if(QueryData.CorrEstReserveAdd > 0)
+            Acc = "-Кор_Резерв, ЦБ";
+         else
+            Acc = "+Кор_Резерв, ЦБ";
+         end;
+        
+         if(QueryData.Portfolio == KINDPORT_ASCB)
+            Role = FIROLE_BA_PUDP;
+         elif(QueryData.Portfolio == KINDPORT_CONTR)
+            Role = FIROLE_BAINCONTR;
+         else
+            Role = FIROLE_BAINPROMISSORY;
+         end;
+        
+        
+         if( not Data.FD.OpenAccount(Acc, null, false, Role, ReservAcc, Data.DateReserv) )
+           return false;
+         end;
+         //beg N.E.
+         if(EstMode == 0)
+           CarrySum = QueryData.CorrEstReserveAdd;
+         else
+           /*Chesnokov D.S. 19.02.2019 поправил, сумма остатка на счете вычитается*/
+           //CarrySum = QueryData.CorrEstReserveOld + QueryData.CorrEstReserveAdd + GetRestAccount( ReservAcc.rec, Data.DateReserv );
+           CarrySum = QueryData.CorrEstReserveOld + QueryData.CorrEstReserveAdd - GetRestAccount( ReservAcc.rec, Data.DateReserv );
+         end;
+         //end N.E.
+         if( QueryData.Portfolio == KINDPORT_ASCB)
+            if( not НачислитьРезерв("КорОР_ЦБ", Role, Data, CarrySum) )
+               return false;
+            end;
+         else        //ПДО или ПКУ
+            if( not НачислитьРезерв("КОР_РС, д/с", GetFIRoleByPortfolio( QueryData.Portfolio), Data, CarrySum) )
+               return false;
+            end;
+         end;
+
+         AddReserv = QueryData.CorrEstReserveAdd;
+
+       If( (valtype(AccDbt) != v_undef) and (valtype(AccCred) != v_undef) ) 
+
+          AddReportLineData(
+            Data.ReservObj.rec.FIID,       //бумага
+           Data.PcRate*100, Data.RiskNum,     //ставка,
+        QueryData.CorrEstReserveOld + AddReserv,
+           QueryData.CorrEstReserveOld, 
+        IIF(AddReserv > 0, AccDbt.rec.Account, AccCred.rec.Account ), ReservAcc.rec.Account,
+            AccDbt.rec.Account, AccCred.rec.Account,
+            null, null, null, null, null,
+        KINDRES_ROCB, AddReserv,
+            null, null, null, null, null, null,
+            QueryData.Portfolio, FIRole, Data.DateReserv
+          );
+       end;
+      end;
+
+    end;
+
+  end;
+  WRTSaveReserveLots(Data.DateReserv, ID_Operation, ID_Step);
+
+  return true;
+
+onError(e)
+  var ErMsg = "", ErCode = 0;
+  if (isEqClass("TRsdError", e.err))
+    for (var i, 0, e.err.environment.ErrorCount-1)
+      if (e.err.environment.Error(i).NativeError != 0)
+        ErCode = DL_UniCreateErrorMessage(e.err.environment.Error(i).NativeError);
+        ErMsg = GetErrMsg();
+        break;
+      end;
+    end;
+  end;
+  if (ErMsg == "")
+    ErCode = e.Code;
+    ErMsg = e.Message;
+  end;
+  return SayReservError(ErCode, ErMsg, Data);
+END; 
+
+PRIVATE MACRO РезервПоТО( SubKindReserv:INTEGER, Data, rq, BaseAmount, BaseFIID, Sum, BaseSum, IsUpdate )
+  var CurSum = $0, CurSumFIID, LastDate = Date(0,0,0);
+
+  if( ( (SubKindReserv == KINDRES_DELAYPAY) AND/*РСОП Резерв по сделкам с отсрочкой платежа*/
+        (not ТОЗакрыто(rq)) AND
+        (DL_GetRQStateOnDate( rq.rec.ID, Data.DateReserv+1 ) != DLRQ_STATE_OVERDUE)
+      ) OR
+      ( (SubKindReserv == KINDRES_EXPREQ ) AND /*РПТ По просроченным требованиям*/
+        (DL_GetRQStateOnDate( rq.rec.ID, Data.DateReserv+1 ) == DLRQ_STATE_OVERDUE )
+      )
+    )
+      CurSum = ПолучитьПоследнююСумму( DLDOC_PAYMENT, rq.rec.ID, DLSUM_KIND_SUM_CLAIMS_LIABILITE, LastDate, CurSumFIID );
+
+      if( LastDate >= Data.DateReserv )
+         return SayReservError( 1,  "По платежу есть изменения после даты резервирования", Data);
+      end;
+
+      if( (LastDate == Date(0,0,0)) AND (CurSum == 0) ) /*Если суммы не найдено - сумма ТО*/
+         if( not SmartConvertSum( CurSum, BaseAmount, Data.DateReserv, BaseFIID, NATCUR, false) )
+            return SayReservError( 1,  "Ошибка при конвертации суммы требования из "+ ПолучитьКодФинИн(BaseFIID)+" в " + ПолучитьКодФинИн(NATCUR), Data);
+         end;
+      else
+         if( not SmartConvertSum( CurSum, CurSum, Data.DateReserv, CurSumFIID, NATCUR, false) )
+            return SayReservError( 1,  "Ошибка при конвертации суммы требования из "+ ПолучитьКодФинИн(CurSumFIID)+" в " + ПолучитьКодФинИн(NATCUR), Data);
+         end;
+      end;
+
+      BaseSum = BaseSum + CurSum;
+      CurSum  = money( CurSum*Data.PcRate );
+
+      if( Data.Update and IsUpdate )
+         if( not СохранитьСуммуКомиссии( DLDOC_PAYMENT, rq.rec.ID, 
+                                         IIF( SubKindReserv == KINDRES_DELAYPAY, DLSUM_KIND_RESERV_DELAY, DLSUM_KIND_RESERV_OVERDUE ),  
+                                         Data.DateReserv, CurSum, $0, NATCUR ) )
+            return SayReservError( 1, "Ошибка при сохранении суммы резерва ", Data);
+         end;
+      end; 
+  end;
+
+  CurSum  = Sum + CurSum;
+  SetParm( 5, CurSum );
+  SetParm( 6, BaseSum );
+  return true;
+END;
+
+PRIVATE MACRO РезервПоТребованиямСОтсрочкойПлатежа( Data:CReservData ):BOOL
+  var DealID, NeedCalc, err, Rnew = $0, Reserv = $0, Rold = $0, BaseSum = $0, Amount = $0;
+
+  if( Data.FD.ExistBack  OR /*во всех обычных сделках покупки и продажи*/
+      (Data.ScOprServDoc.Flag3 != SET_CHAR) OR
+      (SP_DealNeedReserv( KINDRES_DELAYPAY, Data.ScOprServDoc, Data.FD.tick ) == false)
+    )
+     return true;
+  end;
+
+  Data.CalcReserv = Data.CalcReserv + 1;
+
+  if( not Data.FD.IsExistAccount( "+Форвард, расчеты", null, false, null, InAcc, null, Data.DateReserv ) )
+     return false;
+  end;
+
+  err = GetRiskAndPercent( Data, KINDRES_DELAYPAY );
+  if( err != "" )
+     return SayReservError( 1, err, Data);
+  end;
+
+  if( Data.FD.BuySale == DEAL_TYPE_SALE )
+     if( РезервПоТО( KINDRES_DELAYPAY, Data, Data.FD.GetRQ(DLRQ_TYPE_PAYMENT), Data.FD.GetRQ(DLRQ_TYPE_PAYMENT).rec.Amount, Data.FD.GetRQ(DLRQ_TYPE_PAYMENT).rec.FIID, Rnew, BaseSum, true ) == false )
+        return false;
+     end;
+     if( (Data.FD.ExistAvance == true) AND
+         (РезервПоТО( KINDRES_DELAYPAY, Data, Data.FD.GetRQ(DLRQ_TYPE_AVANCE), Data.FD.GetRQ(DLRQ_TYPE_AVANCE).rec.Amount, Data.FD.GetRQ(DLRQ_TYPE_AVANCE).rec.FIID, Rnew, BaseSum, true ) == false)
+       )
+        return false;
+     end;
+  else
+     Amount = Data.FD.GetRQ(DLRQ_TYPE_PAYMENT).rec.Amount;
+     if(Data.FD.ExistAvance)
+       Amount = Amount + Data.FD.GetRQ(DLRQ_TYPE_AVANCE).rec.Amount;
+     end;
+     if( РезервПоТО( KINDRES_DELAYPAY, Data, Data.FD.GetRQ(DLRQ_TYPE_DELIVERY), 
+                          Amount, 
+                          Data.FD.GetRQ(DLRQ_TYPE_PAYMENT).rec.FIID, Rnew, BaseSum, true ) == false )
+        return false;
+     end;
+  end;
+
+  if( Data.FD.IsExistAccount( "Резерв, договор", null, true, FIROLE_RESERV_RSOP, ReservAcc, null, Data.DateReserv ) == true )
+     Rold = ABS(GetRestAccount( ReservAcc.rec, Data.DateReserv ));
+  elif( Rnew != 0 )
+     if( not Data.FD.OpenAccount( "Резерв, договор", null, false, FIROLE_RESERV_RSOP, ReservAcc, Data.DateReserv ) )
+        return false;
+     end;
+     Rold = $0;
+  end;
+
+  Reserv = Rnew - Rold;
+
+  if( (Reserv != $0) and Data.Update )
+     if( not НачислитьРезерв("РС, д/с", FIROLE_BA, Data, Reserv) )
+        return false;
+     else
+         ScOpReportLineData[ScOpReportLineData.Size] = SvOpReserve(
+             Data.ReservObj.rec.DealID, 
+             Data.PcRate*100, Data.RiskNum, BaseSum, 
+             Rold, InAcc.rec.Account, ReservAcc.rec.Account );
+     end;
+  end;
+
+  Data.РезервПоТребованиямСОтсрочкойПлатежа = Data.РезервПоТребованиямСОтсрочкойПлатежа + Rnew/*Reserv*/;
+  return true;
+END;
+
+PRIVATE MACRO ПолучитьСуммуОД(Data:CReservData)
+  var ОД, S1, A2;
+
+  var S1Query = "select t_Amount, nvl(t_ID, 0) as t_ID from ddlrq_dbt where t_DocKind = " + DL_SECURITYDOC + " and t_DocID = ? and t_DealPart = 1 and t_Type in (" + DLRQ_TYPE_PAYMENT + ", " + DLRQ_TYPE_AVANCE + ")";
+  var S1Select = DL_RSDCommand(S1Query);
+  S1Select.AddParam(Data.ReservObj.rec.DealID);
+  var S1DataSet = S1Select.Execute();
+  var A2Query = "select t_Amount, nvl(t_ID, 0) as t_ID from ddlrq_dbt where t_DocKind = " + DL_SECURITYDOC + " and t_DocID = ? and t_DealPart = 2 and t_Type = " + DLRQ_TYPE_AVANCE;
+  var A2Select = DL_RSDCommand(A2Query);
+  A2Select.AddParam(Data.ReservObj.rec.DealID);
+  var A2DataSet = A2Select.Execute();
+
+  var AvanceState = -1;
+  var PaymState = -1;
+  if(S1DataSet.MoveNext())
+    S1 = S1DataSet.Amount;
+    PaymState = DL_GetRQStateOnDate(S1DataSet.ID, Data.DateReserv);
+  end;
+
+  if(A2DataSet.MoveNext())
+    A2 = A2DataSet.Amount;
+    AvanceState = DL_GetRQStateOnDate(A2DataSet.ID, Data.DateReserv);
+  else
+    A2 = 0;
+  end;
+  
+  if(((AvanceState == DLRQ_STATE_EXEC) or (AvanceState == DLRQ_STATE_OVERDUE)) and (PaymState != DLRQ_STATE_EXEC) and (PaymState != DLRQ_STATE_OVERDUE))
+    ОД = S1 - A2;
+  else
+    ОД = S1;
+  end;
+
+  return ОД;
+END;
+
+PRIVATE MACRO РОРЕПО(Data:CReservData)
+  var DealID, NeedCalc, err, Rnew = $0, Reserv = $0, Rold = $0, BaseSum = $0, Sод = $0, Sum = $0, ОД = $0, K, Ортек = $0, КоррОртек = $0, SдоначКОр = $0;
+  var УД, C = $0;
+  var fininstr = TRecHandler("fininstr.dbt");
+  var party = TRecHandler("party.dbt");
+  var AttrID, Acc;
+  var Role;
+  var Lot = Data.FD.pmwrtsum_curr();
+  var OldSum = $0;
+
+  if( (Data.ScOprServDoc.Flag5 != SET_CHAR) )
+     return true;
+  end;
+  Data.CalcReserv = Data.CalcReserv + 1;
+
+  DealID = Data.ReservObj.rec.DealID;
+
+  ПолучитьСубъекта(Data.FD.Tick.rec.PartyID, party);
+  
+  ОД = ПолучитьСуммуОД(Data);
+  if(Data.FD.GetRQ(DLRQ_TYPE_PAYMENT).rec.FIID != NATCUR)
+    if( not SmartConvertSum(ОД, ОД, Data.DateReserv, Data.FD.GetRQ(DLRQ_TYPE_PAYMENT).rec.FIID, NATCUR, false) )
+       return SayReservError( 1,  "Ошибка при конвертации суммы из "+ ПолучитьКодФинИн(Data.FD.GetRQ(DLRQ_TYPE_PAYMENT).rec.FIID)+" в " + ПолучитьКодФинИн(NATCUR), Data);
+    end;
+  end;
+  err = GetReservGuarant( Data, false );
+  if( err != "" )
+     return SayReservError( 1, err, Data);
+  end;
+
+  if( Data.FD.IsExistAccount("+% к погашению", null, true, null, InAcc, null, Data.DateReserv) )
+    Sод = ABS( GetRestAccount( InAcc.rec, Data.DateReserv ) );
+    if(InAcc.rec.Code_Currency != NATCUR)
+      if( not SmartConvertSum( Sод, Sод, Data.DateReserv, InAcc.rec.Code_Currency, NATCUR, false) )
+         return SayReservError( 1,  "Ошибка при конвертации суммы из "+ ПолучитьКодФинИн(InAcc.rec.Code_Currency)+" в " + ПолучитьКодФинИн(NATCUR), Data);
+      end;
+    end;
+  end;
+
+  K = ReadNoteForObject(DL_SECURITYDOC, UniID(Data.FD.Tick, DL_SECURITYDOC), 36, Data.DateReserv);
+  if(K == 0)
+    K = ReadNoteForObject(OBJTYPE_PARTY, UniID(party, OBJTYPE_PARTY), 78, Data.DateReserv);
+  end;
+
+  УД = ОД / (ОД + Sод);
+  C = Data.Guarant * УД;
+  
+  if( C >= ОД )
+     ОД = $0;
+  else
+     ОД = ОД - C;
+  end;
+  Ортек = K / 100 * ОД;
+  КоррОртек = Ортек - Data.РезервПоРЕПООбр2ч;
+
+  if( Data.FD.IsExistAccount( "-КОР_Резерв, договор_проч", null, true, FIROLE_OTHPLACEDMONEY, InAcc, null, Data.DateReserv ) )
+     OldSum = GetRestAccount( InAcc.rec, Data.DateReserv );
+  else
+     OldSum = 0;
+  end;
+
+  if( Data.FD.IsExistAccount( "+КОР_Резерв, договор_проч", null, true, FIROLE_OTHPLACEDMONEY, InAcc, null, Data.DateReserv ) )
+     OldSum = OldSum - GetRestAccount( InAcc.rec, Data.DateReserv );
+  end;
+
+  SдоначКОр = КоррОРтек - OldSum;
+  if(SдоначКОр > 0)
+    Acc = "-КОР_Резерв, договор_проч";
+  else
+    Acc = "+КОР_Резерв, договор_проч";
+  end;
+
+  if( Data.FD.IsExistAccount( Acc, null, true, FIROLE_OTHPLACEDMONEY, ReservAcc, null, Data.DateReserv ) == true )
+  elif( SдоначКОр != 0 )
+     if( not Data.FD.OpenAccount( Acc, null, false, FIROLE_OTHPLACEDMONEY, ReservAcc, Data.DateReserv ) )
+        return false;
+     end;
+  end;
+
+  Rold = OldSum;
+
+  if((SдоначКОр != 0) and (Data.Update))
+     if(not НачислитьРезерв("КОР_РС,д/с%", FIROLE_BA, Data, SдоначКОр))
+        return false;
+     else
+        ScOpReportLineData[ScOpReportLineData.Size] = SvOpReserve(
+                Data.ReservObj.rec.DealID, 
+                K,Data.RiskNum, ОД, 
+                Rold, NULL, ReservAcc.rec.Account, NULL, NULL, NULL, NULL, NULL, NULL, C /*NULL*/, NULL, SдоначКОр );
+     end;
+  end;
+
+  Data.РОРЕПО = Data.РОРЕПО + Ортек;
+  
+  return true;
+END;
+
+PRIVATE MACRO РОРПОР(Data:CReservData)
+  var Sод = $0, K = 0, Ортек = $0, КоррОРтек = $0, OldSum = $0, SдоначКОр = $0, Rold = $0, BaseSum = $0, C = $0, ОД = $0, УД, err;
+  var Acc, ResAcc = TRecHandler("account");
+  var party = TRecHandler("party.dbt");
+  
+  if( (Data.ScOprServDoc.Flag5 != SET_CHAR) )
+     return true;
+  end;
+
+
+  if( not Data.FD.IsExistAccount( "+% к погашению", null, true, null, InAcc, null, Data.DateReserv ) )
+     return true;
+  end;
+
+  ПолучитьСубъекта(Data.FD.Tick.rec.PartyID, party);
+
+  Sод = abs(GetRestAccount( InAcc.rec, Data.DateReserv ));
+  
+  if(InAcc.rec.Code_Currency != NATCUR)
+    if( not SmartConvertSum(Sод, Sод, Data.DateReserv, InAcc.rec.Code_Currency, NATCUR, false) )
+       return SayReservError( 1,  "Ошибка при конвертации суммы из "+ ПолучитьКодФинИн(InAcc.rec.Code_Currency)+" в " + ПолучитьКодФинИн(NATCUR), Data);
+    end;
+  end;
+
+  K = ReadNoteForObject(DL_SECURITYDOC, UniID(Data.FD.Tick, DL_SECURITYDOC), 36, Data.DateReserv);
+  if(K == 0)
+    K = ReadNoteForObject(OBJTYPE_PARTY, UniID(party, OBJTYPE_PARTY), 78, Data.DateReserv);
+  end;
+  ОД = ПолучитьСуммуОД(Data);
+  if(Data.FD.GetRQ(DLRQ_TYPE_PAYMENT).rec.FIID != NATCUR)
+    if( not SmartConvertSum(ОД, ОД, Data.DateReserv, Data.FD.GetRQ(DLRQ_TYPE_PAYMENT).rec.FIID, NATCUR, false) )
+       return SayReservError( 1,  "Ошибка при конвертации суммы из "+ ПолучитьКодФинИн(Data.FD.GetRQ(DLRQ_TYPE_PAYMENT).rec.FIID)+" в " + ПолучитьКодФинИн(NATCUR), Data);
+    end;
+  end;
+  err = GetReservGuarant( Data, false );
+  if( err != "" )
+     return SayReservError( 1, err, Data);
+  end;
+
+  УД = Sод / (ОД + Sод);
+  C = Data.Guarant * УД;
+  if(Sод != 0)
+    Sод = Sод * (1 - C / Sод);
+  else
+    Sод = 0;
+  end;
+
+  Ортек = K / 100 * Sод;
+  КоррОРтек = Ортек - Data.РезервПоПроцентнымТребованиям;
+
+  if( not Data.FD.IsExistAccount( "-КОР_Резерв, договор_проч", null, true, FIROLE_RORPOR, ResAcc, null, Data.DateReserv ) )
+     OldSum = 0;
+  else
+     OldSum = GetRestAccount( ResAcc.rec, Data.DateReserv );
+  end;
+
+  if( Data.FD.IsExistAccount( "+КОР_Резерв, договор_проч", null, true, FIROLE_RORPOR, ResAcc, null, Data.DateReserv ) )
+     OldSum = OldSum - GetRestAccount( ResAcc.rec, Data.DateReserv );
+  end;
+
+  SдоначКОр = КоррОРтек - OldSum;
+
+  if(SдоначКОр > 0)
+    Acc = "-КОР_Резерв, договор_проч";
+  else
+    Acc = "+КОР_Резерв, договор_проч";
+  end;
+
+  if( Data.FD.IsExistAccount( Acc, null, true, FIROLE_RORPOR, ReservAcc, null, Data.DateReserv ) == true )
+  elif( SдоначКОр != 0 )
+     if( not Data.FD.OpenAccount( Acc, null, false, FIROLE_RORPOR, ReservAcc, Data.DateReserv ) )
+        return false;
+     end;
+  end;
+
+  Rold = OldSum;
+
+  if((SдоначКОр != 0) and (Data.Update))
+     if(not НачислитьРезерв("КОР_РС,д/с%", FIROLE_BA, Data, SдоначКОр))
+        return false;
+     else
+        ScOpReportLineData[ScOpReportLineData.Size] = SvOpReserve(
+                Data.ReservObj.rec.DealID, 
+                K,Data.RiskNum, Sод, 
+                Rold, NULL, ReservAcc.rec.Account, NULL, NULL, NULL, NULL, NULL, NULL, C/*NULL*/, NULL, SдоначКОр );
+     end;
+  end;
+
+  Data.РОРПОР = Data.РОРПОР + Ортек;
+
+  return true;
+END;
+
+PRIVATE MACRO РезервПоНеотнРасхПоСущЗатр(Data:CReservData)
+  var K = 0, Ортек = $0, SдоначКОр = $0, КоррОРтек = $0, OldSum = $0, Rold = $0;
+  var Lot = Data.FD.pmwrtsum_curr();
+  var ResAcc = TRecHandler("account");
+  var party = TRecHandler("party.dbt");
+  var Acc;
+
+  if( (Data.ScOprServDoc.Flag5 != SET_CHAR) )
+     return true;
+  end;
+
+  ПолучитьСубъекта(Data.FD.Tick.rec.PartyID, party);
+  K = ReadNoteForObject(DL_SECURITYDOC, UniID(Data.FD.Tick, DL_SECURITYDOC), 36, Data.DateReserv);
+  if(K == 0)
+    K = ReadNoteForObject(OBJTYPE_PARTY, UniID(party, OBJTYPE_PARTY), 78, Data.DateReserv);
+  end;
+
+  Ортек = K / 100 * Lot.rec.NotWrtBonus;
+  КоррОРтек = Ортек;
+
+  if( Data.FD.IsExistAccount( "-КОР_Резерв, договор_проч", null, true, FIROLE_ROZ, ResAcc, null, Data.DateReserv ) )
+     OldSum = GetRestAccount( ResAcc.rec, Data.DateReserv );
+  else
+     OldSum = 0;
+  end;
+
+  if( Data.FD.IsExistAccount( "+КОР_Резерв, договор_проч", null, true, FIROLE_ROZ, ResAcc, null, Data.DateReserv ) )
+     OldSum = OldSum - GetRestAccount( ResAcc.rec, Data.DateReserv );
+  end;
+
+  SдоначКОр = КоррОРтек - OldSum;
+
+  if(SдоначКОр > 0)
+    Acc = "-КОР_Резерв, договор_проч";
+  else
+    Acc = "+КОР_Резерв, договор_проч";
+  end;
+
+  if( Data.FD.IsExistAccount( Acc, null, true, FIROLE_ROZ, ReservAcc, null, Data.DateReserv ) == true )
+  elif( SдоначКОр != 0 )
+     if( not Data.FD.OpenAccount( Acc, null, false, FIROLE_ROZ, ReservAcc, Data.DateReserv ) )
+        return false;
+     end;
+  end;
+
+  Rold = OldSum;
+
+  if((SдоначКОр != 0) and (Data.Update))
+     if(not НачислитьРезерв("КОР_РС,д/с%", FIROLE_BA, Data, SдоначКОр))
+        return false;
+     else
+        ScOpReportLineData[ScOpReportLineData.Size] = SvOpReserve(
+                Data.ReservObj.rec.DealID, 
+                K,Data.RiskNum, Lot.rec.NotWrtBonus, 
+                Rold, NULL, ReservAcc.rec.Account, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, Ортек - Rold );
+     end;
+  end;
+
+  Data.РезервПоНеотнРасхПоСущЗатр = Data.РезервПоНеотнРасхПоСущЗатр + Ортек;
+
+  return true;
+END;
+
+PRIVATE MACRO РезервПоТекКоррПроцПоЭПС(Data:CReservData)
+  var K = 0, Ортек = $0, SдоначКОр = $0, КоррОРтек = $0, OldSum = $0, Rold = $0;
+  var Lot = Data.FD.pmwrtsum_curr();
+  var ResAcc = TRecHandler("account");
+  var party = TRecHandler("party.dbt");
+  var Acc;
+
+  if( (Data.ScOprServDoc.Flag5 != SET_CHAR) )
+     return true;
+  end;
+
+  K = ReadNoteForObject(DL_SECURITYDOC, UniID(Data.FD.Tick/*fininstr*/, DL_SECURITYDOC), 36, Data.DateReserv);
+  if(K == 0)
+    K = ReadNoteForObject(OBJTYPE_PARTY, UniID(party, OBJTYPE_PARTY), 78, Data.DateReserv);
+  end;
+
+  Ортек = K / 100 * Lot.rec.CorrIntToEIR;
+  КоррОРтек = Ортек;
+
+  if( Data.FD.IsExistAccount( "-КОР_Резерв, договор_проч", null, true, FIROLE_ROKOR, ResAcc, null, Data.DateReserv ) )
+     OldSum = GetRestAccount( ResAcc.rec, Data.DateReserv );
+  else
+     OldSum = 0;
+  end;
+
+  if( Data.FD.IsExistAccount( "+КОР_Резерв, договор_проч", null, true, FIROLE_ROKOR, ResAcc, null, Data.DateReserv ) )
+     OldSum = OldSum - GetRestAccount( ResAcc.rec, Data.DateReserv );
+  end;
+
+  SдоначКОр = КоррОРтек - OldSum;
+
+  if(SдоначКОр > 0)
+    Acc = "-КОР_Резерв, договор_проч";
+  else
+    Acc = "+КОР_Резерв, договор_проч";
+  end;
+
+  if( Data.FD.IsExistAccount( Acc, null, true, FIROLE_ROKOR, ReservAcc, null, Data.DateReserv ) == true )
+  elif( SдоначКОр != 0 )
+     if( not Data.FD.OpenAccount( Acc, null, false, FIROLE_ROKOR, ReservAcc, Data.DateReserv ) )
+        return false;
+     end;
+  end;
+
+  Rold = OldSum;
+
+  if((SдоначКОр != 0) and (Data.Update))
+     if(not НачислитьРезерв("КОР_РС,д/с%", FIROLE_BA, Data, SдоначКОр))
+        return false;
+     else
+        ScOpReportLineData[ScOpReportLineData.Size] = SvOpReserve(
+                Data.ReservObj.rec.DealID, 
+                K,Data.RiskNum, Lot.rec.CorrIntToEIR, 
+                Rold, NULL, ReservAcc.rec.Account, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, Ортек - Rold );
+     end;
+  end;
+
+  Data.РезервПоТекКоррПроцПоЭПС = Data.РезервПоТекКоррПроцПоЭПС + Ортек;
+
+  return true;
+END;
+
+PRIVATE MACRO ОцРезервПоПросроченнымТребованиям( Data:CReservData )
+  var Rnew = $0, BaseSum = $0, Ортек = $0, КоррОРтек = $0, Amount = 0, K = 0, OldSum = $0, Rold = $0, SдоначКОр = $0;
+  var ResAcc = TRecHandler("account");
+  var party = TRecHandler("party.dbt");
+  var Acc;
+
+  if( (Data.ScOprServDoc.Flag5 != SET_CHAR) and (Data.ScOprServDoc.Flag1 != SET_CHAR) )
+     return true;
+  end;
+
+  ПолучитьСубъекта(Data.FD.Tick.rec.PartyID, party);
+  K = ReadNoteForObject(DL_SECURITYDOC, UniID(Data.FD.Tick, DL_SECURITYDOC), 36, Data.DateReserv);
+  if(K == 0)
+    K = ReadNoteForObject(OBJTYPE_PARTY, UniID(party, OBJTYPE_PARTY), 78, Data.DateReserv);
+  end;
+
+  if( Data.FD.BuySale == DEAL_TYPE_SALE )
+     if( РезервПоТО( KINDRES_EXPREQ, Data, Data.FD.GetRQ(DLRQ_TYPE_PAYMENT), Data.FD.GetRQ(DLRQ_TYPE_PAYMENT).rec.Amount, Data.FD.GetRQ(DLRQ_TYPE_PAYMENT).rec.FIID, Rnew, BaseSum, false ) == false )
+        return false;
+     end;
+     if( (Data.FD.ExistAvance == true) AND
+         (РезервПоТО( KINDRES_EXPREQ, Data, Data.FD.GetRQ(DLRQ_TYPE_AVANCE), Data.FD.GetRQ(DLRQ_TYPE_AVANCE).rec.Amount, Data.FD.GetRQ(DLRQ_TYPE_AVANCE).rec.FIID, Rnew, BaseSum, false ) == false)
+       )
+        return false;
+     end;
+  else
+     Amount = Data.FD.GetRQ(DLRQ_TYPE_PAYMENT).rec.Amount;
+     if(Data.FD.ExistAvance)
+       Amount = Amount + Data.FD.GetRQ(DLRQ_TYPE_AVANCE).rec.Amount;
+     end;
+     if( РезервПоТО( KINDRES_EXPREQ, Data, Data.FD.GetRQ(DLRQ_TYPE_PAYMENT), 
+                          Amount, 
+                          Data.FD.GetRQ(DLRQ_TYPE_PAYMENT).rec.FIID, Rnew, BaseSum, false ) == false )
+        return false;
+     end;
+  end;
+
+  Ортек = K / 100 * BaseSum;
+  КоррОРтек = Ортек - Data.РезервПоПросроченнымТребованиям;
+ 
+  if( Data.FD.IsExistAccount( "-КОР_Резерв, договор_проч", null, true, FIROLE_RORPT, ResAcc, null, Data.DateReserv ) )
+     OldSum = GetRestAccount( ResAcc.rec, Data.DateReserv );
+  else
+     OldSum = 0;
+  end;
+ 
+  if( Data.FD.IsExistAccount( "+КОР_Резерв, договор_проч", null, true, FIROLE_RORPT, ResAcc, null, Data.DateReserv ) )
+     OldSum = OldSum - GetRestAccount( ResAcc.rec, Data.DateReserv );
+  end;
+ 
+  SдоначКОр = КоррОРтек - OldSum;
+ 
+  if(SдоначКОр > 0)
+    Acc = "-КОР_Резерв, договор_проч";
+  else
+    Acc = "+КОР_Резерв, договор_проч";
+  end;
+ 
+  if( Data.FD.IsExistAccount( Acc, null, true, FIROLE_RORPT, ReservAcc, null, Data.DateReserv ) == true )
+  elif( SдоначКОр != 0 )
+     if( not Data.FD.OpenAccount( Acc, null, false, FIROLE_RORPT, ReservAcc, Data.DateReserv ) )
+        return false;
+     end;
+  end;
+
+  if((SдоначКОр != 0) and (Data.Update))
+     if(not НачислитьРезерв("КОР_РС,д/с%", FIROLE_BA, Data, SдоначКОр))
+        return false;
+     else
+        ScOpReportLineData[ScOpReportLineData.Size] = SvOpReserve(
+                Data.ReservObj.rec.DealID, 
+                K,Data.RiskNum, BaseSum, 
+                Rold, NULL, ReservAcc.rec.Account, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, Ортек - Rold );
+     end;
+  end;
+
+  Data.ОцРезервПоПросроченнымТребованиям = Data.ОцРезервПоПросроченнымТребованиям + Ортек;
+
+  return true;
+END;
+
+PRIVATE MACRO ОцРезервПоПросроченнымПроцентнымТребованиям(Data:CReservData)
+  var Rnew = $0, Bi = $0, Ортек = $0, КоррОРтек = $0, Amount = 0, K = 0, OldSum = $0, Rold = $0, SдоначКОр = $0;
+  var ResAcc = TRecHandler("account");
+  var party = TRecHandler("party.dbt");
+  var Acc;
+
+  if( (Data.ScOprServDoc.Flag5 != SET_CHAR) and (Data.ScOprServDoc.Flag1 != SET_CHAR) )
+     return true;
+  end;
+
+  Data.FD = SPFirstDocDealReserv( Data.ReservObj, Data.ScOprServDoc.OperationKind, true );
+  if( not Data.FD.IsExistAccount( "+% с н.с.", null, true, null, InAcc, null, Data.DateReserv ) )
+     return true;
+  end;
+
+  Bi = ABS( GetRestAccount( InAcc.rec, Data.DateReserv ) );
+
+  ПолучитьСубъекта(Data.FD.Tick.rec.PartyID, party);
+  K = ReadNoteForObject(DL_SECURITYDOC, UniID(Data.FD.Tick, DL_SECURITYDOC), 36, Data.DateReserv);
+  if(K == 0)
+    K = ReadNoteForObject(OBJTYPE_PARTY, UniID(party, OBJTYPE_PARTY), 78, Data.DateReserv);
+  end;
+
+  Ортек = K / 100 * Bi;
+  КоррОРтек = Ортек - Data.РезервПоПросроченнымПроцентнымТребованиям;
+ 
+  if( Data.FD.IsExistAccount( "-КОР_Резерв, договор_проч", null, true, FIROLE_RORPTP, ResAcc, null, Data.DateReserv ) )
+     OldSum = GetRestAccount( ResAcc.rec, Data.DateReserv );
+  else
+     OldSum = 0;
+  end;
+ 
+  if( Data.FD.IsExistAccount( "+КОР_Резерв, договор_проч", null, true, FIROLE_RORPTP, ResAcc, null, Data.DateReserv ) )
+     OldSum = OldSum - GetRestAccount( ResAcc.rec, Data.DateReserv );
+  end;
+ 
+  SдоначКОр = КоррОРтек - OldSum;
+ 
+  if(SдоначКОр > 0)
+    Acc = "-КОР_Резерв, договор_проч";
+  else
+    Acc = "+КОР_Резерв, договор_проч";
+  end;
+ 
+  if( Data.FD.IsExistAccount( Acc, null, true, FIROLE_RORPTP, ReservAcc, null, Data.DateReserv ) == true )
+  elif( SдоначКОр != 0 )
+     if( not Data.FD.OpenAccount( Acc, null, false, FIROLE_RORPTP, ReservAcc, Data.DateReserv ) )
+        return false;
+     end;
+  end;
+
+  Rold = OldSum;
+
+  if((SдоначКОр != 0) and (Data.Update))
+     if(not НачислитьРезерв("КОР_РС,д/с%", FIROLE_BA, Data, SдоначКОр))
+        return false;
+     else
+        ScOpReportLineData[ScOpReportLineData.Size] = SvOpReserve(
+                Data.ReservObj.rec.DealID, 
+                K,Data.RiskNum, Bi, 
+                Rold, NULL, ReservAcc.rec.Account, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, Ортек - Rold );
+     end;
+  end;
+
+  Data.ОцРезервПоПросроченнымПроцентнымТребованиям = Data.ОцРезервПоПросроченнымПроцентнымТребованиям + Ортек;
+
+  return true;
+END;
+
+PRIVATE MACRO РезервПоПросроченнымПроцентнымТребованиям( Data:CReservData ):BOOL
+  var DealID, NeedCalc, err, Rnew = $0, Reserv = $0, Rold = $0, BaseSum = $0, Bi = $0;
+  var SaveFD = Data.FD;
+
+  if( (Data.ScOprServDoc.Flag1 != SET_CHAR) OR
+      (SP_DealNeedReserv( KINDRES_RPTP, Data.ScOprServDoc, Data.FD.tick ) == false)
+    )
+     return true;
+  end;
+
+  Data.CalcReserv = Data.CalcReserv + 1;
+
+  Data.FD = SPFirstDocDealReserv( Data.ReservObj, Data.ScOprServDoc.OperationKind, true );
+  if( not Data.FD.IsExistAccount( "+% с н.с.", null, true, null, InAcc, null, Data.DateReserv ) )
+     return true;
+  end;
+
+  err = GetRiskAndPercent( Data, KINDRES_EXPREQ );
+  if( err != "" )
+     return SayReservError( 1, err, Data);
+  end;
+
+  Bi = ABS( GetRestAccount( InAcc.rec, Data.DateReserv ) );
+  Rnew = money( Data.PcRate * Bi );
+
+  if( Data.FD.IsExistAccount( "Резерв, договор", null, true, FIROLE_RESERV_RPTP, ReservAcc, null, Data.DateReserv ) == true )
+     Rold = ABS(GetRestAccount( ReservAcc.rec, Data.DateReserv ));
+  elif( Rnew != 0 )
+     if( not Data.FD.OpenAccount( "Резерв, договор", null, false, FIROLE_RESERV_RPTP, ReservAcc, Data.DateReserv ) )
+        return false;
+     end;
+     Rold = $0;
+  end;
+
+  Reserv = Rnew - Rold;
+
+  if( (Reserv != $0) and Data.Update )
+     if( not НачислитьРезерв("РС,д/с%", FIROLE_BA, Data, Reserv) )
+        return false;
+     else
+         ScOpReportLineData[ScOpReportLineData.Size] = SvOpReserve(
+             Data.ReservObj.rec.DealID, 
+             Data.PcRate*100,Data.RiskNum, BaseSum, 
+             Rold, InAcc.rec.Account, ReservAcc.rec.Account );
+     end;
+  end;
+
+  Data.РезервПоПросроченнымПроцентнымТребованиям = Data.РезервПоПросроченнымПроцентнымТребованиям + Rnew/*Reserv*/;
+  Data.FD = SaveFD;
+  return true;
+END;
+
+PRIVATE MACRO РезервНаАвансОплату( Data:CReservData, FD, Rnew ):BOOL
+  var Rnewo,Rnewa;
+  var dlsum = TRecHandler("dlsum.dbt");
+  var A2, OD, FD2 = SPFirstDoc( FD.tick, true );
+
+  if( ( not FD2.ExistAvance() ) or 
+      ( FD2.ExistAvance() and 
+        ( ТОБылоПросрочено(FD.GetRQ(DLRQ_TYPE_AVANCE)) or 
+          ТОЗакрыто(FD.GetRQ(DLRQ_TYPE_AVANCE)) 
+        ) 
+      )
+    )
+     Rnewo = Rnew;
+     Rnewa = $0;
+  elif( Rnew == 0 )
+     Rnewo = $0;
+     Rnewa = $0;
+  else
+     OD = FD2.FD.GetRQ(DLRQ_TYPE_PAYMENT).rec.Amount;
+     Rnewo = money( Data.PcRate * (OD - Data.Guarant) );
+
+     if( not SmartConvertSum( Rnewo, Rnewo, Data.DateReserv, FD.GetPayFIID(), NATCUR, false) )
+        return SayReservError( 1,  "Ошибка при конвертации суммы резерва из "+ ПолучитьКодФинИн(FD.GetPayFIID())+" в " + ПолучитьКодФинИн(NATCUR), Data);
+     end;
+
+     Rnewa = Rnew - Rnewo;
+  end;
+
+  if( Data.Update )
+     if( (Rnewa > 0) and (FD2.ExistAvance()))
+        if( not СохранитьСуммуКомиссии( DLDOC_PAYMENT, FD2.GetRQ(DLRQ_TYPE_AVANCE).rec.ID, DLSUM_KIND_RESERV_BACKREPO, Data.DateReserv, Rnewa, $0, NATCUR ) )
+           return SayReservError( 1, "Ошибка при сохранении суммы резерва ", Data);
+        end; 
+     end;
+
+     if( Rnewo > 0 )
+        if( not СохранитьСуммуКомиссии( DLDOC_PAYMENT, FD2.GetRQ(DLRQ_TYPE_PAYMENT).rec.ID, DLSUM_KIND_RESERV_BACKREPO, Data.DateReserv, Rnewo, $0, NATCUR ) )
+           return SayReservError( 1, "Ошибка при сохранении суммы резерва ", Data);
+        end; 
+     end;
+  end;
+
+END;
+
+PRIVATE MACRO РезервПоРепоОбр2ч( Data:CReservData ):BOOL
+  var DealID, NeedCalc, err, Rnew = $0, Reserv = $0, Rold = $0, BaseSum = $0, Sод = $0, C, УД, ОД, S1, A2;
+
+  if( (Data.ScOprServDoc.Flag4 != SET_CHAR) OR
+      (SP_DealNeedReserv( KINDRES_REPO, Data.ScOprServDoc, Data.FD.tick ) == false)
+    )
+     return true;
+  end;
+
+  Data.CalcReserv = Data.CalcReserv + 1;
+  if( Data.FD.IsExistAccount("+% к погашению", null, true, null, InAcc, null, Data.DateReserv) )
+    Sод = ABS( GetRestAccount( InAcc.rec, Data.DateReserv ) );
+    if(InAcc.rec.Code_Currency != NATCUR)
+      if( not SmartConvertSum( Sод, Sод, Data.DateReserv, InAcc.rec.Code_Currency, NATCUR, false) )
+         return SayReservError( 1,  "Ошибка при конвертации суммы из "+ ПолучитьКодФинИн(InAcc.rec.Code_Currency)+" в " + ПолучитьКодФинИн(NATCUR), Data);
+      end;
+    end;
+  end;
+
+  err = GetRiskAndPercent( Data, KINDRES_REPO, true );
+  if( err != "" )
+     return SayReservError( 1, err, Data);
+  end;
+
+  err = GetReservGuarant( Data, false );
+  if( err != "" )
+     return SayReservError( 1, err, Data);
+  end;
+
+  var perRQ = TRecHandler("dlrq.dbt");
+  /*- сумма основного долга, т.е. остаток  КУ "+ОД",*/
+  ОД = ПолучитьСуммуОД(Data);
+  if(Data.FD.GetRQ(DLRQ_TYPE_PAYMENT).rec.FIID != NATCUR)
+    if( not SmartConvertSum(ОД, ОД, Data.DateReserv, Data.FD.GetRQ(DLRQ_TYPE_PAYMENT).rec.FIID, NATCUR, false) )
+       return SayReservError( 1,  "Ошибка при конвертации суммы из "+ ПолучитьКодФинИн(Data.FD.GetRQ(DLRQ_TYPE_PAYMENT).rec.FIID)+" в " + ПолучитьКодФинИн(NATCUR), Data);
+    end;
+  end;
+
+  УД = ОД / (ОД + Sод);
+  C = Data.Guarant * УД;
+  
+  if( C >= ОД )
+     Rnew = $0;
+  else
+     BaseSum = ОД - C;
+     Rnew = money( Data.PcRate * BaseSum );
+  end;
+
+  if( Data.FD.IsExistAccount( "Резерв, договор", null, true, FIROLE_RESERV_ROR, ReservAcc, null, Data.DateReserv ) == true )
+     Rold = ABS(GetRestAccount( ReservAcc.rec, Data.DateReserv ));
+  elif( Rnew != 0 )
+     if( not Data.FD.OpenAccount( "Резерв, договор", null, false, FIROLE_RESERV_ROR, ReservAcc, Data.DateReserv ) )
+        return false;
+     end;
+     Rold = $0;
+  end;
+
+  Reserv = Rnew - Rold;
+
+  РезервНаАвансОплату( Data, Data.FD, Rnew );
+
+  if( (Reserv != $0) and Data.Update )
+     if( not НачислитьРезерв("РС,д/с%", FIROLE_BA, Data, Reserv) )
+        return false;
+     else
+         ScOpReportLineData[ScOpReportLineData.Size] = SvOpReserve(
+             Data.ReservObj.rec.DealID, 
+             Data.PcRate*100, Data.RiskNum, BaseSum, 
+             Rold, InAcc.rec.Account, ReservAcc.rec.Account, null, null, null, null, null, null, C/*Data.Guarant*/, KINDRES_REPO );
+     end;
+  end;
+
+  Data.РезервПоРепоОбр2ч = Data.РезервПоРепоОбр2ч + Rnew/*Reserv*/;
+  return true;
+END;
+
+private class CSumInfo( _Amount, _Portfolio:integer )
+  var Amount     = _Amount, 
+      Portfolio  = _Portfolio;
+
+  var ReservSum  = $0;
+end;
+
+/* Процедура сравнения элементов массива
+   Использууется при сортировке. */
+private macro CompareForSort( key, elem )
+   if( key.Amount > elem.Amount ) return 1;   end;
+   if( key.Amount < elem.Amount ) return -1;  end;
+
+   return 0;
+end;
+
+/* Массив с данными о лоте.
+   Есть методы вставки записей и сортировки. */
+private class (TArray) CLotInfoArray
+
+   /* Очистить массив */
+   macro ClearArray
+      this.Size = 0;
+   end;
+
+   macro SetSumByPort( _Amount, _Portfolio:integer )
+      var
+         Counter     = this.Size, i = 0;
+
+      if( Counter > 0 )
+         while( i < Counter )
+            if( this[i].Portfolio == _Portfolio )
+               this[i].Amount = this[i].Amount + _Amount;
+               break;
+            else
+               this[Counter] = CSumInfo(_Amount,_Portfolio);
+            end;
+            i = i + 1;
+         end;
+      else
+         this[Counter] = CSumInfo(_Amount,_Portfolio);
+      end;
+   end;
+
+   macro GetTotalSum(WithoutBASICDEBT:bool)
+      var TotalSum  = 0.;
+      var Counter  = this.Size, i = 0;
+
+      while( i < Counter )
+         if( (WithoutBASICDEBT != null) and (WithoutBASICDEBT == true) and (this[i].Portfolio == KINDPORT_BASICDEBT) )
+            i = i + 1;
+            continue;
+         end;
+         TotalSum = TotalSum + this[i].Amount;
+         i = i + 1;
+      end;
+
+      return  TotalSum;
+   end;
+
+   /* Сортировка данных в массиве */
+   macro Sorting
+      qsort( this, "CompareForSort" );
+   end;
+
+end;
+
+private class CFIIDRiskParam(pFIID:integer, pPercent:money, pRiskNumSec:integer)
+  var FIID:integer, Percent:money, RiskNumSec:integer;
+
+  FIID       = pFIID;
+  Percent    = pPercent;
+  RiskNumSec = pRiskNumSec;
+
+end;
+
+private class (TArray) FIIDRiskParam()
+
+  /* Очистить массив */
+  macro ClearArray
+     this.Size = 0;
+  end;
+
+  macro AddFIID(pFIID:integer, pPercent:money, pRiskNumSec:integer)
+     var
+        Counter     = this.Size, i = 0, IsExists = false;
+
+     if( Counter > 0 )
+        while( i < Counter )
+           if( this[i].FIID == pFIID )
+              this[i].Percent = pPercent;
+              this[i].RiskNumSec = pRiskNumSec;
+              IsExists = true;
+              break;
+           end;
+           i = i + 1;
+        end;
+        
+        if( not IsExists )
+           this[Counter] = CFIIDRiskParam(pFIID, pPercent, pRiskNumSec);
+        end;
+     else
+        this[Counter] = CFIIDRiskParam(pFIID, pPercent, pRiskNumSec);
+     end;
+  end;
+
+  macro GetRiskParamByFIID(pFIID:integer, pPercent:@money, pRiskNumSec:@integer)
+     var
+        Counter     = this.Size, i = 0, Account = "";
+
+     pPercent    = -1;
+     pRiskNumSec = -1;
+
+     if( Counter > 0 )
+        while( i < Counter )
+
+           if( this[i].FIID == pFIID )
+              pPercent    = this[i].Percent;
+              pRiskNumSec = this[i].RiskNumSec;
+              break;
+           end;
+           i = i + 1;
+        end;
+     end;
+
+  end;
+
+end;
+
+private class CFIIDNumAccount(pFIID:integer, pPortfolio:integer, pAccount:string, pAccRest:money)
+  var FIID:integer, Portfolio:integer, Account:string, AccRest:money = $0;
+
+  FIID       = pFIID;
+  Account    = pAccount;
+  Portfolio  = pPortfolio;
+  AccRest    = pAccRest;
+end;
+
+private class (TArray) FIIDNumAccount()
+
+  /* Очистить массив */
+  macro ClearArray
+     this.Size = 0;
+  end;
+
+  macro AddAccount(pFIID:integer, pPortfolio:integer, pAccount:string, pAccRest:money)
+     var
+        Counter     = this.Size, i = 0, IsExists = false;
+
+     if( Counter > 0 )
+        while( i < Counter )
+           if( (this[i].FIID == pFIID) and (this[i].Portfolio == pPortfolio) and (this[i].Account == pAccount) )
+              this[i].AccRest = this[i].AccRest + pAccRest;
+              IsExists = true;
+              break;
+           end;
+           i = i + 1;
+        end;
+
+        if( not IsExists )
+           this[Counter] = CFIIDNumAccount(pFIID, pPortfolio, pAccount, pAccRest:money);
+        end;
+     else
+        this[Counter] = CFIIDNumAccount(pFIID, pPortfolio, pAccount, pAccRest:money);
+     end;
+  end;
+
+  macro AddRestByPortfolio(pFIID:integer, pPortfolio:integer, pAccRest:money)
+     var
+        Counter     = this.Size, i = 0;
+
+     if( Counter > 0 )
+        while( i < Counter )
+           if( (this[i].FIID == pFIID) and (this[i].Portfolio == pPortfolio) )
+              this[i].AccRest = this[i].AccRest + pAccRest;
+              break;
+           end;
+           i = i + 1;
+        end;
+     end;
+
+  end;
+
+  macro GetAccByFIIDAndPort(pFIID:integer,pPortfolio:integer)
+     var
+        Counter     = this.Size, i = 0, Account = "";
+
+     if( Counter > 0 )
+        while( i < Counter )
+           if( (this[i].FIID == pFIID) and (this[i].Portfolio == pPortfolio) )
+              Account = this[i].Account;
+              break;
+           end;
+           i = i + 1;
+        end;
+     end;
+
+     return Account;
+  end;
+
+  macro GetRestAccByFIIDAndPort(pFIID:integer,pPortfolio:integer,pAccount:string)
+     var
+        Counter     = this.Size, i = 0, AccRest = $0;
+
+     if( Counter > 0 )
+        while( i < Counter )
+           if( (this[i].FIID == pFIID) and (this[i].Portfolio == pPortfolio) and (this[i].Account == pAccount) )
+              AccRest = this[i].AccRest;
+              break;
+           end;
+           i = i + 1;
+        end;
+     end;
+
+     return AccRest;
+  end;
+
+end;
+
+PRIVATE MACRO РезервПоРепоПрм2ч( Data:CReservData ):BOOL
+  var NumAccount = TArray(), CategName = TArray(), ReservCateg = TArray(), FindAccFlag = false;
+  var S1 = TArray(), B1 = $0, B2 = $0, S = $0, РВПпоПРЕПОпоСтЦБ = IIF(РВПпоПРЕПОпоСтоимостиЦБ()==1,true,false), i = 0, FD2;
+  var DealID, NeedCalc, err, Rnew = TArray(), Reserv = $0, Rold = $0, RiskAttrID = 0, RiskNumSec = 0, Рцб = 0., Рцб_max = 0., ReservAmount_Total = 0., ReservAmount = 0., ReservSum_Total = 0.,
+      LastDate = Date(0,0,0), ReservArr = CLotInfoArray(), IsExistRes = false, NumReserAcc = "", stat = 0, k = 0, ArrFIIDRiskParam = FIIDRiskParam(), ArrFIIDNumAccountBPP = FIIDNumAccount();
+  var Percent, vAccount  = "", NumAccount_OD = "";
+
+  macro DefineAcc(CategName:string, FIRole:integer)
+     InAcc.Clear();
+     if( Data.FD.IsExistAccount( CategName, null, true, FIRole, InAcc, null, Data.DateReserv ) )
+        return true;
+     end;
+     return false;
+  end;
+
+  if( (Data.ScOprServDoc.Flag7 != SET_CHAR) OR
+      (SP_DealNeedReserv( int(KINDRES_SALEREPO2), Data.ScOprServDoc, Data.FD.tick ) == false)
+    )
+     return true;
+  end;
+
+  Data.CalcReserv = Data.CalcReserv + 1;
+
+  S1[BPP]=$0;
+  S1[PVO] =$0;
+
+  /*NumAccount только для протокола*/
+  NumAccount[PVO]  = "";
+
+  if(ВедениеСчетовБПППоВыпуску() == true)
+    CategName[BPP]       = "Наш портфель ц/б";
+    CategName[BPP_CONTR] = "Наш портфель ПКУ, ц/б";
+  else
+  CategName[BPP]       = IIF(IsBasket(Data.FD.Group), "Ц/б, Корзина БПП", "Ц/б, БПП");
+  CategName[BPP_CONTR] = IIF(IsBasket(Data.FD.Group), "Ц/б, Корзина ПКУ БПП", "Ц/б, ПКУ БПП");
+  end;
+
+  CategName[PVO]       = IIF(IsBasket(Data.FD.Group), "Ц/б, ПВО_БПП, Корзина", "Ц/б, ПВО_БПП");
+
+  ReservCateg[BPP] = "Резерв ц/б";
+  ReservCateg[PVO]  = "Резерв, договор";
+
+  Data.FD.SetCurPFI(Data.FD.dl_leg.rec.PFI);
+  /*остаток на счете по учету обязательств по возврату денежных средств */
+  InAcc.Clear();               
+  if( Data.FD.IsExistAccount( "-ОД", null, false, null, InAcc, null, Data.DateReserv, Data.FD.FaceFIID()) )
+     S = GetRestAccount( InAcc.rec, Data.DateReserv );
+     NumAccount_OD = InAcc.rec.Account;
+  else
+     if(ExistPlanGrDealBeforeDate(Data.FD.CurPFI(), Data.DateReserv) == true)
+        SayReservError( 1, "В строках графиков исполнения сделок по ц/б с кодом "+ ПолучитьКодФинИн(Data.FD.CurPFI())+" есть запланированные действия за более раннюю дату", Data);
+     end;
+     return false;
+  end;
+
+  if( S == $0.0 )
+     /*здесь проверим, что СО БУ выполнена. Если остатка на счете нет, а сам счет открыт, то скорее всего не выполнена БУ по оплате*/
+     if(ExistPlanGrDealBeforeDate(Data.FD.CurPFI(), Data.DateReserv) == true)
+        SayReservError( 1, "В строках графиков исполнения сделок по ц/б с кодом "+ ПолучитьКодФинИн(Data.FD.CurPFI())+" есть запланированные действия за более раннюю дату", Data);
+     end;
+     return false;
+  end;
+
+  if( not SmartConvertSum( S, S, Data.DateReserv, Data.FD.GetPayFIID(), NATCUR, false) )
+     return SayReservError( 1,  "Ошибка при конвертации суммы остатка счета категории \"-ОД\" из "+ ПолучитьКодФинИн(Data.FD.GetPayFIID())+" в " + ПолучитьКодФинИн(NATCUR), Data);
+  end;
+
+  var Rest:money = $0.0;
+  var ArrFIID = Data.FD.RQGetArrFIID(DLRQ_TYPE_DELIVERY);
+  var j:integer = 0;
+  while( j < ArrFIID.size )
+
+     Data.FD.SetCurPFI(ArrFIID(j));
+     /*остаток на счете по учету ц/б, переданных без прекращения признания (счета категорий <Ц/б, БПП> или <Ц/б, ПВО_БПП>)*/
+     /*по сделке их может быть от 1 до 3-х*/
+     if( DefineAcc(CategName[BPP],GetFIRoleByPortfolio(KINDPORT_SSPU, null, null, true)) )
+       Rest = GetRestAccount(InAcc.rec, Data.DateReserv);
+       if( Rest != 0 )
+          if( not SmartConvertSum(Rest, Rest, Data.DateReserv, Data.FD.FaceFIID(), NATCUR, false) )
+             return SayReservError( 1,  "Ошибка при конвертации остатка счета категории \"" + CategName[BPP] + "\" из "+ ПолучитьКодФинИн(Data.FD.FaceFIID())+" в " + ПолучитьКодФинИн(NATCUR), Data);
+          end;
+          S1[BPP] = S1[BPP] - Rest;/*вычитаем , т.к. счет активный*/
+       end;
+       ArrFIIDNumAccountBPP.AddAccount(ArrFIID(j),KINDPORT_SSPU,InAcc.rec.Account,-Rest);
+       FindAccFlag = true;
+     end;
+    
+     if( DefineAcc(CategName[BPP],GetFIRoleByPortfolio(KINDPORT_SSSD, null, null, true)) )
+       Rest = GetRestAccount(InAcc.rec, Data.DateReserv);
+       if( Rest != 0 )
+          if( not SmartConvertSum(Rest, Rest, Data.DateReserv, Data.FD.FaceFIID(), NATCUR, false) )
+             return SayReservError( 1,  "Ошибка при конвертации остатка счета категории \"" + CategName[BPP] + "\" из "+ ПолучитьКодФинИн(Data.FD.FaceFIID())+" в " + ПолучитьКодФинИн(NATCUR), Data);
+          end;
+          S1[BPP] = S1[BPP] - Rest;/*вычитаем , т.к. счет активный*/
+       end;
+       ArrFIIDNumAccountBPP.AddAccount(ArrFIID(j),KINDPORT_SSSD,InAcc.rec.Account,-Rest);
+       FindAccFlag = true;
+     end;
+    
+     if( DefineAcc(CategName[BPP],GetFIRoleByPortfolio(KINDPORT_ASCB, null, null, true)) )
+       Rest = GetRestAccount(InAcc.rec, Data.DateReserv);
+       if( Rest != 0 )
+          if( not SmartConvertSum(Rest, Rest, Data.DateReserv, Data.FD.FaceFIID(), NATCUR, false) )
+             return SayReservError( 1,  "Ошибка при конвертации остатка счета категории \"" + CategName[BPP] + "\" из "+ ПолучитьКодФинИн(Data.FD.FaceFIID())+" в " + ПолучитьКодФинИн(NATCUR), Data);
+          end;
+          S1[BPP] = S1[BPP] - Rest;/*вычитаем , т.к. счет активный*/
+       end;
+       ArrFIIDNumAccountBPP.AddAccount(ArrFIID(j),KINDPORT_ASCB,InAcc.rec.Account,-Rest);
+       FindAccFlag = true;
+     end;
+
+     if( DefineAcc(CategName[BPP_CONTR], GetFIRoleByPortfolio(KINDPORT_CONTR, null, null, true)) )
+       Rest = GetRestAccount(InAcc.rec, Data.DateReserv);
+       if( Rest != 0 )
+          if( not SmartConvertSum(Rest, Rest, Data.DateReserv, Data.FD.FaceFIID(), NATCUR, false) )
+             return SayReservError(1,  "Ошибка при конвертации остатка счета категории \"" + CategName[BPP_CONTR] + "\" из " + ПолучитьКодФинИн(Data.FD.FaceFIID()) + " в " + ПолучитьКодФинИн(NATCUR), Data);
+          end;
+          S1[BPP] = S1[BPP] - Rest;/*вычитаем , т.к. счет активный*/
+       end;
+       ArrFIIDNumAccountBPP.AddAccount(ArrFIID(j), KINDPORT_CONTR, InAcc.rec.Account, -Rest);
+       FindAccFlag = true;
+     end;
+
+     j = j + 1;
+  end;
+
+  j = 0;
+  while( j < ArrFIID.size )
+
+     Data.FD.SetCurPFI(ArrFIID(j));
+
+     if( DefineAcc(CategName[PVO],null) )
+       Rest = GetRestAccount(InAcc.rec, Data.DateReserv);
+       if( Rest != 0 )
+          if( not SmartConvertSum(Rest, Rest, Data.DateReserv, Data.FD.FaceFIID(), NATCUR, false) )
+             return SayReservError( 1,  "Ошибка при конвертации остатка счета категории \""+CategName[PVO]+"\" из "+ ПолучитьКодФинИн(Data.FD.FaceFIID())+" в " + ПолучитьКодФинИн(NATCUR), Data);
+          end;
+       end;
+       S1[PVO] = S1[PVO] - Rest;/*вычитаем , т.к. счет активный*/
+       NumAccount[PVO] = NumAccount[PVO] + InAcc.rec.Account+ "|";
+       FindAccFlag = true;
+     end;
+
+     j = j + 1;
+  end;
+
+  err = GetRiskAndPercent( Data, KINDRES_SALEREPO2, true );
+  if( err != "" )
+     return SayReservError( 1, err, Data);
+  end;
+
+  if( FindAccFlag and ((abs(S1[BPP]) > $0) or (abs(S1[PVO]) > $0)) )
+     j = 0;
+     while( j < ArrFIID.size )
+        Data.FD.SetCurPFI(ArrFIID(j));
+        /*остаток на счете по учету положительной переоценки требований */
+           InAcc.Clear();
+        if(Data.FD.IsExistAccount( "+Переоценка, ц/б ССПУ_ЦБ", null, true, GetFIRoleByPortfolio( KINDPORT_SSPU ), InAcc, MC_PAIRACCMODE_MANUAL, Data.DateReserv ))
+              Rest = -GetRestAccount( InAcc.rec, Data.DateReserv );/*вычитаем , т.к. счет активный*/
+           ArrFIIDNumAccountBPP.AddRestByPortfolio(ArrFIID(j),KINDPORT_SSPU,Rest);
+              B1 = B1 + Rest; 
+           end;
+
+        if( ПарностьСчетовПереоценки() )
+           InAcc.Clear();
+           if(Data.FD.IsExistAccount( "+Переоценка, ц/б СССД_ЦБ", null, true, GetFIRoleByPortfolio( KINDPORT_SSSD ), InAcc, MC_PAIRACCMODE_MANUAL, Data.DateReserv ))
+              Rest = -GetRestAccount( InAcc.rec, Data.DateReserv );/*вычитаем , т.к. счет активный*/
+              ArrFIIDNumAccountBPP.AddRestByPortfolio(ArrFIID(j),KINDPORT_SSSD,Rest);
+              B1 = B1 + Rest; 
+           end;
+        else
+           InAcc.Clear();
+           if(Data.FD.IsExistAccount( "+Переоценка, ц/б", null, true, GetFIRoleByPortfolio( KINDPORT_SSSD ), InAcc, MC_PAIRACCMODE_MANUAL, Data.DateReserv ))
+              Rest = -GetRestAccount( InAcc.rec, Data.DateReserv );/*вычитаем , т.к. счет активный*/
+              ArrFIIDNumAccountBPP.AddRestByPortfolio(ArrFIID(j),KINDPORT_SSSD,Rest);
+              B1 = B1 + Rest; 
+           end;
+        end;
+
+        /*остаток на счете по учету отрицательной переоценки требований */
+           InAcc.Clear();
+        if(Data.FD.IsExistAccount( "-Переоценка, ц/б ССПУ_ЦБ", null, true, GetFIRoleByPortfolio( KINDPORT_SSPU ), InAcc, MC_PAIRACCMODE_MANUAL, Data.DateReserv ))
+              Rest = GetRestAccount( InAcc.rec, Data.DateReserv );
+           ArrFIIDNumAccountBPP.AddRestByPortfolio(ArrFIID(j),KINDPORT_SSPU,Rest);
+              B2 = B2 + Rest;
+           end;
+        if( ПарностьСчетовПереоценки() )
+           InAcc.Clear();
+           if(Data.FD.IsExistAccount( "-Переоценка, ц/б СССД_ЦБ", null, true, GetFIRoleByPortfolio( KINDPORT_SSSD ), InAcc, MC_PAIRACCMODE_MANUAL,  Data.DateReserv ))
+              Rest = GetRestAccount( InAcc.rec, Data.DateReserv );
+              ArrFIIDNumAccountBPP.AddRestByPortfolio(ArrFIID(j),KINDPORT_SSSD,Rest);
+              B2 = B2 + Rest;
+           end;
+        else
+           InAcc.Clear();
+           if(Data.FD.IsExistAccount( "-Переоценка, ц/б", null, true, GetFIRoleByPortfolio( KINDPORT_SSSD ), InAcc, MC_PAIRACCMODE_MANUAL,  Data.DateReserv ))
+              Rest = GetRestAccount( InAcc.rec, Data.DateReserv );
+              ArrFIIDNumAccountBPP.AddRestByPortfolio(ArrFIID(j),KINDPORT_SSSD,Rest);
+              B2 = B2 + Rest;
+           end;
+        end;
+
+        j = j + 1;
+     end;
+
+     ArrFIIDRiskParam.ClearArray;
+     Рцб_max = 0;/*для ПРЕПО на корзину ищем максимальный процент резервирования среди выпусков обеспечения*/
+     if( РВПпоПРЕПОпоСтЦБ )
+        /*взведена настройка, значит проверяем категории и примечание на ц\б*/
+        /*Получить "Группа риска" */
+        err = "";
+        j = 0;
+        while( j < ArrFIID.size )/*переберем все ц\б и для всех выведем сообщения об ошибках, если они есть*/
+
+           stat = 0;
+           Рцб = 0;
+           Data.FD.SetCurPFI(ArrFIID(j));
+           RiskNumSec = 0;
+
+           if( not GetMainObjAttr( null, OBJTYPE_AVOIRISS, UniID( Data.FD.avoiriss(), OBJTYPE_AVOIRISS), 13/*Категория качества*/, RiskAttrID, null, RiskNumSec, Data.DateReserv ) )
+              stat = 1;
+              err = "Для ц/б с кодом \""+Data.FD.fininstr().rec.FI_Code+"\" не указана категория качества |\"" + ИмяКатегории( OBJTYPE_AVOIRISS,13 ) + "\"";
+           end;
+           
+           if( (stat==0) and (RiskNumSec != 1) )
+              Рцб = double( readNoteForObject( OBJTYPE_AVOIRISS, UniID( Data.FD.avoiriss(), OBJTYPE_AVOIRISS), NOTEKIND_AVOIR_RSKPERC, Data.DateReserv ) );
+              if( Рцб < 0 ) 
+                 stat = 1;
+                 err = "Для ц/б с кодом \""+Data.FD.fininstr().rec.FI_Code+"\" не задано примечание |\"" + ИмяПримечания( OBJTYPE_AVOIRISS, NOTEKIND_AVOIR_RSKPERC ) + "\" на дату " + string(Data.DateReserv);
+              else
+                 Рцб = Рцб/100;
+              end;
+           end;
+           
+           Percent = Рцб * 100;
+           
+           if(  (stat==0) and 
+                (
+                  ( (RiskNumSec == 1) AND (Percent != 0) ) OR
+                  ( (RiskNumSec == 2) AND ( (Percent < 1 ) OR (Percent > 20)) ) OR
+                  ( (RiskNumSec == 3) AND ( (Percent < 21) OR (Percent > 50)) ) OR
+                  ( (RiskNumSec == 4) AND ( (Percent < 51) OR (Percent > 99)) ) OR
+                  ( (RiskNumSec == 5) AND (Percent != 100) )
+                )
+             )
+               stat = 1;
+               err = "Для ц/б с кодом \""+Data.FD.fininstr().rec.FI_Code+"\"  процент резервирования "+string(Percent)+"% не соответствует заданной категории качества "+string(RiskNumSec)+".";
+           end;
+
+           if( ExistNOSS(Data.FD.avoiriss(),Data.DateReserv) )/* для тех, которые имеют ТСС, резервы по ц\б не создаются - считаем, что Рцб = 0*/
+              Percent = Рцб = 0;
+              RiskNumSec = 1;
+           end;
+
+           ArrFIIDRiskParam.AddFIID(ArrFIID(j),Percent,RiskNumSec);
+
+           if( (stat==0) and (Рцб_max < Рцб) )
+              Рцб_max = Рцб;
+           end;
+
+           if( stat )
+              SayReservError( 1, err, Data);
+           end;
+
+           j = j + 1;
+        end;
+
+        if( err != "" )
+           return false;
+        end;
+
+     end;
+
+     Rnew[BPP] = S1[BPP] - abs(B1) + abs(B2) - S;
+     if( Rnew[BPP] < 0 )
+        Rnew[BPP] = $0;
+     end;
+
+     if( РВПпоПРЕПОпоСтЦБ )
+        Rnew[BPP] = money(round(S*Рцб_max + Rnew[BPP]*max(Data.PcRate,Рцб_max)));
+     else
+        Rnew[BPP] = money(round(Rnew[BPP]*Data.PcRate));
+     end;
+
+     if( Rnew[BPP] < 0 )
+        Rnew[BPP] = $0;
+     end;
+
+     Rnew[PVO] = S1[PVO] - S;
+     if( Rnew[PVO] < 0 )
+        Rnew[PVO] = $0;
+     end;
+     Rnew[PVO] = money(round(Rnew[PVO]*Data.PcRate));
+
+     FD2 = SPFirstDoc( Data.FD.tick, true );
+     j = 0;
+     while( j < ArrFIID.size )
+
+        FD2.SetCurPFI(ArrFIID(j));
+
+        i = 0;
+        while( FD2.pmwrtsum(i) != null )
+          if( (FD2.pmwrtsum(i).rec.Portfolio == KINDPORT_SSPU) or (FD2.pmwrtsum(i).rec.Portfolio == KINDPORT_SSSD) or (FD2.pmwrtsum(i).rec.Portfolio == KINDPORT_ASCB) or (FD2.pmwrtsum(i).rec.Portfolio == KINDPORT_CONTR) or (FD2.pmwrtsum(i).rec.Portfolio == KINDPORT_BASICDEBT) )
+             ReservArr.SetSumByPort(FD2.pmwrtsum(i).rec.Amount,FD2.pmwrtsum(i).rec.Portfolio);
+          end; 
+          i = i + 1;
+        end;
+
+        j = j + 1;
+     end;
+
+     ReservAmount_Total = ReservArr.GetTotalSum(true);/*берем только БПП (ПВО не берем)*/
+     ReservArr.Sorting;/*сортируем в порядке возрастания*/
+
+     if( (ReservAmount_Total) > 0. )
+        var ReservSumRest = $0, RnewRest = Rnew[BPP]; 
+        i = 0;
+        while( i < ReservArr.Size() )
+           if( ReservArr[i].Portfolio != KINDPORT_BASICDEBT )
+              ReservArr[i].ReservSum = round(money((RnewRest * ReservArr[i].Amount)/ReservAmount_Total));
+              RnewRest = RnewRest - ReservArr[i].ReservSum;
+              ReservAmount_Total = ReservAmount_Total - ReservArr[i].Amount;
+           end;
+           i = i + 1;
+        end;
+
+        if( (RnewRest != $0.) or (ReservAmount_Total != 0.0) )
+           return "Ошибка начисления резерва по ц/б по сделке с кодом \""+Data.FD.tick().rec.DealCode+"\".";
+        end;
+     end;
+
+     i = 0;
+     while( i < ReservArr.Size() )
+        if( ReservArr[i].Portfolio == KINDPORT_BASICDEBT )
+           ReservArr[i].ReservSum = round(money(Rnew[PVO]));
+        end;
+        i = i + 1;
+     end;
+
+     i = 0;
+     while( i < ReservArr.Size() )
+
+        ReservAcc.Clear();                 
+        Data.FD.SetCurPFI(Data.FD.dl_leg.rec.PFI);
+
+        if( ReservArr[i].Portfolio == KINDPORT_BASICDEBT )
+
+           IsExistRes = false;        
+
+           if( Data.FD.IsExistAccount( ReservCateg[PVO], null, true, РолиСчРезерваПоТр2чПРЕПО(ReservArr[i].Portfolio), ReservAcc, null, Data.DateReserv ) == true )
+              Rold = ABS(GetRestAccount( ReservAcc.rec, Data.DateReserv ));
+           elif( Rnew[PVO] != $0 )
+              if( not Data.FD.OpenAccount( ReservCateg[PVO], null, false, РолиСчРезерваПоТр2чПРЕПО(ReservArr[i].Portfolio), ReservAcc, Data.DateReserv ) )
+                 return false;
+              end;
+              Rold = $0;
+           end;
+
+           Reserv = ReservArr[i].ReservSum - Rold;
+          
+           if( (Reserv != $0) and Data.Update )
+              if( not НачислитьРезерв("РС, д/с", FIROLE_BA, Data, Reserv) )
+                 return false;
+              else
+                 NumReserAcc = NumReserAcc + ReservAcc.rec.Account+ "|";
+                 IsExistRes = true;        
+              end;
+           end;
+
+           if( IsExistRes and Data.Update )
+              ScOpReportLineData[ScOpReportLineData.Size] = SvOpReserve(
+                 Data.ReservObj.rec.DealID,      //ObjID           
+                 Data.PcRate*100,                //ResPc          
+                 Data.RiskNum,                   //RiskGrp
+                 ReservArr[i].ReservSum,         //BaseSum   
+                 Rold,                           //OldReserv  
+                 NumAccount[PVO],                //BaseAcc    
+                 NumReserAcc,                    //ReservAcc  
+                 NULL,                           //AccDbt
+                 NULL,                           //AccCred
+                 false,                          //IsDealNtg  
+                 $0,                             //CostRUR    
+                 $0,                             //MarketSum  
+                 false,                          //IsBiVal    
+                 $0,                             //GuarantSum 
+                 KINDRES_SALEREPO2,              //ResKind    
+                 $0,                             //CorrectSum
+                 РВПпоПРЕПОпоСтЦБ,               //IsSetting  
+                 NumAccount_OD,                  //ReqAcc     
+                 -1,                             //ResPcSec   
+                 -1,                             //RiskGrpSec 
+                 S1[PVO],                        //AccRest_PVO
+                 S                               //AccRest_OD 
+                 );
+           end;
+
+        else
+
+           ReservAmount_Total = ReservArr[i].Amount;
+           ReservSum_Total = ReservArr[i].ReservSum; 
+
+           j = 0;
+           while( j < ArrFIID.size )
+
+              Data.FD.SetCurPFI(ArrFIID(j));
+              FD2.SetCurPFI(ArrFIID(j));
+              ReservAmount = Reserv = $0;
+              NumReserAcc = "";
+              IsExistRes = false;
+
+              LastDate = Date(0,0,0);
+              Rold = ПолучитьПоследнююСумму( DL_SECURITYDOC, Data.FD.tick.rec.DealID, GetDlSumKindResSaleRepo2(ReservArr[i].Portfolio), LastDate, null, IIF(IsBasket(Data.FD.Group),ArrFIID(j),null) );
+              if (LastDate >= Data.DateReserv)
+                 MsgBox( "Дата последней суммы резерва по требованиям (РПР) "+string(LastDate)+" для сделки с кодом " + 
+                         string(Data.FD.tick.rec.DealCode) + 
+                         " не должна быть меньше даты операции "+string(Data.DateReserv));      
+                 return false;
+              end;
+
+              k = 0;
+              while( FD2.pmwrtsum(k) != null )/*в случае ПРЕПО на корзину вынуждены распределять резерв пропорционально кол-ву ц\б в корзине (может быть несколько лотов с данным FIID в данном портфеле)*/
+                if( (FD2.pmwrtsum(k).rec.Portfolio == ReservArr[i].Portfolio) and (FD2.pmwrtsum(k).rec.FIID == ArrFIID(j)) )
+                    ReservAmount = ReservAmount + FD2.pmwrtsum(k).rec.Amount;
+                end; 
+                k = k + 1;
+              end;
+
+              if( ReservAmount > $0. )
+                 /*берем сумму резерва пропорционально кол-ву ц\б в данном портфеле, т.к. параметризация счета и по Ц\Б и по протфелю*/
+                 Reserv = round(money((ReservSum_Total * ReservAmount)/ReservAmount_Total));
+                 ReservSum_Total = ReservSum_Total - Reserv;
+                 ReservAmount_Total = ReservAmount_Total - ReservAmount;
+
+                 Reserv = Reserv - Rold;
+                
+                 if( Rold != $0 )
+                    if( not Data.FD.IsExistAccount( ReservCateg[BPP], null, true, РолиСчРезерваПоТр2чПРЕПО(ReservArr[i].Portfolio), ReservAcc, null, Data.DateReserv ) )
+                       return false;
+                    end;
+                 elif( ReservArr[i].ReservSum != $0 )
+                    if( not Data.FD.OpenAccount( ReservCateg[BPP], null, false, РолиСчРезерваПоТр2чПРЕПО(ReservArr[i].Portfolio), ReservAcc, Data.DateReserv ) )
+                       return false;
+                    end;
+                 end;
+                
+                 if( (Reserv != $0) and Data.Update )
+                    if( not НачислитьРезерв("РС, д/с", FIROLE_BA, Data, Reserv) )
+                       return false;
+                    else
+                       if( not СохранитьСуммуКомиссии( DL_SECURITYDOC, Data.FD.tick.rec.DealID, GetDlSumKindResSaleRepo2(ReservArr[i].Portfolio), Data.DateReserv, abs(Reserv), $0, NATCUR, null, null, IIF(IsBasket(Data.FD.Group),ArrFIID(j),null) ) )
+                          return SayReservError( 1, "Ошибка при сохранении суммы резерва по требованиям (РПР) по сделке "+Data.FD.tick.rec.DealCode, Data);
+                       end; 
+                       NumReserAcc = NumReserAcc + ReservAcc.rec.Account+ "|";
+                       IsExistRes = true;        
+                    end;
+                 end;
+              end;
+
+              /*по каждой проводке одна запись в протокол*/
+              if( IsExistRes and Data.Update )
+
+                    ArrFIIDRiskParam.GetRiskParamByFIID(ArrFIID(j),@Percent,@RiskNumSec);
+                    if( (Percent == -1) and (RiskNumSec == -1) )
+                       Percent = Data.PcRate*100;
+                       RiskNumSec = Data.RiskNum;
+                    end;
+
+                    vAccount = ArrFIIDNumAccountBPP.GetAccByFIIDAndPort(ArrFIID(j),ReservArr[i].Portfolio);
+
+                    ScOpReportLineData[ScOpReportLineData.Size] = SvOpReserve(
+                    Data.ReservObj.rec.DealID,      //ObjID           
+                    Data.PcRate*100,                //ResPc          
+                    Data.RiskNum,                   //RiskGrp
+                    Reserv + Rold,                  //BaseSum   
+                    Rold,                        //OldReserv  
+                    vAccount,                       //BaseAcc    
+                    NumReserAcc,                    //ReservAcc  
+                    NULL,                           //AccDbt
+                    NULL,                           //AccCred
+                    false,                          //IsDealNtg  
+                    $0,                             //CostRUR    
+                    $0,                             //MarketSum  
+                    false,                          //IsBiVal    
+                    $0,                             //GuarantSum 
+                    KINDRES_SALEREPO2,              //ResKind    
+                    $0,                             //CorrectSum
+                    РВПпоПРЕПОпоСтЦБ,               //IsSetting  
+                    NumAccount_OD,                  //ReqAcc     
+                    Percent,                        //ResPcSec   
+                    RiskNumSec,                     //RiskGrpSec 
+                    ArrFIIDNumAccountBPP.GetRestAccByFIIDAndPort(ArrFIID(j),ReservArr[i].Portfolio,vAccount),//AccRest_BPP
+                    S                               //AccRest_OD 
+                    );
+              end;
+
+              j = j + 1;
+           end;
+
+           if( (ReservSum_Total != 0.0) or (ReservAmount_Total != 0.0) )
+              return "Ошибка начисления резерва по сделке с кодом \""+Data.FD.tick().rec.DealCode+"\".";
+           end;
+
+        end;
+
+        i = i + 1;
+     end;
+ 
+  end;
+
+  return true;
+
+END;
+
+PRIVATE MACRO РезервПоПроцентнымТребованиям( Data:CReservData ):BOOL
+  var err, Rnew = $0, Reserv = $0, Rold = $0, BaseSum = $0, C, УД, ОД, S1, A2, Sод;
+  var SaveFD = Data.FD;
+
+  if( (Data.ScOprServDoc.Flag6 != SET_CHAR) OR
+      (SP_DealNeedReserv( KINDRES_RPOR, Data.ScOprServDoc, Data.FD.tick ) == false)
+    )
+     return true;
+  end;
+
+  Data.CalcReserv = Data.CalcReserv + 1;
+
+  Data.FD = SPFirstDocDealReserv( Data.ReservObj, Data.ScOprServDoc.OperationKind, true );
+
+  if( not Data.FD.IsExistAccount( "+% к погашению", null, true, null, InAcc, null, Data.DateReserv ) )
+     return true;
+  end;
+
+  err = GetRiskAndPercent( Data );
+  if( err != "" )
+     return SayReservError( 1, err, Data);
+  end;
+
+  err = GetReservGuarant( Data, false );
+  if( err != "" )
+     return SayReservError( 1, err, Data);
+  end;
+
+  var S1Query = "select t_Amount, nvl(t_ID, 0) as t_ID from ddlrq_dbt where t_DocKind = " + DL_SECURITYDOC + " and t_DocID = ? and t_DealPart = 1 and t_Type in (" + DLRQ_TYPE_PAYMENT + ", " + DLRQ_TYPE_AVANCE + ")";
+  var S1Select = DL_RSDCommand(S1Query);
+  S1Select.AddParam(Data.ReservObj.rec.DealID);
+  var S1DataSet = S1Select.Execute();
+  var A2Query = "select t_Amount, nvl(t_ID, 0) as t_ID from ddlrq_dbt where t_DocKind = " + DL_SECURITYDOC + " and t_DocID = ? and t_DealPart = 2 and t_Type = " + DLRQ_TYPE_AVANCE;
+  var A2Select = DL_RSDCommand(A2Query);
+  A2Select.AddParam(Data.ReservObj.rec.DealID);
+  var A2DataSet = A2Select.Execute();
+
+  var AvanceState = -1;
+  var PaymState = -1;
+  
+  if(S1DataSet.MoveNext())
+    S1 = S1DataSet.Amount;
+    PaymState = DL_GetRQStateOnDate(S1DataSet.ID, Data.DateReserv);
+  end;
+
+  if(A2DataSet.MoveNext())
+    A2 = A2DataSet.Amount;
+    AvanceState = DL_GetRQStateOnDate(A2DataSet.ID, Data.DateReserv);
+  else
+    A2 = 0;
+  end;
+
+  if(((AvanceState == DLRQ_STATE_EXEC) or (AvanceState == DLRQ_STATE_OVERDUE)) and (PaymState != DLRQ_STATE_EXEC) and (PaymState != DLRQ_STATE_OVERDUE))
+    ОД = S1 - A2;
+  else
+    ОД = S1;
+  end;
+
+  Sод = ABS(GetRestAccount(InAcc.rec, Data.DateReserv));
+
+  УД = Sод / (ОД + Sод);
+  C = Data.Guarant * УД;
+  if(Sод != 0)
+    BaseSum = Sод * (1 - C / Sод);
+  else
+    BaseSum = 0;
+  end;
+  Rnew = money(BaseSum * Data.PcRate);
+
+  if( Data.FD.IsExistAccount( "Резерв, договор", null, true, FIROLE_RESERV_RPOR, ReservAcc, null, Data.DateReserv ) == true )
+     Rold = ABS(GetRestAccount( ReservAcc.rec, Data.DateReserv ));
+  elif( Rnew != 0 )
+     if( not Data.FD.OpenAccount( "Резерв, договор", null, false, FIROLE_RESERV_RPOR, ReservAcc, Data.DateReserv ) )
+        return false;
+     end;
+     Rold = $0;
+  end;
+
+  Reserv = Rnew - Rold;
+
+  if( (Reserv != $0) and Data.Update )
+     if( not НачислитьРезерв("РС,д/с%", FIROLE_BA, Data, Reserv) )
+        return false;
+     else
+         ScOpReportLineData[ScOpReportLineData.Size] = SvOpReserve(
+             Data.ReservObj.rec.DealID, 
+             Data.PcRate*100, Data.RiskNum,  BaseSum, 
+             Rold, InAcc.rec.Account, ReservAcc.rec.Account, null, null, null, null, null, null, C/*Data.Guarant*/ );
+     end;
+  end;
+
+  Data.РезервПоПроцентнымТребованиям = Data.РезервПоПроцентнымТребованиям + Rnew/*Reserv*/;
+  Data.FD = SaveFD;
+
+  return true;
+END;
+
+PRIVATE MACRO РезервПоПросроченнымТребованиям( Data:CReservData, IsNetting:BOOL ):BOOL
+  var DealID, NeedCalc, err, Rnew = $0, Reserv = $0, Rold = $0, BaseSum = $0, Amount = $0;
+  var SaveFD = Data.FD;
+
+  if( (Data.ScOprServDoc.Flag1 != SET_CHAR) AND (Data.ScOprServDoc.Flag2 != SET_CHAR) )
+     return true;
+  end;
+
+  if( IsNetting == false )
+     if( SP_DealNeedReserv( KINDRES_EXPREQ, Data.ScOprServDoc, Data.FD.tick ) == false)
+        return true;
+     end;
+
+     if( IsREPO( Data.FD.Group ) )
+        Data.FD = SPFirstDocDealReserv( Data.ReservObj, Data.ScOprServDoc.OperationKind, true );
+     end;
+  else
+     if( SP_NtgNeedReservReq( Data.ScOprServDoc, Data.FD.Deal ) != 0)
+        return true;
+     end;
+  end;
+
+  Data.CalcReserv = Data.CalcReserv + 1;
+
+  if( not Data.FD.IsExistAccount(IIF(IsBasket(Data.FD.Group), "Треб. с н.с., корзина", "Треб. с н.с."), null, true, null, InAcc, null, Data.DateReserv ) )
+     return true;
+  end;
+
+  err = GetRiskAndPercent( Data, KINDRES_EXPREQ, true );
+  if( err != "" )
+     return SayReservError( 1, err, Data);
+  end;
+
+  if( Data.DocKind == DL_NTGSEC )
+     if( РезервПоТО( KINDRES_EXPREQ, Data, Data.FD.GetRQ(DLRQ_TYPE_PAYMENT), Data.FD.GetRQ(DLRQ_TYPE_PAYMENT).rec.Amount, Data.FD.GetRQ(DLRQ_TYPE_PAYMENT).rec.FIID, Rnew, BaseSum, true ) == false )
+        return false;
+     end;
+  else
+     if( Data.FD.BuySale == DEAL_TYPE_SALE )
+        if( РезервПоТО( KINDRES_EXPREQ, Data, Data.FD.GetRQ(DLRQ_TYPE_PAYMENT), Data.FD.GetRQ(DLRQ_TYPE_PAYMENT).rec.Amount, Data.FD.GetRQ(DLRQ_TYPE_PAYMENT).rec.FIID, Rnew, BaseSum, true ) == false )
+           return false;
+        end;
+        if( (Data.FD.ExistAvance == true) AND
+            (РезервПоТО( KINDRES_EXPREQ, Data, Data.FD.GetRQ(DLRQ_TYPE_AVANCE), Data.FD.GetRQ(DLRQ_TYPE_AVANCE).rec.Amount, Data.FD.GetRQ(DLRQ_TYPE_AVANCE).rec.FIID, Rnew, BaseSum, true ) == false)
+          )
+           return false;
+        end;
+     else
+        Amount = Data.FD.GetRQ(DLRQ_TYPE_PAYMENT).rec.Amount;
+        if(Data.FD.ExistAvance)
+          Amount = Amount + Data.FD.GetRQ(DLRQ_TYPE_AVANCE).rec.Amount;
+        end;
+        if( РезервПоТО( KINDRES_EXPREQ, Data, Data.FD.GetRQ(DLRQ_TYPE_PAYMENT), 
+                             Amount, 
+                             Data.FD.GetRQ(DLRQ_TYPE_PAYMENT).rec.FIID, Rnew, BaseSum, true ) == false )
+           return false;
+        end;
+     end;
+  end; 
+
+  if( Data.FD.IsExistAccount( "Резерв, договор", null, true, FIROLE_RESERV_RPT, ReservAcc, null, Data.DateReserv ) == true )
+     Rold = ABS(GetRestAccount( ReservAcc.rec, Data.DateReserv ));
+  elif( Rnew != 0 )
+     if( not Data.FD.OpenAccount( "Резерв, договор", null, false, FIROLE_RESERV_RPT, ReservAcc, Data.DateReserv ) )
+        return false;
+     end;
+     Rold = $0;
+  end;
+
+  Reserv = Rnew - Rold;
+
+  if( (Reserv != $0) and Data.Update )
+
+     if( IsREPO(Data.FD.Group) )
+        if( not НачислитьРезерв("РС,д/с%", FIROLE_BA, Data, Reserv) )
+           return false;
+        end;
+     else
+        if( not НачислитьРезерв("РС, д/с", FIROLE_BA, Data, Reserv) )
+           return false;
+        end;
+     end;
+
+     ScOpReportLineData[ScOpReportLineData.Size] = SvOpReserve(
+         Data.FD.ID, 
+         Data.PcRate*100,Data.RiskNum, BaseSum, 
+         Rold, InAcc.rec.Account, ReservAcc.rec.Account );
+  end;
+
+  Data.РезервПоПросроченнымТребованиям = Data.РезервПоПросроченнымТребованиям + Rnew/*Reserv*/;
+  Data.FD = SaveFD;
+  return true;
+END;
+
+PRIVATE MACRO РезервПоТребованиям( Data:CReservData )
+
+  Data.CalcReserv = 0;
+
+  if( Data.ObjKind == OBJTYPE_NETTING )
+     if( РезервПоПросроченнымТребованиям( Data, true ) == false )
+        return false;
+     end;
+  else
+     if( РезервПоТребованиямСОтсрочкойПлатежа( Data ) == false )
+        return false;
+     end;
+
+     if( РезервПоПросроченнымТребованиям( Data, false ) == false )
+        return false;
+     end;
+
+     if( РезервПоРепоОбр2ч( Data ) == false )
+        return false;
+     end;
+
+     if( РезервПоПроцентнымТребованиям( Data ) == false )
+        return false;
+     end;
+
+     if( РезервПоПросроченнымПроцентнымТребованиям( Data ) == false )
+        return false;
+     end;
+
+     if( РезервПоРепоПрм2ч( Data ) == false )
+        return false;
+     end;
+
+     if(РОРЕПО(Data) == false)
+        return false;
+     end;
+
+     if(РОРПОР(Data) == false)
+        return false;
+     end;
+
+     if(РезервПоНеотнРасхПоСущЗатр(Data) == false)
+        return false;
+     end;
+
+     if(РезервПоТекКоррПроцПоЭПС(Data) == false)
+        return false;
+     end;
+
+     if(ОцРезервПоПросроченнымТребованиям( Data ) == false)
+        return false;
+     end;
+
+     if(ОцРезервПоПросроченнымПроцентнымТребованиям( Data ) == false)
+        return false;
+     end;
+  end;
+
+  if( Data.CalcReserv == 0 )
+     SayReservError( 1, "Сделка не подходит ни для одного из видов резервирования.", Data);
+     return false;
+  end;
+
+  return true;
+END;
+
+MACRO SP_РасчитатьРезерв( Data:CReservData, ID_Operation, ID_Step )
+
+  if( Data.ScOprServDoc.OperationKind == KINDRES_RCB )
+     return РезервПоВложениям( Data, ID_Operation, ID_Step ); 
+  elif( Data.ScOprServDoc.OperationKind == KINDRES_REQ )
+     return РезервПоТребованиям( Data ); 
+  end;
+
+  return false;
+END;
+
+MACRO ВыполнитьРезервирование( D, FirstDoc, FirstDocKind, ID_Operation, ID_Step )
+
+  VAR ReservObj, FD, Data = CReservData(ScOprServDoc.CommDate, D, ID_Operation, ID_Step, ScOprServDoc, FirstDocKind, NULL, NULL, NULL, true);
+
+  if( (ScOprServDoc.OperationKind != KINDRES_RCB) AND  // РЦБ Резерв по ц/б  
+      (ScOprServDoc.OperationKind != KINDRES_REQ)      // РТ  Резерв по требованиям сделок 
+    )
+     SayReservError( 1, "Запрещено использовать старые виды резервирования.", Data);
+     return 1;
+  end;
+  
+  if( FirstDocKind == DLDOC_ISSUE )
+     ReservObj = TRecHandler( "avoiriss" ); 
+     ReservObj.SetRecordAddr( FirstDoc );
+     FD = SPFirstDocFIReserv( ReservObj.rec.FIID, ScOprServDoc.OperationKind );
+
+     Data = CReservData( ScOprServDoc.CommDate, D, ID_Operation, ID_Step, ScOprServDoc, FirstDocKind, OBJTYPE_AVOIRISS, FD, ReservObj, true );
+     if(ExistPlanGrDealBeforeDate(ReservObj.rec.FIID, ScOprServDoc.CommDate) == true)
+       SayReservError( 1, "В строках графиков исполнения сделок по обрабатываемой бумаге есть запланированные действия за более раннюю дату", Data);
+       return 1;
+     end;
+  elif( FirstDocKind == DL_SECURITYDOC )
+     ReservObj = TRecHandler( "dl_tick" ); 
+     ReservObj.SetRecordAddr( FirstDoc );
+
+     if( ScOprServDoc.OperationKind == KINDRES_REQ )
+        FD = SPFirstDocDealReserv( ReservObj, ScOprServDoc.OperationKind );
+     else
+        SayReservError( 1, "Не определен вид операции резервирования.", Data);
+        return 1;
+     end;
+     Data = CReservData( ScOprServDoc.CommDate, D, ID_Operation, ID_Step, ScOprServDoc, FirstDocKind, OBJTYPE_SECDEAL, FD, ReservObj, true );
+  elif( FirstDocKind == DL_NTGSEC )
+     ReservObj = TRecHandler( "dl_nett" ); 
+     ReservObj.SetRecordAddr( FirstDoc );
+     FD = SPFirstDocNtg( FirstDocKind, ReservObj.rec.NettingID, ScOprServDoc.OperationKind );
+     Data = CReservData( ScOprServDoc.CommDate, D, ID_Operation, ID_Step, ScOprServDoc, FirstDocKind, OBJTYPE_NETTING, FD, ReservObj, true );
+  else
+     SayReservError( 1, "Не определен вид первичного документа операции резервирования.", Data);
+     return 1;
+  end;
+
+  if( not SP_РасчитатьРезерв( Data, ID_Operation, ID_Step ) )
+     return 1;
+  end;
+
+  return 0;
+END;
+
+macro ExecuteStep( D, FirstDoc, FirstDocKind, ID_Operation, ID_Step )
+
+  if(ВыполнитьРезервирование( D, FirstDoc, FirstDocKind, ID_Operation, ID_Step )!=0 )   
+    InsertErrorLog_XML(ScOprServDoc.DocumentID, ScOprServDoc.DocKind);
+    ClearErrorArr();  
+    return 1;
+  end;
+
+  return 0;  
+end;
+
+/* Макрос постобработки */
+MACRO PostStep (    
+                CommitOrRollback, /*1-выполнение шага,2 -отакат шага*/
+                errTrn,        /* Статус выполнения шага-!0-произошла ошибка */
+                FirstDoc,      /* Указатель на первичный документ */
+                ID_Operation,  /* Номер экземпляра операции */
+                Num_Step,      /* Номер шага операции(из настроек) */
+                Kind_Operation,/* Вид операции */
+                KindDoc,       /* Вид первичного документа */
+                KindStep,      /* Вид шага операции */
+                ID_Step)       /* Номер шага операции */
+
+    InsertErrorLog_XML(ScOprServDoc.DocumentID, ScOprServDoc.DocKind);
+    ClearErrorArr();  
+    if (errTrn OR (CommitOrRollback == 2)) /* Произошла ошибка или происходит откат */
+       if( CommitOrRollback == 2 )
+          DL_DeleteDataByStep_XML(ID_Operation, ID_Step);
+       end;
+       return;
+    else
+      if(ScOpReportLineData.size > 0)
+         DL_SaveDataForReport_XML(ScOprServDoc.DocumentID, ScOprServDoc.DocKind, ScOpReportLineData, LOG_TYPE_DATA, ID_Operation, ID_Step);
+        // ScOpReportLineData.Size = 0; /*PNV 515288*/
+      end;
+    end;
+  
+    return 0;
+END;

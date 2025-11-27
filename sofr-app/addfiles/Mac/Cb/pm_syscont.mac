@@ -1,0 +1,1854 @@
+/*
+$Name:             pm_syscont.mac
+$Module:           Платежи
+$Description:      Общая функциональность системного контроля
+*/
+
+//-----------------------------------------------------------------------------
+// Блок     : 29014 - "Предобработка платежа банка"
+//            29015 - "Предобработка требования банка"
+//            29016 - "Предобработка клиентского платежа"
+//            29017 - "Предобработка кассового документа"
+//            29018 - "Предобработка мемориального документа"
+//            29037 - "Предобработка платежа из бэк-офиса"
+//            29058 - "Предобработка банковского ордера "
+// Шаг      : 20    - "Системный контроль"
+// Описание : Общие функции
+//-----------------------------------------------------------------------------
+
+import InsCarryDoc, BankInter, PaymInter, FIInter, PTInter, pm_common, pm_setst, likepy, cbsttls;
+import pm_tools, rmcmptl, pmtax, pm_ext, pm_chkrst, bnk_common, pm_const;
+import pmsummo, "pm_check_pbr.mac", wltools, gginfpmsendconst;
+
+private const ERR_ACCOUNTS_EQUAL = "Счета плательщика и получателя не должны совпадать";
+
+private const CHOICE_BUTTON_YES = 0;    //Да
+private const CHOICE_BUTTON_REJECT = 1; //Отвергнуть
+private const CHOICE_BUTTON_CANCEL = 2; //Отменить
+
+private const OBJGROUP_REGIONKIND_OUTSIDEREGION = 2;
+private const ZeroDate = date(0,0,0);
+
+private class ErrPrm
+  var NumErr = 0;
+  var MsgErr = "";
+  var needManual = false;
+  
+  macro Exist()
+    return (NumErr != 0) or (MsgErr != "") or needManual;
+  end;
+  
+  macro Reject(msg)
+    MsgErr = msg;
+    NumErr = 1;
+  end;
+  
+  macro SetNeedManual(msg)
+    NumErr = 0;
+    MsgErr = msg;
+    needManual = true;
+  end;
+end;
+
+// Установлен ли для платежа заданный сегмент статуса 
+macro IsSetStatusKind( ID_Operation:integer, StatusKindID:integer )
+
+  var select:string = " select * " +
+                      " from  DOPRCURST_DBT " +
+                      " where T_ID_OPERATION = :ID_Operation " +
+                      "   and T_STATUSKINDID = :StatusKindID ";
+  var params:TArray = makeArray( SQLParam( "ID_Operation", ID_Operation ),
+                                 SQLParam( "StatusKindID", StatusKindID ) );
+  
+  var rset:RsdRecordset = execSQLselect( select, params, TRUE );
+
+  if( rset and rset.moveNext() )
+    return true;
+  end;     
+  return false;
+end;
+
+//------------------------------------------------------------------------------
+// Является ли документ возвратом невыясненного из АРМ?
+//------------------------------------------------------------------------------
+private macro IsRMOrigin( Payment:RsbPayment ):bool
+  var obj:object = NULL;
+  
+  if( ( Payment.DocKind == DLDOC_BANKPAYMENT ) or ( Payment.DocKind == DLDOC_BANKCLAIM ) )
+    if( Payment.DocKind == DLDOC_BANKPAYMENT )
+      obj = GenObject( "RsbBankPayment", Payment.DocumentID );
+    else
+      obj = GenObject( "RsbBankClaim", Payment.DocumentID );
+    end;
+    return (obj.Origin == MEMORDER_FDOC_RETURN);
+  elif( Payment.DocKind == BBANK_CPORDER )
+    obj = GenObject( "RsbBbCpOrder", Payment.DocumentID );
+    return (obj.Origin == CP_OR_RMRETURN);
+  end;
+
+  return false;
+end;
+
+//-----------------------------------------------------------------------------
+// Проверить номер документа
+//-----------------------------------------------------------------------------
+private macro CheckDocumentNumber( Payment:RsbPayment ):integer
+
+  var Number:string   = Payment.Number;
+  var DocKind:integer = Payment.DocKind;
+
+  if( StrLen( Number ) == 0 ) // Номер документа не задан
+    return 1;
+  end;
+
+  if( ( DocKind == DLDOC_MEMORIALORDER ) or
+      ( DocKind == CB_MULTYDOC ) or 
+      ( DocKind == DLDOC_SUMMARY_MEMORDER ) )
+    return 0;
+  end;
+
+  // Шесть последних цифр не равны 0 для некоторых видов документов
+  if( ( Payment.PayerFIID == NATCUR ) and ( Payment.ReceiverFIID == NATCUR ) and
+      ( ПлатежИсходящий( Payment ) ) )
+    if( int( GetLastSymbols(Number, PM_DOCNO_NONZERO_LEN) ) == 0 )
+      return 1;
+    end;
+  end;
+
+  return 0;
+end;
+
+//-----------------------------------------------------------------------------
+// Проверка наименования получателя.
+// Если в платежном поручении на клиентский счет неверно задано название получателя,
+// то платеж должен отправиться на ручную обработку.
+//-----------------------------------------------------------------------------
+PRIVATE MACRO CheckReceiverName( payment:RsbPayment, Err:ErrPrm )
+  
+  if(     ( not PM_IsClaim2( payment ) )
+      and ( payment.ReceiverGroup != PAYMENTS_GROUP_EXTERNAL )
+      and CчетПолучателяКлиентский( payment )
+      and ( CheckPaymReceiverName( payment.PaymentID ) ) )
+
+    if( payment.DocKind == DLDOC_BANKORDER )
+      Err.Reject(" Неправильное наименование получателя ");
+    else
+      Err.SetNeedManual(" Наименования получателя в платеже и в справочнике клиентов не совпадают.| "+
+                        " Документ должен быть обработан вручную в узле-получателе ");
+    end;
+  end;
+
+END;
+
+//-----------------------------------------------------------------------------
+// Проверить, существует ли субъект в базе
+//-----------------------------------------------------------------------------
+private macro СубъектСуществует( PartyID:integer, IsLocked:bool ):bool
+  
+  var IsExist:bool = false;
+  
+  IsLocked = false;
+
+  RECORD party(party);
+
+  if(ПолучитьСубъекта(PartyID, party) == 0)
+    IsExist = true;
+    IsLocked = party.locked == "X";
+  end;     
+  
+  SetParm(1, IsLocked);
+  return IsExist;
+end;
+                                                
+// Проверка соответствия справочникам налоговых реквизитов
+private macro CheckTaxPropExistsInList(Payment:RsbPayment, err_msg:string)
+
+  var llv:TbFile = TbFile("llvalues.dbt", "r", 1);
+  
+  llv.Clear();
+  llv.rec.List = 1802;
+  llv.rec.Code = Payment.TaxPmType;
+  if(not llv.GetEQ())
+    SetParm( 1, "Значение поля <Тип налогового платежа> не соответствует системному справочнику" );
+    return 1;
+  end;
+
+  llv.Clear();
+  llv.rec.List = 1801;
+  llv.rec.Code = Payment.TaxPmGround;
+  if(not llv.GetEQ())
+    SetParm( 1, "Значение поля <Основание налогового платежа> не соответствует системному справочнику" );
+    return 1;
+  end;
+
+  llv.Clear();
+  llv.rec.List = 1800;
+  llv.rec.Code = Payment.TaxAuthorState;
+  if(not llv.GetEQ())
+    SetParm( 1, "Значение поля <Статус составителя расчетного документа> не соответствует системному справочнику" );
+    return 1;
+  end;
+ 
+  return 0;
+end;
+
+
+// Проверка заданности счета и его открытости
+// Заполняет Err сообщением об ошибке
+private macro IsSetAccAndOpen(Rec_Account:TRecHandler, AddPIAcc, NameSide, Err:ErrPrm, OnDate) 
+  
+  var IsExistAcc = Rec_Account != NULL;
+  var IsAddPIAcc = AddPIAcc    != NULL;
+    
+  if(not IsExistAcc)
+    
+    if(IsAddPIAcc)
+      Err.MsgErr = "Счет разноски \"" + AddPIAcc +"\" не найден.";
+    else
+      Err.MsgErr = NameSide + " не найден.";
+    end;
+    
+    return;
+  
+  elif(IsExistAcc and ( (ValType(OnDate) != V_DATE) and (Rec_Account.rec.Open_Close == "З") 
+                        or
+                        (ValType(OnDate) == V_DATE) and (Rec_Account.rec.Close_Date <= OnDate) and (Rec_Account.rec.Close_Date > ZeroDate)
+                      )
+      )
+    
+    if(IsAddPIAcc)
+      Err.MsgErr = "Счет разноски \"" + Rec_Account.rec.Account +"\" закрыт.";
+    else
+      Err.MsgErr = NameSide + " \"" + Rec_Account.rec.Account +"\" закрыт.";
+    end;
+
+    return;
+  end;
+
+end;
+
+private macro IsPayerSetAccAndOpen(Rec_Account:TRecHandler, AddPIAcc, Err:ErrPrm, NameSide, OnDate) 
+  if(not NameSide)
+    NameSide = "Счет плательщика";
+  end;
+  IsSetAccAndOpen(Rec_Account, AddPIAcc, NameSide, Err, OnDate); 
+end;
+
+private macro IsReceiverSetAccAndOpen(Rec_Account:TRecHandler, AddPIAcc, Err:ErrPrm, OnDate) 
+  IsSetAccAndOpen(Rec_Account, AddPIAcc, "Счет получателя", Err, OnDate); 
+end;
+
+private macro IsFutureReceiverSetAccAndOpen(Rec_Account:TRecHandler, AddPIAcc, Err:ErrPrm, OnDate) 
+  IsSetAccAndOpen(Rec_Account, AddPIAcc, "Текущий счет получателя", Err, OnDate); 
+end;
+
+// Платеж банка  
+private macro IsSfBankPaym(Payment:RsbPayment)
+  
+  var obj:object = NULL;
+
+  if((Payment.DocKind == DLDOC_BANKPAYMENT))
+    obj = GenObject( "RsbBankPayment", Payment.DocumentID );
+    if((obj != null)and (obj.Origin == CP_OR_SF))
+      return true;
+    end;
+  end;
+  return false;
+end;
+
+
+// Проверять текущий счет плательщика?
+private macro IsCheckFuturePayAcc(DocKind)
+  return ( DocKind == OPR_PAYM_ST_DK_BANKPAYMENT   ) or  // Платеж банка
+         ( DocKind == OPR_PAYM_ST_DK_BANKCLAIM     ) or  // Требование банка
+         ( DocKind == OPR_PAYM_ST_DK_CLIENTPAYMENT ) or  // Клиентский платеж
+         ( DocKind == OPR_PAYM_ST_DK_CASHDOC       ) or  // Кассовый документ
+         ( DocKind == OPR_PAYM_ST_DK_MEMORIALDOC   ) or  // Мемориальный документ
+         ( DocKind == OPR_PAYM_ST_DK_BO_PAYMENT    ) or  // Платеж из БО
+         ( DocKind == OPR_PAYM_ST_DK_BANKORDER     );    // Банковский ордер
+end;
+
+// Проверять текущий счет получателя?
+private macro IsCheckFutureRecAcc(DocKind)
+  return ( DocKind == OPR_PAYM_ST_DK_BANKPAYMENT   ) or  // Платеж банка
+         ( DocKind == OPR_PAYM_ST_DK_BANKCLAIM     ) or  // Требование банка
+         ( DocKind == OPR_PAYM_ST_DK_CLIENTPAYMENT ) or  // Клиентский платеж
+         ( DocKind == OPR_PAYM_ST_DK_CASHDOC       ) or  // Кассовый документ
+         ( DocKind == OPR_PAYM_ST_DK_MEMORIALDOC   ) or  // Мемориальный документ
+         ( DocKind == OPR_PAYM_ST_DK_BO_PAYMENT    ) or  // Платеж из БО
+         ( DocKind == OPR_PAYM_ST_DK_BANKORDER     );    // Банковский ордер
+end;
+
+// Проверка счета плательщика
+private macro PayerCheckAccount(Payment:RsbPayment, Rec_Account:TRecHandler, AddPIAcc, Err:ErrPrm)
+  
+  var IsExistAcc = Rec_Account != NULL;
+  var IsAddPIAcc = AddPIAcc    != NULL;
+  var obj:object;
+  var DocKind:integer = GetOprStatus( OPR_PAYM_DOCKIND );
+  
+  var NameSide = "Счет плательщика";
+  if( IsCheckFuturePayAcc(DocKind) )
+    NameSide = "Текущий счет плательщика";
+  end;
+
+  if( ( DocKind == OPR_PAYM_ST_DK_BANKPAYMENT   ) or  // Платеж банка
+      ( DocKind == OPR_PAYM_ST_DK_CLIENTPAYMENT ) or  // Клиентский платеж
+      ( DocKind == OPR_PAYM_ST_DK_BO_PAYMENT    ) or  // Платеж из БО
+      ( DocKind == OPR_PAYM_ST_DK_BANKORDER     ) )   // Банковский ордер
+    
+    IsPayerSetAccAndOpen(Rec_Account, AddPIAcc, Err, NameSide, Payment.ValueDate);
+
+    if(Err.Exist())
+      Err.NumErr = 1; // Отвергаем
+      return;
+    else
+      
+      if( Payment.DocKind == PS_INRQ )
+        // Счет дебета является клиентским. Иначе - "Плательщик не является клиентом. Ошибка выбора операции."
+        if( not IsClientPayerAccount( Payment, Rec_Account.rec.Account ) )
+          Err.Reject("Плательщик не является клиентом. Ошибка выбора операции.");
+          return;
+        end;
+      end;
+    
+      // Счет плательщика не может быть корсчетом
+      if( (Payment.DocKind != DLDOC_BANKPAYMENT) and (Payment.DocKind != BBANK_CPORDER) and (Payment.DocKind != DLDOC_BANKORDER) and (Payment.DocKind != DLDOC_BANKPAYORDER) and ( Payment.PrimDocOrigin != PD_OR_PARTAT) )
+        if( Index( Rec_Account.rec.Type_Account, "К" ) )
+          if( (DocKind == OPR_PAYM_ST_DK_BANKPAYMENT and (not IsChildTranzitOrigin(Payment))) or
+            (DocKind != OPR_PAYM_ST_DK_BANKPAYMENT and (not PM_PaymentIsChildTransit(Payment.PaymentID)))
+            )
+            Err.NumErr = PAYMERR_PAYACC_CORR;
+            return;
+          end;
+        end;
+      end;
+      
+      // Если запрет на дебет
+      if( Index( Rec_Account.rec.Type_Account, "Т" ) )
+        Err.NumErr = PAYMERR_PAYACC_DEBETLOCK;
+        return;
+      end;
+                                                      
+      // Запрет проводок
+      if( Rec_Account.rec.DateNoChange >= Payment.ValueDate )
+        Err.NumErr = PAYMERR_PAYACC_DATENOCHANGE;
+        return;                                      
+      end;
+
+      // Счет плательщика не может быть счетом МФР
+      if( (Payment.DocKind == DLDOC_BANKORDER) and 
+          PM_AccountIsMFR( Rec_Account.rec.Account, Rec_Account.rec.Chapter, Rec_Account.rec.Code_Currency) )
+        Err.NumErr = PAYMERR_PAYACC_MFR;
+        return;
+      end;
+      
+      if(IsAddPIAcc and (Rec_Account.rec.Department != Payment.StartDepartment))
+        Err.Reject("Счет плательщика принадлежит другому филиалу");
+        return;
+      end;
+
+      if( ( Payment.PIList(PRT_Credit).Size <= 0)  and
+          ( Payment.FutureReceiverFIID    == Rec_Account.rec.Code_Currency ) and 
+          ( Payment.FutureReceiverAccount == Rec_Account.rec.Account ) )
+        Err.Reject(ERR_ACCOUNTS_EQUAL);
+        return;
+      end;
+    end;
+
+  elif( DocKind == OPR_PAYM_ST_DK_BANKCLAIM )
+
+    if(Payment.PayerGroup == PAYMENTS_GROUP_INTERNAL)
+      
+      IsPayerSetAccAndOpen(Rec_Account, AddPIAcc, Err, NameSide, Payment.ValueDate);
+      
+      if(Err.Exist())
+        Err.NumErr = 1; // Отвергаем
+        return;
+      end;
+
+      // Если запрет на дебет
+      if(Index( Rec_Account.rec.Type_Account, "Т" ) )
+        Err.NumErr = PAYMERR_PAYACC_DEBETLOCK;
+        return;
+      end;
+                                                      
+      // Запрет проводок
+      if( Rec_Account.rec.DateNoChange >= Payment.ValueDate )
+        Err.NumErr = PAYMERR_PAYACC_DATENOCHANGE;
+        return;                                      
+      end;
+
+      if( IsClientPayerAccount( Payment, Rec_Account.rec.Account ))
+        
+        obj = GenObject( "RsbBankClaim", Payment.DocumentID );
+    
+        //Не внутрибанковский (клиентский)
+        if(obj.Origin != MEMORDER_FDOC_SF) //Можно спокойно продолжать только если клиентский платёж - это комиссия за обслуживание (memorder.Origin==3)
+                                           //В противном случае спрашиваем у пользователя, нужно ли продолжать
+          if(MsgBoxEx(
+                        "Счёт плательщика не является внутрибанковским.||Вы уверены, что хотите продолжить обработку документа?",
+                        MB_YES+MB_NO,
+                        IND_NO,
+                        "Обработка клиентского счёта"
+                     )!=IND_YES
+            )
+                //Если пользователь не сказал "Да"            
+              Err.Reject("Счет плательщика должен быть внутрибанковским");
+              return;
+          end;
+        end;
+      end;
+
+      // Счет плательщика не может быть корсчетом
+      if( Index( Rec_Account.rec.Type_Account, "К" ) and (not IsChildTranzitOrigin(Payment)) )
+        Err.NumErr =  PAYMERR_PAYACC_CORR;
+        return;
+      end;
+
+      if( PM_AccountIsMFR( Rec_Account.rec.Account, Rec_Account.rec.Chapter, Rec_Account.rec.Code_Currency) )
+        Err.SetNeedManual("Счет плательщика не задан");
+        return;
+      end;
+      
+      if(IsAddPIAcc and (Rec_Account.rec.Department != Payment.StartDepartment))
+        Err.SetNeedManual("Счет плательщика не принадлежит банку плательщика"); // На ручную обработку
+        return;
+      end;
+
+      if( ( Payment.PIList(PRT_Credit).Size <= 0)  and
+          ( Payment.FutureReceiverFIID    == Rec_Account.rec.Code_Currency ) and 
+          ( Payment.FutureReceiverAccount == Rec_Account.rec.Account ) )
+        Err.Reject(ERR_ACCOUNTS_EQUAL);
+        return;
+      end;
+    end;
+  
+  elif( DocKind == OPR_PAYM_ST_DK_CASHDOC ) // Кассовый документ
+  
+    IsPayerSetAccAndOpen(Rec_Account, AddPIAcc, Err, NameSide, Payment.ValueDate);
+    
+    if(Err.Exist())
+      Err.NumErr = 1; // Отвергаем
+      return;
+    end;
+    
+    // Установлен ли признак на счете кассы?
+    if( ( Payment.DocKind == CASH_BOF_INCORDER ) or
+        ( Payment.DocKind == CASH_PS_INCORDER ) )
+      
+      if( Index( Rec_Account.rec.Type_Account, "А" ) == 0 )
+        Err.Reject("На счете кассы не установлен соответствующий тип");
+        return;
+      end;
+
+    end;
+
+    if( ( Payment.DocKind == CASH_BOF_ADDORDER ) or
+        ( Payment.DocKind == CASH_PS_OUTORDER  ) or
+        ( Payment.DocKind == CASH_BOF_OUTORDER ) or
+        ( Payment.DocKind == DLDOC_INOUTORDER  ) )
+    
+      // Если запрет на дебет
+      if( Index( Rec_Account.rec.Type_Account, "Т" ) )
+        Err.NumErr = PAYMERR_PAYACC_DEBETLOCK;
+        return;
+      end;
+                                                      
+      // Запрет проводок
+      if( Rec_Account.rec.DateNoChange >= Payment.ValueDate )
+        Err.NumErr = PAYMERR_PAYACC_DATENOCHANGE;
+        return;                                      
+      end;
+
+    end;
+
+    if( ( Payment.PIList(PRT_Credit).Size <= 0)  and
+        ( Payment.ReceiverFIID    == Rec_Account.rec.Code_Currency ) and 
+        ( Payment.ReceiverAccount == Rec_Account.rec.Account ) )
+      Err.Reject(ERR_ACCOUNTS_EQUAL);
+      return;
+    end;
+
+  elif( DocKind == OPR_PAYM_ST_DK_MEMORIALDOC ) // Мемориальный документ
+    
+    IsPayerSetAccAndOpen(Rec_Account, AddPIAcc, Err, NameSide, Payment.ValueDate);
+    
+    if(Err.Exist())
+      Err.NumErr = 1; // Отвергаем
+      return;
+    end;
+    
+    // Если запрет на дебет
+    if( Index( Rec_Account.rec.Type_Account, "Т" ) )
+      Err.NumErr = PAYMERR_PAYACC_DEBETLOCK;
+      return;
+    end;
+                                                    
+    // Запрет проводок
+    if( Rec_Account.rec.DateNoChange >= Payment.ValueDate )
+      Err.NumErr = PAYMERR_PAYACC_DATENOCHANGE;
+      return;                                      
+    end;
+
+  end;
+
+end;
+
+// Проверка счета получателя
+private macro ReceiverCheckAccount(Payment:RsbPayment, Rec_Account:TRecHandler, AddPIAcc, Err:ErrPrm)
+  
+  var IsExistAcc = Rec_Account != NULL;
+  var IsAddPIAcc = AddPIAcc != NULL;
+  var DocKind:integer = GetOprStatus( OPR_PAYM_DOCKIND );
+  if( ( DocKind == OPR_PAYM_ST_DK_BANKPAYMENT   ) or  // Платеж банка
+      ( DocKind == OPR_PAYM_ST_DK_CLIENTPAYMENT ) or  // Клиентский платеж
+      ( DocKind == OPR_PAYM_ST_DK_BO_PAYMENT    ) or  // Платеж из БО
+      ( DocKind == OPR_PAYM_ST_DK_BANKORDER     ) )   // Банковский ордер
+
+    if( (DocKind == OPR_PAYM_ST_DK_BANKORDER) and (not IsExistAcc) and (not IsAddPIAcc) )
+      Err.SetNeedManual(" Счет получателя не найден ");
+    end;
+
+    // Для бэк-офисов и внешних - не проверяем
+    if((not Err.Exist()) and (Payment.ReceiverGroup != PAYMENTS_GROUP_EXTERNAL) and (not Payment.ToBackOffice))
+      
+      // Если проверяется не счет разноски, 
+      // то для банковских, клиентских и платежей из БО
+      // в Rec_Account лежит FutureReceiverAccount!!!
+      
+      IsFutureReceiverSetAccAndOpen(Rec_Account, AddPIAcc, Err, Payment.ValueDate);
+
+      if(Err.Exist()) // Счет или закрыт или не найден
+        if( IfThenElse(IsAddPIAcc, CчетПолучателяКлиентский(Payment, AddPIAcc), CчетПолучателяКлиентский(Payment,Payment.FutureReceiverAccount)) )
+          Err.NumErr = 1; // Отвергаем если кривой счет получателя - клиентский
+        else
+          Err.needManual = true; // Если не клиентский, то на ручную обработку
+        end;
+        return;
+      end;
+        
+      // Если запрет на кредит
+      if( Index( Rec_Account.rec.Type_Account, "У" ) )
+        Err.Reject("Запрещено кредитование счета получателя");
+        return;
+      end;
+      
+      // Запрет проводок
+      if( Rec_Account.rec.DateNoChange >= Payment.ValueDate )
+        Err.NumErr = PAYMERR_RECACC_DATENOCHANGE;
+        return;
+      end;
+
+      // Счет получателя не может быть счетом МФР для банковского ордера
+      if( ( DocKind == OPR_PAYM_ST_DK_BANKORDER ) and
+          PM_AccountIsMFR( Rec_Account.rec.Account, Rec_Account.rec.Chapter, Rec_Account.rec.Code_Currency) 
+        )
+        Err.NumErr = PAYMERR_RECACC_MFR;
+        return;
+      end;
+
+      if((not IsAddPIAcc) and PM_AccountIsMFR( Payment.ReceiverAccount, Payment.Chapter, Payment.ReceiverFIID) )
+        
+        Err.SetNeedManual("Конечный счет получателя не задан");
+        return;
+
+      elif(not IsAddPIAcc) // Проверяем наименования получателя если нет разноски по кредиту
+        CheckReceiverName(Payment, Err);
+        if( Err.Exist() )
+          return;
+        end;
+      end;
+
+      if(IsAddPIAcc and (Rec_Account.rec.Department != Payment.EndDepartment))
+        if(DocKind == OPR_PAYM_ST_DK_BO_PAYMENT)
+          Err.Reject("Счет получателя не принадлежит банку получателя");     
+        else
+          Err.SetNeedManual("Счет получателя не принадлежит банку получателя"); // На ручную обработку
+        end;
+        return;
+      end;
+
+      if( ( Payment.PIList(PRT_Debet).Size <= 0) and
+          ( Payment.FuturePayerFIID    == Rec_Account.rec.Code_Currency ) and 
+          ( Payment.FuturePayerAccount == Rec_Account.rec.Account ) )
+        Err.Reject(ERR_ACCOUNTS_EQUAL);
+        return;
+      end;
+
+    end;
+  
+  elif( DocKind == OPR_PAYM_ST_DK_BANKCLAIM )
+    
+    // акцептные требования
+    if( Payment.DemandAcceptTerm == PM_DEMAND_TERM_ACCEPT )
+
+      IsFutureReceiverSetAccAndOpen(Rec_Account, AddPIAcc, Err, Payment.ValueDate); 
+
+      if(Err.Exist())
+        Err.NumErr = 1; // Отвергаем
+        return;
+      end;
+      
+    else // безакцептные требования
+
+      if( not Payment.ToBackOffice ) //???
+        
+        IsFutureReceiverSetAccAndOpen(Rec_Account, AddPIAcc, Err, Payment.ValueDate);
+
+        if(Err.Exist())
+          Err.NumErr = 1; // Отвергаем
+          return;
+        end;
+        
+/*        // Счет получателя не может быть корсчетом
+        if( Index(Rec_Account.rec.Type_Account, "К" ) )
+          Err.NumErr = PAYMERR_RECACC_CORR; 
+          return;
+        end;
+  */      
+        if( PM_AccountIsMFR( Rec_Account.rec.Account, Rec_Account.rec.Chapter, Rec_Account.rec.Code_Currency) )
+          Err.NumErr = PAYMERR_RECACC_MFR;
+          return;
+        end;
+
+      end;
+    end;
+    
+    // Если запрет на кредит
+    if( Index( Rec_Account.rec.Type_Account, "У" ) )
+      Err.Reject("Запрещено кредитование счета получателя");
+      return;
+    end;
+
+    // Запрет проводок
+    if( Rec_Account.rec.DateNoChange >= Payment.ValueDate )
+      Err.NumErr = PAYMERR_RECACC_DATENOCHANGE;
+      return;
+    end;
+
+    if(IsAddPIAcc and (Rec_Account.rec.Department != Payment.EndDepartment))
+      if(DocKind == OPR_PAYM_ST_DK_BO_PAYMENT)
+        Err.Reject("Счет получателя не принадлежит банку получателя");     
+      end;
+      return;
+    end;
+    
+    if(   IsExistAcc and
+        ( Payment.PIList(PRT_Debet).Size <= 0) and
+        ( Payment.FuturePayerFIID    == Rec_Account.rec.Code_Currency ) and 
+        ( Payment.FuturePayerAccount == Rec_Account.rec.Account ) )
+      Err.Reject(ERR_ACCOUNTS_EQUAL);
+      return;
+    end;
+
+  elif( DocKind == OPR_PAYM_ST_DK_CASHDOC ) // Кассовый документ
+    
+    IsFutureReceiverSetAccAndOpen(Rec_Account, AddPIAcc, Err, Payment.ValueDate); 
+
+    if(Err.Exist())
+      Err.NumErr = 1; // Отвергаем
+      return;
+    end;
+
+    // Установлен ли признак на счете кассы?
+    if( ( Payment.DocKind == CASH_BOF_OUTORDER ) or
+        ( Payment.DocKind == CASH_PS_OUTORDER )  or
+        ( Payment.DocKind == DLDOC_INOUTORDER ) )
+      if( Index( Rec_Account.rec.Type_Account, "А" ) == 0 )
+        Err.Reject("На счете кассы не установлен соответствующий тип");
+        return;
+      end;
+    end;
+    
+    if ((Payment.DocKind == CASH_BOF_ADDORDER) or (Payment.DocKind == DLDOC_INOUTORDER))
+    // Если запрет на кредит
+      if( Index( Rec_Account.rec.Type_Account, "У" ) )
+        Err.Reject("Запрещено кредитование счета получателя");
+        return;
+      end;
+    end;
+   
+  
+  elif( DocKind == OPR_PAYM_ST_DK_MEMORIALDOC ) // Мемориальный документ
+
+    if( not Payment.ToBackOffice )
+      IsFutureReceiverSetAccAndOpen(Rec_Account, AddPIAcc, Err, Payment.ValueDate); 
+
+      if(Err.Exist())
+        Err.needManual = true; // На ручную обработку
+        return;
+      end;
+    end;
+
+    // Если запрет на кредит
+    if( Index( Rec_Account.rec.Type_Account, "У" ) )
+      Err.Reject("Запрещено кредитование счета получателя");
+      return;
+    end;
+    
+    // Запрет проводок
+    if( Rec_Account.rec.DateNoChange >= Payment.ValueDate )
+      Err.NumErr = PAYMERR_RECACC_DATENOCHANGE;
+      return;
+    end;
+
+    // Совпадение счетов плательщика/получателя
+    if( ( not Payment.ToBackOffice ) and ( Index( Rec_Account.rec.Type_Account, "И" ) == 0 ) and 
+        ( ( Payment.FuturePayerFIID == Rec_Account.rec.Code_Currency ) and 
+          ( Payment.FuturePayerAccount == Rec_Account.rec.Account ) ) )
+        Err.Reject(ERR_ACCOUNTS_EQUAL);
+        return;
+    end;
+
+  end;
+
+end;
+
+private macro CheckAccount(Payment:RsbPayment, Side, Rec_Account:TRecHandler, AddPIAcc, Err:ErrPrm);
+    
+  if(Side == PRT_Debet)
+    PayerCheckAccount(Payment, Rec_Account, AddPIAcc, Err);
+  elif(Side == PRT_Credit)
+    ReceiverCheckAccount(Payment, Rec_Account, AddPIAcc, Err);
+  end;
+
+end;
+
+// Проверка разноски
+private macro CheckAddPI(Payment:RsbPayment, Side, Err:ErrPrm)
+  
+  var AddPI:RsbPIPayment      = Payment.PIList(Side);
+  var IsNext                  = AddPI.First(Side);
+  var CurrAddPI:TRecHandler   = TRecHandler( "pmaddpi.dbt" );
+  var Rec_Account:TRecHandler = TRecHandler( "account.dbt" );
+  
+  while( (not Err.Exist()) and (IsNext == 0) and (AddPI.Current( CurrAddPI ) == 0) )
+    
+    if( not AccountIsMask( CurrAddPI.rec.Account ) )
+      
+      if(PM_GetAccountRecord( CurrAddPI.rec.Account, CurrAddPI.rec.FIID, CurrAddPI.rec.Chapter, Rec_Account ))
+        CheckAccount(Payment, Side, Rec_Account, CurrAddPI.rec.Account, Err);
+      else                                                        
+        CheckAccount(Payment, Side, NULL, CurrAddPI.rec.Account, Err);
+      end;
+
+    else                                               
+      Err.Reject("Счет разноски " + Rec_Account.rec.Account +" нельзя задавать маской");
+      return;
+    end;
+    
+    IsNext = AddPI.Next();
+
+  end;
+
+end;
+
+// А счет плательщика задан и не является маской?
+private macro IsSetPayerAccountAndNotMask(PayerAccount, DocKind, Err:ErrPrm, NameSide)
+  
+  if(not NameSide)
+    if( IsCheckFuturePayAcc(DocKind))
+      NameSide = "Текущий счет дебета ";
+    else
+      NameSide = "Счет плательщика "
+    end;
+  end;
+
+  if(PayerAccount == "")
+    if(
+        ( DocKind == OPR_PAYM_ST_DK_BANKPAYMENT   )  or  // Платеж банка     
+        ( DocKind == OPR_PAYM_ST_DK_CLIENTPAYMENT )  or  // Клиентский платеж
+        ( DocKind == OPR_PAYM_ST_DK_BO_PAYMENT    )  or  // Платеж из БО     
+        ( DocKind == OPR_PAYM_ST_DK_CASHDOC       )  or  // Кассовый
+        ( DocKind == OPR_PAYM_ST_DK_MEMORIALDOC   )      // Мемориальный
+      )
+
+      Err.Reject(NameSide + "не задан"); 
+      return;
+    
+    elif((DocKind == OPR_PAYM_ST_DK_BANKCLAIM) and
+         (OPR_PM_ST_DIR_INTERNAL == GetOprStatus( OPR_PAYM_DIRECT )))
+    
+      Err.Reject(NameSide + "не задан"); 
+      return;
+    
+    end;
+  end;
+  
+  if(AccountIsMask( PayerAccount ))
+    Err.Reject(NameSide + PayerAccount +" нельзя задавать маской");
+    return;
+  end;
+
+end;
+
+// А счет получателя задан и не является маской?
+private macro IsSetReceiverAccountAndNotMask(ReceiverAccount, DocKind, Err:ErrPrm, NameSide)
+  
+  if(not NameSide)
+    if( IsCheckFuturePayAcc(DocKind))
+      NameSide = "Текущий счет кредита ";
+    else
+      NameSide = "Счет получателя "
+    end;
+  end;
+
+  if( ReceiverAccount == "" ) // Счет получателя не задан
+  
+    if( ( DocKind == OPR_PAYM_ST_DK_BANKPAYMENT   ) or
+        ( DocKind == OPR_PAYM_ST_DK_CLIENTPAYMENT ) or
+        ( DocKind == OPR_PAYM_ST_DK_BO_PAYMENT    ) or
+        ( DocKind == OPR_PAYM_ST_DK_MEMORIALDOC   ) or
+        ( DocKind == OPR_PAYM_ST_DK_BANKORDER     )
+      )
+        
+      Err.SetNeedManual(NameSide + " не задан"); // Идем на ручную обрботку
+      
+    elif((DocKind == OPR_PAYM_ST_DK_CASHDOC) or
+         (DocKind == OPR_PAYM_ST_DK_BANKCLAIM))
+      Err.Reject(NameSide + " не задан"); 
+    end;
+
+    return;
+  end;
+
+  if(AccountIsMask( ReceiverAccount ))
+    Err.Reject(NameSide + ReceiverAccount +" нельзя задавать маской");
+    return;
+  end;
+
+end;
+
+private macro GetPayerAccountRecord(Payment:RsbPayment, Rec_Account:TRecHandler, DocKind, PaymChapter)
+  
+  if( IsCheckFuturePayAcc(DocKind))
+    return PM_GetAccountRecord( Payment.FuturePayerAccount, Payment.FuturePayerFIID, PaymChapter, Rec_Account );
+  end;
+
+  return PM_GetAccountRecord( Payment.PayerAccount, Payment.PayerFIID, PaymChapter, Rec_Account );
+end;
+
+private macro GetReceiverAccountRecord(Payment:RsbPayment, Rec_Account:TRecHandler, DocKind, PaymChapter)
+  
+  if( IsCheckFutureRecAcc(DocKind))
+    return PM_GetAccountRecord( Payment.FutureReceiverAccount, Payment.FutureReceiverFIID, PaymChapter, Rec_Account );
+  end;
+
+  return PM_GetAccountRecord( Payment.ReceiverAccount, Payment.ReceiverFIID, PaymChapter, Rec_Account );
+end;
+//Проверка счетов плательщика и получателя для:
+// 1. Платеж банка          
+// 2. Требование банка      
+// 3. Клиентский платеж     
+// 4. Кассовый документ     
+// 5. Мемориальный документ 
+// 6. Платеж из бэк-офиса   
+// 7. Банковский ордер
+
+private macro CheckAccountsPayment(Payment:RsbPayment, Err:ErrPrm)
+  
+  var PaymChapter = IfThenElse(Payment.Chapter > 0, Payment.Chapter, 1);
+  var DocKind = GetOprStatus( OPR_PAYM_DOCKIND );
+  var Rec_Account:TRecHandler = TRecHandler( "account.dbt" );
+
+  if(Payment.PIList(PRT_Debet).Size > 0)    //Если есть разноска
+    CheckAddPI(Payment, PRT_Debet, Err);    // то проверяем каждый счет разноски
+  else // проверяем счет плательщика
+    
+    // А счет плательщика задан и не является маской?
+    if(DocKind == OPR_PAYM_ST_DK_CASHDOC)
+      // Для кассовых документов должны быть заданы и основные, и текущие счета
+      IsSetPayerAccountAndNotMask(Payment.PayerAccount, DocKind, Err, "Счет плательщика ");
+      if(not Err.Exist())
+        IsSetPayerAccountAndNotMask(Payment.FuturePayerAccount, DocKind, Err, "Текущий счет дебета ");
+      end;
+    else
+      IsSetPayerAccountAndNotMask(IfThenElse(IsCheckFuturePayAcc(DocKind), Payment.FuturePayerAccount, Payment.PayerAccount), DocKind, Err);
+    end;
+    
+    if(not Err.Exist())
+      if(GetPayerAccountRecord(Payment, Rec_Account, DocKind, PaymChapter))
+        PayerCheckAccount(Payment, Rec_Account, NULL, Err);
+      else
+        PayerCheckAccount(Payment, NULL, NULL, Err);
+      end;
+    end;
+  end;
+  
+  if(not Err.Exist())
+    
+    if(Payment.ToBackOffice and (DocKind != OPR_PAYM_ST_DK_BANKCLAIM)) // Для бэк-офисов кроме требований - не проверяем
+      return;
+    end;
+
+    if(Payment.PIList(PRT_Credit).Size > 0)  //Если есть разноска по кредиту
+      CheckAddPI(Payment, PRT_Credit, Err);     // то проверяем каждый счет разноски
+    else // проверяем счет получателя
+      
+      // А счет получателя задан и не является маской?
+      if(DocKind == OPR_PAYM_ST_DK_CASHDOC)
+        // Для кассовых документов должны быть заданы и основные, и текущие счета
+        IsSetReceiverAccountAndNotMask(Payment.ReceiverAccount, DocKind, Err, "Счет получателя ");
+        if(not Err.Exist())
+          IsSetReceiverAccountAndNotMask(Payment.FutureReceiverAccount, DocKind, Err, "Текущий счет кредита ");
+        end;
+      else
+        IsSetReceiverAccountAndNotMask(IfThenElse(IsCheckFutureRecAcc(DocKind), Payment.FutureReceiverAccount, Payment.ReceiverAccount), DocKind, Err);
+      end;
+
+      if(not Err.Exist())
+        if(GetReceiverAccountRecord(Payment, Rec_Account, DocKind, PaymChapter))
+          ReceiverCheckAccount(Payment, Rec_Account, NULL, Err);
+        else
+          ReceiverCheckAccount(Payment, NULL, NULL, Err);
+        end;
+      end;
+    end;
+  end;
+
+end;
+
+//-----------------------------------------------------------------------------
+// Проверить счета, банка и проч.
+//-----------------------------------------------------------------------------
+private macro CheckAccountAndOther( Payment:RsbPayment, Err:ErrPrm )
+
+  var DocKind:integer = GetOprStatus( OPR_PAYM_DOCKIND );
+  var Direct :integer = GetOprStatus( OPR_PAYM_DIRECT );
+  var IsLocked:bool = false;
+  var tmpErr = "";
+  var errMsg:string = "";
+  
+
+  // Проверяем счетов плательщика и получателя
+  CheckAccountsPayment(Payment, Err);
+  
+  if(not Err.Exist())
+
+    if( ( DocKind == OPR_PAYM_ST_DK_BANKPAYMENT   ) or  // Платеж банка
+        ( DocKind == OPR_PAYM_ST_DK_CLIENTPAYMENT ) or  // Клиентский платеж
+        ( DocKind == OPR_PAYM_ST_DK_BO_PAYMENT    ) )   // Платеж из БО
+      
+      // Проверка получателя
+      if( ( DocKind != OPR_PAYM_ST_DK_BO_PAYMENT ) and ( DocKind != DLDOC_BANKPAYORDER ) )
+        if(СубъектСуществует( Payment.ReceiverBankID, IsLocked ))
+          if(IsLocked)
+            Err.SetNeedManual("Банк получателя не найден в справочнике среди открытых банков"); // Идем на ручную обрботку
+          end;                            
+        else
+          Err.SetNeedManual("Банк получателя не указан"); // Идем на ручную обрботку
+        end;
+      elif(not СубъектСуществует( Payment.ReceiverBankID ))
+        Err.NumErr = ERR_INVALID_REC_BANK;
+        return;
+      end;
+
+      // Проверка внешнего платежа
+      if( ПлатежВнешний( Payment ) ) // Проверка для внешних платежей
+        if( CheckExternalPayment( Payment, Payment.DocKind, tmpErr ) )
+          Err.Reject(tmpErr);
+          return;
+        end;
+      end;
+
+    elif( DocKind == OPR_PAYM_ST_DK_BANKCLAIM ) // Требование банка
+
+      // акцептные требования
+      if( Payment.DemandAcceptTerm == PM_DEMAND_TERM_ACCEPT )
+
+        if( Direct == OPR_PM_ST_DIR_INTERNAL )
+
+          if( Payment.PayerBankID == Payment.ReceiverBankID )
+            Err.Reject("Банк плательщика не должен совпадать с банком получателя");
+            return;
+          end;
+
+          // Проверка плательщика
+          if( not СубъектСуществует( Payment.PayerBankID ) )
+            Err.NumErr = ERR_INVALID_PAY_BANK;
+            return;
+          end;
+
+        elif( Direct == OPR_PM_ST_DIR_OUT )
+
+          // Банк плательщика задан и открыт
+          if( not СубъектСуществует( Payment.PayerBankID ) )
+            Err.NumErr = ERR_INVALID_REC_BANK;
+            return;
+          end;
+
+          if( CheckExternalPayment( Payment, Payment.DocKind, tmpErr ) )
+            Err.Reject(tmpErr);
+            return;
+          end;
+
+        end;
+
+        // Банк получателя задан и открыт
+        if( not СубъектСуществует( Payment.ReceiverBankID ) )
+          Err.NumErr = ERR_INVALID_REC_BANK;
+          return;
+        end;
+
+        // Банк получателя входит в ЦАБС
+        if( not ( (( Payment.ReceiverGroup == PAYMENTS_GROUP_EXTERNAL ) and (PM_IsBankInTS(Payment.ReceiverBankID, false))) or
+                  (( Payment.ReceiverGroup != PAYMENTS_GROUP_EXTERNAL ) and (PM_IsBankInTS(Payment.ReceiverBankID, true ))) )
+          )
+          Err.Reject("Банк получателя не является узлом ТС");
+          return;
+        end;
+
+      else // безакцептные требования
+
+        if( ПлатежВнешний( Payment ) ) // Проверки для внешних платежей
+          if( CheckExternalPayment( Payment, Payment.DocKind, tmpErr ) )
+            Err.Reject(tmpErr);
+            return;
+          end;
+        end;//Конец требования банка
+      end;
+
+    elif( DocKind == OPR_PAYM_ST_DK_CASHDOC ) // Кассовый документ
+
+    elif( DocKind == OPR_PAYM_ST_DK_MEMORIALDOC ) // Мемориальный документ
+    
+    end;
+
+  end;
+
+end;
+
+//-----------------------------------------------------------------------------
+// Проверить счета, банка и проч.
+//-----------------------------------------------------------------------------
+private macro PM_CheckAccountAndOther( Payment:RsbPayment, ErrOut:string, NeedManual:bool ):integer
+  
+  var Err:ErrPrm = ErrPrm();
+  
+  CheckAccountAndOther(Payment, Err);
+  
+  if(Err.Exist())
+    SetParm(1, Err.MsgErr);
+    SetParm(2, Err.needManual);
+    return Err.NumErr; 
+  end;
+  
+  SetParm(1, "");
+  SetParm(2, false);
+  return 0;
+end;
+
+//-----------------------------------------------------------------------------
+// Проверка дат платежа
+//-----------------------------------------------------------------------------
+private macro CheckDate ( Payment:RsbPayment, err_msg:string ) : integer
+
+  err_msg = "";
+
+  // Дата документа pmrmprop.date задана, меньше или равна дате значения pmpaym.valuedate
+  if ( Payment.Date == date(0,0,0) )
+    err_msg = "Дата документа должна быть задана";    
+  elif( Payment.ValueDate < Payment.Date )
+    err_msg = "Дата значения платежа не должна быть меньше даты платежа";
+  end;
+
+  // Дата значения pmpaym.valuedate задана, 
+  // есть операционный день с такой датой, 
+  // день имеет признак баланса 
+  if ( not err_msg and (Payment.ValueDate == date(0,0,0)) )
+    err_msg = "Дата значения платежа должна быть задана";
+  elif( not err_msg )
+    var IsBalance = "";
+    if( existsOperDay(Payment.ValueDate, Payment.Department, @IsBalance) )
+      if( IsBalance != "X" )
+        err_msg = "Невозможно исполнение платежа указанной датой значения";
+      end;
+    else
+      err_msg = "Нет операционного дня с указанной датой значения";
+    end;
+  end;
+
+  // платеж банка
+  if( not err_msg and GetParentOrEqualDocKindFromList(Payment.DocKind, PMDOC_BANKPAYMENT) )
+    if( Payment.PayerBankEnterDate == date(0,0,0) )
+      err_msg = "Не задана дата поступления в банк плательщика";
+    elif( not existsOperDay(Payment.PayerBankEnterDate, Payment.Department) )
+      err_msg = "Нет операционного дня с указанной датой поступления документа в банк плательщика";
+    elif( Payment.ValueDate < Payment.PayerBankEnterDate )
+      err_msg = "Дата поступления в банк плательщика не может быть больше даты значения";
+    end;
+  end;
+
+  if( err_msg )
+     SetParm( 1, err_msg );
+     return 1;
+  end;
+  
+  return 0;
+end;
+
+/**
+ * Проверка курсов валют
+ * 1.Заполняем массив уникальными валютами
+ * 2.Проверяем наличие курсов для этих валют
+*/
+private macro CheckRate( Payment:RsbPayment )
+
+  macro add_element( arr:TArray, new_element:variant )
+    if( find( arr, new_element ) == -1 )
+      arr[arr.size] = new_element;
+    end;
+  end;
+  
+  macro AddFIIDSide( arr:TArray, Payment:RsbPayment, side:integer )
+    var AddPI:RsbPIPayment    = Payment.PIList(side);
+    var IsNext                = AddPI.First(side);
+    var CurrAddPI:TRecHandler = TRecHandler( "pmaddpi.dbt" );
+    var err = 0;
+    if( Payment.PIList(side).Size > 0 )
+      while( ( err == 0 ) and (IsNext == 0) and (AddPI.Current( CurrAddPI ) == 0) )
+        add_element( arr, CurrAddPI.rec.FIID );
+        IsNext = AddPI.Next();
+      end;
+      return;
+    end;
+
+    add_element( arr, IfThenElse( side == PRT_Debet, Payment.PayerFIID, Payment.ReceiverFIID ) );
+  end;
+  
+  var cur:TArray = TArray();
+  var i = 0;
+
+  add_element( cur, Payment.BaseFIID );
+  AddFIIDSide( cur, Payment, PRT_Debet );
+  AddFIIDSide( cur, Payment, PRT_Credit );
+  
+  while( cur.size > i )
+    if( CheckRateForDate( cur[i], Payment.ValueDate ) != 0 );
+      return 1;
+    end;
+    i = i + 1;
+  end;
+
+  return 0;
+end;
+
+private macro PaymentIsDemand( Payment:RsbPayment )
+
+  if( Payment.DocKind == PS_PAYORDER )
+
+    var PayOrder = GenObject( "RsbPSPayOrder", Payment.PaymentID );
+    return PayOrder.DocKind == PSPOKIND_DEMAND;
+
+  end;
+
+  return Payment.DocKind == DLDOC_BANKCLAIM;
+end;
+
+private macro PaymentDemandAcceptTerm( Payment:RsbPayment )
+
+  if( Payment.DocKind == PS_PAYORDER )
+
+    var PayOrder = GenObject( "RsbPSPayOrder", Payment.PaymentID );
+    return PayOrder.AcceptTerm;
+
+  end;
+
+  return Payment.DemandAcceptTerm;
+end;
+
+//-----------------------------------------------------------------------------
+// Общие системные проверки при выполнении шага
+// Возвращает ошибку
+// Если заполняет строку ошибки, то возвращает 1
+//-----------------------------------------------------------------------------
+private macro SystemControl_CommonCheck( Payment:RsbPayment, err_msg:string, NeedManual:bool ):integer
+
+  var stat   :integer = 0;
+  var err    :integer = 0;
+  var err_tmp:string  = "";
+  var RateObj:object  = NULL;
+  var select;
+  var params:TArray = TArray();
+  VAR rs:RsdRecordset;
+  var MacroFile, MacroProc;
+  var OldDoc :integer = 0;
+  FILE pm_paym( pmpaym ) key 0;
+  // Проверить даты документа
+  if( CheckDate( Payment, err_msg ) != 0 )
+    SetParm( 1, err_msg );
+    return 1;
+  end;
+
+  // Проверить номер документа
+  if( CheckDocumentNumber( Payment ) != 0 )
+    return ERR_INVALID_NUMBER;
+  end;
+
+  // Проверить все три валюты документа, в случае разноски проверяем валюту каждой строки разноски
+  if( ( CheckFIID( Payment.BaseFIID ) != 0 ) or
+      ( CheckFIIDonSide(Payment, PRT_Credit)   != 0 ) or
+      ( CheckFIIDonSide(Payment, PRT_Debet )   != 0 ) )
+    return ERR_FIID_NOT_FOUND;
+  end;
+  // Проверить корректность видов кросс-курсов (RateType, BaseRateType)
+ 
+  // Проверить курс всех валют
+  if( CheckRate( Payment ) != 0 )
+    return ERR_RATE_NOT_FOUND;
+  end;
+
+  // Проверить сумму платежа
+  if( Payment.DocKind == PS_INRQ )
+    if( Payment.ReceiverAmount <= 0 )
+      return ERR_INVALID_AMOUNT;
+    end;
+  elif( (Payment.DocKind == BBANK_CPORDER) or (Payment.DocKind == PS_CPORDER) or (Payment.DocKind == DLDOC_BANKORDER) )
+    if( Payment.BaseAmount <= 0 )
+      return ERR_INVALID_AMOUNT;
+    end;
+  elif( Payment.DocKind == DLDOC_BANKCLAIM )
+    if( Payment.BaseAmount <= 0 )
+      return ERR_INVALID_AMOUNT;
+    end;
+  else
+    if( Payment.PayerAmount <= 0 )
+      return ERR_INVALID_AMOUNT;
+    end;
+  end;
+
+  // Дополнительная проверка сумм для мультивалютных
+  if( Payment.DocKind == CB_MULTYDOC )
+    if( Payment.ReceiverAmount <= 0 )
+      return ERR_INVALID_AMOUNT;
+    end;
+
+    if( ( Payment.PayerFIID == Payment.ReceiverFIID ) and
+        ( Payment.PayerAmount != Payment.ReceiverAmount ))
+      err_msg = "При одинаковых валютах суммы должны совпадать";
+      SetParm( 1, err_msg );
+      return 1;
+    end;
+  end;
+
+  // Проверить очередность
+  if( CheckPriority( Payment.Priority, Payment.DocKind ) != 0 )
+    return ERR_INVALID_PRIORITY;
+  end;
+
+  // Проверить номер пачки
+  if( Payment.NumberPack < 0 )
+    return ERR_INVALID_NUMBERPACK;
+  end;
+
+  var PoDocKind = 0;
+  if( Payment.DocKind == PS_PAYORDER )
+    var RsPoObj = RsbPSPayOrder( Payment.PaymentID );
+    PoDocKind = RsPoObj.DocKind;
+  end;
+
+  OldDoc = GetRegValueOldDoc( Payment.DocKind, PoDocKind, ( Payment.ReceiverFIID == NATCUR ) and ( Payment.PayerFIID == NATCUR ) and ( Payment.BaseFIID == NATCUR ) );
+  if( ( Payment.DocKind != DLDOC_BANKPAYORDER ) and ( ValType(OldDoc) == V_INTEGER ) and ( OldDoc > 0 ) )
+    if( (Payment.PayerBankEnterDate - Payment.Date) > OldDoc )
+      err_msg = "Дата составления документа меньше даты поступления в банк плательщика более чем на " + OldDoc + " дней. Документ устарел и не может быть обработан";
+      SetParm( 1, err_msg );
+      return 1;
+    end;
+  end;
+
+  if( Payment.DocKind == DLDOC_BANKORDER )
+    if( (Payment.StartDepartment != Payment.Department) or (Payment.Department != Payment.EndDepartment) )
+      err_msg = "Банковский ордер должен быть однофилиальным";
+      SetParm( 1, err_msg );
+    end;
+  end;
+  
+  // Проверить счета и проч.
+  stat = PM_CheckAccountAndOther( Payment, err_tmp, NeedManual );
+
+  if( ( stat != 0 ) or NeedManual )
+    if( StrLen( err_tmp ))
+      SetParm( 1, err_tmp );
+    end;
+    SetParm( 2, NeedManual );
+    return stat;
+  end;
+
+  stat = CheckExternalPaymentForRls(Payment.PaymentID,err_tmp);
+  if( stat != 0 )
+        SetParm(1,err_tmp);
+    return stat;
+  end;
+
+  return 0;
+end;
+
+private var CheckExistanceOnCheckPIAccount:bool;
+
+macro CheckPIAccount( parm:TExecFunPIParm ):integer
+
+  // Счета не являются масками
+  if( ( parm.pi.rec.Account == "" ) or ( AccountIsMask( parm.pi.rec.Account ) ) )
+    return ERR_INVALID_PAYERACC;
+  end;
+
+  if( CheckExistanceOnCheckPIAccount )
+    if( not СчетСуществуетИОткрыт( parm.pi.rec.FIID, parm.pi.rec.Account, parm.pi.rec.Chapter ) )
+    return ERR_CLOSED_PAYERACC;
+  end;
+  end;
+
+  return 0;
+end;
+
+/**
+ * Проверить корректность счетов в разноске по одной стороне
+ */
+macro CheckPIAccountsOneSide( Payment:RsbPayment, Side:integer )
+  var stat:integer = 0;
+  var piList:RsbPIPayment = Payment.PIList( Side );
+  var piListChanged:bool = piList.IsChanged;
+
+  if( (not stat) and (not piListChanged) and piList.Size )
+    /* Проверяем существование счетов разноски прямо по данным платежа в БД 
+       так намного быстрей */
+    if( not existsSQLselect( "select 1 "
+                             "from dpmaddpi_dbt pi "
+                             "where pi.t_PaymentID = :PaymentID "
+                               "and pi.t_DebetCredit = :Side "
+                               "and not exists( select 1 "
+                                               "from daccount_dbt a "
+                                               "where a.t_Account = pi.t_Account "
+                                                 "and a.t_Chapter = pi.t_Chapter "
+                                                 "and a.t_Code_Currency = pi.t_FIID )",
+                             makeArray( SQLParam( "PaymentID", Payment.PaymentID ),
+                                        SQLParam( "Side", Side ) )
+                           ) )
+      stat = ERR_CLOSED_PAYERACC;
+    end;
+  end;
+
+  CheckExistanceOnCheckPIAccount = piListChanged; /* По одному проверять существование счетов не надо, уже проверили пачкой */
+  var parm:TExecFunPIParm = TExecFunPIParm();
+
+  if( not stat )
+    stat = ExecFunForEachPIInList( Payment, Side, null, @CheckPIAccount, parm );
+  end;
+
+  return stat;
+end;
+
+private macro SystemControl_CheckSummary( Payment:RsbPayment, err_msg:string, NeedManual:bool  ):integer
+  
+  var stat :integer = 0;
+  var PaymentDelivery = -1;
+  var Department     :integer = 0;
+  var Type_Account   :string  = "";
+  var Client_Account :integer = -1;
+  var PaymChapter    :integer = Payment.Chapter;
+  var DateNoChange   :date = date(0,0,0);
+
+  // Проверить номер документа
+  if( CheckDocumentNumber( Payment ) != 0 )
+    return ERR_INVALID_NUMBER;
+  end;
+
+  // Проверить валюты документа
+  // Могут быть не заполнены, если есть мультивалютная разноска по стороне
+  if( ( ( not Payment.PIList( PRT_Credit ).IsAddPIMultyCurrency()  ) and ( CheckFIID( Payment.ReceiverFIID ) != 0 ) ) or 
+      ( ( not Payment.PIList( PRT_Debet ).IsAddPIMultyCurrency() ) and ( CheckFIID( Payment.PayerFIID ) != 0 ) ) )
+    return ERR_FIID_NOT_FOUND;
+  end;
+  
+  if( CheckRate( Payment ) != 0 )
+    return ERR_RATE_NOT_FOUND;
+  end;
+
+  // Проверить номер пачки
+  if( Payment.NumberPack < 0 )
+    return ERR_INVALID_NUMBERPACK;
+  end;
+
+  if( Payment.ValueDate > {curdate} )
+     err_msg = "Дата значения платежа не должна превышать текущую операционную дату";
+     SetParm( 1, err_msg );
+     return 1;
+  end;
+
+  if( ( not Payment.PIList(PRT_Debet).IsAddPIMultyCurrency() ) and ( Payment.PayerAmount == 0.0 ) )
+     err_msg = "Не задана сумма по дебету";
+     SetParm( 1, err_msg );
+     return 1;
+  end;
+
+  if( ( not Payment.PIList(PRT_Credit).IsAddPIMultyCurrency() ) and ( Payment.ReceiverAmount == 0.0 ) )
+     err_msg = "Не задана сумма по кредиту";
+     SetParm( 1, err_msg );
+     return 1;
+  end;
+
+  PaymentDelivery = SidePaymentDeliver( Payment );
+
+  if( PaymentDelivery == 1 )
+    if( Payment.PayerAmount != GetSumPIList( Payment, 1, true ) )
+     err_msg = "Ошибка в распределении суммы по дебету";
+     SetParm( 1, err_msg );
+     return 1;
+    end;
+  elif( PaymentDelivery == 0 )
+    if( Payment.ReceiverAmount != GetSumPIList( Payment, 0, true ) )
+     err_msg = "Ошибка в распределении суммы по кредиту";
+     SetParm( 1, err_msg );
+     return 1;
+    end;
+  end;
+
+  var parm:TExecFunPIParm;
+  stat = ExecFunForEachPIInList( Payment, PRT_Debet, null, @CheckPIAccount, parm );
+
+  if( stat == 0 )
+    stat = ExecFunForEachPIInList( Payment, PRT_Credit, null, @CheckPIAccount, parm );
+  end;
+
+  if( (stat != 0) and not ((stat == ERR_PAYERACCOUNT_RUB) or (stat == ERR_RECEIVERACCOUNT_RUB)))
+     err_msg = "Счет " + parm.pi.rec.Account + " получателя не найден";
+     SetParm( 1, err_msg );
+     NeedManual = true;
+  end;
+
+  return stat;
+
+end;
+
+private macro MsgCreateNotInstancy(ObjPayment:RsbPayment)
+
+  Array Text;
+  Array Buttons;
+                                                         
+  Text(0) = "Платеж № " + ObjPayment.Number + " от " + ObjPayment.Date + " на сумму " + ObjPayment.PayerAmount +
+             " не может быть проведен как срочный."+
+             " Провести его как обычный платеж?";                                                       
+
+  Buttons(CHOICE_BUTTON_YES) = " Да ";
+  Buttons(CHOICE_BUTTON_REJECT) = " Отвергнуть ";
+  Buttons(CHOICE_BUTTON_CANCEL) = " Отменить "; 
+
+  return ConfWin(Text,Buttons);
+end;
+
+//Проверка возможности проведения срочного платежа
+private macro CheckInstancyPM(ObjPayment:RsbPayment)
+  file Corschem(corschem) key 1;   
+  record AssigneeParty(party);
+  record Party(party);
+  
+  var stat = 0;
+  var GroupID;
+  var params:TArray;
+  var rs:RsdRecordset;
+  var select;
+  var choice;
+  var PartyID;
+  
+  if(ObjPayment.Instancy and ObjPayment.IsExternal)
+  
+    if( ObjPayment.ReceiverMesBankID > 0 )
+      PartyID = ObjPayment.ReceiverMesBankID;
+    else
+      ClearRecord(Corschem);
+      Corschem.Number  = ObjPayment.OutCorschem;
+      Corschem.FIID    = ObjPayment.OutCorschemFIID;      
+      Corschem.FI_Kind = 1;
+      if ( GetEQ( Corschem ))
+        Party.PartyID = Corschem.CorrID;
+        if( GetLinkedObject( OBJROLE_PARTY_ASSIGNEE, OBJTYPE_PARTY, Party, OBJTYPE_PARTY, AssigneeParty ) == 0 )
+          PartyID = AssigneeParty.PartyID;
+        else
+          PartyID = Corschem.CorrID;
+        end;
+      end;
+    end;
+  
+    select = "select 1 "+
+               "from dual "+
+              "where exists(select 1 "+
+                             "from dobjattr_dbt oap, dobjattr_dbt oaa, dobjatcor_dbt oacp, dobjatcor_dbt oaca, daccount_dbt acc, ddp_dep_dbt dp "+
+                            "where oap.T_OBJECTTYPE = 3 and "+
+                                  "oap.T_GROUPID = :GroupIDP and "+
+                                  "oap.T_CODELIST = '' and "+
+                                  "oap.T_NUMINLIST = '1' and "+
+
+                                  "oacp.t_ObjectType = oap.T_OBJECTTYPE and  "+
+                                  "oacp.t_Object = lpad(:PartyID, 10, '0') and "+
+                                  "oacp.t_GroupID = oap.T_GROUPID and "+
+                                  "oacp.t_AttrID = oap.T_ATTRID and "+
+                                  "oacp.t_ValidToDate >= :curdateP1 and "+
+                                  "oacp.T_VALIDFROMDATE <= :curdateP2 and "+
+                                  
+                                  "oaa.T_OBJECTTYPE = 4 and "+
+                                  "oaa.T_GROUPID = 19 and "+
+                                  "oaa.T_CODELIST = '' and "+
+                                  "oaa.T_NUMINLIST = '1' and "+
+
+                                  "acc.t_Account = :PayerAccount and "+
+                                  "acc.T_CHAPTER = 1 and "+
+                                  "acc.T_CODE_CURRENCY = :Code_Currency and "+
+                                  "( "+
+                                    "( "+
+                                      "oaca.t_ObjectType = oaa.T_OBJECTTYPE and "+
+                                      "oaca.t_Object = lpad(acc.T_CHAPTER, 2, '0') || lpad(acc.T_CODE_CURRENCY, 7, '0') || acc.t_Account and  "+
+                                      "oaca.t_GroupID = oaa.T_GROUPID and "+
+                                      "oaca.t_AttrID = oaa.T_ATTRID and "+
+                                      "oaca.t_ValidToDate >= :curdateA1 and "+
+                                      "oaca.T_VALIDFROMDATE <= :curdateA2 "+
+                                    ") "+
+                                    "or "+ 
+                                    "( "+
+                                      "dp.T_PARTYID = acc.T_CLIENT and "+
+                                      "dp.T_STATUS in (1 ,2, 4) and "+ // DEPARTMENT_STATUS_OPEN, DEPARTMENT_STATUS_ACTIVE, DEPARTMENT_STATUS_SUPERIOR
+                                      "dp.T_ACCESSMODE = 1 "+       // DEPARTMENT_ACCESS_ONLINE
+                                    ") "+
+                                  ") "+
+                          ")";
+
+    if((ObjPayment.PayerFIID == NATCUR) and  
+       (ObjPayment.ReceiverFIID == NATCUR) and
+       (ObjPayment.BaseFIID == NATCUR))
+      GroupID = PARTY_ATTR_GROUP_INSTANCYPM;
+    else
+      GroupID = PARTY_ATTR_GROUP_CURINSTANCYPM;
+    end;
+    
+    params = MakeArray( SQLParam("GroupIDP", GroupID),
+                        SQLParam("PartyID", PartyID),
+                        SQLParam("curdateP1", {curdate}),
+                        SQLParam("curdateP2", {curdate}));      
+                        
+                        
+    params[params.Size] = SQLParam("PayerAccount", ObjPayment.PayerAccount);
+    params[params.Size] = SQLParam("Code_Currency", ObjPayment.PayerFIID); 
+    params[params.Size] = SQLParam("curdateA1", {curdate});      
+    params[params.Size] = SQLParam("curdateA2", {curdate});      
+
+    rs = execSQLselect( select, params, false );
+    
+    if(rs and (not rs.moveNext()))
+      
+      MsgBox("Платеж № " + ObjPayment.Number + " от " + ObjPayment.Date + " на сумму " + ObjPayment.PayerAmount +
+             " не может быть проведен как срочный."+
+             " Признаки срочности и уведомления будут сняты.");                                                             
+      ObjPayment.Instancy = 0;
+      ObjPayment.NeedNotify = "";
+      ObjPayment.MessageType = Found_Type_Clir_ObjPaym(ObjPayment);
+                  
+    end;
+  end;
+  
+  return stat;
+end;
+
+// Проверка на соответствие номера и серии чека выданным чековым книжкам
+private macro CheckCERTAndChangeStatus( Payment:RsbPayment ):integer
+
+  /* Проверяем только клиентские чеки */
+  if( Payment.DocKind != CASH_PS_OUTORDER )
+    return 0;
+  end;
+
+  var err:integer = 0;
+  var CheckContMethod:integer = -1;
+  GetRegistryValue("PS\\CASHORDER\\OUTORDER\\CHECKNUMBER", V_INTEGER, CheckContMethod, err);
+
+  if( CheckContMethod == 1 )// Не проверять
+    return 0;
+  end;
+  
+  var CachOrder = RsbPSOutCashOrder( Payment.PaymentID );
+
+  return IS_ChangeCertStatusForCheck( CachOrder.Series, Payment.Number, Payment.PayerAccount, Payment.PayerFIID, 
+                                      0/*IS_CS_ARRIVE*/, 32000/*IS_CS_LEFT*/ );
+end;
+
+//-----------------------------------------------------------------------------
+// Проверка шифра операции при частичной оплате
+// Возвращает ошибку
+// Если заполняет строку ошибки, то возвращает 1
+//-----------------------------------------------------------------------------
+private macro CheckPartPaymShifrOper( Payment:RsbPayment, err_mes:@string ):integer
+  if(Payment.PartPaymDateMain == ZeroDate) // платеж не является частичной оплатой 
+    return 0;
+  end;
+  if( not(Payment.IsExternal and not Payment.IsExternalIncoming) ) // платеж не является исходящим
+    return 0;
+  end;
+
+  var err : integer = 0;
+        
+  var Corschem : TRecHandler = TRecHandler( "corschem.dbt" );  
+  err = FindCorschem(Corschem, Payment.OutCorschem, Payment.OutCorschemFIID);
+  if(err == 0)
+    var ShifrOperMustEqual : string = "";
+
+    var AttrFound : bool = false;
+    var RecParty : TRecHandler = TRecHandler("party.dbt");
+    RecParty.rec.PartyID = Payment.ReceiverBankID;
+    // Если корреспондент исходящей корсхемы является РКЦ и
+    // значение категории ATTR_GROUP_REGIONKIND для субъекта pmpaym.ReceiverBankID равно OBJGROUP_REGIONKIND_OUTSIDEREGION
+    if( БанкУБР(Corschem.rec.CorrID) and
+        CheckObjAttrPresence(AttrFound, OBJTYPE_PARTY, UniID(RecParty, OBJTYPE_PARTY), PT_ATTR_GROUP_REGIONKIND, OBJGROUP_REGIONKIND_OUTSIDEREGION) and
+        (AttrFound == true)
+      )
+      var stat : integer = 0;
+      GetRegistryValue("PS\\PAYORDER\\IND2_PAYPART_CODEOP", V_STRING, ShifrOperMustEqual, stat);
+      if(stat)
+        ShifrOperMustEqual = "01";
+      end;          
+    else
+      ShifrOperMustEqual = "16";
+    end;
+
+    if(Payment.ShifrOper != ShifrOperMustEqual)
+      err = 1;
+      err_mes = "Для частичной оплаты неверно задан шифр операции";
+    end;
+  end;
+  return err;
+end;
+
+//-----------------------------------------------------------------------------
+// Выполнение шага "Системный контроль"
+// Payment     - платеж
+// DoNotReject - надо ли помещать в отвергнутые
+//-----------------------------------------------------------------------------
+MACRO ExecuteSysControlStep( Payment:RsbPayment, DoNotReject:bool ):integer
+
+  var err          :integer = 0;
+  var err_mes      :string = "";
+  var tmpNeedManual:bool = false;
+  var obj;
+  var IsSummaryMemord:bool = Payment.DocKind == DLDOC_SUMMARY_MEMORDER;//IsSummaryPayment( Payment );
+  var HCSPaymNote = "";
+
+  record PrevInstrAgent(pmroute);
+  record SenderBank(pmroute);
+  record ExecutorBank(pmroute);
+  record IntermediaryBank(pmroute);
+
+  if( Payment.Actuate() )
+    RejectPayment(Payment, "Не определен курс конверсии");
+    MsgBox("Ошибка при актуализации платежа ");
+    return 1;
+  end;
+
+  if( IsSummaryMemord )
+    err = SystemControl_CheckSummary( Payment, err_mes, tmpNeedManual );
+    if( err == 0 )
+      err = Payment.CheckADDPIList();
+    end;
+  else
+    err = SystemControl_CommonCheck( Payment, err_mes, tmpNeedManual );
+  end;
+  
+    // Проверка налоговых реквизитов
+  if(   (InList(Payment.DocKind, DLDOC_BANKPAYMENT, PS_PAYORDER, PS_INRQ ) 
+      or ( ( Payment.DocKind == BBANK_CPORDER ) and ДокументПорожденВходящимЭСИД( Payment.PaymentID ) ))
+    and (err == 0)
+    )
+
+    err = PM_CheckTaxPropForStep( Payment.PaymentID );
+    if( err != 0 )
+      return err;
+    end;
+
+  end;
+  
+  if( InList(Payment.DocKind, DLDOC_BANKPAYMENT, BBANK_CPORDER, PS_PAYORDER, PS_CPORDER, PS_INRQ, DOC_BO_PAYMENT ) )
+    // Проверка принадлежности получателя оплат ЖКУ
+    HCSPaymNote = IsHCSPaymentReceiver( Payment.GetPM_PAYM(), Payment.GetPMRMPROP(), Payment.GetPMSERV() );
+    if( HCSPaymNote )
+      if( Payment.Notes.AddNote( NOTEKIND_PAYM_HCSWARNING, HCSPaymNote ) != 0 )
+        msgbox( "Ошибка при вставке примечания платежа" );
+        return 1;
+      end;
+    end;
+    
+    HCSPaymNote = readNoteForObject( OBJTYPE_PAYMENT, makeObjectID( OBJTYPE_PAYMENT, 0, Payment.GetPM_PAYM() ), NOTEKIND_PAYM_HCSWARNING );
+    // Проверка реквизитов ЖКХ
+    if( (Payment.HCSPayment == "X") and (HCSPaymNote == "") )
+      if(not PM_CheckCommunalProp( Payment.PaymentID ))
+        return -1;
+      end;
+    end;
+  end;
+
+  if( InList( Payment.DocKind, DLDOC_BANKPAYMENT, PS_PAYORDER ) )
+    var GGPaymNote = readNoteForObject( OBJTYPE_PAYMENT, makeObjectID( OBJTYPE_PAYMENT, 0, Payment.GetPM_PAYM() ), NOTEKIND_PAYM_GISGMP_CHECK_RES );
+    // Проверка реквизитов ГИС ГМП
+    if( GGPaymNote == "" )
+      if(GGPICheckGisGmpProp( Payment.PaymentID, GGPaymNote ))
+        return -1;
+      else
+        if( GGPaymNote != "" )
+          var CheckParametersGisGmp = Bnk_GetRegistryValue( RegPath_CheckParametersGisGmp, V_INTEGER, CheckParametersGisGmp_Dont_Check );
+          if( CheckParametersGisGmp == CheckParametersGisGmp_Continue_Step )
+            err = 0;
+          elif( CheckParametersGisGmp == CheckParametersGisGmp_Reject_Step )
+            err = 1;
+            err_mes = "Не пройдена проверка реквизитов для передачи информации о платеже в ГИС ГМП";
+          end;
+        end;
+      end;
+    end;
+  end;
+
+  // Для требований проверить корректность заполнения AcceptTerm
+  if( PaymentIsDemand( Payment ) and not AllowUseNonAcceptClaim() and ( PaymentDemandAcceptTerm( Payment ) == PM_DEMAND_TERM_WITHOUTACCEPT ) )
+    err = 1;
+    err_mes = "В соответствии с Положением ЦБ РФ №2-П|требования с условием оплаты \"без акцепта\" больше не применяются";
+  end;
+
+  // Для возвратов из МБР установить "Контроль" = "Не проконтролирован"
+  if( IsRMOrigin( Payment ) )
+    if( УстановитьСтатусыПлатежа( OPR_PAYM_CONTROL, OPR_PAYM_ST_CTRL_NOTCONTROL ) )
+      msgbox("Ошибка при установке сегментов статуса экземпляра операции");
+      return 1;
+    end;
+  end;
+  
+  // Требование банка
+  if( ( Payment.DocKind == DLDOC_BANKCLAIM ) AND
+      ( Payment.DemandAcceptTerm == PM_DEMAND_TERM_ACCEPT ) )
+    if( УстановитьСтатусыПлатежа( OPR_PAYM_ACCEPT, OPR_PAYM_ST_ACPT_NEED ) )
+      msgbox("Ошибка при установке сегментов статуса экземпляра операции");
+      return 1;
+    end;
+  else
+    if( УстановитьСтатусыПлатежа( OPR_PAYM_ACCEPT, OPR_PAYM_ST_ACPT_NONE ) )
+      msgbox("Ошибка при установке сегментов статуса экземпляра операции");
+      return 1;
+    end;
+  end;
+
+  if( Payment.DocKind == DLDOC_BANKPAYORDER )   
+
+    ClearRecord( PrevInstrAgent );
+    ClearRecord( SenderBank );
+    ClearRecord( ExecutorBank );
+    ClearRecord( IntermediaryBank );
+
+    if( Payment.GetOperationParticipantsFromRoute( PrevInstrAgent, SenderBank, ExecutorBank, IntermediaryBank  ) and (err == 0) )
+
+
+      var isLocked:bool = false;
+
+      if( SenderBank.PartyID != 0 )
+        if( (not СубъектСуществует( SenderBank.PartyID, IsLocked )) or IsLocked )
+          tmpNeedManual = true;
+          err_mes = "Банк-отправитель не найден в справочнике среди открытых банков";   
+        else
+          var EndPartyID = GetDprtPartyID( Payment.EndDepartment );
+
+          if( (EndPartyID != -1) and (EndPartyID != SenderBank.PartyID) )
+            tmpNeedManual = true;
+            err_mes = "Банк-отправитель не является владельцем корсчета (схемы расчетов), с которого должны быть перечислены средства";     
+          end;
+
+          if(not tmpNeedManual)
+            if( CheckPtIsPartPSBR(SenderBank.PartyID, "Банк-отправитель", @err_mes) != 0 )
+              tmpNeedManual = true;
+            elif( CheckPtRestrictPartPSBR(SenderBank.PartyID, "банка-отправителя", @err_mes) != 0 )
+              tmpNeedManual = true;
+            end;
+          end;
+        end;
+      else
+        tmpNeedManual = true;
+        err_mes = "Банк-отправитель не указан";  
+      end;
+
+      if( tmpNeedManual == false )
+        if( ExecutorBank.PartyID != 0 )
+          if( (not СубъектСуществует( ExecutorBank.PartyID, IsLocked )) or IsLocked )
+            tmpNeedManual = true;
+            err_mes = "Банк-исполнитель не найден в справочнике среди открытых банков";   
+          end;
+
+          if(not tmpNeedManual)
+            if( CheckPtIsPartPSBR(ExecutorBank.PartyID, "Банк-исполнитель", @err_mes) != 0 )
+              tmpNeedManual = true;
+            elif( CheckPtRestrictPartPSBR(ExecutorBank.PartyID, "банка-исполнителя", @err_mes) != 0 )
+              tmpNeedManual = true;
+            end;
+          end;
+        else
+          tmpNeedManual = true;
+          err_mes = "Банк-исполнитель не указан";  
+        end;
+      end;
+    end;    
+  end;  
+
+  // Проверка на соответствие номера и серии чека выданным чековым книжкам
+  if( ( err == 0 ) and
+      ( Payment.DocKind == CASH_PS_OUTORDER ) )
+      err = CheckCERTAndChangeStatus( Payment );
+  end;
+
+  if (err == 0)
+    if(  (GetOprStatus( OPR_PAYM_DOCKIND ) == OPR_PAYM_ST_DK_CLIENTPAYMENT ) and (Payment.PartPaymDateMain != ZeroDate) ) // Если платеж является частичной оплатой 
+      err = CheckPartPaymShifrOper( Payment, @err_mes );
+    end;    
+  end;
+
+  if( err != 0 )
+    if( StrLen( err_mes ) == 0 )
+      InitError();
+      MemoryError( err );
+      err_mes = GetErrMsg();
+    end;
+
+    InitError();
+
+    //ErrMes = err_mes;
+
+    if( not DoNotReject )
+
+      if( RejectPayment( Payment, err_mes ) == 0 )
+        if(Payment.PrimDocKind == DOC_BO_PAYMENT)
+          Payment.PropStatus = PM_PROP_CORREJECTED;
+        end;
+      else
+        return 1;
+      end;
+
+    end;
+
+    msgbox( err_mes );
+
+    return 1;
+  else // А вдруг нужна ручная обработка?
+    if( tmpNeedManual )
+
+      InitError();
+
+      // Заполнить статусы сегментов операции
+      if( УстановитьСтатусыПлатежа( OPR_PAYM_MANUAL, OPR_PAYM_ST_MANUAL_NEED ) )
+        msgbox("Ошибка при установке сегментов статуса экземпляра операции");
+        return 1;
+      end;
+
+      // Заполнить примечание
+      if( Payment.Notes.AddNote( PM_NOTEKIND_DENIALGROUND, err_mes ) != 0 )
+        msgbox( "Ошибка при вставке примечания платежа" );
+        return 1;
+      end;
+
+      msgbox( err_mes );
+
+      return 0;
+    end;
+  end;
+
+  return 0;
+END;

@@ -1,0 +1,384 @@
+ /*
+ $Name: pmin_dem2.mac
+ $Module: Бухгалтерия банка Banking
+ $Description: Макрос шага. Блок 29045 - "Картотека требований-поручений". Шаг 20 - "Изъятие из картотеки требований"
+ */
+
+//-----------------------------------------------------------------------------
+// Блок     : 29045 - "Картотека требований-поручений"
+// Шаг      : 20    - "Изъятие из картотеки требований"
+// Описание : Макрос шага
+//-----------------------------------------------------------------------------
+import globals, PaymInter, FIInter, PTInter, WldInter, pm_setst, likepy, cbsttls, stwlconf, pm_tools;
+
+var PaymentObj:RsbPayment;
+
+PRIVATE CONST CHOICE_ACCEPT = 0; // Акцептовать
+PRIVATE CONST CHOICE_REJECT = 1; // Отказать
+
+PRIVATE const STR_ACTION_STEP_RETURN_TO_SENDER   = "Вернуть отправителю";
+PRIVATE const STR_ACTION_STEP_BREAK              = "Отложить";
+PRIVATE const STR_ACTION_STEP_CONTINUE           = "Продолжить";
+
+PRIVATE const CTRL_REL_ACTION_RETURN_TO_SENDER = 0;
+PRIVATE const CTRL_REL_ACTION_STEP_BREAK       = 1;
+PRIVATE const CTRL_REL_ACTION_STEP_CONTINUE    = 2;
+
+// ----------------------------------------------------------------------------
+// Обертка для вызова меню действий над поручением при наличии отзыва
+// ----------------------------------------------------------------------------
+private macro AskActionIfExistCallback( OriginatorID ):integer
+  Array Text;
+  Array Buttons;
+
+  var shortName = "";
+  var dprtNum;
+  
+  var select:string = " select dp.t_Name, pt.t_Name " + 
+                      " from ddp_dep_dbt dp, dparty_dbt pt " + 
+                      " where dp.t_PartyID = :OriginatorID " + 
+                      "  and pt.t_PartyID = dp.t_PartyID ";
+
+  var params:TArray = makeArray( SQLParam( "OriginatorID", OriginatorID ) );
+  var rset:RsdRecordset = execSQLselect( select, params, true );
+  if( rset and rset.moveNext() )
+    dprtNum = rset.value(0); 
+    shortName = rset.value(1);
+  end;
+
+  Text(0) = "Есть необработанный запрос из филиала " + dprtNum + " " + shortName + " на отзыв документа. Продолжить изъятие?";                                                       
+  Buttons( CTRL_REL_ACTION_RETURN_TO_SENDER ) = STR_ACTION_STEP_RETURN_TO_SENDER;
+  Buttons( CTRL_REL_ACTION_STEP_BREAK )       = STR_ACTION_STEP_BREAK;
+  Buttons( CTRL_REL_ACTION_STEP_CONTINUE  )   = STR_ACTION_STEP_CONTINUE;
+
+  return ConfWin( Text, Buttons, 0 );
+end;
+
+// ----------------------------------------------------------------------------
+// Макрос поиска принятого отзыва и получения ID филиала отправителя
+// ----------------------------------------------------------------------------
+private macro IsExistCallback( PaymentID: integer, ReqID:@integer, OriginatorID:@integer, State: integer ):bool
+  var select:string = " select wlreq.t_ReqID, wlreq.t_OriginatorID" 
+                      " from dwlreq_dbt wlreq, dwlreqlnk_dbt wlrqlnk " +
+                      " where wlrqlnk.t_ObjID = :PaymentID " +
+                      "  and wlrqlnk.t_objKind = :OBJTYPE_MFRPAYMENT " +
+                      "  and wlrqlnk.t_ReqID = wlreq.t_ReqID " +
+                      "  and wlreq.t_State <> :WLD_STATUS_REQ_CLOSED ";
+  if( State )
+    select = select + "  and wlreq.t_State = :State ";
+  end;
+
+  var params:TArray = makeArray( SQLParam( "PaymentID", PaymentID ),
+                                 SQLParam( "OBJTYPE_MFRPAYMENT", OBJTYPE_MFRPAYMENT ),
+                                 SQLParam( "WLD_STATUS_REQ_CLOSED", WLD_STATUS_REQ_CLOSED ),
+                                 SQLParam( "State", State )
+                               );
+  var rset:RsdRecordset = execSQLselect( select, params, true );
+
+  if( rset and rset.moveNext() )
+    ReqID = rset.value(0);    
+    OriginatorID = rset.value(1);
+    return true;
+  end;     
+
+  return false;
+end;
+
+// ----------------------------------------------------------------------------
+// Обертка для вызова вертикального меню
+// ----------------------------------------------------------------------------
+PRIVATE MACRO ShowMenu():integer
+
+  ARRAY m;
+  m(0) = " Акцептовать";
+  m(1) = "  Отказать";
+
+  return Menu( m, "Enter Выбор Esc Отмена", "" );
+
+END;
+
+//-----------------------------------------------------------------------------
+// Является ли субъект резидентом
+//-----------------------------------------------------------------------------
+PRIVATE MACRO IsResident( PartyID ):bool
+  VAR select:string = " select party.T_NotResident " +
+                        " from dparty_dbt party "+
+                       " where party.T_PARTYID = :PartyID";
+  VAR params:TArray = makeArray( SQLParam( "PartyID", PartyID ) );
+  VAR rset:RsdRecordset = execSQLselect( select, params, TRUE );
+
+  if( rset and rset.moveNext() )
+    if( rset.value(0) == "X" )
+      return false;
+    end;
+  end;     
+
+  return true;
+END;
+
+//-----------------------------------------------------------------------------
+// Проверка внешних платежей
+//-----------------------------------------------------------------------------
+PRIVATE MACRO CheckExtPayment( Payment:RsbPayment, err:string ):integer
+
+  var stat   :integer = 0;
+  var err_str:string  = "";
+  var BankID :integer = Payment.ReceiverBankID, 
+      CodeKind:integer = Payment.ReceiverBankCodeKind, 
+      AccLen:integer = 0,
+      retval:integer = 0;
+  var ExtAcc :string  = Payment.ReceiverAccount, 
+      BankCode:string = Payment.ReceiverBankCode,
+      ExtAccNew :string  = "";
+  var params:TArray = NULL;
+  
+  // Если банк российский
+  if( ( stat == 0 ) and ( BankID > 0 ) and ( IsResident( BankID )) )
+    AccLen = strlen( ExtAcc );
+
+    // Проверить длину счета
+    if( ( stat == 0 ) and ( AccLen > 0 ) )
+      if( AccLen != 20 )
+        stat = 1;
+        err_str = "Длина счета должна быть равна 20 символам";
+      else // Проверить ключ счета
+        if( CodeKind != PTCK_BIC )
+          params = makeArray( SQLParam( "p_PartyID"    , BankID               ),
+                              SQLParam( "p_CodeKind"   , PTCK_BIC             ),
+                              SQLParam( "p_Code"       , V_STRING , RSDBP_OUT ),
+                              SQLParam( "p_CodeOwnerID", V_INTEGER, RSDBP_OUT )
+                            );
+          retval = execStoredFunc( "RSBPARTY.PT_GetPartyCodeEx", V_INTEGER, params );
+          if( retval == 0 )
+            BankCode = params.Value(2).value;
+          end;
+        end;
+        ExtAccNew = GetKey( ExtAcc, BankCode );
+        if( ExtAccNew != ExtAcc )
+          err_str = "В номере счета " + ExtAcc + " неверно значение ключа.|Должно быть "
+                     + ExtAccNew;
+          stat = 1;
+        end;
+      end;
+    end;
+  end;
+
+  SetParm( 1, err_str );
+  return stat;
+END;
+
+//-----------------------------------------------------------------------------
+// Некоторые проверки требования
+//-----------------------------------------------------------------------------
+PRIVATE MACRO ControlCheck( Payment:RsbPayment, err_msg:string ):integer
+
+  // Номер документа не задан
+  if( StrLen( Payment.Number ) == 0 ) 
+    err_msg = "Неверно задан номер документа";
+    SetParm( 1, err_msg );
+    return 1;
+  end;
+
+  if( Payment.BaseAmount <= 0 )
+    err_msg = "Неверно задана сумма требования";
+    SetParm( 1, err_msg );
+    return 1;
+  end;
+
+  // Проверить валютe требования
+  if( CheckFIID( Payment.BaseFIID ) != 0 )
+    err_msg = "Не найдена валюта требования";
+    SetParm( 1, err_msg );
+    return 1;
+  end;
+
+  // Проверить курс всех валют
+  if( (Payment.BaseFIID != 0/*NATCUR*/ ) AND (CheckRateForDate( Payment.BaseFIID, {curdate} ) != 0) )
+    err_msg = "Не найден курс валюты требования";
+    SetParm( 1, err_msg );
+    return 1;
+  end;
+
+  if( Payment.PayerBankID == Payment.ReceiverBankID  )
+    err_msg = "Банк плательщика не должен совпадать|с банком получателя";
+    SetParm( 1, err_msg );
+    return 1;
+  end;
+
+  // Проверка плательщика              
+  if( ПолучитьСубъекта( Payment.PayerBankID ) )
+    err_msg = "Неверно задан банк плательщика";
+    SetParm( 1, err_msg );
+    return 1;
+  end;
+
+  // Банк получателя входит в ЦАБС
+  if( ( ( Payment.PayerGroup == PAYMENTS_GROUP_EXTERNAL ) and (PM_IsBankInTS(Payment.PayerBankID, false) ) ) or
+      ( ( Payment.PayerGroup != PAYMENTS_GROUP_EXTERNAL ) and (PM_IsBankInTS(Payment.PayerBankID, true ) ) ) )
+    err_msg = "";
+  else
+    err_msg = "Банк получателя не является узлом ТС";
+    SetParm( 1, err_msg );
+    return 1;
+  end;
+
+  // Банк получателя задан и открыт
+  if( ПолучитьСубъекта( Payment.ReceiverBankID ) )
+    err_msg = "Неверно задан банк плательщика";
+    SetParm( 1, err_msg );
+    return 1;
+  end;
+
+  if( Payment.ReceiverAccount != "" )
+    if( AccountIsMask( Payment.ReceiverAccount ) )
+      err_msg = "Счет получателя не должен быть маской";
+      SetParm( 1, err_msg );
+      return 1;
+    end;
+    if( CheckExtPayment( Payment, err_msg ) )
+      SetParm( 1, err_msg );
+      return 1;
+    end;
+  end;
+
+  return 0;
+END;
+
+// ----------------------------------------------------------------------------
+// Макроса шага
+// ----------------------------------------------------------------------------
+MACRO ExecuteStep( doc, paymDoc, DocKind, ID_Operation, ID_Step )
+
+  var stat:integer = 0;
+  var BankClaimObj:object = null;
+
+  RECORD  wlconf( wlconf );
+  
+  if( PaymentObj.EndDepartment != {OperDprt} )
+    msgbox( "Шаг может быть выполнен только из филиала,|в который направлено требование" ); 
+    return 1;
+  end;
+
+  if( IsOprMultiExec() )
+    msgbox( "Массовое выполнение данного шага недопустимо" );
+    return 1;
+  end;
+  
+  var BranchSymbol = "8"; /*PM_OPR_SYMB_RET_TO_CLIENT*/
+  var KindBranch = "R";  /*OPRBR_REMOVE*/
+  var ReqID = 0;
+  var OriginatorID = 0;
+  if( ( PaymentObj.StartDepartment != PaymentObj.EndDepartment ) and ( IsExistCallback( PaymentObj.PaymentID, @ReqID, @OriginatorID, WLD_STATUS_REQ_RECEIV ) == true ) )
+    var ifCallbackChoiсe = AskActionIfExistCallBack( OriginatorID );
+    if( ifCallbackChoiсe == CTRL_REL_ACTION_RETURN_TO_SENDER )
+      stat = PM_ReturnMFRPayment( PaymentObj.GetPM_PAYM() );
+      if( stat )
+        if( stat == 1264 ) /*OPR_NEED_INSERTBRANCH*/
+          if( Opr_InsertBranch( BranchSymbol, KindBranch, false ) )
+            return 0;
+          end;
+        end;
+        DisplayError();
+        return 1;
+      end;
+      return 0;
+    elif( ifCallbackChoiсe == CTRL_REL_ACTION_STEP_BREAK )
+      return 1;
+    elif( ifCallbackChoiсe == CTRL_REL_ACTION_STEP_CONTINUE )
+      if( PlaceReqToClose( ReqID, ID_Operation, ID_Step ) )
+        msgbox( "Ошибка при помещении отзыва в обработанные" );
+        return 1;
+      end;
+    end;
+  end;
+  
+  var Choice:integer = ShowMenu();
+  var err_msg:string = "";
+
+  if( Choice == CHOICE_ACCEPT )
+
+    // Платеж Входящий - выполнить следующие проверки
+    if( ( not ( ( PaymentObj.PayerGroup  == PAYMENTS_GROUP_EXTERNAL ) and
+                ( PaymentObj.ReceiverGroup == PAYMENTS_GROUP_EXTERNAL ) ) ) and 
+        PaymentObj.IsExternalIncoming )
+   
+       if( ControlCheck( PaymentObj, err_msg ) )
+         msgbox( "Требование не может быть акцептовано. Причина: |" + err_msg );
+         return 1;
+       end;
+    
+    end;
+
+    if( УстановитьСтатусыПлатежа( OPR_PAYM_ACCEPT, OPR_PAYM_ST_ACPT_ACCEPTED,
+                                  OPR_PAYM_DO,     OPR_PM_ST_ENTER ) )
+      msgbox("Ошибка при установке сегментов статуса экземпляра операции");
+      return 1;
+    end;
+
+    PaymentObj.DemandAccept = PM_DEMAND_ACCEPT_ACCEPT;
+    PaymentObj.DemandAcceptDate = {curdate};
+    PaymentObj.DemandIndexExitDate = {curdate};
+
+    // Заполнить примечание
+    if( PaymentObj.Notes.AddNote( PM_NOTEKIND_DENIALGROUND, "" ) != 0 )
+      msgbox( "Ошибка при вставке примечания платежа" );
+      return 1;
+    end;
+
+    return 0;
+
+  elif( Choice == CHOICE_REJECT )
+
+    // Выдать панель ввода отказа от акцепта платежа
+    if( NOT PM_DenialPanel( PaymentObj, PAYMENTS_INDEX_DEMAND, true ) )
+      msgbox( "Пользователь прервал выполение" );
+      return 1;
+    end;
+    
+    // Установить примечание "Причина отказа (возврата)" равным причине отказа 
+    // от акцепта, введенной в панели отказа от акцепта
+    if( PaymentObj.Notes.AddNote( PM_NOTEKIND_DENIALGROUND, PaymentObj.DenialGround() ) != 0 )
+      msgbox( "Ошибка при вставке примечания платежа" );
+      return 1;
+    end;
+
+    // Платеж входящий
+    if( ( not ( ( PaymentObj.PayerGroup  == PAYMENTS_GROUP_EXTERNAL ) and
+                ( PaymentObj.ReceiverGroup == PAYMENTS_GROUP_EXTERNAL ) ) ) and 
+        PaymentObj.IsExternalIncoming )
+     
+      // Сформировать сообщение об отказе от акцепта входящего требования;
+      // Сообщение должно быть отправлено по тому же транспорту, по которому было сформировано входящее требование.
+      ClearRecord( wlconf );
+      FillConfirmationParamObj( PaymentObj, wlconf );
+        
+      wlconf.Cancel      = "X";
+      wlconf.Description = PaymentObj.DenialGround();
+      if( CreateConfirmation(wlconf, TRUE) == FALSE )
+        msgbox("Ошибка при создании подтверждения по проводке");
+        return 1;
+      end;
+
+    end;
+
+    if( УстановитьСтатусыПлатежа( OPR_PAYM_STATE,  OPR_PM_ST_CLOSE,
+                                  OPR_PAYM_DO,     OPR_PM_ST_ENTER,
+                                  OPR_PAYM_ACCEPT, OPR_PAYM_ST_ACPT_REJECTED ) )
+      msgbox("Ошибка при установке сегментов статуса экземпляра операции");
+      return 1;
+    end;
+
+    // Установить статус первичного документа = $(Закрыт);
+    PM_SetPrimDocumentState( PaymentObj, DOCUMENT_ST_CLOSED );
+
+    PaymentObj.DemandAccept = PM_DEMAND_ACCEPT_REJECTED;
+    PaymentObj.DemandIndexExitDate = {curdate};
+
+    return 0;
+  else
+    msgbox("Выполнение процедуры прервано пользователем");
+    return 1;
+  end;
+
+  return 0;
+END;

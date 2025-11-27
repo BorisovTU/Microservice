@@ -1,0 +1,952 @@
+/**                                                                                                             
+ @file scrollnptxmessage.mac                                                                                        
+ @brief BOSS-8091.1 Настройка текста рассылки по переплате/недоплате НДФЛ по итогам года
+                                                                                                                                                                                                                                                                                                                            
+ # changeLog                                                                                                    
+ |date       |author         |tasks               |note                                                         
+ |-----------|---------------|--------------------|-------------------------------------------------------------
+ |2025.08.29 |Шестаков Д.В.  |BOSS-8091.1         |Создание макроса  для создания и обработки скроллинга для  Шаблонов клиентских уведомлений                                                                                                                                                                                                                                                                                      
+*/ 
+
+import OprInter, rsd, RsbDataSet, SQLCONV, dlmisc, RsbFormsInter, "globals.mac", "func_lib.mac", "xls_parser.mac", "poiutils.mac", "CbReport_h.mac", "scsrvrepfun.mac";
+private const FT_STRING:integer = 7;
+private const FT_DATE:integer   = 9;
+private const F_2:integer       = 316;
+private const F_4:integer       = 318;
+private const F_3:integer       = 317;
+private const F_9:integer       = 323;
+private const KEY_ESC:integer   = 27;
+private const C_COMMENT_TEXT:string = string("\\{ФИО}",
+                      "\n\\{Налоговый год}",
+                      "\n\\{Сумма}",
+                      "\n\\{Номер договора ИИС}",
+                      "\n\\{Дата отправки сообщения}",
+                      "\n\\{Номер уведомления}",
+                      "\n\\{Год отправки сообщения}",
+                      "\n\\{Срок для пополнения брокерского счета}",
+                      "\n\\{Сумма прописью}",
+                      "\n\n\n"
+                      "* Перечисленные параметры можно указать в теме или тексте уведомления. В процессе отправки будут подставлены соответствующие данные",
+                      "\n"
+                      "* Обращение \x22Уважаемый\x22 просклоняется в зависимости от пола клиента"                  
+                      );
+
+private const C_COMMENT_TEST_SEND:string = string("* Тестовая рассылка выполняется на адрес - broker@rshb.ru");
+private const C_COMMENT_TEST_CLIENT_1:string = string("** Если в отчете несколько клиентов, то письмо отправляется только по первому");
+
+private const C_SEND_TEST_EMAIL:string = string("broker@rshb.ru");
+
+PRIVATE MACRO GetUniqNumber():integer
+  var cmd = RsdCommand("SELECT DNPTXCTRL_REFSEND_CODE_SEQ.NEXTVAL NextV FROM DUAL;");
+  var ds = TRsbDataSet(cmd);
+
+  if(ds.MoveNext())
+    return Int(ds.NextV);
+  end;
+
+  return 0;
+END;
+
+PRIVATE CLASS TClientRepData(RepDate:date, RepYear:integer, ClientID:integer, ClientIDCFT:string, ClientName:string, IISNumber:string, DueTotal:money)
+  var m_RepDate         = RepDate,  
+      m_RepYear         = RepYear,
+      m_ClientID        = ClientID, 
+      m_ClientIDCFT     = ClientIDCFT,
+      m_ClientShortName = ClientName,
+      m_IISNumber       = IISNumber,
+      m_DueTotal        = DueTotal;     
+      
+  var m_ClientName      = "";
+  var m_ContractsStr  = "";
+  var m_DlContrIDStr  = "";
+  var m_MainEmail     = "";
+  var m_CopyEmailStr  = "";
+  var m_DlContrIDIIS  = "";
+
+  macro CheckIIS():bool
+    var oldDialog = SetDialogFlag(0);
+    var query = 
+     " SELECT dl.t_DlContrID " +
+     "   FROM ddlcontr_dbt dl, dsfcontr_dbt sf " +
+     "  WHERE sf.t_Number = ? " +
+     "    AND dl.t_SfContrID = sf.t_ID " + 
+     "    AND sf.t_PartyID = ? " +
+     "    AND sf.t_DateClose <> TO_DATE('01.01.0001','DD.MM.YYYY') " +
+     "    AND sf.t_DateClose <= ? ";
+    var cmd = DL_RSDCommand(query);
+    cmd.addParam(m_IISNumber);
+    cmd.addParam(m_ClientID);
+    cmd.addParam(m_RepDate);
+    var ds = cmd.Execute();
+    SetDialogFlag(oldDialog);
+    if(ds.moveNext())
+      m_DlContrIDIIS = ds.DlContrID;
+      m_DlContrIDStr = ds.DlContrID;
+      return true;
+    end;
+    return false;
+  OnError(er)
+    SetDialogFlag(oldDialog);
+    return false;
+  end;
+
+  MACRO LoadContrStr()
+    var query, cmd, DataSet;
+    
+    query =   " SELECT NVL(LISTAGG(TRIM(sf.t_Number), ', ') WITHIN GROUP (ORDER BY sf.t_ID ASC), CHR(1)) as ContractsStr, "
+            + "        NVL(LISTAGG(dlc.t_DlContrID, ',') WITHIN GROUP (ORDER BY sf.t_DateBegin DESC), CHR(1)) as DlContrIDStr "
+            + "   FROM dsfcontr_dbt sf, ddlcontr_dbt dlc "
+            + "  WHERE sf.t_PartyID = ? " 
+            + "    AND (sf.t_DateClose = "+GetSQLDate(date(0,0,0))+" OR sf.t_DateClose >= ?) "
+            + "    AND dlc.t_SfContrID = sf.t_ID "
+            + "    AND dlc.t_IIS = chr(0) ";
+
+    cmd = DL_RSDCommand(query);
+
+    cmd.AddParam(m_ClientID);
+    cmd.AddParam(m_RepDate);
+
+    DataSet = cmd.Execute();
+    if(DataSet.moveNext())
+      m_ContractsStr = DataSet.ContractsStr;
+      m_DlContrIDStr = DataSet.DlContrIDStr;
+    end;
+  END;
+
+  macro GetDlContrIDArr()
+    if(m_IISNumber != "")
+      return SplitString(m_DlContrIDIIS, ",");
+    else
+      return SplitString(m_DlContrIDStr, ",");
+    end;
+  end;
+
+  macro GetDlCloseContrIDArr()
+    var query, cmd, DataSet;
+    var ContractsCloseStr;
+    
+    query =   " SELECT NVL(LISTAGG(dlc.t_DlContrID, ',') WITHIN GROUP (ORDER BY sf.t_DateBegin DESC), CHR(1)) as ContractsStr "
+            + "   FROM dsfcontr_dbt sf, ddlcontr_dbt dlc "
+            + "  WHERE sf.t_PartyID = ? " 
+            + "    AND sf.t_DateClose >= TO_DATE('01.01.'||?,'DD.MM.YYYY') "
+            + "    AND sf.t_DateClose <= TO_DATE('31.12.'||?,'DD.MM.YYYY') "
+            + "    AND dlc.t_SfContrID = sf.t_ID "
+            + "    AND dlc.t_IIS = chr(0) ";
+
+    cmd = DL_RSDCommand(query);
+
+    cmd.AddParam(m_ClientID);
+    cmd.AddParam(m_RepYear);
+    cmd.AddParam(m_RepYear);
+
+    DataSet = cmd.Execute();
+    if(DataSet.moveNext())
+      ContractsCloseStr = DataSet.ContractsStr;
+    end;
+
+    return SplitString(ContractsCloseStr, ",");
+  end;
+
+  macro GetContractsNumber()
+    if(m_IISNumber != "")
+      return m_IISNumber;
+    else
+      return m_ContractsStr;
+    end;
+  end;
+
+  MACRO LoadEmailByDlContr()
+    var query, cmd, DataSet;
+    var IsMain:bool = true;
+    
+    query =   " SELECT DISTINCT TRIM(t.t_Email) Email "
+            + "   FROM (SELECT dlc.t_Email " 
+            + "           FROM dsfcontr_dbt sf, ddlcontr_dbt dlc "
+            + "          WHERE dlc.t_SfContrID = sf.t_ID "
+            + "            AND dlc.t_DlContrID IN ("+m_DlContrIDStr+") "
+            + "       ORDER BY sf.t_DateBegin DESC) t "
+            + "  WHERE t.t_Email IS NOT NULL AND t.t_Email <> chr(1) ";
+
+    cmd = DL_RSDCommand(query);
+
+    DataSet = cmd.Execute();
+    while(DataSet.moveNext())
+      if(IsMain)
+        m_MainEmail = DataSet.Email;
+        IsMain = false;
+      else
+        if(m_CopyEmailStr == "")
+          m_CopyEmailStr = DataSet.Email;
+        else
+          m_CopyEmailStr = m_CopyEmailStr + ";" + DataSet.Email;
+        end;
+      end;
+    end;
+  END;
+END;
+
+private macro CheckSofrID(SofrID:integer):bool
+  var oldDialog = SetDialogFlag(0);
+  var query = 
+   " SELECT 1 " +
+   "   FROM dparty_dbt  " +
+   "  WHERE t_PartyID = ? ";
+  var cmd = DL_RSDCommand(query);
+  cmd.addParam(SofrID);
+  var ds = cmd.Execute();
+  SetDialogFlag(oldDialog);
+  if(ds.moveNext())
+    return true;
+  end;
+  return false;
+OnError(er)
+  SetDialogFlag(oldDialog);
+  return false;
+end;
+
+PRIVATE MACRO GetDataForMessageNptx(typeId:Integer, outTheme:@String, outBody:@String)
+    var sql            :string,
+        cmd            :object,
+        dataset        :object;
+
+        sql = " select t_title, t_comments "
+  		      + "   from dnptxmessage_dbt "
+            + "  where t_typeid = :id; ";
+
+        cmd = rsdcommand(sql);
+        cmd.addparam("id", rsdbp_in, typeId);              
+        dataset = trsbdataset(cmd);
+
+        while(dataset.movenext())
+            outTheme  = dataset.title;
+            outBody   = dataset.comments;
+        end;
+END;
+
+PRIVATE MACRO renderNptxMassage(text, map)
+    var sql            :string,
+        cmd            :object,
+        dataset        :object,
+        renderText     :string;
+
+    sql = " declare  v_res   clob;  " 
+          + "  begin  " 
+          + "  v_res := ntpxMessageRender(:tpl, :vals);  " 
+          + "  ?:= v_res;  " 
+          + " end;";   
+
+  cmd = RSDCommand(sql);
+  cmd.AddParam("tpl",   RSDBP_IN,  text);
+  cmd.AddParam("vals",  RSDBP_IN,  map);
+  cmd.addParam("v_res", RSDBP_OUT, V_STRING, 4000);
+
+  cmd.Execute(); 
+
+  renderText   = cmd.value("v_res");             
+
+  return renderText;
+end;
+
+PRIVATE MACRO GetClientIsMale(PartyId)
+    var sql, rs, cmd;
+    sql =  "SELECT pt.t_ismale ismale "
+         + " FROM dpersn_dbt pt  "
+         + " WHERE  pt.t_personid = :id ";
+         
+    cmd = RsdCommand(sql);
+    cmd.AddParam("id", RSDBP_IN, PartyId);
+    rs = RsdRecordSet(cmd, RSDVAL_CLIENT, RSDVAL_STATIC);
+   
+    if (rs and rs.MoveNext())
+        return rs.value("ismale");
+    end;
+   
+    return SET_CHAR;
+END;
+
+PRIVATE MACRO CreateEndSendRep(ClientRepData, Err:@integer, ErrStr:@string, TopUpDate:date, IsFinalSend:bool, TypeIdMsg:Integer)
+  var DueTotalStr:string = "";
+  var pairSourse:string;
+  var emailText, Subject, v_email_processor;
+
+  ErrStr = "";  err = 0;
+              
+  //Отправить письма
+  RubToStrAlt(abs(ClientRepData.m_DueTotal), DueTotalStr, NULL, NULL);
+  pairSourse = String("{\x22ФИО\x22:\x22"                                + ClientRepData.m_ClientName +"\x22,"
+                    "\x22Налоговый год\x22:\x22"                         + string(ClientRepData.m_RepYear) +"\x22,",
+                    "\x22Сумма\x22:\x22"                                 + IIF(TypeIdMsg == 7, string(ClientRepData.m_DueTotal), string(Abs (ClientRepData.m_DueTotal))) +"\x22,", 
+                    "\x22Номер договора ИИС\x22:\x22"                    + ClientRepData.m_IISNumber +"\x22,",
+                    "\x22Дата отправки сообщения\x22:\x22"               + string(Date():f) +"\x22,",
+                    "\x22Номер уведомления\x22:\x22"                     + GetUniqNumber() +"\x22,",
+                    "\x22Год отправки сообщения\x22:\x22"                + string(ClientRepData.m_RepYear+1) +"\x22,",
+                    "\x22Сумма прописью\x22:\x22"                        + StrLwr(DueTotalStr) +"\x22,",
+                    "\x22Срок для пополнения брокерского счета\x22:\x22" + string(TopUpDate:f) +"\x22}");
+
+
+    GetDataForMessageNptx(typeIdMsg, @Subject, @emailText);
+    Subject = renderNptxMassage(Subject, pairSourse);
+    emailText = renderNptxMassage(emailText, pairSourse);
+
+    if (GetClientIsMale(ClientRepData.m_ClientID) != SET_CHAR)
+      emailText =  StrSubst( emailText, "Уважаемый", "Уважаемая" );
+      emailText =  StrSubst( emailText, "уважаемый", "уважаемая" );
+    end;
+
+    emailText =   "<div>"
+                + emailText
+                + "</div>";
+
+    v_email_processor = c_email_proc_env();
+    v_email_processor.m_add_email_to_list(C_SEND_TEST_EMAIL);
+    v_email_processor.m_set_msg_head(Subject);
+    v_email_processor.m_add_row_to_msg_text(emailText);
+    v_email_processor.m_save_to_submit_synch(true);
+    v_email_processor.m_submit_email_synch();
+
+    if(v_email_processor.m_get_error_status())
+      ErrStr = Subject + " не отправлено"; 
+      err = 1; 
+    end;
+
+OnError(er)
+  ErrStr = er.Message;
+  err = 1;
+END;
+
+
+private macro GetSofrIDFromCftID(CftID:string):integer
+  var oldDialog = SetDialogFlag(0);
+  var query = 
+   " SELECT t_ObjectID " +
+   "   FROM dobjcode_dbt " +
+   "  WHERE t_ObjectType = 3 " +
+   "    AND t_CodeKind = 101 " +
+   "    AND t_Code = ? " +
+   "    AND t_state = 0 ";
+  var cmd = DL_RSDCommand(query);
+  cmd.addParam(CftID);
+  var ds = cmd.Execute();
+  SetDialogFlag(oldDialog);
+  if(ds.moveNext())
+    return SQL_ConvTypeInteger(ds.ObjectID);
+  end;
+  return 0;
+OnError(er)
+  SetDialogFlag(oldDialog);
+  return 0;
+end;
+
+
+private macro prepareDataAndSendMes(RepDate:date, RepYear:integer, TopUpDate:date, IdMessage:integer, err:@integer, errStr:@string)
+     var cnt = 0, i = 0;
+     var m_IsFinalSend:bool = true; //предварительно рассчитанный налог, нужен только для 7 шаблона
+     var cmd, DataSet;
+     var pt = TRecHandler("party.dbt");
+     var NeedFormReps = true; //делаем отчет и отправку
+     var ClientData;
+
+    err = 0; errStr = "";
+    if(IdMessage == 7)
+      m_IsFinalSend = false;
+    end; 
+
+    //Формировать справки клиентам
+    cmd = DL_RSDCommand("select * from dnptxctrlexcel_tmp");
+
+    cnt = cmd.GetCount();
+    if(cnt > 0)
+      DataSet = cmd.Execute();
+
+      while(DataSet.moveNext())
+
+        ClientData = TClientRepData(RepDate, RepYear, int(DataSet.ClientIDSofr), DataSet.ClientIDCft, DataSet.ClientName, IIF(ValType(DataSet.IIS) != V_UNDEF, DataSet.IIS, ""), DataSet.DueTotal);
+
+        if(DataSet.DueTotal == 0)
+          ErrStr = "нулевая сумма задолженности/возврата";
+          err = 1;
+          return;
+        end;
+
+        if(CheckSofrID(ClientData.m_ClientID))
+          ClientData.m_ClientIDCFT = ПолучитьКодСубъекта(ClientData.m_ClientID, PARTY_CODEKIND_ABS);
+        else
+          ClientData.m_ClientID = GetSofrIDFromCftID(DataSet.ClientIDCft);
+          ClientData.m_ClientIDCFT = DataSet.ClientIDCft;
+        end;
+
+        if(ClientData.m_ClientID == 0)
+            errStr = "ID не найден";
+            err = 1;
+            return;
+        end;
+ 
+        if(ПолучитьСубъекта(ClientData.m_ClientID, pt) == 0)
+          ClientData.m_ClientName = pt.rec.Name;
+          ClientData.m_ClientShortName = pt.rec.ShortName;
+        else
+          errStr = "ФИО не совпадает";
+          err = 1;
+          return;
+        end;
+
+        if(ClientData.m_ClientShortName != DataSet.ClientName)
+          errStr = "ФИО не совпадает";
+          err = 1;
+          return;
+        end;
+
+        if((ValType(DataSet.IIS) != V_UNDEF) and (DataSet.IIS != ""))
+          if(m_IsFinalSend)
+            if(ClientData.CheckIIS())
+              ClientData.LoadEmailByDlContr();
+            else
+              errStr = "неверный номер договора ИИС";
+              err = 1;
+              return;
+            end;
+          else
+            errStr = "не соответствует условиям рассылки предварительного НДФЛ";
+            err = 1;
+            return;
+          end;
+        end;
+        
+        if(ClientData.m_IISNumber == "")           
+          ClientData.LoadContrStr();
+          if(ClientData.m_DlContrIDStr != "")
+               null;
+          elif(not m_IsFinalSend)
+            errStr = "не соответствует условиям рассылки предварительного НДФЛ";
+            err = 1;
+            return;
+          end;             
+        end;
+        
+        CreateEndSendRep(ClientData, @err, @errStr, TopUpDate, m_IsFinalSend, IdMessage);
+      end;
+    end;
+end;
+
+private macro GetStr(val)
+  var Type = ValType( val );
+
+  if( Type == V_STRING )
+    return Trim(val);
+  elif( ( Type == V_DOUBLE ) or ( Type == V_MONEY ) )
+    return substr(string(val), 1, index(string(val), ".")-1);
+  else
+    return "";
+  end;
+end;
+
+//Получить имя папки файлов
+PRIVATE MACRO GetFilePath()
+  var RegistryPath = "РСХБ\\ДИРЕКТОРИИ\\OUT\\КОНТРОЛЬ_ЗАДОЛЖЕННОСТИ";
+  var Path = "";
+  var stat = 0;
+ 
+  GetRegistryValue(RegistryPath, V_STRING, Path, stat);
+  if((stat) or (Path == "")) 
+    msgbox("Не задана настройка в реестре банка:|", RegistryPath);      
+  else
+    if(substr(Path, strlen(Path)-1, 1) != "\\")
+      Path = Path + "\\";
+    end;
+  end;
+
+  return Path;
+END;
+
+private macro LoadClientListFromFile(m_FilePath:string, RepDate:@date, RepYear:@integer, NeedFormReps:@bool)
+  var objExcel = CExcelPoi();
+  var fileMov = TempFileToServerMover();
+  fileMov.CreateTempFromAbsolutTermOrServPath(m_FilePath);
+  
+  InitProgress(0, "Подготовка Excel-файла", "Подготовка Excel-файла");
+  if (not objExcel.open(fileMov.GetTempFilePath()))
+    RemProgress();
+    RunError("Не удалось открыть excel файл", CustomError("Не удалось открыть excel файл по пути " + m_FilePath));
+  end;
+
+  DL_RSDCommand("TRUNCATE TABLE DNPTXCTRLEXCEL_TMP").ExecuteCMD();
+
+  var ins_nptxctrlexcel = RsbSQLInsert("nptxctrlexcel.tmp");
+  var nptxctrlexcel_new = TRecHandler("nptxctrlexcel.tmp");  
+  var curRow:integer = 1;
+  var iLastRow:integer = objExcel.GetLastRowNum()+1;
+
+  RemProgress();     
+  InitProgress(iLastRow, "Чтение Excel-файла", "Чтение Excel-файла");
+  while(curRow <= iLastRow)
+    if(curRow == 2)
+      if(GetStr(objExcel.CellValue("A"+string(curRow))) == "Отчетная дата")
+        RepDate = date(objExcel.CellValue("C"+string(curRow)));
+      else
+        msgbox("Указан Excel-файл неправильного формата");
+        NeedFormReps = false;
+        break;
+      end;
+    elif(curRow == 3)
+      if(GetStr(objExcel.CellValue("A"+string(curRow))) == "Налоговый год")
+        RepYear = int(objExcel.CellValue("C"+string(curRow)));
+      else
+        msgbox("Указан Excel-файл неправильного формата");
+        NeedFormReps = false;
+        break;
+      end;
+    elif(curRow >= 10)
+      var excelValue = GetStr(objExcel.CellValue("A"+string(curRow)));
+      if(excelValue == "")
+        break;
+      else
+        var dueTotalStr:string = objExcel.CellValue("Z"+string(curRow));
+        var curCol:integer = 1;
+        var csvStr:string = "";
+        while(curCol <= 26) 
+          if(curCol <= 5) //Первые 5 полей приводим к текстовым
+            csvStr = csvStr + GetStr(objExcel.CellValueByRowAndCol(curRow,curCol)) + ";";
+          else
+            csvStr = csvStr + objExcel.CellValueByRowAndCol(curRow,curCol) + ";";
+          end;
+          curCol = curCol + 1;
+        end;
+
+        nptxctrlexcel_new.Clear();
+
+        nptxctrlexcel_new.rec.ClientName   = GetStr(objExcel.CellValue("C"+string(curRow)));
+        nptxctrlexcel_new.rec.ClientIDSofr = GetStr(objExcel.CellValue("A"+string(curRow)));
+        nptxctrlexcel_new.rec.ClientIDCft  = GetStr(objExcel.CellValue("B"+string(curRow)));
+        nptxctrlexcel_new.rec.IIS          = GetStr(objExcel.CellValue("D"+string(curRow)));
+        nptxctrlexcel_new.rec.DueTotal     = money(strsubst(dueTotalStr, ",", "."));
+        nptxctrlexcel_new.rec.CsvStr       = csvStr;
+
+        ins_nptxctrlexcel.AddRecord(nptxctrlexcel_new);
+        if(not ins_nptxctrlexcel.Insert())
+          msgbox("Ошибка при создании записей в dnptxctrlexcel_tmp");
+          NeedFormReps = false;
+        end;
+        UseProgress(curRow = curRow + 1);
+        RemProgress();
+        return;
+      end;
+    end;
+    UseProgress(curRow = curRow + 1);
+  end;
+
+  
+OnError(er)
+   RemProgress();
+   NeedFormReps = false;
+end;
+
+
+PRIVATE CLASS(TRsbPanel) CReportTestSendPanelParm(_idMessage:integer)
+  PRIVATE VAR
+        themeLetterText = NULL,
+        bodyLetterText  = NULL,
+        idMessage       = NULL,
+        filePath        = "",
+        fileExt         = "",
+        fileName        = "",
+        repYear         = 0,
+        needFormReps    = true,
+        repDate         = date(0,0,0),
+        err, errStr,
+        upDate;
+  
+   macro Init(_idMessage:integer) 
+     idMessage       = _idMessage;
+  end;
+
+  /*
+    @brief Основной обработчик нажатий на панели
+  */
+  macro KeyHandler(RsbEvent:Object)
+    var key = RsbEvent.KeyCode;
+    if (key == F_2)
+         MsgBox("Изменений не произошло!");
+    elif(key == F_3) 
+        if(SelectFile(filePath, MergeFile(GetFilePath(), "*.xls*"), NULL , 0, true)) 
+           SplitFile(filePath, fileName, fileExt); 
+           getControl("file_path").value = fileName + fileExt;
+        end;
+
+    elif(key == F_9)
+         debugbreak;
+         if(filePath != "")          
+          //Загрузить строки из Excel-файла во временную таблицу
+          LoadClientListFromFile(filePath, @RepDate, @RepYear, @NeedFormReps);
+          if(NeedFormReps)
+             upDate = getControl("send_date").value;
+             prepareDataAndSendMes(RepDate, RepYear, upDate, idMessage, @err, @errStr);
+             if(err)
+               MsgBox(errStr)
+             else
+              
+              MsgBox("Тестовое письмо успешно отправлено")
+             end;
+          else
+             filePath = "";
+             getControl("file_path").value = "";
+          end;
+          
+         else 
+          MsgBox("Не  выбран файл для загрузки")
+         end;
+         
+    elif(RsbEvent.KeyCode == KEY_ESC)
+        Close(RsbEvent.KeyCode);
+    end;
+  end;
+
+  /*
+    @brief Компоновка элементов панели 
+  */
+  private macro createField(x, y, z, g, textLength, nameField, valueField, editField)
+    var fld = TRsbEditField(FT_STRING);
+    fld.setPosition(x, y);
+    fld.setSize(z, g);
+    fld.textLength = textLength;
+    fld.Editable   = editField;
+    fld.Name       = nameField;
+    fld.value      = valueField;
+    addControl(fld);
+  end;
+
+  private macro _addEditField(str, col, name, def, editable, type, w, h)
+      var Dt = TRsbEditField(type);
+      Dt.setPosition(col,str);
+      Dt.setSize(w,h);
+      Dt.name = name;
+      Dt.value = def;
+      Dt.editable = editable;
+      addControl (Dt);
+   end;
+
+/*
+@brief Настройка Окна для редактирования шаблона сообщения
+*/
+  macro drawPanel()
+    
+    caption = "Тестовая отправка сообщения по клиенту";
+    setPosition(51, 12);
+    setSize(70, 8);
+    setHelpPage(1550);
+    status = "~F3~ Загрузить отчет ~F9~ Отправить тестовое письмо ~Esc~ Выход";
+ 
+    var Tab1 = 2;
+    var Tab2 = 30;
+    var m_Label = null;
+    var curstr = 0;
+    curstr = curstr+1;
+    m_Label = TRsbLabel(Tab1,curstr,"Загрузить отчет контроль задолженности:");
+    addLabel (m_Label);
+    createField(Tab2, curstr,  38, 1, 100,  "file_path", fileName, true);
+    curstr = curstr+1; 
+    m_Label = TRsbLabel(Tab1,curstr,"Срок для пополнения брокерского счета:");
+    addLabel (m_Label);
+    _addEditField(curstr, Tab2, "send_date", {curdate}, true, FT_DATE, 8, 1);
+    curstr = curstr+2;
+    m_Label = TRsbLabel(Tab1, curstr, C_COMMENT_TEST_SEND);
+    addLabel (m_Label);
+    curstr = curstr+1;
+    m_Label = TRsbLabel(Tab1, curstr, C_COMMENT_TEST_CLIENT_1);
+    addLabel (m_Label);
+
+    addEventHandler(RSB_EV_KEY_PRESSED, r2m(this, "KeyHandler"));
+  end;
+
+  InitTRsbPanel();
+  Init(_idMessage);  
+    
+END;
+
+
+
+PRIVATE CLASS(TRsbPanel) CReportPreviewPanelParm(_idMessage:integer, _themeLetterText:string, _bodyLetterText:string, _isUpdate:bool, _isChangeText:bool)
+  PRIVATE VAR
+        themeLetterText = NULL,
+        bodyLetterText  = NULL,
+        allText         = NULL,
+        isUpdate        = NULL,
+        idMessage       = NULL,
+        isSave          = FALSE,
+        isChangeText    = NULL;
+  
+   macro Init(_idMessage:integer, _themeLetterText:string, _bodyLetterText:string, _isUpdate:bool, _isChangeText:bool) 
+     idMessage       = _idMessage;
+     themeLetterText = _themeLetterText;
+     bodyLetterText  = _bodyLetterText;
+     isUpdate        = _isUpdate;
+     allText         = _themeLetterText + "\n\n" + _bodyLetterText;
+     isChangeText    = _isChangeText;
+     
+  end;
+  
+  /*
+    @brief Изменить данные для шаблона сообщений
+    @param[in] idMessage ID шаблона
+    @param[out] themeLetterText  Возвращает  тему письма
+    @param[out] bodyLetterText Возвращает  текст письма
+  */
+  private macro updateNptxMessage(idMessage:integer, themeLetterText:string, bodyLetterText:string)
+        var sql            :String,
+            cmd            :Object;
+
+        sql = " UPDATE dnptxmessage_dbt "
+             + "  SET t_title     = :theme, "
+             + "      t_comments  = :body, "
+             + "      t_date_editing  = sysdate"
+             + "  WHERE t_id = :nptx_id ";
+
+        cmd = RSDCommand(sql);
+        cmd.AddParam("theme",    RSDBP_IN, themeLetterText); 
+        cmd.AddParam("body",     RSDBP_IN, bodyLetterText); 
+        cmd.AddParam("nptx_id",  RSDBP_IN, idMessage);              
+        cmd.execute();
+        isSave = TRUE;
+  end;
+
+  macro GetIsSaveData() 
+      return isSave;
+  end;
+
+  /*
+    @brief Основной обработчик нажатий на панели
+  */
+  macro KeyHandler(RsbEvent:Object)
+    if (RsbEvent.KeyCode == F_2)
+        if (isUpdate)
+          if(isChangeText)
+            if (Gettrue(false, "Вы уверены что хотите сохранить изменения?"))
+              updateNptxMessage(idMessage,themeLetterText, bodyLetterText);
+              MsgBox("Изменения сохранены!"); 
+            end;
+            
+          else
+            MsgBox("Изменений не произошло!"); 
+          end;
+          Close(RsbEvent.KeyCode);  
+
+        end;
+      
+    elif(RsbEvent.KeyCode == KEY_ESC)
+        Close(RsbEvent.KeyCode);
+    end;
+  end;
+
+
+  /*
+    @brief Компоновка элементов панели 
+  */
+  private macro createField(x, y, z, g, textLength, nameField, valueField, editField)
+    var fld = TRsbEditField(FT_STRING);
+    fld.setPosition(x, y);
+    fld.setSize(z, g);
+    fld.textLength = textLength;
+    fld.Editable   = editField;
+    fld.Name       = nameField;
+    fld.value      = valueField;
+    addControl(fld);
+  end;
+
+/*
+@brief Настройка Окна для редактирования шаблона сообщения
+*/
+  macro drawPanel()
+    caption = "Предпросмотр шаблона";
+    setPosition(51, 12);
+    setSize(60, 20);
+    setHelpPage(1550);
+
+    if (isUpdate)
+      status = "~F2~ Сохранить ~Esc~ Выход";
+    else 
+      status = "~Esc~ Выход";
+    end;
+    
+    createField(2, 1,  58, 20, 2000,  "body_theme_letter_text", allText, false);
+
+    addEventHandler(RSB_EV_KEY_PRESSED, r2m(this, "KeyHandler"));
+  end;
+
+  InitTRsbPanel();
+  Init(_idMessage, _themeLetterText, _bodyLetterText, _isUpdate, _isChangeText);  
+    
+END;
+
+PRIVATE CLASS(TRsbPanel) CReportPanelParm(_idMessage:integer)
+  PRIVATE VAR
+        themeLetterText      = NULL,
+        bodyLetterText       = NULL,
+        themeLetterTextAfter = NULL,
+        bodyLetterTextAfter  = NULL,
+        nameMessage          = NULL,
+        isUpdate             = NULL,
+        isChangeText         = NULL,
+        idMessage; 
+  
+  macro Init(_idMessage:integer) 
+     idMessage = _idMessage;
+  end;
+  
+  private macro IsAdminOper()
+    var cmd, res, rs;
+    cmd = RsdCommand("SELECT * FROM dacsoprole_dbt a WHERE A.T_ROLEID IN (10036, 1) AND A.T_OPER = " + {oper});
+    cmd.Execute();
+    rs = TRsbDataSet(cmd);
+    if(rs.MoveNext())
+       return true;
+    else
+       return false;
+    end;
+  end;
+
+
+  /*
+    @brief Основной обработчик нажатий на панели
+  */
+  macro KeyHandler(RsbEvent:Object)
+    if (RsbEvent.KeyCode == F_2)
+        themeLetterTextAfter   = getControl("theme_letter_text").value;
+        bodyLetterTextAfter    = getControl("body_letter_text").value;
+        isChangeText           = ( (themeLetterTextAfter != themeLetterText)  or  (bodyLetterTextAfter != bodyLetterText) );
+
+        var panel = CReportPreviewPanelParm(idMessage, themeLetterTextAfter, bodyLetterTextAfter, isUpdate, isChangeText);
+        panel.drawPanel();
+        panel.run();
+
+        if(panel.GetIsSaveData())
+          themeLetterText = themeLetterTextAfter;
+          bodyLetterText  = bodyLetterTextAfter;
+        end;
+    elif (RsbEvent.KeyCode == F_4)
+        var panelTest = CReportTestSendPanelParm(idMessage);
+        panelTest.drawPanel();
+        panelTest.run();
+   
+    elif(RsbEvent.KeyCode == KEY_ESC)
+        Close(RsbEvent.KeyCode);
+    end;
+  end;
+
+  /*
+    @brief Подготовка данных для отрисовке на панели
+  */
+  macro prepareState()
+      
+        var sql            :String,
+            cmd            :Object,
+            DataSet        :Object;
+
+        sql = " select t_title, t_comments, t_name "
+  		     + "   from DNPTXMESSAGE_DBT "
+             + "  WHERE t_id = :id; ";
+
+        cmd = RSDCommand(sql);
+        cmd.AddParam("id", RSDBP_IN, idMessage);              
+        DataSet = TRsbDataSet(cmd);
+
+        while(DataSet.moveNext())
+            themeLetterText  = DataSet.title;
+            bodyLetterText   = DataSet.comments;
+            nameMessage      = DataSet.name;
+            
+        end;
+  end;
+
+  /*
+    @brief Компоновка элементов панели 
+  */
+  private macro createField(x, y, z, g, textLength, nameField, valueField, editField)
+    var fld = TRsbEditField(FT_STRING);
+    fld.setPosition(x, y);
+    fld.setSize(z, g);
+    fld.textLength = textLength;
+    fld.Editable   = editField;
+    fld.Name       = nameField;
+    fld.value      = valueField;
+    addControl(fld);
+  end;
+
+/*
+@brief Настройка Окна для редактирования шаблона сообщения
+*/
+  macro drawPanel()
+    prepareState();
+    caption = "Шаблон сообщения " + nameMessage;
+    setPosition(10, 3);
+    setSize(100, 40);
+    setHelpPage(1550);
+    status = "~F2~ Предпросмотр ~F4~ Тестовая рассылка по клиенту ~Esc~ Выход";
+    isUpdate = IsAdminOper();
+
+    createField(2, 1,  10, 1,  21,    "theme_letter",      "Тема письма",  false);
+    createField(2, 2,  90, 10, 2000,  "theme_letter_text", themeLetterText, isUpdate);
+    createField(2, 12, 10, 1,  21,    "body_letter",       "Текст письма",  false);
+    createField(2, 13, 90, 10, 3000,  "body_letter_text",   bodyLetterText, isUpdate);
+    createField(2, 23, 23, 1,  30,    "comment",            "Список переменных",  false);
+    createField(2, 24, 90, 12, 2000,  "comment_text",       C_COMMENT_TEXT, false);
+
+    addEventHandler(RSB_EV_KEY_PRESSED, r2m(this, "KeyHandler"));
+  end;
+
+  InitTRsbPanel();
+  Init(_idMessage);  
+    
+END;
+
+
+/*
+@brief Основной обработчик нажатий на панели
+*/
+ macro eRunNptxMessageDialog(rs, cmd, id, key)
+   var nptxId;
+   var CM_FLAG = CM_DEFAULT;
+    
+   nptxId = rs.value("t_id");
+   if(cmd == DLG_INIT)
+      
+   elif(cmd == DLG_KEY)
+      if(key == F_2)
+         var panel = CReportPanelParm(nptxId);
+         panel.drawPanel();
+         panel.run()   
+      end;
+   end;
+
+   return CM_FLAG;
+end;
+
+/*
+@brief Запуск скроллинга
+*/
+macro runScrolling() 
+    var cmdQuery = " SELECT t_id,  "
+       	     + "          t_name_message,   "
+       	     + "	      t_name,      "
+       	     + "	      t_date_create,  "
+       	     + "	      t_date_editing,  "
+       	     + "	      t_oper,   "
+       	     + "	      t_id_oper  "
+  		       + "   FROM DNPTXMESSAGE_DBT ; ";                 
+    var cmdScroll = RsdCommand(cmdQuery);
+
+    var rsScroll = RSDRecordset(cmdScroll, RSDVAL_CLIENT, RSDVAL_STATIC);
+    var Ar = MakeArray("t_id",              "ID шаблона",                        6,  2, -1, 0,
+                        "t_name",           "Наименование шаблона",              27, 2, -1, 0,
+                        "t_name_message",   "Тип рассылки",                      15, 2, -1, 0,  
+                        "t_date_create",    "Дата создания шаблона",             7,  2, -1, 0,
+                        "t_date_editing",   "Дата последнего изменения шаблона", 7,  2, -1, 0, 
+                        "t_oper",           "ФИО инициатора редактирования",     8,  2, -1, 0, 
+                        "t_id_oper",        "ID инициатора редактирования",      7,  2, -1, 0
+                        );
+    while(RunScroll(rsScroll, ar.size/6, Ar, "eRunNptxMessageDialog", "eRunNptxMessageDialog", "Шаблоны клиентских уведомлений", "~F2~ Редактирование записи ~Esc~ Выход", true))
+        cmdScroll = RsdCommand(cmdQuery);
+        rsScroll = RSDRecordset(cmdScroll, RSDVAL_CLIENT, RSDVAL_STATIC);
+    end;
+end;
+
+
+runScrolling();

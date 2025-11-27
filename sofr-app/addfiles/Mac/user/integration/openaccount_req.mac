@@ -1,0 +1,842 @@
+//-----------------------------------------------------------------------------------------
+// Передача из СОФР данных по счетам бухгалтерского учета
+// В.Горленко
+// GTV : 2018-10-25 Исправлен регистр переменных в соответствии со спецификацией
+// kva : 2018-12-12 Изменения в заполнении параметров для разных типов клиентов
+// kva : 2018-12-22 Изменение логики заполнения TDealEndDate
+// maa - todo - ContractCode.RecordCode сделать по справочникам - 20181218 - kva - сделано по таблице ubalanceRSHB_dbt
+// kva : 2019-02-06 Изменения в соответствии со схемой (передаем полную информацию по парному счету)
+// gtv : 2019-03-25 Функции DealEndDate вынесены в func_lib.
+//-----------------------------------------------------------------------------------------
+import bankinter, oralib, likepy, fiinter, CTInter;
+IMPORT globals;
+import func_lib;
+
+Private const REG_ACCOUNT_CLIENT = "REPORT\\КНИГА РЕГИСТРАЦИИ\\СЧЕТА КЛИЕНТОВ";
+private const NOTEKIND_PURPOSE = 112;
+private const NOTEKIND_ACC = 200;
+private const NOTEKIND_ACCRAMB = 201;
+
+private const CATEGORY_DEAL = 200;
+private const CATEGORY_OBKO = 101;
+
+private const CATEGORY_SUBORD_AVOIR = 70;
+
+private file attr("objattr.dbt") key 0;
+
+/* Получение идентификатора парного счета */
+private macro m_get_pair_acc_id(p_acc_id)
+   var v_ret;
+   var v_sql, v_cmd, v_rs;
+
+   v_sql =         "SELECT t_accountid FROM daccount_dbt ";
+   v_sql = v_sql + " WHERE (t_chapter, t_account, t_code_currency) = ";
+   v_sql = v_sql + "       (SELECT t_chapter, t_pairaccount, t_code_currency ";
+   v_sql = v_sql + "          FROM daccount_dbt ";
+   v_sql = v_sql + "         WHERE t_accountid = :p_acc_id) ";
+
+   v_cmd = RSDCommand(v_sql);
+   v_cmd.addParam("p_acc_id", RSDBP_IN, p_acc_id);
+
+   v_rs = RSDRecordSet(v_cmd);
+   if(v_rs.movenext())
+      v_ret = v_rs.value("t_accountid");
+   else
+      v_ret = 0;
+   end;
+
+   v_rs.close(); v_cmd.close(); v_rs = null; v_cmd = null; v_sql = null;
+
+   return v_ret;
+
+onError(err)
+   v_ret = 0;
+   return v_ret;
+end;
+
+
+private macro CheckAccClientMask( Account :string) :bool //проверим принадлежность к клиентским счета по маске счета
+   var MaskAccStr :string = "",
+       state;
+
+   GetRegistryValue( REG_ACCOUNT_CLIENT, V_STRING, MaskAccStr, state );
+   if( not CompareStrWithMasks( MaskAccStr, Substr(Account, 1, 5) ) )
+      return true;
+   else
+      return false;
+   end;
+
+onError(err)
+
+   return false;
+
+end;
+
+
+private class TAccountNumberWithCurrency
+   var AccountNumber :string,
+       CurrencyCode  :string;
+
+end;
+
+
+private class TIntegrationRecord
+   var RecordCode :string,
+       RecordTitle :string,
+       Note :string,
+       SystemId :string;
+end;
+
+
+private class(TIntegrationRecord) TIntergationClassifierRecordSimple
+   var Name :string,
+       ClassifierCode :string;
+
+end;
+
+
+private class TDealEndDate
+   var StartDateDealEndDate  :date,
+       ValueDealEndDate      :date;
+end;
+
+
+private class TSubordKred
+   var StartDateSubordKred  :date,
+       ValueSubordKred      :string;
+end;
+
+private class TTermCode
+   var StartDateTermCode  :date,
+       ValueTermCode      :string;
+end;
+
+private macro getClientType( id )
+
+   if( execSqlSelect("select 1 from ddp_dep_dbt where t_partyid=:1", makeArray (sqlParam ("1", id))).moveNext () )
+      return "В";
+   elif( execSqlSelect("select 1 from dpartyown_dbt where t_partykind=2 and t_partyid=:1", makeArray (sqlParam ("1", id))).moveNext () )
+      return "Б";
+   elif( execSqlSelect("select 1 from dparty_dbt where t_legalform=1 and t_partyid=:1", makeArray (sqlParam ("1", id))).moveNext () )
+      return "Ю";
+   elif( execSqlSelect("select 1 from dparty_dbt where t_legalform=2 and t_partyid=:1", makeArray (sqlParam ("1", id))).moveNext () )
+      // gtv:ИП - юрики
+      if( execSqlSelect("select 1 from dpersn_dbt where t_isemployer = 'X' and t_personid = :1", makeArray (sqlParam ("1", id))).moveNext () )
+         return "Ю";
+      else
+         return "Ч";
+      end;
+   end;
+
+   return "";
+
+end;
+
+
+private class TClientParameter( p_clientId )
+   var Name        :string,
+       BirthDate   :string,
+       BirthPlace  :string,
+       DocSeries   :string,
+       DocNumber   :string,
+       INN         :string,
+       KPP         :string,
+       ClientId    ,//:c_IntegrationSymbolicIdentifierXType,
+       ClientType  ,//:c_IntegrationDictionaryRecordXType,
+       Gender      ,//:c_IntegrationDictionaryRecordXType,
+       DocTypeCode ,//:c_IntegrationDictionaryRecordXType,
+       OPF         ;//:TIntergationClassifierRecordSimple;//!!!!!!!!!!!!!!!!
+
+   this.fill(p_clientId);
+
+
+   macro getExtClientId( id )
+      var res = "";
+      var sql = execSqlSelect ("select t_code from dpartcode_dbt where t_codekind=:1 and t_partyid=:2",
+                               makeArray(sqlParam ("1", PARTY_CODEKIND_ABS), sqlParam("2", id)));
+
+      if( sql.moveNext() )
+         if (Index(sql.value(0),"#") > 0)
+            res = substr(sql.value(0),6);
+         else
+            res = sql.value(0);
+         end; 
+      end;
+
+      return res;
+   end;
+    
+   macro fill( i_clientId ) /* 20181206 - kva - чтобы избежать пересечений */
+      var sql;
+
+      if (i_clientId > 0)
+         ClientId    = c_IntegrationSymbolicIdentifierXType;
+         ClientType  = c_IntegrationDictionaryRecordXType;
+         Gender      = c_IntegrationDictionaryRecordXType;
+         DocTypeCode = c_IntegrationDictionaryRecordXType;
+         OPF         = TIntergationClassifierRecordSimple;//!!!!!!!!!!!!!!!!
+
+         this.ClientID.ObjectId = getExtClientId(i_clientid);
+
+         ClientType.RecordCode = getClientType(i_clientid);
+
+/*maa - отключил пока по просьбе банка
+      /* 20181206 - kva - изменения в формировании идентификатора клиента */
+      if( ClientType.RecordCode == "Б" )
+         ClientID.ObjectId = string("banks,", ClientId.ObjectId);
+      elif( ClientType.RecordCode == "Ю" )
+         ClientID.ObjectId = string("cust-corp,", ClientId.ObjectId);
+      end;
+*/
+
+         if( ClientType.RecordCode == "В" )
+            this.ClientID.ObjectId = NULL;
+         end;
+
+         sql = execSqlSelect("select decode (t_name, chr (1), (select t_name from dpartyname_dbt where t_partyid = dparty_dbt.t_partyid and t_nametypeid = 1), t_name) from dparty_dbt where t_partyid = :1", 
+                             makeArray(sqlParam("1", i_clientId)));
+
+         if( sql.moveNext() )
+            Name = string(sql.value(0));
+         end;
+
+         sql = execSqlSelect("select * from dpersn_dbt where t_personid = :1", 
+                             makeArray(sqlParam("1", i_clientId)));
+
+         if( sql.moveNext() )
+            BirthDate = ifThenElse(date(sql.value("t_born"))==date (0,0,0), NULL, string(date(sql.value("t_born"))));
+            BirthPlace = string(sql.value("t_birsplase"));                                      
+            //maa141218 Gender.Desc = ifThenElse(sql.value("t_ismale") == "X", "Мужской", "Женский");
+            Gender.RecordCode = ifThenElse(sql.value("t_ismale") == "X", "мужской", "женский");
+
+            sql = execSqlSelect("select (select t_codedocum from dpaprkind_dbt where t_paperkind=x.t_paperkind) t_code, x.* from dpersnidc_dbt x where t_personid = :1", 
+                                makeArray(sqlParam("1", i_clientId)));
+            if( sql.moveNext() )
+               DocTypeCode.RecordCode = string(sql.value ("t_code"));
+               DocSeries = string(sql.value ("t_paperseries"));
+               DocNumber = string(sql.value ("t_papernumber"));
+            end;
+         end;
+
+         sql = execSqlSelect("select t_code from dpartcode_dbt where t_codekind = 16 and t_partyid = :1", 
+                             makeArray(sqlParam("1", i_clientId)));
+         if( sql.moveNext() )
+            splitFullInn(string(sql.value(0)), INN, KPP);
+         end;
+
+         sql = execSqlSelect("select t_name from dobjattr_dbt where (t_objecttype, t_groupid, t_attrid) = (select t_objecttype, t_groupid, t_attrid from dobjatcor_dbt where t_objecttype = 3 and t_groupid = 4 and t_validtodate = to_date ('31129999','ddmmyyyy') and t_object = lpad (:1, 10, '0'))",
+                             makeArray (sqlParam ("1", i_clientId)));
+         if( sql.moveNext() )
+            OPF.Name = string(sql.value(0));
+         end;
+      else
+         // gtv клиент отсутствует, значит, внутренний
+         ClientType = c_IntegrationDictionaryRecordXType;
+         ClientType.RecordCode = "В";     
+      end;
+   end;
+
+end;
+//-----------------------------------------------------------------------------------------
+
+private class TAccountParams( p_accountId, p_evnt_type, p_pair_account )
+   var BalanceAccount   :string,
+       AccountName      :string,
+       LoanAcctNum      :string,
+       LoanAcctDate     :date,
+       UserCode         :string,
+       AccountContr     :string,
+       CreatDateAccount :date,
+       CloseDateAccount :date,
+       Dealrate         :string,
+       MSFOAcc          :string,
+       MSFOAccRamb      :string,
+       SubordinatedBondType :string,
+       //IsAccountConsolidateSign : bool,  // BIQ-3804 
+       AcctNumWCur      :TAccountNumberWithCurrency, //!!!!!!!!!!!
+       AccountId        :c_IntegrationSymbolicIdentifierXType,
+       FilialId         :c_IntegrationSymbolicIdentifierXType,
+       Risk             :c_IntegrationDictionaryRecordXType,
+       ObKO             :c_IntegrationDictionaryRecordXType,
+       ContractCode     :c_IntegrationDictionaryRecordXType,
+       IdCust           :c_IntegrationSymbolicIdentifierXType,
+       TypeClient       :c_IntegrationDictionaryRecordXType,
+       Repo             :c_IntegrationDictionaryRecordXType,//!!!!!!!!!!!!
+       I1dec            :TIntergationClassifierRecordSimple,//!!!!!!!!!!
+       DealEndDate      :object,//TDealEndDate,//!!!!!!!!!!!!!!!!!!!!!
+       TermCode         :TTermCode,
+       SubordKred       :TSubordKred,
+       ClientParametr   /*:TClientParameter*/;
+
+    /* Добавлено для заполнения объекта TDealEndDate */
+   private class (TDealEndDate) c_calc_DealEndDate(p_acc_num, p_acc_cur, p_balance, p_purpose, p_opendate)
+      // gtv: класс информации по сделке
+      var i1_dec;
+      var MSFOAcc;
+      var MSFOAccRamb;
+      var SubordKred;
+      var DealRate;
+      var TypeDeal = 0;
+      var IdCust_our = -1;
+      var DealID = -1;
+      var Fiid = -1;
+      var ContractNum = "";
+      var ContractDate = date(0,0,0);
+      var StartDateTermCode = date(0,0,0);
+      var ValueTermCode = NULL;
+
+      //BIQ-11500 признак субординированности по счетам, открытым для суборд. ОЭБ
+      var SubordinatedBondType = NULL;
+
+      private macro m_init_calc_DealEndDate(i_acc_num, i_acc_cur, i_balance, i_purpose, i_opendate)
+         var v_sql, v_cmd, v_rs;
+
+         var dealid_l;
+         var objecttype;
+         var ObjCat, catval;
+         var ddealend;
+
+         if( (ValType(i_acc_num) != V_UNDEF) and (ValType(i_acc_cur) != V_UNDEF) and (ValType(i_balance) != V_UNDEF))
+
+            ddealend = GetDealEndDate(i_acc_num, i_acc_cur, i_balance, i_purpose, i_opendate);
+            if (ValType(ddealend) != V_UNDEF)
+               StartDateDealEndDate = ddealend.StartDate;
+               ValueDealEndDate = ddealend.Value;
+               TypeDeal = ddealend.TypeDeal;
+               IdCust_our = ddealend.IdCust_our;
+               DealID = ddealend.DealID;
+               Fiid = ddealend.Fiid;
+               ContractNum = ddealend.ContractNum;
+               ContractDate = ddealend.ContractDate;
+               StartDateTermCode = ddealend.StartDateTermCode;
+               ValueTermCode = ddealend.ValueTermCode;
+            end;
+
+            if  (TypeDeal > 0) 
+
+               dealid_l = String(DealID:o:34);
+               if (TypeDeal == 199)
+                  objecttype = 145;  // внебиржевая операция с ПИ
+               elif (TypeDeal == 101)
+                  objecttype = 101;  // внебиржевая операция с ПИ
+               elif (TypeDeal == 102)
+
+                  v_sql =         "    SELECT nvl(tick.t_flagtypedeal, -1) as t_flagtypedeal, tick.t_dealdate ";
+                  v_sql = v_sql + "     from ddl_tick_dbt tick ";
+                  v_sql = v_sql + "    where ";
+                  v_sql = v_sql + "         tick.t_dealid = :dealid ";
+                  v_sql = v_sql + "     AND tick.t_bofficekind = 102 ";
+
+                  v_cmd = RSDCommand(v_sql);
+                  v_cmd.addParam("dealid", RSDBP_IN, DealID);
+                  v_rs = RSDRecordSet(v_cmd);
+                  if (v_rs.movenext)
+                     if (v_rs.value("t_flagtypedeal") == 2) // субординированный кредит/депозит
+                        SubordKred = TSubordKred;
+                        SubordKred.StartDateSubordKred = v_rs.value("t_dealdate");
+                        SubordKred.ValueSubordKred = "Суборд";
+                     else
+                        SubordKred = NULL;
+                     end;
+                  end;
+                  v_rs.close(); v_cmd.close(); v_rs = NULL; v_cmd = NULL; v_sql = NULL;
+                  objecttype = 103;  // сделка МБК
+
+               elif (TypeDeal == 176) // РЕПО
+
+                  v_sql =         "    SELECT leg.t_incomerate ";
+                  v_sql = v_sql + "     from ";
+                  v_sql = v_sql + "       ddl_tick_dbt tick ";
+                  v_sql = v_sql + "     JOIN ddl_leg_dbt leg on tick.t_dealid = leg.t_dealid and leg.t_legkind = 0 ";
+                  v_sql = v_sql + "    where ";
+                  v_sql = v_sql + "         tick.t_dealid = :dealid ";
+                  v_sql = v_sql + "     AND tick.t_bofficekind = 101 ";
+
+                  v_cmd = RSDCommand(v_sql);
+                  v_cmd.addParam("dealid", RSDBP_IN, DealID);
+                  v_rs = RSDRecordSet(v_cmd);
+                  if (v_rs.movenext)
+                     DealRate = v_rs.value("t_incomerate");
+                  end;
+
+                  objecttype = 101;  // сделка ЦБ
+                  v_rs.close(); v_cmd.close(); v_rs = NULL; v_cmd = NULL; v_sql = NULL;
+
+               elif ( (TypeDeal == 5) or (TypeDeal == 1) )  // ценные бумаги
+                 //BIQ-11500 признак субординированности по счетам, открытым для суборд. ОЭБ
+                 if (ValType(Fiid) != V_UNDEF)
+                    if (Fiid > 0)
+                        ObjCat = RsbObjCategories( 12, String(Fiid:o:10) );
+                        if (ObjCat.GetMainAttr( CATEGORY_SUBORD_AVOIR, {curdate}, attr ) == 0)
+                           if (attr.attrid == 1)
+                              SubordinatedBondType = "ФО";  // Тип субординированных облигаций: ФО - Финансовое обязательство, ДИ - Долевой инструмент
+                           elif (attr.attrid == 2)
+                              SubordinatedBondType = "ДИ";
+                           end;
+                        end;
+                    end;
+                 end;
+               else
+                  objecttype = 148; // конверсионная операция 
+               end;
+
+               if (dealid)   
+                 ObjCat = RsbObjCategories( objecttype, dealid );
+                 if (ObjCat.GetMainAttr( CATEGORY_DEAL, {curdate}, attr ) == 0)
+                    i1_dec = attr.Numinlist;
+                 end;
+                 // gtv: примечание теперь по счету
+                 //MSFOAcc = readNoteForObject( ObjectType, dealid, NOTEKIND_ACC );
+                 //MSFOAccRamb = readNoteForObject( ObjectType, dealid, NOTEKIND_ACCRAMB );
+               end;
+
+            end;
+         end;
+      end;
+
+      m_init_calc_DealEndDate(p_acc_num, p_acc_cur, p_balance, p_purpose, p_opendate);
+   end;
+
+   this.fill (p_accountId, p_evnt_type, p_pair_account);
+    
+   macro getFilialId ( id )
+     /* var sql = execSqlSelect("select t_code from dpartcode_dbt where t_codekind=:1 and t_partyid=(select t_partyid from ddp_dep_dbt where t_code=:2)",
+                makeArray(sqlParam("1", extCodeKind), sqlParam("2", id)));
+     if( sql.moveNext() )
+       return string(sql.value(0));
+     end; */
+     // gtv: код из наименования dp_dep, кроме ГО
+      if (id == 1)
+         return "0000";
+      else
+         var sql = execSqlSelect("select t_name from ddp_dep_dbt where t_code=:1",
+                                 makeArray(sqlParam("1", id)));
+         if( sql.moveNext() )
+            return string(sql.value(0));
+         end;
+      end;
+
+      return "";
+
+   end;
+    
+   // вынесено в func_lib.mac
+   //macro getUserCode( oper )
+   //end;
+
+
+   macro findContract ( acc )
+      var sql = execSqlSelect("select t_id from dsfcontr_dbt where t_objecttype=1 and t_object=:1", 
+                              makeArray(sqlParam ("1", acc)));
+
+      if( sql.moveNext() )
+         return int(sql.value(0));
+      end;
+
+      sql = execSqlSelect("select t_id from dsfcontr_dbt where t_id in (select t_sfcontrid from ddlcontr_dbt where t_dlcontrid in (select t_docid from dmcaccdoc_dbt where "+
+                          "t_account = :1 and t_catid = (select t_id from dmccateg_dbt where t_number = 1302))) order by t_datebegin, t_id",
+                          makeArray(sqlParam("1", acc)));
+
+      if( sql.moveNext() ) 
+         return int (sql.value (0));
+      end;
+
+      sql = execSqlSelect("select * from dsfcontr_dbt where t_id in (select to_number (t_objectid) from dsfssi_dbt where t_objecttype = 659 and t_setaccid in "+
+                          "(select t_settaccid from dsettacc_dbt where t_account = :1)) order by t_datebegin, t_id",
+                          makeArray(sqlParam("1", acc)));
+      if( sql.moveNext() )
+         return int (sql.value (0));
+      end;
+
+      return 0;
+
+   end;
+/* 20181222 - kva - изменение логики заполнения *//*
+   macro getDealEndDate( accId ) //???????????????
+      var sql;
+
+      sql = execSqlSelect ("select t_enddate from daccoper_dbt where t_accountid = :1 order by 1 desc", makeArray (sqlParam ("1", accId)));
+      if( sql.moveNext() )
+         return date( sql.value (0) );
+      else 
+         return Null;
+      end;
+
+   end;
+*/
+//!!!!!!!!!!!!!!
+   macro getRisk ( accId )
+      var sql = execSqlSelect("select t_numinlist from dobjattr_dbt where (t_objecttype, t_groupid, t_attrid) = "+
+                              "(select t_objecttype, t_groupid, t_attrid from dobjatcor_dbt where t_objecttype = 4 and t_validtodate = to_date ('31129999','ddmmyyyy') and t_groupid = 13 and t_object = "+
+                              "(select lpad (t_chapter,2,'0')||trim(to_char(t_code_currency, '0xxxxxx'))||t_account from daccount_dbt where t_accountid = :1))",
+                              makeArray(sqlParam ("1", accId)));
+      if ( sql.moveNext () ) 
+         return int (sql.value (0));
+      end;
+   end;
+
+
+   macro get_sign_repo(_accnum, _fiid, _chapter, _date)
+
+      var ret = NULL;
+      var v_sql, v_cmd, v_rs;
+      var v_sql2;
+      var res = 0;
+      var dealtype = 0;
+      var catcode = "";
+
+      if (_chapter == 1)
+        v_sql2 = " mccat.t_code like '%БПП%' "+
+                 " or mccat.t_code = '+ОД' or mccat.t_code = '-ОД' "+
+                 " or mccat.t_code = 'Затраты, Репо' or mccat.t_code = 'РасРасх, Репо' "+
+                 " or mccat.t_code = '+% к погашению' or mccat.t_code = '-% к погашению' ";
+      else
+        v_sql2 = " mccat.t_code like '%БПП%' or mccat.t_code like '%ПВО%'";
+      end;
+
+      v_sql =         "select mcacc.t_docid ret, mccat.t_code from dmcaccdoc_dbt mcacc, dmccateg_dbt mccat";
+      v_sql = v_sql + " where mcacc.t_catid = mccat.t_id  and ( ";
+      v_sql = v_sql + v_sql2;
+      v_sql = v_sql + "  ) and t_account = :acc_num  and t_currency = :fiid and t_dockind = 176 ";
+/*      v_sql = v_sql + "  and ( t_disablingdate > :curdate or t_disablingdate = to_date('01.01.0001','dd.mm.yyyy') )";
+      v_sql = v_sql + "  and t_activatedate <= :curdate ";*/
+
+      v_cmd = RSDCommand(v_sql);
+      v_cmd.addParam("acc_num", RSDBP_IN, _accnum);
+      v_cmd.addParam("fiid", RSDBP_IN, _fiid);
+
+/*      v_cmd.addParam("curdate1", RSDBP_IN, _date);
+      v_cmd.addParam("curdate2", RSDBP_IN, _date);*/
+
+      v_rs = RSDRecordSet(v_cmd);
+      if(v_rs.movenext())
+         res = v_rs.value("ret");
+         catcode = v_rs.value("t_code");
+      else
+         res = 0;
+      end;
+      v_rs.close(); v_cmd.close(); v_rs = null; v_cmd = null; v_sql = null;
+
+      if (res != 0)
+        ret = "Да";
+
+        // проверка на обратное РЕПО
+        if (catcode =="-ОД")
+          v_sql = "select count(*) cnt from ddl_tick_dbt tick, ddl_leg_dbt leg, doprkoper_dbt opr  "+
+                  " where tick.t_dealid = leg.t_dealid and leg.t_id = :legid "+
+                  "   and opr.t_kind_operation = tick.t_dealtype "+
+                  "   and Instr(opr.t_systypes, 'B') > 0 and Instr(opr.t_systypes, 't') > 0";
+          v_cmd = RSDCommand(v_sql);
+          v_cmd.addParam("legid", RSDBP_IN, res);
+          v_rs = RSDRecordSet(v_cmd);
+          if(v_rs.movenext())
+            dealtype = v_rs.value(0);
+            /*if ( (dealtype == 2122) or (dealtype == 2124) or (dealtype == 12122) or  
+                 (dealtype == 12123) or (dealtype == 12132) or (dealtype == 12133) or (dealtype == 12134) )*/
+            if (dealtype > 0)
+               ret = "Бум";
+            else
+               ret = "Да";
+            end;
+          else
+            ret = "Да";
+          end;
+          v_rs.close(); v_cmd.close(); v_rs = null; v_cmd = null; v_sql = null;
+        end;
+      end;
+      
+      return ret;
+
+   end;
+
+   macro GetObKO(_objecttype, _ObjectID)
+      var res = c_IntegrationDictionaryRecordXType;
+      var ObjCat;
+
+      res.RecordCode = "";
+
+      ObjCat = RsbObjCategories( _objecttype, _ObjectID );
+      if (ObjCat.GetMainAttr( CATEGORY_OBKO, {curdate}, attr ) == 0)
+         res.RecordCode = attr.name;
+      end;
+      return res;
+   end;
+
+   macro fill( accountId, i_evnt_type, i_pair_account )
+      private var contrId,
+                  contr,
+                  clientId;
+      private var accfile = TBFile("account.dbt", "r", 1);
+      private var ObjectID;
+      //private var AccountSynth;   //BIQ-3804 
+      private var custSofrID;
+
+      var sql = execSqlSelect("select * from daccount_dbt where t_accountid=:1", 
+                              makeArray(sqlParam ("1", accountId)));
+
+      if( not sql.moveNext() )
+         return;
+      end;
+
+
+/* 20181212 - kva - убрал проверку принадлежности счета к клиентским. */
+/* По схеме IdCurs - "Для внутриб. сч. ID клиента", следовательно, его не заполняем - все счета считаем клиентскими *//*
+     if( CheckAccClientMask( sql.value("T_BALANCE") ) ) //проверить счет на принадлежность к клиентскому
+      IdCust.ObjectId = string( sql.value("T_CLIENT"));
+      clientId = sql.value("T_CLIENT");
+     else
+      clientId = 0;
+      IdCust = NULL;
+     end;
+*/
+      clientId = sql.value("T_CLIENT"); /* 20181212 - kva - используется дальше */
+
+      this.AccountId.ObjectId = string(accountId);
+      FilialId.ObjectId = getFilialId(int(sql.value("t_department"))); // или t_branch???
+      /*"Расчет";*///"АИЖК"; //??? /* 20181206 - kva - временно поменял значение; 20181218 - kva - определяем в таблице ubalanceRSHB_dbt по номеру балансового */
+      // gtv: определяется по примечанию на счете, если примечание не задано - по таблице ubalanceRSHB_dbt, если и там не найдено, то "Расчет" 
+      ContractCode.RecordCode = acc_get_contract_code(sql.value("t_balance"), sql.value("t_account"), sql.value("t_code_currency"), sql.value("t_open_date"),sql.value("t_open_date")); 
+      BalanceAccount = string(sql.value ("t_balance"));
+      AcctNumWCur.CurrencyCode = ПолучитьКодФинИн(int(sql.value("t_code_currency")), NULL, 1);
+      //gtv: временно - maa- не временно
+      if ( (BalanceAccount == "47407") or (BalanceAccount == "47408") ) //gtv: для счетов ТО валюта особенная
+         AcctNumWCur.CurrencyCode = Substr(sql.value("t_account"),6,3);
+      else
+         if (AcctNumWCur.CurrencyCode == "959")
+            AcctNumWCur.CurrencyCode = "A98";
+         elif (AcctNumWCur.CurrencyCode == "961")
+            AcctNumWCur.CurrencyCode = "A99";
+         elif (AcctNumWCur.CurrencyCode == "962")
+            AcctNumWCur.CurrencyCode = "A76";
+         elif (AcctNumWCur.CurrencyCode == "964")
+            AcctNumWCur.CurrencyCode = "A33";
+         end;
+      end;
+
+      AccountName = string(sql.value("t_nameaccount"));
+      AcctNumWCur.AccountNumber = string(sql.value("t_account"));
+     
+/*      contrId = findContract(AcctNumWCur.AccountNumber);
+
+      if( contrId )
+         contr = execSqlSelect("select t_dateconc, t_number, t_partyid from dsfcontr_dbt where t_id=:1",
+                               makeArray(sqlParam("1", contrId)));
+         if( contr.moveNext() )
+            LoanAcctDate = date(contr.value("t_dateconc"));
+            LoanAcctNum = string(contr.value("t_number"));
+//       clientId = int(contr.value("t_partyid"));
+         end;
+      end;*/
+
+      UserCode = u_getUserCode(int(sql.value("t_oper")));
+//shev def-36033
+      if (Valtype(UserCode) == V_UNDEF)
+//         UserCode = "00001363";  
+         UserCode = "";  
+      end;
+
+//      DealEndDate.Value = getDealEndDate(accountId); //??? /* 20181222 - kva - изменение логики заполнения */
+      var serv_DealEndDate = c_calc_DealEndDate(sql.value("t_account"), sql.value("t_code_currency"), 
+                                                BalanceAccount, ContractCode.RecordCode, sql.value("t_open_date")); // для получения доп.параметров из сделки
+          
+
+      if (ValType(serv_DealEndDate) != V_UNDEF)
+         if (serv_DealEndDate.ContractNum)
+            LoanAcctNum = serv_DealEndDate.ContractNum;
+            LoanAcctDate = serv_DealEndDate.ContractDate;
+         end;
+
+         if (ValType(serv_DealEndDate.ValueTermCode) != V_UNDEF)
+            DealEndDate = NULL;
+            TermCode = TTermCode;
+            TermCode.StartDateTermCode = serv_DealEndDate.StartDateTermCode;
+            TermCode.ValueTermCode = serv_DealEndDate.ValueTermCode;
+         else
+            TermCode = NULL;
+            if ( (ValType(serv_DealEndDate.ValueDealEndDate) == V_Date) and (serv_DealEndDate.ValueDealEndDate > date(0,0,0) ) )
+              DealEndDate = TDealEndDate;
+              DealEndDate.StartDateDealEndDate = serv_DealEndDate.StartDateDealEndDate;
+              DealEndDate.ValueDealEndDate = serv_DealEndDate.ValueDealEndDate;
+            end;
+         end;
+
+         I1dec.RecordCode = serv_DealEndDate.i1_dec;
+         //MSFOAcc = serv_DealEndDate.MSFOAcc;   //gtv: теперь примечание ко счету
+         //MSFOAccRamb = serv_DealEndDate.MSFOAccRamb;
+         SubordinatedBondType = serv_DealEndDate.SubordinatedBondType;
+
+         if (serv_DealEndDate.SubordKred)
+           SubordKred = TSubordKred;
+           SubordKred.StartDateSubordKred = serv_DealEndDate.SubordKred.StartDateSubordKred;
+           SubordKred.ValueSubordKred = serv_DealEndDate.SubordKred.ValueSubordKred;
+         else
+           SubordKred = NULL;
+         end;
+         Dealrate = serv_DealEndDate.DealRate;
+
+         if (serv_DealEndDate.TypeDeal > 0) 
+           if (serv_DealEndDate.IdCust_our > 0)
+             custSofrID = serv_DealEndDate.IdCust_our;
+             IdCust.ObjectId = GetPartyCode_ByNumber(serv_DealEndDate.IdCust_our, PARTY_CODEKIND_ABS);
+             if (IdCust.ObjectId)
+               var pos = Index(IdCust.ObjectId,"#");
+               if (pos > 0)
+                  IdCust.ObjectId = Substr(IdCust.ObjectId,6);
+               end;
+               TypeClient.RecordCode = getClientType( serv_DealEndDate.IdCust_our );
+               if (TypeClient.RecordCode == "В")
+                  TypeClient.RecordCode == "Б";
+               end;
+             else
+               IdCust = NULL;
+               TypeClient = NULL;
+             end;
+           end;
+         end;
+
+      else
+        DealEndDate = NULL;
+      end;
+
+      // нелогично и дубликация кода, но нужен UniID
+      accfile.rec.accountid = accountId;
+      if (accfile.getEQ())
+         ObjectID = UniID(accfile, OBJTYPE_ACCOUNT);
+         MSFOAcc = readNoteForObject( OBJTYPE_ACCOUNT, ObjectID, NOTEKIND_ACC);
+         MSFOAccRamb = readNoteForObject( OBJTYPE_ACCOUNT, ObjectID, NOTEKIND_ACCRAMB);
+         ObKO = GetObKO(OBJTYPE_ACCOUNT, ObjectID);
+      end;
+
+      if (not I1dec.RecordCode)
+        I1dec       = NULL;
+      end;
+      if (not MSFOAcc)
+        MSFOAcc     = NULL;
+      end;
+      if (not MSFOAccRamb)
+        MSFOAccRamb = NULL;
+      end;
+      //проверка на сводный счет  
+      //AccountSynth = GetSynthAccByMC_Bisquit( AcctNumWCur.AccountNumber ); //BIQ-3804
+      /*if ( AccountSynth == AcctNumWCur.AccountNumber) // обычный  BIQ-3804 
+         IsAccountConsolidateSign = false;
+      else
+         IsAccountConsolidateSign = true;
+      end; */
+
+      Risk.RecordCode = getRisk(accountId);
+     /* kva: 20181121 - Если не можем заполнить единственный обязательный параметр объекта, то объект не передается */
+      if(ValType(Risk.RecordCode) == V_UNDEF)
+         Risk = NULL;
+      end;
+
+      if (sql.value("t_balance") == "91419")
+         Repo.RecordCode = "Бум";
+         Dealrate = 0;
+      else
+         Repo.RecordCode = get_sign_repo(sql.value("t_account"), sql.value("t_code_currency"), sql.value("t_chapter"), {curdate});
+         if(ValType(Repo.RecordCode) == V_UNDEF)
+            Repo = NULL;
+            Dealrate = NULL;
+         elif (Repo.RecordCode == "Бум")
+            Dealrate = 0;
+         end;
+      end;
+
+      // Парный передается только для того, который из пары позже открыт
+      if( (sql.value("t_pairaccount") != "") /*and 
+         execSqlSelect ("select 1 from daccount_dbt where t_chapter=:1 and t_account=:2 and t_accountid > :3",
+                        makeArray (sqlParam("1", int (sql.value("t_chapter"))),
+                                   sqlParam("2", sql.value("t_pairaccount")), 
+                                   sqlParam("3", accountId))).moveNext()*/ ) /* 20190114 - kva - передаем парные счета всегда */
+         AccountContr = sql.value("t_pairaccount");
+      else 
+         AccountContr = i_pair_account;       
+      end;
+
+      CreatDateAccount = date(sql.value("t_open_date"));
+/* 20190117 - kva - для того, чтобы в конце дня перед проводками не выгружать закрытые счета *//*
+      if( date(sql.value("t_close_date")) != date(0,0,0) )
+         CloseDateAccount = date(sql.value("t_close_date"));
+      end;
+*/
+      if( (date(sql.value("t_close_date")) != date(0,0,0)) and (i_evnt_type == 3) )
+//      if( (date(sql.value("t_close_date")) != date(0,0,0)) and (date(sql.value("t_close_date")) < date(22,3,2019))  )
+         CloseDateAccount = date(sql.value("t_close_date"));
+      end;
+
+      ClientParametr = TClientParameter(clientId);
+      /* 20181212 - kva - для "внутренних" счетов ClientParametr не заполняется */
+      /* 2021-04-06 Cherednichenko теперь "Внутренние" заполняем по id клиента (не владельца) */
+      // 2021-07-05 Cherednichenko заполнение только при нахождении клиента, в противном случае пустые данные.
+      if(ClientParametr.ClientType.RecordCode == "В")
+      // 2021-08-05 Cherednichenko is 531426 Если и клиент счета РСХБ, информацию не выгружаем
+        if( (ValType(custSofrID) != V_UNDEF) and (custSofrID != {OurBank}) )
+          ClientParametr = TClientParameter(custSofrID);
+        else
+          ClientParametr = NULL;
+        end;
+      else
+         IdCust.ObjectId = ClientParametr.ClientID.ObjectId; 
+         TypeClient.RecordCode = ClientParametr.ClientType.RecordCode;
+         if (TypeClient.RecordCode == "В")
+            TypeClient.RecordCode == "Б";
+         end;
+      end;  
+
+   end;
+
+end;
+
+
+private class TSOFROpenAccountReq
+//   var AccountParams :TAccountParams;
+   var AccountParamsList;
+
+end;
+
+
+private class TSOFROpenAccountRequest
+   var OpenAccountsRequest = TSOFROpenAccountReq;
+
+end;
+
+
+private class TSOFROpenAccount_Req
+   var OpenAccountsRequestMsg = TSOFROpenAccountRequest;
+
+end;
+
+
+macro SOFR_OpenAccount_Req( accountId, p_evnt_type )
+   const CV_EVNT_TYPE_DEF = 1;
+   const CV_EVNT_TYPE_CLOSE = 3;
+   var v_aux_cntr = 0;
+   var v_pair_acc_id;
+   var v_evnt_type;
+   var pair_accountnumber = null;
+   var res = TSOFROpenAccount_Req();
+
+   if(ValType(p_evnt_type) != V_UNDEF)
+      v_evnt_type = p_evnt_type;
+   else
+      v_evnt_type = CV_EVNT_TYPE_DEF;
+   end;
+
+   if( valType (accountId) == V_INTEGER )
+      res.OpenAccountsRequestMsg.OpenAccountsRequest.AccountParamsList = TArray();
+      res.OpenAccountsRequestMsg.OpenAccountsRequest.AccountParamsList.value(v_aux_cntr) = TAccountParams(accountId, v_evnt_type);
+      //DEF-63202 для закрытия отправляем только 1 счет 
+      pair_accountnumber = res.OpenAccountsRequestMsg.OpenAccountsRequest.AccountParamsList.value(v_aux_cntr).AcctNumWCur.AccountNumber;
+      if (v_evnt_type != CV_EVNT_TYPE_CLOSE)
+         v_pair_acc_id = m_get_pair_acc_id(accountId);
+         if(v_pair_acc_id != 0)
+            v_aux_cntr = v_aux_cntr + 1;
+            res.OpenAccountsRequestMsg.OpenAccountsRequest.AccountParamsList.value(v_aux_cntr) = TAccountParams(v_pair_acc_id, v_evnt_type, pair_accountnumber); 
+         end;
+      end;
+   end;
+
+   return res;
+
+end;

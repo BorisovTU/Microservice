@@ -1,0 +1,423 @@
+/*
+*  ---------------------
+*  R-Style Software Lab.
+*  ---------------------
+*  RS-Retail
+*
+*  Компенсации по вкладам
+*
+*  Реестр начисленных и выплаченных компенсаций
+*
+*/
+
+import CommonInter, Acc_Form;
+import sqlexec,sqlconv, RSD;
+
+var SpecialAccess = GetSpecialAccess(); /*имеет ли операционист спецдоступ к счетам*/
+var OperMayListSpecialAccounts = GetShowSpecialAccessAccounts() and GetBankStandart(); /* может ли операционист просматривать спец счета ,не имея спец. доступа*/
+
+file acc     ("depositr.dbt"  ) key 7;        /* Счета вкладчиков */
+file subop   ( "suboper.dbt"  ) key 1;        /* Подоперации */
+var doc = TBFile ("sbdepdoc.dbt", "r", 1);
+file compens ( "compens.dbt"  ) key 4;        /* Компенсации по вкладам */
+file comptmp ( "comptmp.tmp" ) key 0 write;  /* Временный файл компенсаций для сортировки */
+file comp_cli( "comp_cli.dbt" ) key 0;        /* Связь вида комп. и кат. вкладчика SCR 11656 */
+
+var depclnt = TClientList;
+
+const PaternKind = "Шаблонный",  /* Шаблонный вид вклада */
+      OP_OUTCOMP = 15,           /* Операция выдачи компенсации */
+      OP_PUTCOMP = 74;           /* Опреация зачисления компенсации */
+
+var {CNum};
+
+var flagCur = NumFlagCur(),  /* Валютность */
+    branch  = NumFNCash();   /* Номер текущего филиала */
+
+var TxtDir = GetRegVal( "BANK_INI\\ОБЩИЕ ПАРАМЕТРЫ\\ДИРЕКТОРИИ\\TEXTDIR", true ), FNct;
+
+var compDocSum;
+
+var ErrCode, ErrText;
+
+/* Значения кода режима работы */
+const MODE_NORMAL = 0;       /* Нормальный режим */
+const MODE_EOY = 1;          /* Конец периода */
+const MODE_EOY_PRECALC = 2;  /* Конец периода - документы предварительного расчета */
+const MODE_GZ = 4;           /* Группа зачисления */
+ 
+/************************************************************************
+         Открытие временного файла компенсаций для сортировки
+************************************************************************/
+MACRO Open_Temp_File()  
+  var cmd;
+
+  cmd = RsdCommand( NULL, string("truncate table dcomptmp_tmp") );
+  cmd.execute();
+
+  return 0;
+END;
+
+/************************************************************************
+                    Поиск подоперации компенсации
+************************************************************************/
+MACRO FindSubOper( p_type )
+ var str;
+ /* Added by Martinov SCR 11656*/
+ ReWind (comp_cli);
+ comp_cli.ClientCatID = p_type;
+ if ( GetEQ( comp_cli) )
+   str = "\"" + comp_cli.ClientCatName + "\"";
+ else
+   str = "???";
+ end;
+/*
+ ReWind( subop );
+ subop.IsCur    = flagCur;
+ subop.Kind     = PaternKind;
+ subop.OperType = OP_PUTCOMP;
+ subop.Type     = p_type;
+ if ( GetEQ( subop ) )
+   str = "\"" + subop.Name + "\"";
+ else
+   str = "???";
+ end;
+*/ 
+ return str;
+END;
+
+/************************************************************************
+             Поиск документов выплаченной компенсации
+************************************************************************/
+MACRO CompOutDocs( d1, d2 )
+  var ret = TRUE;
+  compDocSum = $0;
+  ClearRecord( acc );
+  acc.FNCash  = compens.FNCash;
+  acc.Account = compens.DestAccount;
+  ret = GetEQ( acc );
+  if ( NOT ret )
+    PrintLn( " *** Не найден счет ", Acc_Form(compens.Account) );
+  end;
+  if ( ret )
+    doc.Clear;
+    doc.rec.Referenc = acc.Referenc;
+    doc.rec.TypeOper = OP_OUTCOMP;  /* Выдача компенсации */
+    doc.addFilter ( "t.t_referenc=" + string(acc.Referenc) +
+                    " and t.t_typeoper=" + string(OP_OUTCOMP) +
+                    " and t.t_date_document between " + sqlDateToStr(d1) +
+                    " and " + sqlDateToStr(d2) +
+                    " and t.t_Mode != " + String(MODE_GZ));
+    if ( doc.GetGE )
+      while ( ret                               AND
+              ( doc.rec.Referenc == acc.Referenc )  AND
+              ( doc.rec.TypeOper == OP_OUTCOMP ) )
+        if ( ( doc.rec.Date_Document >= d1 )  AND
+             ( doc.rec.Date_Document <= d2 ) )
+          compDocSum = compDocSum + doc.rec.OutSum;
+        end;
+        ret = doc.Next;
+      end;
+      ret = TRUE;
+    end;
+    doc.dropFilter;
+  end;
+  return ret;
+END;
+
+/************************************************************************
+         Формирование Ф.И.О. клиента, если они не заданы
+************************************************************************/
+MACRO FIO_copmpens()
+  if ( StrLen( compens.LastName ) <= 0 )
+
+    if ( depclnt.GetRecord( compens.CodClient ) )
+      comptmp.LastName  = depclnt.CurRec.rec.Name1;
+      comptmp.FirstName = depclnt.CurRec.rec.Name2;
+      comptmp.PatrName  = depclnt.CurRec.rec.Name3;
+    end;
+  end;
+END;
+
+MACRO CompAll()
+ var cmd, rs;  
+ var Records;
+ var appl_type = -1, nn = 0;
+ var iSumC = $0, iSumP = $0;
+ var cSumC = $0, cSumP = $0;
+ var stat = Next( comptmp );
+ var nCnt = 0;
+ var FIO;
+
+ cmd = RsdCommand("select cmp.t_codclient as CodClient, cmp.t_account as Account, cmp.t_ApplType as ApplType,"+
+                  " cmp.t_LastName as LastName, cmp.t_FirstName as FirstName, cmp.t_PatrName as PatrName, cmp.t_sum as Sum,"+
+                  " cmp.t_compensedsum as CompensedSum, dep.t_SpecialAccess as SpecialAccess "+
+                  " from dcomptmp_tmp cmp, ddepositr_dbt dep where "+
+                  " cmp.T_ACCOUNT = dep.T_ACCOUNT and cmp.t_fncash = dep.t_fncash");
+ cmd.execute();
+ rs = RsdRecordset(cmd);
+ InitProgress( rs.RecCount, " Ж Д И Т Е ...",
+                "Формирование отчета" );
+
+ while  ( rs.moveNext() )
+   if ( appl_type != rs.value("ApplType") )
+     nn = 0;
+     if ( appl_type != -1 )
+       [ |----------------------------------------------------------------------+---------------------+---------------------|
+         |                                                               Итого: | ################### | ################### |
+         |----------------------------------------------------------------------+---------------------+---------------------|]
+       ( iSumC:a, iSumP:a );
+     end;
+     cSumC = cSumC + iSumC;
+     cSumP = cSumP + iSumP;
+     iSumC = $0;
+     iSumP = $0;
+     appl_type = rs.value("ApplType");
+     [
+
+         Категория: #
+
+       |-------+------------------------------+-------------------------------+---------------------+---------------------|
+       | N п\п |       Ф.И.О. вкладчика       |      Номер лицевого счета     |       Начислено     |       Выплачено     |
+       |-------+------------------------------+-------------------------------+---------------------+---------------------|]
+     ( FindSubOper( appl_type ) );
+   end;
+   nn = nn + 1;
+   nCnt = nCnt + 1;
+   UseProgress( nCnt );
+
+   if(  (not SpecialAccess) and OperMayListSpecialAccounts and rs.value("SpecialAccess"))
+      FIO = "XXXXXX X.X.";
+   else
+      FIO = rs.value("LastName")+" "+SubStr(rs.value("FirstName"), 1, 1)+". "+SubStr(rs.value("PatrName"), 1, 1) + ".";
+   end;   
+   
+   [ | ##### | ############################ | ############################# | ################### | ################### |]
+   (
+     nn,
+     FIO,
+     Acc_Form(String(rs.value("Account"))):f,
+     rs.value("Sum"):a,
+     rs.value("CompensedSum"):a
+   );
+   iSumC = iSumC + rs.value("Sum");
+   iSumP = iSumP + rs.value("CompensedSum");
+ end;
+ [ |-------+------------------------------+-------------------------------+---------------------+---------------------|
+   |                                                               Итого: | ################### | ################### |
+   |----------------------------------------------------------------------+---------------------+---------------------|]
+ ( iSumC:a, iSumP:a );
+ RemProgress();
+ cSumC = cSumC + iSumC;
+ cSumP = cSumP + iSumP;
+ [
+
+               Всего:  начислено: #####################,  выплачено: #####################
+
+
+               Контролер ______________________________]
+ ( cSumC:a, cSumP:a );
+END;
+
+MACRO CompType( type )
+ var Records;
+ var nn = 0;
+ var iSumC = $0, iSumP = $0;
+ var stat;
+ comptmp.ApplType = type;
+ stat = GetGE( comptmp );
+ Records = NRecordsSQL (comptmp,"t.t_appltype="+string(type));
+
+ InitProgress( Records, " Ж Д И Т Е ...",
+                "Формирование отчета" );
+ [
+
+     Категория: #
+
+   |-------+------------------------------+-------------------------------+---------------------+---------------------|
+   | N п\п |       Ф.И.О. вкладчика       |      Номер лицевого счета     |       Начислено     |       Выплачено     |
+   |-------+------------------------------+-------------------------------+---------------------+---------------------|]
+ ( FindSubOper( comptmp.ApplType ) );
+ while  ( stat  AND  ( comptmp.ApplType == type ) )
+   nn = nn + 1;
+   UseProgress( nn );
+   [ | ##### | ############################ | ############################# | ################### | ################### |]
+   (
+     nn,
+     comptmp.LastName + " " +
+       SubStr( comptmp.FirstName, 1, 1 ) + ". " +
+       SubStr( comptmp.PatrName,  1, 1 ) + ".",
+     Acc_Form(comptmp.Account):f,
+     comptmp.Sum:a,
+     comptmp.CompensedSum:a
+   );
+   iSumC = iSumC + comptmp.Sum;
+   iSumP = iSumP + comptmp.CompensedSum;
+   stat = Next( comptmp );
+ end;
+ [ |-------+------------------------------+-------------------------------+---------------------+---------------------|
+   |                                                               Итого: | ################### | ################### |
+   |----------------------------------------------------------------------+---------------------+---------------------|]
+ ( iSumC:a, iSumP:a );
+ RemProgress();
+ [
+
+               Всего:  начислено: #####################,  выплачено: #####################
+
+
+               Контролер ______________________________]
+ ( iSumC:a, iSumP:a );
+END;
+
+/*************************************************************************
+                 Головная процедура формирования отчета
+*************************************************************************/
+macro _main(kind, date1, date2, tmp_fncash, stat )
+ var Records;
+ var nn = 0;
+      Records = NRecordsSQL (compens,
+                              "t.t_fncash="+string(tmp_fncash)+
+                              " and t.t_kind="+string(kind)+
+                              " and t.t_date between "+sqlDateToStr(date1)+
+                              " and "+sqlDateToStr(date2));
+      InitProgress( Records, " Ж Д И Т Е ...",
+                   "Копирование во временный файл" );
+      while  ( stat  AND
+               ( compens.FNCash == tmp_fncash )  AND
+               ( compens.Kind   == kind   )  AND
+               ( compens.Date   >= date1  )  AND
+               ( compens.Date   <= date2  ) )
+            nn = nn + 1;
+            UseProgress( nn );
+            Copy( comptmp, compens );
+            stat = CompOutDocs( date1, date2 );  /* Выплаченные компенсации */
+            comptmp.CompensedSum = compDocSum;   /* Сумма выплаченных компенсаций */
+
+            if ( stat )
+              FIO_copmpens();
+              stat = Insert( comptmp );
+              if ( stat )
+                stat = Next( compens );
+              else
+                PrintLn( " *** Ошибка при записи во временный файл" );
+                ErrCode = Status( ErrText );
+                PrintLn( " *** ", ErrCode, ": ", ErrText );
+                Exit( 0 );
+              end;
+            else
+              ErrCode = Status( ErrText );
+              PrintLn( " *** ", ErrCode, ": ", ErrText );
+              Exit( 0 );
+            end;
+
+      end;
+      RemProgress();
+end;
+
+MACRO CompensationReestr( kind, type, date1, date2, fncash )
+
+ var stat;
+ var appl_type = -1;
+ var sFilial = "";
+ var iSumC = $0, iSumP = $0;
+ var cSumC = $0, cSumP = $0;
+ var cmd, rs;
+
+if (kind == 6)
+   ExecMacroFile("comp_r04", "listCompens2004", kind, type, date1, date2, fncash );
+   return 1;
+end;
+ 
+ /* Открытие временного файла */
+ if ( Open_Temp_File() )
+   MsgBox( "Невозможно открыть временный файл" );
+   Exit( 0 );
+ end;
+if (fncash != 0)
+    /***   Определение названия филиала   ***/
+    if ( not findDepartment(branch, sFilial) )
+      sFilial = "";
+    end;
+else
+   sFilial = "По всем подразделениям";
+end;
+
+    /***   Копирование во временный файл   ***/
+    ReWind( compens );
+if (fncash != 0)
+    compens.FNCash = branch;  // = fncash;
+else
+    cmd = RsdCommand(" select DISTINCT(dcompens_dbt.t_fncash) from dcompens_dbt where "
+                     " dcompens_dbt.t_kind = ? and dcompens_dbt.t_date = ? ");
+    cmd.addParam("T_kind", RsdBp_in);
+    cmd.value("T_kind") = kind;
+    cmd.addParam("t_date", RsdBp_in);
+    cmd.value("t_date") = date1;
+    cmd.execute;
+    rs = RsdRecordset(cmd);
+    rs.moveNext();
+    compens.FNCash = rs.value(0);   
+end;
+    compens.Kind   = kind;
+    compens.Date   = date1;
+    stat = GetGE( compens );
+    if ( stat  AND
+         ( compens.FNCash == branch )  AND
+         ( compens.Kind   == kind   )  AND
+         ( fncash         != 0      )  AND
+         ( compens.Date   >= date1  ) )
+      [
+         Структурное подразделение №: #
+
+                                   РЕЕСТР начисленных и выплаченных компенсаций
+                                     с #
+      ]
+      (
+        sFilial,
+        String( date1:m ) + " по " + String( date2:m )
+      );
+      _main(kind, date1, date2, branch, stat);
+    elif ( stat  AND
+         ( fncash         == 0      )  AND
+         ( compens.Kind   == kind   )  AND
+         ( compens.Date   >= date1  ) )
+      [
+         Структурное подразделение №: #
+
+                                   РЕЕСТР начисленных и выплаченных компенсаций
+                                     с #
+      ]
+      (
+        sFilial,
+        String( date1:m ) + " по " + String( date2:m )
+      );
+
+         cmd = RsdCommand(" select DISTINCT(dcompens_dbt.t_fncash) from dcompens_dbt where "
+                          " dcompens_dbt.t_kind = ? and dcompens_dbt.t_date >= ? ");
+         cmd.addParam("T_kind", RsdBp_in);
+         cmd.value("T_kind") = kind;
+         cmd.addParam("t_date", RsdBp_in);
+         cmd.value("t_date") = date1;
+
+         cmd.execute;
+         rs = RsdRecordset(cmd);
+         while ( rs.moveNext() )
+            compens.FNCash = rs.value(0);
+            _main( kind, date1, date2, rs.value(0), stat );
+         end;
+
+    
+    else
+      [ Не найдено записей в указанном филиале ];
+    end;
+
+ 
+ /***   Формирование отчета   ***/
+ ReWind( comptmp );
+ if ( type == -1 )
+   CompAll();
+ else
+   CompType( type );
+ end;
+
+END;

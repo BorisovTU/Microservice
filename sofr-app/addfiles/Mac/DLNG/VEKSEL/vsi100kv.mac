@@ -1,0 +1,431 @@
+/*──────────────────────────────────────────────────────────────────────────┐
+  RS-Bank 5.1                                          R-Style Software Lab
+
+  File Name   : vsi100kv.mac
+                                vs-вексель
+                                 i-операция эмиссии векселя (issue)
+                               100-номер (соответствующий шагу)
+                                kv-квитовка
+  Programmer  : Велигжанин А.В.
+  Операция    : Эмиссия (или продажа) собственного векселя
+  Шаг         : К.Квитовка платежей
+  Comment     :
+└───────────────────────────────────────────────────────────────────────────*/
+IMPORT PaymInter, vs4each, vsrep, vsdates, vskvits, vscngst, oralib, likepy;
+import vs_userlib;
+
+
+/* Массивы с информацией о исполняемых платежах для квитовки 
+   Инициализируются бэк-офисом 
+*/
+VAR PlanIDs     = TArray;
+VAR FactIDs     = TArray;
+VAR KvitAmounts = TArray;
+VAR ExecDate;
+
+PRIVATE var StepDate; // Дата шага (дата проводки док-тов)
+
+
+/* Класс - параметры квитовки
+*/
+PRIVATE CLASS KvitParms ()
+private var
+  i, paym = null, Sums = TArray;
+
+  PRIVATE MACRO GetPaym(i) /* возвращает платеж */
+    if(i < FactIDs.size)
+      paym = MyRsbPayment(FactIDs(i));
+    else
+      paym = null;
+    end;
+
+    return paym;
+  END;
+
+  PRIVATE MACRO InitSums() 
+     var j = 0;
+     while (j < FactIDs.size)
+       Sums[j] = KvitAmounts(j);
+       j = j + 1;
+     end;
+  END;
+
+  MACRO GetFst() /* возвращает 1ый платеж */
+    return GetPaym(i = 0);
+  END;
+
+  MACRO GetNext() /* возвращает след. платеж */
+    return GetPaym(i = i + 1);
+  END;
+
+  MACRO GetKvitAmount()
+    return Sums[i];
+  END;
+
+  MACRO SetKvitAmount(s)
+    return Sums[i] = s;
+  END;
+
+  macro GetSumByAccount (account:string)
+    var sum = 0, j = 0, pmpaym = null;
+
+    while (j < FactIDs.size)
+      pmpaym = MyRsbPayment(FactIDs(j));
+      if (account == pmpaym.ReceiverAccount) 
+        sum = sum + pmpaym.PayerAmount;
+      end;
+      j = j + 1;
+    end;
+    return sum;
+  End;
+
+  i = -1;
+  InitSums();
+END;
+
+
+/* 10.1. Действия шага.
+Особенность - в СОФР всегда формируется одно требование
+При выдаче следующие ситуации:
+1. Выдаётся один вексель. Пришёл один входящий платёж
+   A. Входящий платёж на счёт векселя
+   B. Входящий платёж на невыясненные (47416)
+2. Выдаётся один вексель. Пришло несколько входящих платежей.
+   A. Входящие платежи на один счет векселя
+   В. Входящие платежи на счета невыясненных сумм (47416)
+3. Выдаётся несколько векселей. Пришёл один входящий платёж
+   А. Платёж на один из вексельных счетов
+   В. Платёж на счет невыясненных (47416)
+4. Выдаётся несколько векселей. На каждый вексель пришёл свой платёж
+   А. Платежи на вексельные счета
+   В. Платежи на счета невыясненных (47416)
+5. Выдаётся несколько векселей. Пришло несколько платежей. Суммы платежей не совпадают со стоимостью векселей. Общая сумма платежей равна сумме требования
+   А. Платежи на вексельные счета
+   В. Платежи на счета невыясненных (47416)
+
+Порядок действий:
+1. Сначала проверка по счетам векселя и получателя в платеже
+   А. Попадается платёж, совпавший по сумме с векселем => пачка 55, в БИС не выгружается
+   В. Попался платёж по сумме больше векселя => С этого платежа будут квитоваться и другие векселя => пачка 170, в БИС выгружается
+   С. Попался платёж по сумме меньше векселя => Среди плановых найти сумму всех платежей с таким счетом получателя => Если сумма равна сумме векселя, то всё ок, пачка 55. Иначе пачка 170
+2. Ищется платёж с суммой равной суммой векселя для квитовки. Сделано для ситуаций, когда на каждый вексель приходит отдельный платёж. Если суммы векселей разные, то могут сформироваться неверные проводки при ручной квитовке
+3. Стандартная квитовка, которая квитует всё оставшееся.
+В пункте 2 и 3 всегда пачка 170, т.к. все возможные ситуации, когда во входящем платеже указан верный счёт получателя, обработаны в п. 1
+*/
+// BIQ-8464 ответная проводка всегда выгружается в АБС, пачка всегда 170 
+PRIVATE MACRO КвитовкаВекселя(bnr, leg, emi, order, i, lnk, data:@variant)
+var
+   fd,
+   НоминалБезДисконта, Счет, ОсткСчет, 
+   delta, paym = null, Stop = false,
+   KvitAmt, Sum,
+   needToClose = false,
+   NumberPack = 0;
+   record acc( account );
+
+
+  private macro KvitPaym ()
+    data.SetKvitAmount(KvitAmt - Sum);
+
+    needToClose = false;
+
+    if(Sum > paym.FuturePayerAmount)
+      return Ошибка("Сумма фактического платежа меньше суммы планового.");
+    elif(Sum == KvitAmt)
+      needToClose = true;
+    end;
+
+    paym.NumberPack = NumberPack;
+
+    if(not paym.Bookpass( String(GetVekselName(fd.GetBnr()) + " по договору выдачи №" + order.OrderNUmber),
+         Счет,                    // CreditAccount
+         acc.Code_Currency,       // CreditAccountFIID
+         Sum,                     // MinorAmount 
+         Paym.ReceiverFIID,       // MinorFIID
+         null,
+         null, null,
+         StepDate
+      ))
+      return 1; // ошибка
+    elif(needToClose)
+      if(not VS_ChangeStat(paym, PM_FINISHED, null, StepDate))
+        return 1; // ошибка
+      end;
+    end;
+       
+    if(not Stop)
+      paym = data.GetNext();
+    end;
+
+    return 0;
+  onerror()
+    return 1;
+  End;
+
+
+  if(order.ContractKind == DL_ORDER_VSSALE) // продажа
+    fd = VSOrderFD(order);
+
+    /*Simanov. Этот счет в РСХБ не используется
+    if(not ПолучитьСчетВекселя("-Расчеты", fd, Счет, MC_OPENACC_CREATE, null, acc, StepDate))
+      return 1;
+    end;
+    */
+    delta = lnk.rec.BCCost;
+  else // эмиссия
+    fd = VSBannerFD(bnr, leg);
+    НоминалБезДисконта = lnk.rec.BCCost;
+
+    if(not ПолучитьСчетВекселя("Наш вексель", fd, Счет, MC_OPENACC_CREATE, null, acc, StepDate))
+      return 1;
+    elif(not ПолучитьОстаток(ОсткСчет, Счет, acc.Code_Currency, StepDate))
+      return Ошибка("Ошибка при получении остатка|счета ", счет);
+    end;
+    ОсткСчет = VS_Convert(ОсткСчет, StepDate, acc.Code_Currency, lnk.rec.BCCFI);
+    if(НоминалБезДисконта <= ОсткСчет)
+      // вексель сквитован: пропускаем
+      delta = 0;
+    else
+      delta = НоминалБезДисконта - ОсткСчет;
+    end;
+  end;
+
+  if(delta)
+    // перебираем платежи, пока не сквитуем вексель
+    paym = data.GetFst();
+    delta = VS_Convert(delta, StepDate, lnk.rec.BCCFI, Paym.ReceiverFIID);
+
+    //1. Сначала проверка по счетам векселя и получателя в платеже
+    while (not Stop)
+      if(paym == null)
+        stop = true;
+        continue;
+        // платежи закончились
+        // останавливаем процесс перебора векселей 
+      elif((paym.PaymStatus != PM_KVITWAIT) or (paym.FuturePayerAmount == 0))
+        // этот факт. платеж уже сквитован на всю сумму или произошло еще что-то
+        paym = data.GetNext();
+        continue;
+      elif (paym.ReceiverAccount != Счет)
+        //Счёт не совпадает: пропускаем платёж
+        paym = data.GetNext();
+        continue;
+      else
+
+        if (НоминалБезДисконта == paym.FuturePayerAmount) 
+          //Платёж, совпавший по сумме с векселем => пачка 55, в БИС не выгружается
+          //NumberPack = 55;
+          //paym.UserField2 = "1";
+          // BIQ-8464 всегда выгружаем
+          NumberPack = 170;
+        elif (НоминалБезДисконта < paym.FuturePayerAmount)
+          //Платёж по сумме больше векселя => С этого платежа будут квитоваться и другие векселя => пачка 170, в БИС выгружается
+          NumberPack = 170;
+        elif (НоминалБезДисконта > paym.FuturePayerAmount)
+          /*Платёж по сумме меньше векселя => Среди плановых найти сумму всех платежей с таким счетом получателя =>
+                                              Если сумма равна сумме векселя, то всё ок - пачка 55.
+                                              Если оставшаяся несквитованная сумма больше всей суммы платежа, то платёж полностью уйдёт на проводку - пачка 55
+                                              Иначе пачка 170
+          */
+          if ( (НоминалБезДисконта == data.GetSumByAccount(Счет)) or (delta >= data.GetSumByAccount(Счет)) )
+            //NumberPack = 55;
+            //paym.UserField2 = "1";
+            // BIQ-8464 всегда выгружаем
+            NumberPack = 170;
+          else
+            NumberPack = 170;
+          end;
+        end;
+
+        KvitAmt = data.GetKvitAmount();
+        if(KvitAmt < delta)
+          /* сумма по платежу меньше, чем по векселю
+             проводим сколько есть и переходим к след. платежу */
+          Sum = KvitAmt;
+          delta = delta - Sum;
+        else
+          /* сумма платежа превосходит вексельную
+             проводим все и выходим из процесса (идем к след. векселю) */
+          Sum = delta;
+          Stop = true;
+          delta = 0;
+        end;
+
+        if (KvitPaym() == 1)
+          return 1;
+        end;
+
+      end;
+    end;
+
+    //Simanov. Пробегаемся по всем платежам, и ищем платёж по сумме равный стоимости приобретения векселя
+    if (delta)
+      stop = false;
+      NumberPack = 170;
+      paym = data.GetFst();
+      while( not Stop )
+        if(paym == null)
+          stop = true;
+          continue;
+          // платежи закончились
+          // останавливаем процесс перебора векселей 
+        elif((paym.PaymStatus != PM_KVITWAIT) or (paym.FuturePayerAmount == 0))
+          // этот факт. платеж уже сквитован на всю сумму или произошло еще что-то
+          paym = data.GetNext();
+          continue;
+        elif (delta != data.GetKvitAmount() )
+          //сумма платежа не равна сумме векселя - пропускаем
+          paym = data.GetNext();
+          continue;
+        else
+          KvitAmt = data.GetKvitAmount();
+          Sum = delta;
+          Stop = true;
+          delta = 0;
+
+          if (KvitPaym() == 1)
+            return 1;
+          end;
+        end;
+      end; //while( not Stop )
+    end; //if (delta)
+
+    if (delta) 
+      stop = false; 
+      paym = data.GetFst();
+      while( not Stop )
+        if(paym == null)
+          return 1;  // платежи закончились
+                     // останавливаем процесс перебора векселей 
+        elif((paym.PaymStatus != PM_KVITWAIT) or (paym.FuturePayerAmount == 0))
+          // этот факт. платеж уже сквитован на всю сумму или произошло еще что-то
+          paym = data.GetNext();
+          continue;
+        else
+          KvitAmt = data.GetKvitAmount();
+          if(KvitAmt < delta)
+            /* сумма по платежу меньше, чем по векселю
+               проводим сколько есть и переходим к след. платежу */
+            Sum = KvitAmt;
+            delta = delta - Sum;
+          else
+            /* сумма платежа превосходит вексельную
+               проводим все и выходим из процесса (идем к след. векселю) */
+            Sum = delta;
+            Stop = true;
+          end;
+
+          if (KvitPaym() == 1)
+            return 1;
+          end;
+
+        end;
+      end; //while( not Stop )
+    end; //if (delta) 
+  end;
+
+  return 0;
+END;
+
+
+/* Квитуем векселя, то есть выполняем проводки с платежа на "Наш вексель"
+     Предполагается, что счёт "Наш весель" - уникальный для каждого векселя.
+*/
+PRIVATE MACRO КвитовкаВекселей(order)
+VAR
+   p = KvitParms();
+   
+   return (ДляКаждогоВекселя(order, @КвитовкаВекселя, VSORDLNK_K_EMISSION, p, "BL") == 0);
+END;
+
+
+/* Запуск шага
+*/
+MACRO ExecuteStep(Buffer, dl_order)
+var
+    ИнтегрРежимРаботы = false, stat = 0;
+
+    record order( dl_order );
+    SetBuff( order, dl_order );
+    
+    if(not VS_TestStepDate(DATE_EMI_DOC, @StepDate, order.SignDate))
+       return 1;
+    end;
+
+    if(not VS_CheckWorkMode_INTEGRATED(@ИнтегрРежимРаботы))
+       stat = 1;
+    elif(not ИнтегрРежимРаботы)
+      stat = Ошибка("Квитовка платежей не предусмотрена");
+    elif(not КвитовкаПлатежаСВ(PlanIDs, FactIDs))
+      stat = 1;
+    elif(not КвитовкаВекселей(order))
+      stat = 1;
+    end;
+
+    return stat;
+
+END;
+
+
+/* Макрос постобработки 
+*/
+MACRO PostStep (    
+                CommitOrRollback, /*1-выполнение шага,2 -отакат шага*/
+                errTrn,        /* Статус выполнения шага-!0-произошла ошибка */
+                FirstDoc,      /* Указатель на первичный документ */
+                ID_Operation,  /* Номер экземпляра операции */
+                Num_Step,      /* Номер шага операции(из настроек) */
+                Kind_Operation,/* Вид операции */
+                KindDoc,       /* Вид первичного документа */
+                KindStep,      /* Вид шага операции */
+                ID_Step)       /* Номер шага операции */
+  var sql;
+
+  record order( "dl_order" );
+  SetBuff( order, FirstDoc );
+
+  if (errTrn OR (CommitOrRollback==2)) 
+      /* Произошла ошибка или происходит откат */
+
+     return;
+  end;
+
+  sql = "delete from dpmdocs_dbt "
+      + "where t_acctrnid in (select t_acctrnid from doprdocs_dbt doc "
+      + "                     where t_id_operation = " + ID_Operation
+      + "                           and t_dockind = 1 "
+      + "                           and t_id_step = " + ID_Step
+      + "                           and exists (select 1 from dacctrn_dbt where t_acctrnid = doc.t_acctrnid and t_number_pack = 170)) ";
+  ExecSql(sql);
+  
+  var Kind = RSDCommand( "select party_read.is_legal_entity(?) NeedSend from dual" );
+  Kind.addParam( "", RSDBP_IN, order.Contractor );
+  Kind.execute();
+  var DataSet = TRsbDataSet(Kind);
+  if(DataSet.moveNext() and (DataSet.NeedSend == 1))
+    /*BOSS-5356 Отправка договора со статусов 30-оплачено в ДБО ЮЛ "Свой бизнес"*/
+    var SendBillDeal = RSDCommand( "BEGIN FOR c IN (SELECT lnk.T_BCID BCID FROM dvsordlnk_dbt lnk WHERE lnk.T_CONTRACTID = ? AND lnk.T_DOCKIND = ?) LOOP IT_NDBOLE.send_bill_json(c.BCID); END LOOP; END;" );
+    SendBillDeal.addParam( "", RSDBP_IN, order.ContractID );
+    SendBillDeal.addParam( "", RSDBP_IN, order.DocKind);
+    SendBillDeal.execute();
+  end; 
+
+  return 1;
+END;
+
+
+/* Макрос печати 
+*/
+MACRO PrintStepDocs (
+                ID_Operation,  /* Номер экземпляра операции */
+                ID_Step,       /* Номер шага операции */
+                Kind_Operation,/* Вид операции */
+                KindStep)      /* Вид шага операции */
+
+    if(not Печать(false, "vsrep", ID_Operation, ID_step, isOprMultiExec, "СП")) /* Счета, Проводки */
+      msgbox("Нет документов для печати");
+      exit(1);
+    end;
+
+    return 1;
+END;

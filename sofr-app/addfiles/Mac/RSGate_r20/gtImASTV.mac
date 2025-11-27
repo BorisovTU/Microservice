@@ -1,0 +1,378 @@
+/*
+$Name:        gtImASTV.mac
+$Module:      Шлюз Securities
+$Description: Онлайн-импорт сделок валютного рынка из Шлюза Московской биржи 
+*/
+
+IMPORT gtImMVB_VR, "secinter.mac";
+
+PRIVATE CONST PNFLD_IMPDATE      = 0,
+              PNFLD_OWN_DEALS    = 1,
+              PNFLD_CLIENT_DEALS = 2;
+
+PRIVATE VAR NumImportDeals = 0, NumImportDealsTotal = 0;
+private record pp(IMP_ASTV, "rgate.lbr") dialog;
+
+private macro DelFromASTSTRADESBySeanceID(ASTS_Table)
+  var ErrStr = "", errorCount = 0, i = 0;
+
+  var cmd = RSDCommand( " delete from " + ASTS_Table + " ASTS " 
+                       +"       where ASTS.T_IS_SNAPSHOT = chr(88) "                                                                                                                   
+                       +"         and ASTS.T_TRADETYPE != 'F' "                                                            
+                       +"         and exists ( select 1 "                                                             
+                       +"                        from DGTSNCREC_DBT gtsncrec, DGTRECPRM_DBT cprm, DGTKOPRM_DBT oprm, DGTRECPRM_DBT cprm1, DGTKOPRM_DBT oprm1 "
+                       +"                       where GTSNCREC.T_SEANCEID = ? "                                       
+                       +"                         and CPRM.T_RECORDID = GTSNCREC.T_RECORDID "                         
+                       +"                         and CPRM.T_KOPRMID = OPRM.T_KOPRMID "                               
+                       +"                         and (    (OPRM.T_OBJECTKIND = ? and OPRM.T_NAME = 'RGDVNDL_EXTCODE') " 
+                       +"                               or (OPRM.T_OBJECTKIND = ? and OPRM.T_NAME = 'RGDVFXDL_EXTCODE') "  
+                       +"                             ) "                                                       
+                       +"                         and CPRM.T_STRINGVAL = case when (ASTS.T_PARENTTRADENO IS NOT NULL and ASTS.T_PARENTTRADENO > 0) then to_char(ASTS.T_PARENTTRADENO) else to_char(ASTS.T_TRADENO) end "  
+                       +"                         and CPRM1.T_RECORDID = GTSNCREC.T_RECORDID "                         
+                       +"                         and CPRM1.T_KOPRMID = OPRM1.T_KOPRMID "                               
+                       +"                         and (    (OPRM1.T_OBJECTKIND = ? and OPRM1.T_NAME = 'RGDVNDL_CLIENT') " 
+                       +"                               or (OPRM1.T_OBJECTKIND = ? and OPRM1.T_NAME = 'RGDVFXDL_CLIENT') "  
+                       +"                             ) "                                                       
+                       +"                         and CPRM1.T_STRINGVAL = nvl(ASTS.T_CLIENTCODE, chr(1)) "  
+                       +"                    ) "    
+                      );
+
+   cmd.addParam( "", RSDBP_IN, SeanceID );                                                    
+   cmd.addParam( "", RSDBP_IN, RG_DVNDEAL );  
+   cmd.addParam( "", RSDBP_IN, RG_DVFXDEAL );
+   cmd.addParam( "", RSDBP_IN, RG_DVNDEAL );  
+   cmd.addParam( "", RSDBP_IN, RG_DVFXDEAL );
+
+   if(GetDialogFlag())
+      InitProgress(-1, "Удаление записей по успешно загруженным сделкам из исходной таблицы", "Удаление записей по успешно загруженным сделкам из исходной таблицы");
+   end;
+
+   cmd.execute();
+
+   if(GetDialogFlag())
+      RemProgress();
+   end;
+
+OnError(er)
+  
+  if(GetDialogFlag())
+     RemProgress();
+  end;
+
+  if (IsEqClass ("TrslError", er))
+    ErrStr=er.Message;
+    if(IsEqClass ("TDbError", er.err))
+      ErrStr=ErrStr+":|"+er.err.Stat+"-"+er.err.Oper+"-"+er.err.Table+"-"+er.err.Message;
+    elif (isEqClass("TRsdError", er.err))
+
+      errorCount = er.err.environment.ErrorCount;
+      while (i < errorCount)
+          ErrStr=ErrStr+er.err.environment.Error(i).Descr;
+          i = i + 1;
+      end;
+    end;
+  end;
+
+  if(ErrStr == "")
+    ErrStr=er.module+ " "+er.line+" "+er.message;
+  end;
+
+  RGLog.Error(ErrStr);
+end;
+
+private macro FindASTSTable():String
+     var Query, Data;
+     var RetVal:String = "";
+     Query = DL_RSDCommand( "Select RSB_SECUR.GetFullNameASTSTable(?) as t_ASTSTable From DUAL" );
+     Query.addParam(DV_MARKETKIND_CURRENCY);
+     
+     Data = Query.execute();
+     if( Data.MoveNext() )
+        RetVal = Data.ASTSTable;
+     end;
+     if(ValType(RetVal) == V_UNDEF)
+        RetVal = "";
+     end; 
+     return RetVal;
+end;
+
+/**
+ @brief Получить информацию по размеру лота
+ @param[out] LotSize  Размер лота
+ @param[in]  SecСode  Код инструмента
+ @param[in]  SecBoard Режим торгов
+ @param[in]  RealCCC  Код срочности
+*/
+private macro GetLotSize(LotSize:@money, SecCode:string, SecBoard:string, RealCCC:string)
+  var Query, Data;
+  var RetVal:String = "";
+  Query = DL_RSDCommand( "Select t_LotAmount From DASTS_CURRLOTSIZE_DBT Where t_Main_Board = ? AND t_SecCode = ?" );
+  Query.addParam(SecBoard);
+  Query.addParam(SecCode);
+     
+  Data = Query.execute();
+  if( Data.MoveNext() )
+    LotSize = Data.LotAmount;
+  else
+    LotSize = IIF(RealCCC == "TMS", 0.01, 1000);
+  end;
+end;
+
+private macro RunImportASTS( Pan )
+
+  var i:integer = 0, Query, cmd, ds, ASTS_Table = "", NRec = 0;
+  var RetVal = CM_SAVE, stat = 0;
+  var BaseFICode = "", QuoteFICode = "", DurationSSS = "", DurationCCC = "", RealCCC = "";
+  var LotSize = 0 /*размер лота*/;
+
+  private macro RunImp()
+     if( WriteDealData(@NumImportDeals, @NumImportDealsTotal) != true )
+        return 1;
+     end;
+
+     return 0;
+
+  OnError(ErObj)
+     RGLog.Error( "Модуль: " + string(ErObj.Module) + "\nСтрока: " + string(ErObj.Line) + "\nКод ошибки: " + string(ErObj.Code) + "\n" + ErObj.Message );
+
+     if(ErObj.Code == CtrlBrkErr)
+        FlagCtrlBrk = true;
+     else
+        RemProgress();
+        RunError( "Модуль: " + string(ErObj.Module) + "\nСтрока: " + string(ErObj.Line) + "\nКод ошибки: " + string(ErObj.Code) + "\n" + ErObj.Message );
+     end;
+     return ErObj.Code;
+  end;
+
+  if( Pan.impdate > {curdate} )
+     if( GetDialogFlag() )
+        MsgBox("Неверно задана дата.");
+     end;
+     RetVal = CM_IGNORE;
+  end;
+
+  if( RetVal != CM_IGNORE )
+     RGLog = GTDL_Log(SeanceID);
+
+     NumImportDeals = 0;
+     NumImportDealsTotal = 0;
+
+     ASTS_Table = FindASTSTable();
+     if( ASTS_Table == "" )
+        RGLog.Error("Отсутствует таблица для загрузки сделок! \nУбедитесь в корректности настройки RG\\ASTS\\SCRSCHEMA_CURR в реестре банка");      
+     else
+        RG = TGtRecordBatchCharger();
+
+        Query = "select to_char(t.T_TRADENO) T_TRADENO, " +
+                "       nvl(to_char(t.T_PARENTTRADENO), chr(1)) T_PARENTTRADENO, " +
+                "       to_char(t.T_ORDERNO) T_ORDERNO, " +
+                "       t.T_TRADEDATE, "
+                "       nvl(t.T_TRADETIME, to_date('01.01.0001','DD.MM.YYYY')) T_TRADETIME, " +
+                "       nvl(t.T_BUYSELL, chr(0)) T_BUYSELL, " +
+                "       nvl(t1.T_BUYSELL, chr(0)) T_BUYSELL_2, " +
+                "       nvl(t.T_SECCODE, chr(1)) T_SECCODE, " +
+                "       nvl((select t2.T_SECCODE from " + ASTS_Table + " t2 where t2.T_TRADENO = t.T_PARENTTRADENO and t2.T_ORDERNO = t.T_ORDERNO), chr(1)) T_SECCODE_2, " + //Для свопов берем значение из титульной сделки
+                "       nvl(t.T_PRICE, 0) T_PRICE, " +
+                "       nvl(t1.T_PRICE, 0) T_PRICE_2, " +
+                "       nvl(t.T_QUANTITY, 0) T_QUANTITY, " +
+                "       nvl(t1.T_QUANTITY, 0) T_QUANTITY_2, " +
+                "       nvl(t.T_VALUE, 0) T_VALUE, " +
+                "       nvl(t1.T_VALUE, 0) T_VALUE_2, " +
+                "       nvl(t.T_SETTLEDATE, to_date('01.01.0001','DD.MM.YYYY')) T_SETTLEDATE, " +
+                "       nvl(t1.T_SETTLEDATE, to_date('01.01.0001','DD.MM.YYYY')) T_SETTLEDATE_2, " +
+                "       nvl(t.T_SETTLECODE, chr(1)) T_SETTLECODE, " +
+                "       nvl(t.T_CLEARINGCENTERCOMM, 0) T_CLEARINGCENTERCOMM, " +
+                "       nvl(t.T_EXCHANGECOMM, 0) T_EXCHANGECOMM, " +
+                "       nvl(t.T_TRADINGSYSTEMCOMM, 0) T_TRADINGSYSTEMCOMM, " +
+                "       nvl(t.T_CLIENTCODE, chr(1)) T_CLIENTCODE, " +
+                "       nvl(t.T_CURRENCYID, chr(1)) T_CURRENCYID, " +
+                "       nvl(t.T_SECBOARD, chr(0)) T_SECBOARD " +
+                "  from " + ASTS_Table + " t left join " + ASTS_Table + " t1 " + 
+                "    on t.T_PARENTTRADENO IS NOT NULL and t.T_PARENTTRADENO > 0 and t1.T_PARENTTRADENO = t.T_PARENTTRADENO and t1.T_ORDERNO = t.T_ORDERNO " +
+                "   and (    (t1.T_SETTLEDATE > t.T_SETTLEDATE) " + 
+                "         or (t1.T_SETTLEDATE = t.T_SETTLEDATE and (t1.T_CLEARINGCENTERCOMM IS NULL or t1.T_CLEARINGCENTERCOMM = 0) and (t1.T_EXCHANGECOMM IS NULL or t1.T_EXCHANGECOMM = 0) and (t1.T_TRADINGSYSTEMCOMM IS NULL or t1.T_TRADINGSYSTEMCOMM = 0)) " +
+                "       ) " +
+                " where t.T_IS_SNAPSHOT = chr(88) " +
+                "   and t.T_STATUS = 'M' " +
+                "   and t.T_TRADETYPE <> 'F' " +
+                "   and t.T_TRADEDATE = ? " + 
+                "   and not exists (select 1 from " + ASTS_Table + " t2 " +  // Чтобы везде не таскать проверку части, в качестве первой части сразу откидываем варианты, где дата больше, чем у аналогичной записи (или без комиссий)
+                "                    where t.T_PARENTTRADENO IS NOT NULL and t.T_PARENTTRADENO > 0 and t2.T_PARENTTRADENO = t.T_PARENTTRADENO and t2.T_ORDERNO = t.T_ORDERNO " +
+                "                      and (    (t.T_SETTLEDATE > t2.T_SETTLEDATE) " + 
+                "                            or (t.T_SETTLEDATE = t2.T_SETTLEDATE and (t.T_CLEARINGCENTERCOMM IS NULL or t.T_CLEARINGCENTERCOMM = 0) and (t.T_EXCHANGECOMM IS NULL or t.T_EXCHANGECOMM = 0) and (t.T_TRADINGSYSTEMCOMM IS NULL or t.T_TRADINGSYSTEMCOMM = 0)) " +
+                "                          ) " +
+                "                  ) " +
+                "   and not exists (select 1 from " + ASTS_Table + " t2 where t2.T_PARENTTRADENO = t.T_TRADENO) " +
+                "   and (    (nvl(t.T_CLIENTCODE, chr(1)) = chr(1)  and ? = 'X') " +
+                "         or (nvl(t.T_CLIENTCODE, chr(1)) <> chr(1) and ? = 'X') " +
+                "       ) ";
+        cmd = DL_RSDCommand(Query);
+        cmd.AddParam(Pan.impdate);
+        cmd.AddParam(Pan.own_deals);
+        cmd.AddParam(Pan.client_deals);
+        NRec = cmd.GetCount();
+
+        if( NRec > 0 )
+           if(GetDialogFlag())
+              InitProgress(NRec, "Загрузка внешнего файла сделок", "ОБРАБОТКА ВХОДНЫХ ДАННЫХ");
+           end;
+           ds = cmd.execute();
+           while(ds.MoveNext)
+              VRDealGl = VRDealRec();
+
+              RG_GetFICodeAndDurationBySecID( IIF((ds.SETTLEDATE_2!=date(0,0,0))and(ds.SECCODE_2!=""),ds.SECCODE_2,ds.SECCODE), @BaseFICode, @QuoteFICode, @DurationSSS, @DurationCCC, @RealCCC );
+              if(ds.CLIENTCODE != "")
+                 BaseFICode = RG_GetFullFICodeVR(BaseFICode);
+              end;
+
+              if( ds.SETTLEDATE_2 != date(0,0,0) )
+                 if( (DurationCCC == "1D") or (DurationCCC == "2D") )
+                    if(ds.CLIENTCODE != "")
+                       VRDealGl.leg1.Kind = КороткийСВОП_Кл;
+                    else
+                       VRDealGl.leg1.Kind = КороткийСВОП;
+                    end;
+                 else
+                    VRDealGl.leg1.Kind = ВалютныйСВОП;
+                 end;
+              else
+                 if( (DurationCCC == "0D") or (DurationCCC == "1D") or (DurationCCC == "2D") )
+                    if(ds.CLIENTCODE != "")
+                       VRDealGl.leg1.Kind = ПИКО_ПокупкаПродажа_Кл;
+                    else
+                       VRDealGl.leg1.Kind = ПИКО_ПокупкаПродажа;
+                    end;
+                 else
+                    VRDealGl.leg1.Kind = ВнебиржФорвард;
+                 end;
+              end;
+              GetLotSize(@LotSize, IIF((ds.SETTLEDATE_2!=date(0,0,0))and(ds.SECCODE_2!=""),ds.SECCODE_2,ds.SECCODE), ds.SecBoard, RealCCC); 
+
+              VRDealGl.leg1.TradeNo = ds.TRADENO;
+              VRDealGl.leg1.RepoTradeNo = ds.PARENTTRADENO;
+              VRDealGl.leg1.OrderNo = ds.ORDERNO;
+              VRDealGl.leg1.BuySell = ds.BUYSELL;      
+              VRDealGl.leg1.ReportDate = ds.TRADEDATE;
+              VRDealGl.leg1.TradeTime = ds.TRADETIME;
+              VRDealGl.leg1.ClientCode = ds.CLIENTCODE;
+              VRDealGl.leg1.CurrencyId = BaseFICode;
+              VRDealGl.leg1.Quantity = ds.QUANTITY * LotSize;
+              VRDealGl.leg1.Price = ds.PRICE;
+              VRDealGl.leg1.CoCurrencyId = ds.CURRENCYID; 
+              VRDealGl.leg1.Value_ = ds.VALUE;
+              VRDealGl.leg1.SettleDate = ds.SETTLEDATE;
+              VRDealGl.leg1.ExchComm = ds.EXCHANGECOMM;
+              VRDealGl.leg1.ClrComm = ds.CLEARINGCENTERCOMM;
+              VRDealGl.leg1.ITSComm = ds.TRADINGSYSTEMCOMM;
+              VRDealGl.leg1.SecShortName = ds.SECCODE;
+              VRDealGl.leg1.ExtSettleCode = "";
+
+              if( (VRDealGl.leg1.Kind == ВалютныйСВОП) or (VRDealGl.leg1.Kind == КороткийСВОП) or (VRDealGl.leg1.Kind == КороткийСВОП_Кл) )
+                 VRDealGl.leg1.Decimals = max(GT_GetSumPoint(ds.PRICE), GT_GetSumPoint(ds.PRICE_2));
+                 VRDealGl.leg1.MainSecShortName = ds.SECCODE_2;
+
+                 VRDealGl.leg2.GetCopy(VRDealGl.leg1);
+
+                 VRDealGl.leg2.BuySell = ds.BUYSELL_2;      
+                 VRDealGl.leg2.Quantity = ds.QUANTITY_2 * LotSize;
+                 VRDealGl.leg2.Price = ds.PRICE_2;
+                 VRDealGl.leg2.Value_ = ds.VALUE_2;
+                 VRDealGl.leg2.SettleDate = ds.SETTLEDATE_2;
+              else
+                 VRDealGl.leg1.Decimals = max(GT_GetSumPoint(ds.PRICE), 4);
+                 VRDealGl.leg1.MainSecShortName = "";
+              end;
+             
+              if( RunImp() )
+                 stat = 1;
+              end;
+             
+              i = i + 1;
+              if(GetDialogFlag())
+                 UseProgress(i);
+              end;
+              if( FlagCtrlBrk == true )
+                 break;
+              end;
+           end;
+           
+           if(GetDialogFlag())
+              RemProgress(); 
+           end;
+        end;
+     end;
+
+     if( i == 0 )
+        RGLog.Message("Нет данных для загрузки.");
+     else
+        if( not FlagCtrlBrk )
+           DelFromASTSTRADESBySeanceID( ASTS_Table );
+        end;
+        /* сообщаем о результатах загрузки */
+        RGLog.Message("Всего обработано сделок валютного рынка из Шлюза ASTS - " + string(NumImportDeals) + "\nиз них успешно - " + string(NumImportDealsTotal) + "\nошибочно - " + string(NumImportDeals - NumImportDealsTotal));
+     end;
+
+     RGLog.Save();
+  end;
+
+  return RetVal;
+
+OnError( RslErrObj )
+  if( GetDialogFlag() )
+     RemProgress(); 
+  end;
+end;
+
+private macro RunInitASTS( Pan )
+  Pan.impdate = {curdate};
+  Pan.own_deals    = UNSET_CHAR;
+  Pan.client_deals = SET_CHAR;
+end;
+
+private macro ProcessPanel( Pn, Cmd, ID, Key )
+
+  if( Cmd == DLG_INIT )
+     RunInitASTS(Pn);
+     UpdateFields(Pn);
+  elif( cmd == DLG_KEY )
+     if( (key == 317) AND (ID == PNFLD_IMPDATE) ) /* F3 */
+        Pn.impdate = GetDateByCalendar(Pn.impdate);
+        UpdateFields(Pn);
+     elif( (Cmd == DLG_KEY) and (Key == 32) ) /* Пробел */
+        if ((ID == PNFLD_OWN_DEALS)
+        or  (ID == PNFLD_CLIENT_DEALS))
+           Pn(ID) = IIF(Pn(ID) == SET_CHAR, UNSET_CHAR, SET_CHAR);
+        end;
+     elif( Key == 316 )
+        return RunImportASTS(Pn);
+     elif( (Key == 13) or (Key == 323) )
+        return CM_IGNORE;
+     end;
+  end;
+
+  return CM_DEFAULT;
+end;
+
+macro Process( SeanceID, Parms )
+end;
+
+macro Receive( _SeanceID:integer, Parm:variant )
+  SeanceID = _SeanceID;
+
+  SOURCE_CODE = "Шлюз ASTS-2";
+  FileImport = FileASTS;
+
+  if( IsShedulerRunning() )
+     RunInitASTS(pp);
+     AutoSetParm(pp, Parm);                     // пар-ры из панели источника
+     AutoSetParm(pp, GetShedulerCommandLine()); // пар-ры из задания планировщика
+     RunImportASTS(pp);
+  else
+     RunDialog(pp, "ProcessPanel");
+  end;
+
+  return 0;
+end;
+
+macro Deliver( SeanceID, Parm )
+end;

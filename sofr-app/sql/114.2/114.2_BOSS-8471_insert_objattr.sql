@@ -1,0 +1,19 @@
+--Разовый скрипт создания уровня риска "КНУР" на ДБО
+DECLARE
+  V_CNT NUMBER := 0;
+BEGIN
+  SELECT COUNT(1)
+    INTO V_CNT
+    FROM DOBJATTR_DBT
+   WHERE T_OBJECTTYPE = 207
+     AND T_GROUPID = 103
+     AND T_ATTRID = 4;
+
+  IF V_CNT = 0 THEN
+    INSERT INTO DOBJATTR_DBT (T_OBJECTTYPE, T_GROUPID, T_ATTRID, T_PARENTID, T_CODELIST, T_NUMINLIST, T_NAMEOBJECT, T_CHATTR, T_LONGATTR, T_INTATTR,
+                              T_NAME, T_FULLNAME, T_OPENDATE, T_CLOSEDATE, T_CLASSIFICATOR, T_CORRACTYPE, T_BALANCE, T_ISOBJECT)	
+           VALUES (207, 103, 4, 0, CHR(1), '4', '4', CHR(0), 0, 0, 
+                   'КНУР', 'Клиент с начальным уровнем риска', TO_DATE('01/01/0001','DD/MM/YYYY'), TO_DATE('01/01/0001','DD/MM/YYYY'), 0, CHR(1), CHR(1), CHR(0));
+  END IF;
+END;
+/

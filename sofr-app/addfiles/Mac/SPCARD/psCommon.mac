@@ -1,0 +1,420 @@
+/*
+$Name:           psCommon.mac
+$Module:         Карточки
+$Description:    On-line работа с карточками (базовый)
+*/
+import spCardInter, alg_vars, sqlconv, rsd, ErrHandler, "psParams.mac";
+
+private var {curdate}, {oper};
+private var scCard    = TBFile( "scCard.dbt",   "r", 0, NULL, "spcard.def" );
+private var scMail    = TBFile( "scMail.dbt",   "w", 0, NULL, "spcard.def" ); /* Сеансы связи          */
+private var scMailIt  = TBFile( "scMailIt.dbt", "w", 0, NULL, "spcard.def" ); /* Расшифровки сеансов   */
+
+private const LogSC_Card   = 5;             /* Номер файла карточек              */
+
+
+private const
+  OP_ADD_CARD_CASH      = 41, // (40) Наличное пополнение карты
+  OP_ADD_CARD_NCASH     = 42, // (40) Безналичное пополнение карты
+  OP_CARD_PAYMENT_CASH  = 43, // (0) Выдача наличных с карты
+  OP_CARD_PAYMENT       = 44, // (0) Перевод денежных средств с карты
+  OP_CARD_PAYMENT_TOACC = 45, // (0) Внутр. перевод с карты на счет
+  OP_CARD_COMMISSION    = 68; // (0) Списание средств с карты
+
+
+class PsOnlineStep
+  private var Params = TPSOnlineParams;
+  private var CodType = 32;
+  private var CodCode = "INTSO";
+
+  private var RepeatCount;
+  private var WaitTime;
+  private var IsDialogRegime;
+  private var MailNotes;
+  private var MacroName;
+  private var MailRef;
+  
+  //--------------------------------------------------------------------------
+  private macro getScCardRec()
+    scCard.KeyNum = 0;
+    scCard.rec.FNCash = RetrieveValue("psOnline:CardBranch");
+    scCard.rec.cardRef = RetrieveValue("psOnline:CardRef");
+    CheckError(scCard.GetEQ());
+
+    Params.scCard = TRecHandler("scCard.dbt", "spcard.def");
+    Copy(Params.scCard, scCard);
+  end;
+
+  //--------------------------------------------------------------------------
+  private macro isCardOper(): bool
+    var op = Params.OpNumOper;
+    if ((op == OP_ADD_CARD_CASH) or
+        (op == OP_ADD_CARD_NCASH) or
+        (op == OP_CARD_PAYMENT_CASH) or
+        (op == OP_CARD_PAYMENT) or
+        (op == OP_CARD_PAYMENT_TOACC) or
+        (op == OP_CARD_COMMISSION))
+      return true;
+    end;
+    return false;
+  end;
+
+  //--------------------------------------------------------------------------
+  private macro getCommissionSum()
+    return RetrieveValue("psOnline:CommissionSum");
+  end;
+
+  //--------------------------------------------------------------------------
+  private macro init()
+    getScCardRec();
+    
+    Params.OpNumOper = ALG_PARAM.NumOpert;
+    Params.OpSubOper = ALG_RET_OP.SubOp;
+    Params.OpAppKind = ALG_RET_OP.ApplicationKind;
+    Params.OpAppKey = ALG_RET_OP.ApplicationKey;
+    Params.flagStorn = false;
+    Params.ComSum = $0;
+
+    if (isCardOper())
+      Params.depdoc = TRecHandler("sbdepdoc.dbt");
+      Copy(Params.depdoc, ALG_SBDEPDOC);
+
+      var comm = getCommissionSum();
+      if (comm)
+        Params.ComSum = comm;
+      end;
+    end;
+  end;
+
+  //--------------------------------------------------------------------------
+  private macro getPsRef(): integer
+    return Params.scCard.rec.psRef;
+  end;
+
+  //--------------------------------------------------------------------------
+  private macro getCardRef(): integer
+    return Params.scCard.rec.cardRef;
+  end;
+
+  //--------------------------------------------------------------------------
+  private macro getFNCash(): integer
+    return Params.scCard.rec.FNCash;
+  end;
+  
+  //--------------------------------------------------------------------------
+  private macro isOnline(): bool
+    var cmd = RsdCommand(
+        "SELECT t_InteractionType, t_RepeatCount, t_WaitTime, t_IsDialogRegime "+
+        "FROM dSCPos_dbt "+
+        "WHERE t_psRef = ?");
+    cmd.addParam("psRef", RSDBP_IN, getPsRef());
+    cmd.execute();
+
+    var rs = RsdRecordset(cmd);
+    rs.NullConversion = true;
+    if (not rs.moveNext())
+      DoError("Не найден процессинговый центр с кодом " + getPsRef());
+    end;
+
+    RepeatCount = rs.value("t_RepeatCount");
+    WaitTime = rs.value("t_WaitTime");
+    IsDialogRegime = rs.value("t_IsDialogRegime");
+    
+    if (rs.value("t_InteractionType") == 1)
+      return true;
+    end;
+
+    return false;
+  end;
+
+  //--------------------------------------------------------------------------
+  private macro getScCodif(codType: integer)
+    MailNotes = "";
+    
+    var cmd = RsdCommand(
+        "SELECT t_CodNotes, t_CodNameFile "+
+        "FROM dSCCodif_dbt "+
+        "WHERE t_CodType = ? "+
+        "  AND t_CodCode = ? "+
+        "  AND t_psRef = ? ");
+    cmd.addParam("codType", RSDBP_IN, codType);
+    cmd.addParam("codCode", RSDBP_IN, CodCode);
+    cmd.addParam("psRef", RSDBP_IN, getPsRef());
+    cmd.execute();
+
+    var rs = RsdRecordset(cmd);
+    rs.NullConversion = true;
+    if (rs.moveNext())
+      MailNotes = rs.value("t_CodNotes");
+      MacroName = rs.value("t_CodNameFile");
+    end;
+  end;
+
+  //--------------------------------------------------------------------------
+  private macro makeMailNotes(codType: integer): string
+    if (not MailNotes)
+      getScCodif(codType);
+    end;
+
+    return MailNotes;
+  end;
+
+  //--------------------------------------------------------------------------
+  private macro getMacroName(): string
+    if (not MacroName)
+      getScCodif(32);
+    end;
+
+    return MacroName;
+  end;
+
+  //--------------------------------------------------------------------------
+  // Определение значения поля mailCode - код сеанса связи
+  private macro makeMailCode(): string
+    var stat          = TRUE;
+    var NumberSession;
+    var CounterForDay = 0;
+    var StrNumberSession;
+    var TodayDate     = {curdate};
+    var PsRef = getPsRef();
+    var BranchCode = getFNCash();
+    var year,month,day;
+    var YYYY,MM,DD;
+
+    DateSplit(TodayDate,day,month,year);
+    YYYY = Trim(String(year));
+    while (StrLen(YYYY) < 4)
+      YYYY = "0" + YYYY;
+    end;
+    MM = Trim(String(month));
+    while (StrLen(MM) < 2)
+      MM = "0" + MM;
+    end;
+    DD = Trim(String(day));
+    while (StrLen(DD) < 2)
+      DD = "0" + DD;
+    end;
+
+    scMail.KeyNum = 1;
+    scMail.rec.FNCash   = BranchCode;
+    scMail.rec.psRef    = PsRef;
+    scMail.rec.mailDate = TodayDate;
+    scMail.rec.mailTime = Time( 23, 59, 59 );
+    scMail.addFilter( "t.t_FNCash = " + string( BranchCode ) + " and " +
+                      "t.t_psRef = " + string( PsRef ) + " and " +
+                      "t.t_mailDate = " + sqlDateToStr( TodayDate ) );
+    stat = scMail.GetLE;
+    if ( stat )
+      if ( ( scMail.rec.FNCash   == BranchCode    ) and
+           ( scMail.rec.psRef    == PsRef     ) and
+           ( scMail.rec.mailDate == TodayDate )    )
+        if ( StrLen( scMail.rec.mailCode ) > 8 )
+          NumberSession = Int( Trim( SubStr( scMail.rec.mailCode, 9 ) ) ) + 1;
+        else
+          NumberSession = 1;
+        end;
+      else
+        NumberSession = 1;
+      end;
+    else
+      NumberSession = 1;
+    end;
+    scMail.dropFilter;
+
+    scMail.ReWind;
+    scMail.rec.FNCash   = BranchCode;
+    scMail.rec.psRef    = PsRef;
+    scMail.rec.mailDate = TodayDate;
+    scMail.rec.mailTime = Time( 0, 0, 0 );
+    scMail.addFilter( "t.t_FNCash = " + string( BranchCode ) + " and " +
+                      "t.t_psRef = " + string( PsRef ) + " and " +
+                      "t.t_mailDate = " + sqlDateToStr( TodayDate ) );
+    stat = scMail.GetGE;
+    while ( stat )
+      if ( ( scMail.rec.FNCash   == BranchCode    ) and
+           ( scMail.rec.psRef    == PsRef     ) and
+           ( scMail.rec.mailDate == TodayDate )    )
+        CounterForDay = CounterForDay + 1;
+        stat = scMail.Next;
+      else
+        stat = false;
+      end;
+    end;
+    scMail.dropFilter;
+
+    if ( NumberSession <= CounterForDay )
+      NumberSession == CounterForDay + 1;
+    end;
+    StrNumberSession = Trim( String( NumberSession ) );
+    while ( StrLen( StrNumberSession ) < 7 )
+      StrNumberSession = "0" + StrNumberSession;
+    end;
+
+    return YYYY + MM + DD + StrNumberSession;
+  end;
+
+  //--------------------------------------------------------------------------
+  // Запись информации в файл сеансов связи
+  private macro writeToMail()
+    scMail.Clear;
+    scMail.rec.mailCode      = makeMailCode();
+    scMail.rec.FNCash        = getFNCash();
+    scMail.rec.psRef         = getPsRef();
+    scMail.rec.oper          = {oper};
+    scMail.rec.mailStateCode = "ISENT";
+    scMail.rec.mailTypeCode  = CodCode;
+    scMail.rec.mailDate      = {curdate};
+    scMail.rec.mailTime      = Time();
+    scMail.rec.mailNotes     = makeMailNotes(32);
+    
+    MailRef = scDefReferMail();
+    if (MailRef <= 0)
+      DoError("Ошибка при формировании записи сеанса связи");
+    end;
+    
+    scMail.rec.mailRef = MailRef;
+    CheckError(scMail.Insert());
+  end;
+
+  //--------------------------------------------------------------------------
+  // Запись информации в расшифровки сеансов связей
+  private macro writeToMailIt()
+    var ItemRef = scDefReferMailIt();
+
+    if (ItemRef < 1)
+      DoError("Ошибка при формировании записи расшифровки сеанса связи");
+    end;
+    
+    scMailIt.Clear;
+    scMailIt.rec.mailItemRef  = ItemRef;
+    scMailIt.rec.mailRef      = MailRef;
+    scMailIt.rec.FNCash       = getFNCash();
+    scMailIt.rec.SessItemType = LogSC_Card;
+    scMailIt.rec.mailRefFile  = getCardRef();
+
+    CheckError(scMailIt.Insert());
+  end;
+  //-------------------------------------------------------------------------
+  private macro findOpMailT(_scMail)
+    if (scMail == null)
+      return null;
+    end;
+    scMailIt.keynum = 1;
+    scMailIt.rec.mailRef      = _scMail.rec.mailRef  ;
+    scMailIt.rec.FNCash       = _scMail.rec.FNCash   ;
+    if(scMailIt.GetEQ())
+      return scMailIt();
+    end;
+    return null;
+  end;
+
+  //--------------------------------------------------------------------------
+  private var stateCode: string ;
+  private var applKind: integer ;
+  private var applKey: string   ;
+  macro updateMailTrn()
+    scMail.KeyNum = 0;
+    scMail.rec.FNCash  = getFNCash();
+    scMail.rec.mailRef = MailRef;
+    
+    CheckError(scMail.GetEQ());
+
+    scMail.rec.mailStateCode = stateCode;
+
+    if (applKind and applKey)
+      scMail.rec.applKind = applKind;
+      scMail.rec.applKey  = applKey;
+    end;
+    if(findOpMailT(scMail))
+      scMailIt.rec.RRN          = Params.RRN;
+      scMailIt.rec.AuthCode     = Params.AuthCode;
+      CheckError(scMailIt.Update());
+    end;
+    CheckError(scMail.Update());
+  end;
+  private macro updateMail( _stateCode: string,_applKind: integer,_applKey: string)
+    stateCode = _stateCode;
+    applKind  = _applKind;
+    applKey   = _applKey ; 
+    if(not isTrn())
+        CheckError(ProcessTrn(0, R2M(this, "updateMailTrn")));
+    else
+        updateMailTrn();
+    end;
+  end;
+
+  //--------------------------------------------------------------------------
+  private macro findOpMail(applKind: integer, applKey: string)
+    scMail.KeyNum = 10;
+    scMail.rec.applKind = applKind;
+    scMail.rec.applKey  = applKey;
+
+    if (scMail.GetEQ())
+      return scMail;
+    end;
+
+    return null;
+  end;
+
+  //--------------------------------------------------------------------------
+  macro initMailTrn()
+    writeToMail();
+    writeToMailIt();
+
+  OnError(err)
+    AddErrMessage(err.Message);
+    AbortTrn();
+  end;
+
+  //--------------------------------------------------------------------------
+  private macro initMail()
+    if(not isTrn())
+        CheckError(ProcessTrn(0, R2M(this, "initMailTrn")));
+    else
+        initMailTrn();
+    end;
+  end;
+
+  //--------------------------------------------------------------------------
+  macro deleteMailTrn()
+    scMailIt.KeyNum = 1;
+    scMailIt.rec.FNCash  = getFNCash();
+    scMailIt.rec.mailRef = MailRef;
+    if (scMailIt.GetEQ())
+      CheckError(scMailIt.Delete());
+    end;
+
+    CheckError(scMail.Delete());
+
+  OnError(err)
+    AddErrMessage(err.Message);
+    AbortTrn();
+  end;
+
+  //--------------------------------------------------------------------------
+  private macro deleteMail(applKind: integer, applKey: string)
+    if (findOpMail(applKind, applKey) != null)
+      MailRef = scMail.rec.mailRef;
+      if(not isTrn())
+          CheckError(ProcessTrn(0, R2M(this, "deleteMailTrn")));
+      else
+          deleteMailTrn();
+      end;
+
+    end;
+  end;
+
+  //--------------------------------------------------------------------------
+  macro psCheckError()
+     if(Params.Result != 0)
+         MsgBox(Params.ResultText + ". Код: " + Params.Result);
+         return ERR_RES;
+     else
+        return OK_RES;      
+     end;
+  end;
+  
+  init();
+  
+end;
+

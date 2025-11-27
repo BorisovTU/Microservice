@@ -1,0 +1,21 @@
+/*Добавление Delete Rule для FK_MB_EQM06_PROCESSING_LOG*/
+
+BEGIN
+  EXECUTE IMMEDIATE '
+alter table MB_EQM06
+   drop constraint FK_MB_EQM06_PROCESSING_LOG';
+EXCEPTION 
+    WHEN OTHERS THEN NULL;
+END;
+/
+ 
+BEGIN
+  EXECUTE IMMEDIATE '
+alter table MB_EQM06
+   add constraint FK_MB_EQM06_PROCESSING_LOG foreign key (ID_PROCESSING_LOG)
+      references PROCESSING_LOG (ID_PROCESSING_LOG)
+      on delete set null';
+EXCEPTION 
+    WHEN OTHERS THEN NULL;
+END;
+/

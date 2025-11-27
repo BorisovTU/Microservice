@@ -1,0 +1,3616 @@
+/*
+$Name:          BWP_LIB.MAC 
+$Module:        Файл подсистемы "ГКБО"
+$Description:   Файл содержит макропроцедуры для обработки РПС
+*/
+/*───────────────────────────────────────────────────────────────────────────┐
+  RS-Bank version 5.00, 5.10, 6.00                            R-Style SoftLab
+
+  Файл подсистемы "ГКБО"
+
+  Файл содержит макропроцедуры для обработки РПС
+
+FILENAME: BWP_LIB.MAC
+CREATED : 25.11.02 - Sal.
+
+MODIFICATIONS:
+
+NOTES:
+  Для всех обновлений справочника балансовых счетов (за редкими специальными
+  случаями) используется процедура BWP_UpdateBal, которая синхронизирует обно-
+  вление рублевого и валютного справочника балансовых счетов.
+    BugZ    11.03.2005  SCR 65606
+                        Сделал возможность вызова функции определения
+                        принадлежности счета РПС из макроса (BWPIsBalanceUsed).
+    BugZ    05.07.2005  SCR 67395 Фильтрация по ТС/РС
+    BugZ    31.08.2005  Отказ от document_dbt
+    ABP     19.10.2005  В r20 функция Exit() наконец-то работает правильно,
+                        т.е. при ее вызове макрос завершается АВАРИЙНО и
+                        инструмент возвращаем false. В связи с этим переделал
+                        возврат из макросов: в случае ошибки вызывается
+                        Exit(1), если ошибки нет, то Exit(0) НЕ ВЫЗЫВАЕТСЯ, но
+                        BWP_Status = 0 устанавливается.
+└───────────────────────────────────────────────────────────────────────────*/
+import FIInter, /* работа с валютой */
+       globals, /* глобализмы       */
+       cb_sql,  /* SQL-утилиты      */
+       treport; /* класс отчетов    */
+import Reporting;
+import ReportInter;
+import ofstream;
+
+/*****************************************************************************
+             ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ, ПАРАМЕТРЫ ПРОЦЕДУР
+*****************************************************************************/
+
+/* Режим тестирования - обновление базы не происходит (не действует на ручное изменения РПС) */
+Private Const BWP_TEST = false;
+
+/* Переменные для обмена информацией с программой */
+Var BWP_Status      : Integer  = 1,          /* Код возврата - устанавливается процедурами */
+    BWP_IncludeDate : Date     = {CurDate},  /* Дата включения  счета в  РПС */
+    BWP_ExcludeDate : Date     = {CurDate};  /* Дата исключения счета из РПС */
+
+/* Имя информационного файла (для показа перед запуском процедур) */
+Const BWP_InfFileName : String = GetTxtFileName("bwp_temp");
+
+/* Используемые файлы */
+/* Рубли */
+Private File a   ( "account.dbt"  );        /* лицевые счета         */
+Private File b   ( "balance.dbt"  ) write;  /* балансовые счета      */
+Private File ab  ( "accblnc.dbt"  );        /* лицевые по балансовым */
+Private File d   ( "document.dbt" );        /* документы опердня     */
+Private File ad  ( "arhdoc.dbt"   );        /* архивные документы    */
+
+/* Валюта */
+Private File aC  ( "account$.dbt" );        /* лицевые счета         */
+Private File abC ( "accblnc$.dbt" );        /* лицевые по балансовым */
+Private File dC  ( "documnt$.dbt" );        /* документы опердня     */
+Private File adC ( "arhdoc$.dbt"  );        /* архивные документы    */
+
+/* Справочник глав */
+Private File obch( "obchaptr.dbt" );        /* справочник глав       */
+
+/* Ссылки на файлы (для общности работы, реальная работа идет только с ними) */
+Private Var  acc,       /* лицевые счета         */
+             bal,       /* балансовые счета      */
+             accbal,    /* лицевые по балансовым */
+             doc,       /* документы опердня     */
+             adoc;      /* архивные документы    */
+
+/* Номер плана балансовых счетов (пока работаем только с первым)*/
+Private Const BWP_NumPlan = 0;
+
+/* Обслуживается валюта или рубли */
+Private Var BWP_IsCur = false;
+
+/* Нулевая дата */
+Private Const BWP_MinDate = Date( 1, 1,   2);
+Private Const BWP_MaxDate = Date(31,12,9999);
+
+var reportBodyFileName;
+
+/*****************************************************************************
+                   ОБЩИЕ ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
+*****************************************************************************/
+
+/* Получить название главы */
+Private
+MACRO GetChapterName( ChapterGN )
+  ClearRecord( obch );
+  obch.Chapter = ChapterGN;
+  if ( not GetEQ( obch ) )
+    MsgBox("Не найдена в справочнике глава №" + ChapterGN);
+    Exit(1);
+  end;
+
+  return obch.Name;
+End;
+
+/* Вывод сообщения об ошибке */
+Private
+MACRO BWP_MsgBox( ChapterMB )
+  Var Mess = "",
+      Parm = "",
+      PrmN = 1;
+
+  while( GetParm( PrmN, Parm ) )
+    Mess = Mess + String(Parm);
+    PrmN = PrmN + 1;
+  end;
+
+  MsgBox( "Глава \"" + GetChapterName(ChapterMB) + "\"|", Mess );
+END;
+
+/* Создание информационного файла */
+Private
+MACRO BWP_PreInform( InformStr )
+
+  setoutput( BWP_InfFileName, false );
+
+  println  ( InformStr  );
+
+  setoutput( Null, true );
+
+END;
+
+
+/* Получить дату первого числа текущего месяца */
+Private
+MACRO GetFirstDayMonth( ServDate )
+  Var Day, Mon, Year;
+
+  DateSplit( ServDate, Day, Mon, Year );
+
+  return Date( 1, Mon, Year );
+END;
+
+
+/* Встать на запись балансового счета */
+Private
+MACRO BWP_GetBal( ChapterGB, BalanceGB, SayErr )
+  Var StatGB,
+      StrCur;
+
+  bal.Chapter = ChapterGB;
+  bal.iNumPlan = BWP_NumPlan;
+  bal.Balance  = BalanceGB;
+
+  StatGB = GetEQ(bal);
+
+  if ( (not StatGB) and (ValType(SayErr) == V_BOOL) and SayErr )
+    if ( BWP_IsCur )
+      StrCur = "валютном";
+    else
+      StrCur = "рублёвом";
+    end;
+    BWP_MsgBox( ChapterGB, "Отсутствует балансовый счет №", BalanceGB, " в ", StrCur, " справочнике б/счетов");
+  end;
+
+  return StatGB;
+END;
+
+
+/* Проверка существования балансового счета */
+Private
+MACRO BWP_ExistBal( ChapterEB, BalanceEB, SayErr )
+  Var StatEB,
+      pos = GetPos( bal );
+
+  StatEB = BWP_GetBal( ChapterEB, BalanceEB, SayErr );
+
+  GetDirect( bal );
+
+  return StatEB;
+END;
+
+
+/* Проверка существования балансового счета первого порядка */
+Private
+MACRO BWP_ExistBal1( ChapterEB, BalanceEB, SayErr )
+  Var StatEB,
+      pos = GetPos( bal );
+
+  StatEB = BWP_GetBal( ChapterEB, BalanceEB, SayErr );
+
+  if ( StatEB )
+    if ( Index( bal.Type_Balance, "1" ) <= 0 )
+      StatEB = false;
+    end;
+  end;
+
+  GetDirect( bal );
+
+  return StatEB;
+END;
+
+
+/* Встать на запись лицевого счета */
+Private
+MACRO BWP_GetAcc( ChapterGA, AccountGA, CodeCurrGA, SayErr )
+  Var StatGA,
+      StrCur;
+
+  ClearRecord( acc );
+
+  acc.Account       = AccountGA;
+  acc.Chapter       = ChapterGA;
+  acc.Code_Currency = CodeCurrGA;
+
+  StatGA = GetEQ(acc);
+
+  if ( (not StatGA) and (ValType(SayErr) == V_BOOL) and SayErr )
+    if ( BWP_IsCur )
+      StrCur = "валютном";
+    else
+      StrCur = "рублёвом";
+    end;
+    BWP_MsgBox( ChapterGA, "Отсутствует лицевой счет №", AccountGA, "|в ", StrCur, " справочнике лицевых счетов");
+  end;
+
+  return StatGA;
+END;
+
+
+/* Проверка существования лицевого счета */
+Private
+MACRO BWP_ExistAcc( ChapterEA, AccountEA, CodeCurrEA, SayErr )
+  Var StatEA,
+      pos = GetPos( acc );
+
+  StatEA = BWP_GetAcc( ChapterEA, AccountEA, CodeCurrEA, SayErr );
+
+  GetDirect( acc );
+
+  return StatEA;
+END;
+
+
+/* Функция инициализации переменных-ссылок на файлы */
+Private
+MACRO BWP_GetFiles( IsCur )
+
+  if ( IsCur )
+    acc    = aC;
+    bal    = b;
+    accbal = abC;
+    doc    = dC;
+    adoc   = adC;
+
+    BWP_IsCur = true;
+  else
+    acc    = a;
+    bal    = b;
+    accbal = ab;
+    doc    = d;
+    adoc   = ad;
+
+    BWP_IsCur = false;
+  end;
+
+END;
+
+
+/* Обновление файлов в транзакции */
+Private
+MACRO TrnUpdateBFiles()
+
+  if( not ( Update(b) ) )
+    AbortTrn();
+  end;
+
+END;
+
+
+/* Используется ли балансовый счет в РПС */
+Private
+MACRO BWP_IsUsed( balref, BegDate, EndDate, LastWrkDate )
+
+  Var StatU = true;
+
+  StatU = ( (balref.bdIncludeBWP <= EndDate) and (balref.bdExcludeBWP >= BegDate) );
+
+  if ( (ValType(LastWrkDate) == V_DATE) and (LastWrkDate <= EndDate) )
+    StatU = StatU and ( LastWrkDate <= balref.bdExcludeBWP );
+  end;
+
+  return StatU;
+
+END;
+
+
+/* Синхронно обновить балансовый счет в рублях и валюте */
+Private
+MACRO BWP_UpdateBal( refbal )
+
+  if ( BWP_IsUsed(refbal,{curdate},{curdate}) )
+      refbal.cBlncUsedBWP = "X";
+  else
+      refbal.cBlncUsedBWP = "";
+  end;
+
+  if( FileName(refbal) == FileName(b) ) /* Валютный справочник */
+    /* Тогда надо синхронно обновить рублевый */
+    b.Chapter   = refbal.Chapter;
+    b.iNumPlan  = refbal.iNumPlan;
+    b.Balance   = refbal.Balance;
+    if ( not GetEQ(b) )
+      BWP_MsgBox( refbal.Chapter,
+                  "Несоответствие справочников б/с для рублей и валюты:|",
+                  "б/с ", b.Balance, " отстутствует в справочнике б/с для рублей" );
+      BWP_Status = 1;
+      Exit(1);
+    end;
+    Copy( b,  refbal );
+  end;
+
+  return ProcessTrn( 0, "TrnUpdateBFiles", b );
+END;
+
+/* Организовать цикл по счетам */
+Private
+CLASS BWP_MainScan( BegDate : Date, EndDate : Date )
+   private var m_rs;
+   private var m_num_recs = 0;
+   private var m_beg_date = BegDate;
+   private var m_end_date = EndDate;
+   private var m_balance1 = TArray();
+
+   var Chapter    : Integer = 0;
+   var Balance    : String  = "";
+   var Name_Part  : String  = "";
+   var IncludeBWP : Date    = Date(0,0,0);
+   var ExcludeBWP : Date    = Date(0,0,0);
+   var MinInclude : Date    = Date(0,0,0);
+   var MaxExclude : Date    = Date(0,0,0);
+   var PlanRest   : Money   = $0;
+   var nOpenAcc   : Integer = 0;
+   var Debet      : Money   = $0;
+   var Credit     : Money   = $0;
+   var LastDtWork : Date    = Date(0,0,0);
+
+   Private
+   Macro fill_balance1()
+     var qr = "SELECT t_Chapter, t_Balance FROM dbalance_dbt WHERE INSTR(t_Type_Balance,'1') > 0 AND t_iNumPlan = " + BWP_NumPlan + " AND t_Chapter BETWEEN 1 AND 5";
+     var nr;
+     var rs = RsdRecordset( SQL_Execute(qr) );
+     var ch = 0,
+         bl = "";
+
+     m_balance1[1] = TArray();
+     m_balance1[2] = TArray();
+     m_balance1[3] = TArray();
+     m_balance1[4] = TArray();
+     m_balance1[5] = TArray();
+     /*23 Mar 07 Malakhova Irina 103782*/
+     InitProgress(-1, "Загрузка б/с 1-го порядка", "Обработано записей" );
+
+     nr = 0;
+
+     while( rs.moveNext() )
+       ch = rs.value(0,null,V_INTEGER);
+       bl = rs.value(1,null,V_STRING );
+
+       m_balance1[ch][Int(bl)] = bl;
+
+       nr = nr + 1;
+
+       UseProgress(nr);
+     end;
+
+     RemProgress();
+
+   End;
+
+   Private
+   Macro init()
+     /* Фильтрация по ТС/РС                                                        */
+     /* Инициализация значениями из реестра                                        */
+     /* Временное решение?!                                                        */
+     var organizationStructure, issueMode;
+     REP_GetDefaultParmTS( organizationStructure, issueMode);
+     var departmentList = RepDepartmentList( organizationStructure, issueMode, {OperDprt} );
+     var accountFilter  = RepAccountFilter(  departmentList   );
+
+     /* Запрос по балансовым счетам */
+     var bq   = "SELECT t_Chapter, t_Balance, t_bdIncludeBWP, t_bdExcludeBWP, t_Name_Part FROM dbalance_dbt WHERE t_iNumPlan = " + BWP_NumPlan + " AND t_Chapter BETWEEN 1 AND 5";
+
+     /* Запрос по таблице разнесения лицевых по балансовым */
+     var abq  = "SELECT t_Chapter, t_Balance" + BWP_NumPlan + " t_Balance, t_Account FROM daccblnc_dbt WHERE t_Chapter BETWEEN 1 AND 5";
+
+     /* Запрос по лицевым счетам */
+     var aq   = "SELECT t_Chapter, t_Account, (SELECT SUM(r.t_planRest) FROM drestdate_dbt r WHERE t_accountId = r.t_accountId AND r.t_restDate = (SELECT MAX(rd.t_restDate) FROM drestdate_dbt rd WHERE rd.t_accountId = r.t_accountId AND rd.t_restCurrency = r.t_restCurrency AND rd.t_restDate <= " + GetSQLDate(m_end_date) + ") ) t_PlanRest, CASE WHEN t_Open_Date <= " + GetSQLDate(m_end_date) + " AND (t_Close_Date >= " + GetSQLDate(m_beg_date) + " OR t_Close_Date = TO_DATE('01-01-0001','DD-MM-YYYY')) THEN 1 ELSE 0 END t_N FROM daccount_dbt acc WHERE t_Chapter BETWEEN 1 AND 5 "; // AND " + accountFilter.GetAsSqlString( "acc" );
+
+     /* Запрос по дебетовым документам архива */
+     var adpq = "SELECT t_Chapter, t_Account_Payer,    MAX(t_Date_Carry) t_Last_Carry, SUM(t_Sum_Natcur) t_Sum FROM dacctrn_dbt   WHERE t_state = 1 AND t_Result_Carry != 23 AND t_Date_Carry BETWEEN " + GetSQLDate(m_beg_date) + " AND " + GetSQLDate(m_end_date) + " AND t_Chapter BETWEEN 1 AND 5 GROUP BY t_Chapter, t_Account_Payer";
+
+     /* Запрос по кредитовым документам архива */
+     var adrq = "SELECT t_Chapter, t_Account_Receiver, MAX(t_Date_Carry) t_Last_Carry, SUM(t_Sum_Natcur) t_Sum FROM dacctrn_dbt   WHERE t_state = 1 AND t_Result_Carry != 23 AND t_Date_Carry BETWEEN " + GetSQLDate(m_beg_date) + " AND " + GetSQLDate(m_end_date) + " AND t_Chapter BETWEEN 1 AND 5 GROUP BY t_Chapter, t_Account_Receiver";
+
+     /* Запрос на количество записей */
+     var cntq = " SELECT b.t_Chapter, DECODE(GROUPING(b.t_Balance),1,SUBSTR(b.t_Balance,1,3),b.t_Balance) t_Balance" +
+                " FROM   ( "+bq +" ) b,  " +
+                "        ( "+abq+" ) ab, " +
+                "        ( "+aq +" ) a   " +
+                " WHERE      b.t_Chapter = ab.t_Chapter "
+                "        AND b.t_Balance = ab.t_Balance "
+                "        AND a.t_Account = ab.t_Account "
+                "        AND a.t_Chapter = ab.t_Chapter "
+                " GROUP BY b.t_Chapter, ROLLUP(SUBSTR(b.t_Balance,1,3),b.t_Balance) ";
+
+     /* Запрос для получения основных данных */
+     var datq = " SELECT b.t_Chapter                                                            t_Chapter,    " +
+                "        DECODE(GROUPING(b.t_Balance),1,SUBSTR(b.t_Balance,1,3),b.t_Balance)    t_Balance,    " +
+                "        MIN(b.t_bdIncludeBWP)                                                  t_MinInclude, " +
+                "        MAX(b.t_bdExcludeBWP)                                                  t_MaxExclude, " +
+                "        SUM(NVL(t_PlanRest,0))                                                 t_PlanRest,   " +
+                "        SUM(NVL(t_N,0))                                                        t_nOpenAcc,   " +
+                "        SUM(NVL(adp.t_Sum,0))                                                  t_SumP,       " +
+                "        SUM(NVL(adr.t_Sum,0))                                                  t_SumR,       " +
+                "        MAX(NVL(adp.t_Last_Carry,TO_DATE('01-01-0001','DD-MM-YYYY')))          t_LCarryADP,  " +
+                "        MAX(NVL(adr.t_Last_Carry,TO_DATE('01-01-0001','DD-MM-YYYY')))          t_LCarryADR   " +
+                " FROM   ( " + bq   + " ) b,   " +
+                "        ( " + abq  + " ) ab,  " +
+                "        ( " + aq   + " ) a,   " +
+                "        ( " + adpq + " ) adp, " +
+                "        ( " + adrq + " ) adr  " +
+                " WHERE      b.t_Chapter =  ab.t_Chapter " +
+                "        AND b.t_Balance =  ab.t_Balance " +
+                "        AND a.t_Account =  ab.t_Account " +
+                "        AND a.t_Chapter =  ab.t_Chapter " +
+                "        AND a.t_Account = adp.t_Account_Payer(+)    " +
+                "        AND a.t_Chapter = adp.t_Chapter(+)          " +
+                "        AND a.t_Account = adr.t_Account_Receiver(+) " +
+                "        AND a.t_Chapter = adr.t_Chapter(+)          " +
+                " GROUP BY b.t_Chapter, ROLLUP(SUBSTR(b.t_Balance,1,3),b.t_Balance)";
+
+     /* Итоговый запрос для получения результата */
+     var resq = " SELECT b1.t_Chapter,      " +
+                "        b1.t_Balance,      " +
+                "        b1.t_Name_Part,    " +
+                "        b1.t_bdIncludeBWP, " +
+                "        b1.t_bdExcludeBWP, " +
+                "        b2.t_MinInclude,   " +
+                "        b2.t_MaxExclude,   " +
+                "        b2.t_PlanRest,     " +
+                "        b2.t_nOpenAcc,     " +
+                "        b2.t_SumP,         " +
+                "        b2.t_SumR,         " +
+                "        b2.t_LCarryADP,    " +
+                "        b2.t_LCarryADR     " +
+                " FROM   ( " + bq   + " ) b1, " +
+                "        ( " + datq + " ) b2  " +
+                " WHERE      b1.t_Chapter = b2.t_Chapter " +
+                "        AND b1.t_Balance = b2.t_Balance " +
+                " ORDER BY b1.t_Chapter, b1.t_Balance ";
+
+     /*23 Mar 07 Malakhova Irina 103782*/
+     m_rs       = TRsbDataSet(resq);
+
+
+     fill_balance1();
+   End;
+
+   Macro moveNext()
+     if ( m_rs.moveNext() )
+       Chapter    = m_rs.value( 0,null,V_INTEGER);
+       Balance    = m_rs.value( 1,null,V_STRING );
+       Name_Part  = m_rs.value( 2,null,V_STRING );
+       IncludeBWP = m_rs.value( 3,null,V_DATE   );
+       ExcludeBWP = m_rs.value( 4,null,V_DATE   );
+       MinInclude = m_rs.value( 5,null,V_DATE   );
+       MaxExclude = m_rs.value( 6,null,V_DATE   );
+       PlanRest   = m_rs.value( 7,null,V_MONEY  );
+       nOpenAcc   = m_rs.value( 8,null,V_INTEGER);
+       Debet      = m_rs.value( 9,null,V_MONEY  );
+       Credit     = m_rs.value(10,null,V_MONEY  );
+       LastDtWork = Max( m_rs.value(11,null,V_DATE), m_rs.value(12,null,V_DATE) );
+       if ( (nOpenAcc > 0) or (PlanRest != $0) )
+         LastDtWork = m_end_date;
+       end;
+
+       return true;
+     end;
+
+     return false;
+   End;
+
+   Macro hasBalance1()
+     return ValType(m_balance1[Chapter][Int(SubStr(Balance,1,3))]) != V_UNDEF;
+   End;
+
+   Macro isBalance1()
+     return ValType(m_balance1[Chapter][Int(Balance)]) != V_UNDEF;
+   End;
+
+   Macro isUsedBWP( check_date_work )
+     if ( ValType(check_date_work) != V_BOOL )
+       check_date_work = false;
+     end;
+
+     return  (IncludeBWP <= m_end_date) and
+             (ExcludeBWP >= m_beg_date) and
+             (
+                (check_date_work == false) or
+                (LastDtWork >  m_end_date) or
+                (LastDtWork <= ExcludeBWP)
+             );
+   End;
+
+   Macro isNowUsed()
+     return (IncludeBWP <= {curdate}) and (ExcludeBWP >= {curdate});
+   End;
+
+   Macro cNowUsed()
+     if ( isNowUsed() ) return "X";
+     else               return "";
+     end;
+   End;
+
+   Macro update()
+      macro make_sql_statement( tname )
+        return " UPDATE " + tname +
+               " SET t_cBlncUsedBWP = " + GetSQLChar(cNowUsed()) + ", " +
+               "     t_bdIncludeBWP = " + GetSQLDate(IncludeBWP) + ", " +
+               "     t_bdExcludeBWP = " + GetSQLDate(ExcludeBWP) +
+               " WHERE     t_Chapter  = " + Chapter     +
+               "       AND t_iNumPlan = " + BWP_NumPlan +
+               "       AND t_Balance  = '" + Balance + "'";
+      end;
+
+      if ( not BWP_TEST )
+      SQL_ExecuteTrn( make_sql_statement("dbalance_dbt") );
+      end;
+
+      return true;
+
+      OnError();
+      return false;
+   End;
+
+   init();
+
+END;
+
+/****************************************************************************
+                        ФУНКЦИИ - СКАНЕРЫ
+****************************************************************************/
+
+/* Сканер лицевых в плане балансовых (по балансовому счету) */
+Private
+Var FirstAB = true;
+
+Private
+MACRO BWP_ScanAB( ChapterAB, BalanceAB )
+  Var StatAB;
+
+  if ( FirstAB )
+    FirstAB = False;
+
+    ClearRecord( accbal );
+    accbal.Chapter           = ChapterAB;
+    accbal( BWP_NumPlan + 2 ) = BalanceAB;
+
+    StatAB = GetGE( accbal );
+  else
+    StatAB = Next ( accbal );
+  end;
+
+  return StatAB and ( accbal(BWP_NumPlan + 2) == BalanceAB ) and ( accbal.Chapter == ChapterAB );
+END;
+
+
+/* Сканер лицевых в плане балансовых (по балансовому счету первого порядка) */
+Private
+Var FirstAB1 = true;
+
+Private
+MACRO BWP_ScanAB1( ChapterAB1, BalanceAB1 )
+  Var StatAB1;
+
+  if ( FirstAB1 )
+    FirstAB1 = False;
+
+    ClearRecord( accbal );
+    accbal.Chapter           = ChapterAB1;
+    accbal( BWP_NumPlan + 2 ) = BalanceAB1;
+
+    StatAB1 = GetGE( accbal );
+  else
+    StatAB1 = Next ( accbal );
+  end;
+
+  return StatAB1 and ( SubStr( accbal(BWP_NumPlan + 2), 1, 3 ) == BalanceAB1 ) and ( accbal.Chapter == ChapterAB1 );
+END;
+
+
+/* Сканер балансовых счетов (по главе) */
+Private
+Var FirstB = true;
+
+Private
+MACRO BWP_ScanB( ChapterB )
+  Var StatB;
+
+  if ( FirstB )
+    FirstB = False;
+
+    ClearRecord( bal );
+    bal.Chapter  = ChapterB;
+    bal.iNumPlan = BWP_NumPlan;
+
+    StatB = GetGE( bal );
+  else
+    StatB = Next ( bal );
+  end;
+
+  return StatB and ( bal.iNumPlan == BWP_NumPlan ) and ( bal.Chapter == ChapterB );
+END;
+
+
+/* Сканер балансовых счетов (по б/с 1-го порядка) */
+Private
+Var FirstB1 = true;
+
+Private
+MACRO BWP_ScanB1( ChapterB1, BalanceB1 )
+  Var StatB1;
+
+  if ( FirstB1 )
+    FirstB1 = False;
+
+    ClearRecord( bal );
+    bal.Chapter  = ChapterB1;
+    bal.iNumPlan = BWP_NumPlan;
+    bal.Balance  = BalanceB1;
+
+    StatB1 = GetGE( bal );
+
+    if ( StatB1 and (bal.Balance == BalanceB1) )
+      StatB1 = Next( bal );
+    end;
+
+  else
+    StatB1 = Next ( bal );
+  end;
+
+  return StatB1                                         and
+         ( SubStr( bal.Balance, 1, 3 ) == BalanceB1   ) and
+         ( bal.iNumPlan                == BWP_NumPlan ) and
+         ( bal.Chapter                 == ChapterB1   );
+END;
+
+/* Сканер документов опердня (по лицевому плательщика) */
+Private
+Var FirstDP = true;
+
+Private
+MACRO BWP_ScanDP( ChapterDP, AccountDP, CodeCurrDP )
+
+  Var StatDP = false;
+
+  if ( FirstDP )
+
+    FirstDP = false;
+
+    ClearRecord( doc );
+
+    KeyNum( doc, 2 );
+    doc.Chapter       = ChapterDP;
+    doc.Account_Payer = AccountDP;
+    doc.Code_Currency = CodeCurrDP;
+
+    StatDP = GetGE( doc );
+  else
+    StatDP = Next ( doc );
+  end;
+
+  return StatDP and (doc.Account_Payer == AccountDP) and (doc.Chapter == ChapterDP);
+END;
+
+
+/* Сканер документов опердня (по лицевому получателя) */
+Private
+Var FirstDR = true;
+
+Private
+MACRO BWP_ScanDR( ChapterDR, AccountDR, CodeCurrDR )
+
+  Var StatDR = false;
+
+  if ( FirstDR )
+
+    FirstDR = false;
+
+    ClearRecord( doc );
+
+    KeyNum( doc, 3 );
+    doc.Chapter          = ChapterDR;
+    doc.Account_Receiver = AccountDR;
+    doc.Code_Currency    = CodeCurrDR;
+
+    StatDR = GetGE( doc );
+  else
+    StatDR = Next ( doc );
+  end;
+
+  return StatDR and (doc.Account_Receiver == AccountDR) and (doc.Chapter == ChapterDR);
+END;
+
+/* Сканер архивных документов (по лицевому плательщика) */
+Private
+Var FirstADP = true;
+
+Private
+MACRO BWP_ScanADP( ChapterADP, AccountADP, CodeCurrADP )
+
+  Var StatADP = false;
+
+  if ( FirstADP )
+
+    FirstADP = false;
+
+    ClearRecord( adoc );
+
+    KeyNum( adoc, 2 );
+    adoc.Chapter       = ChapterADP;
+    adoc.Account_Payer = AccountADP;
+    adoc.Code_Currency = CodeCurrADP;
+
+    StatADP = GetGE( adoc );
+  else
+    StatADP = Next ( adoc );
+  end;
+
+  return StatADP and (adoc.Account_Payer == AccountADP) and (adoc.Chapter == ChapterADP);
+END;
+
+/* Получить последнюю дату проводки по плательщику */
+Private
+MACRO BWP_GetLastDateCarryADP( ChapterADP, AccountADP, CodeCurrADP, BegDate, EndDate )
+
+  Var StatADP = false;
+
+  Macro TestRecord_Key()
+    return ( adoc.Account_Payer == AccountADP  ) and
+           ( adoc.Chapter       == ChapterADP  ) and
+           ( adoc.Code_Currency == CodeCurrADP );
+  End;
+
+  ClearRecord( adoc );
+
+  KeyNum( adoc, 2 );
+  adoc.Chapter       = ChapterADP;
+  adoc.Account_Payer = AccountADP;
+  adoc.Code_Currency = CodeCurrADP;
+  adoc.Date_Carry    = Date( 31, 12, 9999 );
+
+  StatADP = GetGE( adoc );
+  if ( not StatADP )
+    Rewind( adoc );
+  end;
+  StatADP = Prev( adoc );
+
+  StatADP = TestRecord_Key();
+
+  if ( StatADP )
+    while( (adoc.Date_Carry > EndDate) and StatADP )
+      StatADP = Prev( adoc );
+      if ( StatADP )
+        StatADP = TestRecord_Key();
+      end;
+    end;
+
+    if ( (adoc.Date_Carry < BegDate) or (not StatADP) )
+      return BWP_MinDate;
+    end;
+
+    return adoc.Date_Carry;
+  end;
+
+  return BWP_MinDate;
+
+END;
+
+/* Сканер архивных документов (по лицевому получателя) */
+Private
+Var FirstADR = true;
+
+Private
+MACRO BWP_ScanADR( ChapterADR, AccountADR, CodeCurrADR )
+
+  Var StatADR = false;
+
+  if ( FirstADR )
+
+    FirstADR = false;
+
+    ClearRecord( adoc );
+
+    KeyNum( adoc, 3 );
+    adoc.Chapter          = ChapterADR;
+    adoc.Account_Receiver = AccountADR;
+    adoc.Code_Currency    = CodeCurrADR;
+
+    StatADR = GetGE( adoc );
+  else
+    StatADR = Next ( adoc );
+  end;
+
+  return StatADR and (adoc.Account_Receiver == AccountADR) and (adoc.Chapter == ChapterADR);
+END;
+
+/* Получить последнюю дату проводки по получателю */
+Private
+MACRO BWP_GetLastDateCarryADR( ChapterADR, AccountADR, CodeCurrADR, BegDate, EndDate )
+
+  Var StatADR = false;
+
+  Macro TestRecord_Key()
+    return (adoc.Account_Receiver == AccountADR  ) and
+           (adoc.Chapter          == ChapterADR  ) and
+           (adoc.Code_Currency    == CodeCurrADR );
+  End;
+
+  ClearRecord( adoc );
+
+  KeyNum( adoc, 3 );
+  adoc.Chapter          = ChapterADR;
+  adoc.Account_Receiver = AccountADR;
+  adoc.Code_Currency    = CodeCurrADR;
+  adoc.Date_Carry       = Date( 31, 12, 9999 );
+
+  StatADR = GetGE( adoc );
+  if ( not StatADR )
+    Rewind( adoc );
+  end;
+  StatADR = Prev( adoc );
+
+  StatADR = TestRecord_Key();
+
+  if ( StatADR )
+    while( (adoc.Date_Carry > EndDate) and StatADR )
+      StatADR = Prev( adoc );
+      if ( StatADR )
+        StatADR = TestRecord_Key();
+      end;
+    end;
+
+    if ( (adoc.Date_Carry < BegDate) or (not StatADR) )
+      return BWP_MinDate;
+    end;
+
+    return adoc.Date_Carry;
+  end;
+
+  return BWP_MinDate;
+
+END;
+
+/****************************************************************************
+           ОСНОВНЫЕ ПРОЦЕДУРЫ КОРРЕКТИРОВКИ РАБОЧЕГО ПЛАНА СЧЕТОВ
+****************************************************************************/
+
+/*****************************************/
+/* Исключение счета из РПС пользователем */
+/*****************************************/
+MACRO BWP_ManualExclude( Chapter, NPlan, Balance, IsCur )
+
+  if ( NPlan != BWP_NumPlan )
+    BWP_Status = 0;
+    return;
+  end;
+
+  BWP_Status = 1;
+
+  if ( not GetDate( BWP_ExcludeDate, "Введите дату исключения счета из РПС:" ) )
+    BWP_Status = 1;
+    Exit( 1 );
+  end;
+
+  /* Исключаем балансовый счет первого порядка, если исключены все балансовые 2-го порядка */
+  Macro ExcludeBalance_1( Bal_2 )
+
+    Var Stat = true,
+        Updt = true,
+        scan = true,
+        pos  = GetPos( bal );
+
+    if ( BWP_ExistBal1( Chapter, SubStr( Bal_2, 1, 3 ) ) )
+      while( scan )
+        scan = scan                                                    and
+               Next( bal )                                             and
+               ( bal.iNumPlan                == BWP_NumPlan          ) and
+               ( SubStr( bal.Balance, 1, 3 ) == SubStr( Bal_2, 1, 3) ) and
+               ( bal.Chapter                 == Chapter              );
+
+        if ( (trim(bal.cBlncUsedBWP) == "X") and (bal.Balance != Bal_2) )
+          scan = false;
+          Updt = false;
+        end;
+      end;
+    end;
+
+    if ( BWP_GetBal( Chapter, SubStr( Bal_2, 1, 3 ), True ) and Updt )
+      bal.cBlncUsedBWP = "";
+      bal.bdExcludeBWP = BWP_ExcludeDate;
+      if ( not BWP_UpdateBal( bal ) )
+        BWP_MsgBox( Chapter, "Ошибка исключения из РПС счета 1-го порядка: ", bal.Balance );
+        Stat = false;
+      end;
+    end;
+
+    GetDirect( bal, pos );
+
+    return Stat;
+  End;
+
+  /* Исключаем счет первого порядка */
+  Macro TestBalance_2( Bal_1 )
+
+    Var Stat = true,
+        scan = true,
+        pos  = GetPos( bal );
+
+    while( scan )
+
+      scan = scan                                           and
+             Next( bal )                                    and
+             ( bal.iNumPlan == BWP_NumPlan                ) and
+             ( Bal_1        == SubStr( bal.Balance, 1, 3) ) and
+             ( bal.Chapter  == Chapter                    );
+
+      if ( trim(bal.cBlncUsedBWP) != "" )
+        scan = false;
+        Stat = false;
+      end;
+
+    end;
+
+    GetDirect( bal, pos );
+
+    if ( not Stat )
+      BWP_MsgBox(
+                  Chapter,
+                  "Нельзя исключить из РПС счет 1-го порядка (", Bal_1,"), т.к. есть|",
+                  "принадлежащие ему счета 2-го порядка включенные в РПС."
+                );
+    end;
+
+    return Stat;
+  End;
+
+  Var StopScan = false;
+
+  BWP_GetFiles( IsCur );
+
+  if ( not BWP_GetBal( Chapter, Balance, True ) )
+    BWP_Status = 1;
+    Exit(1);
+  end;
+
+  BWP_Status = 0;
+
+  FirstAB = true;
+
+  if   ( Index( bal.Type_Balance, "1" ) > 0 )
+    if ( not TestBalance_2(bal.Balance) )
+      BWP_Status = 1;
+      Exit(1);
+    end;
+  else
+    while ( BWP_ScanAB( Chapter, Balance) and (not StopScan))
+
+      if ( not BWP_GetAcc( Chapter, accbal.Account, accbal.Code_Currency ) )
+        BWP_MsgBox( Chapter, "Не найден счет " + accbal.Account + "|для балансового " + accbal(BWP_NumPlan + 2) + " в плане №" + BWP_NumPlan );
+        Exit( 1 );
+      end;
+
+      if (
+           ( trim(a.Open_Close) == ""        ) or
+           ( acc.Close_Date >= BWP_ExcludeDate )
+         )
+         StopScan   = true;
+         if ( GetTrue( False, "На дату " + BWP_ExcludeDate + " были л/с, открытые на б/с " + Balance +
+                              "|Исключить счет из рабочего плана счетов?"
+                     )
+            )
+           BWP_Status = 0;
+         else
+           BWP_Status = 1;
+         end;
+      end;
+    end;
+  end;
+
+  if ( (BWP_Status == 0) and ExcludeBalance_1( bal.Balance ) )
+    BWP_Status = 0;
+    return;
+  else
+    BWP_Status = 1;
+    Exit(1);
+  end;
+
+END;
+
+/***************************************/
+/* Включение счета в РПС пользователем */
+/***************************************/
+MACRO BWP_ManualInclude( Chapter, NPlan, Balance, IsCur )
+
+  if ( NPlan != BWP_NumPlan )
+    BWP_Status = 0;
+    return;
+  end;
+
+  BWP_Status = 1;
+
+  BWP_ExcludeDate = BWP_MaxDate;
+
+  if ( not GetDate( BWP_IncludeDate, "Введите дату включения счета в РПС:" ) )
+    BWP_Status = 1;
+    Exit(1);
+  end;
+
+  /* Включем счет первого порядка, если есть включенные 2-го порядка */
+  Macro IncludeBalance_1( Bal_2 )
+
+    Var Stat = true,
+        Updt = false,
+        pos  = GetPos( bal );
+
+    if ( BWP_GetBal( Chapter, SubStr( Bal_2, 1, 3 )) and (Index(bal.Type_Balance, "1") > 0))
+      if ( trim(bal.cBlncUsedBWP) != "" )
+        if ( bal.bdIncludeBWP > BWP_IncludeDate )
+          Updt = true;
+        end;
+      else
+        Updt = true;
+      end;
+    end;
+
+    if ( Updt )
+      bal.cBlncUsedBWP = "X";
+      bal.bdIncludeBWP = BWP_IncludeDate;
+      bal.bdExcludeBWP = BWP_ExcludeDate;
+      if ( not BWP_UpdateBal( bal ) )
+        BWP_MsgBox( Chapter, "Ошибка включения в РПС счета 1-го порядка: ", bal.Balance );
+        Stat = false;
+      end;
+    end;
+
+    GetDirect( bal, pos );
+
+    return Stat;
+
+  End;
+
+  /* Включем счет первого порядка */
+  Macro TestBalance_2( Bal_1 )
+
+    Var Stat = false,
+        scan = true,
+        pos  = GetPos( bal );
+
+    while( scan )
+      scan = scan                                    and
+             Next( bal )                             and
+             ( bal.iNumPlan == BWP_NumPlan         ) and
+             ( Bal_1 == SubStr( bal.Balance, 1, 3) ) and
+             ( bal.Chapter == Chapter              );
+
+      if ( trim(bal.cBlncUsedBWP) != "" )
+        scan = false;
+        Stat = true;
+      end;
+    end;
+
+    GetDirect( bal, pos );
+
+    if ( not Stat )
+      BWP_MsgBox(
+                  Chapter,
+                  "Нельзя включить в РПС счет 1-го порядка (", Bal_1,"), т.к. ни|",
+                  "один принадлежащий ему счет 2-го порядка не включен в РПС."
+                );
+    end;
+
+    return Stat;
+
+  End;
+
+  BWP_GetFiles( IsCur );
+
+  if ( not BWP_GetBal( Chapter, Balance, True ) )
+    BWP_Status = 1;
+    Exit(1);
+  end;
+
+  if   ( Index( bal.Type_Balance, "1" ) > 0 )
+    if ( TestBalance_2( bal.Balance ) )
+      BWP_Status = 0;
+      Exit( 0 );
+    end;
+  else
+    if ( IncludeBalance_1( bal.Balance ) )
+      BWP_Status = 0;
+      Exit( 0 );
+    end;
+  end;
+
+  BWP_Status = 1;
+  Exit(1);
+
+END;
+
+/*********************************/
+/* Исключение всех счетов из РПС */
+/*********************************/
+
+/* Предварительная информация */
+MACRO BWP_ExcludeAllPreInform
+  BWP_PreInform
+  (
+    "В результате выполнения этой процедуры со всех счетов будут сняты признаки\n" +
+    "отнесения к рабочему плану счетов, что повлияет на выпуск баланса.\n" +
+    "Если Вы уверены в необходимости проведения операции, то Вам необходимо\n" +
+    "будет ввести дату, с которой из РПС должны быть исключены все счета.\n\n" +
+    "Для продолжения нажмите <Esc>..."
+  );
+END;
+
+/* Исключение всех счетов из РПС */
+MACRO BWP_ExcludeAll()
+
+  BWP_Status = 1;
+
+  /* Обрабатываем все главы */
+  Const Chapter = 0;
+
+  if ( not GetDate( BWP_ExcludeDate, "Введите дату исключения всех счетов из РПС:" ) )
+    BWP_Status = 1;
+    Exit(1);
+  end;
+
+  /* Отчет */
+  Var Rep = CTableReport( 0, true, true );
+
+  /* Ошибки BTrieve */
+  Var BErrCode = 0,
+      BErrMess = "";
+
+  Var Recs = 0;
+
+  /* Создание отчета */
+  Macro ConstructReport()
+    Rep.AddColumn( "Б/с 1 п",       3 );
+    Rep.AddColumn( "Б/с 2 п",       5 );
+
+    Rep.PrintFreeString("Протокол исключения б/с из рабочего плана счетов на дату " + BWP_ExcludeDate);
+    Rep.PrintFreeString("Исполнитель: " + {oper});
+    Rep.PrintFreeString("Дата и время создания: " + date + "   " + time);
+    Rep.PrintFreeString(" ");
+    Rep.PrintFreeString("В результате выполнения операции из рабочего плана счетов были исключены");
+    Rep.PrintFreeString("следующие балансовые счета: ");
+  End;
+
+  /* Сканирование счетов по ссылкам */
+  Macro ScanBalRef( IsCur )
+
+    macro FilterBalance()
+      Var StatF = true;
+
+      if ( Chapter != 0 )
+        if ( Chapter != bal.Chapter )
+          StatF = false;
+        end;
+      else
+        if ( bal.Chapter > 5 )
+          StatF = false;
+        end;
+      end;
+
+      if ( not StatF )
+        return StatF;
+      end;
+
+      if ( BWP_NumPlan != bal.iNumPlan )
+        StatF = false;
+      end;
+
+      if ( not StatF )
+        return StatF;
+      end;
+
+      return StatF;
+    end;
+
+    Var IsCurStr =  "",
+        Bal_1    =  "",
+        Bal_2    =  "",
+        HeadPr   =  false;
+
+    /* Инициализировать ссылки */
+    BWP_GetFiles( IsCur );
+
+    KeyNum( bal, 0 );
+    Rewind( bal );
+    while ( Next(bal) )
+
+      Recs = Recs + 1;
+
+      UseProgress( Recs );
+
+      if ( FilterBalance() )
+
+        if ( bal.bdExcludeBWP > BWP_ExcludeDate )
+
+          if ( Bal_1 == SubStr(bal.Balance, 1, 3 ) )
+            Bal_1 = "";
+          else
+            Bal_1 = SubStr(bal.Balance, 1, 3);
+            if ( not BWP_ExistBal1( bal.Chapter, Bal_1 ) )
+              Bal_1 = "Нет";
+            end;
+          end;
+
+          if ( Index( bal.Type_Balance, "1" ) > 0 )
+            Bal_2 = "";
+          else
+            Bal_2 = bal.Balance;
+          end;
+
+          bal.cBlncUsedBWP = "";
+          bal.bdExcludeBWP = BWP_ExcludeDate;
+          if ( BWP_TEST or BWP_UpdateBal(bal) )
+            Rep.PrintString   ( Bal_1, Bal_2 );
+          else
+            BErrCode = Status( BErrMess );
+            Rep.PrintString   ( Bal_1, Bal_2 );
+            Rep.PrintSeparatorExt( false, true,   2 );
+            Rep.PrintStringExt( BErrMess,         2 );
+            Rep.PrintSeparatorExt( false, false,  2 );
+          end;
+
+          Bal_1 = SubStr(bal.Balance, 1, 3);
+
+        end;
+      end;
+    end;
+  End;
+
+  /*23 Mar 07 Malakhova Irina 103782*/
+  InitProgress(-1,
+                "Исключение всех счетов из РПС",
+                "Обработано записей" );
+
+  /* Создаем отчет */
+  ConstructReport();
+
+  /* Сканируем рубли */
+  Rep.MemHead();
+  ScanBalRef( false );
+
+  /* Сканируем валюту - для подстраховки, т.к. все уже должно быть исключено */
+  ScanBalRef( true  );
+  Rep.MemBottom();
+
+  /* Печатаем то, что запомнили */
+  if ( Rep.GetEmpty() )
+    Rep.ResetMemStr();
+    Rep.PrintFreeString(" ");
+    Rep.PrintFreeString("Все счета уже исключены из РПС");
+  else
+    Rep.PrintMemStr();
+  end;
+
+  RemProgress();
+
+  BWP_Status = 0;
+
+END;
+
+/********************/
+/* Актуализация РПС */
+/********************/
+
+/* Предварительная информация */
+MACRO BWP_ActualizationPreInform()
+
+  BWP_PreInform
+  (
+    "В результате выполнения этой процедуры в РПС будут включены б/с, на\n" +
+    "которых есть открытые л/с.\n" +
+    "Из РПС будут исключены счета, не работающие в указанный Вами период,\n" +
+    "при условии, что на них нет открытых лицевых счетов.\n\n" +
+    "Для продолжения нажмите <Esc>..."
+  );
+
+END;
+
+/* Актуализация РПС */
+Private
+MACRO BWP_ActualizationPervasive()
+
+  BWP_Status = 1;
+
+  /* Обрабатываем все главы */
+  Const Chapter = 0;
+
+  /* Файл отчета по исключенным счетам (временный) */
+  Const ExcOutName = GetTxtFileName("ExcOut");
+
+  /* Даты периода актуализации */
+  Var BegDate = GetFirstDayMonth( {curdate} ),
+      EndDate = {curdate};
+
+  if ( not GetDate( BegDate, "Введите дату начала периода") )
+    BWP_Status = 1;
+    Exit(1);
+  end;
+
+  if ( not GetDate( EndDate, "Введите дату конца периода") )
+    BWP_Status = 1;
+    Exit(1);
+  end;
+
+  if ( BegDate > EndDate )
+    MsgBox( "Дата на начала периода не должна превышать дату его конца" );
+    BWP_Status = 1;
+    Exit(1);
+  end;
+
+  BWP_IncludeDate = EndDate;
+  BWP_ExcludeDate = EndDate;
+
+  /* Отчеты */
+  Var RepExc = CTableReport( 0, true, true ), /* Отчет по исключенным */
+      RepInc = CTableReport( 0, true, true ); /* Отчет по добавленным */
+
+  /* Ошибки работы с БД */
+  Var BErrCode = 0,    /* Код ошибки */
+      BErrMess = "";   /* Сообщение  */
+
+  /* Количество обработанных записей для "полоски" */
+  Var Recs = 0;
+
+  /* Скопировать отчет по исключенным в стандартный файл вывода */
+  Macro PrintCommonReport()
+    File ExcOut() txt;
+
+    if ( not Open( ExcOut, ExcOutName ) )
+      MsgBox("Ошибка открытия файла отчета об исключенных счетах|", ExcOutName );
+    end;
+
+    Rewind( ExcOut );
+    while ( Next(ExcOut) )
+      println(ExcOut.Str);
+    end;
+  End;
+
+  /* Создать отчеты */
+  Macro ConstructReport()
+    RepExc.AddOutFile( ExcOutName );
+
+    RepExc.AddColumn( "Б/с 1 п",      3 );
+    RepExc.AddColumn( "Б/с 2 п",      5 );
+
+    RepExc.PrintFreeString(" ");
+    RepExc.PrintFreeString(" ");
+    RepExc.PrintFreeString("В результате выполнения операции, из рабочего плана счетов были исключены");
+    RepExc.PrintFreeString("следующие балансовые счета: ");
+    RepExc.PrintFreeString(" ");
+
+    RepInc.AddColumn( "Б/с 1 п",      3 );
+    RepInc.AddColumn( "Б/с 2 п",      5 );
+
+    RepInc.PrintFreeString("Протокол актуализации рабочего плана счетов на дату " + {curdate});
+    RepInc.PrintFreeString("Исполнитель: " + {oper});
+    RepInc.PrintFreeString("Дата и время создания: " + date + "   " + time);
+    RepInc.PrintFreeString(" ");
+    RepInc.PrintFreeString("В результате выполнения операции в рабочий план счетов были включены");
+    RepInc.PrintFreeString("следующие балансовые счета: ");
+    RepInc.PrintFreeString(" ");
+  End;
+
+  /* Сканирование файлов по ссылкам */
+  Macro ScanBalRefExc( IsCur )
+
+    /* Инициализировать ссылки */
+    BWP_GetFiles( IsCur );
+
+    /* Фильтр на балансовые счета */
+    macro FilterBalance()
+      Var StatF = true;
+
+      if ( Chapter != 0 )
+        if ( Chapter != bal.Chapter )
+          StatF = false;
+        end;
+      else
+        if ( bal.Chapter > 5 )
+          StatF = false;
+        end;
+      end;
+
+      if ( not StatF )
+        return StatF;
+      end;
+
+      if ( BWP_NumPlan != bal.iNumPlan )
+        StatF = false;
+      end;
+
+      if ( not StatF )
+        return StatF;
+      end;
+
+      return StatF;
+    end;
+
+    /* Обработать/проверить один лицевой */
+    macro TestExcludeOneAccount( ChapterA, LastWrkDate )
+      Var StatA = true;
+
+      /* Были ли обороты */
+      macro IsAccTurns( DateCarry )
+
+        Var LastDateCarry = BWP_MinDate;
+
+        DateCarry = BWP_MinDate;
+
+        if ( EndDate >= {curdate} )
+          /* Сканируем документы опердня по плательщику,
+             если хоть один найден - обороты были */
+          FirstDP  = true;
+          while ( BWP_ScanDP( ChapterA, acc.Account, acc.Code_Currency ) )
+            DateCarry = {curdate};
+            SetParm( 0, DateCarry );
+            return true;
+          end;
+
+          /* Сканируем документы опердня по получателю,
+             если хоть один найден - обороты были */
+          FirstDR  = true;
+          while ( BWP_ScanDR( ChapterA, acc.Account, acc.Code_Currency ) )
+            DateCarry = {curdate};
+            SetParm( 0, DateCarry );
+            return true;
+          end;
+        end;
+
+        if ( BegDate < {curdate} )
+          /* Получить последнюю дату проводки в архиве по плательщику */
+          LastDateCarry = BWP_GetLastDateCarryADP( ChapterA, acc.Account, acc.Code_Currency, BegDate, EndDate );
+          if ( DateCarry < LastDateCarry )
+            DateCarry = LastDateCarry;
+          end;
+
+          /* Получить последнюю дату проводки в архиве по получателю */
+          LastDateCarry = BWP_GetLastDateCarryADR( ChapterA, acc.Account, acc.Code_Currency, BegDate, EndDate );
+          if ( DateCarry < LastDateCarry )
+            DateCarry = LastDateCarry;
+          end;
+
+          if ( DateCarry > BWP_MinDate )
+            SetParm( 0, DateCarry );
+            return true;
+          end;
+        end;
+
+        /* Оборотов не было */
+        return false;
+      end;
+
+      Var DateCarry = BWP_MinDate;
+
+      if ( not BWP_GetAcc( ChapterA, accbal.Account, accbal.Code_Currency, True ) )
+        BWP_Status = 1;
+        Exit( 1 );
+      end;
+
+      /* Проверяем лицевой */
+      if ( acc.Open_Date <= EndDate )
+        if   ( acc.Open_Close == "" )   /* Счет открыт           */
+          LastWrkDate = EndDate;
+          StatA = false;
+        elif ( acc.PlanRest   != 0  )   /* Остаток ненулевой     */
+          LastWrkDate = EndDate;
+          StatA = false;
+        elif ( IsAccTurns(DateCarry))   /* Были обороты по счету */
+          if ( LastWrkDate < DateCarry )
+            LastWrkDate = DateCarry;
+          end;
+          StatA = false;
+        end;
+      end;
+
+      SetParm( 1, LastWrkDate );
+
+      return StatA;
+    end;
+
+    Var Stat        = true,
+        Bal_1       = "",
+        Bal_2       = "",
+        Bal_1_Chg   = false,
+        LastWrkDate = BWP_MinDate;
+
+    /* Сканируем балансовые */
+    KeyNum( bal, 0 );
+    Rewind( bal );
+    while ( Next( bal ) )
+
+      Recs = Recs + 1;
+      UseProgress( Recs );
+
+      if ( FilterBalance() )
+
+        LastWrkDate = BWP_MinDate;
+
+        Stat     = true;
+        KeyNum( accbal, BWP_NumPlan );
+
+        if ( (Bal_1 != SubStr( bal.Balance, 1, 3)) or (not Bal_1_Chg) )
+          Bal_1 = SubStr( bal.Balance, 1, 3);
+          if ( not BWP_ExistBal1( bal.Chapter, Bal_1 ) )
+            Bal_1 = "Нет";
+          end;
+          Bal_1_Chg = false;
+        else
+          Bal_1 = "";
+        end;
+
+        /* Отдельно сканируем лицевые балансовых 2-го и 1-го порядков */
+        if ( Index( bal.Type_Balance, "1" ) > 0 )
+          FirstAB1 = true;
+          while( BWP_ScanAB1( bal.Chapter, bal.Balance ) and Stat )
+            Stat  = TestExcludeOneAccount( bal.Chapter, LastWrkDate );
+          end;
+          Bal_2 = "";
+        else
+          FirstAB  = true;
+          while( BWP_ScanAB( bal.Chapter, bal.Balance ) and Stat )
+            Stat = TestExcludeOneAccount( bal.Chapter, LastWrkDate );
+          end;
+          Bal_2 = bal.Balance;
+        end;
+
+        /* Движений не было - пробуем по другому справочнику */
+        if ( Stat )
+          BWP_GetFiles( not IsCur );
+
+          if ( Index( bal.Type_Balance, "1" ) > 0 )
+            FirstAB1 = true;
+            while( BWP_ScanAB1( bal.Chapter, bal.Balance ) and Stat )
+             Stat  = TestExcludeOneAccount( bal.Chapter, LastWrkDate );
+            end;
+            Bal_2 = "";
+          else
+            FirstAB  = true;
+            while( BWP_ScanAB( bal.Chapter, bal.Balance ) and Stat )
+              Stat = TestExcludeOneAccount( bal.Chapter, LastWrkDate );
+            end;
+            Bal_2 = bal.Balance;
+          end;
+
+          BWP_GetFiles( IsCur );
+        end;
+
+        /* Обработка результатов сканирования лицевых балансового */
+        if ( Stat )
+          /* Движений не было - исключить */
+          if ( BWP_IsUsed( bal, BegDate, EndDate, LastWrkDate ) )
+            bal.cBlncUsedBWP = "";
+            bal.bdExcludeBWP = BegDate - 1;
+            if ( BWP_TEST or BWP_UpdateBal( bal ) )
+              RepExc.PrintString( Bal_1, Bal_2 );
+            else
+              BErrCode = Status( BErrMess );
+              RepExc.PrintString      ( Bal_1, Bal_2 );
+              RepExc.PrintSeparatorExt( false, true,  2 );
+              RepExc.PrintStringExt   ( BErrMess,     2 );
+              RepExc.PrintSeparatorExt( false, false, 2 );
+            end;
+
+            Bal_1_Chg = true;
+          end;
+        else
+          /* Движения были - включить */
+          if ( not BWP_IsUsed( bal, BegDate, EndDate, LastWrkDate ) )
+            bal.cBlncUsedBWP = "X";
+            bal.bdIncludeBWP = BegDate;
+            bal.bdExcludeBWP = BWP_MaxDate;
+            if ( BWP_TEST or BWP_UpdateBal( bal ) )
+              RepInc.PrintString( Bal_1, Bal_2 );
+            else
+              BErrCode = Status( BErrMess );
+              RepInc.PrintString   ( Bal_1, Bal_2 );
+              RepInc.PrintSeparatorExt( false, true,  2 );
+              RepInc.PrintStringExt   ( BErrMess,     2 );
+              RepInc.PrintSeparatorExt( false, false, 2 );
+            end;
+
+            Bal_1_Chg = true;
+          end;
+        end;
+
+        Bal_1 = SubStr( bal.Balance, 1, 3);
+
+      end;
+    end;
+  End;
+
+  /*23 Mar 07 Malakhova Irina 103782*/
+  InitProgress(-1,
+                "Актуализация рабочего плана счетов",
+                "Обработано записей" );
+
+  /* Создать отчет */
+  ConstructReport();
+
+  /* Сканируем */
+  RepInc.MemHead();
+  RepExc.MemHead();
+  ScanBalRefExc( false );
+  RepExc.MemBottom();
+  RepInc.MemBottom();
+
+  /* Обработка результатов сканирования рублей (чтобы не печатать пустую таблицу)*/
+  if ( RepInc.GetEmpty() )
+    RepInc.ResetMemStr();
+    RepInc.PrintFreeString(" ");
+    RepInc.PrintFreeString("Включение счетов в РПС не требуется.");
+  end;
+  if ( RepExc.GetEmpty() )
+    RepExc.ResetMemStr();
+    RepExc.PrintFreeString(" ");
+    RepExc.PrintFreeString("Исключение счетов из РПС не требуется.");
+  end;
+
+  /* Печатаем, если что-то запоминали */
+  RepInc.PrintMemStr();
+  RepExc.PrintMemStr();
+
+  RemProgress();
+
+  /* Печатаем общий отчет */
+  PrintCommonReport();
+
+  BWP_Status = 0;
+
+END;
+
+/* Актуализация РПС */
+Private
+MACRO BWP_ActualizationSQL()
+
+  BWP_Status = 1;
+
+  /* Обрабатываем все главы */
+  Const Chapter = 0;
+
+  /* Файл отчета по исключенным счетам (временный) */
+  Const ExcOutName = GetTxtFileName("ExcOut");
+
+  /* Даты периода актуализации */
+  Var BegDate = GetFirstDayMonth( {curdate} ),
+      EndDate = {curdate};
+
+  if ( not GetDate( BegDate, "Введите дату начала периода") )
+    BWP_Status = 1;
+    Exit(1);
+  end;
+
+  if ( not GetDate( EndDate, "Введите дату конца периода") )
+    BWP_Status = 1;
+    Exit(1);
+  end;
+
+  if ( BegDate > EndDate )
+    MsgBox( "Дата на начала периода не должна превышать дату его конца" );
+    BWP_Status = 1;
+    Exit(1);
+  end;
+
+  BWP_IncludeDate = EndDate;
+  BWP_ExcludeDate = EndDate;
+
+  /* Отчеты */
+  Var RepExc = CTableReport( 0, true, true ), /* Отчет по исключенным */
+      RepInc = CTableReport( 0, true, true ); /* Отчет по добавленным */
+
+  /* Ошибки работы с БД */
+  Var BErrCode = 0,    /* Код ошибки */
+      BErrMess = "";   /* Сообщение  */
+
+  /* Количество обработанных записей для "полоски" */
+  Var Recs = 0;
+
+  /* Скопировать отчет по исключенным в стандартный файл вывода */
+  Macro PrintCommonReport()
+    File ExcOut() txt;
+
+    if ( not Open( ExcOut, ExcOutName ) )
+      MsgBox("Ошибка открытия файла отчета об исключенных счетах|", ExcOutName );
+    end;
+
+    Rewind( ExcOut );
+    while ( Next(ExcOut) )
+      println(ExcOut.Str);
+    end;
+  End;
+
+  /* Создать отчеты */
+  Macro ConstructReport()
+    RepExc.AddOutFile( ExcOutName );
+
+    RepExc.AddColumn( "Б/с 1 п",      3 );
+    RepExc.AddColumn( "Б/с 2 п",      5 );
+
+    RepExc.PrintFreeString(" ");
+    RepExc.PrintFreeString(" ");
+    RepExc.PrintFreeString("В результате выполнения операции, из рабочего плана счетов были исключены");
+    RepExc.PrintFreeString("следующие балансовые счета: ");
+    RepExc.PrintFreeString(" ");
+
+    RepInc.AddColumn( "Б/с 1 п",      3 );
+    RepInc.AddColumn( "Б/с 2 п",      5 );
+
+    RepInc.PrintFreeString("Протокол актуализации рабочего плана счетов на дату " + {curdate});
+    RepInc.PrintFreeString("Исполнитель: " + {oper});
+    RepInc.PrintFreeString("Дата и время создания: " + date + "   " + time);
+    RepInc.PrintFreeString(" ");
+    RepInc.PrintFreeString("В результате выполнения операции в рабочий план счетов были включены");
+    RepInc.PrintFreeString("следующие балансовые счета: ");
+    RepInc.PrintFreeString(" ");
+  End;
+
+  /* Сканирование счетов */
+  Macro ScanBal()
+
+    Var Scaner    = BWP_MainScan( BegDate, EndDate );
+    Var NRecs;  /*06 Aug 07 Mon 14:13:43 Malakhova Irina 110786*/
+    Var Bal_1     = "",
+        Bal_2     = "",
+        Bal_1_Chg = false;
+
+    /*//23 Mar 07 Malakhova Irina 103782*/
+    InitProgress(-1,
+                  "Актуализация рабочего плана счетов",
+                  "Обработано записей" );
+
+    NRecs = 0;
+
+    while( Scaner.moveNext() )
+
+      if ( (Bal_1 != SubStr( Scaner.Balance, 1, 3)) or (not Bal_1_Chg) )
+        Bal_1 = SubStr( Scaner.Balance, 1, 3);
+        if ( not Scaner.hasBalance1() )
+          Bal_1 = "Нет";
+        end;
+        Bal_1_Chg = false;
+      else
+        Bal_1 = "";
+      end;
+
+      if ( Scaner.isBalance1() )
+        Bal_2 = "";
+      else
+        Bal_2 = Scaner.Balance;
+      end;
+
+      /* Обработка результатов сканирования лицевых балансового */
+      if ( (Scaner.nOpenAcc > 0) or (Scaner.PlanRest != $0) or (Scaner.Debet != $0) or (Scaner.Credit != $0) )
+        /* Движения были - включить */
+        if ( not Scaner.isUsedBWP(true) )
+          Scaner.IncludeBWP = BegDate;
+          Scaner.ExcludeBWP = BWP_MaxDate;
+          if ( Scaner.update() )
+            RepInc.PrintString( Bal_1, Bal_2 );
+          else
+            BErrCode = Status( BErrMess );
+            RepInc.PrintString      ( Bal_1, Bal_2    );
+            RepInc.PrintSeparatorExt( false, true,  2 );
+            RepInc.PrintStringExt   ( BErrMess,     2 );
+            RepInc.PrintSeparatorExt( false, false, 2 );
+          end;
+          Bal_1_Chg = true;
+        end;
+      else
+        /* Движений не было - исключить */
+        if ( Scaner.isUsedBWP(true) )
+          Scaner.ExcludeBWP = BegDate - 1;
+          if ( scaner.update() )
+            RepExc.PrintString( Bal_1, Bal_2 );
+          else
+            BErrCode = Status( BErrMess );
+            RepExc.PrintString      ( Bal_1, Bal_2    );
+            RepExc.PrintSeparatorExt( false, true,  2 );
+            RepExc.PrintStringExt   ( BErrMess,     2 );
+            RepExc.PrintSeparatorExt( false, false, 2 );
+          end;
+          Bal_1_Chg = true;
+        end;
+      end;
+
+      Bal_1 = SubStr(Scaner.Balance, 1, 3);
+
+      NRecs = NRecs + 1;
+
+      UseProgress(NRecs);
+    end;
+
+    RemProgress();
+  End;
+
+  /* Создать отчет */
+  ConstructReport();
+
+  /* Сканируем */
+  RepInc.MemHead();
+  RepExc.MemHead();
+  ScanBal();
+  RepExc.MemBottom();
+  RepInc.MemBottom();
+
+  /* Обработка результатов сканирования рублей (чтобы не печатать пустую таблицу)*/
+  if ( RepInc.GetEmpty() )
+    RepInc.ResetMemStr();
+    RepInc.PrintFreeString(" ");
+    RepInc.PrintFreeString("Включение счетов в РПС не требуется.");
+  end;
+  if ( RepExc.GetEmpty() )
+    RepExc.ResetMemStr();
+    RepExc.PrintFreeString(" ");
+    RepExc.PrintFreeString("Исключение счетов из РПС не требуется.");
+  end;
+
+  /* Печатаем, если что-то запоминали */
+  RepInc.PrintMemStr();
+  RepExc.PrintMemStr();
+
+  /* Печатаем общий отчет */
+  PrintCommonReport();
+
+  BWP_Status = 0;
+
+END;
+
+/* Актуализация РПС */
+MACRO BWP_Actualization()
+
+  if ( IsSQL() ) BWP_ActualizationSQL();
+  else           BWP_ActualizationPervasive();
+  end;
+
+End;
+
+/********************************/
+/* Построение РПС (общая часть) */
+/********************************/
+
+CONST KindConstructBWP_Work = 1,
+      KindConstructBWP_Open = 2;
+
+/* Построение РПС (общая часть) */
+Private
+MACRO BWP_ConstructCommonPervasive( StrProcName, KindConstruct, ProcTestOneAccount )
+
+  BWP_Status = 1;
+
+  /* Обрабатываем все главы */
+  Const Chapter = 0;
+
+  /* Даты периода построения РПС */
+  Var BegDate = GetFirstDayMonth( {curdate} ),
+      EndDate = {curdate};
+
+  if ( not GetDate( BegDate, "Введите дату начала периода") )
+    BWP_Status = 1;
+    Exit(1);
+  end;
+
+  if ( not GetDate( EndDate, "Введите дату конца периода") )
+    BWP_Status = 1;
+    Exit(1);
+  end;
+
+  if ( BegDate > EndDate )
+    MsgBox( "Дата на начала периода не должна превышать дату его конца" );
+    BWP_Status = 1;
+    Exit(1);
+  end;
+
+  BWP_IncludeDate = EndDate;
+  BWP_ExcludeDate = EndDate;
+
+  /* Отчет по добавленным */
+  Var Rep = CTableReport( 0, true, true );
+
+  /* Ошибки работы с БД */
+  Var BErrCode = 0,    /* Код ошибки */
+      BErrMess = "";   /* Сообщение  */
+
+  /* Количество обработанных записей для "полоски" */
+  Var Recs = 0;
+
+  /* Создать отчет */
+  Macro ConstructReport()
+    Var i;
+
+    if   ( KindConstruct == KindConstructBWP_Open )
+      Rep.AddColumn( "Б/с 1 п",      3 );
+      Rep.AddColumn( "Б/с 2 п",      5 );
+    elif ( KindConstruct == KindConstructBWP_Work )
+      Rep.AddColumn( "Б/с 1 п",            3 );
+      Rep.AddColumn( "Б/с 2 п",            5 );
+      Rep.AddColumn( "Причина отнесения", 35 );
+    end;
+
+    Rep.PrintFreeString("Протокол отнесения балансовых счетов к РПС на дату " + {curdate});
+    Rep.PrintFreeString("Исполнитель: " + {oper});
+    Rep.PrintFreeString("Дата и время создания: " + date + "   " + time);
+    Rep.PrintFreeString(" ");
+    Rep.PrintFreeString("В результате выполнения операции к рабочему плану счетов были отнесены");
+    Rep.PrintFreeString("следующие балансовые счета: ");
+    Rep.PrintFreeString(" ");
+  End;
+
+  /* Сканирование файлов по ссылкам */
+  Macro ScanBalRefExc( IsCur )
+
+    /* Инициализировать ссылки */
+    BWP_GetFiles( IsCur );
+
+    /* Фильтр на балансовые счета */
+    macro FilterBalance()
+      Var StatF = true;
+
+      if ( Chapter != 0 )
+        if ( Chapter != bal.Chapter )
+          StatF = false;
+        end;
+      else
+        if ( bal.Chapter > 5 )
+          StatF = false;
+        end;
+      end;
+
+      if ( not StatF )
+        return StatF;
+      end;
+
+      if ( BWP_NumPlan != bal.iNumPlan )
+        StatF = false;
+      end;
+
+      if ( not StatF )
+        return StatF;
+      end;
+
+      return StatF;
+    end;
+
+    Var Stat        = true,
+        Bal_1       = "",
+        Bal_2       = "",
+        Bal_1_Chg   = false,
+        LastWrkDate = BWP_MinDate,
+        IncReason   = "";
+
+    /* Сканируем балансовые */
+    KeyNum( bal, 0 );
+    Rewind( bal );
+    while ( Next( bal ) )
+
+      Recs = Recs + 1;
+      UseProgress( Recs );
+
+      if ( FilterBalance() )
+
+        IncReason   = "";
+        LastWrkDate = BWP_MinDate;
+
+        Stat     = false;
+        KeyNum( accbal, BWP_NumPlan );
+
+        if ( (Bal_1 != SubStr( bal.Balance, 1, 3)) or (not Bal_1_Chg) )
+          Bal_1 = SubStr( bal.Balance, 1, 3);
+          if ( not BWP_ExistBal1( bal.Chapter, Bal_1 ) )
+            Bal_1 = "Нет";
+          end;
+          Bal_1_Chg = false;
+        else
+          Bal_1 = "";
+        end;
+
+        /* Отдельно сканируем лицевые балансовых 2-го и 1-го порядков */
+        if ( Index( bal.Type_Balance, "1" ) > 0 )
+          FirstAB1 = true;
+          while( BWP_ScanAB1( bal.Chapter, bal.Balance ) )
+            Stat  = ExecMacro2( ProcTestOneAccount, Stat, bal.Chapter, BegDate, EndDate, LastWrkDate, IncReason );
+          end;
+          Bal_2 = "";
+        else
+          FirstAB  = true;
+          while( BWP_ScanAB( bal.Chapter, bal.Balance ) )
+            Stat  = ExecMacro2( ProcTestOneAccount, Stat, bal.Chapter, BegDate, EndDate, LastWrkDate, IncReason );
+          end;
+          Bal_2 = bal.Balance;
+        end;
+
+        /* Не нашли счетов - пробуем по другому справочнику */
+        if ( not Stat )
+          BWP_GetFiles( not IsCur );
+
+          /* Отдельно сканируем лицевые балансовых 2-го и 1-го порядков */
+          if ( Index( bal.Type_Balance, "1" ) > 0 )
+            FirstAB1 = true;
+            while( BWP_ScanAB1( bal.Chapter, bal.Balance ) )
+              Stat  = ExecMacro2( ProcTestOneAccount, Stat, bal.Chapter, BegDate, EndDate, LastWrkDate, IncReason );
+            end;
+            Bal_2 = "";
+          else
+            FirstAB  = true;
+            while( BWP_ScanAB( bal.Chapter, bal.Balance ) )
+              Stat  = ExecMacro2( ProcTestOneAccount, Stat, bal.Chapter, BegDate, EndDate, LastWrkDate, IncReason );
+            end;
+            Bal_2 = bal.Balance;
+          end;
+
+          BWP_GetFiles( IsCur );
+        end;
+
+        /* Обработка результатов сканирования лицевых балансового */
+        if ( Stat )
+          /* Открытые счета есть - включить */
+          if ( not BWP_IsUsed( bal, BegDate, EndDate, LastWrkDate ) )
+            bal.cBlncUsedBWP = "X";
+            bal.bdIncludeBWP = BegDate;
+            bal.bdExcludeBWP = BWP_MaxDate;
+            if ( BWP_TEST or BWP_UpdateBal( bal ) )
+              if ( Index( bal.Type_Balance, "1" ) > 0 )
+                IncReason = "Включенны б/счета 2-го порядка";
+              end;
+              Rep.PrintString( Bal_1, Bal_2, IncReason );
+            else
+              BErrCode = Status( BErrMess );
+              Rep.PrintString   ( Bal_1, Bal_2 );
+              Rep.PrintSeparatorExt( false, true,  2 );
+              Rep.PrintStringExt   ( BErrMess,     2 );
+              Rep.PrintSeparatorExt( false, false, 2 );
+            end;
+
+            Bal_1_Chg = true;
+          end;
+        end;
+
+        Bal_1 = SubStr( bal.Balance, 1, 3);
+
+      end;
+    end;
+  End;
+
+  /*//23 Mar 07 Malakhova Irina 103782*/
+  InitProgress(-1,
+                StrProcName,
+                "Обработано записей" );
+
+  /* Создать отчет */
+  ConstructReport();
+
+  /* Сканируем */
+  Rep.MemHead();
+  ScanBalRefExc( false );
+  Rep.MemBottom();
+
+  /* Обработка результатов сканирования рублей (чтобы не печатать пустую таблицу)*/
+  if ( Rep.GetEmpty() )
+    Rep.ResetMemStr();
+    Rep.PrintFreeString(" ");
+    Rep.PrintFreeString("Отнесение счетов к РПС не требуется.");
+  end;
+
+  /* Печатаем, если что-то запоминали */
+  Rep.PrintMemStr();
+
+  RemProgress();
+
+  BWP_Status = 0;
+
+END;
+
+/* Построение РПС (общая часть) */
+Private
+MACRO BWP_ConstructCommonSQL( StrProcName, KindConstruct, ProcTestOneAccount )
+
+  BWP_Status = 1;
+
+  /* Обрабатываем все главы */
+  Const Chapter = 0;
+
+  /* Даты периода построения РПС */
+  Var BegDate = GetFirstDayMonth( {curdate} ),
+      EndDate = {curdate};
+
+  if ( not GetDate( BegDate, "Введите дату начала периода") )
+    BWP_Status = 1;
+    Exit(1);
+  end;
+
+  if ( not GetDate( EndDate, "Введите дату конца периода") )
+    BWP_Status = 1;
+    Exit(1);
+  end;
+
+  if ( BegDate > EndDate )
+    MsgBox( "Дата на начала периода не должна превышать дату его конца" );
+    BWP_Status = 1;
+    Exit(1);
+  end;
+
+  BWP_IncludeDate = EndDate;
+  BWP_ExcludeDate = EndDate;
+
+  /* Отчет по добавленным */
+  Var Rep = CTableReport( 0, true, true );
+
+  /* Ошибки работы с БД */
+  Var BErrCode = 0,    /* Код ошибки */
+      BErrMess = "";   /* Сообщение  */
+
+  /* Количество обработанных записей для "полоски" */
+  Var Recs = 0;
+
+  /* Создать отчет */
+  Macro ConstructReport()
+    Var i;
+
+    if   ( KindConstruct == KindConstructBWP_Open )
+      Rep.AddColumn( "Б/с 1 п",      3 );
+      Rep.AddColumn( "Б/с 2 п",      5 );
+    elif ( KindConstruct == KindConstructBWP_Work )
+      Rep.AddColumn( "Б/с 1 п",            3 );
+      Rep.AddColumn( "Б/с 2 п",            5 );
+      Rep.AddColumn( "Причина отнесения", 35 );
+    end;
+
+    Rep.PrintFreeString("Протокол отнесения балансовых счетов к РПС на дату " + {curdate});
+    Rep.PrintFreeString("Исполнитель: " + {oper});
+    Rep.PrintFreeString("Дата и время создания: " + date + "   " + time);
+    Rep.PrintFreeString(" ");
+    Rep.PrintFreeString("В результате выполнения операции к рабочему плану счетов были отнесены");
+    Rep.PrintFreeString("следующие балансовые счета: ");
+    Rep.PrintFreeString(" ");
+  End;
+
+  /* Сканирование файлов по ссылкам */
+  Macro ScanBal()
+
+    Var Scaner      = BWP_MainScan( BegDate, EndDate );
+    Var NRecs;
+    Var Bal_1       = "",
+        Bal_2       = "",
+        Bal_1_Chg   = false,
+        IncReason   = "";
+
+    /*//23 Mar 07 Malakhova Irina 103782*/
+    InitProgress(-1,
+                  StrProcName,
+                  "Обработано записей" );
+
+    NRecs = 0;
+
+    while( Scaner.moveNext() )
+
+      IncReason   = "";
+
+      if ( (Bal_1 != SubStr( Scaner.Balance, 1, 3)) or (not Bal_1_Chg) )
+        Bal_1 = SubStr( Scaner.Balance, 1, 3);
+        if ( not Scaner.hasBalance1() )
+          Bal_1 = "Нет";
+        end;
+        Bal_1_Chg = false;
+      else
+        Bal_1 = "";
+      end;
+
+      if ( Scaner.isBalance1() )
+        Bal_2 = "";
+      else
+        Bal_2 = Scaner.Balance;
+      end;
+
+      if ( ExecMacro2(ProcTestOneAccount,Scaner,IncReason) )
+        if ( not Scaner.isUsedBWP(true) )
+          Scaner.IncludeBWP  = BegDate;
+          Scaner.ExcludeBWP  = BWP_MaxDate;
+          if ( Scaner.update() )
+            if ( Scaner.isBalance1() )
+              IncReason = "Включенны б/счета 2-го порядка";
+            end;
+            Rep.PrintString( Bal_1, Bal_2, IncReason );
+          else
+            BErrCode = Status( BErrMess );
+            Rep.PrintString      ( Bal_1, Bal_2    );
+            Rep.PrintSeparatorExt( false, true,  2 );
+            Rep.PrintStringExt   ( BErrMess,     2 );
+            Rep.PrintSeparatorExt( false, false, 2 );
+          end;
+
+          Bal_1_Chg = true;
+        end;
+      end;
+      Bal_1 = SubStr( Scaner.Balance, 1, 3);
+
+      NRecs = NRecs + 1;
+      UseProgress(NRecs);
+
+    end;
+
+    RemProgress();
+
+  End;
+
+  /* Создать отчет */
+  ConstructReport();
+
+  /* Сканируем */
+  Rep.MemHead();
+  ScanBal();
+  Rep.MemBottom();
+
+  /* Обработка результатов сканирования рублей (чтобы не печатать пустую таблицу)*/
+  if ( Rep.GetEmpty() )
+    Rep.ResetMemStr();
+    Rep.PrintFreeString(" ");
+    Rep.PrintFreeString("Отнесение счетов к РПС не требуется.");
+  end;
+
+  /* Печатаем, если что-то запоминали */
+  Rep.PrintMemStr();
+
+  BWP_Status = 0;
+
+END;
+
+/*************************************/
+/* Построение РПС по открытым счетам */
+/*************************************/
+
+/* Предварительная информация */
+MACRO BWP_ConstructByOpenAccountsPreInform()
+
+  BWP_PreInform
+  (
+    "В результате выполнения этой процедуры будет построен рабочий план счетов,\n" +
+    "в который войдут балансовые счета, на которых в указанный Вами период были\n" +
+    "открытые лицевые счета.\n\n" +
+    "Для продолжения нажмите <Esc>..."
+  );
+
+END;
+
+/* Обработать/проверить один лицевой */
+MACRO TestOneAccount_ByOpenAccounts( StatA, ChapterA, BegDate, EndDate, LastWrkDate )
+
+  if ( not BWP_GetAcc( ChapterA, accbal.Account, accbal.Code_Currency, True ) )
+    BWP_Status = 1;
+    Exit( 1 );
+  end;
+
+  /* Проверяем лицевой */
+  if ( acc.Open_Date <= EndDate )
+    if   ( acc.Open_Close == ""      )  /* Счет открыт                */
+      LastWrkDate = EndDate;
+      StatA = true;
+    elif ( acc.Close_Date >= BegDate )  /* Закрыт в период построения */
+      if ( acc.Close_Date > EndDate )
+        LastWrkDate = EndDate;
+      else
+        if ( LastWrkDate < acc.Close_Date )
+          LastWrkDate = acc.Close_Date;
+        end;
+      end;
+      StatA = true;
+    end;
+  end;
+
+  SetParm( 4, LastWrkDate );
+
+  return StatA;
+END;
+
+/* Построение РПС по открытым счетам */
+MACRO BWP_ConstructByOpenAccountsPervasive()
+
+  BWP_ConstructCommonPervasive(
+                                "Построение рабочего плана счетов по открытым счетам",
+                                KindConstructBWP_Open,
+                                @TestOneAccount_ByOpenAccounts
+                              );
+
+END;
+
+/* Обработать/проверить один лицевой */
+MACRO TestOneBalance_ByOpenAccounts( Scaner )
+  return Scaner.nOpenAcc > 0;
+END;
+
+/* Построение РПС по открытым счетам */
+MACRO BWP_ConstructByOpenAccountsSQL()
+
+
+  BWP_ConstructCommonSQL(
+                       "Построение рабочего плана счетов по открытым счетам",
+                       KindConstructBWP_Open,
+                       @TestOneBalance_ByOpenAccounts
+                     );
+
+END;
+
+/* Построение РПС по открытым счетам */
+MACRO BWP_ConstructByOpenAccounts()
+
+  if ( IsSQL() ) BWP_ConstructByOpenAccountsSQL();
+  else           BWP_ConstructByOpenAccountsPervasive();
+  end;
+
+END;
+
+/***************************************/
+/* Построение РПС по работающим счетам */
+/***************************************/
+
+/* Предварительная информация */
+MACRO BWP_ConstructByWorkAccountsPreInform()
+
+  BWP_PreInform
+  (
+    "В результате выполнения этой процедуры будет построен рабочий план счетов,\n" +
+    "в который войдут балансовые счета, работающие в указанный Вами период\n\n" +
+    "Для продолжения нажмите <Esc>..."
+  );
+
+END;
+
+
+/* Обработать/проверить один лицевой */
+MACRO TestOneAccount_ByWorkAccounts( StatA, ChapterA, BegDate, EndDate, LastWrkDate, IncReason )
+
+  /* Были ли обороты */
+  Macro IsAccTurns( DateCarry )
+
+    Var LastDateCarry = BWP_MinDate;
+
+    DateCarry = BWP_MinDate;
+
+    if ( EndDate >= {curdate} )
+      /* Сканируем документы опердня по плательщику,
+          если хоть один найден - обороты были */
+      FirstDP  = true;
+      while ( BWP_ScanDP( ChapterA, acc.Account, acc.Code_Currency ) )
+        DateCarry = {curdate};
+        SetParm( 0, DateCarry );
+        return true;
+      end;
+
+      /* Сканируем документы опердня по получателю,
+         если хоть один найден - обороты были */
+      FirstDR  = true;
+      while ( BWP_ScanDR( ChapterA, acc.Account, acc.Code_Currency ) )
+        DateCarry = {curdate};
+        SetParm( 0, DateCarry );
+        return true;
+      end;
+    end;
+
+    if ( BegDate < {curdate} )
+      /* Получить последнюю дату проводки в архиве по плательщику */
+      LastDateCarry = BWP_GetLastDateCarryADP( ChapterA, acc.Account, acc.Code_Currency, BegDate, EndDate );
+      if ( DateCarry < LastDateCarry )
+        DateCarry = LastDateCarry;
+      end;
+
+      /* Получить последнюю дату проводки в архиве по получателю */
+      LastDateCarry = BWP_GetLastDateCarryADR( ChapterA, acc.Account, acc.Code_Currency, BegDate, EndDate );
+      if ( DateCarry < LastDateCarry )
+        DateCarry = LastDateCarry;
+      end;
+    end;
+
+    SetParm( 0, DateCarry );
+
+    return DateCarry != BWP_MinDate;
+
+  End;
+
+  Var DateCarry = BWP_MinDate,
+      STR_REST  = "Ненулевой остаток",
+      STR_TURN  = "Наличие оборотов";
+
+  if ( not BWP_GetAcc( ChapterA, accbal.Account, accbal.Code_Currency, True ) )
+    BWP_Status = 1;
+    Exit( 1 );
+  end;
+
+  /* Проверяем лицевой */
+  if ( acc.Open_Date <= EndDate )
+    if   ( acc.PlanRest   != 0  )     /* Ненулевой остаток по счету */
+      LastWrkDate = EndDate;
+      StatA = true;
+      IncReason = STR_REST;
+    elif ( IsAccTurns( DateCarry ) )  /* Были обороты по счету      */
+      if ( LastWrkDate < DateCarry )
+        LastWrkDate = DateCarry;
+      end;
+      StatA = true;
+      if ( IncReason != STR_REST )
+        IncReason = STR_TURN;
+      end;
+    end;
+  end;
+
+  SetParm( 4, LastWrkDate );
+  SetParm( 5, IncReason   );
+
+  return StatA;
+END;
+
+/* Построение РПС по работающим счетам */
+MACRO BWP_ConstructByWorkAccountsPervasive()
+
+  BWP_ConstructCommonPervasive(
+                                "Построение рабочего плана счетов по работающим счетам",
+                                KindConstructBWP_Work,
+                                @TestOneAccount_ByWorkAccounts
+                              );
+
+END;
+
+/* Обработать/проверить один лицевой */
+MACRO TestOneBalance_ByWorkAccounts( Scaner, IncReason )
+
+  Var STR_REST  = "Ненулевой остаток",
+      STR_TURN  = "Наличие оборотов";
+
+  IncReason = "";
+
+  if   ( Scaner.PlanRest != $0 )                         IncReason = STR_REST;
+  elif ( (Scaner.Debet != $0) or (Scaner.Credit != $0) ) IncReason = STR_TURN;
+  end;
+
+  SetParm( 1, IncReason );
+
+  return IncReason != "";
+END;
+
+/* Построение РПС по работающим счетам */
+MACRO BWP_ConstructByWorkAccountsSQL()
+
+  BWP_ConstructCommonSQL(
+                          "Построение рабочего плана счетов по работающим счетам",
+                          KindConstructBWP_Work,
+                          @TestOneBalance_ByWorkAccounts
+                        );
+
+END;
+
+/* Построение РПС по работающим счетам */
+MACRO BWP_ConstructByWorkAccounts()
+
+  if ( IsSQL() ) BWP_ConstructByWorkAccountsSQL();
+  else           BWP_ConstructByWorkAccountsPervasive();
+  end;
+
+END;
+
+/************/
+/* КОНТРОЛЬ */
+/************/
+
+Private
+MACRO BWP_ControlPervasive()
+
+  BWP_Status = 1;
+
+  /* Обрабатываем все главы */
+  Const Chapter = 0;
+
+  /* Файл отчета по исключенным счетам (временный) */
+  Const ExcOutName = GetTxtFileName("ExcOut");
+
+  /* Даты периода контроля */
+  Var BegDate = GetFirstDayMonth( {curdate} ),
+      EndDate = {curdate};
+
+  if ( not GetDate( BegDate, "Введите дату начала периода") )
+    BWP_Status = 1;
+    Exit(1);
+  end;
+
+  if ( not GetDate( EndDate, "Введите дату конца периода") )
+    BWP_Status = 1;
+    Exit(1);
+  end;
+
+  if ( BegDate > EndDate )
+    MsgBox( "Дата на начала периода не должна превышать дату его конца" );
+    BWP_Status = 1;
+    Exit(1);
+  end;
+
+  /* Отчеты */
+  Var RepExc = CTableReport( 0, true, true ), /* Отчет по исключенным */
+      RepInc = CTableReport( 0, true, true ); /* Отчет по входящим    */
+
+  /* Ошибки работы с БД */
+  Var BErrCode = 0,    /* Код ошибки */
+      BErrMess = "";   /* Сообщение  */
+
+  /* Количество обработанных записей для "полоски" */
+  Var Recs = 0;
+
+  /* Скопировать отчет по исключенным в стандартный файл вывода */
+  Macro PrintCommonReport()
+    File ExcOut() txt;
+
+    if ( not Open( ExcOut, ExcOutName ) )
+      MsgBox("Ошибка открытия файла отчета об исключенных счетах|", ExcOutName );
+    end;
+
+    Rewind( ExcOut );
+    while ( Next(ExcOut) )
+      println(ExcOut.Str);
+    end;
+  End;
+
+  /* Создать отчеты */
+  Macro ConstructReport()
+    RepExc.AddOutFile( ExcOutName );
+
+    RepExc.AddColumn( "Б/с",                                 5              );
+    RepExc.AddColumn( "Кол-во|откр. л/с",                    5              );
+    RepExc.AddColumn( "Сумма оборотов за|период по Дебету",  DOCUMENTSUMLEN );
+    RepExc.AddColumn( "Сумма оборотов за|период по Кредиту", DOCUMENTSUMLEN );
+    RepExc.AddColumn( "<<Примечание",                        40             );
+
+    RepExc.PrintFreeString(" ");
+    RepExc.PrintFreeString(" ");
+    RepExc.PrintFreeString("В рабочий план счетов за период с " + BegDate + " по " + EndDate + " не вошли");
+    RepExc.PrintFreeString("следующие балансовые счета: ");
+    RepExc.PrintFreeString(" ");
+
+    RepInc.AddColumn( "Б/с",                                 5              );
+    RepInc.AddColumn( "Кол-во|откр. л/с",                    5              );
+    RepInc.AddColumn( "Сумма оборотов за|период по Дебету",  DOCUMENTSUMLEN );
+    RepInc.AddColumn( "Сумма оборотов за|период по Кредиту", DOCUMENTSUMLEN );
+    RepInc.AddColumn( "<<Примечание",                        40             );
+
+    RepInc.PrintFreeString("Протокол контроля соответствия рабочего плана счетов и счетов,");
+    RepInc.PrintFreeString("открытых в балансе за период с " + BegDate + " по " + EndDate  );
+    RepInc.PrintFreeString("Исполнитель: " + {oper});
+    RepInc.PrintFreeString("Дата и время создания: " + date + "   " + time);
+    RepInc.PrintFreeString(" ");
+    RepInc.PrintFreeString("К рабочему плану счетов за период с " + BegDate + " по " + EndDate + " относятся");
+    RepInc.PrintFreeString("следующие балансовые счета: ");
+    RepInc.PrintFreeString(" ");
+  End;
+
+  /* Сканирование файлов по ссылкам */
+  Macro ScanBalRefExc( IsCur )
+
+    /* Инициализировать ссылки */
+    BWP_GetFiles( IsCur );
+
+    /* Фильтр на балансовые счета */
+    macro FilterBalance()
+      Var StatF = true;
+
+      if ( Chapter != 0 )
+        if ( Chapter != bal.Chapter )
+          StatF = false;
+        end;
+      else
+        if ( bal.Chapter > 5 )
+          StatF = false;
+        end;
+      end;
+
+      if ( not StatF )
+        return StatF;
+      end;
+
+      if ( BWP_NumPlan != bal.iNumPlan )
+        StatF = false;
+      end;
+
+      if ( not StatF )
+        return StatF;
+      end;
+
+      return StatF;
+    end;
+
+    /* Обработать один лицевой */
+    macro ServOneAccount( ChapterA, nOpenedA, DebetA, CreditA, LastWrkDate )
+
+      /* Были ли обороты */
+      macro GetAccTurns( DateCarry )
+
+        Var S = $0;
+
+        DateCarry = BWP_MinDate;
+
+        if ( EndDate >= {curdate} )
+          /* Сканируем документы опердня по плательщику,
+             если хоть один найден - обороты были */
+          FirstDP  = true;
+          while ( BWP_ScanDP( ChapterA, acc.Account, acc.Code_Currency ) )
+            ConvSum( S, doc.Sum, {curdate}, acc.Code_Currency, 0 );
+            DebetA = DebetA + S;
+            DateCarry = {curdate};
+          end;
+
+          /* Сканируем документы опердня по получателю,
+             если хоть один найден - обороты были */
+          FirstDR  = true;
+          while ( BWP_ScanDR( ChapterA, acc.Account, acc.Code_Currency ) )
+            ConvSum( S, doc.Sum, {curdate}, acc.Code_Currency, 0 );
+            CreditA = CreditA + S;
+            DateCarry = {curdate};
+          end;
+        end;
+
+        if ( BegDate < {curdate} )
+          /* Сканируем архивные документы по плательщику, если дата
+             проводки больше начала периода актуализации - обороты были */
+          FirstADP = true;
+          while ( BWP_ScanADP( ChapterA, acc.Account, acc.Code_Currency ) )
+            if ( (adoc.Date_Carry >= BegDate) and (adoc.Date_Carry <= EndDate) )
+              ConvSum( S, adoc.Sum, adoc.Date_Carry, acc.Code_Currency, 0 );
+              DebetA = DebetA + S;
+              if ( DateCarry < adoc.Date_Carry )
+                DateCarry = adoc.Date_Carry;
+              end;
+            end;
+          end;
+
+          /* Сканируем архивные документы по получателю, если дата
+             проводки больше начала периода актуализации - обороты были */
+          FirstADR = true;
+          while ( BWP_ScanADR( ChapterA, acc.Account, acc.Code_Currency ) )
+            if ( (adoc.Date_Carry >= BegDate) and (adoc.Date_Carry <= EndDate) )
+              ConvSum( S, adoc.Sum, adoc.Date_Carry, acc.Code_Currency, 0 );
+              CreditA = CreditA + S;
+              if ( DateCarry < adoc.Date_Carry )
+                DateCarry = adoc.Date_Carry;
+              end;
+            end;
+          end;
+        end;
+
+        SetParm( 0, DateCarry );
+
+      end;
+
+      Var DateCarry = BWP_MinDate;
+
+      if ( not BWP_GetAcc( ChapterA, accbal.Account, accbal.Code_Currency, True ) )
+        BWP_Status = 1;
+        Exit( 1 );
+      end;
+
+      /* Был ли открыт счет */
+      if   ( (acc.Open_Date  <= EndDate) and (acc.Close_Date == BWP_MinDate ) ) nOpenedA = nOpenedA + 1;  /* Счет был открыт */
+      elif ( (acc.Close_Date >= BegDate) and (acc.Close_Date <= EndDate     ) ) nOpenedA = nOpenedA + 1;  /* Счет был открыт */
+      end;
+
+      if ( acc.Open_Date <= EndDate )
+        if ( acc.Open_Close == "" )
+          LastWrkDate = EndDate;
+        elif ( acc.Close_Date >= BegDate )    /* Закрыт в период построения */
+          if ( acc.Close_Date > EndDate )
+            LastWrkDate = EndDate;
+          elif ( LastWrkDate < acc.Close_Date )
+              LastWrkDate = acc.Close_Date;
+          end;
+        end;
+
+        /* Получить обороты */
+        GetAccTurns( DateCarry );
+      end;
+
+      if ( LastWrkDate < DateCarry )
+        LastWrkDate = DateCarry;
+      end;
+
+      SetParm( 1, nOpenedA    );
+      SetParm( 2, DebetA      );
+      SetParm( 3, CreditA     );
+      SetParm( 4, LastWrkDate );
+
+    end;
+
+    Var Chap        =  1,
+        nOpAcc      =  0,
+        Debet       = $0,
+        Credit      = $0,
+        Note        = "",
+        LastWrkDate = BWP_MinDate;
+
+    /* Сканируем балансовые */
+    KeyNum( bal, 0 );
+    Rewind( bal );
+    while ( Next( bal ) )
+
+      Recs = Recs + 1;
+      UseProgress( Recs );
+
+      if ( FilterBalance() )
+
+        nOpAcc      =  0;
+        Debet       = $0;
+        Credit      = $0;
+        Note        = "";
+        LastWrkDate = BWP_MinDate;
+
+        /* Отдельно сканируем лицевые балансовых 2-го и 1-го порядков */
+        if ( Index( bal.Type_Balance, "1" ) > 0 )
+          FirstAB1 =  true;
+          while( BWP_ScanAB1( bal.Chapter, bal.Balance ) )
+            ServOneAccount( bal.Chapter, nOpAcc, Debet, Credit, LastWrkDate );
+          end;
+        else
+          FirstAB  =  true;
+          while( BWP_ScanAB( bal.Chapter, bal.Balance ) )
+            ServOneAccount( bal.Chapter, nOpAcc, Debet, Credit, LastWrkDate );
+          end;
+        end;
+
+        /* Теперь пробуем по другому справочнику */
+        BWP_GetFiles( not IsCur );
+
+        /* Отдельно сканируем лицевые балансовых 2-го и 1-го порядков */
+        if ( Index( bal.Type_Balance, "1" ) > 0 )
+          FirstAB1 =  true;
+          while( BWP_ScanAB1( bal.Chapter, bal.Balance ) )
+            ServOneAccount( bal.Chapter, nOpAcc, Debet, Credit, LastWrkDate );
+          end;
+        else
+          FirstAB  =  true;
+          while( BWP_ScanAB( bal.Chapter, bal.Balance ) )
+            ServOneAccount( bal.Chapter, nOpAcc, Debet, Credit, LastWrkDate );
+          end;
+        end;
+
+        BWP_GetFiles( IsCur );
+
+        /* Обрабатываем включенные и исключенные */
+        if ( not BWP_IsUsed( bal, BegDate, EndDate, LastWrkDate ) )
+          if   ( (nOpAcc > 0) and ((Debet != $0) or (Credit != $0)) )
+            Note = "Есть открытые л/с и обороты";
+          elif ( nOpAcc > 0 )
+            Note = "На б/с есть открытые л/с";
+          elif ( (Debet != $0) or (Credit != $0) )
+            Note = "Были обороты по счету за период";
+          end;
+
+          RepExc.PrintString( bal.Balance, nOpAcc, Debet, Credit, Note );
+        else
+          if   ( (nOpAcc == 0) and ((Debet == $0) and (Credit == $0)) )
+            Note = "Нет открытых л/с и движений за период";
+          elif ( nOpAcc == 0 )
+            Note = "Нет открытых л/с";
+          elif ( (Debet == $0) and (Credit == $0) )
+            Note = "Не было движения по счету за период";
+          end;
+
+          RepInc.PrintString( bal.Balance, nOpAcc, Debet, Credit, Note );
+
+        end;
+
+      end;
+    end;
+  End;
+  /*//23 Mar 07 Malakhova Irina 103782*/
+  InitProgress(-1,
+                "Контроль рабочего плана счетов",
+                "Обработано записей" );
+
+  /* Создать отчет */
+  ConstructReport();
+
+  /* Сканируем рубли */
+  RepInc.MemHead();
+  RepExc.MemHead();
+  ScanBalRefExc( false );
+  RepExc.MemBottom();
+  RepInc.MemBottom();
+
+  /* Обработка результатов сканирования (чтобы не печатать пустую таблицу)*/
+  if ( RepInc.GetEmpty() )
+    RepInc.ResetMemStr();
+    RepInc.PrintFreeString(" ");
+    RepInc.PrintFreeString("Все балансовые счета исключены из РПС");
+  end;
+  if ( RepExc.GetEmpty() )
+    RepExc.ResetMemStr();
+    RepExc.PrintFreeString(" ");
+    RepExc.PrintFreeString("Все балансовые счета входят в РПС");
+  end;
+
+  /* Печатаем, если что-то запоминали */
+  RepInc.PrintMemStr();
+  RepExc.PrintMemStr();
+
+  RemProgress();
+
+  /* Печатаем общий отчет */
+  PrintCommonReport();
+
+  BWP_Status = 0;
+
+END;
+
+Private
+MACRO BWP_ControlSQL()
+
+  BWP_Status = 1;
+
+  /* Обрабатываем все главы */
+  Const Chapter = 0;
+
+  /* Файл отчета по исключенным счетам (временный) */
+  Const ExcOutName = GetTxtFileName("ExcOut");
+
+  /* Даты периода контроля */
+  Var BegDate = GetFirstDayMonth( {curdate} ),
+      EndDate = {curdate};
+
+  if ( not GetDate( BegDate, "Введите дату начала периода") )
+    BWP_Status = 1;
+    Exit(1);
+  end;
+
+  if ( not GetDate( EndDate, "Введите дату конца периода") )
+    BWP_Status = 1;
+    Exit(1);
+  end;
+
+  if ( BegDate > EndDate )
+    MsgBox( "Дата на начала периода не должна превышать дату его конца" );
+    BWP_Status = 1;
+    Exit(1);
+  end;
+
+  /* Отчеты */
+  Var RepExc = CTableReport( 0, true, true ), /* Отчет по исключенным */
+      RepInc = CTableReport( 0, true, true ); /* Отчет по входящим    */
+
+  /* Ошибки работы с БД */
+  Var BErrCode = 0,    /* Код ошибки */
+      BErrMess = "";   /* Сообщение  */
+
+  /* Количество обработанных записей для "полоски" */
+  Var Recs = 0;
+
+  /* Скопировать отчет по исключенным в стандартный файл вывода */
+  Macro PrintCommonReport()
+    File ExcOut() txt;
+
+    if ( not Open( ExcOut, ExcOutName ) )
+      MsgBox("Ошибка открытия файла отчета об исключенных счетах|", ExcOutName );
+    end;
+
+    Rewind( ExcOut );
+    while ( Next(ExcOut) )
+      println(ExcOut.Str);
+    end;
+  End;
+
+  /* Создать отчеты */
+  Macro ConstructReport()
+    RepExc.AddOutFile( ExcOutName );
+
+    RepExc.AddColumn( "Б/с",                                 5              );
+    RepExc.AddColumn( "Кол-во|откр. л/с",                    5              );
+    RepExc.AddColumn( "Сумма оборотов за|период по Дебету",  DOCUMENTSUMLEN );
+    RepExc.AddColumn( "Сумма оборотов за|период по Кредиту", DOCUMENTSUMLEN );
+    RepExc.AddColumn( "<<Примечание",                        40             );
+
+    RepExc.PrintFreeString(" ");
+    RepExc.PrintFreeString(" ");
+    RepExc.PrintFreeString("В рабочий план счетов за период с " + BegDate + " по " + EndDate + " не вошли");
+    RepExc.PrintFreeString("следующие балансовые счета: ");
+    RepExc.PrintFreeString(" ");
+
+    RepInc.AddColumn( "Б/с",                                 5              );
+    RepInc.AddColumn( "Кол-во|откр. л/с",                    5              );
+    RepInc.AddColumn( "Сумма оборотов за|период по Дебету",  DOCUMENTSUMLEN );
+    RepInc.AddColumn( "Сумма оборотов за|период по Кредиту", DOCUMENTSUMLEN );
+    RepInc.AddColumn( "<<Примечание",                        40             );
+
+    RepInc.PrintFreeString("Протокол контроля соответствия рабочего плана счетов и счетов,");
+    RepInc.PrintFreeString("открытых в балансе за период с " + BegDate + " по " + EndDate  );
+    RepInc.PrintFreeString("Исполнитель: " + {oper});
+    RepInc.PrintFreeString("Дата и время создания: " + date + "   " + time);
+    RepInc.PrintFreeString(" ");
+    RepInc.PrintFreeString("К рабочему плану счетов за период с " + BegDate + " по " + EndDate + " относятся");
+    RepInc.PrintFreeString("следующие балансовые счета: ");
+    RepInc.PrintFreeString(" ");
+  End;
+
+  /* Сканирование файлов по ссылкам */
+  Macro ScanBal()
+
+    Var Scaner = BWP_MainScan( BegDate, EndDate );
+    Var NRecs;
+    Var Note   = "";
+
+    /*//23 Mar 07 Malakhova Irina 103782*/
+    InitProgress(-1,
+                  "Контроль рабочего плана счетов",
+                  "Обработано записей" );
+
+    NRecs = 0;
+
+    while( Scaner.moveNext() )
+
+      Note = "";
+
+      if ( not Scaner.isUsedBWP(true) )
+        if   ( (Scaner.nOpenAcc > 0) and ((Scaner.Debet != $0) or (Scaner.Credit != $0)) )
+          Note = "Есть открытые л/с и обороты";
+        elif ( Scaner.nOpenAcc > 0 )
+          Note = "На б/с есть открытые л/с";
+        elif ( (Scaner.Debet != $0) or (Scaner.Credit != $0) )
+          Note = "Были обороты по счету за период";
+        end;
+
+        RepExc.PrintString( Scaner.Balance, Scaner.nOpenAcc, Scaner.Debet, Scaner.Credit, Note );
+      else
+        if   ( (Scaner.nOpenAcc == 0) and ((Scaner.Debet == $0) and (Scaner.Credit == $0)) )
+          Note = "Нет открытых л/с и движений за период";
+        elif ( Scaner.nOpenAcc == 0 )
+          Note = "Нет открытых л/с";
+        elif ( (Scaner.Debet == $0) and (Scaner.Credit == $0) )
+          Note = "Не было движения по счету за период";
+        end;
+
+        RepInc.PrintString( Scaner.Balance, Scaner.nOpenAcc, Scaner.Debet, Scaner.Credit, Note );
+
+      end;
+
+      NRecs = NRecs + 1;
+      UseProgress(NRecs);
+
+    end;
+
+    RemProgress();
+
+  End;
+
+  /* Создать отчет */
+  ConstructReport();
+
+  /* Сканируем рубли */
+  RepInc.MemHead();
+  RepExc.MemHead();
+  ScanBal( false );
+  RepExc.MemBottom();
+  RepInc.MemBottom();
+
+  /* Обработка результатов сканирования (чтобы не печатать пустую таблицу)*/
+  if ( RepInc.GetEmpty() )
+    RepInc.ResetMemStr();
+    RepInc.PrintFreeString(" ");
+    RepInc.PrintFreeString("Все балансовые счета исключены из РПС");
+  end;
+  if ( RepExc.GetEmpty() )
+    RepExc.ResetMemStr();
+    RepExc.PrintFreeString(" ");
+    RepExc.PrintFreeString("Все балансовые счета входят в РПС");
+  end;
+
+  /* Печатаем, если что-то запоминали */
+  RepInc.PrintMemStr();
+  RepExc.PrintMemStr();
+
+  /* Печатаем общий отчет */
+  PrintCommonReport();
+
+  BWP_Status = 0;
+
+END;
+
+MACRO BWP_Control()
+
+  if ( IsSQL() ) BWP_ControlSQL();
+  else           BWP_ControlPervasive();
+  end;
+
+END;
+
+/******************************************/
+/* Используется ли счет в течение периода */
+/******************************************/
+
+MACRO BWP_IsBalanceUsed( Chapter, NumPlan, Balance, IsCur, BegDate, EndDate )
+
+  BWP_Status = 1;
+
+  /* Инициализировать ссылки */
+  BWP_GetFiles( IsCur );
+
+  /* Встать на балансовый */
+  if ( not BWP_GetBal( Chapter, Balance, True ) )
+    BWP_Status = 1;
+    Exit(1);
+  end;
+
+  /* Анализ периода */
+  if ( (bal.bdIncludeBWP <= EndDate) and (bal.bdExcludeBWP >= BegDate ) )
+    BWP_Status = 0;
+  else
+    BWP_Status = 1;
+  end;
+
+  Exit(1);
+
+END;
+
+/* !!!BZ!!! Эта функция является библиотечной. По возможности выне
+            сти в библиотеку lib_bwp.mac                        */
+/****************************************************************/
+/* Используется ли счет в течение периода( вызовы из макросов ) */
+/****************************************************************/
+
+MACRO BWPIsBalanceUsed( Chapter, NumPlan, Balance, IsCur, BegDate, EndDate )
+
+  /* Инициализировать ссылки */
+  BWP_GetFiles( IsCur );
+
+  /* Встать на балансовый */
+  if ( not BWP_GetBal( Chapter, Balance, True ) )
+    return false;
+  end;
+
+  /* Анализ периода */
+  if ( (bal.bdIncludeBWP <= EndDate) and (bal.bdExcludeBWP >= BegDate ) )
+    return true;
+  else
+    return false;
+  end;
+
+END;
+
+
+/*******************************************************************/
+/* Инициализировать процедуру включения счетов при расчете баланса */
+/*******************************************************************/
+
+Var BWP_CalcBalanceOutName = GetTxtFileName("bwp_bclc");
+
+MACRO BWP_CalcBalanceConstructReport( Rep, AddToFile )
+
+  Rep.AddOutFile( BWP_CalcBalanceOutName, AddToFile );
+
+  Rep.AddColumn("Бал. счет",  5  );
+  Rep.AddColumn("",           40 );  /* для сообщений об ошибках */
+
+END;
+
+
+MACRO BWP_CalcBalanceInit()
+  DelFile( BWP_CalcBalanceOutName );
+
+  BWP_Status = 0;
+END;
+
+/*************************************/
+/* Включить счет при расчете баланса */
+/*************************************/
+
+MACRO BWP_CalcBalanceInclude( Chapter, NumPlan, Balance, IsCur, IncludeDate )
+
+  BWP_Status = 1;
+
+  /* Инициализировать ссылки */
+  BWP_GetFiles( IsCur );
+
+  /* Ошибки BTrieve */
+  Var BErrCode = 0,
+      BErrMess = "";
+
+  /* Отчет */
+  Var Rep = CTableReport( 0, true, true );
+
+  BWP_IncludeDate = IncludeDate;
+  BWP_ExcludeDate = BWP_MaxDate;
+
+  /* Если файла нет, то создаем и рисуем шарку */
+  if ( not ExistFile(BWP_CalcBalanceOutName) )
+    BWP_CalcBalanceConstructReport( Rep, False );
+
+    Rep.PrintFreeString("При расчете баланса были выявлены обороты (остатки) по счетам,");
+    Rep.PrintFreeString("не входящим в РПС за период расчета. Счета включены в РПС:");
+    Rep.PrintFreeString(" ");
+
+    Rep.PrintHead();
+  else
+    BWP_CalcBalanceConstructReport( Rep, True );
+  end;
+
+  /* Включем счет первого порядка, если есть включенные 2-го порядка */
+  Macro IncludeBalance_1( Bal_2 )
+
+    Var Stat = true,
+        Updt = false,
+        pos  = GetPos( bal );
+
+    if ( BWP_GetBal( Chapter, SubStr( Bal_2, 1, 3 )) and (Index(bal.Type_Balance, "1") > 0) )
+      if ( trim(bal.cBlncUsedBWP) != "" )
+        if ( bal.bdIncludeBWP > BWP_IncludeDate )
+          Updt = true;
+        end;
+      else
+        Updt = true;
+      end;
+    end;
+
+    if ( Updt )
+      bal.bdIncludeBWP = BWP_IncludeDate;
+      if ( bal.bdIncludeBWP > bal.bdExcludeBWP )
+        bal.bdExcludeBWP = BWP_ExcludeDate;
+      end;
+      if ( bal.bdExcludeBWP < {curdate} )
+        bal.cBlncUsedBWP = "X";
+      end;
+      if ( BWP_TEST or BWP_UpdateBal( bal ) )
+        Rep.PrintString( bal.Balance, "" );
+        Stat = true;
+      else
+        BErrCode = Status( BErrMess );
+        Rep.PrintString( bal.Balance, "Ошибка (" + BErrCode + "): " + BErrMess );
+        Stat = false;
+      end;
+    end;
+
+    GetDirect( bal, pos );
+
+    return Stat;
+
+  End;
+
+  /* Встать на балансовый */
+  if ( not BWP_GetBal( Chapter, Balance, True ) )
+    BWP_Status = 1;
+    Exit(1);
+  end;
+
+  /* Включить балансовый первого порядка, если не включен */
+  IncludeBalance_1( Balance );
+
+  /* Включить наш балансовый */
+  bal.bdIncludeBWP = BWP_IncludeDate;
+  if ( bal.bdIncludeBWP > bal.bdExcludeBWP )
+    bal.bdExcludeBWP = BWP_ExcludeDate;
+  end;
+  if ( bal.bdExcludeBWP < {curdate} )
+    bal.cBlncUsedBWP = "X";
+  end;
+  if ( BWP_TEST or BWP_UpdateBal( bal ) )
+    Rep.PrintString( bal.Balance, "" );
+  else
+    BErrCode = Status( BErrMess );
+    Rep.PrintString( bal.Balance, "Ошибка (" + BErrCode + "): " + BErrMess );
+  end;
+
+  BWP_Status = 0;
+  return;
+
+END;
+
+/*********************************************************************/
+/* Деинициализировать процедуру включения счетов при расчете баланса */
+/*********************************************************************/
+MACRO BWP_CalcBalanceDone()
+
+  /* Если файла нет, то включенных счетов не было */
+  if ( not ExistFile(BWP_CalcBalanceOutName) )
+    BWP_Status = 0;
+    return;
+  end;
+
+  /* Отчет */
+  Var Rep = CTableReport( 0, true, true );
+
+  /* Конструируем отчет по расчету */
+  BWP_CalcBalanceConstructReport( Rep, True );
+
+  /* Печатем его низ */
+  Rep.PrintBottom();
+
+  /* Файл вывода (для показа пользователю) */
+  File OutFile() txt;
+
+  if ( not Open( OutFile, BWP_CalcBalanceOutName) )
+    MsgBox("Ошибка открытия файла с протоколом отнесения б/с к РПС");
+  else
+    ViewFile( OutFile );
+  end;
+
+  BWP_Status = 0;
+  return;
+
+END;
+
+
+/**********************************/
+/* Отчет по рабочему плану счетов */
+/**********************************/
+Private
+MACRO BWP_ReportPervasive()
+
+  /* Обрабатываем все главы */
+  Const Chapter = 0;
+
+  /* Отчет */
+  Var Rep = CTableReport( 0, false, true );
+
+  /* Даты периода отчета */
+  Var BegDate = GetFirstDayMonth( {curdate} ),
+      EndDate = {curdate};
+
+  if ( not GetDate( BegDate, "Введите дату начала периода") )
+    BWP_Status = 1;
+    Exit(1);
+  end;
+
+  if ( not GetDate( EndDate, "Введите дату конца периода") )
+    BWP_Status = 1;
+    Exit(1);
+  end;
+
+  if ( BegDate > EndDate )
+    MsgBox( "Дата на начала периода не должна превышать дату его конца" );
+    BWP_Status = 1;
+    Exit(1);
+  end;
+
+  /* Количество обработанных записей для "полоски" */
+  Var Recs = 0;
+
+  Macro ConstructReport()
+
+    Rep.AddColumn( "Б/с",                            5 );
+    Rep.AddColumn( "Дата вкл.",                     10 );
+    Rep.AddColumn( "Дата искл.",                    10 );
+    Rep.AddColumn( "<<Название балансового счета", 181 );
+
+    Rep.PrintFreeString("Рабочий план счетов за период с " + BegDate + " по " + EndDate );
+    Rep.PrintFreeString("Исполнитель: " + {oper});
+    Rep.PrintFreeString("Дата и время создания: " + date + "   " + time);
+    Rep.PrintFreeString("");
+    Rep.PrintFreeString("К рабочему плану счетов за период с " + BegDate + " по " + EndDate + " относятся следующие" );
+    Rep.PrintFreeString("балансовые счета:" );
+
+  End;
+
+  /* Сканирование файлов по ссылкам */
+  Macro ScanBalRefExc( IsCur )
+
+    /* Инициализировать ссылки */
+    BWP_GetFiles( IsCur );
+
+    /* Фильтр на балансовые счета */
+    macro FilterBalance()
+      Var StatF = true;
+
+      if ( Chapter != 0 )
+        if ( Chapter != bal.Chapter )
+          StatF = false;
+        end;
+      else
+        if ( bal.Chapter > 5 )
+          StatF = false;
+        end;
+      end;
+
+      if ( BWP_NumPlan != bal.iNumPlan )
+        StatF = false;
+      end;
+
+      if ( not StatF )
+        return StatF;
+      end;
+
+      return StatF;
+    end;
+
+    Var bpos = 0,
+        chap = 0,
+        blnc = "";
+
+    Var incdate1 = BWP_MaxDate,
+        excdate1 = BWP_MinDate;
+
+    /* Для печати нулевых дат */
+    Var str_inc = "",
+        str_exc = "";
+
+    /* Сканируем балансовые */
+    KeyNum( bal, 0 );
+    Rewind( bal );
+    while ( Next( bal ) )
+
+      Recs = Recs + 1;
+      UseProgress( Recs );
+
+      if ( FilterBalance() )
+
+        /* Отдельно сканируем лицевые балансовых 2-го и 1-го порядков */
+        if ( Index( bal.Type_Balance, "1" ) > 0 )
+          incdate1 = BWP_MaxDate;
+          excdate1 = BWP_MinDate;
+
+          bpos    = GetPos( bal );
+          chap    = bal.Chapter;
+          blnc    = bal.Balance;
+          FirstB1 = true;
+          while ( BWP_ScanB1( chap, blnc ) )
+            if ( (incdate1 > bal.bdIncludeBWP) and BWP_IsUsed( bal, BegDate, EndDate ) )
+              incdate1 = bal.bdIncludeBWP;
+            end;
+            if ( excdate1 < bal.bdExcludeBWP )
+              excdate1 = bal.bdExcludeBWP;
+            end;
+          end;
+          GetDirect( bal, bpos );
+
+          if ( (bal.bdIncludeBWP != incdate1) or (bal.bdExcludeBWP != excdate1) )
+            bal.bdIncludeBWP = incdate1;
+            bal.bdExcludeBWP = excdate1;
+            if ( not BWP_UpdateBal(bal) )
+              BWP_MsgBox( Chap, "Несоответствие дат счета 1-го порядка ", bal.Balance,"|и соответствующих счетов 2-го порядка" );
+            end;
+          end;
+        end;
+
+        if ( BWP_IsUsed( bal, BegDate, EndDate ) )
+          str_inc = String( bal.bdIncludeBWP );
+          str_exc = String( bal.bdExcludeBWP );
+          Rep.PrintString( bal.Balance, str_inc, str_exc, bal.Name_Part);
+        end;
+      end;
+
+    end;
+
+  End;
+  /*23 Mar 07 Malakhova Irina 103782*/
+  InitProgress(-1,
+                "Отчет по рабочему плану счетов",
+                "Обработано записей" );
+
+  /* Создать отчет */
+  ConstructReport();
+
+  /* Сканируем рубли */
+  Rep.MemHead();
+  ScanBalRefExc( false );
+  Rep.MemBottom();
+
+  if ( Rep.GetEmpty() )
+    Rep.PrintFreeString(" ");
+    Rep.PrintFreeString("Ни один счет не входит в РПС");
+    Rep.ResetMemStr();
+  else
+    Rep.SetEmpty();
+  end;
+
+  RemProgress();
+
+  /* Печатаем, если что-то запоминали */
+  Rep.PrintMemStr();
+
+  BWP_Status = 0;
+  return;
+
+END;
+
+Private
+MACRO BWP_ReportSQL()
+
+  /* Обрабатываем все главы */
+  Const Chapter = 0;
+
+  /* Отчет */
+  Var Rep = CTableReport( 0, false, true );
+
+  /* Даты периода отчета */
+  Var BegDate = GetFirstDayMonth( {curdate} ),
+      EndDate = {curdate};
+
+  if ( not GetDate( BegDate, "Введите дату начала периода") )
+    BWP_Status = 1;
+    Exit(1);
+  end;
+
+  if ( not GetDate( EndDate, "Введите дату конца периода") )
+    BWP_Status = 1;
+    Exit(1);
+  end;
+
+  if ( BegDate > EndDate )
+    MsgBox( "Дата на начала периода не должна превышать дату его конца" );
+    BWP_Status = 1;
+    Exit(1);
+  end;
+
+  /* Количество обработанных записей для "полоски" */
+  Var Recs = 0;
+
+  Macro ConstructReport()
+
+    Rep.AddColumn( "Б/с",                            5 );
+    Rep.AddColumn( "Дата вкл.",                     10 );
+    Rep.AddColumn( "Дата искл.",                    10 );
+    Rep.AddColumn( "<<Название балансового счета", 181 );
+
+    Rep.PrintFreeString("Рабочий план счетов за период с " + BegDate + " по " + EndDate );
+    Rep.PrintFreeString("Исполнитель: " + {oper});
+    Rep.PrintFreeString("Дата и время создания: " + date + "   " + time);
+    Rep.PrintFreeString("");
+    Rep.PrintFreeString("К рабочему плану счетов за период с " + BegDate + " по " + EndDate + " относятся следующие" );
+    Rep.PrintFreeString("балансовые счета:" );
+
+  End;
+
+  /* Сканирование файлов по ссылкам */
+  Macro ScanBal()
+
+    Var Scaner  = BWP_MainScan( BegDate, EndDate );
+    Var NRecs;
+    Var str_inc = "";
+    Var str_exc = "";
+
+    /*//23 Mar 07 Malakhova Irina 103782*/
+    InitProgress(-1,
+                  "Отчет по рабочему плану счетов",
+                  "Обработано записей" );
+
+    NRecs = 0;
+
+    while( Scaner.moveNext() )
+
+      if ( Scaner.isUsedBWP() )
+        str_inc = String( Scaner.IncludeBWP );
+        str_exc = String( Scaner.ExcludeBWP );
+        Rep.PrintString( Scaner.Balance, str_inc, str_exc, Scaner.Name_Part);
+      end;
+
+      NRecs = NRecs + 1;
+      UseProgress(NRecs);
+
+    end;
+
+    RemProgress();
+
+  End;
+
+  /* Контроль открытых опердней */
+  Var organizationStructure, issueMode;
+  REP_GetDefaultParmTS( organizationStructure, issueMode);
+  Var departmentList = RepDepartmentList( organizationStructure, issueMode, {OperDprt} );
+  Var opd = RepOperdaysOpened(departmentList, BegDate, EndDate);
+  if (opd.ShouldContinue == false)
+    Exit(1);
+  end;
+
+  /* Создать отчет */
+  ConstructReport();
+
+  /* Сканируем рубли */
+  Rep.MemHead();
+  ScanBal();
+  Rep.MemBottom();
+
+  if ( Rep.GetEmpty() )
+    Rep.PrintFreeString(" ");
+    Rep.PrintFreeString("Ни один счет не входит в РПС");
+    Rep.ResetMemStr();
+  else
+    Rep.SetEmpty();
+  end;
+
+  /* Печатаем, если что-то запоминали */
+  Rep.PrintMemStr();
+
+  BWP_Status = 0;
+  return;
+
+END;
+
+MACRO ibrCreateReport(beginDate, endDate)
+  var output = TOFStream("ibr_bwp_lib_web");
+
+  output.setOutputFile();
+  reportBodyFileName = output.getFileName();
+
+  /* Обрабатываем все главы */
+  Const Chapter = 0;
+
+  /* Отчет */
+  Var Rep = CTableReport( 0, false, true );
+
+  Macro ConstructReport()
+
+    Rep.AddColumn( "Б/с",                            5 );
+    Rep.AddColumn( "Дата вкл.",                     10 );
+    Rep.AddColumn( "Дата искл.",                    10 );
+    Rep.AddColumn( "<<Название балансового счета", 181 );
+
+    Rep.PrintFreeString("Рабочий план счетов за период с " + beginDate + " по " + endDate );
+    Rep.PrintFreeString("Исполнитель: " + {oper});
+    Rep.PrintFreeString("Дата и время создания: " + date + "   " + time);
+    Rep.PrintFreeString("");
+    Rep.PrintFreeString("К рабочему плану счетов за период с " + beginDate + " по " + endDate + " относятся следующие" );
+    Rep.PrintFreeString("балансовые счета:" );
+
+  End;
+
+  /* Сканирование файлов по ссылкам */
+  Macro ScanBal()
+
+    Var Scaner  = BWP_MainScan( beginDate, endDate );
+    Var NRecs;
+    Var str_inc = "";
+    Var str_exc = "";
+
+    /*//23 Mar 07 Malakhova Irina 103782*/
+    InitProgress(-1,
+                  "Отчет по рабочему плану счетов",
+                  "Обработано записей" );
+
+    NRecs = 0;
+
+    while( Scaner.moveNext() )
+
+      if ( Scaner.isUsedBWP() )
+        str_inc = String( Scaner.IncludeBWP );
+        str_exc = String( Scaner.ExcludeBWP );
+        Rep.PrintString( Scaner.Balance, str_inc, str_exc, Scaner.Name_Part);
+      end;
+
+      NRecs = NRecs + 1;
+      UseProgress(NRecs);
+
+    end;
+
+    RemProgress();
+
+  End;
+
+  /* Контроль открытых опердней */
+  Var organizationStructure, issueMode;
+  REP_GetDefaultParmTS( organizationStructure, issueMode);
+  Var departmentList = RepDepartmentList( organizationStructure, issueMode, {OperDprt} );
+  Var opd = RepOperdaysOpened(departmentList, beginDate, endDate);
+  if (opd.ShouldContinue == false)
+    Exit(1);
+  end;
+
+  /* Создать отчет */
+  ConstructReport();
+
+  /* Сканируем рубли */
+  Rep.MemHead();
+  ScanBal();
+  Rep.MemBottom();
+
+  if ( Rep.GetEmpty() )
+    Rep.PrintFreeString(" ");
+    Rep.PrintFreeString("Ни один счет не входит в РПС");
+    Rep.ResetMemStr();
+  else
+    Rep.SetEmpty();
+  end;
+
+  /* Печатаем, если что-то запоминали */
+  Rep.PrintMemStr();
+  
+  output.resetOutputFile();
+  return true;
+END;
+
+MACRO BWP_Report()
+
+  if ( IsSQL() ) BWP_ReportSQL();
+  else           BWP_ReportPervasive();
+  end;
+
+END;
+
+/* EOF */

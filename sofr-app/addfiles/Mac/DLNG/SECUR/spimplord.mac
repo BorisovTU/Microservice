@@ -1,0 +1,625 @@
+/*
+$Name:         spimplord.mac
+$Module:       Ценные бумаги
+$Description:  Формирование поручений депо в НРД при эмиссии (с целью дальнейшей загрузки в ПО "Луч")
+*/
+//import FIInter, secinter, /*FMInter,*/ "dlmisc.mac", "dl_xml.mac", "dlquery.mac", "pt_lib.mac";
+import FIInter, secinter, "dl_xml.mac", "dlquery.mac";
+import "qracctools.mac";
+
+private var Log = ErrorLoger();
+private var Rep;
+
+
+private const spr_EmSchet = 5018; //Код спрвочника эмиссионных счетов
+private const spr_NRD     = "NRD";
+private const spr_NRD_R   = "NRD_R";
+private const spr_NRD_T   = "NRD_T";
+
+private const NoAllowedChars = "[^0-9A-Za-z_()+.,-:?]";
+private const RusChars = "[А-я]";
+
+// Допустимые типы:
+private const Kind_n       = 0, // последовательность, состоящая максимально из n символов
+              Kind_X_Y     = 1, // число, большее или равное 0, состоящее максимально из X знаков
+              Kind_RUS     = 2, // контроль на русские буквы
+              Kind_Allowed = 3; // допустимые символы в коде анкеты
+
+private macro FoundCreateQrRest(ScQrAcc:TRecHandler, Rest:money, RestDate:date, ErrStr:@string)
+    var err=0, bufStr="";
+    var ScQrRestTB = TBFile("scqrrest.dbt","w",1);
+    ScQrRestTB.rec.QrId = ScQrAcc.rec.QrId;
+    ScQrRestTB.rec.Date = RestDate;
+    if (ScQrRestTB.GetEQ())
+      ScQrRestTB.rec.Rest = Rest;
+      if (not ScQrRestTB.Update())
+        RunError("Ошибка обновления записи таблицы scqrrest.dbt:|"+status(bufStr)+"-"+bufStr);
+      end;
+    else
+      ScQrRestTB.rec.QrId = ScQrAcc.rec.QrId;
+      ScQrRestTB.rec.Date = RestDate;
+      ScQrRestTB.rec.Rest = Rest;
+      if (not ScQrRestTB.Insert())
+        RunError("Ошибка вставки записи в таблицу scqrrest.dbt:|"+status(bufStr)+"-"+bufStr);
+      end;
+    end;
+  OnError(ErrObj)
+    if (IsEqClass ("TrslError", ErrObj))
+      ErrStr=ErrObj.Message;
+      if(IsEqClass ("TDbError", ErrObj.err))
+        ErrStr=ErrStr+":|"+ErrObj.err.Stat+"-"+ErrObj.err.Oper+"-"+ErrObj.err.Table+"-"+ErrObj.err.Message;
+      end;
+    elif (not ErrStr)
+      ErrStr="Ошибка выполнения FoundOpenScQr";
+    end;
+    return 1;
+  end;
+
+
+private macro FoundOpenScQr(EurPartyId:integer, DepoAcc:string, DepoPart:string, 
+    Fiid:integer, ScQrAcc:TRecHandler, AvoirRec:TRecHandler, FininstRec:TRecHandler, Rest:money, RestDate:date, ErrStr:@string)
+    var err=0, bufStr="";
+    var cmd, DataSet;
+    var ScQrAccTB = TBFile("scqracc.dbt","w");
+    ScQrAcc.Clear();
+    FininstRec.Clear();
+    AvoirRec.Clear();
+    cmd = DL_RSDCommand(  "select * from dscqracc_dbt qracc"
+                               + " where qracc.t_StorageId  = ? "
+                               + "   and qracc.t_Fiid  = ? "
+                               + "   and qracc.t_DepoAccCode = ? "
+                               + "   and qracc.t_DepoPartCode = ? "
+                               + "   and rownum = 1"
+                               ); 
+    cmd.AddParam(EurPartyId);
+    cmd.AddParam(Fiid);
+    cmd.AddParam(DepoAcc);
+    cmd.AddParam(DepoPart);
+    DataSet = cmd.Execute();
+    if (DataSet.moveNext())
+      DataSet.GetRecord().CopyTo(ScQrAcc.rec);
+      err=FoundCreateQrRest(ScQrAcc, Rest, RestDate, @ErrStr);
+    else
+      ScQrAcc.rec.StorageId = EurPartyId;
+      ScQrAcc.rec.Fiid = Fiid;
+      ScQrAcc.rec.DepoAccCode = DepoAcc;
+      ScQrAcc.rec.DepoPartCode = DepoPart;
+      err = СоздатьЗаписьВРегистреКДУ(ScQrAcc, RestDate, Rest, @ErrStr);
+    end;
+    if (not err)
+      ПолучитьФинИн(Int(Fiid),FininstRec,AvoirRec);
+    end;
+    return err;
+  OnError(ErrObj)
+    if (IsEqClass ("TrslError", ErrObj))
+      ErrStr=ErrObj.Message;
+      if(IsEqClass ("TDbError", ErrObj.err))
+        ErrStr=ErrStr+":|"+ErrObj.err.Stat+"-"+ErrObj.err.Oper+"-"+ErrObj.err.Table+"-"+ErrObj.err.Message;
+      end;
+    elif (not ErrStr)
+      ErrStr="Ошибка выполнения FoundOpenScQr";
+    end;
+    return 1;
+  end;
+
+
+ private macro processExecKDU(_FIID,_DepoAcc,_DepoPart,_Rest,_ExDate)
+    var err = 0;
+    var ErrStr = "";
+    var NumRep,StateDate,Finish,SafeDepo,ExtActi;
+    var Fiid = 0;
+    var cmd, DataSet;
+    var ScQrAcc = TRecHandler("scqracc.dbt");
+    var AvoirRec = TRecHandler("avoiriss.dbt");
+    var FininstRec = TRecHandler("fininstr.dbt"); 
+    var NRDPartyID;
+    var CodeStr = "";
+
+   GetRegistryValue( "SECUR\\NRD_CODE", V_STRING, CodeStr, err );
+          if (not err)
+            NRDPartyID = ПолучитьКодСубъекта(String(CodeStr), PTCK_CLIENT);
+            NRDPartyID = IIF(NRDPartyID,Int(NRDPartyID),0);
+          end;
+
+ 
+
+    err = FoundOpenScQr(NRDPartyId, _DepoAcc, _DepoPart, 
+                _Fiid, ScQrAcc, AvoirRec, FininstRec, _Rest, _ExDate, @ErrStr);
+ 
+     return err;
+  end;
+
+
+
+
+
+
+
+private class TSPImplOrdPrm(piNumDprt:Integer, pImplOrdDate:Date, pExecOrdDate:Date, pExecOrdTime:Time, pLastExecOrdDate:Date, pLastExecOrdTime:Time, pFormOrd:Integer, pXld:String, pFiid:Integer, pAmount:DoubleL)
+   var iNumDprt:Integer;     // Филиал
+   var ImplOrdDate:Date;     // Дата формирования поручения
+   var ExecOrdDate:Date;     // Дата исполнения поручения
+   var ExecOrdTime:Time;     // Время исполнения поручения
+   var LastExecOrdDate:Date; // Дата истечения срока исполнения поручения
+   var LastExecOrdTime:Time; // Время истечения срока исполнения поручения
+   var FormOrd:Integer;      // Форма поручения
+   var Xld:String;           // № входящего документа
+   var Fiid:Integer;         // Ценная бумага
+   var Amount:DoubleL;       // Количество ц/б
+
+   macro SetData(piNumDprt:Integer, pImplOrdDate:Date, pExecOrdDate:Date, pExecOrdTime:Time, pLastExecOrdDate:Date, pLastExecOrdTime:Time, pFormOrd:Integer, pXld:String, pFiid:Integer, pAmount:DoubleL)
+      iNumDprt = piNumDprt;               if(iNumDprt == null) iNumDprt = UnknownParty; end;
+      ImplOrdDate = pImplOrdDate;         if(ImplOrdDate == null) ImplOrdDate = Date(0,0,0); end;
+      ExecOrdDate = pExecOrdDate;         if(ExecOrdDate == null) ExecOrdDate = Date(0,0,0); end;
+      ExecOrdTime = pExecOrdTime;         if(ExecOrdTime == null) ExecOrdTime = Time(0,0,0); end;
+      LastExecOrdDate = pLastExecOrdDate; if(LastExecOrdDate == null) LastExecOrdDate = Date(0,0,0); end;
+      LastExecOrdTime = pLastExecOrdTime; if(LastExecOrdTime == null) LastExecOrdTime = Time(0,0,0); end;
+      FormOrd = pFormOrd;                 if(FormOrd == null) FormOrd = 0; end;
+      Xld = pXld;                         if(Xld == null) Xld = ""; end;
+      Fiid = pFiid;                       if(Fiid == null) Fiid = ALLFININSTR; end;
+      Amount = pAmount;                   if(Amount == null) Amount = 0.0; end;
+   end;   
+
+   private macro Constructor(piNumDprt:Integer, pImplOrdDate:Date, pExecOrdDate:Date, pExecOrdTime:Time, pLastExecOrdDate:Date, pLastExecOrdTime:Time, pFormOrd:Integer, pXld:String, pFiid:Integer, pAmount:DoubleL)
+      SetData(piNumDprt, pImplOrdDate, pExecOrdDate, pExecOrdTime, pLastExecOrdDate, pLastExecOrdTime, pFormOrd, pXld, pFiid, pAmount);
+   end;
+
+   Constructor(piNumDprt, pImplOrdDate, pExecOrdDate, pExecOrdTime, pLastExecOrdDate, pLastExecOrdTime, pFormOrd, pXld, pFiid, pAmount);
+end;
+
+private var ImplOrdPrm = TSPImplOrdPrm();
+
+
+private macro GetFormatDate(_date)
+   var y, mon, d;
+
+   datesplit(_date, d, mon, y); 
+   return string(L_Z(y, 4)) + "-" + string(L_Z(mon,2)) + "-" + string(L_Z(d,2));
+end;
+
+private macro GetFormatDateTime(_date, _time)
+   var y, mon, d, h, m, s;
+
+   datesplit(_date, d, mon, y);
+   TimeSplit(_time, h, m, s);
+   return string(L_Z(y, 4)) + "-" + string(L_Z(mon,2)) + "-" + string(L_Z(d,2)) + " " +
+          string(L_Z(h,2)) + ":" + string(L_Z(m,2)) + ":" + string(L_Z(s, 2));
+end;
+
+private macro SQL_ExistsChars(str, templ)
+   var query, cmd, dataSet, cnt = 0;
+
+   query = " SELECT 1 FROM DUAL WHERE REGEXP_LIKE(?, ?) ";
+
+   cmd = DL_RSDCommand(query);
+   cmd.AddParam(str);
+   cmd.AddParam(templ);
+
+   cnt = cmd.GetCount();
+   if(cnt > 0)
+      return true;
+   end;
+   return false;
+end;
+
+private macro CheckValue(val, kind, len, fld_name)
+   var stat = true;
+
+   if( kind == Kind_n )
+      if( strlen(val) > len )
+         Log.LogError("Длина поля " + fld_name + " не должна превышать " + len + " символ(а/ов)" );
+         stat = false;
+      end;
+   elif( kind == Kind_RUS )
+      if( SQL_ExistsChars(val, RusChars) )
+         Log.LogError("В поле " + fld_name + " не должно быть русских символов" );
+         stat = false;
+      end;
+   elif( kind == Kind_Allowed )
+      if( SQL_ExistsChars(val, NoAllowedChars) )
+         Log.LogError("В поле " + fld_name + " допускаются только символы: 0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz().,-+:?" );
+         stat = false;
+      end;
+   end;
+
+   return stat;
+end;
+
+PRIVATE CLASS (DL_XML) TSpImplOrd_XML(ds)
+   private var m_MainNode = NULL,
+               m_ds;
+
+   private macro GetFileName()
+      if(m_FileName == NULL)
+         var y, mon, d, h, m, s, impl_ord_date, _date, _time;
+
+         datesplit(ImplOrdPrm.ImplOrdDate, d, mon, y);
+         impl_ord_date = string(L_Z(d,2)) + string(L_Z(mon,2)) + string(L_Z(y, 4));
+
+         datesplit(Date(), d, mon, y);
+         _date = string(L_Z(d,2)) + string(L_Z(mon,2)) + string(L_Z(y, 4));
+
+         TimeSplit(Time(), h, m, s);
+         _time = string(L_Z(h,2)) + string(L_Z(m,2)) + string(L_Z(s, 2));
+
+         m_FileName = impl_ord_date + "_" + m_ds.id + "_" + _date + _time;
+      end;
+
+      return m_FileName;
+   end;
+
+   macro SaveXML()
+     if(m_MainNode != null)
+       AddMainNode(m_MainNode);
+       //RemoveEmpty();
+       SaveXML();
+       Log.LogError("Сформирован файл " + GetFileName()+".xml");
+     end;
+   end;
+
+   private macro CreateNode_ORDER_HEADER()
+      return CreateNode("ORDER_HEADER");
+   end;
+
+   private macro CreateElementValue_deposit_c(val)
+      return CreateElementValue("deposit_c", val);
+   end;
+
+   private macro CreateElementValue_contrag_c(val)
+      return CreateElementValue("contrag_c", val);
+   end;
+
+   private macro CreateElementValue_contr_d_id(val)
+      return CreateElementValue("contr_d_id", val);
+   end;
+
+   private macro CreateElementValue_createdate(val)
+      return CreateElementValue("createdate", val);
+   end;
+
+   private macro CreateElementValue_order_t_id(val)
+      return CreateElementValue("order_t_id", val);
+   end;
+
+   private macro CreateElementValue_execute_dt(val)
+      return CreateElementValue("execute_dt", val);
+   end;
+
+   private macro CreateElementValue_expirat_dt(val)
+      return CreateElementValue("expirat_dt", val);
+   end;
+
+   private macro CreateNode_MF020()
+      return CreateNode("MF020");
+   end;
+
+   private macro CreateElementValue_dep_acc_c(val)
+      return CreateElementValue("dep_acc_c", val);
+   end;
+
+   private macro CreateElementValue_deponent_c(val)
+      return CreateElementValue("deponent_c", val);
+   end;
+
+   private macro CreateElementValue_sec_c(val)
+      return CreateElementValue("sec_c", val);
+   end;
+
+   private macro CreateElementValue_corr_sec_c(val)
+      return CreateElementValue("corr_sec_c", val);
+   end;
+
+   private macro CreateElementValue_based_on(val)
+      return CreateElementValue("based_on", val);
+   end;
+
+   private macro CreateNode_security()
+      return CreateNode("security");
+   end;
+
+   private macro CreateElementValue_security_c(val)
+      return CreateElementValue("security_c", val);
+   end;
+
+   private macro CreateElementValue_security_q(val)
+      return CreateElementValue("security_q", val);
+   end;
+
+   private macro CreateNode_securities()
+      return CreateNode("securities");
+   end;
+
+   private macro Create_Nodes()
+      var stat = true, val, ORDER_HEADER, MF020, security, securities, fld_name;
+
+      ORDER_HEADER = CreateNode_ORDER_HEADER();
+      ORDER_HEADER.appendChild(CreateElementValue_deposit_c("NDC000000000"));
+
+      fld_name = "Код инициатора поручения";
+      val = m_ds.OurBankNDC;
+      if( stat and (stat = CheckValue(val, Kind_n, 12, fld_name))
+      and (stat = CheckValue(val, Kind_RUS, NULL, fld_name)) 
+      and (stat = CheckValue(val, Kind_Allowed, NULL, fld_name)) )
+         ORDER_HEADER.appendChild(CreateElementValue_contrag_c(val));
+      end;
+
+      fld_name = "Исходящий номер документа";
+      val = ImplOrdPrm.Xld;
+      if( stat and (stat = CheckValue(val, Kind_n, 16, fld_name)) )
+         ORDER_HEADER.appendChild(CreateElementValue_contr_d_id(val));
+      end;
+
+      if( stat )
+         ORDER_HEADER.appendChild(CreateElementValue_createdate(GetFormatDate(ImplOrdPrm.ImplOrdDate)));
+         ORDER_HEADER.appendChild(CreateElementValue_order_t_id("MF020"));
+         ORDER_HEADER.appendChild(CreateElementValue_execute_dt(GetFormatDateTime(ImplOrdPrm.ExecOrdDate, ImplOrdPrm.ExecOrdTime)));
+         ORDER_HEADER.appendChild(CreateElementValue_expirat_dt(GetFormatDateTime(ImplOrdPrm.LastExecOrdDate, ImplOrdPrm.LastExecOrdTime)));
+
+         MF020 = CreateNode_MF020();
+
+         fld_name = "Счет депо";
+         val = m_ds.note_21;
+         if( stat and (stat = CheckValue(val, Kind_n, 12, fld_name))
+         and (stat = CheckValue(val, Kind_RUS, NULL, fld_name)) )
+            MF020.appendChild(CreateElementValue_dep_acc_c(val));
+         end;
+
+         MF020.appendChild(CreateElementValue_deponent_c(m_ds.OurBankNDC));
+      end;
+
+      fld_name = "Раздел счета депо отправителя";
+      val = m_ds.note_22;
+      if( stat and (stat = CheckValue(val, Kind_n, 17, fld_name))
+      and (stat = CheckValue(val, Kind_RUS, NULL, fld_name)) )
+         MF020.appendChild(CreateElementValue_sec_c(val));
+      end;
+
+      fld_name = "Раздел счета депо получателя";
+      val = m_ds.note_23;
+      if( stat and (stat = CheckValue(val, Kind_n, 17, fld_name))
+      and (stat = CheckValue(val, Kind_RUS, NULL, fld_name)) )
+         MF020.appendChild(CreateElementValue_corr_sec_c(val));
+      end;
+
+      if( stat )
+         MF020.appendChild(CreateElementValue_based_on("Поручение депонента"));
+   
+         security = CreateNode_security();
+      end;
+
+      fld_name = "Код ценной бумаги";
+      val = m_ds.AvrNRD;
+      if( stat and (stat = CheckValue(val, Kind_n, 12, fld_name))
+      and (stat = CheckValue(val, Kind_Allowed, NULL, fld_name)) )
+         security.appendChild(CreateElementValue_security_c(val));
+      end;
+
+      if( stat )
+         security.appendChild(CreateElementValue_security_q(string(ImplOrdPrm.Amount)));
+
+         securities = CreateNode_securities();
+         securities.appendChild(security);
+   
+         MF020.appendChild(securities);
+   
+         m_MainNode = CreateNode("TMP");
+         m_MainNode.appendChild(ORDER_HEADER);
+         m_MainNode.appendChild(MF020);
+      end;
+   end;
+
+   macro Construct(ds);
+      CreateXML();
+      m_ds = ds;
+
+      Create_Nodes();
+   end;
+
+   initDL_XML();
+   this.Construct(ds);
+END;
+
+private macro _ImplOrd()
+   var stat = 0, query, cmd, dataSet, i = 0, cnt = 0, xml_file;
+
+   Rep = CMakeReport();
+   Log.InitErrLog( Rep, true );
+   Log.StartErrLog();
+
+   query = " SELECT case when length(avr.t_LSIN) <> 0 then avr.t_LSIN else avr.t_ISIN end as id, " +
+        // "        pm_common.GetNoteTextStr(fin.t_FIID, ?, ?, ?) as note_21, " +
+        // "        pm_common.GetNoteTextStr(fin.t_FIID, ?, ?, ?) as note_22, " +
+        // "        pm_common.GetNoteTextStr(fin.t_FIID, ?, ?, ?) as note_23, " +
+         
+ /*******************************************************************************************************/
+	   "   CASE                                                           " +
+	   "      WHEN (pm_common.GetNoteTextStr (fin.t_FIID,                 " +
+	   "                                       ?,                         " +//1
+	   "                                       ?,                         " +//2
+	   "                                       ?)) <> CHR (0)             " +//3
+	   "      THEN                                                        " +
+	   "         (pm_common.GetNoteTextStr (fin.t_FIID,                   " +
+	   "                                     ?,                           " +//4
+	   "                                     ?,                           " +//5
+	   "                                     ?))                          " +//6
+	   "      ELSE                                                        " +
+	   "         (SELECT t_name                                           " +
+	   "            FROM dllclsval_dbt clsv, dllvalues_dbt dllv           " +
+	   "           WHERE     clsv.t_list = ?                              " +//7
+	   "                 AND dllv.t_list = clsv.t_list                    " +
+	   "                 AND dllv.t_element = clsv.t_element              " +
+	   "                 AND dllv.t_code = ?                              " +//8
+	   "                 AND ROWNUM = 1)                                  " +
+	   "   END                                                            " +
+	   "      AS note_21,                                                 " +
+	   "   CASE                                                           " +
+	   "      WHEN (pm_common.GetNoteTextStr (fin.t_FIID,                 " +
+	   "                                      ?,                         " +
+	   "                                      ?,                         " +
+	   "                                      ?)) <> CHR (0)              " +//7
+	   "      THEN                                                        " +
+	   "         (pm_common.GetNoteTextStr (fin.t_FIID,                   " +
+	   "                                    ?,                           " +
+	   "                                    ?,                           " +
+	   "                                    ?))                           " +
+	   "      ELSE                                                        " +
+	   "         (SELECT t_name                                           " +
+	   "            FROM dllclsval_dbt clsv, dllvalues_dbt dllv           " +
+	   "           WHERE     clsv.t_list = ?                              " +
+	   "                 AND dllv.t_list = clsv.t_list                    " +
+	   "                 AND dllv.t_element = clsv.t_element              " +
+	   "                 AND dllv.t_code = ?                              " +
+	   "                 AND ROWNUM = 1)                                  " +
+	   "   END                                                            " +
+	   "      AS note_22,                                                 " +
+	   "   CASE                                                           " +
+	   "      WHEN (pm_common.GetNoteTextStr (fin.t_FIID,                 " +
+	   "                                      ?,                         " +
+	   "                                      ?,                         " +
+	   "                                      ?)) <> CHR (0)             " +
+	   "      THEN                                                        " +
+	   "         (pm_common.GetNoteTextStr (fin.t_FIID,                   " +
+	   "                                    ?,                           " +
+	   "                                    ?,                           " +
+	   "                                    ?))                           " +
+	   "      ELSE                                                        " +
+	   "         (SELECT t_name                                           " +
+	   "            FROM dllclsval_dbt clsv, dllvalues_dbt dllv           " +
+	   "           WHERE     clsv.t_list = ?                              " +
+	   "                 AND dllv.t_list = clsv.t_list                    " +
+	   "                 AND dllv.t_element = clsv.t_element              " +
+	   "                 AND dllv.t_code = ?                              " +
+	   "                 AND ROWNUM = 1)                                  " +
+	   "   END                                                            " +
+	   "      AS note_23,                                                  " +
+/*************************************************************************************************************/
+
+           "        NVL((select objcode.t_Code " +
+           "               from dobjcode_dbt objcode " +
+           "              where objcode.t_ObjectType = ? " +
+           "                and objcode.t_CodeKind = ? " +
+           "                and objcode.t_ObjectID = ? " +
+           "                and objcode.t_State = 0 " +
+           "            ), CHR(0)) as OurBankNDC, " +
+           "        NVL((select objcode.t_Code " +
+           "               from dobjcode_dbt objcode " +
+           "              where objcode.t_ObjectType = ? " +
+           "                and objcode.t_CodeKind = ? " +
+           "                and objcode.t_ObjectID = fin.t_FIID " +
+           "                and objcode.t_State = 0 " +
+           "            ), CHR(0)) as AvrNRD " +
+           "   FROM dfininstr_dbt fin, " +
+           "        davoiriss_dbt avr " +
+           "  WHERE fin.t_Issuer = ? " +
+           "    AND fin.t_FI_Kind = ? " +
+           "    AND fin.t_FIID = avr.t_FIID " +
+           "    AND RSB_FIInstr.FI_AvrKindsEQ (?, ?, fin.t_AvoirKind) = 1 " +
+           "    AND rsi_rsb_fiinstr.FI_IsSecurEmissive (fin.t_FIID) = 1 " +
+  //         "    AND pm_common.GetNoteTextStr(fin.t_FIID, ?, ?, ?) <> chr(0) " +
+  //         "    AND pm_common.GetNoteTextStr(fin.t_FIID, ?, ?, ?) <> chr(0) " +
+  //         "    AND pm_common.GetNoteTextStr(fin.t_FIID, ?, ?, ?) <> chr(0) " +
+
+           IIF(ImplOrdPrm.Fiid != ALLFININSTR, " AND fin.t_FIID = ? ", "");
+   cmd = DL_RSDCommand(query);
+  
+   cmd.AddParam(OBJTYPE_AVOIRISS);
+   cmd.AddParam(21);
+   cmd.AddParam({CurDate});
+   cmd.AddParam(OBJTYPE_AVOIRISS);
+   cmd.AddParam(21);
+   cmd.AddParam({CurDate});
+   cmd.AddParam(spr_EmSchet);      // Номер справочника
+   cmd.AddParam(spr_NRD);          // Код значения  эмиссионного счета в НРД
+
+   cmd.AddParam(OBJTYPE_AVOIRISS);
+   cmd.AddParam(22);
+   cmd.AddParam({CurDate});
+   cmd.AddParam(OBJTYPE_AVOIRISS);
+   cmd.AddParam(22);
+   cmd.AddParam({CurDate});
+   cmd.AddParam(spr_EmSchet);      // Номер справочника
+   cmd.AddParam(spr_NRD_R);        // Код значения  раздела размещение эмиссионного счета в НРД
+
+   cmd.AddParam(OBJTYPE_AVOIRISS);
+   cmd.AddParam(23);
+   cmd.AddParam({CurDate});
+   cmd.AddParam(OBJTYPE_AVOIRISS);
+   cmd.AddParam(23);
+   cmd.AddParam({CurDate});
+   cmd.AddParam(spr_EmSchet);      // Номер справочника
+   cmd.AddParam(spr_NRD_T);        // Код значения торгового раздела эмиссионного счета в НРД
+
+   cmd.AddParam(OBJTYPE_PARTY);
+   cmd.AddParam(PTCK_NRD);
+   cmd.AddParam({OurBank});
+   cmd.AddParam(OBJTYPE_FININSTR);
+   cmd.AddParam(14/*CODE_NADC*/);
+   cmd.AddParam({OurBank});
+   cmd.AddParam(FIKIND_AVOIRISS);
+   cmd.AddParam(FIKIND_AVOIRISS);
+   cmd.AddParam(AVOIRISSKIND_BOND);
+  
+// cmd.AddParam(OBJTYPE_AVOIRISS);
+// cmd.AddParam(21);
+// cmd.AddParam({CurDate});
+
+// cmd.AddParam(OBJTYPE_AVOIRISS);
+// cmd.AddParam(22);
+// cmd.AddParam({CurDate});
+
+// cmd.AddParam(OBJTYPE_AVOIRISS);
+// cmd.AddParam(23);
+// cmd.AddParam({CurDate});
+
+   if( ImplOrdPrm.Fiid != ALLFININSTR )
+      cmd.AddParam(ImplOrdPrm.Fiid );
+   end;
+
+   cnt = cmd.GetCount();
+   if(cnt > 0)
+      dataSet = cmd.Execute();
+      InitProgress( cnt, "Обработка данных", "Обработка данных..." );
+
+      while(DataSet.moveNext())
+         xml_file = TSpImplOrd_XML(dataSet);
+         xml_file.SaveXML();
+
+         UseProgress(i = i + 1);
+      end;
+      RemProgress();
+ var KDU_err = processExecKDU(ImplOrdPrm.FIID,"MZ0412010040","31MC0134700000P00",ImplOrdPrm.Amount,ImplOrdPrm.IMPLORDDATE);
+   else
+      Log.LogError("Нет данных");
+   end;
+
+   Log.FinishErrLog();
+    //Напечатать протокол
+   Log.ShowErrLog(true);
+   Rep.SetZoomType( ZOOM_TYPE_A4L );// альбомная ориентация
+   Rep.PrintWinRep();
+   Rep.ShowWinRep();
+
+   return stat;
+end;
+
+macro SP_ImplOrd(
+   iNumDprt:Integer
+  ,ImplOrdDate:Date
+  ,ExecOrdDate:Date
+  ,ExecOrdTime:Time
+  ,LastExecOrdDate:Date
+  ,LastExecOrdTime:Time
+  ,FormOrd:Integer
+  ,Xld:String
+  ,Fiid:Integer
+  ,Amount:DoubleL
+)
+//   InitError();
+
+   ImplOrdPrm.SetData(iNumDprt, ImplOrdDate, ExecOrdDate, ExecOrdTime, LastExecOrdDate, LastExecOrdTime, FormOrd, Xld, Fiid, Amount);
+
+  var r_ImplOrd=_ImplOrd();
+ 
+
+   return r_ImplOrd;
+end;

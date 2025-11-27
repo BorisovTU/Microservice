@@ -1,0 +1,733 @@
+/**
+ @file GTImpDVReq.mac
+ @brief Импорт клиентских заявок БО ПИ
+ 
+ # menu
+ - БО ФИССиКО\Сервисные операции\Обработка клиентских операций валютного рынка
+ 
+ # tag
+ - functional_block:Шлюз_Securities
+ - code_type:API
+  
+ # changeLog
+ |date       |author         |tasks               |note                                                        
+ |-----------|---------------|--------------------|-------------------------------------------------------------
+ |2023.10.12 |Велигжанин А.В.|BIQ-9103            | Разбор заявок с Margin Call
+
+*/
+
+import OPrInter, DVInter, BankInter, FiInter, PtInter, SfInter, CtInter, "globals.mac", "gtdlfun.mac", "MoCommon.mac";
+import "rgtgtrec.mac", "gtconst.inc", "secinter.mac", "rgobj.mac","dvserv.mac";;
+
+private const UnknownParty = -1;
+PRIVATE CONST MMVB_CODE = "ММВБ";    /* код ММВБ */
+
+PRIVATE CONST SET_CHAR   = "X";
+PRIVATE CONST UNSET_CHAR = "";
+
+PRIVATE const Код_на_ММВБ_ФинИн   = 11;
+PRIVATE const Код_на_ММВБ_Субъект = 8;
+
+private const ВАЛЮТНЫЙ_РЫНОК = 1,
+              СРОЧНЫЙ_РЫНОК  = 2;
+
+/**
+@brief 				Установка информационного сообщения
+@param[out] 	Comment			комментарий (для протокола обработки записи репликации)
+@param[in] 	WarningText		текст информационного сообщения
+@return 				-1
+*/
+PRIVATE MACRO SetWarning( Comment:@STRING, WarningText:String )
+  Comment = WarningText; 
+  return -1;
+END;
+
+/**
+@brief 				Установка ошибки
+@param[in] 	ErrorText		текст ошибки
+*/
+PRIVATE MACRO SetError( ErrorText )
+  RunError( "", ErrorText );
+END;
+
+/**
+@brief 				Аналог условного оператора  в си.
+@param[in] 	condition		условие
+@param[in] 	value_true		значение, если условие выполняется
+@param[in] 	value_false		значение, если условие не выполняется
+@return 				value_true - condition имеет значение true
+@return 				value_false - condition имеет значение false
+*/
+private macro IIF( condition, value_true, value_false )
+   if( condition )
+      return value_true;
+   else 
+      return value_false;
+   end;
+end;
+
+/**
+@brief 				Инициализация панели
+@param[in] 	Pan 			панель
+*/
+macro StringToDate ( inString )
+
+  var retValue = Date( 0, 0, 0 );
+  var d, m, y;
+
+  if ( StrLen( inString ) == 10 )
+    d = Int( SubStr( inString, 1, 2 ) );
+    m = Int( SubStr( inString, 4, 2 ) );
+    y = Int( SubStr( inString, 7 ) );
+
+    if ( ( d > 0 ) and ( d <= 31 ) and ( m > 0 ) and ( m <= 12 ) and ( y > 0 ) )
+      retValue = Date( d, m, y );
+    end;
+  end;
+
+  return retValue;
+end;
+
+/**
+@brief 				Инициализация панели
+@param[in] 	Pan 			панель
+*/
+MACRO RunInitMVB1(Pan)
+   Pan.ImpDate      = {curdate};
+END;
+
+/**
+@brief 				Позиционирует файл сделки и возвращает true, если сделка существует
+@param[in] 	Deal 			файл сделки
+@param[in] 	DealCode 		код сделки
+@return 				true - сделка существует
+@return 				false - сделки нет
+*/
+PRIVATE MACRO GetDeal( Deal:TBFile, DealCode:string ):BOOL
+   Deal.Clear();
+   Deal.rec.Code = DealCode;
+   return Deal.GetEQ();
+END;
+
+/**
+@brief 				Возвращает true, если есть значение классификатора
+@param[in] 	Classificator 		код классификатора
+@param[in] 	CheckValue 		значение
+@return 				true - значение существует
+@return 				false - значения не существует
+*/
+PRIVATE MACRO GetLLClsVal( Classificator:INTEGER, CheckValue:INTEGER ):BOOL
+  VAR ClsVal = TBFile("llclsval.dbt", "R", 0 );
+
+  ClsVal.rec.Classificator = Classificator;
+  ClsVal.rec.Element       = CheckValue;
+  if (ClsVal.GetEQ())
+     return true;
+  else
+     return false;
+  end;
+END;
+
+/**
+@brief 				Возвращает тип объекта по типу документа сделки (для валютного рынка)
+@param[in] 	p_DocKind 		Тип документа
+@return 				Тип объекта
+*/
+MACRO GetDVNObjType ( p_DocKind: INTEGER ): INTEGER
+  var ObjType: integer;
+  if(p_DocKind == DL_DVFXDEAL) 
+    ObjType = OBJTYPE_FXOPER_DV;
+  else
+    ObjType = OBJTYPE_OUTOPER_DV;
+  end;
+  return ObjType;
+END;
+
+/**
+@brief 				Возвращает ID сделки по коду заявки
+@param[in] 	req_code		код заявки
+@return 				ID сделки
+*/
+MACRO GetDVNDealID ( req_code: STRING ): INTEGER
+  var dsRec;
+  var sel = RsdCommand();
+  var DealID: integer = -1;
+
+  sel.cmdText = "SELECT t_Id FROM ddvndeal_dbt WHERE t_reqcode = ?";
+  sel.addParam("", RSDBP_IN, req_code);
+  sel.Execute();
+
+  dsRec = TRsbDataSet(sel);
+  if(dsRec.MoveNext())
+    DealID = dsRec.rec.t_Id;
+  end; 
+
+  return DealID;
+END;
+
+/**
+@brief 				Возвращает информацию о сделке валютного рынка
+@param[in] 	DealID			ID сделки
+@param[out] 	TraderNote 		Примечание трейдера
+@param[out] 	IsMarginCall 		Признак ручной подачи (Margin Call)
+*/
+MACRO GetDealInfo ( DealID: INTEGER, TraderNote:@STRING, IsMarginCall:@BOOL )
+  var ObjID: string;
+  var ObjType: integer;
+  var AttrID: integer = -1;
+  var dvndeal = TBFile( "dvndeal.dbt" );
+  
+  TraderNote = "";
+  IsMarginCall = false;
+
+  if( DealID > 0 )
+    dvndeal.Clear();
+    dvndeal.KeyNum = 0;
+    dvndeal.rec.ID = DealID;
+    if( dvndeal.GetEQ() == true )
+       ObjType = GetDVNObjType( dvndeal.rec.DocKind );
+       ObjID = UniID(dvndeal, ObjType);
+       TraderNote = readNoteForObject(ObjType, ObjID, 150, date(31, 12, 9999));
+       if( GetMainObjAttr( null, ObjType, ObjID, MARGINCALL_CATEGORY, AttrID, NULL, NULL, NULL ) )
+          IsMarginCall = (AttrID == 1);
+       end;
+    end;
+  end;
+END;
+
+/**
+@brief 				Создает заявку
+@param[in] 	RecordID		ID записи репликации шлюза
+@param[in] 	SeanceID 		ID сеанса репликации
+@param[out] 	ID 			ID созданной заявки
+@param[out] 	Comment 		Комментарий (для отчета)
+@return 				0 - флаг успешного создания заявки
+@return 				1 - ошибка создания
+*/
+macro _DVRequest_CreateNew( RecordID:INTEGER, SeanceID:INTEGER, ID:@STRING, Comment:@STRING ):INTEGER
+
+   var fin       = TRecHandler("fininstr.dbt");
+   var fin_2     = TRecHandler("fininstr.dbt");
+   var fideriv   = TBFile("fideriv.dbt");
+   var fideriv_2 = TBFile("fideriv.dbt");
+   var fideriv_Base  = TBFile("fideriv.dbt");//сомнительно
+   var dlcom     = TRecHandler("dvdlcom.dbt");
+   var BasisFI   = TRecHandler("fininstr.dbt");
+
+   var SpGrDocID = 0;
+   var type:integer;
+   var stat:integer;
+   var fi_code, fi_code_2, ErrMes, PartyObjectID;
+   var CalcOperKind, CalcOperCode:string;
+   var MarketID:integer;
+   var MarketSchemeID:integer;
+   var Guaranty, Margin;
+   var CUX23Code:string = "";
+   var ArrComSums = TArray();/*список комиссиий (бирже)*/
+   var Price = 0.0, Price_RUR = 0.0, Tick = $0, TC = 0.0;
+   var Price_2 = 0.0, Price_RUR_2 = 0.0, Tick_2 = $0, TC_2 = 0.0;
+   var i = 0;
+   var НаКредитнуюСтавку = false;
+   var PrevDate;
+   var ParmType:integer = 0;
+   var ModeSpread:integer = 1;
+
+   //!!!Нужные переменные ниже
+   var ClntRep   = TRecHandler("spground.dbt");
+   var Request   = TRecHandler("dl_req.dbt");
+
+   var RG;
+   var OperKind:integer = 0;
+   var _client:string;
+   var ORCB:string = "X";
+   var Kind = Код_на_ММВБ_ФинИн;/*код, соответствующий значению из поля "Код" анкеты ПИ*/
+   var CodeKind:integer = Код_на_ММВБ_Субъект;
+   var PartyCode = MICEX_CODE;
+   var OrderType = ""; var isOutAddr = 2;
+   var ServKind = "";
+   var TradeGroup = "";
+   var pos = 0; var sub_str = "";
+   var trader_name ; //TEG
+   var GrndNum:string = "";
+   var IDDeal:string =  "";
+   var IDMULT:string =  "";     
+  
+   ClntRep.Clear();
+   Request.Clear();
+
+   RG = TGTRecord();
+   RG.LoadFromDB(RecordID);
+
+   if( GetRealID( RG_PARTY, PartyCode, PTCK_CONTR, @MarketID, @ErrMes ) != 0 )
+      SetError( ErrMes );
+   end;
+  
+   if( (GetParmByName( RG, "RGDVRQ_OPERKIND", @OperKind, @type ) == NULL) OR (type != V_INTEGER) )
+      SetError( "Не найден параметр RGDVRQ_OPERKIND объекта " + String(RecordID) );
+   end;
+
+   if( (GetParmByName( RG, "RGDVRQ_DATE", @Request.rec.Date, @type ) == NULL) OR (type != V_DATE) )
+      SetError( "Не найден параметр RGDVRQ_DATE объекта " + String(RecordID) );
+   end;
+
+   if( (GetParmByName( RG, "RGDVRQ_TIME", @Request.rec.Time, @type ) == NULL) OR (type != V_TIME) )
+      SetError( "Не найден параметр RGDVRQ_TIME объекта " + String(RecordID) );
+   end;
+
+   if( (GetParmByName( RG, "RGDVRQ_FI_CODE", @fi_code, @type ) == NULL) OR (type != V_STRING) )
+      SetError( "Не найден параметр RGDVRQ_FI_CODE объекта " + String(RecordID) );
+   end;
+   //TEG 28.06.19
+   if( (GetParmByName( RG, "RGDVRQ_TRADERCODE", @trader_name, @type ) == NULL) OR (type != V_STRING) )
+     // RunError( "Ошибка при получении параметра RGDVRQ_TRADERCODE." );
+      trader_name = "";
+   end;
+   
+   GetParmByName(RG, "RGDVRQ_TYPE", @ParmType, @type);
+   
+   if ((ParmType == 14) or (ParmType == 15) or (OperKind == -1))//если ноги спреда - берём второй фининстр
+      if  ((GetParmByName( RG, "RGDVRQ_FI_CODE_2", @fi_code_2, @type )==NULL) OR (type != V_STRING) )
+        SetError( "Не найден параметр RGDVRQ_FI_CODE_2 объекта " + String(RecordID) );
+      end;
+   end;
+
+   Request.rec.Client = UnknownParty;
+   Request.rec.ClientContr = 0;
+
+   if( (GetParmByName( RG, "RGDVRQ_CLIENT", @_client, @type ) != NULL) AND (type == V_STRING) )
+      _client = Trim(_client);
+     if( (_client != "") and (_client != "0") and (_client != "-1") )
+       //TEG проверим код клиента банка, если код банку принадлежит то договор не ищем
+       if(not RG_CheckBankCode(_client))
+         if(RG_USRGetClientContr(_client, @Request.rec.Client, @Request.rec.ClientContr, @ErrMes)!=0)
+            SetError( ErrMes );
+         end;
+
+         Request.rec.Client = IIF(Request.rec.Client == {OurBank}, UnknownParty, Request.rec.Client);
+       else
+         Request.rec.Client = UnknownParty;
+       end;
+     end;  
+ /*      
+         if( GetRealID( RG_PARTY, _client, PTCK_MICEX, @Request.rec.Client, @ErrMes, true , ServKind, Request.rec.Date, @Request.rec.ClientContr, MarketID) != 0 )
+            SetError( ErrMes );
+         end;
+        
+         Request.rec.Client = IIF(Request.rec.Client == {OurBank}, UnknownParty, Request.rec.Client);
+        
+         if( Request.rec.Client != UnknownParty )
+        
+               if ( ПолучитьСубъекта(Request.rec.Client, PartyCode) )
+                    SetError("|Не найден код субъекта вида " + string(PTCK_CONTR));
+               end;
+
+               if( Request.rec.ClientContr <= 0 )
+                  Request.rec.ClientContr = RGDLFUN_GetContrID( ServKind, {OurBank}, Request.rec.Client, Request.rec.Date, NULL, NULL, @ErrMes );
+                  if( Request.rec.ClientContr <= 0 )
+                    SetError( ErrMes );
+                  end;
+               end;
+          end;
+   */   
+   end;
+
+   if( 
+       (OperKind == ПокупкаФьючерсов) or (OperKind == ПокупкаОпционов) or (OperKind == ПродажаФьючерсов) or (OperKind == ПродажаОпционов) or (OperKind == -1)
+     )
+
+      if( GT_ПолучитьПИ( fi_code, Kind, fin, fideriv, @ErrMes ) != true )
+         if ( (OperKind != -1) or (fin.rec.fi_code == "") )
+         SetError( ErrMes );
+         else
+            Request.rec.FIID = fin.rec.FIID;
+         end;
+      elif(fin.rec.issuer == MarketID)
+         Request.rec.FIID = fin.rec.FIID;
+      else
+         if((RG.GetSourceID() == GT_CSV) OR (RG.GetSourceID() == GT_PAYMENTS_CSV))
+            SetError("В ПИ с FIID = " + string(fin.rec.FIID) + " эмитент не является " + MICEX_CODE_FB);
+         else
+            SetError("В ПИ с FIID = " + string(fin.rec.FIID) + " эмитент не является " + MICEX_CODE);
+         end;
+      end;
+   
+      if ((ParmType == 14) or (ParmType == 15) or (OperKind == -1))   
+         if( GT_ПолучитьПИ( fi_code_2, Kind, fin_2, fideriv_2, @ErrMes ) != true )
+            if ( (OperKind != -1) or (fin_2.rec.fi_code == "") )
+            SetError( ErrMes );
+            else
+               Request.rec.PriceFIID = fin_2.rec.FIID;
+            end;
+         elif(fin_2.rec.issuer == MarketID)
+              ;//dvdeal.rec.FIID = fin.rec.FIID;
+         else
+            if((RG.GetSourceID() == GT_CSV) OR (RG.GetSourceID() == GT_PAYMENTS_CSV))
+               SetError("В ПИ с FIID = " + string(fin_2.rec.FIID) + " эмитент не является " + MICEX_CODE_FB);
+            else
+               SetError("В ПИ с FIID = " + string(fin_2.rec.FIID) + " эмитент не является " + MICEX_CODE);
+            end;
+         end;   
+      end;
+
+      Request.rec.SourceKind   = IIF((RG.GetSourceID() == GT_VR) or (RG.GetSourceID() == GT_PAYMENTS_VR), DL_DVFXDEAL, DL_DVDEAL);
+
+      Request.rec.IsExchange   = "X";
+      if(GetRealID(RG_PARTY, MMVB_CODE, PTCK_CONTR, @Request.rec.MarketID, @ErrMes) != 0)
+         SetError(ErrMes);
+      end;
+
+      Request.rec.MarketKind   = IIF((RG.GetSourceID() == GT_VR) or (RG.GetSourceID() == GT_PAYMENTS_VR), DV_MARKETKIND_CURRENCY, DV_MARKETKIND_DERIV);
+      Request.rec.MethodApplic = DL_REQ_METHODAPPLIC_EDOC;
+
+      // если задан код трейдера, то голосовое сообщение
+      if(trader_name != "") //DL_REQ_METHODAPPLIC_OTHER DL_REQ_METHODAPPLIC_VMES DL_REQ_METHODAPPLIC_PDOC DL_REQ_METHODAPPLIC_EDOC
+         SetMethodApplic(trader_name, @Request.rec.MethodApplic);
+      end;
+
+      if( fin.rec.AvoirKind == DERIVATIVE_FUTURES )
+            Request.rec.PFIKind = DL_REQ_PFIKIND_FUTURES;
+      elif( fin.rec.AvoirKind == DERIVATIVE_OPTION )
+         if( fideriv.rec.OptionType == DVTYPE_CALL )
+            Request.rec.PFIKind = DL_REQ_PFIKIND_OPTIONCALL;
+         else
+            Request.rec.PFIKind = DL_REQ_PFIKIND_OPTIONPUT;
+         end;
+      end;
+	  
+     if ((ParmType == 14) or (ParmType == 15))
+         Request.rec.PFIKind = DL_REQ_PFIKIND_CALENDARSPREAD;
+     end;
+
+      Request.rec.Kind = 350/*DOCKIND_REQ_CLIENT_DEAL*/;
+
+      if( (GetParmByName(RG, "RGDVRQ_CODETS", @Request.rec.CodeTS, @type) == NULL) OR (type != V_STRING) OR (trim(Request.rec.CodeTS) == "") )
+         RunError( "Ошибка при получении параметра RGDVRQ_CODETS." );
+      end;
+
+      Request.rec.Party    = MarketID;
+      Request.rec.RepoRate = 0.0;
+
+      if( (GetParmByName( RG, "RGDVRQ_DIRECTION", @Request.rec.Direction, @type ) == NULL) OR (type != V_INTEGER) )
+      if( (OperKind == ПокупкаФьючерсов) or (OperKind == ПокупкаОпционов) )
+         if (ParmType == 14)//если фьючерс - нога спреда (покупка-продажа)
+            Request.rec.Direction = DL_REQ_DIRECTION_BS;
+         elif (ParmType == 15)//(продажа-покупка)
+            Request.rec.Direction = DL_REQ_DIRECTION_SB;
+         else               //если фьючерс - не нога спреда
+            Request.rec.Direction = DL_REQ_DIRECTION_B;
+         end;
+      elif( (OperKind == ПродажаФьючерсов) or (OperKind == ПродажаОпционов) )
+         if (ParmType == 15)   //если фьючерс - нога спреда (покупка-продажа)
+            Request.rec.Direction = DL_REQ_DIRECTION_BS;
+         elif (ParmType == 14) //(продажа-покупка)
+            Request.rec.Direction = DL_REQ_DIRECTION_SB;
+         else                  //если фьючерс - не нога спреда
+            Request.rec.Direction = DL_REQ_DIRECTION_S;
+         end;
+      end;
+      end;
+      
+      //если вставляем ногу спреда, то на текущий момент fin установлен на второй фининстр 
+      if ((ParmType == 14) OR (ParmType == 15))
+        Request.rec.FIID2    = fin.rec.FIID
+      end;
+
+     if( (GetParmByName( RG, "RGDVRQ_PRICE", @Price, @type ) == NULL) OR (type != V_DOUBLE) )
+         /*SetError( "Не найден параметр RGDVDL_PRICE объекта " + String(RecordID) );*/
+         /*Тоже будем считать что не обязательно все нужное дозаполним в СИшнике*/
+      end;
+
+      if( (GetParmByName( RG, "RGDVRQ_PRICE_RUR", @Price_RUR, @type ) == NULL) OR (type != V_DOUBLE) )
+         /*SetError( "Не найден параметр RGDVDL_PRICE объекта " + String(RecordID) );*/
+         /*Тоже будем считать что не обязательно все нужное дозаполним в СИшнике*/
+      end;
+
+      if( (GetParmByName( RG, "RGDVRQ_PRICE_2", @Price_2, @type ) == NULL) OR (type != V_DOUBLE) )
+         /*SetError( "Не найден параметр RGDVDL_PRICE_2 объекта " + String(RecordID) );*/
+         /*Тоже будем считать что не обязательно все нужное дозаполним в СИшнике*/
+      end;
+
+      if( (GetParmByName( RG, "RGDVRQ_PRICE_RUR_2", @Price_RUR_2, @type ) == NULL) OR (type != V_DOUBLE) )
+         /*SetError( "Не найден параметр RGDVDL_PRICE_2 объекта " + String(RecordID) );*/
+         /*Тоже будем считать что не обязательно все нужное дозаполним в СИшнике*/
+      end;
+       
+      if ( OperKind != -1 ) 
+      TC = DV_TickCost(Request.rec.FIID, Request.rec.Date);
+      if( TC == 0.0 )
+         Comment = "Не задан курс вида <Стоимость мин. шага цены> для ПФИ с кодом <"+ Fin.rec.FI_Code +"> за дату "+string(Request.rec.Date)+" в единицах измерения стоимости минимального шага цены.";
+         return 1;
+      end;
+   
+      if( fideriv.rec.Tick != $0 )
+         Tick = fideriv.rec.Tick;
+      else
+         Tick = $1;
+      end;
+      end;
+
+      if ((OperKind == -1) or (RG.GetSourceID() == GT_CSV) or (RG.GetSourceID() == GT_PAYMENTS_CSV))
+         Request.rec.Price = Price;
+      elif( (OperKind != ИсполнениеФьючерсов) and (OperKind != ИсполнениеОпционов) )
+
+         if( fin.rec.AvoirKind == DERIVATIVE_FUTURES )
+            if( fideriv.rec.PriceMode == DERIVATIVE_MODE_PARENTFI )
+               НаКредитнуюСтавку = true;
+            end;
+         else
+            if( ПолучитьФинИн( fin.rec.FaceValueFI, BasisFI ) != 0 )
+               SetError( "Не найден в справочнике финансовый инструмент с ID = \'" + fin.rec.FaceValueFI + "\'" );
+            end;
+            if( (BasisFI.rec.FI_Kind == FIKIND_DERIVATIVE) and (BasisFI.rec.AvoirKind == DERIVATIVE_FUTURES) )
+               if( not GT_ПолучитьПИ( BasisFI.rec.Name/*TEG у нас нет кодов типа 11 с кодом FI BasisFI.rec.FI_Code*/, Kind, BasisFI, fideriv_Base, @ErrMes ) )
+                  SetError( ErrMes );
+               end;
+               if( fideriv_Base.rec.PriceMode == DERIVATIVE_MODE_PARENTFI )
+                  НаКредитнуюСтавку = true;
+               end;
+            end;                             
+         end;
+         /*Далее Цена1. 
+           PRICE_RUR - для фьючерсов\(опционов на фьючерс) на кредитную ставку или PRICE в единицах измерения минимального шага цены (указанная в анкете инструмента) - для остальных фьючерсов*/
+        /*Далее Цена2.
+           PRICE_RUR - для фьючерсов\(опционов на фьючерс) ставку или PRICE в единицах измерения стоимости минимального шага цены (указанная в анкете инструмента) - для остальных фьючерсов*/
+         if( НаКредитнуюСтавку )
+            Request.rec.Price = Price_RUR;
+         else
+          //  if( fin.rec.AvoirKind == DERIVATIVE_FUTURES )//TEG 28.05.19
+               Request.rec.Price = Price;
+          //  else                              
+          //     Request.rec.Price = fideriv.rec.Strike;// dvdeal.rec.Bonus ;
+          //  end;
+         end;
+      else/*исполнение*/                                
+         if( fin.rec.AvoirKind == DERIVATIVE_FUTURES )
+            PrevDate = GetDateAfterWorkDays(Request.rec.Date,-1);
+            if( ПолучитьКурсЗаданногоTипа( @Request.rec.Price, Request.rec.FIID, Fideriv.rec.TickFIID, RATETYPE_CALC_PRICE, PrevDate, true ) != true  ) 
+               SetError( "Не задан курс вида \"Расчетная цена\" для контракта <" + fin.rec.FI_Code + "> за дату " +string(PrevDate)+ "." );
+            end;
+         else                              
+            Request.rec.Price = Price //fideriv.rec.Strike;//dvdeal.rec.Bonus ;//TEG 28.05.19
+         end;
+      end;
+
+      if( (GetParmByName( RG, "RGDVRQ_VOL", @Request.rec.Amount, @type ) == NULL) OR (type != V_DOUBLE) )
+         SetError( "Не найден параметр RGDVRQ_VOL объекта " + String(RecordID) );
+      end;
+      Request.rec.CurrencyID = -1; /*не заполняется*/    
+      if (OperKind != -1 )    
+      Request.rec.PriceFIID  = -1; /*не заполняется*/
+      end;
+      Request.rec.PriceType  = -1; /*не заполняется*/
+      //если нога фьючерса, то Price и CurrencyID будет другой
+      if ((ParmType == 14) or (ParmType == 15))
+        var Date_2;
+        if( (GetParmByName( RG, "RGDVRQ_DATE_2", @Date_2, @type ) == NULL) OR (type != V_DATE) )
+           SetError( "Не найден параметр RGDVRQ_DATE_2 объекта " + String(RecordID) );
+        end;
+        if( GT_ПолучитьПИ( fi_code_2, Kind, fin_2, fideriv_2, @ErrMes ) != true )
+           SetError( ErrMes );
+        elif(fin.rec.issuer != MarketID)
+         /*;
+        else*/
+          if((RG.GetSourceID() == GT_CSV) OR (RG.GetSourceID() == GT_PAYMENTS_CSV))
+            SetError("В ПИ с FIID = " + string(fin_2.rec.FIID) + " эмитент не является " + MICEX_CODE_FB);
+          else
+            SetError("В ПИ с FIID = " + string(fin_2.rec.FIID) + " эмитент не является " + MICEX_CODE);
+           end;
+        end;
+        
+        TC_2 = DV_TickCost(fin_2.rec.FIID, Date_2);
+        if( TC_2 == 0.0 )
+          Comment = "Не задан курс вида <Стоимость мин. шага цены> для ПФИ с кодом <"+ Fin_2.rec.FI_Code +"> за дату "+string(Date_2)+" в единицах измерения стоимости минимального шага цены.";
+          return 1;
+        end;
+        
+         if( fideriv_2.rec.Tick != $0 )
+            Tick_2 = fideriv_2.rec.Tick;
+         else
+            Tick_2 = $1;
+         end;
+       /*** TEG сделаем одинаковый расчет на всех видах 
+        if (НаКредитнуюСтавку)        
+          //Request.rec.CurrencyID = 0;//рубли
+          Request.rec.t_PriceFIID = 0;
+          if (ParmType == 14)
+            Request.rec.Price    = Price_RUR_2 - Price_RUR;
+          else
+            Request.rec.Price    = Price_RUR - Price_RUR_2;
+          end;
+        else
+          Request.rec.PriceFIID = fideriv.rec.tickFIID;
+          if (ParmType == 14)
+            Request.rec.Price    = Price_2 * TC_2 / Tick_2 - Price * TC / Tick;
+          else
+            Request.rec.Price    = Price * TC / Tick - Price_2 * TC_2 / Tick_2;
+          end;
+        end; ****/
+        if (ParmType == 14)
+            Request.rec.Price    = Price_RUR_2 - Price_RUR;
+        else
+            Request.rec.Price    = Price_RUR - Price_RUR_2;
+        end;
+        if (НаКредитнуюСтавку)        
+          //Request.rec.CurrencyID = 0;//рубли
+          Request.rec.t_PriceFIID = 0;
+        else
+          //Request.rec.CurrencyID = fideriv.rec.tickFIID;
+          Request.rec.PriceFIID = fideriv.rec.tickFIID;
+        end;
+      end;       
+      if( (GetParmByName( RG, "RGDVRQ_STATUS", @Request.rec.Status, @type ) == NULL) OR (type != V_STRING) )        
+      Request.rec.Status     = REQ_MADE_DEAL;
+     end;
+      if( (GetParmByName( RG, "RGDVRQ_SECSHORTNAME", @Request.rec.SecShortName, @type ) == NULL) OR (type != V_STRING) )
+
+      end;
+      if( (GetParmByName( RG, "RGDVRQ_TRADEGROUP", @TradeGroup, @type ) == NULL) OR (type != V_STRING) )
+      end;
+      if( TradeGroup == "S" )
+         pos = IIF( Index( Request.rec.SecShortName, "_") != 0, Index( Request.rec.SecShortName, "_") + 1, 7);
+         sub_str = SubStr(Request.rec.SecShortName, pos, strlen(Request.rec.SecShortName) - pos + 1);
+         if( (sub_str == "TODTOM") or (sub_str == "TOMSPT") or (sub_str == "TDSTMS") or (sub_str == "TDTM") or (sub_str == "TMSP"))
+            Request.rec.PFIKind = DL_REQ_PFIKIND_SWAP;
+         else
+            Request.rec.PFIKind = DL_REQ_PFIKIND_CURSWAP;
+         end;
+      end;
+
+      if((RG.GetSourceID() == GT_CSV) or (RG.GetSourceID() == GT_PAYMENTS_CSV) or (RG.GetSourceID() == GT_VR) or (RG.GetSourceID() == GT_PAYMENTS_VR)) //DEF-41951
+         GrndNum = SubStr(Request.rec.CodeTS, 4, strlen(Request.rec.CodeTS) - 3);
+      end;
+
+      ClntRep.rec.Kind        = 251/*DOCKIND_ORD_CLIENTOP*/;
+      ClntRep.rec.MethodApplic= Request.rec.MethodApplic;
+      ClntRep.rec.Party       = Request.rec.Client;
+      DL_СкорректироватьДатуЗаявки(Request.rec.Date, Request.rec.Time, @ClntRep.rec.RegistrDate, @ClntRep.rec.RegistrTime);
+      ClntRep.rec.XLD         = DL_СформироватьНомерЗаявки(Request.rec.Party, ClntRep.rec.RegistrDate, ClntRep.rec.RegistrTime, GrndNum);
+      ClntRep.rec.SignedDate  = ClntRep.rec.RegistrDate;
+      ClntRep.rec.SignedTime  = ClntRep.rec.RegistrTime;
+      ClntRep.rec.DocLog      = LLCLASS_KINDDOC_DERIV;
+      ClntRep.rec.Direction   = 1/*ENTERING*/;
+      ClntRep.rec.AltXLD      = ClntRep.rec.XLD;
+      ClntRep.rec.Division    = SelfDivision;
+      ClntRep.rec.Receptionist= {oper};
+      ClntRep.rec.BackOffice  = StrFor(GetIdentProgram());
+      ClntRep.rec.Comment     = "Поручение клиента на сделку по заявке " + Request.rec.CodeTS;
+      ClntRep.rec.Department  = {OperDprt};
+      ClntRep.rec.IsMakeAuto  = SET_CHAR;
+
+      GetParmByName(RG, "RGDVRQ_IDDEAL", @IDDeal, @type);
+      GetParmByName(RG, "RGDVRQ_IDMULT", @IDMULT, @type);
+
+      var day, mon, year;
+      DateSplit(Request.rec.Date, day, mon, year);
+
+      if ( ParmType == 14 )//если ноги спреда, формируем код спреда, код заявки по спреду
+         Request.rec.SPREAD_CODE = fi_code + SubStr(fi_code_2, Index(fi_code_2, "-"));
+         Request.rec.Code = string(day:2:o) + string(mon:2:o) + string(year:4:o) + "0" + IDMULT;
+      elif ( ParmType == 15 )
+         Request.rec.SPREAD_CODE = fi_code_2 + SubStr(fi_code, Index(fi_code, "-"));
+         Request.rec.Code = string(day:2:o) + string(mon:2:o) + string(year:4:o) + "0" + IDMULT;
+      elif ((RG.GetSourceID() == GT_CSV) OR (RG.GetSourceID() == GT_PAYMENTS_CSV))
+         if( (GetParmByName(RG, "RGDVRQ_CODE", @Request.rec.Code, @type) == NULL) OR (type != V_STRING) OR (trim(Request.rec.Code) == "") )
+            RunError( "Ошибка при получении параметра RGDVRQ_CODE" );
+         end;
+      elif (OperKind == -1)
+         Request.rec.Code = "CM/"+Request.rec.CodeTS;/*IS 507345 _по идее_ здесь только заявки по валютке*/
+      else
+         Request.rec.Code = iif(Request.rec.Direction == DL_REQ_DIRECTION_S,"S/","B/") + string(day:2:o) + string(mon:2:o) + string(year:4:o) + "0" + IDDeal;//для спреда должен быть MULT
+      end;
+   end;
+
+   if( (GetParmByName(RG, "RGDVRQ_ORDTYPECODE", @OrderType, @type) == NULL) OR (type != V_STRING) )
+   else
+      isOutAddr = IIF( SubStr(OrderType,1,1) == "N", 1, 2);       
+   end;
+
+   // BIQ-9103, для заявок валютного рынка
+   // 1) способ подачи заявок определяется через примечание 150 'Трейдер' на связанной сделке
+   // 2) если в сделке установлена категория MarginCall, заявка не создается
+   var isMarginCall: bool = false;
+   var InsertReq: bool = true;
+   var DealID: integer = -1;
+   if( (RG.GetSourceID() == GT_VR) or (RG.GetSourceID() == GT_PAYMENTS_VR) )
+     DealID = GetDVNDealID(Request.rec.CodeTS);
+     GetDealInfo(DealID, @trader_name, @isMarginCall);
+     SetMethodApplic(trader_name, @Request.rec.MethodApplic);
+     ClntRep.rec.MethodApplic = Request.rec.MethodApplic;
+     InsertReq = (isMarginCall == false);
+   end;
+
+   if(InsertReq == false) 
+      ID = "0";
+      Comment = Comment + "В ФИССиКО заявка-поручение №" + Request.rec.CodeTS + 
+           " не создана, так как на сделке DealID = " + string(DealID) + 
+           " установлена категория Margin Call ";
+      return 0;
+   else 
+      stat = DVDealGateOpenCloseFiles(true);
+      LoopInTrn(true);
+      if (ProcessTrn(0, "GT_DVRequestGateCreateNew") )
+         if(not stat)                                          
+           ConnectObjAttr(NULL, 149, UniID(Request, 149), 1, isOutAddr);
+         end;   
+                                             
+         ID = string(Request.rec.ID);
+         if (not stat)
+           Comment = Comment + "В ФИССиКО успешно создана заявка-поручение №" + Request.rec.CodeTS + ". ID = " + ID;
+         elif(stat == -1)
+           Comment = Comment + "При обработке записи репликации клиентское поручение не создано. Для сделки №" + IDDeal + " добавлена связь с существующим клиентским поручением №" + Request.rec.CodeTS;
+         else
+           Comment = Comment + "Обновлена информация для клиентского поручения №" + Request.rec.CodeTS;
+         end;
+         DVDealGateOpenCloseFiles(false);
+         return 0;
+      else
+         DVDealGateOpenCloseFiles(false);
+         SetError("Ошибка при обновлении информации по заявке в ФИССиКО. \n" + GetErrMsg());
+         return 1;
+      end;
+   end;
+
+   private Macro GT_DVRequestGateCreateNew()
+
+      VAR FlagAbortTRN = false;
+      MACRO Exit()
+         FlagAbortTRN = true;
+         AbortTRN;
+      END;
+
+      stat = DVRequestGateCreateNew(ClntRep, Request, iif((RG.GetSourceID() == GT_VR) or (RG.GetSourceID() == GT_PAYMENTS_VR), true, false), iif((RG.GetSourceID() == GT_CSV) OR (RG.GetSourceID() == GT_PAYMENTS_CSV), true, false), IDDeal);
+
+      if( stat > 0 )
+         Exit();                  
+      end;
+      //TEG 28.06.19 вставим в примечание имя трейдера
+      if( (trader_name != "") and not stat )
+          if( addNoteForObject( 149, 
+                            UniID(Request, 149),
+                            102, 
+                            trader_name, 
+                            Request.rec.Date ) )
+             RunError("Ошибка при установке примечания |\""+ИмяПримечания(149, 102)+"\" для объекта " + String(RecordID));
+          end;
+       end;  
+      return 0;
+
+   OnError( RslErrObj )
+      if (not FlagAbortTRN)
+         AbortTRN
+      end;
+      //return 1;
+   end;   
+
+OnError( RslErrObj )
+   if( RslErrObj.Err != NULL )
+      Comment =  RslErrObj.Err;
+   else
+      Comment =  RslErrObj.Message;
+   end;
+   return 1;
+
+end;

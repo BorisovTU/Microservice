@@ -1,0 +1,12 @@
+/*Обновление шага*/
+DECLARE
+BEGIN
+
+  UPDATE DOPROSTEP_DBT
+     SET T_KIND_ACTION = 1
+   WHERE T_BLOCKID = 203500
+     AND T_NUMBER_STEP = 10;
+
+END;
+/
+

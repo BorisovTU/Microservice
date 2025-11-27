@@ -1,0 +1,266 @@
+/*
+$Name: spadd_20.mac
+$Module: Депозитарий
+$Description: Зачисление безналичных ценных бумаг. Шаг "Открытие разделов"
+*/
+import OprInter, PaymInter, InsCarryDoc, dpmassexec;
+
+/* Буферы ПД, заполняемые из операции */
+record Pm_paym( pmpaym );    /*основной платеж*/
+record Pm_prop_deb( pmprop ); /*св-ва платежа банка-плательщика*/
+record Pm_prop( pmprop );    /*св-ва платежа*/
+record Pm_rmprop( pmrmprop ); /*платеж по ценным бумагам*/
+
+macro ExecuteStep( d, spdraft ) 
+  var pmobj = RsbPayment( Pm_paym.PaymentID ), DpNode, err = 0;
+  record r_spdraft( spdraft );
+  FILE DepoAcc( depoacnt ) key 2;  /* по короткому коду + номер отделения */
+  var CorrAccDpNode = 0;
+  var ErrStr = "";
+  var OprStatus = 0;
+
+  SetBuff( r_spdraft, spdraft );
+
+  if( DP_CheckRejectedDepoDraft( spdraft, Pm_paym, err ) ) return err; end;
+
+  if( Pm_paym.ValueDate > {curdate} )
+    MsgBox("Дата проводки больше текущей.\n Выполнение операции приостановлено\n до наступления запланированной даты.");
+    return 1;
+  end;
+
+  DpNode = InputDepoPartByDepoAcc( DP_OPRACC_PAYER, Pm_paym.PayerDpNode, spdraft, err, r_spdraft.SPgroundID, Pm_paym.DocKind, Pm_paym.DocumentID, DP_SPDRAFT_OPERATION, DP_IIF(r_spdraft.FromTransitAccount == "X", true, false) );
+  if(DpNode)
+    pmobj.PayerDpNode = Pm_paym.PayerDpNode = DpNode;
+  else /* Была ошибка */
+    err = 1;
+  end;
+
+  if(NOT err)
+    DpNode = InputDepoPartByDepoAcc( DP_OPRACC_RECEIVER, Pm_paym.ReceiverDpNode, spdraft, err, r_spdraft.SPgroundID, Pm_paym.DocKind, Pm_paym.DocumentID, DP_SPDRAFT_OPERATION );
+    if(DpNode)
+      pmobj.ReceiverDpNode = Pm_paym.ReceiverDpNode = DpNode;
+    else /* Была ошибка */
+      err = 1;
+    end;
+  end;
+
+  if(not err)
+    err = DP_AddAllMortgageeToGrRep(Pm_paym.PayerDpNode, spdraft);
+  end;
+  if(not err)
+    err = DP_AddAllMortgageeToGrRep(Pm_paym.ReceiverDpNode, spdraft);
+  end;
+
+  //если работает через транзитный счет, то надо на корсчете открыть/найти терминальный раздел и л/с
+  if((not err) and (r_spdraft.FromTransitAccount == "X"))
+  
+     if( Pm_prop_deb.Corschem != -1 )
+       DepoAcc.BriefCode = GetCorAcc( Pm_prop_deb.PayFIID, Pm_prop_deb.Corschem, CORS_ACC_ACCOUNT );
+       DepoAcc.Department = {OperDprt};
+       if( getEQ( DepoAcc ) )
+         CorrAccDpNode = InputDepoPartByDepoAcc( DP_OPRACC_PAYER, DepoAcc.AutoKey, spdraft, err, r_spdraft.SPgroundID, Pm_paym.DocKind, Pm_paym.DocumentID, DP_SPDRAFT_OPERATION, false );
+         if( CorrAccDpNode == 0)
+           err = 1;
+         end;
+       end;
+     end;
+  end;
+
+  if( err )
+    err = RejectDepoDraftYesNo( spdraft, DP_SPDRAFT_OPERATION );
+  else
+    if((r_spdraft.SendInstruction == SET_CHAR) AND (not FindDpMessageByDraft(r_spdraft.AutoKey)))
+      OprStatus = DP_OPERSTATUS_SPDRAFT_DO_CRMESS; //Создание инструкции
+    elif(r_spdraft.UseKvit == SET_CHAR)
+      OprStatus = DP_OPERSTATUS_SPDRAFT_DO_KVIT; //Квитовка Встречных
+    elif((r_spdraft.WaitForConf == SET_CHAR) OR (r_spdraft.WaitConfirmation == SET_CHAR))
+      OprStatus = DP_OPERSTATUS_SPDRAFT_DO_CONFIRM; //Подтверждение операции
+    end;
+
+    if( OprStatus and (not InsertOprStatus( DP_OPERSTATUS_ENROL_DO, OprStatus)) ) 
+       msgbox( "Ошибка при установке статуса <Документооборот> операции" );
+       err = 1;
+    end;
+  end;
+
+  return err;
+end;
+
+
+MACRO MassExecuteStep()
+  var cmd, query, DataSet;
+  var r_spdraft= TRecHandler("spdraft.dbt");
+  var r_paym   = TRecHandler( "pmpaym.dbt" );  
+  var save_paym= TRecHandler( "pmpaym.dbt" );
+  var r_debet  = TRecHandler( "pmprop.dbt" );  
+  var r_credit = TRecHandler( "pmprop.dbt" );  
+  var r_rmprop = TRecHandler( "pmrmprop.dbt" );
+
+  var pmobj = NULL, DpNode, err = 0, stat = 0, ErrStr;
+  var OprStatus = 0;
+  FILE DepoAcc( depoacnt ) key 2;  /* по короткому коду + номер отделения */
+  var CorrAccDpNode = 0;
+  var TransitNodeID = 0;
+  var TermTransitNodeID = DP_GetTermTransitAccount();
+
+  if(DP_MassCheckRejectedDepoDraft() != 0)
+    return 1;
+  end;
+
+  if(DP_MassCheckTransitAccount() != 0)
+    return 1;
+  end;
+
+  if(GetTransitAccount( DepoAcc ) == 0)
+    TransitNodeID = DepoAcc.AutoKey;
+  end;
+
+  query =   " select dr.*, mv.t_PaymentID, oprtemp.t_ID_Operation, oprtemp.t_ID_Step, "
+          + "        (case when (dr.t_FromTransitAccount = 'X' and prop.t_Corschem != -1 and 0 = rsb_depo.IsTerminalAcntNode(rsb_depo.GetAcntNodeFromCorschem(prop.t_Corschem, pm.t_FIID))) then 1 else 0 end) NeedCors, "
+          + "        (case when 0 = rsb_depo.IsTerminalAcntNode(pm.t_PayerDpNode) then 1 else 0 end) as NeedPayerDpNode, "
+          + "        (case when 0 = rsb_depo.IsTerminalAcntNode(pm.t_ReceiverDpNode) then 1 else 0 end) as NeedReceiverDpNode "
+          + "   from DOPRTEMP_VIEW oprtemp, dspdraft_dbt dr, dspdrmove_dbt mv, dpmpaym_dbt pm, dpmprop_dbt prop"
+          + "  where dr.t_AutoKey = oprtemp.t_OrderID "
+          + "    and mv.t_DraftID = dr.t_AutoKey "
+          + "    and pm.t_PaymentID = mv.t_PaymentID "
+          + "    and prop.t_PaymentID = pm.t_PaymentID "
+          + "    and prop.t_DebetCredit = 0 "; //дебет
+
+  cmd = DL_RSDCommand(query);
+
+  
+  DataSet = cmd.Execute();
+  while(DataSet.moveNext())
+
+    if((r_spdraft.rec.FromTransitAccount == SET_CHAR) or 
+       (DataSet.NeedCors) or 
+       (DataSet.NeedPayerDpNode) or 
+       (DataSet.NeedReceiverDpNode)
+      )
+
+      stat = 0;
+      
+      DataSet.GetRecord().CopyTo( r_spdraft.rec );
+
+      pmobj = RsbPayment( DataSet.PaymentID );
+
+      Copy(r_paym,   pmobj.GetPM_PAYM());
+      Copy(r_rmprop, pmobj.GetPMRMPROP());
+      Copy(r_debet,  pmobj.GetDEBET());
+      Copy(r_credit, pmobj.GetCREDIT());
+
+      Copy(save_paym, r_paym);
+
+      var DraftAllParm = DP_DraftAllParms(r_spdraft, NULL, r_paym, r_rmprop, r_debet, r_credit, DataSet.ID_Operation, DataSet.ID_Step);
+
+      if(r_spdraft.rec.FromTransitAccount == SET_CHAR)
+        if(TermTransitNodeID > 0)
+          DpNode = TermTransitNodeID;
+        else
+          DpNode = InputDepoPartByDepoAcc( DP_OPRACC_PAYER, TransitNodeID, NULL, stat, r_spdraft.rec.SPgroundID, r_paym.rec.DocKind, r_paym.rec.DocumentID, DP_SPDRAFT_OPERATION, DP_IIF(r_spdraft.rec.FromTransitAccount == "X", true, false), DraftAllParm );
+        end;
+      elif(DataSet.NeedPayerDpNode != 0)
+        DpNode = InputDepoPartByDepoAcc( DP_OPRACC_PAYER, r_paym.rec.PayerDpNode, NULL, stat, r_spdraft.rec.SPgroundID, r_paym.rec.DocKind, r_paym.rec.DocumentID, DP_SPDRAFT_OPERATION, DP_IIF(r_spdraft.rec.FromTransitAccount == "X", true, false), DraftAllParm );
+      else
+        DpNode = r_paym.rec.PayerDpNode;
+      end;
+
+      if(DpNode)
+        r_paym.rec.PayerDpNode = DpNode;
+      else
+        stat = 1;
+        DP_SetErrorOprTemp( r_paym.rec.PaymentID, stat, DPError.GetErr() );
+      end;
+
+      if(NOT stat)
+        if(DataSet.NeedReceiverDpNode != 0)
+          DpNode = InputDepoPartByDepoAcc( DP_OPRACC_RECEIVER, r_paym.rec.ReceiverDpNode, NULL, stat, r_spdraft.rec.SPgroundID, r_paym.rec.DocKind, r_paym.rec.DocumentID, DP_SPDRAFT_OPERATION, false, DraftAllParm );
+          if(DpNode)
+            r_paym.rec.ReceiverDpNode = DpNode;
+          end;
+        else
+          DpNode = r_paym.rec.ReceiverDpNode;
+        end;
+        if( DpNode == 0 ) /* Была ошибка */
+          stat = 1;
+          DP_SetErrorOprTemp( r_paym.rec.PaymentID, stat, DPError.GetErr() );
+        end;
+      end;
+
+      //если работает через транзитный счет, то надо на корсчете открыть/найти терминальный раздел и л/с
+      if((not stat) and (r_spdraft.rec.FromTransitAccount == "X") and (DataSet.NeedCors != 0))
+         if( r_debet.rec.Corschem != -1 )
+           var AcntNodeID = DP_GetCorAcc( r_debet.rec.Corschem, r_debet.rec.PayFIID );
+           if( AcntNodeID > 0 )
+             CorrAccDpNode = InputDepoPartByDepoAcc( DP_OPRACC_PAYER, AcntNodeID, NULL, stat, r_spdraft.rec.SPgroundID, r_paym.rec.DocKind, r_paym.rec.DocumentID, DP_SPDRAFT_OPERATION, false, DraftAllParm );
+             if( CorrAccDpNode == 0)
+               stat = 1;
+               DP_SetErrorOprTemp( r_paym.rec.PaymentID, stat, DPError.GetErr() );
+             end;
+           end;
+         end;
+      end;
+
+      if((not stat) and ((r_paym.rec.PayerDpNode != save_paym.rec.PayerDpNode) or (r_paym.rec.ReceiverDpNode != save_paym.rec.ReceiverDpNode)))
+        stat = DP_SetDpNodeToPaym(r_paym.rec.PaymentID, r_paym.rec.PayerDpNode, r_paym.rec.ReceiverDpNode);
+        if(stat)
+          DP_SetErrorOprTemp( r_paym.rec.PaymentID, stat, "Ошибка при обновлении платежа" );
+        else
+          stat = DP_SavePaymForBackOut(save_paym, DataSet.ID_Operation, DataSet.ID_Step);
+          if(stat)
+            DP_SetErrorOprTemp( save_paym.rec.PaymentID, stat, "Ошибка при сохранении платежа для отката" );
+          end;
+        end; 
+      end;
+
+    end; 
+
+  end;
+
+  var pointName = DP_SqlSavePoint();
+
+  if(not err)
+    err = DP_MassAddAllMortgageeToGrRep();
+  end;   
+
+  if(not err)
+    VAR OperStatus = DP_MassOperStatus();
+
+    OperStatus.Insert( DP_OPERSTATUS_ENROL_DO, DP_OPERSTATUS_SPDRAFT_DO_ACCCARRY, " dr.t_SendInstruction = CHR(0) " );
+    OperStatus.Insert( DP_OPERSTATUS_ENROL_DO, DP_OPERSTATUS_SPDRAFT_DO_CONFIRM,  " (dr.t_WaitForConf = 'X' or dr.t_WaitConfirmation = 'X') " );
+    OperStatus.Insert( DP_OPERSTATUS_ENROL_DO, DP_OPERSTATUS_SPDRAFT_DO_KVIT,     " dr.t_UseKvit = 'X' " );
+    
+    query =   " select dr.t_AutoKey "
+            + "   from DOPRTEMP_VIEW oprtemp, dspdraft_dbt dr"
+            + "  where dr.t_AutoKey = oprtemp.t_OrderID "
+            + "    and dr.t_SendInstruction = 'X' ";
+
+    cmd = DL_RSDCommand(query);
+
+    
+    DataSet = cmd.Execute();
+    while(DataSet.moveNext())
+      if(not FindDpMessageByDraft(DataSet.AutoKey))
+        OperStatus.Insert( DP_OPERSTATUS_ENROL_DO, DP_OPERSTATUS_SPDRAFT_DO_CRMESS, " dr.t_AutoKey = " + DataSet.AutoKey );  
+      end;
+    end;
+
+    err = OperStatus.Execute( "Шаг настройки операции. Установка статуса операций." );
+  end;
+
+  if(err)
+    DP_SqlRollBackPoint(pointName);
+    //ставим отметку об ошибке выполнения всем поручениям пачки
+    DP_SetErrorOprTemp(0, err, "Ошибка при пакетном выполнении шага");
+  end;
+
+  return 0;
+
+OnError(er)
+  if((ValType(pointName) != V_UNDEF) and pointName != "")
+    DP_SqlRollBackPoint(pointName);
+  end;
+
+  DP_SetErrorOprTemp(0, 1, er.module+ " "+er.line+" "+er.message);
+  return 0;
+END;

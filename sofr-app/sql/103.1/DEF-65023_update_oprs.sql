@@ -1,0 +1,8 @@
+BEGIN
+  UPDATE DOPROSTEP_DBT
+     SET T_DAYFLAG = CHR (0)
+   WHERE T_BLOCKID IN (SELECT T_BLOCKID
+                         FROM DOPRBLOCK_DBT
+                        WHERE T_DOCKIND IN (192));
+END;
+/

@@ -1,0 +1,2012 @@
+/**
+ @file 		vslib.mac
+ @brief 	Функции общего употребления библиотеки векселей
+
+ # changelog
+ |date       |autor          |tasks                                           |note
+ |-----------|---------------|------------------------------------------------|-------------------------------------------------------------
+ |28.12.2023 |Велигжанин А.В.|DEF-56486                                       |Оптимизация. Выражение GetGE() неэффективно без addFilter()
+*/
+
+IMPORT vsmisc, FIInter, DealsInter, PaymInter, VSInter, CTInter, PTInter, oralib,
+       OprInter, BankInter, globals, Проценты, Календарь, vsacc, vsconv, "cb_sql", "dlvaprds.mac";
+import likepy;
+
+//глобальне переменные
+//чтобы не протаскивать их через все ф-ции
+//пока инициализируются не на всех шагах !!!
+//должны инициализироваться в ExecuteStep, а сбрасываться в PostStep
+var VS_CurrIDOperation = 0; //ID текущей операции
+var VS_CurrIDStep = 0; //ID текущего шага
+
+//получить процентную ставку по векселю - для машины процентов (вызывается из C)
+MACRO VS_GetBillPrice(ContractID, RateDate)
+  var query, DataSet, cmd;
+  var Rate = 0;
+
+  query =   " select rsb_bill.GetBnrRateOnDate(TO_NUMBER(prcc.t_ObjectID), ?)/10000 as Rate"
+          + "   from dprccontract_dbt prcc "
+          + "  where prcc.t_ContractID = " + ContractID
+          + "    and prcc.t_ObjectType = " + OBJTYPE_VEKSEL;
+  cmd = DL_RSDCommand(query);
+  cmd.AddParam(RateDate);
+
+  DataSet = cmd.Execute();
+  if(DataSet.moveNext())
+    Rate = DataSet.Rate;
+  end;
+
+  return Rate;
+END;
+
+MACRO VS_GetRegistryValue(reg_parm, type, val:@variant)
+var stat;
+
+    GetRegistryValue(reg_parm, type, val, stat);
+    if (stat)
+        msgbox("Ошибка при получении настройки|" + reg_parm);
+        return false;
+    else
+        return true;
+    end;
+END;
+
+/* Определить плановую дату погашения
+*/
+MACRO VS_GetPlanExpryDate(bnr, leg)
+  return DL_VS_GetPlanExpryDate(bnr, leg);
+END;
+
+/* Получить дату повторного размещения (продажи) векселя
+*/
+MACRO VS_GetStartDate(bnr, leg)
+  return DL_VS_GetStartDate(bnr, leg);
+END;
+
+/* Получить срок обращения векселя
+*/
+MACRO VS_GetTermCircDate(bnr, leg)
+  return DL_VS_GetTermCircDate(bnr, leg);
+END;
+
+/* Получить сумму последнего размещения векселя,
+   актуально для дисконтного векселя
+*/
+MACRO ПолучитьСуммуРазмещения( leg, bnr )
+  var BCCFI;
+  var СуммаРазмещения, PFI;
+
+  if(ValType(leg) == V_GENOBJ)
+    PFI = leg.rec.PFI;
+  else
+    PFI = leg.PFI;
+  end;
+
+  СуммаРазмещения = DL_VS_GetReceiptAmount(leg, @BCCFI);
+  if(PFI != BCCFI)
+    СуммаРазмещения = VS_Convert(СуммаРазмещения, VS_GetStartDate(bnr, leg), BCCFI, PFI);
+  end;
+
+  return СуммаРазмещения;
+END;
+
+/* ИСТИНа, если вексель процентный
+     передаются параметры: либо 'a' - Formula и 'b' - Price,
+       либо 'a' - буфер структуры dl_leg.
+*/
+MACRO ВексельПроцентный(a, b)
+var
+   Ok = false, Price, Formula, ttype = ValType(a);
+
+   if(ttype == V_INTEGER)
+      Formula = a;
+      Price   = b;
+   elif(ttype == V_GENOBJ)
+      Formula = a.rec.Formula;
+      Price   = a.rec.Price;
+   else
+      Formula = a.Formula;
+      Price   = a.Price;
+   end;
+
+   if(ValType(Price) != V_UNDEF)
+      if(Price == 0)
+         return false; // процентов нет, считаем вексель непроцентым
+      end;
+   END;
+
+   if(Formula == VS_IN_S_PC)     // простые %%
+     Ok = true;
+   elif(Formula == VS_IN_M_PC)     // сложные %%
+     Ok = true;
+   elif(Formula == VS_IN_DISC_PC)  // процентно-дисконтный
+     Ok = true;
+   end;
+
+   return Ok;
+END;
+
+/* ИСТИНа, если вексель дисконтный
+*/
+MACRO ВексельДисконтный(a, b)
+   return DL_VS_IsVsDiscount(a, b);
+END;
+
+/* ИСТИНа, если вексель с начальной премией
+*/
+MACRO ВексельсПремией(a, b)
+   return DL_VS_IsVsBonus(a, b);
+END;
+
+
+/* Определяет платеж по договору. Назначение платежа должно быть задано.
+     Если назначение платежа задано неявным образом (== -1),
+     то ищется платеж по виду договора.
+*/
+MACRO НайтиПлатежПоДоговору(pm:@variant, Договор, Purp)
+var
+    DocKind, ContractID, типДоговора = ValType(Договор), SubPurp = 0, splinter = false;
+
+   if(типДоговора == V_STRUC)
+      DocKind = Договор.DocKind;
+      ContractID = Договор.ContractID;
+   elif(типДоговора == V_GENOBJ)
+      DocKind = Договор.rec.DocKind;
+      ContractID = Договор.rec.ContractID;
+   else
+      return false;
+   end;
+
+   if((Purp == null) or (ValType(Purp) != V_INTEGER))
+     return false;
+   elif(Purp != -1)
+     /* назначение платежа задано явно */;
+   elif(DocKind == DL_VEKSELORDER)               /* эмиссия */
+     Purp = PM_PURP_VEKSEL;
+   elif(DocKind == DL_VEKSELDRAWORDER)           /* погашение */
+     Purp = PM_PURP_VEKSELDRAW;
+   elif(DocKind == DL_VSBARTERORDER)             /* мена */
+     Purp = PM_PURP_VSBARTERDIFF;
+   elif(DocKind == DL_VSSTORAGEORDER)            /* хранение */
+     Purp = PM_PURP_STORAGEFEE;
+   elif(DocKind == DL_VSSALE)                    /* продажа */
+     Purp = PM_PURP_VEKSEL;
+   else
+     return false;
+   end;
+
+   pm = RsbPayment(DocKind, ContractID, Purp, SubPurp);
+
+   return ((pm != null) AND (pm.PaymentID > 0));
+END;
+
+/* Определить валюту учета векселя (ВУ)
+*/
+MACRO ОпределитьВалютуУчетаВекселя(PayFIID, PFI)
+var
+   ВалУч = ALLFININSTR,
+   RegVal;
+
+   if( PayFIID != ALLFININSTR )
+     ВалУч = PayFIID;
+   else
+     if( PFI == NATCUR ) /*Номинал*/
+       ВалУч = NATCUR;
+     elif( (VS_GetRegistryValue("ВЕКСЕЛЯ БАНКА\\РЕЖИМ РАБОТЫ\\УЧЕТ_ВАЛ_ВЕКС_БЕЗ_ОЭП_В_РУБЛЯХ", V_BOOL, @RegVal)) and RegVal )
+       ВалУч = NATCUR;
+     else
+       ВалУч = PFI;
+     end;
+   end;
+
+   return ВалУч;
+END;
+
+/* Определяет валюту платежа по договору
+*/
+MACRO ВалютаПлатежаПоДоговору(Договор)
+var
+    paym, ret = -1;
+
+    if(НайтиПлатежПоДоговору(@paym, Договор))
+      ret = paym.ReceiverFIID;
+    end;
+
+    return ret;
+END;
+
+/*  Отображает сообщение об ошибке и возвращает 1.
+*/
+MACRO Ошибка()
+    var i=0,parm,mes="";
+
+    While ( GetParm(i,parm) and (ValType(parm)!=V_UNDEF) )
+        mes = String(mes,parm);
+        i = i + 1;
+    end;
+
+    msgbox (mes);
+    return 1;
+END;
+
+/* Возвращает имя оператора 'id'
+*/
+MACRO ИмяОператора( id )
+  var person=TBfile("person.dbt"), ret;
+  person.KeyNum=0;
+  person.rec.Oper=id;
+  ret=person.GetEQ;
+  return VS_IIF(ret,person.rec.Name,"");
+END;
+
+/* Возвращает PartyID оператора или -1
+*/
+MACRO PartyIDОператора( id )
+  var person=TBfile("person.dbt"), ret;
+  person.KeyNum=0;
+  person.rec.Oper=id;
+  ret=person.GetEQ;
+  return VS_IIF(ret,person.rec.PartyID,-1);
+END;
+
+/* Возвращает CodeDepart оператора или -1
+*/
+MACRO CodeDepartОператора( id )
+  var person=TBfile("person.dbt"), ret;
+  person.KeyNum=0;
+  person.rec.Oper=id;
+  ret=person.GetEQ;
+  return VS_IIF(ret,person.rec.CodeDepart,-1);
+END;
+
+/* Возвращает краткое наименование субъекта
+*/
+MACRO VS_GetPartyShortName( partyID )
+var
+    pt = TRecHandler ("party"),
+    ptname = "";
+
+    if (ПолучитьСубъекта (partyID, pt) == 0)
+       ptname = pt.rec.ShortName;
+    end;
+
+    return ptname;
+END;
+
+/* Возвращает краткое наименование
+   нашего банка
+*/
+MACRO НашБанк()
+   var party=TBfile("party.dbt"), Ok;
+   party.KeyNum=0;
+   party.rec.PartyID={OurBank};
+   Ok=party.GetEQ;
+   return VS_IIF(Ok,party.rec.ShortName,"");
+END;
+
+/* Возвращает БИК нашего банка
+*/
+MACRO НашБик()
+   var party=TBfile("party.dbt"),
+       partcode=TBfile("partcode.dbt"),
+       Ok;
+   party.KeyNum=0;
+   party.rec.PartyID={OurBank};
+   Ok=party.GetEQ;
+   if(not Ok)
+     return "";
+   end;
+   partcode.KeyNum=0;
+   partcode.rec.PartyID=party.rec.PartyID;
+   partcode.rec.CodeKind=PTCK_BIC;
+   Ok=partcode.GetEQ;
+   return VS_IIF(Ok,partcode.rec.Code,"");
+END;
+
+/* Ищет операцию с номером 'id'
+   в файле 'oproper'
+*/
+MACRO ПоискОперации( oproper, id )
+   var
+      ret, otype=ValType(oproper);
+   if(otype==V_STRUC)
+      oproper.ID_Operation=id;
+      ret=GetEQ(oproper);
+   elif(otype==V_GENOBJ)
+      oproper.KeyNum=0;
+      oproper.rec.ID_Operation=id;
+      ret=oproper.GetEQ;
+   else
+      ret=false;
+   end;
+   return ret;
+END;
+
+/*  Изменение статуса векселя
+*/
+MACRO СменитьСтатусВекселя(BCID, ChangeDate, newStatus)
+  return ИзменитьВексель(BCID, ChangeDate, "bcstatus", newStatus);
+END;
+
+/* Ищет договор с номером 'ContractID'
+*/
+MACRO ПоискДоговора(order, ContractID)
+   var
+      Ok, otype=ValType(order);
+   if(otype==V_STRUC)
+      order.ContractID = ContractID;
+      Ok=GetEQ(order);
+   elif(otype==V_GENOBJ)
+      order.KeyNum = 0;
+      order.rec.ContractID = ContractID;
+      Ok=order.GetEQ;
+   else
+      Ok=false;
+   end;
+
+   if(Ok)
+     setparm(0, order);
+   end;
+   return Ok;
+END;
+
+/* Ищет сделку с номером 'DealID'
+*/
+MACRO ПоискСделки(tick, DealID)
+   var
+      Ok, otype=ValType(tick);
+   if(otype==V_STRUC)
+      tick.DealID = DealID;
+      Ok=GetEQ(tick);
+   elif(otype==V_GENOBJ)
+      tick.KeyNum = 0;
+      tick.rec.DealID = DealID;
+      Ok=tick.GetEQ;
+   else
+      Ok=false;
+   end;
+
+   if(Ok)
+     setparm(0, tick);
+   end;
+   return Ok;
+END;
+
+/* Ищет вексель с идентификатором 'BCID'
+*/
+MACRO ПоискВекселя(bnr, BCID)
+   var
+      ret, otype=ValType(bnr);
+   if(otype==V_FILE)
+      bnr.BCID = BCID;
+      ret=GetEQ(bnr);
+   elif(otype==V_GENOBJ)
+      bnr.KeyNum = 0;
+      bnr.rec.BCID = BCID;
+      ret=bnr.GetEQ;
+   else
+     ret=false;
+   end;
+   return ret;
+END;
+
+/* Ищет ценовые условия для векселя 'BCID'
+*/
+MACRO ПоискЦеновыхУсловийВекселя(leg, BCID)
+   var
+      ret, otype=ValType(leg);
+   if(otype==V_STRUC)
+      leg.DealID=BCID;
+      leg.LegKind=1;               /* Ценовые условия векселя */
+      leg.LegID=0;
+      ret=GetEQ(leg);
+   elif(otype==V_GENOBJ)
+      leg.KeyNum=0;
+      leg.rec.DealID=BCID;
+      leg.rec.LegKind=1;           /* Ценовые условия векселя */
+      leg.rec.LegID=0;
+      ret=leg.GetEQ;
+   else
+     ret=false;
+   end;
+   return ret;
+END;
+
+/*  Поиск регистрирующего документа для договора.
+*/
+MACRO ПоискРегистратора(spg, Договор)
+var
+    ordType=ValType(Договор),
+    spgType=ValType(spg),
+    DocKind,
+    ContractID,
+    Department,
+    Direction,
+    Division=DIVISION_VEKSEL,
+    Ok=true;
+
+    if(ordType==V_STRUC)
+       DocKind=Договор.DocKind;
+       ContractID=Договор.ContractID;
+       Department=Договор.Department;
+    elif(ordType==V_GENOBJ)
+       DocKind=Договор.rec.DocKind;
+       ContractID=Договор.rec.ContractID;
+       Department=Договор.rec.Department;
+    else
+       return false;
+    end;
+
+    if ((DocKind == DL_VEKSELPAWNORDER) or
+        (DocKind == DL_VEKSELDRAWORDER))
+        Direction = ENTERING;
+    else
+        Direction = EXITING;
+    end;
+
+    if(spgType==V_STRUC)
+       spg.SourceDocKind=DocKind;
+       spg.SourceDocID=ContractID;
+       spg.Direction=Direction;
+       spg.Department=Department;
+       spg.Division=Division;
+       Ok=getEQ(spg);
+    elif(spgType==V_GENOBJ)
+       spg.KeyNum=6;
+       spg.rec.SourceDocKind=DocKind;
+       spg.rec.SourceDocID=ContractID;
+       spg.rec.Direction=Direction;
+       spg.rec.Department=Department;
+       spg.rec.Division=Division;
+       Ok=spg.getEQ;
+    else
+       Ok=false;
+    end;
+    return Ok;
+
+END;
+
+/* Возвращает символьный код валюты для FIID
+*/
+MACRO GetCcyCode(FIID)
+record fi( fininstr );
+var r = 0;
+
+ if( ПолучитьФинИн( FIID, fi ) == 0 )
+    r = fi.Ccy;
+ end;
+
+   return r;
+
+END;
+
+/* Чтобы избежать коллизий между реализациями getISOCode
+   в get_mfo.mac и prpm.mac, сделаем свою версию (#65077, 66740)
+*/
+MACRO VS_GetISOCode( FIID:integer ):integer
+var
+  fi = TRecHandler( "fininstr.dbt" );
+
+  if( FIID >= 0 )
+    if( ПолучитьФинИн( FIID, fi ) == 0 )
+      return fi.rec.ISO_Number;
+    end;
+  end;
+  return 0;
+END;
+
+/* Возвращает сумму прописью
+   Необязательные параметры (FIID, rub, kop)
+*/
+MACRO ValueWr(Sum, FIID, rub, kop)
+var ret, r, k;
+   ПоУмолчанию(FIID, 0);
+   ПоУмолчанию(r, 0);
+   ПоУмолчанию(k, 0);
+   ret=curtostralt(Sum, r, k, VS_GetISOCode(FIID));
+   if (ValType(rub)!=V_UNDEF)
+       setparm(2,r);
+   end;
+   if (ValType(kop)!=V_UNDEF)
+       setparm(2,k);
+   end;
+   return ret;
+END;
+
+/*  Выполняет действия 'action' для представителя
+*/
+PRIVATE MACRO ВыполнитьДляПредст(action, order, proxy, spg, num)
+   return (ExecMacro2(action, order, proxy, spg, num) == 0);
+END;
+
+/*  Поиск регистрирующего документа по идентификатору
+*/
+PRIVATE MACRO НайтиSpg(spg, ID)
+   var
+      ret, otype=ValType(spg);
+   if(otype==V_STRUC)
+      spg.SPgroundID=ID;
+      ret=GetEQ(spg);
+   elif(otype==V_GENOBJ)
+      spg.KeyNum=0;
+      spg.rec.SPgroundID=ID;
+      ret=spg.GetEQ;
+   else
+      ret=false;
+   end;
+   return ret;
+END;
+
+/*  Стандартный вызов действий для каждого представителя в
+       может вызываться в любом месте (не только на шагах)
+*/
+MACRO ДляКаждогоПредставителя(order, action)
+
+PRIVATE var proxy = TBfile ("dl_proxy"),
+            spg   = TBfile ("spground"),
+            Ok, ContractID, otype, i;
+
+    otype=ValType(order);
+    if(otype==V_GENOBJ)
+      ContractID=order.rec.ContractID;
+    else
+      ContractID=order.ContractID;
+    end;
+    proxy.KeyNum=0;
+    proxy.rec.ContractID=ContractID;
+    proxy.rec.ContractParty=0;
+    proxy.rec.ProxyRole=0;
+
+    Ok=proxy.GetGE;
+
+    i=0;
+    while(Ok)
+       Ok=(proxy.rec.ContractID==ContractID);
+       if(Ok)
+          if(not НайтиSpg(spg, proxy.rec.ProxyID))
+            return Ошибка("Не найден документ представителя");
+          elif(not ВыполнитьДляПредст(action,order,proxy,spg,i))
+            return 1;
+          end;
+          i=i+1;
+          Ok=proxy.next;
+       end;
+    end;
+    return 0;
+
+END;
+
+/* Возвращает "правильную" дату для процентных функций (ограниченную датой окончания проц.периода)
+*/
+MACRO VS_GetRightPcDate(pc, aDate)
+var
+   endDate = ZeroDate,
+   rightDate = ZeroDate;
+
+   if(ValType(pc) == V_GENOBJ)
+     endDate = pc.rec.endDate;
+   else
+     endDate = pc.endDate;
+   end;
+
+  if((aDate > endDate) and (endDate != ZeroDate))
+    rightDate = endDate;
+  else
+    rightDate = aDate;
+  end;
+
+  return rightDate;
+END;
+
+/*  Получает суммы процентов "начисленных" и "к начислению"
+    по векселю на дату
+*/
+MACRO ПолучитьСуммуКНачисл_В(
+  bnr,
+  leg,
+  дата,
+  Скн:@Money,       // сумма к начислению по %%
+  ОсткБСчПр:@Money  // остаток балансового счета %%
+)
+var
+  BCID = 0,
+  prccontract = TRecHandler("prccontract"),
+  stat = 0;
+
+  if(ValType(bnr) == V_GENOBJ)
+    BCID = bnr.rec.BCID;
+  else
+    BCID = bnr.BCID;
+  end;
+
+  if(дата == ZeroDate)
+    дата = {curdate};
+  end;
+
+  if(not НайтиСчетПроцВекселя(prccontract, BCID, null, VS_FINDPC_ACTUAL))
+    stat = Ошибка("Не найден счет процентного векселя");
+  elif(not СуммаНачисленныхПроцентовПоПДВекселя(prccontract.rec.ContractID, prccontract.rec.BeginDate, дата, ОсткБСчПр))
+    stat = Ошибка("Ошибка при получении суммы начисленных процентов");
+  elif(not ПроцентыКНачислениюПоПДВекселя(prccontract.rec.ContractID, VS_GetRightPcDate(prccontract, дата), Скн))
+    stat = Ошибка("Ошибка при получении суммы процентов к начислению");
+  end;
+
+  return (stat == 0);
+END;
+
+MACRO НайтиНачОтделаСВО ()
+   var
+       officer  = TBfile("officer.dbt"),
+       pt       = TRecHandler ("party"),
+       OfficeID = VS_GetSetting ("ПОДРАЗДЕЛЕНИЕ"),
+       Название = "",
+       Ok;
+
+    officer.KeyNum = 5;
+    officer.rec.OfficeID = OfficeID;
+    officer.rec.PartyID = {OurBank};
+    officer.rec.IsFirstOfficePerson="X";
+    Ok=officer.GetEQ;
+    if (Ok)
+      ПолучитьСубъекта (officer.rec.PersonID, pt);
+      Название = pt.rec.Name;
+    end;
+
+ return Название;
+END;
+
+/* Возвращает номер телефона
+*/
+MACRO VS_GetPhoneNumber ()
+   var
+        person  = TBfile("person.dbt"),
+        officer = TBfile("officer.dbt"),
+        PhoneNumber = "";
+
+    person.KeyNum = 0;
+    person.rec.Oper = {Oper};
+    if(person.GetEQ AND person.rec.PartyID != 0)
+       officer.KeyNum = 0; /* PartyID+PersonID*/
+       officer.rec.PartyID = {OurBank};
+       officer.rec.PersonID = person.rec.PartyID;
+       officer.addFilter("t_PartyID = " + string({OurBank}) + " and t_PersonID = " + string(person.rec.PartyID)); // DEF-56486, без добавления фильтра SELECT неэффективен
+       if(officer.GetGE)
+          PhoneNumber = officer.rec.PhoneNumber;
+       end;
+       officer.dropFilter(); // DEF-56486
+    end;
+
+    return PhoneNumber;
+END;
+
+MACRO НазваниеЦентраРасч()
+var ptoffice  = TBfile("ptoffice.dbt"),
+    Название = "";
+
+  ptoffice.KeyNum = 0;
+  ptoffice.rec.PartyID = {OurBank};
+  ptoffice.rec.OfficeID = VS_GetSetting("РАСЧЕТНЫЙ ЦЕНТР");
+
+  if (ptoffice.GetEQ)
+   Название = ptoffice.rec.OfficeName;
+  end;
+
+ return Название;
+END;
+
+/* Проверяет договор на существенные изменения */
+MACRO ВажнИзмДог(ord_old, ord)
+
+ if (ord_old.ContractStatus == ORDER_CONTRACT_STATUS_PREP)
+  return 0;
+ elif ((ord.Contractor !=ord_old.Contractor) OR
+       (ord.ContractorName !=ord_old.ContractorName))
+  return 1;
+ end;
+
+END;
+
+/*  Для векселя с идентификатором 'BCID'
+        ищет договор, по которому этот вексель эмитирован.
+        Договор и порядковый номер векселя в этом договоре (начиная с 0)
+        возвращаются через параметры retEmi и retNum соответственно (если нужно).
+    Здесь:
+      order - договор, в котором используется вексель.
+              не обязательно, что это договор эмиссии
+              (например, может быть договор погашения векселя).
+   LinkKind - вид связи векселя с договором 'order'.
+          i - номер векселя в договоре 'order'.
+*/
+MACRO ПоискДоговораЭмиссииВекселя(BCID, LinkKind, order, i, retEmi, retNum)
+   var
+      emi = TBfile ("dl_order"), /* договор эмиссии векселя*/
+      lnk = TBfile ("vsordlnk"),
+      otype = ValType(order),
+      ContractID = 0,            /* идентификатор найденного договора эмиссии*/
+      Ok,
+      found = false,             /* следит за поиском порядк. номера векселя*/
+      j,
+      ret;
+
+   if(ValType(LinkKind) != V_UNDEF)
+      if(LinkKind == VSORDLNK_K_EMISSION)
+         /* тривиальный случай - уже движемся по договору эмиссии
+         */
+         setparm(4,order);         /* retEmi */
+         setparm(5,i);             /* retNum */
+         return true;
+      end;
+   end;
+
+   /* Поиск идентификатора договора эмиссии
+      по VSORDLNK - файлу связи договора эмиссии
+   */
+   lnk.keyNum = 0;             /* Индекс BCID+LinkKind+DocKind+ContractID+Start */
+   lnk.rec.BCID = BCID;
+   lnk.rec.LinkKind = VSORDLNK_K_EMISSION;
+   lnk.rec.DocKind = DL_VEKSELORDER;
+   lnk.rec.ContractID = 0;
+   lnk.rec.Start = date(0,0,0);
+   lnk.addFilter("t_BCID = " + string(BCID) + " and t_LinkKind = " + string(VSORDLNK_K_EMISSION)); // DEF-56486, без добавления фильтра SELECT неэффективен
+   Ok = lnk.GetGE;
+   j = 0;
+   while(Ok)
+      Ok = (lnk.rec.BCID == BCID);
+      if(Ok)
+         if((lnk.rec.LinkKind == VSORDLNK_K_EMISSION) AND (lnk.rec.IsPartycular == "X"))
+            /*договор эмиссии?  */
+            ContractID = lnk.rec.ContractID;
+            Ok = false;   /* выходим из цикла */
+         else
+            j = j + 1;
+            Ok = lnk.next;
+         end;
+      end;
+   end;
+   lnk.dropFilter(); // DEF-56486
+
+   if(ContractID == 0)    /* Не нашли */
+     return false;
+   elif(ValType(retEmi) == V_UNDEF) /* Сам договор эмиссии не нужен, важен только факт наличия*/
+     return true;
+   elif(not ПоискДоговора(emi, ContractID))
+     return false; /* ошибка */
+   end;
+   setparm(4, emi);     /* retEmi */
+
+   /* Поиск порядкового номера векселя BCID
+      в его договоре эмиссии
+   */
+   if(ValType(retNum) == V_UNDEF)
+     return true;
+   end;
+   lnk.keyNum = 1;                               /* Индекс ContractID + BCID */
+   lnk.rec.DocKind = DL_VEKSELORDER;
+   lnk.rec.ContractID = ContractID;
+   lnk.rec.Issuer = {OurBank};
+   lnk.rec.BCID = 0;
+   lnk.addFilter("t_DocKind = " + string(DL_VEKSELORDER) + " and t_ContractID = " + string(ContractID)); // DEF-56486, без добавления фильтра SELECT неэффективен
+   Ok = lnk.GetGE;
+   found = false;
+   j = 0;
+   while(Ok)
+      Ok = (lnk.rec.ContractID == ContractID);
+      if(Ok)
+         if(lnk.rec.BCID ==BCID)  /*наш вексель?      */
+            found = true;          /* да               */
+            Ok = false;            /* выходим из цикла */
+         else
+            j = j + 1;
+            Ok = lnk.next;
+         end;
+      end;
+   end;
+   lnk.dropFilter(); // DEF-56486
+   if(not found)      /* Не нашли */
+     return false;
+   end;
+   setparm(5, j);     /* retNum */
+   return true;
+
+END;
+
+/* Получить дату для документов по таблицам dl_tick, dl_order, vsfrmord
+*/
+MACRO ДатаДокумента(doc)
+var doc_date = date(0, 0, 0);
+
+    if(ValType(doc) == V_UNDEF)
+        /* ... */
+    elif(ValType(doc) == V_GENOBJ)
+        if   (doc.FileName == "dl_tick.dbt")
+            doc_date = doc.rec.DealDate;
+        elif (doc.FileName == "dl_order.dbt")
+            doc_date = doc.rec.SignDate;
+        elif (doc.FileName == "vsfrmord.dbt")
+            doc_date = doc.rec.Signed;
+        end;
+    else
+        if   (FileName(doc) == "dl_tick.dbt")
+            doc_date = doc.DealDate;
+        elif (FileName(doc) == "dl_order.dbt")
+            doc_date = doc.SignDate;
+        elif (FileName(doc) == "vsfrmord.dbt")
+            doc_date = doc.Signed;
+        end;
+    end;
+
+    return doc_date;
+END;
+
+MACRO VS_GetDepartmentCode(Филиал)
+var DpCode;
+
+    if ( Филиал == 0 )
+        return "";
+    else
+        if (CB_GetDepartmentCodeAndName(Филиал,DpCode,NULL))
+            DpCode = "";
+        end;
+        return DpCode;
+    end;
+
+END;
+
+/* True, если включена настройка "разбивка исх.платежей при погаш"
+*/
+MACRO VS_IsSplinter()
+var
+  splinter = false;
+  if(not VS_GetRegistryValue("ВЕКСЕЛЯ БАНКА\\РЕЖИМ РАБОТЫ\\РАЗБИВКА ИСХ.ПЛАТЕЖЕЙ ПРИ ПОГАШ", V_BOOL, @splinter))
+    splinter = false;
+  end;
+  return splinter;
+END;
+
+/* True, если включена настройка ""
+*/
+MACRO VS_IsSumSeparation()
+var 
+  separate = false;
+  if(not VS_GetRegistryValue("ВЕКСЕЛЯ БАНКА\\РЕЖИМ РАБОТЫ\\ПЕРЕНОС \"К ИСП.\" РАЗБИВКА СУММ", V_BOOL, @separate))
+    separate = false;
+  end;
+  return separate;
+
+END;
+
+/* True, если включена настройка "проводка по исходящим платежам"
+*/
+MACRO VS_IsBkpByOut()
+var
+  f = false;
+  if(not VS_GetRegistryValue("COMMON\\WORK_MODE\\ПРОВОДКА ПО ИСХОДЯЩИМ ПЛАТЕЖАМ", V_BOOL, @f))
+    f = false;
+  end;
+  return f;
+END;
+
+/* Функция возвращает true, если полученный документ 'doc'
+     имеет соответсвующее имя 'name'.
+     Заодно возвращаются также DocKind & DocID.
+*/
+MACRO VS_IsDocument(doc, name, DocKind:@variant, DocID:@variant)
+VAR
+   ret = false, doctype = ValType(doc), RealName;
+
+   if(doctype == V_UNDEF)
+     return false;
+   elif(doctype == V_GENOBJ)
+     RealName = doc.FileName;
+   else
+     RealName = FileName(doc);
+   end;
+
+   if(ValType(name) == V_STRING)
+     ret = (RealName == String(name,".dbt"));
+   elif(ValType(name) == V_UNDEF)
+     ret = true;
+   end;
+
+   if(not ret)
+       DocKind = 0;
+   elif((RealName == "dl_tick.dbt") AND (doctype == V_GENOBJ))
+       DocKind = doc.rec.BofficeKind;
+   elif(RealName == "dl_tick.dbt")
+       DocKind = doc.BofficeKind;
+   elif((RealName == "dl_order.dbt") AND (doctype == V_GENOBJ))
+       DocKind = doc.rec.DocKind;
+   elif(RealName == "dl_order.dbt")
+       DocKind = doc.DocKind;
+   elif(RealName == "vsfrmord.dbt")
+       DocKind = DL_WRITEOFF_RDM_BNR;
+   end;
+
+   if(not ret)
+       DocID = 0;
+   elif((RealName == "dl_tick.dbt") AND (doctype == V_GENOBJ))
+       DocID   = doc.rec.DealID;
+   elif(RealName == "dl_tick.dbt")
+       DocID   = doc.DealID;
+   elif((RealName == "dl_order.dbt") AND (doctype == V_GENOBJ))
+       DocID   = doc.rec.ContractID;
+   elif(RealName == "dl_order.dbt")
+       DocID   = doc.ContractID;
+   elif((RealName == "vsfrmord.dbt") AND (doctype == V_GENOBJ))
+       DocID   = doc.rec.FrmOrdId;
+   elif(RealName == "vsfrmord.dbt")
+       DocID   = doc.FrmOrdId;
+   end;
+
+   return ret;
+END;
+
+// Работаем в интегрированном режиме?
+MACRO VS_CheckWorkMode_INTEGRATED(val:@variant)
+    return VS_GetRegistryValue("COMMON\\WORK_MODE\\INTEGRATED", V_BOOL, @val);
+END;
+
+/* Принимает счет s = '52302810512340000001'
+   Возвращает счет  = '52302.810.5.1234.0000001'
+*/
+MACRO VS_AccountStr(s)
+var
+  D = Substr(s,1,5), x;
+
+  if(D != "")
+    if((x = Substr(s,6,3)) == "")
+      D = D + ".";
+    else
+      D = D + "." + x;
+      if((x = Substr(s,10,4)) != "")
+        D = D + "." + x;
+        if((x = Substr(s,14)) != "")
+          D = D + "." + x;
+        end;
+      end;
+    end;
+  end;
+
+  return D;
+END;
+
+MACRO ДатаПоследнегоНачисленияПоВекселю(ContractID, Дата, ДПН:@variant)
+  var query, Select, DataSet;
+
+  query =   " select NVL(max(T_PERIODENDDATE), "+GetSQLDate(date(0,0,0))+") as maxdate "
+          + "   from DPRCCNTSCHED_DBT "
+          + "  where T_CONTRACTID = ? and T_SCHEDULEKIND = ? and T_SUMCALC > 0 and T_PERIODENDDATE <= ?";
+  Select = RsdCommand(query);
+  Select.addParam("", RSDBP_IN, ContractID);
+  Select.addParam("", RSDBP_IN, 1);
+  Select.addParam("", RSDBP_IN, Дата);
+  Select.execute();
+
+  DataSet = TRsbDataSet(Select);
+  if(DataSet.moveNext())
+    ДПН = date(DataSet.maxdate);
+  end;
+
+  return true;
+END;
+
+/* Возвращает даты первого и последнего начисления
+*/
+MACRO VS_GetPercentDates(BCID, ДатаДоначисления, ДНН:@variant, ДПН:@variant)
+   PRIVATE RECORD prccontract (prccontract);
+   if(not НайтиСчетПроцВекселя (prccontract, BCID))
+     ДНН = Date(0,0,0);
+   else
+     ДНН = prccontract.BeginDate;
+   end;
+
+   if(not ДатаПоследнегоНачисленияПоВекселю(prccontract.ContractID, ДатаДоначисления, ДПН))
+     ДПН = Date(0,0,0);
+    end;
+
+   if((ValType(ДатаДоначисления) == V_DATE) AND (ДатаДоначисления > ДПН))
+     ДПН = ДатаДоначисления;
+   end;
+
+   return true;
+END;
+
+//проверить вид операции
+MACRO ОперацияПогашения(DealType)
+  //здесь необходимо указать перечень видов операций, которые должны расцениваться как "погашение"
+  return (DealType == 4904) or (DealType == 14904);
+END;
+
+MACRO ОперацияВыкупа(DealType)
+  //здесь необходимо указать перечень видов операций, которые должны расцениваться как "выкуп"
+  return (DealType == 4918) or (DealType == 2450 /*Мена УВ<->СВ*/) or (DealType == 14918);
+END;
+/*  ПолучитьСчетУчетаНоминала.
+    Получает счет учета номинала для векселя и перв.документа.
+*/
+MACRO ПолучитьСчетУчетаНоминала(bnr, fd, Дата, счет:@variant, ИгнорИ)
+var
+   ok = true,
+   ИгнорироватьПереносКИсполнению = false;
+
+   if( ValType(ИгнорИ) != V_UNDEF )
+     ИгнорироватьПереносКИсполнению = ИгнорИ;
+   end;
+
+   if((Index(bnr.rec.BCState, "И") == 0) or (ИгнорироватьПереносКИсполнению == true))
+     /* не перенесен к исполнению */
+     ok = ПолучитьСчетВекселя("Наш вексель", fd, счет, NULL, NULL, NULL, Дата);
+   else
+     /* перенесен к исполнению */
+     ok = ПолучитьСчетВекселя("СВексель к исполнению", fd, счет, NULL, NULL, NULL, Дата);
+   end;
+
+   return ok;
+END;
+
+/*  Получает счет учета процентов для векселя и перв.документа.
+*/
+MACRO ПолучитьСчетУчетаПроцентов(bnr, fd, Дата, счет:@variant, ИгнорИ)
+var
+   ok = true,
+   ИгнорироватьПереносКИсполнению = false;
+
+   if( ValType(ИгнорИ) != V_UNDEF )
+     ИгнорироватьПереносКИсполнению = ИгнорИ;
+   end;
+
+   if((Index(bnr.rec.BCState, "И") == 0) or (ИгнорироватьПереносКИсполнению == true))
+     /* не перенесен к исполнению */                          
+     ok = ПолучитьСчетВекселя("Обяз%,СВексель", fd, счет, MC_OPENACC_CHECKEXIST/*SImanov NULL*/, NULL, NULL, Дата, FIROLE_FIDOC);
+   else
+     /* перенесен к исполнению */
+     ok = ПолучитьСчетВекселя("СВексель к исполнению", fd, счет, NULL, NULL, NULL, Дата);
+     if (VS_IsSumSeparation() ==true )
+       ok = ПолучитьСчетВекселя("Обяз%, СВексель к исп.", fd, счет, NULL, NULL, NULL, Дата);
+     end;
+   end;
+
+   return ok;
+END;
+
+MACRO ПолучитьСчетУчетаДисконта(bnr, fd, Дата, счет:@variant, ИгнорИ)
+var
+   ok = true,
+   ИгнорироватьПереносКИсполнению = false;
+
+   if( ValType(ИгнорИ) != V_UNDEF )
+     ИгнорироватьПереносКИсполнению = ИгнорИ;
+   end;
+   if((Index(bnr.rec.BCState, "И") == 0) or (ИгнорироватьПереносКИсполнению == true))
+     /* не перенесен к исполнению */
+     ok = ПолучитьСчетВекселя("Дисконт, Свексель", fd, счет, NULL, NULL, NULL, Дата, FIROLE_DISCOUNT);
+   else
+     /* перенесен к исполнению */
+     ok = ПолучитьСчетВекселя("СВексель к исполнению", fd, счет, NULL, NULL, NULL, Дата);
+     if (VS_IsSumSeparation() ==true )
+       ok = ПолучитьСчетВекселя("Дисконт, СВексель к исп.", fd, счет, NULL, NULL, NULL, Дата);
+     end;
+   end;
+
+   return ok;
+END;
+
+/* Получить дату последнего расчета дисконта
+На самом деле это дата последней операции с векселем.
+*/
+MACRO ПолучитьДатуПоследОперацииПоВекселю( bnr, leg, ToDate )
+  var vDate = date(0,0,0),
+      sql, rsd;
+
+  sql = " SELECT nvl(max(step.t_Plan_Date),to_date('01-01-0001','DD-MM-YYYY')) t_Plan_Date "
+      +   " FROM doproper_dbt oper, "
+      +        " doprstep_dbt step "
+      + " WHERE oper.t_DocKind = " + string(DL_VSBANNER)
+      +   " AND oper.t_DocumentID = '" + string(bnr.BCID) + "' "
+      +   " AND step.t_ID_Operation = oper.t_ID_Operation "
+      +   " AND step.t_Plan_Date <= " + GetSQLDate(ToDate);
+
+  rsd = TRsbDataSet(sql);
+  if( rsd.MoveNext() )
+    vDate = date(rsd.Plan_Date);
+  end;
+  if( vDate == date(0,0,0) )
+    vDate = leg.Start;
+  end;
+
+  return vDate;
+END;
+
+MACRO ПолучитьСуммуПроцетовНаДату( VDate, BCID, leg, Error:@STRING)
+  var
+  prccontract = TRecHandler ("prccontract"), СуммаПроцентов = 0.0;
+
+  if(НайтиСчетПроцВекселя(prccontract, BCID, NULL, VS_FINDPC_ACTUAL) )
+    VDate = VS_GetRightPcDate(prccontract, VDate);
+
+    if( not СуммаНачисленныхПроцентовПоПДВекселя(prccontract.rec.ContractID, prccontract.rec.BeginDate, VDate, СуммаПроцентов) )
+      СуммаПроцентов = 0.0;
+    end;
+  elif( Error != NULL )
+     Error = "Не найден счет процентов векселя (dvsbanner_dbt.t_BCID=" + BCID + ")";
+  end;
+
+  return СуммаПроцентов;
+END;
+
+/* Получить сумму начального дисконта
+*/
+
+MACRO ПолучитьСуммуНачальногоДисконта( bnr, leg, Дата )
+  var N, R, Днач, Principal, ttype = ValType(leg);
+
+  if(ttype == V_GENOBJ)
+    Principal = leg.rec.Principal;
+  else
+    Principal = leg.Principal;
+  end;
+
+  N = Principal; /* номинал  */
+  R = ПолучитьСуммуРазмещения(leg, bnr); /* цена размещения */
+
+  Днач = N - R;
+
+  return Днач;
+END;
+
+/* Сумма рассчитанного дисконта на дату
+*/
+MACRO ПолучитьСуммуДисконтаНаДату(VDate, bnr, leg)
+  var P = 0, T = 0;
+  var Днач = ПолучитьСуммуНачальногоДисконта(bnr, leg, VDate);
+  var Драсч = $0;
+  var BCTermFormula = 0;
+  var IncomeDateType = DL_INCOMEDATETYPE_PLUSONE;
+
+  if(Днач > $0)
+    T = VS_GetTermCircDate(bnr, leg); // срок обращения векселя (определяется от даты выпуска до плановой даты погашения включительно)
+
+    if(T > 0)
+      P = VDate - VS_GetStartDate(bnr, leg);
+
+      if(P > 0)
+        if(ValType(bnr) == V_GENOBJ)
+          BCTermFormula = bnr.rec.BCTermFormula;
+        else
+          BCTermFormula = bnr.BCTermFormula
+        end;
+
+        if(BCTermFormula != VS_TERMF_INATIME)
+          if(DL_GetStartIncomeDateType(@IncomeDateType) and (IncomeDateType == DL_INCOMEDATETYPE_CBR))
+            P = P + 1; // чтобы учесть дату начала, которая была потеряна при вычитании
+
+            if(VDate >= DL_GetBnrPlanRepayDate(bnr, leg))
+              P = P - 1; // в дату погашения саму дату погашения учитывать не нужно
+            end;
+          end;
+        end;
+
+        if(P > T)
+          P = T;
+        end;
+
+        Драсч = Round(Днач * P / T, 2); // нужно до 2-х знаков здесь, в противном случае накапливается ошибка
+      end;
+    end;
+  end;
+
+  return Драсч;
+END;
+
+/* Сумма оплаченного дисконта на дату
+*/
+MACRO ПолучитьСуммуОплаченногоДисконтаНаДату( bnr, leg, ОстатокНаСчетеДисконта, VDate )
+var
+   Днач = ПолучитьСуммуНачальногоДисконта( bnr, leg, VDate );
+
+   return Днач - ОстатокНаСчетеДисконта;
+END;
+
+/* Расчет суммы дисконта с известным отстком счета дисконта
+*/
+MACRO РассчитатьСуммуДисконта( VDate, bnr, leg, ОстатокНаСчетеДисконта )
+var
+   Допл, Др;
+
+   Др   = ПолучитьСуммуДисконтаНаДату( VDate, bnr, leg );
+   Допл = ОстатокНаСчетеДисконта;/*ПолучитьСуммуОплаченногоДисконтаНаДату( bnr, leg, ОстатокНаСчетеДисконта, VDate );*/
+
+   return Др - Допл;
+END;
+
+MACRO ПолучитьНачальнуюОР( bnr, leg, Дата )
+  var FairValue = $0.0; //Справедливая стоимость
+  var R = $0.0;         //Сумма размещения
+  var DelayedDiff = $0.0; //Отсроченная разница
+  var DataSet;
+  var BCID;
+  var cmd = DL_RSDCommand("select rsb_bill.GetVABnrFrValueOnDate(?, 0, ?, CHR(0)) as FairValue from dual");
+
+  if(ValType(bnr) == V_GENOBJ)
+    BCID = bnr.rec.BCID;
+  else
+    BCID = bnr.BCID;
+  end;
+
+  cmd.AddParam(BCID);
+  cmd.AddParam(Дата);
+
+  DataSet = cmd.Execute();
+  if(DataSet.moveNext())
+    FairValue = DataSet.FairValue;
+  end;
+
+  R = ПолучитьСуммуРазмещения(leg, bnr); /* цена размещения */
+
+  DelayedDiff = R - FairValue;
+
+  return DelayedDiff;
+END;
+
+MACRO ПолучитьОтсроченнуюРазницу(BCID, VDate)
+  var StartDefDif = 0.0;
+  var Select, DataSet;
+
+  Select = DL_RSDCommand("select cast(rsb_bill.GetVSBnrStartDefDif(?, ?) as NUMBER(32,12)) as StartDefDif from dual");
+  Select.AddParam(BCID);
+  Select.AddParam(VDate);
+
+  DataSet = Select.Execute();
+  if(DataSet.moveNext())
+    StartDefDif = SQL_ConvTypeSum(DataSet.StartDefDif);
+  end;
+
+  return StartDefDif;
+END;
+
+MACRO ПолучитьНеОтнесеннуюОтсроченнуюРазницу(BCID, VDate)
+  var DefDif = 0.0;
+  var Select, DataSet;
+
+  Select = DL_RSDCommand("select cast(rsb_bill.GetVSBnrNotWrittenDefDif(?, ?) as NUMBER(32,12)) as DefDif from dual");
+  Select.AddParam(BCID);
+  Select.AddParam(VDate);
+
+  DataSet = Select.Execute();
+  if(DataSet.moveNext())
+    DefDif = SQL_ConvTypeSum(DataSet.DefDif);
+  end;
+
+  return DefDif;
+END;
+
+MACRO ПолучитьОтнесеннуюОтсроченнуюРазницу(BCID, VDate)
+  return ПолучитьОтсроченнуюРазницу(BCID,VDate) - ПолучитьНеОтнесеннуюОтсроченнуюРазницу(BCID,VDate);
+END;
+
+
+MACRO ПолучитьРасчетнуюСуммуОРНаДату(VDate, bnr, leg)
+  var P = 0, T = 0;
+  var BCID = $0;
+  if(ValType(bnr) == V_GENOBJ)
+    BCID = bnr.rec.BCID;
+  else
+    BCID = bnr.BCID;
+  end;
+  var DDBeg = ПолучитьОтсроченнуюРазницу(BCID, VDate);
+  var DDCalc = $0;
+  var BCTermFormula = 0;
+  var IncomeDateType = DL_INCOMEDATETYPE_PLUSONE;
+
+  if(DDBeg != $0)
+    T = VS_GetTermCircDate(bnr, leg); // срок обращения векселя (определяется от даты выпуска до плановой даты погашения включительно)
+
+    if(T > 0)
+      P = VDate - VS_GetStartDate(bnr, leg);
+
+      if(P > 0)
+        if(ValType(bnr) == V_GENOBJ)
+          BCTermFormula = bnr.rec.BCTermFormula;
+        else
+          BCTermFormula = bnr.BCTermFormula
+        end;
+
+        if(BCTermFormula != VS_TERMF_INATIME)
+          if(DL_GetStartIncomeDateType(@IncomeDateType) and (IncomeDateType == DL_INCOMEDATETYPE_CBR))
+            P = P + 1; // чтобы учесть дату начала, которая была потеряна при вычитании
+
+            if(VDate >= DL_GetBnrPlanRepayDate(bnr, leg))
+              P = P - 1; // в дату погашения саму дату погашения учитывать не нужно
+            end;
+          end;
+        end;
+
+        if(P > T)
+          P = T;
+        end;
+
+        DDCalc = Round(DDBeg * P / T, 2); // нужно до 2-х знаков здесь, в противном случае накапливается ошибка
+      end;
+    end;
+  end;
+
+  return DDCalc;
+END;
+
+MACRO ПолучитьРанееНачисленнуюОР( bnr, leg, VDate )
+
+  var DDBeg = ПолучитьНачальнуюОР( bnr, leg, VDate );
+  var ReturnIncome;
+
+  if(ValType(leg) == V_GENOBJ)
+    ReturnIncome = leg.rec.ReturnIncome;
+  else
+    ReturnIncome = leg.ReturnIncome;
+  end;
+
+  return DDBeg - ReturnIncome;
+END;
+
+MACRO РасчитатьСуммуОР( VDate, bnr, leg )
+  var BCID = $0;
+  if(ValType(bnr) == V_GENOBJ)
+    BCID = bnr.rec.BCID;
+  else
+    BCID = bnr.BCID;
+  end;
+  var DDCalc = ПолучитьРасчетнуюСуммуОРНаДату( VDate, bnr, leg );
+  var DDPayed = ПолучитьОтнесеннуюОтсроченнуюРазницу( BCID, VDate );
+  return DDCalc - DDPayed;
+END;
+
+MACRO ПолучитьСуммуКорректировкиКОтражению( bnr, leg, VDate )
+  var legDealID;
+  var PerCorrective=$0.0; //разница процентов, начисленных по ЭПС и процентов (дисконта), начисленных по ставке договора
+  var Per;
+  var retPrice;
+
+  if(ValType(leg) == V_GENOBJ)
+    retPrice = leg.rec.Price;
+    legDealID = leg.rec.DealID;
+        else
+    retPrice = leg.retPrice;
+    legDealID = leg.DealID;
+        end;
+
+  /*TODO: вызов системной фунции корректировки % до ЭПС, когда она появится
+РасчетЭПС(leg.DealID, Vdate);
+*/
+  
+  return $0.0;
+END;
+
+MACRO VS_SaveIncomeSum(IncomeType, //тип суммы
+                       BCID,       //ID векселя
+                       Enrolment_ID,//ID записи смены статуса на "В обращении" в истории векселя
+                       SetDate,    //дата занесения суммы
+                       Sum,        //сумма в валюте номинала
+                       SumFI,      //валюта номинала
+                       AccSum,     //сумма в валюте учета
+                       AccFI)      //валюта учета
+
+  record income("vsincome");
+  var stat = 1;
+  
+  ClearRecord(income);
+  income.AutoKey   = 0;
+  income.BCID      = BCID; // ID векселя/сертификата
+  income.Perc      = Round(Sum,2);          
+  income.Disc      = $0;           
+  income.Currency  = SumFI;  // Валюта
+  income.StartDate = date(SetDate);
+  income.EndDate   = date(SetDate);                                            
+  income.OperDate  = date(SetDate);      
+  income.Quality   = UNSET_CHAR;    
+  income.Enrolment_ID = Enrolment_ID; 
+  income.AccPerc   = Round(AccSum,2);
+  income.AccDisc   = $0;        
+  income.AccCurrency = AccFI;  
+  income.IncomeType = IncomeType;
+  income.Bonus     = $0;
+  income.AccBonus  = $0;
+  income.EPRPerc    = $0;
+  income.AccEPRPerc = $0;
+  income.Amortiz    = $0;
+  income.AccAmortiz = $0;
+  income.Expens     = $0;
+  income.AccExpens  = $0;
+  income.DefDif     = $0;
+  income.AccDefDif  = $0;
+  if( InsertVSINCOME(income) )
+    stat = 0;
+  end;
+
+  return stat;
+END;
+
+MACRO СВ_ПолучитьТекущуюКорректировкуПДДпоЭПС(BCID, VDate, AdjEIR, AccAdjEIR)
+  var Select;
+  
+  Select = RsdCommand("begin ?:= rsb_bill.GetVSBnrAdjustmentEIR(?, ?, ?, ?);\n end;");
+  Select.addParam("pReturn",             RSDBP_OUT, V_INTEGER );  
+  Select.AddParam("pBCID",               RSDBP_IN,  BCID      );
+  Select.AddParam("pOnDate",             RSDBP_IN,  VDate     );
+  Select.AddParam("vАdjustmentEIR",      RSDBP_OUT, V_NUMERIC );
+  Select.AddParam("vAccАdjustmentEIR",   RSDBP_OUT, V_NUMERIC );
+
+  Select.Execute();
+  SetParm(2,SQL_ConvTypeSum(Select.value(3)));
+  SetParm(3,SQL_ConvTypeSum(Select.value(4)));
+  return (SQL_ConvTypeInteger(Select.value(0)) == 0);  
+
+END;
+
+MACRO СВ_ПолучитьСС(BCID)
+  private var cmd, DataSet;
+  cmd = DL_RSDCommand( "select t_FairValue from DBNRFRVAL_DBT "
+                       + " where t_BCID = ?" 
+                       //+ "   and t_BegDate <= ? "
+                       + " Order by t_BegDate desc");
+  cmd.AddParam(BCID);
+  //cmd.AddParam({curdate});
+  DataSet = cmd.Execute();
+  if (DataSet.moveNext())
+    return DataSet.FairValue;
+  end;
+  return $0;
+end;
+
+macro СВ_ПроверитьСуществованиеШагаПоДоговору(ContractID, Symb, IsExecute)
+  var dlOrd = TBFile("dl_order.dbt"),
+      dOprOper = TBFile("oproper.dbt","R",1),
+      dOperStep = TBFile("oprstep.dbt","R",8);
+  var documentId = "";
+  dlOrd.rec.ContractId = ContractID;
+  if (dlOrd.GetEQ())
+    VS_MakeDocumentID(dlOrd, documentId, dlOrd.rec.DocKind);
+    if (documentId and (documentId != ""))
+      dOprOper.rec.DocKind = dlOrd.rec.DocKind;
+      dOprOper.rec.DocumentId = documentId;
+      if (dOprOper.GetEQ())
+        dOperStep.rec.ID_Operation = dOprOper.rec.ID_Operation;
+        dOperStep.rec.IsExecute = IsExecute;
+        dOperStep.rec.Symbol = Symb;
+        return dOperStep.GetEQ();
+      end;
+    end;
+  end;
+  return false;
+end;
+
+MACRO VS_GetAccountManual(
+    CatCode,       /* код категории */
+    fd,            /* первичный документ */
+    FindAccount,   /* здесь вернется номер счета */
+    /*необязательные параметры*/
+    AccCreate,     /* признак верификации\открытия лицевого счета       */
+    Currency,      /* если задан код валюты, то получаем счет по этой
+                      валюте, иначе используем основную валюту */
+    FIRole,        /* роль финансового инструмента */
+    AccBuf,        /* буфер для найденного\открытого счета (account.dbt)*/
+    ActionDate,    /* дата действия */
+    ActivateDate,   /* дата начала действия счета */
+    IsCommon
+)
+var
+    stat = 0;
+    IsCommon = IIF(valType(IsCommon) == V_UNDEF, false, IsCommon);
+
+    if(not IsCommon)
+    	FindAccount = MC_FindAndOpenAccountEx(
+        	CatCode,
+        	fd,
+        	ActionDate,             /* дата действия */
+        	0,                      /* немассовый режим */
+        	AccCreate,              /* Создавать счет ?*/
+        	AccBuf,
+        	Currency,               /* Валюта проводки */
+        	null,
+        	MC_PAIRACCMODE_AUTO,    /* PairAcc */
+        	null,
+        	FIRole,                 /* роль финансового инструмента */
+        	null,
+        	null,
+        	null,
+        	ActivateDate,           /* дата начала действия счета */
+        	null
+    	);
+    else
+       FindAccount = MC_FindAndOpenCommonAccByFD(
+        CatCode,
+        fd,
+        ActionDate,
+        0,
+        AccCreate,
+        AccBuf,
+        Currency,
+        null,
+        MC_PAIRACCMODE_AUTO,
+        null,
+        FIRole,
+        null,
+        null,
+        null,
+        null,
+        ActivateDate,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null
+      );
+    end;
+
+    if(FindAccount == "")
+        if(AccCreate != MC_OPENACC_CHECKEXIST) /* ругаемся только, если пустой счет - нештатная ситуация */
+           msgbox("Ошибка в получении счета:|категория: ", CatCode);
+        end;
+        stat = 1;
+    else
+        SetParm( 2, FindAccount );
+    end;
+
+    return (stat == 0);
+END;
+
+macro СВ_ПолучитьДатуПоследнегоРасчетаКорр(BCID, VDate, LimitSearch)
+  var cmd, DataSet, query;
+  var retVal = null;
+  var isLimitSearch = false;
+  if ((ValType(LimitSearch) == V_BOOL) and (LimitSearch))
+    isLimitSearch = true;
+  end;
+  query =  "SELECT NVL(MAX(T_OPERDATE),TO_DATE('01.01.0001','DD.MM.YYYY')) as LastDate "
+          +"  FROM DVSINCOME_DBT "
+          +" WHERE     T_INCOMETYPE = ? "
+          +"       AND T_BCID = ? "
+          +"       AND T_ENROLMENT_ID = "
+          +"              RSB_BILL.GetVSBnrLastPayedEnrolID (?, ?) ";
+  if (isLimitSearch)
+    query = query + " AND T_OPERDATE <= ?";
+  end;
+  cmd = DL_RSDCommand(query);
+  cmd.AddParam(VSINCOMETYPE_EPRPERC   );
+  cmd.AddParam(BCID);
+  cmd.AddParam(BCID);
+  cmd.AddParam(VDate);
+  if (isLimitSearch)
+    cmd.AddParam(VDate);
+  end;
+
+  DataSet = cmd.Execute();
+  if (DataSet.MoveNext())
+    retVal = SQL_ConvTypeDate(DataSet.LastDate);
+  end;
+  return retVal;
+end;
+
+macro СВ_РасчетПроцентов(fd, VDate, _ID_Operation, _ID_Step, prcSum:@Numeric, err:@string, needShow:@bool, ContractID:@integer, BeginDate:@date, PcDate:@date)
+  var stat = true;
+  var leg, bnr, retPrc, ДНП;
+  var prccontract = TRecHandler("prccontract.dbt");
+  var prcCntSched = TRecHandler("prccntsched.dbt");
+  var DPN = date(0,0,0);
+  leg = fd.GetLeg();
+  bnr = fd.GetBnr();
+  if(leg.rec.InterestStart > VDate)
+    err = "Дата начисления процентов еще не наступила";
+    stat = false;
+  elif(not НайтиСчетПроцВекселя(prccontract, bnr.rec.BCID))
+    err = "Не найден счет процентов векселя";
+    stat = false;
+  end;
+
+  if(stat)
+    VDate = VS_GetRightPcDate(prccontract, VDate);
+    ДНП = VDate;
+    PcDate = VDate;
+  end;
+
+  if(not stat)
+    ;// больше ничего не делаем, т.к. уже есть ошибка
+  elif(not ДатаПоследнегоНачисленияПоВекселю(prccontract.rec.ContractID, VDate, @DPN))
+    err = "Неверная дата начисления процентов";
+    stat = false;
+  elif(not Prc_CheckHistory(prccontract.rec.ContractID, 1, IIF(((ValType(DPN) == V_UNDEF) or (DPN == ZeroDate)), prccontract.rec.beginDate, DPN), prcCntSched))
+    err = String("Пропущено начисление процентов за период ", date(prcCntSched.rec.PeriodBeginDate),":",date(prcCntSched.rec.PeriodEndDate));
+    stat = false;
+  elif(not VS_PercentCalc(prccontract.rec.ContractID, VDate, prccontract.rec.beginDate, retPrc, _ID_Operation, _ID_Step) )
+    err = "Ошибка при расчете процентов к начислению";
+    needShow = true;
+    stat = false;
+  elif((ValType(retPrc) == V_UNDEF) or (not retPrc))
+    //Simanov err = "Проценты на вексель уже начислены в полном объеме";
+    //Simanov stat = false;
+    prcSum = 0;
+  else
+    prcSum = retPrc;
+  end;
+  ContractID = prccontract.rec.ContractID;
+  BeginDate = prccontract.rec.beginDate;
+  return stat;
+Onerror(e)
+  return false;
+end;
+
+macro СВ_ПолучитьЦенуПродажиНаДату(LegID,CalcDate,SalePrice)
+  var Select;
+  Select = RsdCommand("begin ?:= rsb_bill.GetLastBnrSalePrice(?, ?, ?);\n end;");
+  Select.addParam("pReturn",             RSDBP_OUT, V_INTEGER );  
+  Select.AddParam("p_LegId",             RSDBP_IN,  LegID      );
+  Select.AddParam("p_CalcDate",          RSDBP_IN,  CalcDate     );
+  Select.AddParam("p_LastSalePrice",     RSDBP_OUT, V_NUMERIC );
+
+  Select.Execute();
+  SetParm(2,SQL_ConvTypeSum(Select.value(3)));
+  return (SQL_ConvTypeInteger(Select.value(0)) == 0);  
+Onerror(e)
+  return false;
+end;
+
+macro GetBankByMode(BankId)
+  var RetBankId = BankId;
+  var isCentrAcc = false;
+
+  if (VS_GetRegistryValue("ВЕКСЕЛЯ БАНКА\\РЕЖИМ РАБОТЫ\\ЦЕНТРАЛИЗОВАННЫЙ УЧЕТ", V_BOOL, @isCentrAcc))
+    if (isCentrAcc)
+      RetBankId = {HeadBankID};
+    end;
+  end;
+
+  return RetBankId;
+end;
+
+macro IsBankCentrMode()
+  var isCentrAcc;
+  if (VS_GetRegistryValue("ВЕКСЕЛЯ БАНКА\\РЕЖИМ РАБОТЫ\\ЦЕНТРАЛИЗОВАННЫЙ УЧЕТ", V_BOOL, @isCentrAcc))
+    if (isCentrAcc)
+      return true;
+    end;
+  end;
+  return false;
+end;
+
+macro VS_GetHeadDepartment()
+  var HeadID : integer = 0;
+
+  var select : string = 
+    " select T_CODE " +
+    "   from ddp_dep_dbt " +
+    "  where t_ParentCode = 0 ";
+
+  var rs = execSQLselect( select );
+  if(rs and rs.moveNext())
+    HeadID = rs.value(0);
+  end;
+
+  return HeadID;
+end;
+
+//Краткое именовение бака по id подразделения
+MACRO VS_GetShortNameByDepId(DepId):STRING
+  var Query = " Select pt.t_ShortName from dparty_dbt pt                              "+
+              "        join ddp_dep_dbt dep on dep.t_partyId = pt.t_partyId           "+
+              "        where dep.t_code = ?";
+  var name = "";
+  var cmd = RSDCommand(Query);
+  cmd.addParam("1", RSDBP_IN, DepId);
+  cmd.execute();
+  var cmdData = TRsbDataSet(cmd);
+  if( cmdData.MoveNext() )
+    name = cmdData.ShortName;
+  end;
+  return name;
+END;
+MACRO VS_GetMaxPaymNumberInDeal(DocKind, ContractID):integer
+  var cmd, DataSet;
+  var Query = "SELECT MAX (CAST (rm.t_NUMBER AS INT)) as MaxNumberExist " +
+              "  FROM DPMRMPROP_DBT rm, DPMPAYM_DBT paym " +
+              " WHERE     paym.t_DOCKIND = ? " +
+              "       AND PAYM.T_DOCUMENTID = ? " +
+              "       AND RM.T_PAYMENTID = PAYM.T_PAYMENTID ";
+  var retVal = 0;
+
+  cmd = DL_RSDCommand(Query);
+  cmd.AddParam(DocKind);
+  cmd.AddParam(ContractID);
+
+  DataSet = cmd.Execute();
+  if (DataSet.MoveNext())
+    retVal = DataSet.MaxNumberExist;
+  end;
+  return retVal;
+
+END;
+//Simanov =>
+
+/*
+Класс для создания строки с номерами векселей в договоре
+*/
+class CVeksNumbers (_series)       
+  var series = _series;
+  var Numbers = TArray();
+
+  //если не найдено такого же номера, возвращает true
+  macro ПроверитьНаличиеНомера (num)
+    var count = 0;
+    while (count < Numbers.size)
+      if (Numbers[count] == num)
+        return false;
+      end;
+      count = count + 1;
+    end;
+    return true;
+  End;
+
+  //возвращает true если добавляет
+  macro ДобавитьНомер (num:integer)
+    if (ПроверитьНаличиеНомера(num) )
+      numbers(numbers.size) = num;
+      return true;
+    end;
+    return false;
+  End;
+
+  macro СоздатьСтроку ()
+    var retVal = "";
+    var serprf = "Серия";
+    var numprf = "№№";
+    var LastIdInNumbers;
+    var РазницаНаОдин;
+    var i = 0, j = 0;
+    var size = Numbers.Size;
+
+    macro НайтиМаксимальныйНомерИдущийПодряд (count, arr)
+      while ( (arr(count) + 1) == (arr(count + 1)) )
+        count = count + 1;
+      end;
+      return count;
+    End;
+
+    if (Numbers.size > 0) 
+      retVal = serprf + " " + series + " " + numprf;
+    end;
+
+    while (i < size)
+      j = i;
+
+      LastIdInNumbers = НайтиМаксимальныйНомерИдущийПодряд(i, Numbers);
+
+      if (i == LastIdInNumbers)
+        if (i != 0) 
+          retVal = retVal + ",";
+        end;
+        retVal = retVal + " " + Numbers[i];
+      else
+        if (i != 0) 
+          retVal = retVal + ",";
+        end;
+        retVal = retVal + " " + Numbers[i] + "-" + Numbers[LastIdInNumbers];
+        i = LastIdInNumbers;
+      end;
+
+      i = i + 1;
+    end;
+    return retVal;
+  End;
+
+END;
+
+/*
+Функция возвращает строку, аналогично VS_GetBlanksEnumStr
+id - номер договора
+count - количество векселей
+*/
+macro GetVeksEnumStr (ID, count)
+  var sql;
+  var VeksNumbers = TArray();
+  var i;
+  var SeriesCount = 0;
+  var CurrSeriesID = -1;
+  var CountVeks = 0;
+  var retStr = "";
+
+  sql = " select bnr.t_bcseries ser, to_number(bnr.t_bcnumber) num "
+          + "from dvsordlnk_dbt lnk, dvsbanner_dbt bnr "
+          + "where     lnk.t_contractid = :id "
+          + "      and bnr.t_bcnumber <> chr('1') " //две временные строки
+          + "      and bnr.t_bcseries <> chr('1') "
+          + "      and lnk.t_bcid = bnr.t_bcid "
+          + "order by ser, num ";
+  sql = ExecSqlSelect(sql, MakeArray(SqlParam("id", ID)), false);
+
+  while (sql.MoveNext() )
+    i = 0;
+    CurrSeriesID = -1;
+    while (i < VeksNumbers.Size() ) 
+      if (VeksNumbers[i].series == trim(sql.value("ser"))) 
+        CurrSeriesID = i;
+      end;
+      i = i + 1;
+    end;
+
+    //если серия не найдена, то записать её, иначе добавить новый номер к серии
+    if (CurrSeriesID == -1)
+      VeksNumbers[SeriesCount] = CVeksNumbers(trim(sql.value("ser")));
+      VeksNumbers[SeriesCount].ДобавитьНомер(sql.value("num"));
+      SeriesCount = SeriesCount + 1;
+      CountVeks = CountVeks + 1;
+    else
+      if (VeksNumbers[CurrSeriesID].ДобавитьНомер(sql.value("num")) )
+        CountVeks = CountVeks + 1;
+      end;
+    end;
+
+  end; //while (sql.MoveNext() )
+
+  i = 0;
+  while (i < SeriesCount)
+    if (retStr != "") 
+      retStr = retStr + "; ";
+    end;
+    retStr = retStr + VeksNumbers[i].СоздатьСтроку();
+    i = i + 1;
+  end;
+
+  setparm(1, CountVeks);
+  return retStr;
+End;
+
+/*срок погашения векселя
+formula == 10 - на определённый день
+formula == 20 - по предъявлении
+
+maturity - дата, не ранее которой должно быть погашение
+expiry   - дата, не позднее которой должно быть погашение
+WordFlag - признак вывода значение месяца словом, или числом. true=словом
+*/
+macro VS_TermFormula (formula:integer, maturity:date, expiry:date, WordFlag:bool)
+  var rez = "";
+  var maturity_text:string, expiry_text:string;
+
+  if (valtype(WordFlag) == V_UNDEF)
+    WordFlag = false;
+  end;
+
+  maturity_text = VS_IIF(WordFlag, string(maturity:m:f), string(maturity:f));
+  expiry_text = VS_IIF(WordFlag, string(expiry:m:f), string(expiry:f));
+
+  if (formula == 10) //на определенный день
+    rez = string(maturity);
+  elif (formula == 20) //по предъявлении
+    rez = "По предъявлении";
+    if ((maturity != date(0, 0, 0)) and (expiry == date(0, 0, 0)))
+      rez = rez + ", но не ранее " + maturity_text;
+    elif ((maturity == date(0, 0, 0)) and (expiry != date(0, 0, 0)))
+      rez = rez + ", но не позднее " + expiry_text;
+    elif ((maturity != date(0, 0, 0)) and (expiry != date(0, 0, 0)))
+      rez = rez + ", но не ранее " + maturity_text + " и не позднее " + expiry_text;
+    end;
+
+  end;
+  return rez;
+End;
+
+//наименование филиала
+macro GetDprtName (NumDprt)
+  var name = "";
+  var sql = " select party.t_shortname name "
+          + "from ddp_dep_dbt dep, dparty_dbt party "
+          + "where dep.t_partyid = party.t_partyid and dep.t_code = :NumDprt ";
+  sql = ExecSqlSelect(sql, MakeArray(SqlParam("NumDprt", NumDprt)), false);
+  if (sql.MoveNext() ) 
+    name = sql.value("name");
+  end;
+  return name;
+End;
+
+
+//Последний календарный день в месяце
+/*Simanov 30.08.2019 Закоментил эту функцию в связи с ненадобностью. Если в процессе работы до 01.10.2019 не возникнет ошибок компиляций, то можно смело удалять функцию вместе с этим комментарием
+macro LastDayInMonth (dt:date):date
+  var day, month, year;
+  DateSplit(dt, null, month, year);
+  if ((month == 1) or (month == 3) or (month == 5) or (month == 7) or (month == 8) or (month == 10) or (month == 12) )
+    day = 31;
+  elif ((month == 4) or (month == 6) or (month == 9) or (month == 11))
+    day = 30;
+  elif (month == 2)
+    if (mod(year, 4) == 0) 
+      day = 29;
+    else
+      day = 28;
+    end;
+  end;
+  return date(day, month, year);
+End;
+*/
+
+/*
+Считает коэффициенты для рассчета ставки дисконта.
+Coef365 = Количество дней в периоде, которые попадают в год, в котором 365 дней / 365
+Coef366 = аналогично, но с 366
+*/
+macro GetDaysCoef (BeginDate:date, EndDate:date, Coef365:@double, Coef366:@double)
+  var TempDate:Date = BeginDate+1;
+  var Count365:double = 0;
+  var Count366:double = 0;
+  var year:integer;
+
+  if (TempDate > EndDate)
+    return false;
+  end;
+
+  while (TempDate <= EndDate)
+    datesplit(TempDate, null, null, year);
+    if (mod(year, 4) == 0) 
+      Count366 = Count366 + 1;
+    else
+      Count365 = Count365 + 1;
+    end;
+    TempDate = TempDate + 1;
+  end;
+
+  Coef365 = Count365/365;
+  Coef366 = Count366/366;
+
+  return true;
+onerror()
+  return false;
+End;
+
+/*Рассчитать Дату начала периода, для дисконта*/
+MACRO ВернутьСледующийДень(vDate)
+  var СледующийДень = vDate + 1;
+  var ТекущийМесяц = 1;
+  var Год, Месяц;
+
+
+  DateSplit(vDate, null, ТекущийМесяц, null);
+  DateSplit(СледующийДень, null, Месяц, Год);
+  if(ТекущийМесяц != Месяц)
+    return date(1, Месяц, Год);
+  end;
+  while(not IsWorkday(СледующийДень))
+    DateSplit(СледующийДень, null, Месяц, Год);
+    if(ТекущийМесяц != Месяц)
+      return date(1, Месяц, Год);
+    end;
+    СледующийДень = СледующийДень + 1;
+  end;
+
+  return СледующийДень;
+END;
+
+/*Рассчитать Дату начала периода, для дисконта*/
+MACRO ВернутьКонецПериода(vDate)
+  var СледующийДень = vDate + 1;
+  var ТекущийМесяц = 1;
+  var Год, Месяц;
+
+  DateSplit(vDate, null, ТекущийМесяц, null);
+  DateSplit(СледующийДень, null, Месяц, Год);
+  if(ТекущийМесяц != Месяц) // Если следующий день, это уже следующий месяц, то берем текущую дату
+    return vDate;
+  end;
+
+  if (IsWorkday(СледующийДень)) // Если следующий день рабочий, текущая дата последняя
+    return vDate;
+  end;
+  
+  while(not IsWorkday(СледующийДень)) // Шагаем по нерабочим дням
+    DateSplit(СледующийДень, null, Месяц, Год);
+    if(ТекущийМесяц != Месяц) // Если следующий день, это уже следующий месяц, то берем текущую дату
+      return СледующийДень - 1; 
+    end;
+    СледующийДень = СледующийДень + 1;
+  end;
+
+  return vDate;
+END;

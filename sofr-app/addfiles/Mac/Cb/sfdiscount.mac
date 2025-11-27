@@ -1,0 +1,579 @@
+Import CTInter, globals, PaymInter, InsCarryDoc, BilFacturaInter;
+Import  RsbDataSet, "sf_lib.mac";
+
+
+private const PlusCalc_CatCode = "+Расчеты"; 
+private const PlusCalcNDS_CatCode = "+Расчеты НДС"; 
+private const MinusNDSAccrual_CatCode = "-НДС начисленный"; 
+
+private const PlusCalcNVPI_CatCode = "+Расчеты,НВПИ"; 
+private const PlusCalcNDS_NVPI_CatCode = "+Расчеты НДС,НВПИ";
+private const MinusNDSAccrual_NVPI_CatCode = "-НДС начисленный, НВПИ";
+
+private const MinusNDS_CatCode = "-НДС";
+
+private const SFDISCOUNT_MACRO_ERROR = 30738;
+
+private macro CountNDS_Carry( DateCarry, debetFIID, debetAccount, creditFIID, creditAccount, Sum, Ground,
+                              ID_Operation, ID_Step, objectType, objectBuf )    
+
+  var ret = 0;
+
+  var Doc = RsbAccTransaction;
+
+  if( Sum > $0 )
+
+    Doc.Chapter    = 1;
+    Doc.Date_Carry = DateCarry;   
+    Doc.Ground     = Ground;
+   
+    /*Doc.SumPayer    = Sum;    */
+
+    Doc.FIIDPayer       = debetFIID;   
+    Doc.AccountPayer    = debetAccount;
+ 
+    Doc.FIIDReceiver    = creditFIID;   
+    Doc.AccountReceiver = creditAccount;
+    Doc.SumReceiver     = Sum;   
+
+    Doc.Department = {OperDprt};
+
+    Doc.ID_Operation = ID_Operation;
+    Doc.ID_Step = ID_Step; 
+
+    if( not Doc.Carry() )
+      ret = 1;
+      if( ID_Operation > 0 )
+        SfSetOprErrorStatus( ID_Operation, SFDISCOUNT_MACRO_ERROR );
+      else
+        msgbox( "Ошибка при вставке проводки" );
+      end;
+    else      
+      SfPay_ConnectSfDocs( SFDOCS_LINKKIND_NDSDISCOUNT, objectType, objectBuf, Doc.AccTrnID, ID_Operation, ID_Step );      
+    end; 
+  
+  end;
+
+  return ret;
+end;
+
+private macro sfBFCreateBilBookEntry( FacturaID, Paym, CarryDate, OperationID, StepID )
+  
+  var bilbeID = 0;
+  var bilfDocArray = TArray;
+  
+  const DocIdSize = 34;
+  var DocID = string( Paym.PaymentID() );
+  DocID = mkstr( "0", DocIdSize - strlen(DocID) ) + DocID;
+
+  bilfDocArray[0] = TRecHandler("bilf_doc.rec");
+
+  bilfDocArray[0].Clear();
+  bilfDocArray[0].rec.DocID = string( Paym.PaymentID() );
+  bilfDocArray[0].rec.DocKind = Paym.DocKind;
+  bilfDocArray[0].rec.FIID  =  Paym.BaseFIID;                   
+  bilfDocArray[0].rec.Amount = Paym.BaseAmount;
+
+  if( (OperationID > 0) AND (StepID > 0) )
+    bilfDocArray[0].rec.OperationId = OperationID;
+    bilfDocArray[0].rec.StepId = StepID;
+  else
+    Opr_GetLastExecStep( bilfDocArray[0].rec.DocKind, DocID, bilfDocArray[0].rec.OperationId, bilfDocArray[0].rec.StepId );
+  end;
+        
+  if( not BFCreateBilBookEntry(FacturaID, bilfDocArray, CarryDate, bilbeID) )
+    if( OperationID == 0 )/*В BatchMode ошибку для документа не устанавливать*/
+      MsgBox("Не удалось связать оплату комиссии с СФ.");
+    end;
+  end;
+
+end;
+
+private macro GetPaidNDS_FromAmount( feeType, Paym, NDSRateValue, InvoiceID, SfInv, 
+                                     bDepoServable, depoPaidAmount:@money, depoPaidNDS:@money, depoPayFIID:@integer,
+                                     OperationID )
+  var Amount = $0, PaidNDS = $0, SumToConv = $0;
+  
+  /*Получить сумму платежа Amount путем пересчета Paym.ReceiverAmount из Paym.ReceiverFIID в НацВал по основному курсу на дату Paym.ValueDate.*/
+  if( Paym.PayerFIID == Paym.ReceiverFIID )
+    SumToConv = Paym.FuturePayerAmount;
+  else
+    SumToConv = Paym.FutureReceiverAmount;
+  end;
+  if( ConvSum( Amount, SumToConv, Paym.ValueDate, Paym.ReceiverFIID, NATCUR, 0 ) != 0 )
+    if( OperationID > 0 )
+      SfSetOprErrorStatus( OperationID, SFDISCOUNT_MACRO_ERROR );
+    else
+      MsgBox("Не найден основной курс ",ПолучитьКодФинИн(Paym.ReceiverFIID), " относительно ",
+            ПолучитьКодФинИн(NATCUR), " за ", Paym.ValueDate);
+    end;
+    return $0;
+  end;
+  
+  if( (feeType == SF_FEE_TYPE_SINGLE) or (feeType == SF_FEE_TYPE_ONCE) or (feeType == SF_FEE_TYPE_PERIOD) )/*единовременные и разовые*/
+    /*Рассчитать сумму НДС, как PaidNDS = Amount * $(ставку НДС)/ (100 + $(ставка НДС)), 
+    где $(Ставка НДС) - это Com.NDSRateValue.*/
+    PaidNDS = Amount * NDSRateValue /(100 + NDSRateValue);
+    
+    if( bDepoServable == true )
+      depoPaidNDS = SumToConv * NDSRateValue /(100 + NDSRateValue);
+      depoPaidAmount = SumToConv - depoPaidNDS;
+      depoPayFIID = Paym.ReceiverFIID; 
+    end;
+  elif( feeType == SF_FEE_TYPE_INVOICE ) /*ТО*/
+    /*Если Paym - это платеж, который полностью закрывает ТО, т.е. обе суммы: сумма по DSFINVLNK_DBT.T_PAYAMOUNT 
+      и сумма по DSFINVLNK_DBT.T_PAIDNDS для всех не закрытых записей (DSFINVLNK_DBT.T_LINKSTATUS = 0) DSFINVLNK_DBT 
+      относящихся к ТО SfInv, за исключением записи для Paym.PaymentID равны нулю, то*/
+    if( IsPaymFull(InvoiceID, Paym.PaymentID) == true )
+      PaidNDS = SfInv.NDSAmount - SfInv.PaidNDS;
+      
+      if( bDepoServable == true )
+        depoPaidNDS = SfInv.NDSAmount - SfInv.PaidNDS;
+        depoPaidAmount = SfInv.TotalAmount - SfInv.PaidAmount - depoPaidNDS;
+        depoPayFIID = SfInv.PayFIID;
+      end;
+       
+      /*Перевести PaidNDS из валюты ТО в валюту оплаты передав в функцию дату валютирования платежа Paym.ValueDate.*/
+      if( SfInvSumConvertToPayFIID(InvoiceID, PaidNDS, Paym.ValueDate, PaidNDS) )
+        return $0;
+      end;
+
+      /*... Затем в НацВал по основному курсу на Paym.ValueDate.*/
+      if( ConvSum( PaidNDS, PaidNDS, Paym.ValueDate, sfinv.PayFIID, NATCUR, 0 ) != 0 )
+        if( OperationID > 0 )
+          SfSetOprErrorStatus( OperationID, SFDISCOUNT_MACRO_ERROR );
+        else
+          MsgBox("Не найден основной курс ",ПолучитьКодФинИн(Paym.ReceiverFIID), " относительно ",ПолучитьКодФинИн(NATCUR), " за ", Paym.ValueDate);
+        end;
+        return $0;
+      end;
+    else /*Иначе (это платеж частичной оплаты):*/
+      PaidNDS = Amount * SfInv.NDSAmount / SfInv.TotalAmount;
+
+      if( bDepoServable == true )
+        depoPaidNDS = SumToConv * NDSRateValue /(100 + NDSRateValue);
+        depoPaidAmount = SumToConv - depoPaidNDS;
+        depoPayFIID = Paym.ReceiverFIID;
+      end;
+    end;
+  end;
+
+  return PaidNDS;
+end;
+
+private macro GetPaidNDS_FromPIList( Paym, AccNDS, 
+                                     bDepoServable, depoPaidAmount:@money, depoPaidNDS:@money, depoPayFIID:@integer,
+                                     OperationID )
+  
+  var Amount = $0, PaidNDS = $0;
+
+  var first_pi  = TRecHandler( "pmaddpi.dbt" );
+  var second_pi = TRecHandler( "pmaddpi.dbt" );
+
+  var piFIID = -1;
+  
+  var stat = Paym.PIList(PRT_Credit).First() or Paym.PIList(PRT_Credit).Current(first_pi); 
+  if( not stat )
+     stat = Paym.PIList(PRT_Credit).Next() or Paym.PIList(PRT_Credit).Current(second_pi); 
+  end;
+  
+  if( not stat )
+    /*В разноске платежа Paym.PIList, найти запись со счетом по кредиту pmaddpi.Account = accNDS и получить ее сумму по PaidNDS = pmaddpi.Amount.*/
+    if( first_pi.rec.Account == AccNDS )
+      PaidNDS = first_pi.rec.Amount;
+      piFIID  = first_pi.rec.FIID;
+
+      if( bDepoServable == true )
+        depoPaidAmount = second_pi.rec.Amount;
+        depoPaidNDS = PaidNDS;
+        depoPayFIID = piFIID;
+      end;
+    elif( second_pi.rec.Account == AccNDS )
+      PaidNDS = second_pi.rec.Amount;
+      piFIID  = second_pi.rec.FIID;
+
+      if( bDepoServable == true )
+        depoPaidAmount = first_pi.rec.Amount;
+        depoPaidNDS = PaidNDS;
+        depoPayFIID = piFIID;
+      end;
+    else
+      if( OperationID > 0 )
+        SfSetOprErrorStatus( OperationID, SFDISCOUNT_MACRO_ERROR );
+      else
+        MsgBox( "Не найдена сумма НДС в разноске платежа ПЗО ", Paym.PaymentID);
+      end;
+      return $0;
+    end;      
+    /*Если pmaddpi.FIID не НацВал, то перевести PaidNDS из pmaddpi.FIID в НацВал по основному курсу на дату Paym.ValueDate.*/
+    if( piFIID != NATCUR )
+      if( ConvSum( PaidNDS, PaidNDS, Paym.ValueDate, piFIID, NATCUR, 0 ) != 0 )
+        if( OperationID > 0 )
+          SfSetOprErrorStatus( OperationID, SFDISCOUNT_MACRO_ERROR );
+        else
+          MsgBox("Не найден основной курс ",ПолучитьКодФинИн(piFIID), " относительно ",ПолучитьКодФинИн(NATCUR), " за ", Paym.ValueDate);
+        end;
+        return $0;
+      end;
+    end;
+  end;
+ 
+  return PaidNDS;
+end;
+
+private macro SfDiscountNDS_SayError( OperationID, errMsg )
+  if( OperationID > 0 )
+    SfSetOprErrorStatus( OperationID, SFDISCOUNT_MACRO_ERROR );
+  else
+    MsgBox( errMsg );
+  end;
+end;
+
+
+private macro discountNDS_ForSfInv( Paym, InvoiceID, OperationID, StepID )
+  
+  var AccNDS:string, PlusCalc_Account:string, NDS_Account:string,MinusNDS_Account:string;
+  var Amount = $0, PaidNDS = $0, NDSRateValue = 0.0;
+
+  var IsNVPI : bool;
+
+  file SfComiss( "sfcomiss.dbt" );
+  file SfContr( "sfcontr.dbt") key 0;
+  
+  var SfConCom = TRecHandler( "sfconcom.dbt" );
+
+  var Ground, defComID = 0;
+
+  var SfConComOnDate = {BranchCurDate};
+
+  var sfDefComs = TArray(), err:bool = true, i:integer = 0;
+  var depoPaidAmount:money = $0, depoPaidNDS:money = $0, depoPayFIID:integer = 0, bDepoServable:bool = false; 
+
+  var sfdefcom_Inv = TBFile( "sfdef.dbt" );
+
+  var SfInv = RsbSfInv( InvoiceID );
+
+  if( SfInv.FacturaID > 0 )
+    sfBFCreateBilBookEntry( SfInv.FacturaID, Paym, Paym.ValueDate, OperationID, StepID );
+  end;
+
+  if( (SfInv.NDSAmount == $0) OR (SfInv.IsIncluded == "") )
+    return true;/*Завершить работу функции и вернуть true.*/
+  end;
+
+  SfComiss.number  = GetDefComissParm( InvoiceID, @SfConComOnDate, @defComID, @SfComiss.feeType );
+  if( not getEQ( SfComiss ) )
+    SfDiscountNDS_SayError( OperationID, "Не найдена комиссия." );
+    return false;
+  end;
+
+  SfContr.Id = SfInv.ContractID;
+  if( not getEQ( SfContr ) )
+    SfDiscountNDS_SayError( OperationID, "Не найден договор обслуживания: " + SfInv.ContractID );
+    return false;
+  end;
+
+  if( FindSfConCom_OnDate(SfInv.ContractID, SfComiss.feeType, SfComiss.number, 659, -1, SfConComOnDate, SfConCom) )
+    SfDiscountNDS_SayError( OperationID, "Не найдена комиссия ДО." );
+    return false;
+  end;
+
+  if( SfComiss.ServiceKind == PTSK_DEPOS )
+    bDepoServable = true;
+  else
+    bDepoServable = false;
+  end;
+    
+  IsNVPI = IsNVPICarry( SfInv.PayFIID, SfInv.InvoiceFIID, SfInv.PayRateDateKind );
+
+  /*Определить счета начисления комиссий по соответсвующим КУ*/
+  if( not defineCat_SfSiAccounts(SF_FEE_TYPE_PERIOD, isNVPI, false, defComID, SfConCom.rec, SfContr, sfinv.InvoiceFIID, sfinv.PayFIID, 
+                                 @PlusCalc_Account, @AccNDS, @NDS_Account, @MinusNDS_Account, null, true) )
+    SfDiscountNDS_SayError( OperationID, SfCatAcc_GetErrMsg() );
+    return false;
+  end;
+
+  /*2.6. Если счет начисления комиссии совпадает со счетом начисления НДС (сравниваем счета категорий "+Расчеты" 
+         и "+Расчеты НДС" без НВПИ и "+Расчеты НВПИ" и "+Расчеты НДС НВПИ" с НВПИ; нужно ли НВПИ определяем аналогично тому, 
+         как это описано нижеприведенном пункте 2.2.1), то */
+  if( AccNDS == PlusCalc_Account )
+    PaidNDS = GetPaidNDS_FromAmount( SF_FEE_TYPE_INVOICE, Paym, null, InvoiceID, SfInv, 
+                                     bDepoServable, @depoPaidAmount, @depoPaidNDS, @depoPayFIID, OperationID );
+  else /*2.7.  Иначе (счета начисления НДС и комиссий различны)*/
+    PaidNDS = GetPaidNDS_FromPIList( Paym, AccNDS, bDepoServable, @depoPaidAmount, @depoPaidNDS, @depoPayFIID, OperationID );
+  end;
+
+  /*2.8 Выполнить проводку по учету НДС 2Ва или 2Вб (Таблица 23) по сути это одна и та же проводка дт accNDS кт "-НДС" 
+    на сумму PaidNDS за дату Paym.ValueDate.*/
+  Ground = "Оплата НДС комиссии " + sfcomiss.Code;
+  if( CountNDS_Carry(Paym.ValueDate, sfinv.PayFIID, NDS_Account, NATCUR, MinusNDS_Account, PaidNDS, Ground, 
+                     OperationID, StepID, OBJTYPE_SFINVOICE, SfInv.GetSfInvBuff() ) != 0 )
+    return false;
+  end;
+
+  if( bDepoServable == true )
+    i = 0;
+    sfdefcom_Inv.addFilter( " t_InvoiceID = " + InvoiceID );
+    err = sfdefcom_Inv.GetGE();
+    while( err )    
+      sfDefComs[i] = TArray();
+      sfDefComs[i][0] = sfdefcom_Inv.rec.feeType;
+      sfDefComs[i][1] = sfdefcom_Inv.rec;
+      i = i + 1;
+      err = sfdefcom_Inv.Next();
+    end;
+
+    if( afterSfPay(sfDefComs, depoPaidAmount, depoPaidNDS, depoPayFIID, Paym.PaymentID) == false )
+      return false;
+    end;
+  end;
+
+  return true;
+
+end;
+
+private macro discountNDS_ForSfDef( Paym, SfDef, OperationID, StepID )  
+  
+  var AccNDS:string, PlusCalc_Account:string, NDS_Account:string,MinusNDS_Account:string;
+  var Amount = $0, PaidNDS = $0, NDSRateValue = 0.0;
+
+  var IsNVPI : bool;
+
+  file SfComiss( "sfcomiss.dbt" );
+  
+  file SfContr( "sfcontr.dbt") key 0;
+
+  var SfConCom = TRecHandler( "sfconcom.dbt" );
+  
+  var SfComPD_Buff = SfDef;
+
+  var Ground;
+  var payFIID = -1, defComID = 0;
+
+  var objectType = OBJTYPE_SFDEFCOM;
+
+  var SfConComOnDate = {BranchCurDate};
+
+  var sfDefComs = TArray(), err:bool = true, i:integer = 0;
+  var depoPaidAmount:money = $0, depoPaidNDS:money = $0, depoPayFIID:integer = 0, bDepoServable:bool = false;
+  
+  if( SfDef.FacturaID > 0 )
+    sfBFCreateBilBookEntry( SfDef.FacturaID, Paym, Paym.ValueDate, OperationID, StepID );
+  end;
+
+  if( not Opr_ChangeSfDefComStatus(SfDef.ID, SFDEFCOM_STATUS_PAYED, OperationID, StepID, SfDef.FeeType, Paym.ValueDate) )
+    return false;
+  end;
+  
+  if( (SfDef.SumNDS == $0) OR (SfDef.IsIncluded == "") )
+    return true;
+  end;
+  
+  SfComiss.feeType = SfDef.FeeType;
+  SfComiss.number  = SfDef.CommNumber;
+  if( not getEQ( SfComiss ) )
+    SfDiscountNDS_SayError( OperationID, "Не найдена комиссия." );
+    return false;
+  end;
+
+  if( SfComiss.ServiceKind == PTSK_DEPOS )
+    bDepoServable = true;
+  else
+    bDepoServable = false;
+  end;
+
+  payFIID = SfDef.FIID_Sum;
+  if( SfDef.FeeType == SF_FEE_TYPE_ONCE )
+    IsNVPI = false;
+    objectType = OBJTYPE_SFSINGDF;
+
+    if(SfDef.FIID_paySum >= 0)
+      payFIID = SfDef.FIID_paySum;
+    end;
+  else
+    if( sfcomiss.FIID_paySum != -1 )
+      payFIID = sfcomiss.FIID_paySum; 
+    end;
+
+    SfContr.Id = SfDef.SfContrID;
+    if( not getEQ(SfContr) )
+      SfDiscountNDS_SayError( OperationID, "Не найден договор обслуживания: " + SfDef.SfContrID );
+      return false;
+    end;
+
+    if( SfDef.FeeType == SF_FEE_TYPE_SINGLE )
+      objectType = OBJTYPE_OPRSFCOM;
+      GetOprSfcomParm( SfDef.ID_Operation, SfDef.ID_Step, @SfConComOnDate );
+    end;
+
+    if( isDefComNVPI( objectType, SfDef, isNVPI ) != 0 )
+      return false;
+    end;
+
+    if( FindSfConCom_OnDate(SfDef.SfContrID, SfDef.FeeType, SfDef.CommNumber, 659, -1, SfConComOnDate, SfConCom) )
+      SfDiscountNDS_SayError( OperationID, "Не найдена комиссия ДО." );
+      return false;
+    end;
+    SfComPD_Buff = SfConCom.rec;
+  end;
+
+  /*Определить счета начисления комиссий по соответсвующим КУ*/
+  if( not defineCat_SfSiAccounts(SfDef.feeType, isNVPI, false, SfDef.ID, SfComPD_Buff, SfContr, SfDef.FIID_Sum, payFIID, 
+                                 @PlusCalc_Account, @AccNDS, @NDS_Account, @MinusNDS_Account, null, true) )
+    SfDiscountNDS_SayError( OperationID, SfCatAcc_GetErrMsg() );
+    return false;
+  end;
+
+  /*3.3. Если счет начисления комиссии совпадает со счетом начисления НДС (сравниваем счета категорий "+Расчеты" 
+  и "+Расчеты НДС" без НВПИ и "+Расчеты НВПИ" и "+Расчеты НДС НВПИ" с НВПИ; нужно ли НВПИ определяем по алгоритму приведенному в п. 8.9), то*/
+  if( AccNDS == PlusCalc_Account )
+    if( SfDef.NDSRateValue != 0 )
+      NDSRateValue = SfDef.NDSRateValue;
+    else
+      NDSRateValue = double( round(SfDef.sumNDS/SfDef.Sum) ) * 100.0;
+    end;
+    PaidNDS = GetPaidNDS_FromAmount( SfDef.feeType, Paym, SfDef.NDSRateValue, null, null,
+                                     bDepoServable, @depoPaidAmount, @depoPaidNDS, @depoPayFIID, OperationID );
+  else /*3.4.  Иначе (счета начисления НДС и комиссий различны)*/
+    PaidNDS = GetPaidNDS_FromPIList( Paym, AccNDS, bDepoServable, @depoPaidAmount, @depoPaidNDS, @depoPayFIID );
+  end;
+
+  /*Выполнить проводку по учету НДС: дт accNDS кт "-НДС" на сумму PaidNDS за дату Paym.ValueDate.*/
+  Ground = "Оплата НДС комиссии " + sfcomiss.Code;
+  if( CountNDS_Carry(Paym.ValueDate, payFIID, NDS_Account, NATCUR, MinusNDS_Account, PaidNDS, Ground, 
+                     OperationID, StepID, objectType, SfDef) != 0 )
+    return false;
+  end;
+
+  if( bDepoServable == true )
+    sfDefComs[0] = TArray();
+    sfDefComs[0][0] = SfDef.FeeType;
+    sfDefComs[0][1] = SfDef;
+
+    if( afterSfPay(sfDefComs, depoPaidAmount, depoPaidNDS, depoPayFIID, Paym.PaymentID) == false )
+      return false;
+    end;
+  end;
+
+  return true;
+
+end;
+
+
+/*Вызывается из макроса шага зачисления платежа для платежей привязанных к ТО и для платежей по единовременным комиссиям, 
+а также для их для частичных оплат.
+Функция является макросом RSL вызываемом в контексте выполнения макроса шага операции.
+Функция получает в качестве входящиего параметра ид. платежа PaymentID и возвращает результат: 
+true - функция отработала успешно, false - ошибка.
+При ошибке платеж не зачисляется и осуществляется откат шага.
+Функция выполняет проводку по учету НДС на сумму НДС оплаченного платежом PaymentID. 
+Для определдения суммы НДС используется, как процедура расчета, так получение этой суммы из разноски платежа.
+Алгоритм:*/
+macro discountNDS( PaymentID, CarryDate )
+  /*// Определить к чему относится платеж, к ТО, к единовременной комиссии или к разовой комиссии.
+  1.  Получить объект платежа RsbPayment Paym по его идентификатору PaymentID.*/  
+  var Paym = RsbPayment( PaymentID );
+  var InvoiceID:integer;
+  var bRetVal = true;
+  file SfDef( "sfdef.dbt" );
+
+  /*2.  Если для PaymentID найдена строка в DSFINVLNK_DBT (мы имеем дело с платежом по ТО), то*/
+  if( IsPaymForSfInv(PaymentID, @InvoiceID) == true )
+    bRetVal = discountNDS_ForSfInv( Paym, InvoiceID, 0, 0 );
+  elif( (Paym.DefComID > 0) AND 
+    ((Paym.feeType == SF_FEE_TYPE_SINGLE) OR (Paym.feeType == SF_FEE_TYPE_ONCE) OR (Paym.feeType == SF_FEE_TYPE_PERIOD)) ) 
+    SfDef.FeeType = Paym.FeeType;
+    SfDef.ID = Paym.DefComID;
+    /*3.1 Для каждого отобранного платежа по полями Paym.feeType и Paym.DefComId определяем 
+        оплачиваемые удержанные комиссии SFDEF.DBT.*/
+    if( not getEQ( SfDef ) )
+      MsgBox( "Не найдена удержанная комиссия" );
+      return false;
+    else
+      bRetVal = discountNDS_ForSfDef( Paym, SfDef, 0, 0 );
+    end;
+  end;
+
+  return bRetVal;
+end;
+
+
+/*Алгоритм функции для пакетного режима выполнения операции:
+Функция должна массово выполнить требуемые действия (как в обычном единичном режиме) 
+для списка обрабатываемых платежей - записи таблицы oprtemp.tmp. 
+Функция вызывается из транзакционной части шага.
+Все совершаемые в функции действия должны выполняться с привязкой к соответствующему шагу операции: 
+- создание ЗК - функция CreateBilBookEntry это умеет делать, 
+- формирование проводок, 
+- действия по изменению статуса комиссии.*/
+macro discountNDS_BatchMode()
+ 
+  var PaymentID, OperationID, StepID, FeeType, DefComID;
+  var InvoiceID:integer;
+  var Paym;
+
+  file SfDef( "sfdef.dbt" );
+
+  var sqlString, rs, cmd;
+  
+  /*1 По oprtemp.tmp получить значения полей соответствующих исполняемых платежей pmpaym.dbt.
+    2 Из полученного списка отбираем платежи по ТО - т.е. те, для которых существует запись в SFINVLNK.DBT 
+      (ссылка в поле SFINVLNK.PaymentID).*/
+  sqlString = " SELECT t_OrderID, t_ID_Operation, t_ID_Step FROM doprtemp_tmp WHERE t_OrderID IN " +
+              " (SELECT lnk.t_PaymentID FROM dsfinvlnk_dbt lnk) AND t_ErrorStatus = 0 ";
+
+  cmd = RSDCommand( sqlString );
+  
+  rs = RsdRecordset( cmd );
+  while( rs.moveNext() )
+    PaymentID = rs.value(0);
+    OperationID = rs.value(1);
+    StepID = rs.value(2);
+
+    /*2.1 Для платежей находим соответствующие ТО - записи SfInv, в которых SfInv.InvoiceID = SFINVLNK.InvoiceID.*/
+    if( IsPaymForSfInv(PaymentID, @InvoiceID) == false )
+      /*2.1.1 Для тех платежей, для которых записи в SfInv.DBT не найдены, устанавливаем в oprtemp.ErrorStatus код соответствующей 
+          ошибки и из дальнейшей обработки данные платежи исключаем.*/
+      SfSetOprErrorStatus( OperationID, SFDISCOUNT_MACRO_ERROR );
+    else
+      Paym = RsbPayment( PaymentID );
+      discountNDS_ForSfInv( Paym, InvoiceID, OperationID, StepID );
+    end;
+    
+  end;
+
+  /*3 Из оставшегося списка платежей отбираем платежи по Удержанным комиссиям - те, 
+      у которых Paym.feeType=$(Единовременная)|| $(Периодическая)||$(Разовая)и Paym.DefComId>0:*/
+  sqlString = " SELECT opr.t_OrderID, opr.t_ID_Operation, opr.t_ID_Step, pm.t_FeeType, pm.t_DefComID " +
+              " FROM doprtemp_tmp opr, dpmpaym_dbt pm " +
+              " WHERE opr.t_OrderID = pm.t_PaymentID AND (pm.t_FeeType = ? OR pm.t_FeeType = ? OR pm.t_FeeType = ?) " +
+              " AND pm.t_DefComID > 0 AND opr.t_ErrorStatus = 0 ";
+  cmd = RSDCommand( sqlString );
+  cmd.addParam( "", RSDBP_IN, SF_FEE_TYPE_PERIOD );
+  cmd.addParam( "", RSDBP_IN, SF_FEE_TYPE_SINGLE );
+  cmd.addParam( "", RSDBP_IN, SF_FEE_TYPE_ONCE );
+
+  rs = RsdRecordset( cmd );
+  while( rs.moveNext() )
+    PaymentID = rs.value(0);
+    OperationID = rs.value(1);
+    StepID = rs.value(2);
+    FeeType = rs.value(3);
+    DefComID = rs.value(4);
+
+    SfDef.FeeType = FeeType;
+    SfDef.ID = DefComID;
+    /*3.1 Для каждого отобранного платежа по полями Paym.feeType и Paym.DefComId определяем 
+        оплачиваемые удержанные комиссии SFDEF.DBT.*/
+    if( not getEQ( SfDef ) )
+      /*3.1.1 Для тех платежей, для которых запись SFDEF.DBT не найдена, устанавливаем в oprtemp.ErrorStatus код 
+              соответствующей ошибки и из дальнейшей обработки данные платежи исключаем.*/
+      SfSetOprErrorStatus( OperationID, SFDISCOUNT_MACRO_ERROR );
+    else
+      Paym = RsbPayment( PaymentID );
+      discountNDS_ForSfDef( Paym, SfDef, OperationID, StepID );
+    end;
+  end;
+
+  return true;
+end;

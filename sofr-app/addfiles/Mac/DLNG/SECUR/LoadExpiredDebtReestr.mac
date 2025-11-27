@@ -1,0 +1,403 @@
+/**                                                                                                             
+ @file  LoadExpiredDebtReestr.mac                                                                                           
+ @brief Разовый макрос начального решения по загрузке текущей "прочей задолженности" в реестр задолженности СОФР из файла банка в формате Excel                                                                        
+                                                                                                                
+ #tag                                                                                                          
+ - functional_block:СО                                                                             
+ - code_type:GUI 
+ - code_type:API                                                                                                                                                                                               
+                                                                                                                
+ # changeLog                                                                                                    
+ |date       |author         |tasks               |note                                                         
+ |-----------|---------------|--------------------|-------------------------------------------------------------
+ |2025.07.29 |Жиц М.В.       |BOSS-2183           |Создание макроса начального решения                                                                                                                                                 
+*/ 
+import "DebtSumOp_Common.mac", "xls_parser.mac", "poisimplerepo.mac"; 
+
+PRIVATE CONST START_EXCEL_PROCESSING = 4; //Обработка файла должна выполняться построчно с 4-й строки
+
+/**
+ @brief Стартовая директория для поиска файла на сервере приложений
+*/                    
+PRIVATE MACRO InputDir()
+  return  "..\\Import\\";
+END; 
+
+/**
+ @brief Парсер формата считываемой ячейки Excel
+ @param[in] val  считанное значение ячейки Excel
+ @return значение, приведенное к корректному формату
+*/                    
+PRIVATE MACRO GetStr(val)
+  var Type = ValType(val);
+
+  if(Type == V_STRING)
+    return Trim(val);
+  elif((Type == V_DOUBLE) OR (Type == V_MONEY))
+    return substr(string(val), 1, index(string(val), ".")-1);
+  end;
+    
+  return "";
+END;
+
+/**
+ @brief Загрузка данных из файла Excel во временную таблицу ddl_debtreestrexcel_tmp
+ @param[in] m_FilePath  полный путь до файла
+ @return true, если данные файла успешно загружены в теблицу и можно продолжать выполнение
+ @return false, если в процессе загрузки произошли ошибки и дальнейшее выполнение должно быть остановлено
+*/                    
+PRIVATE MACRO LoadDebtListFromFile(m_FilePath:string):bool
+  var objExcel = CExcelPoi();
+  var fileMov = TempFileToServerMover();
+  fileMov.CreateTempFromAbsolutTermOrServPath(m_FilePath);
+
+  if(not objExcel.open(fileMov.GetTempFilePath()))
+    RunError("Не удалось открыть Excel файл", CustomError("Не удалось открыть Excel файл по пути " + m_FilePath));
+  end;
+
+  DL_RSDCommand("TRUNCATE TABLE DDL_DEBTREESTREXCEL_TMP").ExecuteCMD();
+
+  var ins_debtreestrexcel = RsbSQLInsert("dl_debtreestrexcel.tmp");
+  var debtreestrexcel_new = TRecHandler("dl_debtreestrexcel.tmp");  
+  var curRow:integer = 1;
+  var iLastRow:integer = objExcel.GetLastRowNum()+1;
+     
+  InitProgress(iLastRow, "Чтение Excel-файла", "Чтение Excel-файла");
+  while(curRow <= iLastRow)
+    if(curRow >= START_EXCEL_PROCESSING) //Обработка файла должна выполняться построчно с 4-й строки
+      if(GetStr(objExcel.CellValue("A"+string(curRow))) == "") //Блок с данными закончился
+        break;
+      else
+        debtreestrexcel_new.Clear();
+
+        debtreestrexcel_new.rec.RowNum = curRow;
+        debtreestrexcel_new.rec.DboNum = GetStr(objExcel.CellValue("G"+string(curRow)));
+        debtreestrexcel_new.rec.DebtAccount = GetStr(objExcel.CellValue("C"+string(curRow)));
+        debtreestrexcel_new.rec.DebtAccountVal = GetStr(objExcel.CellValue("D"+string(curRow)));
+        debtreestrexcel_new.rec.DebtDate = date(objExcel.CellValue("H"+string(curRow)));
+        debtreestrexcel_new.rec.DebtSum = money(strsubst(string(objExcel.CellValue("B"+string(curRow))), ",", "."));
+
+        ins_debtreestrexcel.AddRecord(debtreestrexcel_new);
+      end;
+    end;
+    UseProgress(curRow = curRow + 1);
+  end;
+
+  if(not ins_debtreestrexcel.Insert())
+    MsgBox("Ошибка при создании записей в ddl_debtreestrexcel_tmp");
+    RemProgress();
+    return false;
+  end;
+
+  RemProgress();
+  return true;
+END;
+
+/**
+ @brief Получение идентификатора счёта по его номеру и валюте
+ @param[in] Account  номер счета
+ @param[in] Currency валюта счета
+ @return идентификатор счета 
+*/                    
+PRIVATE MACRO GetAccountIDByNumber(Account:string, Currency:integer):integer
+  var cmd, DataSet;
+
+  cmd = DL_RSDCommand("SELECT t_AccountID " +        
+                      "  FROM daccount_dbt " +       
+                      " WHERE t_Account = ? " +      
+                      "   AND t_Code_Currency = ? " +
+                      "   AND t_Chapter = 1 "         
+                     ); 
+  cmd.AddParam(Account);
+  cmd.AddParam(Currency);
+
+  DataSet = cmd.Execute();
+  if(DataSet.moveNext())
+    return DataSet.AccountID;
+  end;
+
+  return 0;
+END;
+
+/**
+ @brief Поиск ДБО по его номеру
+ @param[in]  Number       номер ДБО
+ @param[out] DBOIsClosed  признак задолженности по закрытому ДБО
+ @return идентификатор ДБО
+*/                    
+PRIVATE MACRO GetDlContrByNumber(Number:string, DBOIsClosed:@bool):integer
+  var cmd, DataSet;
+  
+  cmd = DL_RSDCommand("SELECT dl.t_DlContrID, sf.t_DateClose " +
+                      "  FROM ddlcontr_dbt dl, dsfcontr_dbt sf " +
+                      " WHERE dl.t_SfContrID = sf.t_ID " +
+                      "   AND sf.t_Number = ? " +
+                      "   AND sf.t_ServKind = 0 "
+                     );
+  cmd.AddParam(Number);
+
+  DataSet = cmd.Execute();
+  if(DataSet.moveNext())
+    if(date(DataSet.DateClose) != date(0,0,0))
+      DBOIsClosed = true;
+    end;
+    return DataSet.DlContrID;
+  end;
+
+  return -1;
+END;
+
+/**
+ @brief Поиск субдоговора по номеру счета и ДБО
+ @param[in]  Account   номер счета
+ @param[in]  DlContrID идентификатор ДБО
+ @param[out] PartyID   идентификатор клиента
+ @return идентификатор субдоговора
+*/                    
+PRIVATE MACRO GetSfContrByAccountAndDBO(Account:string, DlContrID:integer, PartyID:@integer):integer
+  var cmd, DataSet;
+  
+  cmd = DL_RSDCommand("SELECT DISTINCT sf.t_ID, sf.t_PartyID, sf.t_Dateclose " +
+                      "  FROM ddlcontrmp_dbt mp " +
+                      " INNER JOIN dsfcontr_dbt sf " +
+                      "    ON sf.t_ID = mp.t_SfContrID " +
+                      " INNER JOIN dmcaccdoc_dbt mc " +
+                      "    ON mc.t_CatID = (SELECT cat.t_ID FROM dmccateg_dbt cat WHERE cat.t_LevelType = 1 AND cat.t_Code = 'ДС клиента, ц/б') " +
+                      "   AND mc.t_Owner = sf.t_PartyID " +
+                      "   AND mc.t_ClientContrID = sf.t_ID " +
+                      "   AND mc.t_Account = ? " +
+                      "  LEFT JOIN dobjatcor_dbt at " +
+                      "    ON at.t_ObjectType = 659 AND at.t_GroupID = 102 AND at.t_Object = LPAD(sf.t_ID, 10, '0') " +
+                      " WHERE mp.t_DlContrID = ? " +
+                      "   AND (    NVL(at.t_AttrID, 0) <> 1 " +
+                      "         OR (NVL(at.t_AttrID, 0) = 1 AND sf.t_ServKind = 1 AND sf.t_ServKindSub = 8 AND mp.t_MarketID = 2) " +
+                      "       ) " +
+                      " ORDER BY sf.t_DateClose ASC "
+                     );
+  cmd.AddParam(Account);
+  cmd.AddParam(DlContrID);
+
+  DataSet = cmd.Execute();
+  if(DataSet.moveNext())
+    PartyID = DataSet.PartyID;
+    return DataSet.ID;
+  end;
+
+  return -1;
+END;
+
+/**
+ @brief Поиск действующего счета просроченной задолженности 458* по идентификатору субдоговора
+ @param[in] SfContrID    идентификатор субдоговора
+ @param[in] PartyID      идентификатор клиента
+ @param[in] DebtCurrency валюта задолженности
+ @return идентификатор 458* счета
+*/                      
+PRIVATE MACRO GetDebt458AccIDBySfContr(SfContrID:integer, PartyID:integer, DebtCurrency:integer)
+  var cmd, DataSet;
+
+  cmd = DL_RSDCommand("SELECT /*+ ordered use_nl(mc) index(mc DMCACCDOC_DBT_IDXC)*/ DISTINCT acc.t_AccountID " +
+                      "  FROM dmcaccdoc_dbt mc, daccount_dbt acc " +
+                      " WHERE mc.t_CatID = (SELECT cat.t_ID FROM dmccateg_dbt cat WHERE cat.t_LevelType = 1 AND cat.t_Code = 'Треб. с н.с. брок') " +
+                      "   AND mc.t_IsCommon = 'X' " +
+                      "   AND mc.t_Owner = ? " +
+                      "   AND mc.t_ClientContrID = ? " +
+                      "   AND acc.t_Account = mc.t_Account " +
+                      "   AND acc.t_Chapter = mc.t_Chapter " +
+                      "   AND acc.t_Code_Currency = ? " +
+                      "   AND acc.t_Code_Currency = mc.t_Currency " +
+                      "   AND acc.t_Close_Date = TO_DATE('01.01.0001', 'DD.MM.YYYY') " +
+                      "   AND mc.t_DisablingDate = TO_DATE('01.01.0001', 'DD.MM.YYYY') "
+                     );
+  cmd.AddParam(PartyID);
+  cmd.AddParam(SfContrID);
+  cmd.AddParam(DebtCurrency);
+
+  DataSet = cmd.Execute();
+  if(DataSet.moveNext())
+    return DataSet.AccountID;
+  end;
+
+  return 0;
+END;
+
+/**
+ @brief Проверки и поиск недостающих данных при загрузке записи из Excel 
+ @param[in/out]  prm          параметры записи реестра
+ @param[in]      DataSet      результат запроса, соответствующий записи ddl_debtreestrexcel_tmp
+ @param[out]     DBOIsClosed  признак задолженности по закрытому ДБО
+ @param[out]     errmsg       сообщение об ошибке
+ @return true, если проверки успешно пройдены и можно продолжать выполнение
+ @return false, если проверки не пройдены и дальнейшее выполнение должно быть остановлено
+*/  
+PRIVATE MACRO FillParamsFromExcel(prm:@ExpiredDebtReestrParams, DataSet, DBOIsClosed:@bool, errmsg:@string):bool
+  errmsg = "";
+
+  prm.DebtCurrency = GetFIIDByCodeInAccount(DataSet.DebtAccountVal);
+  if(prm.DebtCurrency < 0)
+    errmsg = "Не удалось определить валюту по коду "+DataSet.DebtAccountVal;
+    return false;
+  end;
+
+  prm.DlContrID = GetDlContrByNumber(DataSet.DBONum, @DBOIsClosed);
+  if(prm.DlContrID <= 0)
+    errmsg = "Не удалось найти ДБО по номеру "+DataSet.DBONum;
+    return false;
+  end;
+
+  prm.DebtAccID = GetAccountIDByNumber(DataSet.DebtAccount, prm.DebtCurrency);
+  if(prm.DebtAccID <= 0)
+    errmsg = "Не удалось найти счет по номеру счета "+DataSet.DebtAccount;
+    return false;
+  end;
+
+  prm.SfContrID = GetSfContrByAccountAndDBO(DataSet.DebtAccount, prm.DlContrID, @prm.ClientID);
+  if(prm.SfContrID <= 0)
+    errmsg = "Не удалось определить субдоговор по номеру счета "+DataSet.DebtAccount+" (идентификатор "+prm.DebtAccID+") и номеру ДБО "+DataSet.DBONum+" (идентификатор "+prm.DlContrID+")";
+    return false;
+  end;
+
+  if(not DBOIsClosed)
+    prm.Debt458AccID = GetDebt458AccIDBySfContr(prm.SfContrID, prm.ClientID, prm.DebtCurrency);
+    if(prm.Debt458AccID <= 0)
+      errmsg = "Не удалось определить действующий счет просроченной задолженности по идентификатору субдоговора "+prm.SfContrID+", принадлежащему ДБО с номером "+DataSet.DBONum;
+      return false;
+    end;
+  end;
+
+  prm.DebtDate = DataSet.DebtDate;
+  prm.DebtSum = abs(DataSet.DebtSum);   
+
+  return true;
+
+onError(erru)  
+  errmsg = "Ошибка при проверке записи: " + erru.message + " (модуль " + erru.module + ", строка " + erru.line + ")";
+  return false;    
+END;
+
+/**
+ @brief Создание записи в реестре задолженности на основании записи файла Excel с созданием недостающих проводок ВУ
+ @param[in]  prm          параметры записи реестра 
+ @param[in]  RowNum       номер строки файла Excel для формирования уникального номера проводки ВУ
+ @param[out] DBOIsClosed  признак задолженности по закрытому ДБО 
+ @param[out] errmsg       сообщение об ошибке
+ @return true, если запись и проводки ВУ успешно созданы в БД
+ @return false, если в процессе работы процедуры произошли ошибки
+*/                    
+PRIVATE MACRO InsertExpiredDebtReestrRecFromExcelWithInnerCarry(prm:ExpiredDebtReestrParams, RowNum:integer, DBOIsClosed:bool, errmsg:@string):bool
+  var FD = NULL;
+  record DebAccVU(account);
+  record CredAccVU(account);
+  var ВидРО:integer = 104;
+
+  errmsg = "";
+
+  FD = DL_SubContrFD(prm.SfContrID);
+
+  if(IsExistsDebtIntoReestr(prm.SfContrID, prm.DebtDate, prm.DebtCurrency))
+    errmsg = "Нельзя добавить в реестр несколько прочих задолженностей по субдоговору "+GetSfContrNumber(prm.SfContrID)+" за одну дату. Требуется сначала вручную отредактировать/удалить существующую запись реестра";
+    return false;
+  end;
+
+  RslDefCon.BeginTrans();
+
+  if(not InsertDebtIntoReestr(-1, prm.ClientID, prm.DlContrID, prm.SfContrID, prm.DebtDate, prm.DebtSum, prm.DebtCurrency, prm.DebtAccID, prm.Debt458AccID, {oper}, prm.DebtDate, @errmsg))
+    RslDefCon.RollbackTrans();
+    return false;
+  end;
+
+  if((prm.DebtDate >= date(19,11,2021)) and (prm.DebtDate < date(10,6,2025)) and (not DBOIsClosed))
+    if(not FD.OpenAccount("ДС Клиента, ВУ", NULL, true, DebAccVU, prm.DebtDate, prm.DebtCurrency))
+      errmsg = "Ошибка: не открыт счет категории \"ДС Клиента, ВУ\" в валюте FIID = " + GetFinInstrCcy(prm.DebtCurrency);
+      RslDefCon.RollbackTrans();
+      return false;
+    end;
+    
+    if(not FD.OpenAccount("ДС, Расч. с клиентом, ВУ", NULL, true, CredAccVU, prm.DebtDate, prm.DebtCurrency))
+      errmsg = "Ошибка: не открыт счет категории \"ДС, Расч. с клиентом, ВУ\" в валюте FIID = " + GetFinInstrCcy(prm.DebtCurrency);
+      RslDefCon.RollbackTrans();
+      return false;
+    end;
+
+    CreateCarryByExpired(FD, DebAccVU, CredAccVU,
+                         prm.DebtDate, 21, prm.DebtCurrency, prm.DebtSum, 
+                         "Задолженность в связи с недостаточностью денежных средств на брокерском счете по договору № "+GetDLContrNumber(prm.DlContrID)+". Клиент - "+DL_getPartyShortName(prm.ClientID), 
+                         {oper}, "2229"+string(RowNum), true, ВидРО);
+  end; 
+
+  RslDefCon.CommitTrans();
+  return true;    
+
+onError(erru) 
+  if(RslDefCon.IsInTrans)
+    RslDefCon.RollbackTrans();
+  end;
+  errmsg = "Ошибка при создании записи: " + erru.message + " (модуль " + erru.module + ", строка " + erru.line + ")";
+  return false;
+END;
+
+/**
+ @brief Начальное решение по загрузке текущей "прочей задолженности" в реестр задолженности СОФР из файла банка в формате Excel
+*/  
+MACRO LoadExpiredDebtReestr()
+  var cmd, DataSet;
+  var dt, tm;
+  var cnt:integer, i:integer = 0, err:integer = 0;
+  var FullNameFile:string = "", LogFileName:string = "", errmsg:string = "";
+  FILE LogOutFile() txt write; /*файл вывода для протокола*/
+
+  //Выбор файла для обработки
+  if(not SelectFile(FullNameFile, InputDir() + "*.xls*", "Выберите файл для загрузки", 0, false))
+    MsgBox("Отказ от загрузки");
+    return;
+  end;
+
+  //Загрузка строк из Excel-файла во временную таблицу
+  if(LoadDebtListFromFile(FullNameFile))
+    cmd = DL_RSDCommand("select * from ddl_debtreestrexcel_tmp order by t_RowNum");
+   
+    cnt = cmd.GetCount();
+    if(cnt > 0)
+      dt = StrSubSt(string(Date()),".","");
+      tm = StrSubst(StrSubSt(string(time()),":","")," ","0");
+      //Создание файла протокола  
+      LogFileName = GetTxtFileName("LoadExpiredDebtReestr_"+dt+"_"+tm);
+      if(not Open(LogOutFile, LogFileName))
+        MsgBox("Ошибка при создании файла протокола "+LogFileName);
+      end;
+      SetOutput(LogFileName); 
+
+      InitProgress(cnt, "Обработка загруженных записей", "Обработка загруженных записей");
+
+      DataSet = cmd.Execute();
+      while(DataSet.moveNext())
+        var DBOIsClosed:bool = false;
+        var prm = ExpiredDebtReestrParams(); //Параметры записи реестра
+
+        if(not FillParamsFromExcel(prm, DataSet, @DBOIsClosed, @errmsg)) //Поиск недостающих данных
+          println("Строка "+DataSet.RowNum+": "+errmsg);
+          err = err + 1;
+        else
+          if(not InsertExpiredDebtReestrRecFromExcelWithInnerCarry(prm, DataSet.RowNum, DBOIsClosed, @errmsg))
+            println("Строка "+DataSet.RowNum+": "+errmsg);
+            err = err + 1;
+          end;
+        end;
+
+        UseProgress(i = i + 1);
+      end; 
+      RemProgress();
+
+      println("Обработано: "+i+". Из них с ошибкой: "+err);
+
+      SetOutput(NULL, true);
+      close(LogOutFile);
+      ViewFile(LogOutFile);
+    else
+      MsgBox("Задолженности к загрузке не найдены");
+    end;
+  end;
+END;
+
+LoadExpiredDebtReestr();
+Exit(1);

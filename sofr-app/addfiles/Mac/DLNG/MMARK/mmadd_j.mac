@@ -1,0 +1,591 @@
+/*
+$Name: mmadd_j.mac
+$Module: МБК
+$Description: Макрос выполнения шага "Начисление процентов по сделке"
+*/
+
+IMPORT InsCarryDoc, MmarkInter, mmlibr, mmcarry, mmcnst_j, mpclb, Проценты,fx_lib,dl_lib,funk,dealInfo,dl_plib,fx_globals,dl_nplat;
+
+  VAR da0,emes=0,ddend;
+
+PRIVATE CONST SERV_ACCINT_BLOCKID = 3000019; // сервисная операция начисления процентов
+PRIVATE CONST PARTY_MSP_BANK = 857; // АО "МСП БАНК"
+
+
+//Глобальные переменные, заполняются в сишнике
+PRIVATE VAR ДатаДокументовНачисления, 
+            ДатаНачисления,
+            PlanIDs     = TArray,
+            FactIDs     = TArray,
+            KvitAmounts = TArray,
+            ExecDate;
+
+     
+//dan определение даты поиска платежей для функции PPOG 7614
+private macro get_date_for_ppog(dealid, CalcDate, PaymDate)
+   var rezDate = CalcDate;
+   var dl_cmd = dl_RSDCommand("select ga.t_outpmtmin1, tick.t_adjdatetype\n" +
+                              "        from ddl_tick_dbt tick, ddl_genagr_dbt ga\n" + 
+                              "       where ga.t_genagrid(+) = tick.t_genagrid\n" + 
+                              "         and tick.t_dealid = ?");
+      dl_cmd.AddParam(dealid);
+   var dl_rsd = dl_cmd.execute();
+   if (dl_rsd.movenext())
+      if(dl_rsd.ADJDATETYPE == 0) 
+         rezDate = PaymDate;
+      elif (dl_rsd.ADJDATETYPE == 1)    //корректировка дата вперед платежа приходящегося на выходные 
+         if(not IsWorkDay( PaymDate))
+         rezDate = GetDateAfterWorkDays(PaymDate, 1);
+         else
+         rezDate = PaymDate;
+         end;
+      elif (dl_rsd.ADJDATETYPE == 2)    //корректировка дата назад платежа приходящегося на выходные 
+         if(not IsWorkDay( PaymDate))
+         rezDate = GetDateAfterWorkDays(PaymDate,-1);
+         else
+         rezDate = PaymDate;
+         end;
+      end;
+   end;
+   return rezDate;
+end;
+
+//Объект для начисления процентов по сделке
+//
+// Передаваемые парметры:
+// ДатаНачисления           - дата, на которую начисляем проценты
+// ДатаДокументовНачисления - дата проводок по начислению
+// Сделка                   - идентификатор сделки: может быть числовым идентификатором сделки в БД
+//                            или объект MMFirstDoc (первичный документ по сделке)
+CLASS MMOBJ_PcAdd(ДатаНачисления, ДатаДокументовНачисления, Сделка, ВыводитьОшибки)
+  private var 
+      isCheck        = false;       //флаг, отвечающий за то, что пройдена проверки или нет
+
+  var
+      PcAddGround_P  = "",         //основание проводки для сделки привлечения
+      PcAddGround_NR = "",         //основание проводки для сделок с отрицательной процентной ставкой
+      PcAddGround_RN = "",         //основание проводки для надежной сделки размещения
+      PcAddGround_RP = "";         //основание проводки для проблемной сделки размещения
+
+  var ID_Operation = 0,
+      ID_Step      = 0,
+      ZeroSumTrue  = 1,
+      CorrectSum   = 0;
+
+  private var
+      prm_Quality      = 0,          // надежность сделки
+      prm_CarrySum     = 0,          // сумма проводки
+      prm_PercContract = NULL;       // процентный договор
+
+  private var
+      prm_PcAddDate:date = {curdate}, //дата начисления
+      prm_PcAddDateCarry = {curdate}, //дата проводок
+      prm_FirstDoc       = NULL,       //первичный документ
+      prm_ShowError       = true;       //признак вывода сообщений об ошибках
+
+  private macro PcAdd_Error(_errStr)
+      if (prm_ShowError)
+          mm_error(_errStr);
+      end;
+  end;
+
+  macro GetQuality()
+      return prm_Quality;
+  end;
+
+  macro GetCarrySum()
+      return prm_CarrySum;
+  end;
+
+//Основания проводок по умолчанию
+  macro SetDefaultGround()
+      PcAddGround_P  = "Начисление процентов по сделке МБК";
+      PcAddGround_NR = "Начисление процентов по сделке МБК с отриц. ставкой";
+      PcAddGround_RN = "Начисление процентов по надежной сделке МБК";
+      PcAddGround_RP = "Начисление процентов по проблемной сделке МБК";
+  end;
+
+//Конструктор
+  macro Init(Date, DateCarry, Deal, ShowErr)
+      var PlanPaym, CntSched;
+      if (ValType(ShowErr) == V_BOOL)
+          prm_ShowError = ShowErr;
+      else
+          prm_ShowError = true;
+      end;
+
+      if (ValType(Deal) == V_INTEGER)
+          prm_FirstDoc = MMFirstDoc(DL_IBCDOC, Deal, true);
+      elif (ValType(Deal) == V_GENOBJ)
+          prm_FirstDoc = Deal;
+      else
+          PcAdd_Error("Ошибка при получении первичного документа сделки!");
+          isCheck = false;
+          return;
+      end;
+
+
+      if (ValType(prm_FirstDoc) == V_GENOBJ)
+          prm_PercContract = MM_GetPercContractID(PC_IBC_CON, prm_FirstDoc.GetTick().DealCode);
+      end;
+
+/*
+      if ((prm_PercContract == NULL)or(prm_PercContract == 0))
+          PcAdd_Error("Не найден процентный договор по сделке ", prm_FirstDoc.GetTick().DealCode);
+          isCheck = false;
+          return;
+      end;
+*/
+      if (ValType(Date) == V_DATE)
+          prm_PcAddDate = Date;
+      else
+          prm_PcAddDate = {curdate};
+      end;
+
+      // начисление идет перед исполнением вход/исх платежей 
+      if (PlanIDs.size >= 1)
+          PlanPaym = RsbPayment(PlanIDs(0));
+          if (IsGraphPaym(prm_FirstDoc.GetTick().DealID, prm_FirstDoc.GetTick().BOfficeKind, PlanPaym.Purpose) and 
+             (not IsLastPurpPaym(prm_FirstDoc.GetTick().DealID, prm_FirstDoc.GetTick().BOfficeKind, PlanPaym.Purpose)) and 
+             (prm_FirstDoc.GetTick().AdjDateType > 0))
+             // дата платежа могла быть перенесена, получить реальную дату платежа
+             if ((prm_FirstDoc.GetTick().AdjDateType == 1) and (not IsWorkday(PlanPaym.ValueDate-1))) 
+                CntSched = TRsbDataSet("select t_Date from DPRCCNTSCHED_DBT where " +
+                                       "T_CONTRACTID = " + prm_PercContract + " and T_SCHEDULEKIND = 3 and T_SPECIALTYPE = 0 " +
+                                       "and T_DATE <= TO_DATE('" + PlanPaym.ValueDate + "') " +
+                                       "order by T_DATE desc");
+                if (CntSched.MoveNext())
+                    prm_PcAddDate = CntSched.Date;
+                end;
+
+             elif ((prm_FirstDoc.GetTick().AdjDateType == 2) and (not IsWorkday(PlanPaym.ValueDate+1)))
+                CntSched = TRsbDataSet("select t_Date from DPRCCNTSCHED_DBT where " +
+                                       "T_CONTRACTID = " + prm_PercContract + " and T_SCHEDULEKIND = 3 and T_SPECIALTYPE = 0 " +
+                                       "and T_DATE >= TO_DATE('" + PlanPaym.ValueDate + "') " +
+                                       "order by T_DATE asc");
+                if (CntSched.MoveNext())
+                   prm_PcAddDate = CntSched.Date;
+                end;
+             end; 
+          elif ((IsLastPurpPaym(prm_FirstDoc.GetTick().DealID, prm_FirstDoc.GetTick().BOfficeKind, PlanPaym.Purpose)) and 
+               (prm_FirstDoc.GetTick().AdjDateType > 0))
+             CntSched = TRsbDataSet("select Max(t_Date) as MDate from DPRCCNTSCHED_DBT where " +
+                                    "T_CONTRACTID = " + prm_PercContract + " and T_SCHEDULEKIND = 3 and T_SPECIALTYPE = 0 " +
+                                    "order by T_DATE asc");
+             if (CntSched.MoveNext())
+                prm_PcAddDate = CntSched.MDate;
+             end;
+          end;
+      end;
+    
+      if (ValType(DateCarry) == V_DATE)
+          prm_PcAddDateCarry = DateCarry;
+      else
+          prm_PcAddDateCarry = {curdate};
+      end;
+
+      if (IsSALE( GetOperationGroup(prm_FirstDoc.GetTick().DealType)))
+        prm_Quality = 1;
+      end;
+
+      SetDefaultGround();
+      isCheck = true;
+  end;
+
+//Проверка перед выполнением операции начисления
+  macro Check()
+      var 
+          CntSched = NULL;
+
+      if (not isCheck)
+         return isCheck;
+      end;
+
+      if (CheckExistence(LEG_LegKind_DealID_LegID, LEG_KIND_DL_TICK, prm_FirstDoc.GetTick().DealID, 1))
+          PcAdd_Error("Не найден транш сделки ", prm_FirstDoc.GetTick().DealCode);
+          return false;
+      end;
+
+      if ((prm_PcAddDate < prm_FirstDoc.GetLeg().Start)or
+          (prm_PcAddDate > (prm_FirstDoc.GetLeg().Start + Int(prm_FirstDoc.GetLeg().Duration))))
+           // PcAdd_Error("Не найден период начисления");
+           // return false;
+      end;
+
+      CntSched = TRsbDataSet("select t_DateReal from DPRCCNTSCHED_DBT where " +
+                              "T_CONTRACTID = " + prm_PercContract + " and T_SCHEDULEKIND = 2 and T_SPECIALTYPE = 0 " +
+                              "and T_DATE < TO_DATE('" + prm_PcAddDate + "') " +
+                              "order by T_DATE desc");
+/*
+      if ((CntSched.MoveNext())and(CntSched.DateReal == date(0,0,0)))
+           PcAdd_Error("Не было начисления в более ранние даты по графику начисления");
+           return false;
+      end;
+*/
+      return isCheck = true;
+  end;
+
+//Формирование проводки
+  private macro Carry()
+   var
+      at = MM_Carry, isSaleDeal = IsSALE( GetOperationGroup(prm_FirstDoc.GetTick().DealType));
+   var day2,ssu,day3,basis,price,rs,sunp,que,rs5,rs51,d0,d1,newsu,dsu,ppaymentid,accp,std_pls_flag=false,dist_carry_sum_flag=false;
+   var dayv;
+   if (not isCheck)
+      //ругались раньше, так что просто выходим
+      return false;
+   end;
+
+   d0=prm_FirstDoc.GetTick().dealdate;
+   d1=DAT(MM_leg(prm_FirstDoc.GetTick().dealid,"maturity",1));
+   if (IsOverdraft(prm_FirstDoc.GetTick().dealtype))     //SVE 507960 19.05.2020 так как по сделкам овердрафт не известна сумма начисления заранее, запрашиваем ее в момент выполнения начисления
+      getdouble(prm_CarrySum,"Введите сумму процентов:", 16, false, 4);
+   elif ((d1 - d0) == 1)
+      prm_CarrySum=MM_leg(prm_FirstDoc.GetTick().dealid,"cost",1);
+   else
+      day2=DAT(MM_leg(prm_FirstDoc.GetTick().dealid,"start",1));
+      if ( da0 > day2 )
+         day2=da0-1;
+      end;
+   
+      basis= MM_leg(prm_FirstDoc.GetTick().dealid,"basis",1);
+      price= Новая_проц_ставка(prm_FirstDoc.GetTick().dealid,ДатаНачисления);
+      ssu=MM_leg(prm_FirstDoc.GetTick().dealid,"principal",1);
+
+      /* MAA: DEF-20493 Не учитывались сделки "привлечения, ТФ", у которых счет по КУ "ОДТФ" */           
+      if (  isTF(prm_FirstDoc.GetTick().dealtype) )
+         accp =MM_acc(prm_FirstDoc.GetTick().dealid,804);
+         if ( accp == 0 )     /* MAA: DEF-20493. Если по КУ "ОДТФ" не найдено, тогда ищем по КУ "ОД"(Исключение для старых сделок ТФ, по которым открыты счета "ОД", а не ОДТФ) */
+            accp =MM_acc(prm_FirstDoc.GetTick().dealid,111);          
+         end;              
+      else
+         accp =MM_acc(prm_FirstDoc.GetTick().dealid,111);  
+      end;
+
+      if (prm_FirstDoc.GetTick().partyid == PARTY_MSP_BANK )
+         ssu=abs(execmacrofile("calculate.mac", "RestA_", accp, ДатаНачисления-1, 1, prm_FirstDoc.GetLeg().PFI)) ;
+      else
+         ssu=abs(execmacrofile("calculate.mac", "RestA_", accp, ДатаНачисления, 1, prm_FirstDoc.GetLeg().PFI)) ;
+      end;
+      if (IsCLAIMSACQ(GetOperationGroup(prm_FirstDoc.GetTick().dealtype)) or IsOverdraft(prm_FirstDoc.GetTick().dealtype))
+         ssu=MM_leg(prm_FirstDoc.GetTick().dealid,"principal",1);
+      end;
+      dsu=0;
+      que="select count(*) from dstd_pls_dbt where t_id="+prm_FirstDoc.GetTick().dealid+"  and t_dizm > '"+day2+"' and t_dizm <= '"+ДатаНачисления+"'"; 
+      // msgbox(que);
+      rs5 = LnGetRecordSet(que);
+      if (rs5 != null)
+         if (rs5.moveNext) 
+            if ( rs5.value(0) > 0 )
+               std_pls_flag = true;
+               // ---
+               que="select t_stav/1000000  st  from dstd_pls_dbt where t_id="+prm_FirstDoc.GetTick().dealid+"  and t_dizm <= '"+day2+"' order by t_dizm desc  "; 
+               rs51 = LnGetRecordSet(que);
+               if (rs51 != null)
+                  if (rs51.moveNext) 
+                     day3=rs51.value(0);
+                  end;
+               end;
+               que="select to_char(t_dizm,'dd.mm.yyyy') from dstd_pls_dbt where t_id="+prm_FirstDoc.GetTick().dealid+"  and t_dizm > '"+day2+"' and t_dizm <= '"+ДатаНачисления+"'"; 
+               rs51 = LnGetRecordSet(que);
+               if (rs51 != null)
+                  if (rs51.moveNext) 
+                     // msgbox("1",ssu,"-", day2,"-", date(rs51.value(0)),"-",day3);
+                     dsu=round(РасчётПроцентнойСтавки(ssu, day2, date(rs51.value(0))-1,day3, basis), 2);
+                     day2=date(rs51.value(0))-1;
+                  end;
+               end;
+               // ---
+            end;
+         end;
+      end;
+      /*VVL DEF-25696 22/07/2022 Использовать дистрибутивное начисление процентов, если есть частичные погашения и нет записей в dstd_pls_dbt*/
+      if ((std_pls_flag) == false)
+         var prevssu=abs(execmacrofile("calculate.mac", "RestA_", accp, prm_FirstDoc.GetLeg().Start, 1, prm_FirstDoc.GetLeg().PFI)) ;
+         if ((prevssu != ssu) and (prevssu != 0))
+            dist_carry_sum_flag = true;
+         end;
+      end;
+      if (not dist_carry_sum_flag)
+         prm_CarrySum=round(РасчётПроцентнойСтавки(ssu, day2, ДатаНачисления,price, basis), 2);
+         prm_CarrySum=prm_CarrySum+dsu;
+         IF ( emes == 0 )
+            que="select t_account acc,t_fiid fiid from dmcaccdoc_dbt t where t_docid="+prm_FirstDoc.GetTick().dealid+" and (t_catid = 117 or  t_catid = 118)   and t_dockind=102 ";
+            rs5 = LnGetRecordSet(que);
+            if (rs5 != null)
+               if (rs5.moveNext) 
+                  sunp=plat_dil0(prm_FirstDoc.GetTick().dealid,"102","11",get_date_for_ppog(prm_FirstDoc.GetTick().dealid, ДатаНачисления, ДатаНачисления),"baseamount");
+                  newsu=abs(execmacrofile("calculate.mac", "RestA_", rs5.value("acc"), ДатаНачисления, 1, MM_leg(prm_FirstDoc.GetTick().dealid,"pfi",1))) ;
+                  dsu=newsu+prm_CarrySum;
+                  if ((sunp != " ") and (abs(sunp-dsu) < 0.1) )
+                     prm_CarrySum=sunp-newsu;
+                  end;
+               end;
+            end;
+         END;
+      end;
+   end;
+
+   if  ( (prm_FirstDoc.GetTick().partyid  == _BANK_RF) and (not dist_carry_sum_flag) ) 
+      //       da0=day2;     //KEA 509408
+      da0=da0-1;
+      que="select t_baseamount,t_valuedate from dpmpaym_dbt where t_purpose=10 and t_dockind=102 and t_documentid="+prm_FirstDoc.GetTick().dealid+" and t_valuedate < '"+СДАТ(ДатаНачисления)+"' and t_valuedate >= '"+СДАТ(da0)+"'";
+      //  msgbox(que);
+      rs51 = LnGetRecordSet(que);
+      if (rs51 != null)
+         if (rs51.moveNext) 
+            //day2=DAT(rs51.value(1));
+            dayv=DAT(rs51.value(1));
+            ssu=rs51.value(0);
+            if (dayv < day2)
+               newsu=round(РасчётПроцентнойСтавки(ssu, da0, dayv,day3, basis), 2);
+            else
+               newsu=round(РасчётПроцентнойСтавки(ssu, da0, dayv,price, basis), 2);
+            end;
+            prm_CarrySum=prm_CarrySum+newsu;
+         end;
+      end;
+   end;
+
+   if ((prm_CarrySum > 0) and ((ddend < ДатаНачисления ) or IsOverdraft(prm_FirstDoc.GetTick().dealtype)))
+      ppaymentid=plat_dil(prm_FirstDoc.GetTick().dealid,"102","11","paymentid"); 
+      newsu=prm_CarrySum;
+      Histpaym11(ppaymentid);
+      que = "update dpmpaym_dbt SET t_FUTUREPAYERAMOUNT = '"+newsu+"' ,  t_FUTURERECEIVERAMOUNT = '"+newsu+"' ,  t_AMOUNT = '"+newsu+"' , t_BASEAMOUNT = '"+newsu+"' ,  t_PAYAMOUNT ='"+newsu+"'";
+      que=que+" where t_paymentid ="+ ppaymentid; 
+      rs = LnGetRecordSet(que);
+      Histpaym22(ppaymentid);
+      msgbox("Выполнено обновление суммы платежа по процентам !");
+      if ( IsOverdraft(prm_FirstDoc.GetTick().dealtype) )
+         que="update dpmpaym_dbt set t_valuedate='"+SDAT(ДатаДокументовНачисления)+"', t_futuredratedate='"+SDAT(ДатаДокументовНачисления)+"' , t_futurecratedate='"+SDAT(ДатаДокументовНачисления)+"'";
+         que=que+" where t_paymentid ="+ ppaymentid; 
+         rs = LnGetRecordSet(que);
+         que="update dpmprop_dbt set t_transferdate='"+SDAT(ДатаДокументовНачисления)+"'";
+         que=que+" where t_paymentid ="+ ppaymentid; 
+         rs = LnGetRecordSet(que);
+         que = "update dpmrmprop_dbt SET t_DATE='"+SDAT(ДатаДокументовНачисления)+"',  t_paydate='"+SDAT(ДатаДокументовНачисления)+"'";
+         que=que+" where t_paymentid ="+ ppaymentid; 
+         rs = LnGetRecordSet(que);
+      end;
+   end;
+
+   at.date_carry   = prm_PcAddDateCarry;
+   
+   at.PrimaryDoc   = prm_FirstDoc;
+
+   PcAddGround_P=mm_ground(prm_FirstDoc.GetTick().dealid,26);
+   PcAddGround_NR=mm_ground(prm_FirstDoc.GetTick().dealid,26);
+   PcAddGround_RN=mm_ground(prm_FirstDoc.GetTick().dealid,26);
+
+   que="select count(*) from  doprdocs_dbt a , doproper_dbt b, dacctrn_dbt bb  where  a.t_id_operation=b.t_id_operation ";
+   que=que+"and b.t_dockind=102 and b.t_DocumentID=lpad("+prm_FirstDoc.GetTick().dealid+",34,'0')   and a.t_acctrnid > 0 and bb.t_acctrnid=a.t_acctrnid and to_char(bb.t_date_carry,'dd.mm.yyyy')='"+СДАТ(ДатаДокументовНачисления)+"'";
+   if ( isBuy(GetOperationGroup(prm_FirstDoc.GetTick().dealtype)))
+      que=que+" and bb.t_sum_receiver= "+prm_CarrySum;
+   else
+      que=que+" and bb.t_sum_payer= "+prm_CarrySum;
+   end;
+   rs51 = LnGetRecordSet(que);
+   if (rs51 != null)
+      if (rs51.moveNext) 
+         if (rs51.value(0) > 0 )
+            msgbox("Начисление уже выполнено !");
+            return false;
+         end;
+      end;
+   end;
+
+   if(isBuy(GetOperationGroup(prm_FirstDoc.GetTick().dealtype)) and (CheckIsDealTminus1_ByDealID(prm_FirstDoc.GetTick().dealid))) //dan нужно перенести проводку для сделок по ГС с Т-1      
+      at.date_carry   = ДатаНачисления;
+   end;
+
+   if ( (prm_Quality == 0) and (prm_FirstDoc.GetTick().NegativeRate == "")) 
+      // сделка привлечения, т.к. для сделок привлечения надежность не считается,
+      // а для сделок размещения, если надежность не определена, то ругались раньше
+      // at.CatPayer       = tdr_percP(prm_FirstDoc.GetTick().TypeDoc);
+      at.CatPayer       = "-%, Кр0";
+      at.CatReceiver    = tdr_claimP;
+      at.FIIDPayer      = NATCUR;
+      at.FIIDReceiver   = prm_FirstDoc.GetLeg().PFI;
+      at.SumReceiver    = prm_CarrySum;
+      at.Chapter        = 1;
+      at.Ground         = PcAddGround_P;
+   elif((prm_Quality == 0) and (prm_FirstDoc.GetTick().NegativeRate == "X"))
+      VAR CarrySum;
+      ConvSum(CarrySum, prm_CarrySum, prm_PcAddDateCarry, prm_FirstDoc.GetLeg().PFI, NATCUR);
+      at.CatPayer       = tdr_perc3R;
+      at.CatReceiver    = tdr_perc4R;
+      at.FIIDPayer      = prm_FirstDoc.GetLeg().PFI;
+      at.FIIDReceiver   = NATCUR;
+      at.SumReceiver    = CarrySum;
+      at.Chapter        = 1;
+      at.Ground         = PcAddGround_NR;
+   elif((prm_Quality != 0) and (prm_FirstDoc.GetTick().NegativeRate == ""))
+      at.CatPayer       = tdr_claimR;
+      if ( prm_FirstDoc.GetTick().partyid  == _BANK_RF )
+         at.CatReceiver    =  "+%, Кр00";
+      elif ( prm_FirstDoc.GetTick().dealtype  == 12335 )
+         at.CatReceiver    =  "+%, Кр01";
+      else
+         at.CatReceiver    = tdr_percR(prm_FirstDoc.GetTick().TypeDoc);
+      end;
+      at.FIIDPayer      = prm_FirstDoc.GetLeg().PFI;
+      at.FIIDReceiver   = NATCUR;
+      at.SumPayer       = prm_CarrySum;
+      at.Chapter        = 1;
+      at.Ground         = PcAddGround_RN;
+   elif((prm_Quality != 0) and (prm_FirstDoc.GetTick().NegativeRate == "X"))
+      at.CatPayer       = tdr_perc4P;
+      at.CatReceiver    = tdr_perc3P;
+      at.FIIDPayer      = NATCUR;
+      at.FIIDReceiver   = prm_FirstDoc.GetLeg().PFI;
+      at.SumReceiver    = prm_CarrySum;
+      at.Chapter        = 1;
+      at.Ground         = PcAddGround_NR;
+   end;
+
+   if (not at.carry())
+      PcAdd_Error("Ошибка при начислении процентов");
+      return false;
+   end;
+
+   return true;
+end;
+
+//Начать операцию начисления
+  macro PcAddOperation()
+      var 
+          CntSched = NULL, retVal = true;
+
+      if (not Check())
+          return false;
+      end;
+
+      CntSched = TRsbDataSet("select t_DateReal from DPRCCNTSCHED_DBT where " +
+                              "T_CONTRACTID = " + prm_PercContract + " and T_SCHEDULEKIND = 2 and T_SPECIALTYPE = 0 " +
+                              "and T_DATE >=TO_DATE('" + prm_PcAddDate + "') " +
+                              "order by T_DATE");
+
+      CntSched.MoveNext();
+	  
+      if (CntSched.DateReal == date(0,0,0))
+          if (not MM_CalcPerc(prm_PercContract, prm_PcAddDate, 2, ID_Operation ,ID_Step, prm_FirstDoc.GetLeg().Basis, prm_CarrySum))
+              //prm_CarrySum = 0;
+          end;
+      else
+          prm_CarrySum = 0;
+      end;
+ 
+      prm_CarrySum = prm_CarrySum + CorrectSum;
+
+      if ((ZeroSumTrue)and(prm_CarrySum == 0))
+          retVal = true;
+      else
+          retVal = Carry();
+      end;
+      return retVal;
+  end;
+
+//Вызов конструктора
+  Init(ДатаНачисления, ДатаДокументовНачисления, Сделка, ВыводитьОшибки);
+END;
+
+//Выполнение шага
+PRIVATE MACRO ExecuteStep(Buffer, Document, DocKind, ID_Operation, ID_Step)
+  record deal(dl_tick);
+
+   VAR PcAdd = NULL,dend,mon1,mon2,dachp,paysta,qque,rs50,PmDateGreaterDealDate=false;
+   SetBuff(deal, Document);
+   DL_PrepareCarryBuffer (Buffer);
+
+   paysta=plat_dil(deal.dealid,"102","9","paymstatus");
+   if ((paysta == PM_PREPARING) OR (paysta == PM_READIED)) 
+      msgbox("Не проведен платеж ОД по сделке !");
+      return 0;
+   end;
+
+   if ((GetBlockNumber(ID_Operation, ID_Step) == SERV_ACCINT_BLOCKID) OR IsOverdraft(deal.dealtype))
+      ДатаДокументовНачисления={curdate};
+      ДатаНачисления={curdate};
+   end;
+   //DEF-30655 Проценты уже должны быть начислены
+   if (ValType(ДатаНачисления) == V_UNDEF)
+      return 0;
+   end;
+
+   if (deal.dealdate >=  ДатаНачисления )
+      msgbox("Начисление %% не требуется ! (начало)");
+      return 0;
+   end;
+
+   dend=DAT(MM_leg(deal.dealid,"maturity",1));
+   ddend=dend;
+
+   if ((dend < ДатаНачисления ) and (not IsOverdraft(deal.dealtype)))
+      // VVL DEF-29866 для случая, если дата окончания сделки приходится на вых. день, а дата платежа перенесена на след. рабочий
+      var LastPaym = TRsbDataSet("select 1 from dpmpaym_dbt where " +
+            "t_dockind= " + DL_IBCDOC + " and t_documentid= " + deal.dealid + " and t_purpose=11 and t_valuedate=" + GetSQLDate(get_date_for_ppog(deal.dealid, ДатаНачисления, dend)));
+
+      if (LastPaym.MoveNext())
+         ДатаНачисления = dend;
+         PmDateGreaterDealDate = true;
+      end;
+      
+      if (not PmDateGreaterDealDate )
+         msgbox("Начисление %% не требуется ! (окончание)");
+         return 0;
+      end;
+   end;
+   if((CheckIsDealTminus1_ByDealID(deal.dealid))  and (DateAfterWorkDays({curdate} , 1) == dend) )
+      ДатаДокументовНачисления = dend; 
+   end;
+
+   da0=СДАТ(ДатаНачисления);
+   da0=ДАТ("01"+substr(da0,3));
+
+   if (deal.partyid  != PARTY_MSP_BANK )
+      if ( PPOG_CH(deal.DealID,ДатаНачисления)  > 0 )
+         dachp=ДАТ(PPOG_CH2(deal.DealID,ДатаНачисления));
+         if ((dachp > da0 ) and  (dachp <= ДатаДокументовНачисления ))
+            da0=dachp+1;
+         end;
+      end;
+   end;
+
+   dend=ДатаНачисления+1;
+   datesplit(ДатаНачисления,null,mon1,null);
+   datesplit(dend,null,mon2,null);
+
+   if (mon2 > mon1 )
+      emes=1;
+   else
+      emes=0;
+   end;
+
+   if (substr(СДАТ(ДатаНачисления),1,5) == "31.12")
+      emes=1;
+   end;
+   /* DEF-72866
+   if ((not IsOverdraft(deal.dealtype)) and (not IsTF(deal.dealtype)))    //SVE 527895
+      if ( emes == 0  )
+         if ( (PPOG(deal.DealID,get_date_for_ppog(deal.DealID, ДатаНачисления, DAT(MM_leg(deal.dealid,"maturity",1))))  == 0) and (not PmDateGreaterDealDate) )
+            msgbox("Начисление %% не требуется ! (погашение) ");
+            return 0;
+         end;
+      end;
+   else
+      emes =1;
+   end;*/
+
+   PcAdd = MMOBJ_PcAdd(ДатаНачисления, ДатаДокументовНачисления, deal.DealID, true);
+   PcAdd.ID_Operation = ID_Operation;
+   PcAdd.ID_Step      = ID_Step;
+   PcAdd.ZeroSumTrue  = 0;
+
+   if (not PcAdd.PcAddOperation())
+      return 1;
+   end;
+   
+   return 0;
+END;
+
+NameMacroFile = "mmadd_j.mac"; 

@@ -1,0 +1,3200 @@
+/**
+ @file 		AddAccountingEntriesRequestMsg.mac
+ @brief 	Интеграция с внешними системами. Обработка входящих зачислений
+
+ #menu 
+  - БО ЦБ\ Отчеты \ РСХБ \ [13408] Сверка зачислений списаний ДС СОФР_ЦФТ
+
+ # changelog
+ |date       |autor          |tasks                                           |note
+ |-----------|---------------|------------------------------------------------|-------------------------------------------------------------
+ |01.08.2025 |Топорков Д.В.  |BOSS-8439                                       |Доработка зачислений ДС для ЮЛ
+ |06.05.2025 |Велигжанин А.В.|DEF-80324                                       |1) Проводка для mode==6 проводится со статусом ACCTRN_STATUS_DOCUMENT
+ |           |               |                                                |2) Доработано логгирование
+ |03.03.2025 |Велигжанин А.В.|DEF-80324                                       |Доп.логгирование для даты опер.дня и даты проводки
+ |           |               |                                                |(для определения ситуаций попадания проводки в статус Планируемая)
+ |01.03.2023 |Гераськина Т.В.|BIQ-10484                                       |Контейнер OperationCode используется для загрузки депозитарный комиссий
+
+*/
+import globals, oralib, likepy, DealsInter, InsCarryDoc, PaymInter, vabkpnum, vsbkpnum, dl_car, email_notifyfun, OprInter, BankInter, enroll_class;
+import "global_utils_intgr.mac";
+import "bnk_ptlib.mac";
+import "usr_connect_attr.mac","ws_msg_transform_sec.mac";
+import func_lib;
+import commonutil;
+import "cblogger2.mac";
+
+/**
+@brief        Возвращает dacctrn_dbt.t_state
+@param[in] 	p_AccTrnID	ID проводки
+*/
+PRIVATE MACRO GetAccTrnState(p_AccTrnID: integer)
+  var cmd = RsdCommand("select a.t_state from dacctrn_dbt a where a.t_acctrnid = :1 ");
+  cmd.addParam("", RSDBP_IN, p_AccTrnID);
+  var rs = RsdRecordSet(cmd);
+
+  if (rs.MoveNext())
+    return rs.Value("t_state");
+  else
+    return -1;
+  end;
+END;
+
+
+/**
+@brief        Процедура логгирования ошибки с использованием объекта NewLogger
+@param[in] 	p_ObjName	наименование объекта (itt_log.object_name)
+@param[in] 	p_Msg		строка ошибки (itt_log.msg)
+*/
+PRIVATE MACRO WriteNewLogger(p_ObjName: string, p_Msg: string)
+  var logger = NewLogger(c_logger.IT_LOG_TYPE, p_ObjName);
+  logger.Error(p_Msg);
+END;
+
+/**
+@brief        Процедура проверки даты проводки. 
+              Если статус проводки не 1, информация логгируется.
+@param[in] 	p_ObjName	наименование объекта (itt_log.object_name)
+@param[in] 	p_CurDate	дата опер.дня
+@param[in] 	p_DateCarry	дата проводки
+@param[in] 	p_AccTrnID	ID проводки
+*/
+PRIVATE MACRO CheckDateCarry(p_ObjName: string, p_CurDate: date, p_DateCarry: date, p_AccTrnID: integer)
+  IF(CheckDateCarry(p_AccTrnID) != 1)
+     WriteNewLogger(p_ObjName, "CurDate: "+string(p_CurDate)+", DateCarry: "+string(p_DateCarry)+", AccTrnID: "+string(p_AccTrnID));
+  END;
+END;
+
+private macro UpdatePmUserfield( PaymentId :integer, FldValue :string ) :integer
+var Params :TArray,
+    DataSet :RsdRecordset,
+    Query :string = "";
+
+  Query = " DECLARE " +
+          "  v_PaymentId              dpmpaym_dbt.T_PAYMENTID%TYPE := :p_PaymentId; " +
+          "  v_UsrField               dpmpaym_dbt.T_USERFIELD4%TYPE := :p_UsrField; " +
+          " BEGIN " +
+          
+          "  UPDATE dpmpaym_dbt " +
+          "  SET T_USERFIELD4 = v_UsrField || '#1' " +
+          "  WHERE T_PAYMENTID = v_PaymentId; " +
+          
+          " END; ";
+ 
+  Params = Null;
+  Params = makeArray( SQLParam("p_PaymentId", PaymentId),
+                      SQLParam("p_UsrField", FldValue) );
+
+  execSQL( Query, Params );
+  Params = Null;
+  return 0;
+
+onError(err)
+
+ Params = Null;
+ return 1;
+
+end;
+
+
+//shev 22.08.2019 
+private macro UpdateTrnUserfield( AccTrntId :integer, FldValue :string ) :integer
+var sql :string = "",
+    cmd, rs;
+
+  sql = " DECLARE " +
+          "  v_AcctrnId              dacctrn_dbt.T_ACCTRNID%TYPE := :p_AcctrnId; " +
+          "  v_UsrField              dacctrn_dbt.T_USERFIELD4%TYPE := :p_UsrField; " +
+          " BEGIN " +
+
+          "  UPDATE dacctrn_dbt " +
+          "  SET T_USERFIELD4 = v_UsrField || '#1' " +
+          "  WHERE T_ACCTRNID = v_ACCTRNId; " +
+          
+          " COMMIT;   "+
+
+          " END; ";
+
+  cmd = RSDCommand(sql);
+  cmd.AddParam("p_AcctrnId", RSDBP_IN, AccTrntId);
+  cmd.AddParam("p_UsrField", RSDBP_IN, FldValue);
+  cmd.execute();
+
+  return 0;
+
+onError(err)
+
+ return 1;
+
+end;
+
+
+// DEF-34766
+// автономная транзакция для вставки записи в upmbiscotto_dbt
+private macro AddBiscottoId_autonomous(p_BiscottoId)
+   var sql, cmd;
+   var res = 0;
+   
+   sql = "DECLARE "+
+         "  PRAGMA autonomous_transaction; "+
+         "  v_ret          NUMBER(5) := 0; "+
+         "  v_DocKind      number := -900; "+
+         "  v_BiscottoId   varchar2(255 byte) := :p_BiscottoId; "+
+         "BEGIN "+
+         "  begin "+
+         "    INSERT INTO upmbiscotto_dbt (t_PmId, t_DocKind, t_BiscottoId) "+
+         "    VALUES( 0/*AINC*/, v_DocKind, v_BiscottoId ); "+
+         "    v_ret := 0; "+
+         "  exception "+
+         "     when others then v_ret := 1; "+
+         "  end; "+
+         "  COMMIT; "+
+         "  :p_ret := v_ret; "+
+         "END; ";
+   cmd = RSDCommand(sql);
+   cmd.addParam("p_BiscottoId", RSDBP_IN, p_BiscottoId);
+   cmd.addParam("p_ret", RSDBP_OUT, V_INTEGER);
+   cmd.execute();
+
+   res = cmd.value("p_ret");
+   cmd.close(); cmd = NULL; sql = NULL;
+
+   return res;
+onerror
+   return 1;
+end;
+
+private macro UpdateBiscottoId_autonomous(p_PmId, p_DocKind, p_BiscottoId)
+   var sql, cmd;
+   var res = 0;
+   
+   sql = "DECLARE "+
+         "  PRAGMA autonomous_transaction; "+
+         "  v_PmId         number := :p_PmId; "+
+         "  v_DocKind      number := :p_DocKind; "+
+         "  v_BiscottoId   varchar2(255 byte) := :p_BiscottoId; "+
+         "BEGIN "+
+         "  IF v_DocKind < 0 THEN /*для nptxop подтягиваем вид документа*/ "+
+         "     SELECT T_DOCKIND INTO v_DocKind FROM dnptxop_dbt WHERE T_ID = v_PmId; "+
+         "  END IF; "+
+         "  update upmbiscotto_dbt set t_pmid = v_PmId, t_dockind = v_DocKind where t_biscottoid = v_BiscottoId; "+
+         "  COMMIT; "+
+         "END; ";
+
+   cmd = RSDCommand(sql);
+   cmd.addParam("p_PmId", RSDBP_IN, p_PmId);
+   cmd.addParam("p_DocKind", RSDBP_IN, p_DocKind);
+   cmd.addParam("p_BiscottoId", RSDBP_IN, p_BiscottoId);
+   cmd.execute();
+
+   cmd.close(); cmd = NULL; sql = NULL;
+end;
+
+// DEF-34766
+// автономная транзакция для удаления записи в upmbiscotto_dbt
+private macro DeleteBiscottoId_autonomous(p_BiscottoId)
+   var sql, cmd;
+   var res = 0;
+   
+   sql = "DECLARE "+
+         "  PRAGMA autonomous_transaction; "+
+         "  v_BiscottoId   varchar2(255 byte) := :p_BiscottoId; "+
+         "BEGIN "+
+         "  delete from upmbiscotto_dbt where t_biscottoid = v_BiscottoId; "+
+         "  COMMIT; "+
+         "END; ";
+
+   cmd = RSDCommand(sql);
+   cmd.addParam("p_BiscottoId", RSDBP_IN, p_BiscottoId);
+   cmd.execute();
+
+   cmd.close(); cmd = NULL; sql = NULL;
+
+   return res;
+onerror
+   return 1;
+end;
+
+
+//получим FIID из ISO кода валюты
+private macro GetFiidFromCodeISO( FiKind :integer, FiCode :string ) :integer
+var Query :string = "",
+    DataSet :RsdRecordset,
+    Params :TArray;
+
+
+ Query = " SELECT T_FIID FROM dfininstr_dbt " +
+         " WHERE T_FI_KIND = :FiKind " +
+         "  AND T_FI_CODE = :FiCode ";
+
+ Params = makeArray( SQLParam("FiKind", FiKind),
+                     SQLParam("FiCode", FiCode) );
+ DataSet = execSQLselect( Query, Params );
+
+ if( DataSet.MoveNext )
+  return DataSet.value(0, Null, V_INTEGER);
+ else
+  return -1;
+ end;
+
+end;
+//получим FIID из ISO кода валюты
+
+
+//заполняем лог результатов загрузки из Бисквит в СОФР платежей
+private macro AddPmLog( Req, Resp, i, Mode, PaymentId )
+var Params :TArray,
+    DataSet :RsdRecordset,
+    Query :string = "",
+    DocKind :integer,
+    ContrNumber :string = "",
+    ErrorCode :integer,
+    ErrorText :string;
+
+  if( Mode == 0)
+   DocKind = 322;
+  else
+   DocKind = 4607;
+  end;
+
+
+  if( ( ValType( Req.AddAccountingEntriesRequest.TransactionList[i].EntryList[0].AgreementNumber ) != V_UNDEF) and 
+    ( ValType( Req.AddAccountingEntriesRequest.TransactionList[i].EntryList[0].AgreementNumber ) != 26) )
+// shev 150121 обрезаем пустой символ
+   ContrNumber = trim(Req.AddAccountingEntriesRequest.TransactionList[i].EntryList[0].AgreementNumber);
+  else
+   ContrNumber = "_";
+  end;
+
+  if ( ( ValType( Resp.AddAccountingEntriesResponseMsg.AddAccountingEntriesResponse.TransactionResultList[0].EntryResultList[0].ErrorList ) == V_UNDEF )
+       or ( (ValType(Resp.AddAccountingEntriesResponseMsg.AddAccountingEntriesResponse.TransactionResultList[0].EntryResultList[0].ErrorList) == V_GENOBJ)
+             and (Resp.AddAccountingEntriesResponseMsg.AddAccountingEntriesResponse.TransactionResultList[0].EntryResultList[0].ErrorList.size ==0)
+           )
+      )
+   ErrorCode = 0;
+   ErrorText = "_";
+  else
+   ErrorCode = int(Resp.AddAccountingEntriesResponseMsg.AddAccountingEntriesResponse.TransactionResultList[0].EntryResultList[0].ErrorList[0].ErrorCode); 
+   ErrorText = Resp.AddAccountingEntriesResponseMsg.AddAccountingEntriesResponse.TransactionResultList[0].EntryResultList[0].ErrorList[0].ErrorDesc;
+  end;
+
+
+  Query = " DECLARE " +
+          "  v_PmId                  upminsofrlog_dbt.T_PMID%TYPE := :p_PmId; " +
+          "  v_DocKind               upminsofrlog_dbt.T_DOCKIND%TYPE := :p_DocKind; " +
+          "  v_BiscottoId            upminsofrlog_dbt.T_BISCOTTOID%TYPE := :p_BiscottoId; " +
+          "  v_ContrNumber           upminsofrlog_dbt.T_CONTRNUMBER%TYPE := :p_ContrNumber; " +
+          "  v_ValueDate             upminsofrlog_dbt.T_VALUEDATE%TYPE := :p_ValueDate; " +
+          "  v_PayerAccount          upminsofrlog_dbt.T_PAYERACCOUNT%TYPE := :p_PayerAccount; " +
+          "  v_ReceiverAccount       upminsofrlog_dbt.T_RECEIVERACCOUNT%TYPE := :p_ReceiverAccount; " +
+          "  v_Fiid                  upminsofrlog_dbt.T_FIID%TYPE := :p_Fiid; " +
+          "  v_PayFiid               upminsofrlog_dbt.T_PAYFIID%TYPE := :p_PayFiid; " +
+          "  v_Amount                upminsofrlog_dbt.T_AMOUNT%TYPE := :p_Amount; " +
+          "  v_PayAmount             upminsofrlog_dbt.T_PAYAMOUNT%TYPE := :p_PayAmount; " +
+          "  v_Ground                upminsofrlog_dbt.T_GROUND%TYPE := :p_Ground; " +
+          "  v_Status                upminsofrlog_dbt.T_STATUS%TYPE := :p_Status; " +
+          "  v_ErrCode               upminsofrlog_dbt.T_ERRCODE%TYPE := NVL( :p_ErrCode, 0 ); " +
+          "  v_ErrText               upminsofrlog_dbt.T_ERRTEXT%TYPE := NVL( :p_ErrText, CHR(0) ); " +
+          "  v_CreationTime          upminsofrlog_dbt.T_CREATIONTIME%TYPE := SYSDATE; " +
+
+          
+          " BEGIN " +
+          
+          "  INSERT INTO upminsofrlog_dbt( T_PMID, T_DOCKIND, T_BISCOTTOID, T_CONTRNUMBER, T_VALUEDATE, T_PAYERACCOUNT, T_RECEIVERACCOUNT, T_FIID, T_PAYFIID, " +
+          "   T_AMOUNT, T_PAYAMOUNT, T_GROUND, T_STATUS, T_ERRCODE, T_ERRTEXT, T_CREATIONTIME ) " +
+          "   ( SELECT v_PmId, v_DocKind, v_BiscottoId, v_ContrNumber, v_ValueDate, v_PayerAccount, v_ReceiverAccount, v_Fiid, v_PayFiid, v_Amount, v_PayAmount, " +
+          "      v_Ground, v_Status, v_ErrCode, v_ErrText, v_CreationTime " +
+          "   FROM DUAL ); " +
+          
+          " END; ";
+ 
+  Params = Null;
+  Params = makeArray( SQLParam("p_PmId", PaymentId ),
+                      SQLParam("p_DocKind", DocKind ),
+                      SQLParam("p_BiscottoId", Req.AddAccountingEntriesRequest.TransactionList[i].EntryList[0].ReferenceId.ObjectId ),
+                      SQLParam("p_ContrNumber", ContrNumber ),
+                      SQLParam("p_ValueDate", Req.AddAccountingEntriesRequest.TransactionList[i].EntryList[0].OperationalDay ),
+                      SQLParam("p_PayerAccount", Req.AddAccountingEntriesRequest.TransactionList[i].EntryList[0].DebitAccount.AccountNumber ),
+                      SQLParam("p_ReceiverAccount", Req.AddAccountingEntriesRequest.TransactionList[i].EntryList[0].CreditAccount.AccountNumber ),
+                      SQLParam("p_Fiid", GetFiidFromCodeISO( 1, Req.AddAccountingEntriesRequest.TransactionList[i].EntryList[0].DebitAccount.CurrencyCode ) ),
+                      SQLParam("p_PayFiid", GetFiidFromCodeISO( 1, Req.AddAccountingEntriesRequest.TransactionList[i].EntryList[0].CreditAccount.CurrencyCode ) ),
+                      SQLParam("p_Amount", numeric( Req.AddAccountingEntriesRequest.TransactionList[i].EntryList[0].DebitAmount ) ),
+                      SQLParam("p_PayAmount", numeric( Req.AddAccountingEntriesRequest.TransactionList[i].EntryList[0].CreditAmount ) ),
+                      SQLParam("p_Ground", Req.AddAccountingEntriesRequest.TransactionList[i].EntryList[0].EntryDetails ),
+                      SQLParam("p_Status", int(Resp.AddAccountingEntriesResponseMsg.AddAccountingEntriesResponse.TransactionResultList[i].EntryResultList[Resp.AddAccountingEntriesResponseMsg.AddAccountingEntriesResponse.TransactionResultList[i].EntryResultList.Size-1].ResultCode) ),
+                      SQLParam("p_ErrCode", ErrorCode ),
+                      SQLParam("p_ErrText", ErrorText ) );
+
+  execSQL( Query, Params );
+  Params = Null;
+
+
+onError(err)
+
+ Params = Null;
+
+end;
+
+
+//получить Id субъекта по коду субъекта на дату
+private macro GetPartyIdByCode( Code :string, CodeKind :integer, BankDate :date ) :integer
+var Params = TArray();
+
+
+  Params = Null;
+  Params = makeArray( SQLParam( "p_Code", Code ),
+                      SQLParam( "p_CodeKind", CodeKind ),
+                      SQLParam( "p_Date", BankDate ));
+  return execStoredFunc( "USR_PKG_IMPORT_SOFR.GetPtIdActORLastClosedByCode", V_INTEGER, Params );
+
+end;
+//получить Id субъекта по коду субъекта на дату
+
+
+//получим наименование субъекта-банк по коду 3 и 6
+private macro GetFullNameFromTwoCode( Code_1 :string, CodeKind_1 :integer, Code_2 :string, CodeKind_2 :integer, BankDate :date ) :string
+var Params = TArray();
+
+
+  Params = Null;
+  Params = makeArray( SQLParam( "p_Code_1", Code_1 ),
+                      SQLParam( "p_CodeKind_1", CodeKind_1 ),
+                      SQLParam( "p_Code_1", Code_2 ),
+                      SQLParam( "p_CodeKind_1", CodeKind_2 ),
+                      SQLParam( "p_Date", BankDate ));
+  return execStoredFunc( "USR_PKG_IMPORT_SOFR.GetFullNameFromTwoCode", V_INTEGER, Params );
+
+end;
+//получим наименование субъекта-банк по коду 3 и 6
+
+
+
+//получим вид кода субъекта-банк 3 или 6
+private macro CheckBankCodeKind( BIC :string) :integer
+var StrDigit :string = "0123456789",
+    i :integer = 0,
+    state :integer = 0;
+
+ if( (Valtype(BIC) != V_UNDEF) and (Valtype(BIC) != 26) and (BIC != "") )
+  i = 1;
+  state = 0;
+  if( StrLen(BIC) == 9 )
+
+   while( i <= StrLen(BIC) ) //нормализация оставить, что только цифры или разделитель
+
+    if( Index( StrDigit, Substr(BIC, i, 1) ) >= 1 )
+     state = 3;
+    else
+     state = 6;
+     Break;
+    end;
+
+    i = i + 1;
+
+   end;
+
+  else
+   state = 6;
+  end;
+
+ else
+  state = 0;
+ end;
+
+ return state;
+
+end;
+//получим вид кода субъекта-банк 3 или 6
+
+
+class TParentPmInput
+var objProps = TArray(),
+    queryStr = "",
+    Obj = Null,
+    DocKind = 0,
+    IdentProgram = "";
+
+  objProps[objProps.Size] = "Date";
+  objProps[objProps.Size] = "ValueDate";
+  objProps[objProps.Size] = "PayerBankID";
+  objProps[objProps.Size] = "PayerAccount";
+  objProps[objProps.Size] = "FuturePayerAccount";
+  objProps[objProps.Size] = "Payer";
+  objProps[objProps.Size] = "ReceiverBankID";
+  objProps[objProps.Size] = "ReceiverAccount";
+  objProps[objProps.Size] = "Receiver";
+  objProps[objProps.Size] = "Number";
+  objProps[objProps.Size] = "Ground";
+  objProps[objProps.Size] = "NumberPack";
+  objProps[objProps.Size] = "Department";
+  objProps[objProps.Size] = "Oper";
+  objProps[objProps.Size] = "OperNode";
+
+  macro SelectFields
+  var result :string = "",
+      item;
+
+   for( item, objProps )
+    result =  result + ", t_" + item;
+   end;
+
+   return SubStr(result, 2);
+
+  end;
+
+  macro Query()
+   return queryStr = queryStr + string(Obj.PaymentID);
+  end;
+
+  macro FindById(PaymentID)
+   return Null;
+  end;
+
+  macro Find(PaymentID)
+  var tmp;
+
+   if(PaymentID == Null)
+    tmp = FindById(PaymentID);
+   else
+    tmp = FindById(PaymentID);
+   end;
+
+   if(tmp)
+    Obj = Null;
+    Obj = tmp;
+   end;
+
+  end;
+
+
+  macro ReturnError(Msg, code)
+  var Err = AL_GetErrorInfo(true),
+      Err2 = Null;
+
+   PrintLn(Msg + string(code));
+
+   if(code)
+
+    if( Err.Stat != code )
+     MemoryError( code );
+     Err2 = AL_GetErrorInfo(true);
+    else
+     Err2 = Err;
+     Err = Null;
+    end;
+
+   end;
+
+   if(Err2)
+    PrintLn("Расшифровка: " + Err.Message);
+   end;
+
+   if(Err and Err.State)
+    PrintLn("Доп. ошибка установленная кодом: " + string(Err.Stat) + " - " + Err.Message);
+   end;
+
+  end;
+
+end;
+
+
+class (TParentPmInput) TPmInput( entrylistObj :object)
+var PaymentId :integer;
+var BankAccount :string = ""; //Simanov. Вынесено сюда, потому что счёт будет использоваться только для маршрутизации, в самом платеже его не будет
+
+
+  InitTParentPmInput;
+  objProps[objProps.Size - 3] = "BaseAmount";
+  objProps[objProps.Size - 1] = "ShifrOper";
+  IdentProgram = "Н";
+
+  macro Insert()
+   return InsertInPayment( Obj );
+  end;
+
+  macro FindById( PaymentID )
+   return FindInPayment( PaymentID );
+  end;
+
+  macro Change()
+   Obj.NumberPack = 1;
+  end;
+
+  macro Update( )
+   return UpdateInPayment( Obj.PaymentID, Obj );
+  end;
+
+  macro Delete( )
+   return DeleteInPayment( Obj.PaymentID );
+  end;
+
+
+  macro Init(entrylistObj :object)
+  var cache = PaymentFieldStringCache,
+      Fiid :integer = 0,
+      PartyId :integer = 0,
+      PartyName :string = "",
+      LegalForm :integer = 0,
+      CodeKind :integer = 0,
+      Inn :string = "",
+      BankName :string = "",
+      BIC:string = "",
+      AccountNumber :string = "",
+      IsED107 :bool, //20191129 - Simanov
+      Corschem :integer,
+      error,
+      ErrCode,
+      v_aux_buf;
+
+
+    DocKind = 322; /*WL_WIPM*/
+    Obj = BOInPaymentParm();
+
+    //20191129 - Simanov - в платежах ЕД107 счёт получателя может передаваться в поле BankAccount. По нему потом можно смаршрутизировать платёж
+    //20200129 - Cherednichenko - св-ва legalentitypayeedetails может не существовать, поэтому ищем BankAccount через uTryToGetPropS
+    v_aux_buf = uTryToGetPropS(entrylistObj, "BankAccount");
+    IsED107 = entrylistObj.IsED107;
+    if ( (valtype(IsED107) != V_UNDEF) and IsED107 and valtype(v_aux_buf) != V_UNDEF )
+      BankAccount = v_aux_buf;
+    end;
+
+    //заполняем платеж
+    Fiid = GetFiidFromCodeISO( 1, entrylistObj.CreditAccount.CurrencyCode);
+    if( Fiid == 0 )
+     CodeKind = PTCK_BIC;
+    else
+     CodeKind = PTCK_SWIFT;
+    end;
+    Obj.DocKind = DocKind;
+    Obj.BaseAmount = money(entrylistObj.CreditAmount);
+    Obj.PayerAmount = money(entrylistObj.DebitAmount);
+    Obj.ReceiverAmount = money(entrylistObj.CreditAmount);
+    Obj.ReceiverINN = "";
+
+    //Получатель Наш Банк
+    if( ( Valtype(entrylistObj.LegalEntityPayeeDetails) == V_UNDEF ) and 
+      ( Valtype(entrylistObj.PersonPayeeDetails) == V_UNDEF ) )
+
+      Obj.ReceiverFIID = Fiid;
+      Obj.BaseFIID = Fiid;
+      Obj.ReceiverAccount = entrylistObj.CreditAccount.AccountNumber;
+
+    else //Получатель сторонняя КО
+
+     Obj.ReceiverFIID = Fiid;
+     Obj.BaseFIID = Fiid;
+     Obj.ReceiverAccount = entrylistObj.CreditAccount.AccountNumber;
+
+     if( ( Valtype(entrylistObj.PersonPayeeDetails) != V_UNDEF ) and
+       ( Valtype(entrylistObj.PersonPayeeDetails) != 26 ) )
+      LegalForm = 2;
+     elif( (Valtype(entrylistObj.LegalEntityPayeeDetails) != V_UNDEF ) and
+       ( Valtype(entrylistObj.LegalEntityPayeeDetails) != 26 ) )
+      LegalForm = 1;
+     else 
+      LegalForm = 0;
+     end;
+
+     if( LegalForm == 2 )
+      PartyName = entrylistObj.PersonPayeeDetails.PersonPayeeFIO;
+     elif( LegalForm == 1 )
+      PartyName = entrylistObj.LegalEntityPayeeDetails.LEPayeeName;
+     end;
+
+     Obj.ReceiverName = PartyName;
+    end;
+
+    if( Fiid == 0 )
+     Obj.ReceiverBankID = {OurBank};
+     Obj.ReceiverBankCodeKind = CodeKind;
+     Obj.ReceiverBankCode = {MFO_Bank};
+    else
+     Obj.ReceiverBankID = {OurBank};
+     Obj.ReceiverBankCodeKind = CodeKind;
+     Obj.ReceiverBankCode = ПолучитьКодСубъекта({OurBank}, CodeKind, error);
+    end;
+
+
+
+    Fiid = GetFiidFromCodeISO( 1, entrylistObj.DebitAccount.CurrencyCode);
+    if( Fiid == 0 )
+     CodeKind = PTCK_BIC;
+    else
+     CodeKind = PTCK_SWIFT;
+    end;
+
+    if( ( Valtype(entrylistObj.PersonPayerDetails) != V_UNDEF ) and
+      ( Valtype(entrylistObj.PersonPayerDetails) != 26 ) )
+     LegalForm = 2;
+    elif( (Valtype(entrylistObj.LegalEntityPayerDetails) != V_UNDEF ) and
+      ( Valtype(entrylistObj.LegalEntityPayerDetails) != 26 ) )
+     LegalForm = 1;
+    else 
+     LegalForm = 0;
+    end;
+
+    //Плательщик Наш Банк
+    if( ( Valtype(entrylistObj.LegalEntityPayerDetails) == V_UNDEF ) and 
+      ( Valtype(entrylistObj.PersonPayerDetails) == V_UNDEF ) )
+
+      Obj.PayerFIID = Fiid;
+      Obj.PayerAccount = entrylistObj.DebitAccount.AccountNumber;
+
+    else //Плательщик сторонняя КО
+
+      
+      if( LegalForm == 2 )
+
+       BIC = entrylistObj.PersonPayerDetails.BIC;
+       CodeKind = CheckBankCodeKind( BIC );
+       PartyId = GetPartyIdByCode( entrylistObj.PersonPayerDetails.BIC, CodeKind, {CurDate} );
+       //DEF-33387 если нет PersonPayerFIO, то NameSend 
+       v_aux_buf = uTryToGetPropS( entrylistObj.PersonPayerDetails, "PersonPayerFIO" );
+       if (ValType(v_aux_buf) == V_UNDEF)
+          v_aux_buf = uTryToGetPropS( entrylistObj.PersonPayerDetails, "NameSend" );
+       end;
+       if (ValType(v_aux_buf) == V_UNDEF)
+          v_aux_buf = "";
+       end;
+       PartyName = v_aux_buf;
+       Inn = entrylistObj.PersonPayerDetails.INN;
+       AccountNumber = entrylistObj.DebitAccount.AccountNumber;
+
+      elif( LegalForm == 1 )
+       //Simanov. 25.11.2019. Т.к. БИК стал необязательным - нужна проверка
+       if ( entrylistObj.LegalEntityPayerDetails.BIC != "" )
+          
+         BIC = entrylistObj.LegalEntityPayerDetails.BIC;
+         CodeKind = CheckBankCodeKind( BIC );
+         PartyId = GetPartyIdByCode( entrylistObj.LegalEntityPayerDetails.BIC, CodeKind, {CurDate} );
+         PartyName = entrylistObj.LegalEntityPayerDetails.LEPayerName;
+         Inn = entrylistObj.LegalEntityPayerDetails.INN;
+       end;
+
+//shev isup 518179
+       PartyName = entrylistObj.LegalEntityPayerDetails.LEPayerName;
+
+       if( ( ValType( entrylistObj.LegalEntityPayerDetails.LEPayerAccount ) == V_UNDEF ) or
+           ( ValType( entrylistObj.LegalEntityPayerDetails.LEPayerAccount ) == 26 ) )
+
+        AccountNumber = AccountNumber = entrylistObj.DebitAccount.AccountNumber;
+
+       else
+        AccountNumber = entrylistObj.LegalEntityPayerDetails.LEPayerAccount;
+       end;
+
+      end;
+      Obj.PayerFIID = Fiid;
+      Obj.PayerAccount = AccountNumber;
+      Obj.PayerName = PartyName;
+      Obj.PayerBankID = PartyId;
+      Obj.PayerBankCodeKind = CodeKind;
+      Obj.PayerBankCode = BIC;
+
+      Obj.PayerBankName = Bnk_GetPartyName(PartyId); //maa
+      Obj.Payer =  PartyId; //shev 280519
+      Obj.PayerINN = Inn;
+    end;
+
+
+    Obj.PayerIsSender = "X";
+    Obj.Ground = entrylistObj.EntryDetails;
+    Obj.CheckTerror = 0;
+    Obj.NumberPack = 0;
+    Obj.ValueDate = entrylistObj.OperationalDay;
+    Obj.Number = entrylistObj.EntryNumber;
+
+    queryStr = "select " + SelectFields + " from dpmpaym_dbt join dpmrmprop_dbt using(t_PaymentID) where t_PaymentID = ";
+
+  end;
+
+  Init( entrylistObj );
+
+end;
+
+
+private class TIntegrationSymbolicIdentifierX( RequestObj_ )
+var ObjectId :string,
+    SystemId :string,
+    SystemNodeId :string;
+
+
+ private macro InitIntegrationSymbolicIdentifierX( RequestObj_ )
+ private var v_aux_buf,
+             v_service_msg;
+
+  if( ValType( RequestObj_ ) != V_UNDEF )
+
+   ObjectId = uTryToGetPropS( RequestObj_, "ObjectId" );
+   if( ValType( ObjectId ) == V_UNDEF)
+
+    v_service_msg = string( InErrComPart, "ObjectId" );
+    RunError(v_service_msg, c_usr_err_obj(v_service_msg));
+
+   end;
+
+   SystemId = uTryToGetPropS( RequestObj_, "SystemId" );
+   SystemNodeId = uTryToGetPropS( RequestObj_, "SystemNodeId" );
+  end;
+
+ end;
+
+ InitIntegrationSymbolicIdentifierX( RequestObj_ );
+
+end;
+
+
+private class TIntegrationSimpleErrorData( ErrorCode_ :string, ErrorDesc_ :string )
+var ErrorCode :string,
+    ErrorDesc :string;
+
+
+  private macro InitAddError( ErrorCode_ :string, ErrorDesc_ :string )
+   ErrorCode = ErrorCode_;
+   ErrorDesc = ErrorDesc_;
+  end;
+
+  InitAddError( ErrorCode_, ErrorDesc_ );
+
+end;
+
+
+private class TEntryResult( Entry :object, ResultCode_ :string )
+var ResultCode :string,
+    DocumentNumberInSOFR :string,
+    DocumentNumberInABS :string,
+    EntryId :object, //TIntegrationSymbolicIdentifierX
+    ReferenceId :object,  //TIntegrationSymbolicIdentifierX
+    ErrorList :object; //TArray
+
+  private macro InitEntryResult( Entry :object, ResultCode_ :string )
+     EntryId = TIntegrationSymbolicIdentifierX();
+     ReferenceId = TIntegrationSymbolicIdentifierX();
+     ErrorList = TArray();
+
+     if(ValType(Entry) != V_UNDEF)
+        EntryId.ObjectId = Entry.EntryId.ObjectId;
+        ReferenceId.ObjectId = Entry.ReferenceId.ObjectId;
+        DocumentNumberInSOFR = "";
+        DocumentNumberInABS = Entry.ReferenceId.ObjectId;
+     end;
+
+     if(ValType(ResultCode_) != V_UNDEF)
+        ResultCode = ResultCode_;
+     end;
+  end;
+
+  InitEntryResult( Entry :object, ResultCode_ :string );
+
+end;
+
+
+private class TTransactionResult( TransactionResult :object )
+var TransactionId :object, //TIntegrationSymbolicIdentifierX
+    EntryResultList :object; //TArray
+
+  macro AddEntryResultList( Entry :object, ResultCode :string )
+
+   EntryResultList[EntryResultList.Size] = TEntryResult( Entry, ResultCode );
+
+  end;
+
+  macro AddError( ErrorObj :object )
+
+   if( ValType(EntryResultList[EntryResultList.Size - 1].ErrorList) == V_UNDEF )
+    EntryResultList[EntryResultList.Size - 1].ErrorList = TArray();
+   end;
+   EntryResultList[EntryResultList.Size - 1].ErrorList[EntryResultList[EntryResultList.Size - 1].ErrorList.Size] = ErrorObj;
+
+  end;
+
+  private macro m_init_TTransactionResult(i_TransactionResult)
+     if(ValType(i_TransactionResult) != V_UNDEF)
+        TransactionId = TIntegrationSymbolicIdentifierX();
+        TransactionId.ObjectId = i_TransactionResult.TransactionId.ObjectId;
+     end;
+
+     EntryResultList = TArray();
+  end;
+
+  m_init_TTransactionResult(TransactionResult);
+
+end;
+
+
+private class TAddAccountingEntriesResponse()
+var TransactionResultList :object; //TTransactionResultList 
+
+
+ macro AddTransactionResult( TransactionResult :object )
+ var trnPmRes :TTransactionResult;
+
+  trnPmRes = Null;
+  trnPmRes = TTransactionResult( TransactionResult );
+  TransactionResultList[TransactionResultList.Size] = trnPmRes;
+  trnPmRes = Null;
+ end;
+
+ TransactionResultList = TArray();
+
+end;
+
+
+private class TAddAccountingEntriesResponseMsg()
+var AddAccountingEntriesResponse :object; //TAddAccountingEntriesResponse
+
+  AddAccountingEntriesResponse = TAddAccountingEntriesResponse();
+
+end;
+
+
+//параметры ответа из RS-Securities СОФР
+private class TAddAccountingEntriesResp()
+var AddAccountingEntriesResponseMsg :object; //TAddAccountingEntriesResponse
+
+ AddAccountingEntriesResponseMsg = TAddAccountingEntriesResponseMsg();
+
+end;
+
+
+private class TIntegrationRecordX( RequestObj_ )
+var RecordCode :string,
+    RecordTitle :string,
+    Note :string,
+    SystemId :string,
+    SystemNodeId :string;
+
+ private macro InitIntegrationRecordX( RequestObj_ )
+ private var v_aux_buf,
+             v_service_msg;
+
+  if( ValType( RequestObj_ ) != V_UNDEF )
+
+   RecordCode = uTryToGetPropS( RequestObj_, "RecordCode" );
+   if( ValType( RecordCode ) == V_UNDEF)
+    v_service_msg = string( InErrComPart, "RecordCode" );
+    RunError(v_service_msg, c_usr_err_obj(v_service_msg));
+   end;
+
+   RecordTitle = uTryToGetPropS( RequestObj_, "RecordTitle" );
+   if( ValType( RecordTitle ) == V_UNDEF)
+    v_service_msg = string( InErrComPart, "RecordTitle" );
+    RunError(v_service_msg, c_usr_err_obj(v_service_msg));
+   end;
+
+   Note = uTryToGetPropS( RequestObj_, "Note" );
+   if( ValType( Note ) == V_UNDEF)
+    v_service_msg = string( InErrComPart, "Note" );
+    RunError(v_service_msg, c_usr_err_obj(v_service_msg));
+   end;
+
+   SystemId = uTryToGetPropS( RequestObj_, "SystemId" );
+   if( ValType( SystemId ) == V_UNDEF)
+    v_service_msg = string( InErrComPart, "SystemId" );
+    RunError(v_service_msg, c_usr_err_obj(v_service_msg));
+   end;
+
+   SystemNodeId = uTryToGetPropS( RequestObj_, "SystemNodeId" );
+   if( ValType( SystemNodeId ) == V_UNDEF)
+    v_service_msg = string( InErrComPart, "SystemNodeId" );
+    RunError(v_service_msg, c_usr_err_obj(v_service_msg));
+   end;
+
+  end;
+
+ end;
+
+ InitIntegrationRecordX( RequestObj_ );
+
+end;
+
+
+private class(TIntegrationRecordX) TIntegrationDictionaryRecordX( RequestObj_ )
+var Desc :string,
+    DictionaryCode :string;
+
+
+ private macro InitIntegrationDictionaryRecordX( RequestObj_ )
+ private var v_aux_buf,
+             v_service_msg;
+
+  if( ValType( RequestObj_ ) != V_UNDEF )
+
+   Desc = uTryToGetPropS( RequestObj_, "Desc" );
+   DictionaryCode = uTryToGetPropS( RequestObj_, "DictionaryCode" );
+   RecordCode = uTryToGetPropS( RequestObj_, "RecordCode" );
+   if( ValType( RecordCode ) == V_UNDEF)
+    v_service_msg = string( InErrComPart, "RecordCode" );
+    RunError(v_service_msg, c_usr_err_obj(v_service_msg));
+   end;
+   RecordTitle = uTryToGetPropS( RequestObj_, "RecordTitle" );
+   Note = uTryToGetPropS( RequestObj_, "Note" );
+   SystemId = uTryToGetPropS( RequestObj_, "SystemId" );
+   SystemNodeId = uTryToGetPropS( RequestObj_, "SystemNodeId" );
+
+  end;
+
+ end;
+
+ InitIntegrationDictionaryRecordX( RequestObj_ );
+
+end;
+
+
+private class TCoupledPerson( RequestObj_ )
+var StartDate :date,
+    EndDate :date,
+    RoleCode :TIntegrationDictionaryRecordX,
+    CoupledPersonId :TIntegrationSymbolicIdentifierX;
+
+ private macro InitCoupledPerson( RequestObj_ )
+ private var v_aux_buf,
+             v_service_msg;
+
+  if( ValType( RequestObj_ ) != V_UNDEF )
+
+   StartDate = uTryToGetPropS( RequestObj_, "StartDate" );
+   if( ValType( StartDate ) == V_UNDEF)
+    v_service_msg = string( InErrComPart, "StartDate" );
+    RunError(v_service_msg, c_usr_err_obj(v_service_msg));
+   end;
+
+   EndDate = uTryToGetPropS( RequestObj_, "EndDate" );
+   if( ValType( EndDate ) == V_UNDEF)
+    v_service_msg = string( InErrComPart, "EndDate" );
+    RunError(v_service_msg, c_usr_err_obj(v_service_msg));
+   end;
+
+   v_aux_buf = uTryToGetPropS( RequestObj_, "RoleCode" );
+   if( ValType(v_aux_buf) != V_UNDEF)
+    if( ValType(v_aux_buf) == V_GENOBJ)
+     RoleCode = TIntegrationDictionaryRecordX( RequestObj_.RoleCode );
+    else
+     v_service_msg = string( InErrNotObj, "RoleCode" );
+     RunError( v_service_msg, c_usr_err_obj( v_service_msg ) );
+    end;
+   else
+    v_service_msg = string( InErrComPart, "RoleCode" );
+    RunError( v_service_msg, c_usr_err_obj( v_service_msg ) );
+   end;
+
+   v_aux_buf = uTryToGetPropS( RequestObj_, "CoupledPersonId" );
+   if( ValType(v_aux_buf) != V_UNDEF)
+    if( ValType(v_aux_buf) == V_GENOBJ)
+     CoupledPersonId = TIntegrationSymbolicIdentifierX( RequestObj_.CoupledPersonId );
+    else
+     v_service_msg = string( InErrNotObj, "CoupledPersonId" );
+     RunError( v_service_msg, c_usr_err_obj( v_service_msg ) );
+    end;
+   else
+    v_service_msg = string( InErrComPart, "CoupledPersonId" );
+    RunError( v_service_msg, c_usr_err_obj( v_service_msg ) );
+   end;
+
+  end;
+
+ end;
+
+ InitCoupledPerson( RequestObj_ );
+
+end;
+
+
+private class TSet1( RequestObj_ )
+var Month :integer,
+    Year :integer,
+    UnifiedAccountNumber :string;
+
+ private macro InitSet1( RequestObj_ )
+ private var v_aux_buf,
+             v_service_msg;
+
+  if( ValType( RequestObj_ ) != V_UNDEF )
+
+   Month = uTryToGetPropS( RequestObj_, "Month" );
+   if( ValType( Month ) == V_UNDEF)
+    v_service_msg = string( InErrComPart, "Month" );
+    RunError(v_service_msg, c_usr_err_obj(v_service_msg));
+   end;
+
+   Year = uTryToGetPropS( RequestObj_, "Year" );
+   if( ValType( Year ) == V_UNDEF)
+    v_service_msg = string( InErrComPart, "Year" );
+    RunError(v_service_msg, c_usr_err_obj(v_service_msg));
+   end;
+
+   UnifiedAccountNumber = uTryToGetPropS( RequestObj_, "UnifiedAccountNumber" );
+   if( ValType( UnifiedAccountNumber ) == V_UNDEF)
+    v_service_msg = string( InErrComPart, "UnifiedAccountNumber" );
+    RunError(v_service_msg, c_usr_err_obj(v_service_msg));
+   end;
+
+  end;
+
+ end;
+
+ InitSet1( RequestObj_ );
+
+end;
+
+
+private class TSet2( RequestObj_ )
+var AccountNumber :string,
+    Month :integer,
+    Year :integer;
+
+ private macro InitSet2( RequestObj_ )
+ private var v_aux_buf,
+             v_service_msg;
+
+  if( ValType( RequestObj_ ) != V_UNDEF )
+
+   AccountNumber = uTryToGetPropS( RequestObj_, "AccountNumber" );
+   if( ValType( AccountNumber ) == V_UNDEF)
+    v_service_msg = string( InErrComPart, "AccountNumber" );
+    RunError(v_service_msg, c_usr_err_obj(v_service_msg));
+   end;
+
+   Month = uTryToGetPropS( RequestObj_, "Month" );
+   if( ValType( Month ) == V_UNDEF)
+    v_service_msg = string( InErrComPart, "Month" );
+    RunError(v_service_msg, c_usr_err_obj(v_service_msg));
+   end;
+
+   Year = uTryToGetPropS( RequestObj_, "Year" );
+   if( ValType( Year ) == V_UNDEF)
+    v_service_msg = string( InErrComPart, "Year" );
+    RunError(v_service_msg, c_usr_err_obj(v_service_msg));
+   end;
+
+  end;
+
+ end;
+
+ InitSet2( RequestObj_ );
+
+end;
+
+
+private class TSet3( RequestObj_ )
+var ServiceID :string,
+    Month :integer,
+    Year :integer;
+
+ private macro InitSet3( RequestObj_ )
+ private var v_aux_buf,
+             v_service_msg;
+
+  if( ValType( RequestObj_ ) != V_UNDEF )
+
+   ServiceID = uTryToGetPropS( RequestObj_, "ServiceID" );
+   if( ValType( ServiceID ) == V_UNDEF)
+    v_service_msg = string( InErrComPart, "ServiceID" );
+    RunError(v_service_msg, c_usr_err_obj(v_service_msg));
+   end;
+
+   Month = uTryToGetPropS( RequestObj_, "Month" );
+   if( ValType( Month ) == V_UNDEF)
+    v_service_msg = string( InErrComPart, "Month" );
+    RunError(v_service_msg, c_usr_err_obj(v_service_msg));
+   end;
+
+   Year = uTryToGetPropS( RequestObj_, "Year" );
+   if( ValType( Year ) == V_UNDEF)
+    v_service_msg = string( InErrComPart, "Year" );
+    RunError(v_service_msg, c_usr_err_obj(v_service_msg));
+   end;
+
+  end;
+
+ end;
+
+ InitSet3( RequestObj_ );
+
+end;
+
+
+private class TSet4( RequestObj_ )
+var Month :integer,
+    Year :integer,
+    PaymentDocumentNumber :string,
+    Apartment :string, 
+    Placement :string, 
+    NonLivingApartment :string,
+    FIASHouseGuid :string;
+
+ private macro InitSet4( RequestObj_ )
+ private var v_aux_buf,
+             v_service_msg;
+
+  if( ValType( RequestObj_ ) != V_UNDEF )
+
+   Month = uTryToGetPropS( RequestObj_, "Month" );
+   if( ValType( Month ) == V_UNDEF)
+    v_service_msg = string( InErrComPart, "Month" );
+    RunError(v_service_msg, c_usr_err_obj(v_service_msg));
+   end;
+
+   Year = uTryToGetPropS( RequestObj_, "Year" );
+   if( ValType( Year ) == V_UNDEF)
+    v_service_msg = string( InErrComPart, "Year" );
+    RunError(v_service_msg, c_usr_err_obj(v_service_msg));
+   end;
+
+   PaymentDocumentNumber = uTryToGetPropS( RequestObj_, "PaymentDocumentNumber" );
+   if( ValType( PaymentDocumentNumber ) == V_UNDEF)
+    v_service_msg = string( InErrComPart, "PaymentDocumentNumber" );
+    RunError(v_service_msg, c_usr_err_obj(v_service_msg));
+   end;
+
+   Apartment = uTryToGetPropS( RequestObj_, "Apartment" );
+   if( ValType( Apartment ) == V_UNDEF)
+    v_service_msg = string( InErrComPart, "Apartment" );
+    RunError(v_service_msg, c_usr_err_obj(v_service_msg));
+   end;
+
+   Placement = uTryToGetPropS( RequestObj_, "Placement" );
+   if( ValType( Placement ) == V_UNDEF)
+    v_service_msg = string( InErrComPart, "Placement" );
+    RunError(v_service_msg, c_usr_err_obj(v_service_msg));
+   end;
+
+   NonLivingApartment = uTryToGetPropS( RequestObj_, "NonLivingApartment" );
+   if( ValType( NonLivingApartment ) == V_UNDEF)
+    v_service_msg = string( InErrComPart, "NonLivingApartment" );
+    RunError(v_service_msg, c_usr_err_obj(v_service_msg));
+   end;
+
+   FIASHouseGuid = uTryToGetPropS( RequestObj_, "FIASHouseGuid" );
+   if( ValType( FIASHouseGuid ) == V_UNDEF)
+    v_service_msg = string( InErrComPart, "FIASHouseGuid" );
+    RunError(v_service_msg, c_usr_err_obj(v_service_msg));
+   end;
+
+  end;
+
+ end;
+
+ InitSet4( RequestObj_ );
+
+end;
+
+
+private class TAccountNumberWithCurrency( RequestObj_ )
+var AccountNumber :string,
+    CurrencyCode  :string;
+
+
+ private macro InitAccountNumberWithCurrency( RequestObj_ )
+ private var v_aux_buf,
+             v_service_msg;
+
+  if( ValType( RequestObj_ ) != V_UNDEF )
+
+   AccountNumber = uTryToGetPropS( RequestObj_, "AccountNumber" );
+   if( ValType( AccountNumber ) == V_UNDEF)
+    v_service_msg = string( InErrComPart, "AccountNumber" );
+    RunError(v_service_msg, c_usr_err_obj(v_service_msg));
+   end;
+
+   CurrencyCode = uTryToGetPropS( RequestObj_, "CurrencyCode" );
+   if( ValType( CurrencyCode ) == V_UNDEF)
+    v_service_msg = string( InErrComPart, "CurrencyCode" );
+    RunError(v_service_msg, c_usr_err_obj(v_service_msg));
+   end;
+
+  end;
+
+ end;
+
+ InitAccountNumberWithCurrency( RequestObj_ );
+
+end;
+
+
+private class TSWIFTSigns( RequestObj_ )
+var MessageTypes :string,
+    SWIFTMessage :string,
+    SWIFTCurrency :TIntegrationDictionaryRecordX;
+
+ private macro InitSWIFTSigns( RequestObj_ )
+ private var v_aux_buf,
+             v_service_msg;
+
+  if( ValType( RequestObj_ ) != V_UNDEF )
+
+   MessageTypes = uTryToGetPropS( RequestObj_, "MessageTypes" );
+   if( ValType( MessageTypes ) == V_UNDEF)
+    v_service_msg = string( InErrComPart, "MessageTypes" );
+    RunError(v_service_msg, c_usr_err_obj(v_service_msg));
+   end;
+
+   SWIFTMessage = uTryToGetPropS( RequestObj_, "SWIFTMessage" );
+   if( ValType( SWIFTMessage ) == V_UNDEF)
+    v_service_msg = string( InErrComPart, "SWIFTMessage" );
+    RunError(v_service_msg, c_usr_err_obj(v_service_msg));
+   end;
+
+   v_aux_buf = uTryToGetPropS( RequestObj_, "SWIFTCurrency" );
+   if( ValType(v_aux_buf) != V_UNDEF)
+    if( ValType(v_aux_buf) == V_GENOBJ)
+     SWIFTCurrency = TIntegrationDictionaryRecordX( RequestObj_.SWIFTCurrency );
+    else
+     v_service_msg = string( InErrNotObj, "SWIFTCurrency" );
+     RunError( v_service_msg, c_usr_err_obj( v_service_msg ) );
+    end;
+   else
+    v_service_msg = string( InErrComPart, "SWIFTCurrency" );
+    RunError( v_service_msg, c_usr_err_obj( v_service_msg ) );
+   end;
+
+  end;
+
+ end;
+
+ InitSWIFTSigns( RequestObj_ );
+
+end;
+
+
+private class TThirdPersonInfo( RequestObj_ )
+var LastName :string,
+    FirstName :string,
+    MiddleName :string,
+    ResidenceAddress :string,
+    INN :string;
+    
+
+ private macro InitThirdPersonInfo( RequestObj_ )
+ private var v_aux_buf,
+             v_service_msg;
+
+  if( ValType( RequestObj_ ) != V_UNDEF )
+
+   LastName = uTryToGetPropS( RequestObj_, "LastName" );
+   if( ValType( LastName ) == V_UNDEF)
+    v_service_msg = string( InErrComPart, "LastName" );
+    RunError(v_service_msg, c_usr_err_obj(v_service_msg));
+   end;
+
+   FirstName = uTryToGetPropS( RequestObj_, "FirstName" );
+   if( ValType( FirstName ) == V_UNDEF)
+    v_service_msg = string( InErrComPart, "FirstName" );
+    RunError(v_service_msg, c_usr_err_obj(v_service_msg));
+   end;
+
+   MiddleName = uTryToGetPropS( RequestObj_, "MiddleName" );
+   ResidenceAddress = uTryToGetPropS( RequestObj_, "ResidenceAddress" );
+   INN = uTryToGetPropS( RequestObj_, "INN" );
+
+  end;
+
+ end;
+
+ InitThirdPersonInfo( RequestObj_ );
+
+end;
+
+
+private class TLegalInfoPayer( RequestObj_ )
+var LEPayerName :string,
+    LEPayerAddress :string,
+    INN :string,
+    KPP :string,
+    LEPayerAccount :string,
+    BIC :string,
+    NostroBank :string,
+    NostroValueDate :string,
+    NameSend :string,
+    LegalEntityId :TIntegrationSymbolicIdentifierX,
+    LEPayerCountryCode :TIntegrationDictionaryRecordX,
+    LEPayerBankCountryCode :TIntegrationDictionaryRecordX;
+
+
+ private macro InitLegalInfoPayer( RequestObj_ )
+ private var v_aux_buf,
+             v_service_msg;
+
+  if( ValType( RequestObj_ ) != V_UNDEF )
+
+   LEPayerName = uTryToGetPropS( RequestObj_, "LEPayerName" );
+   if( ValType( LEPayerName ) == V_UNDEF)
+    v_service_msg = string( InErrComPart, "LEPayerName" );
+    RunError(v_service_msg, c_usr_err_obj(v_service_msg));
+   end;
+
+   LEPayerAddress = uTryToGetPropS( RequestObj_, "LEPayerAddress" );
+
+   INN = uTryToGetPropS( RequestObj_, "INN" );
+   KPP = uTryToGetPropS( RequestObj_, "KPP" );
+   if( ValType( KPP ) == V_UNDEF)
+//shev isup 522154
+/*
+    v_service_msg = string( InErrComPart, "KPP" );
+    RunError(v_service_msg, c_usr_err_obj(v_service_msg));
+*/
+   end;
+
+   LEPayerAccount = uTryToGetPropS( RequestObj_, "LEPayerAccount" );
+   BIC = uTryToGetPropS( RequestObj_, "BIC" );
+   if( ValType( BIC ) == V_UNDEF)
+    /*Simanov. 25.11.2019 - теперь БИК - необязательный параметр
+    v_service_msg = string( InErrComPart, "BIC" );
+    RunError(v_service_msg, c_usr_err_obj(v_service_msg));*/
+    BIC = "";
+   end;
+
+   NostroBank = uTryToGetPropS( RequestObj_, "NostroBank" );
+   NostroValueDate = uTryToGetPropS( RequestObj_, "NostroValueDate" );
+   NameSend = uTryToGetPropS( RequestObj_, "NameSend" );
+
+   v_aux_buf = uTryToGetPropS( RequestObj_, "LegalEntityId" );
+   if( ValType(v_aux_buf) != V_UNDEF)
+    if( ValType(v_aux_buf) == V_GENOBJ)
+     LegalEntityId = TIntegrationSymbolicIdentifierX( RequestObj_.LegalEntityId );
+    else
+     v_service_msg = string( InErrNotObj, "LegalEntityId" );
+     RunError( v_service_msg, c_usr_err_obj( v_service_msg ) );
+    end;
+   else
+   end;
+
+   v_aux_buf = uTryToGetPropS( RequestObj_, "LEPayerCountryCode" );
+   if( ValType(v_aux_buf) != V_UNDEF)
+    if( ValType(v_aux_buf) == V_GENOBJ)
+     LEPayerCountryCode = TIntegrationDictionaryRecordX( RequestObj_.LEPayerCountryCode );
+    else
+     v_service_msg = string( InErrNotObj, "LEPayerCountryCode" );
+     RunError( v_service_msg, c_usr_err_obj( v_service_msg ) );
+    end;
+   else
+   end;
+
+   v_aux_buf = uTryToGetPropS( RequestObj_, "LEPayerBankCountryCode" );
+   if( ValType(v_aux_buf) != V_UNDEF)
+    if( ValType(v_aux_buf) == V_GENOBJ)
+     LEPayerBankCountryCode = TIntegrationDictionaryRecordX( RequestObj_.LEPayerBankCountryCode );
+    else
+     v_service_msg = string( InErrNotObj, "LEPayerBankCountryCode" );
+     RunError( v_service_msg, c_usr_err_obj( v_service_msg ) );
+    end;
+   else
+   end;
+
+  end;
+
+ end;
+
+ InitLegalInfoPayer( RequestObj_ );
+
+end;
+
+
+
+private class TLegalInfoReceiver( RequestObj_ )
+var INN :string,
+    KPP :string,
+    OKATO :string,
+    OKTMO :string,
+    BankAccount :string,
+    BIC :string,
+    CorrAccount :string,
+    BankName :string,
+    NostroBank :string,
+    NostroValueDate :string,
+    LEPayeeName :string,
+    LEPayeeCountryCode :TIntegrationDictionaryRecordX,
+    LEPayeeBankCountryCode :TIntegrationDictionaryRecordX;
+
+
+ private macro InitLegalInfoReceiver( RequestObj_ )
+ private var v_aux_buf,
+             v_service_msg;
+
+  if( ValType( RequestObj_ ) != V_UNDEF )
+
+   INN = uTryToGetPropS( RequestObj_, "INN" );
+   KPP = uTryToGetPropS( RequestObj_, "KPP" );
+   OKATO = uTryToGetPropS( RequestObj_, "OKATO" );
+   OKTMO = uTryToGetPropS( RequestObj_, "OKTMO" );
+
+   BankAccount = uTryToGetPropS( RequestObj_, "BankAccount" );
+
+   if( ValType( BankAccount ) == V_UNDEF)
+    v_service_msg = string( InErrComPart, "BankAccount" );
+    RunError(v_service_msg, c_usr_err_obj(v_service_msg));
+   end;
+
+   BIC = uTryToGetPropS( RequestObj_, "BIC" );
+   if( ValType( BIC ) == V_UNDEF)
+    v_service_msg = string( InErrComPart, "BIC" );
+    RunError(v_service_msg, c_usr_err_obj(v_service_msg));
+   end;
+
+   CorrAccount = uTryToGetPropS( RequestObj_, "CorrAccount" );
+
+   BankName = uTryToGetPropS( RequestObj_, "BankName" );
+   if( ValType( BankName ) == V_UNDEF)
+    v_service_msg = string( InErrComPart, "BankName" );
+    RunError(v_service_msg, c_usr_err_obj(v_service_msg));
+   end;
+
+   NostroBank = uTryToGetPropS( RequestObj_, "NostroBank" );
+   NostroValueDate = uTryToGetPropS( RequestObj_, "NostroValueDate" );
+
+   LEPayeeName = uTryToGetPropS( RequestObj_, "LEPayeeName" );
+   if( ValType( LEPayeeName ) == V_UNDEF)
+    v_service_msg = string( InErrComPart, "LEPayeeName" );
+    RunError(v_service_msg, c_usr_err_obj(v_service_msg));
+   end;
+
+   v_aux_buf = uTryToGetPropS( RequestObj_, "LEPayeeCountryCode" );
+   if( ValType(v_aux_buf) != V_UNDEF)
+    if( ValType(v_aux_buf) == V_GENOBJ)
+     LEPayeeCountryCode = TIntegrationDictionaryRecordX( RequestObj_.LEPayeeCountryCode );
+    else
+     v_service_msg = string( InErrNotObj, "LEPayeeCountryCode" );
+     RunError( v_service_msg, c_usr_err_obj( v_service_msg ) );
+    end;
+   else
+   end;
+
+   v_aux_buf = uTryToGetPropS( RequestObj_, "LEPayeeBankCountryCode" );
+   if( ValType(v_aux_buf) != V_UNDEF)
+    if( ValType(v_aux_buf) == V_GENOBJ)
+     LEPayeeBankCountryCode = TIntegrationDictionaryRecordX( RequestObj_.LEPayeeBankCountryCode );
+    else
+     v_service_msg = string( InErrNotObj, "LEPayeeBankCountryCode" );
+     RunError( v_service_msg, c_usr_err_obj( v_service_msg ) );
+    end;
+   else
+   end;
+
+  end;
+
+ end;
+
+ InitLegalInfoReceiver( RequestObj_ );
+
+end;
+                                                      
+                                                  
+private class TPersInfoPayer( RequestObj_ , IncomeBrokAccount )
+var LastName :string,
+    FirstName :string,
+    MiddleName :string,
+    ResidenceAddress :string,
+    DocumentNumber :string,
+    DocumentIssue :date,
+    DocumentIssuer :string,
+    INN :string,
+    AcctSend :string,
+    BIC:string,
+    NostroBank :string,
+    NostroValueDate :string,
+    NameSend :string,
+    KindDocumentCode :TIntegrationDictionaryRecordX,
+    PersonId :TIntegrationSymbolicIdentifierX,
+    PersonPayerCountryCode :TIntegrationDictionaryRecordX,
+    PersonPayerBankCountryCode :TIntegrationDictionaryRecordX,
+    CoupledPerson :TCoupledPerson;
+
+
+ private macro InitPersInfoPayer( RequestObj_,IncomeBrokAccount )
+ private var v_aux_buf,
+             v_service_msg;
+
+  if( ValType( RequestObj_ ) != V_UNDEF )
+
+   LastName = uTryToGetPropS( RequestObj_, "LastName" );
+   if( (ValType( LastName ) == V_UNDEF) and (IncomeBrokAccount == false))//def-58966
+    v_service_msg = string( InErrComPart, "LastName" );
+    RunError(v_service_msg, c_usr_err_obj(v_service_msg));
+   end;
+
+   FirstName = uTryToGetPropS( RequestObj_, "FirstName" );
+   if( (ValType( FirstName ) == V_UNDEF) and (IncomeBrokAccount == false)) //def-58966
+    v_service_msg = string( InErrComPart, "FirstName" );
+    RunError(v_service_msg, c_usr_err_obj(v_service_msg));
+   end;
+
+   MiddleName = uTryToGetPropS( RequestObj_, "MiddleName" );
+   ResidenceAddress = uTryToGetPropS( RequestObj_, "ResidenceAddress" );
+   DocumentNumber = uTryToGetPropS( RequestObj_, "DocumentNumber" );
+   DocumentIssue = uTryToGetPropS( RequestObj_, "DocumentIssue" );
+   DocumentIssuer = uTryToGetPropS( RequestObj_, "DocumentIssuer" );
+   INN = uTryToGetPropS( RequestObj_, "INN" );
+   AcctSend = uTryToGetPropS( RequestObj_, "AcctSend" );
+
+   BIC = uTryToGetPropS( RequestObj_, "BIC" );
+   if( ValType( BIC ) == V_UNDEF)
+    v_service_msg = string( InErrComPart, "BIC" );
+    RunError(v_service_msg, c_usr_err_obj(v_service_msg));
+   end;
+
+   NostroBank = uTryToGetPropS( RequestObj_, "NostroBank" );
+   NostroValueDate = uTryToGetPropS( RequestObj_, "NostroValueDate" );
+   NameSend = uTryToGetPropS( RequestObj_, "NameSend" );
+
+   v_aux_buf = uTryToGetPropS( RequestObj_, "KindDocumentCode" );
+   if( ValType(v_aux_buf) != V_UNDEF)
+    if( ValType(v_aux_buf) == V_GENOBJ)
+     KindDocumentCode = TIntegrationDictionaryRecordX( RequestObj_.KindDocumentCode );
+    else
+     v_service_msg = string( InErrNotObj, "KindDocumentCode" );
+     RunError( v_service_msg, c_usr_err_obj( v_service_msg ) );
+    end;
+   else
+   end;
+
+   v_aux_buf = uTryToGetPropS( RequestObj_, "PersonId" );
+   if( ValType(v_aux_buf) != V_UNDEF)
+    if( ValType(v_aux_buf) == V_GENOBJ)
+     PersonId = TIntegrationSymbolicIdentifierX( RequestObj_.PersonId );
+    else
+     v_service_msg = string( InErrNotObj, "PersonId" );
+     RunError( v_service_msg, c_usr_err_obj( v_service_msg ) );
+    end;
+   else
+   end;
+
+   v_aux_buf = uTryToGetPropS( RequestObj_, "PersonPayerCountryCode" );
+   if( ValType(v_aux_buf) != V_UNDEF)
+    if( ValType(v_aux_buf) == V_GENOBJ)
+     PersonPayerCountryCode = TIntegrationDictionaryRecordX( RequestObj_.PersonPayerCountryCode );
+    else
+     v_service_msg = string( InErrNotObj, "PersonPayerCountryCode" );
+     RunError( v_service_msg, c_usr_err_obj( v_service_msg ) );
+    end;
+   else
+   end;
+
+   v_aux_buf = uTryToGetPropS( RequestObj_, "PersonPayerBankCountryCode" );
+   if( ValType(v_aux_buf) != V_UNDEF)
+    if( ValType(v_aux_buf) == V_GENOBJ)
+     PersonPayerBankCountryCode = TIntegrationDictionaryRecordX( RequestObj_.PersonPayerBankCountryCode );
+    else
+     v_service_msg = string( InErrNotObj, "PersonPayerBankCountryCode" );
+     RunError( v_service_msg, c_usr_err_obj( v_service_msg ) );
+    end;
+   else
+   end;
+
+   v_aux_buf = uTryToGetPropS( RequestObj_, "CoupledPerson" );
+   if( ValType(v_aux_buf) != V_UNDEF)
+    if( ValType(v_aux_buf) == V_GENOBJ)
+     CoupledPerson = TCoupledPerson( RequestObj_.CoupledPerson );
+    else
+     v_service_msg = string( InErrNotObj, "CoupledPerson" );
+     RunError( v_service_msg, c_usr_err_obj( v_service_msg ) );
+    end;
+   else
+   end;
+
+  end;
+
+ end;
+
+ InitPersInfoPayer( RequestObj_, IncomeBrokAccount );
+
+end;
+
+
+private class TPersInfoReceiver( RequestObj_ )
+var INN :string,
+    BankAccount :string,
+    BIC :string,
+    CorrAccount :string,
+    BankName :string,
+    NostroBank :string,
+    NostroValueDate :string,
+    PersonPayeeFIO :string,
+    PersonPayeeCountryCode :TIntegrationDictionaryRecordX,
+    PersonPayeeBankCountryCode :TIntegrationDictionaryRecordX;
+
+
+ private macro InitPersInfoReceiver( RequestObj_ )
+ private var v_aux_buf,
+             v_service_msg;
+
+  if( ValType( RequestObj_ ) != V_UNDEF )
+
+   INN = uTryToGetPropS( RequestObj_, "INN" );
+   BankAccount = uTryToGetPropS( RequestObj_, "BankAccount" );
+
+   BIC = uTryToGetPropS( RequestObj_, "BIC" );
+   if( ValType( BIC ) == V_UNDEF)
+    v_service_msg = string( InErrComPart, "BIC" );
+    RunError(v_service_msg, c_usr_err_obj(v_service_msg));
+   end;
+
+   CorrAccount = uTryToGetPropS( RequestObj_, "CorrAccount" );
+   if( ValType( CorrAccount ) == V_UNDEF)
+    v_service_msg = string( InErrComPart, "CorrAccount" );
+    RunError(v_service_msg, c_usr_err_obj(v_service_msg));
+   end;
+
+   BankName = uTryToGetPropS( RequestObj_, "BankName" );
+   if( ValType( BankName ) == V_UNDEF)
+    v_service_msg = string( InErrComPart, "BankName" );
+    RunError(v_service_msg, c_usr_err_obj(v_service_msg));
+   end;
+
+   NostroBank = uTryToGetPropS( RequestObj_, "NostroBank" );
+   NostroValueDate = uTryToGetPropS( RequestObj_, "NostroValueDate" );
+
+   PersonPayeeFIO = uTryToGetPropS( RequestObj_, "PersonPayeeFIO" );
+   if( ValType( PersonPayeeFIO ) == V_UNDEF)
+    v_service_msg = string( InErrComPart, "PersonPayeeFIO" );
+    RunError(v_service_msg, c_usr_err_obj(v_service_msg));
+   end;
+
+
+   v_aux_buf = uTryToGetPropS( RequestObj_, "PersonPayeeCountryCode" );
+   if( ValType(v_aux_buf) != V_UNDEF)
+    if( ValType(v_aux_buf) == V_GENOBJ)
+     PersonPayeeCountryCode = TIntegrationDictionaryRecordX( RequestObj_.PersonPayeeCountryCode );
+    end;
+   else
+   end;
+
+   v_aux_buf = uTryToGetPropS( RequestObj_, "PersonPayeeBankCountryCode" );
+   if( ValType(v_aux_buf) != V_UNDEF)
+    if( ValType(v_aux_buf) == V_GENOBJ)
+     PersonPayeeBankCountryCode = TIntegrationDictionaryRecordX( RequestObj_.PersonPayeeBankCountryCode );
+    end;
+   else
+   end;
+
+  end;
+
+ end;
+
+ InitPersInfoReceiver( RequestObj_ );
+
+
+end;
+
+
+private class TEntry( RequestObj_ ) //класс проводки
+var OperationalDay :date,
+    PersonnelNumber :string,
+    PayTool :string,
+    DebitAmount :decimal,
+    CreditAmount :decimal,
+    EntryDetails :string,
+    EntryNumber :string,
+    ControllerPersonalNumber :string,
+    IsED107 :bool,
+    Priority :integer,
+    IsUrgent :bool,
+    AfterReportingEventsDocuments :string,
+    MSFOLoanAccount :string,
+    AgreementNumber :string,
+    ReferenceId :TIntegrationSymbolicIdentifierX,
+    BranchId :TIntegrationSymbolicIdentifierX,
+    DocumentTypeCode :TIntegrationDictionaryRecordX,
+    EntryId :TIntegrationSymbolicIdentifierX,
+    DebitAccount :object /*TAccountNumberWithCurrency*/,
+    CreditAccount :object /*TAccountNumberWithCurrency*/,
+    SuspiciousTransactionTypeCode :TIntegrationDictionaryRecordX,
+    EntryStatusCode :TIntegrationDictionaryRecordX,
+    DFIPayCode :TIntegrationDictionaryRecordX,
+    LegalEntityPayeeDetails :object /*TLegalInfoReceiver*/,
+    PersonPayeeDetails :object /*TPersInfoReceiver*/,
+    PersonPayerDetails :object /*TPersInfoPayer*/,
+    LegalEntityPayerDetails :object /*TLegalInfoPayer*/,
+    ThirdPersonInfo :object /*TThirdPersonInfo*/,
+    SWIFTSigns :object /*TSWIFTSigns*/;
+
+ private macro InitEntry( RequestObj_ )
+ private var v_aux_buf,          
+             v_service_msg,IncomeBrokAccount = false;
+
+  if( ValType( RequestObj_ ) != V_UNDEF )
+
+   OperationalDay = uTryToGetPropS( RequestObj_, "OperationalDay" );
+   if( ValType( OperationalDay ) == V_UNDEF)
+    v_service_msg = string( InErrComPart, "OperationalDay" );
+    RunError(v_service_msg, c_usr_err_obj(v_service_msg));
+   end;
+
+   PersonnelNumber = uTryToGetPropS( RequestObj_, "PersonnelNumber" );
+   if( ValType( PersonnelNumber ) == V_UNDEF)
+    v_service_msg = string( InErrComPart, "PersonnelNumber" );
+    RunError(v_service_msg, c_usr_err_obj(v_service_msg));
+   end;
+
+   PayTool = uTryToGetPropS( RequestObj_, "PayTool" );
+   if( ValType( PayTool ) == V_UNDEF)
+    v_service_msg = string( InErrComPart, "PayTool" );
+    RunError(v_service_msg, c_usr_err_obj(v_service_msg));
+   end;
+
+   DebitAmount = uTryToGetPropS( RequestObj_, "DebitAmount" );
+   if( ValType( DebitAmount ) == V_UNDEF)
+    v_service_msg = string( InErrComPart, "DebitAmount" );
+    RunError(v_service_msg, c_usr_err_obj(v_service_msg));
+   end;
+
+   CreditAmount = uTryToGetPropS( RequestObj_, "CreditAmount" );
+   if( ValType( CreditAmount ) == V_UNDEF)
+    v_service_msg = string( InErrComPart, "CreditAmount" );
+    RunError(v_service_msg, c_usr_err_obj(v_service_msg));
+   end;
+
+   EntryDetails = uTryToGetPropS( RequestObj_, "EntryDetails" );
+   if( ValType( EntryDetails ) == V_UNDEF)
+     EntryDetails = ""; //20191127 - Simanov - теперь это поле не обязательно
+   end;
+
+   EntryNumber = uTryToGetPropS( RequestObj_, "EntryNumber" );
+   ControllerPersonalNumber = uTryToGetPropS( RequestObj_, "ControllerPersonalNumber" );
+   IsED107 = uTryToGetPropS( RequestObj_, "IsED107" );
+   Priority = uTryToGetPropS( RequestObj_, "Priority" );
+   IsUrgent = uTryToGetPropS( RequestObj_, "IsUrgent" );
+   AfterReportingEventsDocuments = uTryToGetPropS( RequestObj_, "AfterReportingEventsDocuments" );
+   MSFOLoanAccount = uTryToGetPropS( RequestObj_, "MSFOLoanAccount" );
+   AgreementNumber = uTryToGetPropS( RequestObj_, "AgreementNumber" );
+
+   v_aux_buf = uTryToGetPropS( RequestObj_, "ReferenceId" );
+   if( ValType(v_aux_buf) != V_UNDEF)
+    if( ValType(v_aux_buf) == V_GENOBJ)
+     ReferenceId = TIntegrationSymbolicIdentifierX( RequestObj_.ReferenceId );
+    else
+     v_service_msg = string( InErrNotObj, "ReferenceId" );
+     RunError( v_service_msg, c_usr_err_obj( v_service_msg ) );
+    end;
+   else
+    v_service_msg = string( InErrComPart, "ReferenceId" );
+    RunError( v_service_msg, c_usr_err_obj( v_service_msg ) );
+   end;
+
+   v_aux_buf = uTryToGetPropS( RequestObj_, "BranchId" );
+   if( ValType(v_aux_buf) != V_UNDEF)
+    if( ValType(v_aux_buf) == V_GENOBJ)
+     BranchId = TIntegrationSymbolicIdentifierX( RequestObj_.BranchId );
+    else
+     v_service_msg = string( InErrNotObj, "BranchId" );
+     RunError( v_service_msg, c_usr_err_obj( v_service_msg ) );
+    end;
+   else
+    v_service_msg = string( InErrComPart, "BranchId" );
+    RunError( v_service_msg, c_usr_err_obj( v_service_msg ) );
+   end;
+
+   v_aux_buf = uTryToGetPropS( RequestObj_, "DocumentTypeCode" );
+   if( ValType(v_aux_buf) != V_UNDEF)
+    if( ValType(v_aux_buf) == V_GENOBJ)
+     DocumentTypeCode = TIntegrationDictionaryRecordX( RequestObj_.DocumentTypeCode );
+    else
+     v_service_msg = string( InErrNotObj, "DocumentTypeCode" );
+     RunError( v_service_msg, c_usr_err_obj( v_service_msg ) );
+    end;
+   else
+    v_service_msg = string( InErrComPart, "DocumentTypeCode" );
+    RunError( v_service_msg, c_usr_err_obj( v_service_msg ) );
+   end;
+
+   v_aux_buf = uTryToGetPropS( RequestObj_, "EntryId" );
+   if( ValType(v_aux_buf) != V_UNDEF)
+    if( ValType(v_aux_buf) == V_GENOBJ)
+     EntryId = TIntegrationSymbolicIdentifierX( RequestObj_.EntryId );
+    else
+     v_service_msg = string( InErrNotObj, "EntryId" );
+     RunError( v_service_msg, c_usr_err_obj( v_service_msg ) );
+    end;
+   else
+   end;
+
+   v_aux_buf = uTryToGetPropS( RequestObj_, "DebitAccount" );
+   if( ValType(v_aux_buf) != V_UNDEF)
+    if( ValType(v_aux_buf) == V_GENOBJ)
+     DebitAccount = TAccountNumberWithCurrency( RequestObj_.DebitAccount );
+    else
+     v_service_msg = string( InErrNotObj, "DebitAccount" );
+     RunError( v_service_msg, c_usr_err_obj( v_service_msg ) );
+    end;
+   else
+    v_service_msg = string( InErrComPart, "DebitAccount" );
+    RunError( v_service_msg, c_usr_err_obj( v_service_msg ) );
+   end;
+
+   v_aux_buf = uTryToGetPropS( RequestObj_, "CreditAccount" );
+   if( ValType(v_aux_buf) != V_UNDEF)
+    if( ValType(v_aux_buf) == V_GENOBJ)
+     CreditAccount = TAccountNumberWithCurrency( RequestObj_.CreditAccount );
+    else
+     v_service_msg = string( InErrNotObj, "CreditAccount" );
+     RunError( v_service_msg, c_usr_err_obj( v_service_msg ) );
+    end;
+   else
+    v_service_msg = string( InErrComPart, "CreditAccount" );
+    RunError( v_service_msg, c_usr_err_obj( v_service_msg ) );
+   end;
+
+   v_aux_buf = uTryToGetPropS( RequestObj_, "SuspiciousTransactionTypeCode" );
+   if( ValType(v_aux_buf) != V_UNDEF)
+    if( ValType(v_aux_buf) == V_GENOBJ)
+     SuspiciousTransactionTypeCode = TIntegrationDictionaryRecordX( RequestObj_.SuspiciousTransactionTypeCode );
+    else
+
+     v_service_msg = string( InErrNotObj, "SuspiciousTransactionTypeCode" );
+     RunError( v_service_msg, c_usr_err_obj( v_service_msg ) );
+
+    end;
+   else
+   end;
+
+   v_aux_buf = uTryToGetPropS( RequestObj_, "EntryStatusCode" );
+   if( ValType(v_aux_buf) != V_UNDEF)
+    if( ValType(v_aux_buf) == V_GENOBJ)
+     EntryStatusCode = TIntegrationDictionaryRecordX( RequestObj_.EntryStatusCode );
+    else
+     v_service_msg = string( InErrNotObj, "EntryStatusCode" );
+     RunError( v_service_msg, c_usr_err_obj( v_service_msg ) );
+    end;
+   else
+    v_service_msg = string( InErrComPart, "EntryStatusCode" );
+    RunError( v_service_msg, c_usr_err_obj( v_service_msg ) );
+   end;
+
+   v_aux_buf = uTryToGetPropS( RequestObj_, "DFIPayCode" );
+   if( ValType(v_aux_buf) != V_UNDEF)
+    if( ValType(v_aux_buf) == V_GENOBJ)
+     DFIPayCode = TIntegrationDictionaryRecordX( RequestObj_.DFIPayCode );
+    else
+     v_service_msg = string( InErrNotObj, "DFIPayCode" );
+     RunError( v_service_msg, c_usr_err_obj( v_service_msg ) );
+    end;
+   else
+   end;
+
+   v_aux_buf = uTryToGetPropS( RequestObj_, "LegalEntityPayeeDetails" );
+   if( ValType(v_aux_buf) != V_UNDEF)
+    if( ValType(v_aux_buf) == V_GENOBJ)
+     LegalEntityPayeeDetails = TLegalInfoReceiver( RequestObj_.LegalEntityPayeeDetails );
+    else
+     v_service_msg = string( InErrNotObj, "LegalEntityPayeeDetails" );
+     RunError( v_service_msg, c_usr_err_obj( v_service_msg ) );
+    end;
+   else
+   end;
+
+   v_aux_buf = uTryToGetPropS( RequestObj_, "PersonPayeeDetails" );
+   if( ValType(v_aux_buf) != V_UNDEF)
+    if( ValType(v_aux_buf) == V_GENOBJ)
+     PersonPayeeDetails = TPersInfoReceiver( RequestObj_.PersonPayeeDetails );
+    else
+     v_service_msg = string( InErrNotObj, "PersonPayeeDetails" );
+     RunError( v_service_msg, c_usr_err_obj( v_service_msg ) );
+    end;
+   else
+   end;
+
+   if((substr(RequestObj_.debitaccount.accountnumber,1,5) == 47422) and (substr(RequestObj_.CreditAccount.AccountNumber,1,3)  == 306)) 
+      IncomeBrokAccount = true;
+   end;
+   v_aux_buf = uTryToGetPropS( RequestObj_, "PersonPayerDetails" );
+   if( ValType(v_aux_buf) != V_UNDEF)
+    if( ValType(v_aux_buf) == V_GENOBJ)
+     PersonPayerDetails = TPersInfoPayer( RequestObj_.PersonPayerDetails, IncomeBrokAccount );
+    else
+     v_service_msg = string( InErrNotObj, "PersonPayerDetails" );
+     RunError( v_service_msg, c_usr_err_obj( v_service_msg ) );
+    end;
+   else
+   end;
+
+   v_aux_buf = uTryToGetPropS( RequestObj_, "LegalEntityPayerDetails" );
+   if( ValType(v_aux_buf) != V_UNDEF)
+    if( ValType(v_aux_buf) == V_GENOBJ)
+     LegalEntityPayerDetails = TLegalInfoPayer( RequestObj_.LegalEntityPayerDetails );
+    else
+     v_service_msg = string( InErrNotObj, "LegalEntityPayerDetails" );
+     RunError( v_service_msg, c_usr_err_obj( v_service_msg ) );
+    end;
+   else
+   end;
+
+   v_aux_buf = uTryToGetPropS( RequestObj_, "ThirdPersonInfo" );
+   if( ValType(v_aux_buf) != V_UNDEF)
+    if( ValType(v_aux_buf) == V_GENOBJ)
+     ThirdPersonInfo = TThirdPersonInfo( RequestObj_.ThirdPersonInfo );
+    else
+     v_service_msg = string( InErrNotObj, "ThirdPersonInfo" );
+     RunError( v_service_msg, c_usr_err_obj( v_service_msg ) );
+    end;
+   else
+   end;
+
+   v_aux_buf = uTryToGetPropS( RequestObj_, "SWIFTSigns" );
+   if( ValType(v_aux_buf) != V_UNDEF)
+    if( ValType(v_aux_buf) == V_GENOBJ)
+     SWIFTSigns = TSWIFTSigns( RequestObj_.SWIFTSigns );
+    else
+     v_service_msg = string( InErrNotObj, "SWIFTSigns" );
+     RunError( v_service_msg, c_usr_err_obj( v_service_msg ) );
+    end;
+   else
+   end;
+
+  end;
+
+ end;
+
+ InitEntry( RequestObj_ );
+end;
+
+
+private class TTransaction( RequestObj_ )
+var OperationCode :object, //TIntegrationDictionaryRecordX
+    ProductCode :object, //TIntegrationDictionaryRecordX
+    TransactionId :object, //TIntegrationSymbolicIdentifierX
+    EntryList :object; //TArray
+
+   private macro InitTransaction( RequestObj_ )
+    private var v_aux_buf,
+                v_service_msg,
+                i :integer,
+                trn :object; //TTransaction
+
+      if( ValType( RequestObj_ ) != V_UNDEF )
+
+         // BIQ-10484 
+         v_aux_buf = uTryToGetPropS( RequestObj_, "OperationCode" );
+         if( ValType(v_aux_buf) != V_UNDEF)
+            if( ValType(v_aux_buf) == V_GENOBJ)
+               OperationCode = TIntegrationDictionaryRecordX( RequestObj_.OperationCode );
+            else
+               v_service_msg = string( InErrNotObj, "OperationCode" );
+               RunError( v_service_msg, c_usr_err_obj( v_service_msg ) );
+            end;
+         end;
+
+         v_aux_buf = uTryToGetPropS( RequestObj_, "ProductCode" );
+         if( ValType(v_aux_buf) != V_UNDEF)
+            if( ValType(v_aux_buf) == V_GENOBJ)
+               ProductCode = TIntegrationDictionaryRecordX( RequestObj_.ProductCode );
+            else
+               v_service_msg = string( InErrNotObj, "ProductCode" );
+               RunError( v_service_msg, c_usr_err_obj( v_service_msg ) );
+            end;
+         else
+         end;
+
+         v_aux_buf = ValType( uTryToGetPropS( RequestObj_, "TransactionId" ) );
+         if(v_aux_buf != V_UNDEF)
+            if(v_aux_buf == V_GENOBJ)
+               TransactionId = TIntegrationSymbolicIdentifierX(RequestObj_.TransactionId);
+            else
+               v_service_msg = string( InErrNotObj, "TransactionId" );
+               RunError( v_service_msg, c_usr_err_obj( v_service_msg ) );
+            end;
+         else
+            v_service_msg = string( InErrComPart, "TransactionId" );
+            RunError( v_service_msg, c_usr_err_obj( v_service_msg ) );
+         end;
+
+         v_aux_buf = ValType( uTryToGetPropS( RequestObj_, "EntryList" ) );
+         if(v_aux_buf != V_UNDEF)
+            if(v_aux_buf == V_GENOBJ)
+               if( (ValType(RequestObj_.EntryList) == V_GENOBJ) and (isEqClass("TArray", RequestObj_.EntryList)) )
+                  i = 0;
+                  EntryList = Null;
+                  EntryList = TArray();
+                  while( i < RequestObj_.EntryList.Size)
+                     EntryList[EntryList.Size] = TEntry( RequestObj_.EntryList[i] );
+                     i = i + 1;
+                  end;
+               else
+                  v_service_msg = string( InErrNotObj, "TArray" );
+                  RunError( v_service_msg, c_usr_err_obj( v_service_msg ) );
+               end;
+             else
+               v_service_msg = string( InErrNotObj, "EntryList" );
+               RunError( v_service_msg, c_usr_err_obj( v_service_msg ) );
+            end;
+         else
+            v_service_msg = string( InErrComPart, "EntryList" );
+            RunError( v_service_msg, c_usr_err_obj( v_service_msg ) );
+         end;
+     end;
+
+   end;
+
+   InitTransaction( RequestObj_ );
+
+end;
+
+
+private class TAddAccountingEntriesRequest( RequestObj_ )
+var TransactionList :TArray;
+
+ private macro InitAddAccountingEntriesRequest( RequestObj_ )
+ private var i :integer,
+             v_aux_buf,
+             v_service_msg,
+             trn :object; //TTransaction
+
+  if( ValType(RequestObj_) != V_UNDEF )
+
+   v_aux_buf = ValType( uTryToGetPropS( RequestObj_, "TransactionList" ) );
+   if(v_aux_buf != V_UNDEF)
+    if(v_aux_buf == V_GENOBJ)
+
+     if( (ValType(RequestObj_.TransactionList) == V_GENOBJ) and (isEqClass("TArray", RequestObj_.TransactionList)) )
+      i = 0;
+      TransactionList = Null;
+      TransactionList = TArray();
+      while( i < RequestObj_.TransactionList.Size)
+       trn = Null;
+       trn = TTransaction( RequestObj_.TransactionList[i] );
+       TransactionList[TransactionList.Size] = trn;
+       i = i + 1;
+      end;
+     else
+      v_service_msg = string( InErrNotObj, "TArray" );
+      RunError( v_service_msg, c_usr_err_obj( v_service_msg ) );
+     end;
+
+    else
+     v_service_msg = string( InErrNotObj, "TransactionList" );
+     RunError( v_service_msg, c_usr_err_obj( v_service_msg ) );
+    end;
+   else
+    v_service_msg = string( InErrComPart, "TransactionList" );
+    RunError( v_service_msg, c_usr_err_obj( v_service_msg ) );
+   end;
+
+
+  end;
+
+ end;
+
+ InitAddAccountingEntriesRequest( RequestObj_ );
+ 
+end;
+
+
+private class TAddAccountingEntriesReq( RequestObj_ )
+var AddAccountingEntriesRequest :object; //TArray
+
+ private macro InitAddAccountingEntriesRequest( RequestObj_ )
+ private var v_aux_buf,
+             v_service_msg;
+
+  if( ValType(RequestObj_) != V_UNDEF )
+   v_aux_buf = ValType( uTryToGetPropS( RequestObj_, "AddAccountingEntriesRequest" ) );
+   if(v_aux_buf != V_UNDEF)
+    if(v_aux_buf == V_GENOBJ)
+     AddAccountingEntriesRequest = TAddAccountingEntriesRequest( RequestObj_.AddAccountingEntriesRequest );
+    else
+     v_service_msg = string( InErrNotObj, "AddAccountingEntriesRequest" );
+     RunError( v_service_msg, c_usr_err_obj( v_service_msg ) );
+    end;
+   else
+    v_service_msg = string( InErrComPart, "AddAccountingEntriesRequest" );
+    RunError( v_service_msg, c_usr_err_obj( v_service_msg ) );
+   end;
+  end;
+
+ end;
+
+ InitAddAccountingEntriesRequest( RequestObj_ );
+
+end;
+
+//shev 22.08.2019  заполнение обьекта для вставки проводки
+macro AccTrans( cur_Transaction_Entry :object, i :integer )
+   var Fiid;
+   var obj = RsbAccTransaction();
+
+   Fiid = GetFiidFromCodeISO( 1, cur_Transaction_Entry.CreditAccount.CurrencyCode);
+
+   obj.Chapter         = 1;
+   obj.Date_Carry      = cur_Transaction_Entry.OperationalDay;
+   obj.FiidPayer       = Fiid;
+   obj.AccountPayer    = cur_Transaction_Entry.DebitAccount.AccountNumber;
+   obj.SumPayer        = money(cur_Transaction_Entry.DebitAmount);
+   obj.FiidReceiver    = Fiid;
+   obj.AccountReceiver = cur_Transaction_Entry.CreditAccount.AccountNumber;
+   obj.SumReceiver     = money(cur_Transaction_Entry.CreditAmount);
+   obj.Fiid            = Fiid;
+   obj.Sum             = money(cur_Transaction_Entry.DebitAmount);
+   obj.Ground          = cur_Transaction_Entry.EntryDetails;
+   obj.Numb_document = cur_Transaction_Entry.EntryNumber;
+   obj.Number_Pack     = 0;
+   obj.ResultCarry = 1;
+   return obj;
+end;
+
+//получим главу счета
+private macro GetChapterByAcc( Account :string ) :integer
+var Query :string = "",
+    DataSet :RsdRecordset,
+    Params :TArray;
+
+
+ Query = " SELECT T_CHAPTER FROM dbalance_dbt " +
+         " WHERE T_INUMPLAN = 0 " +
+         "  AND T_BALANCE = SUBSTR(:Account, 1, 5) ";
+
+ Params = makeArray( SQLParam("Account", Account) );
+ DataSet = execSQLselect( Query, Params );
+
+ if( DataSet.MoveNext )
+  return DataSet.value(0, Null, V_INTEGER);
+ else
+  return -1;
+ end;
+
+end;
+//получим главу счета
+
+//поиск корсхемы по счёту
+macro findCorschem (account:string):integer
+   var foundcorschem:integer = -1;
+   var sql = execSQLselect("select * from dcorschem_dbt where t_account = :acc", makeArray(SQLParam("acc", account)));
+
+   if (sql.movenext() ) 
+      foundcorschem = sql.value("t_number", null, V_INTEGER);
+   end;
+   return foundcorschem;
+onerror()
+   return foundcorschem;
+End;
+
+// Определяет, является ли счет сводным/агрегированным
+private macro IsConsolidatedAccount(account)
+  var Query = " SELECT 1 FROM dbrokacc_dbt D WHERE D.T_ACCOUNT = :Acc ";
+  var Params = makeArray(SQLParam("Acc", account));
+  var DataSet = execSQLselect(Query, Params);
+  
+  if (DataSet.MoveNext()) 
+    return true;
+  end;
+  
+  return false;
+end;
+
+// BIQ-13408 Извлечь данные о ФЛ из поля Плательщик
+private macro ExtractPersonDetailsFromPayerInfo(PayerInfo, LastName: @String, FirstName: @String, MiddleName: @String, INN: @String, ResidenceAddress: @String)
+  //попытаемся опеределить эти параметры по полю Плательщик вида:
+  // 'наименование кредитной организации //Фамилия Имя Отчество//12345678//адрес//' - 3 варианта указания этих атрибутов в ТЗ указаны
+  CaptureOutput;
+  [
+        with clientname as (
+        select 
+         :1 nm
+        from dual ),
+        clientname_splited as (select 
+        rtrim(regexp_substr(nm,'([^/]+)//',1,2),'/') fio,
+        rtrim(regexp_substr(nm,'([^/]+)//',1,3),'/') inn_nom,
+        rtrim(regexp_substr(nm,'([^/]+)//',1,4),'/') inn_addr
+        from clientname
+        )
+        select 
+         regexp_substr(fio,'[^ ]+',1,1) surname,
+         regexp_substr(fio,'[^ ]+',1,2) nam,
+         regexp_substr(fio,'[^ ]+',1,3) middlename,
+         regexp_substr(inn_nom,'\d{12}') inn1,
+         regexp_substr(inn_addr,'\d{12}') inn2,
+         inn_addr
+        from clientname_splited
+  ];
+  var sql_get_fio_inn_addr = StopCaptureOutput; 
+  var rs_get_fio_inn_addr = execSQLselectPrmDyn(sql_get_fio_inn_addr, PayerInfo);
+  
+  if (rs_get_fio_inn_addr.movenext())
+    if ( ((LastName==strfor(1)) or (LastName=="")) and (rs_get_fio_inn_addr.value("surname")!="") and (valtype(rs_get_fio_inn_addr.value("surname"))!=26) ) 
+      LastName = rs_get_fio_inn_addr.value("surname");
+    end;
+    if ( ((FirstName==strfor(1)) or (FirstName=="")) and (rs_get_fio_inn_addr.value("nam")!="") and (valtype(rs_get_fio_inn_addr.value("nam"))!=26) ) 
+      FirstName = rs_get_fio_inn_addr.value("nam");
+    end;
+    if ( ((MiddleName==strfor(1)) or (MiddleName=="") ) and (rs_get_fio_inn_addr.value("middleName")!="") and (valtype(rs_get_fio_inn_addr.value("middleName"))!=26) ) 
+      MiddleName = rs_get_fio_inn_addr.value("middleName");
+    end;
+    if ( (INN==strfor(1)) and (rs_get_fio_inn_addr.value("inn1")!="") and (valtype(rs_get_fio_inn_addr.value("inn1"))!=26) ) 
+      INN = rs_get_fio_inn_addr.value("inn1");
+    end;
+    if ( (INN==strfor(1)) and (rs_get_fio_inn_addr.value("inn2")!="") and (valtype(rs_get_fio_inn_addr.value("inn2"))!=26) ) 
+      INN = rs_get_fio_inn_addr.value("inn2");
+    end;
+    if (ResidenceAddress==strfor(1)) 
+      if (rs_get_fio_inn_addr.value("inn_addr")!="") 
+         if (valtype(rs_get_fio_inn_addr.value("inn_addr"))!=26) 
+           ResidenceAddress = rs_get_fio_inn_addr.value("inn_addr");
+         end;
+      end;
+    end;
+  end;   
+end;
+
+// Найти номер договора и сокр. имя владельца по счету
+private macro FindContractInfoByAccount(account, contractNumber: @String, contractOwner: @String)
+  contractNumber = "";
+  contractOwner = "";
+  var cmd = RSDCommand("SELECT sf.t_number, party.t_shortName " +
+                         "FROM dSfContr_dbt sf, dParty_dbt party " +
+                        "WHERE sf.t_id = (SELECT dl.t_sfContrID " +
+                                           "FROM dDlContr_dbt dl, dDlContrMp_dbt mp " +
+                                          "WHERE mp.t_dlContrID = dl.t_dlContrID " +
+                                            "AND mp.t_sfContrId = (SELECT t_docID " +
+                                                                    "FROM dMcAccDoc_dbt " +
+                                                                   "WHERE t_docKind = :docKind " +
+                                                                     "AND t_account = :account " +
+                                                                     "AND rownum = 1)) " +
+                          "AND sf.t_partyID = party.t_partyID");
+  cmd.AddParam("docKind", RSDBP_IN, SFCONTR_DOC);
+  cmd.AddParam("account", RSDBP_IN, account);
+  var rs = RSDRecordSet(cmd);
+  
+  if (rs.MoveNext())
+    contractNumber = rs.Value("t_number");
+    contractOwner = rs.Value("t_shortName");
+  end;
+  
+OnError(err)
+end;
+
+// Заполнить данные специфичные для ФЛ
+private macro InitNaturalPersonEnroll(enroll, cur_Transaction_Entry)
+  if (ValType(cur_Transaction_Entry.PersonPayerDetails) != V_UNDEF)
+    enroll.m_LastName = cur_Transaction_Entry.PersonPayerDetails.LastName;
+    enroll.m_FirstName = cur_Transaction_Entry.PersonPayerDetails.FirstName;
+    
+    if (ValType(cur_Transaction_Entry.PersonPayerDetails.MiddleName) != V_UNDEF)
+      enroll.m_MiddleName = cur_Transaction_Entry.PersonPayerDetails.MiddleName;
+    else
+      enroll.m_MiddleName = StrFor(1);                                            
+    end;
+    
+    enroll.m_PayerName = cur_Transaction_Entry.PersonPayerDetails.NameSend;
+    enroll.m_PayerINN = get_Defined_StringField(cur_Transaction_Entry.PersonPayerDetails.INN);
+    enroll.m_ResidenceAddress = get_Defined_StringField(cur_Transaction_Entry.PersonPayerDetails.ResidenceAddress);
+    enroll.m_AcctSend = cur_Transaction_Entry.PersonPayerDetails.AcctSend;
+    enroll.m_BIC      = cur_Transaction_Entry.PersonPayerDetails.Bic;
+    enroll.m_ClientCode = cur_Transaction_Entry.PersonPayerDetails.PersonId.ObjectID;
+    enroll.m_DocNumber = cur_Transaction_Entry.PersonPayerDetails.DocumentNumber;
+    enroll.m_DocIssued = cur_Transaction_Entry.PersonPayerDetails.DocumentIssue;
+    //shev для зачислений из других банков
+  else
+    enroll.m_AcctSend  = cur_Transaction_Entry.DebitAccount.AccountNumber;
+    enroll.m_DocIssued = date(0,0,0);
+    enroll.m_BIC = "044525111"; //наш банк
+  end;
+  
+  //BIQ-13408  
+  if ((enroll.m_LastName==strfor(1)) or (enroll.m_FirstName==strfor(1)) or (enroll.m_MiddleName==strfor(1)) or (enroll.m_PayerINN==strfor(1)) or (enroll.m_ResidenceAddress==strfor(1)) or
+      (enroll.m_LastName==strfor(0)) or (enroll.m_FirstName==strfor(0)) or (enroll.m_MiddleName==strfor(0)) or (enroll.m_PayerINN==strfor(0)) or (enroll.m_ResidenceAddress==strfor(0)))
+    ExtractPersonDetailsFromPayerInfo(enroll.m_PayerName, @enroll.m_LastName, @enroll.m_FirstName, @enroll.m_MiddleName, @enroll.m_PayerINN, @enroll.m_ResidenceAddress);
+  end;
+
+  if (ValType(cur_Transaction_Entry.PersonPayeeDetails) != V_UNDEF)
+    enroll.m_PayeeName = get_Defined_StringField(cur_Transaction_Entry.PersonPayeeDetails.PersonPayeeFio);
+  elif (ValType(cur_Transaction_Entry.LegalEntityPayeeDetails) != V_UNDEF)
+    enroll.m_PayeeName = get_Defined_StringField(cur_Transaction_Entry.LegalEntityPayeeDetails.LEPayeeName);
+  else
+    enroll.m_PayeeName = strfor(1);
+  end;
+  
+  enroll.m_IsReliable = strFor(0);
+  //BIQ-15498 В буферную таблицу добавляются поля IsReliable "Параметры операции надежно определены"
+  // (да, если договор в атрибутах сообщения И счет плательщика начинается с цифры 4)
+
+  var IsAccount = false;
+
+  if (ValType(enroll.m_AcctSend) != V_UNDEF)
+    IsAccount = SubStr(enroll.m_AcctSend,1,1) == "4";
+  end;
+
+  if (not IsAccount)
+    if( (ValType(cur_Transaction_Entry.LegalEntityPayerDetails ) != V_UNDEF) and 
+        (ValType(cur_Transaction_Entry.LegalEntityPayerDetails ) != 26) )
+      IsAccount = SubStr(cur_Transaction_Entry.LegalEntityPayerDetails.LEPayerAccount,1,1) == "4";
+    end;
+  end;
+
+  if (IsAccount)
+    enroll.m_IsReliable = strFor(88); // X
+  end;
+
+  if(ValType(cur_Transaction_Entry.EntryId.ObjectId) != V_UNDEF) 
+      enroll.m_DepoPaymentDocId = cur_Transaction_Entry.EntryId.ObjectId;
+  end;
+end;
+
+// Заполнить данные специфичные для ЮЛ
+private macro InitLegalPersonEnroll(enroll, cur_Transaction_Entry)
+  var contractOwner = "";
+  var contractNumber = "";
+  enroll.m_IsReliable = StrFor(88);
+  
+  FindContractInfoByAccount(enroll.m_CreditAccount, @contractNumber, @contractOwner);
+  
+  if (StrLen(enroll.m_ContrNumber) == 0)
+    enroll.m_ContrNumber = contractNumber;
+  end;
+  
+  if (SubStr(enroll.m_CreditAccount, 1, 3) == "306")
+    enroll.m_PayeeName = contractOwner;
+  elif (ValType(cur_Transaction_Entry.LegalEntityPayeeDetails) != V_UNDEF)
+    enroll.m_PayeeName = get_Defined_StringField(cur_Transaction_Entry.LegalEntityPayeeDetails.LEPayeeName);
+  end;
+  
+  var isPersonPayerDetailsExist = ((ValType(cur_Transaction_Entry.PersonPayerDetails) != V_UNDEF) and
+                                   (ValType(cur_Transaction_Entry.PersonPayerDetails) != 26));
+
+  if (ValType(cur_Transaction_Entry.LegalEntityPayerDetails) != V_UNDEF)
+    enroll.m_AcctSend = get_Defined_StringField(cur_Transaction_Entry.LegalEntityPayerDetails.LEPayerAccount);
+    enroll.m_BIC = get_Defined_StringField(cur_Transaction_Entry.LegalEntityPayerDetails.BIC);
+    enroll.m_PayerName = get_Defined_StringField(cur_Transaction_Entry.LegalEntityPayerDetails.LEPayerName);
+    enroll.m_PayerINN = get_Defined_StringField(cur_Transaction_Entry.LegalEntityPayerDetails.INN);
+    enroll.m_PayerKPP = get_Defined_StringField(cur_Transaction_Entry.LegalEntityPayerDetails.KPP);
+  elif (isPersonPayerDetailsExist)
+    enroll.m_AcctSend = cur_Transaction_Entry.PersonPayerDetails.AcctSend;
+    enroll.m_BIC      = cur_Transaction_Entry.PersonPayerDetails.Bic;
+    enroll.m_PayerName = cur_Transaction_Entry.PersonPayerDetails.NameSend;
+    enroll.m_PayerINN = get_Defined_StringField(cur_Transaction_Entry.PersonPayerDetails.INN);
+  end;
+  
+end;
+
+// BIQ-10484 запрос на депозитарную комиссию
+macro CreateComOperation(p_Transaction_Entry, PaymentId:@integer, Error:@string)
+   var v_stat = 0;
+   var m_opertype       = 48, //Оплата прочей депозитарной комиссии
+       m_fikind         = 1,  //Вид ФИ валюта
+       m_fiid           = 0,  //фин.инструмент 
+       m_old_place_kind = 1,
+       m_old_place      = 1, 
+       m_old_marketplace= 0,
+       m_old_sector     = 0,
+       m_new_place_kind = 2,  // вид субъекта
+       m_new_place      = 1,  //наш банк
+       m_new_marketplace= 0,
+       m_new_sector     = 0,
+       m_amount         = 0,  //сумма
+       m_date           = p_Transaction_Entry.OperationalDay, //дата
+       m_run            = 0,  //признак запуска
+       m_client         = 0,  //client
+       m_clientcontr    = 0,
+       m_ServKind       = 0,
+       m_ServKindSub    = 0,
+       m_ID             = 0;
+   
+   var Query, Params, DataSet;
+   var countBrokAcc = 0;
+   var ContrNumber = "", LegalForm = 0;
+   var AccountNumber = p_Transaction_Entry.DebitAccount.AccountNumber;
+   
+   Error = "";
+   PaymentId = 0;
+
+   m_fiid = GetFiidFromCodeISO( m_fikind, p_Transaction_Entry.DebitAccount.CurrencyCode);
+   m_amount = numeric(p_Transaction_Entry.DebitAmount);
+   
+   Query = " SELECT count(*) FROM dbrokacc_dbt D WHERE D.T_ACCOUNT = :Acc ";
+   Params = makeArray( SQLParam("Acc", AccountNumber) );
+   DataSet = execSQLselect( Query, Params );
+   if(    (DataSet.MoveNext) and ( ValType( DataSet.value( 0, NULL, V_INTEGER) ) != V_UNDEF ) 
+      and ( ValType( DataSet.value( 0, NULL, V_INTEGER) ) != 26 ) )
+      countBrokAcc = DataSet.value( 0, NULL, V_INTEGER);
+   end;
+   
+   if(
+      ( 
+       (ValType(p_Transaction_Entry.PersonPayerDetails ) != V_UNDEF) and 
+       (ValType(p_Transaction_Entry.PersonPayerDetails ) != 26) 
+      )
+       or (countBrokAcc > 0 )
+   )
+      // физики
+      ContrNumber = trim(p_Transaction_Entry.AgreementNumber);
+      LegalForm = 2;
+   elif( (ValType(p_Transaction_Entry.LegalEntityPayerDetails ) != V_UNDEF) and 
+         (ValType(p_Transaction_Entry.LegalEntityPayerDetails ) != 26) )
+      // юрики
+      ContrNumber = trim(p_Transaction_Entry.AgreementNumber);
+      LegalForm = 1;
+   end;
+  
+   if ( (ContrNumber == "") or (ContrNumber == StrFor(1)) )
+      /* пытаемся получить номер договора из назначения платежа */
+      /* сначала удаляем все даты формата ДД.ММ.ГГГГ и ДД.ММ.ГГ, т.к. они потенциально могут повлиять на результат поиска*/
+      /* затем удялем все пробелы и ищем последовательность, состоящую */
+      /*  из цифр, латинских букв и символов "\/-" длинной не менее трех символов и которая может оканчиваться символами "ИИС" */
+      DataSet = TRsbDataSet(
+            " select " + 
+            " regexp_substr(replace(regexp_replace(upper('"+p_Transaction_Entry.EntryDetails+"'),'(\d{2}(\.|/)\d{2}(\.|/)\d{4})|(\d{2}(\.|/)\d{2}(\.|/)\d{2})'),' '),'[a-z0-9/\\-]{3,}(ИИС)?') contrnumber " + 
+            " from dual ");
+      if (DataSet.movenext())
+         ContrNumber = DataSet.contrnumber;
+      end;
+   end;
+   
+   if ( (ContrNumber == "") or (ContrNumber == StrFor(1)) )
+      Error = "Нe определен договор клиента ";
+      return -1;
+   end;
+   
+   if (LegalForm == 1)
+      Query = " SELECT contr.t_partyid, contr.t_id, contr.t_servkind, contr.t_servkindsub "+
+              "   FROM dmcaccdoc_dbt mcacc, "+
+              "        dmccateg_dbt categ, "+
+              "        dsfcontr_dbt contr, "+
+              "        daccount_dbt acc "+
+              "  WHERE mcacc.t_account = :p_Account "+
+              "    AND mcacc.t_iscommon = 'X' "+
+              "    AND categ.t_id = mcacc.t_catid "+
+              "    AND categ.t_code = 'ДС клиента, ц/б' "+
+              "    AND SUBSTR(mcacc.t_account, 1, 3) = '306' "+
+              "    AND contr.t_id = mcacc.t_clientcontrid "+
+              "    AND acc.t_account = mcacc.t_account "+
+              "    AND acc.t_chapter = mcacc.t_chapter "+
+              "    AND acc.t_code_currency = mcacc.t_currency";
+      Params = makeArray( SQLParam("p_Account" , AccountNumber ) );
+   elif (LegalForm == 2)
+      Query = " SELECT dlsf.t_partyid, subsf.t_id, subsf.t_servkind, subsf.t_servkindsub "+
+              "   FROM dbrokacc_dbt brokacc, "+
+              "        dsfcontr_dbt dlsf, "+
+              "        ddlcontr_dbt dl, "+
+              "        ddlcontrmp_dbt mp, "+
+              "        dsfcontr_dbt subsf "+
+              "  WHERE brokacc.t_account = :p_Account "+
+              "    AND dlsf.t_number = :p_contrnumber "+
+              "    AND dlsf.t_dateclose = TO_DATE('01010001','ddmmyyyy') "+
+              "    AND dl.t_sfcontrid = dlsf.T_ID "+
+              "    AND mp.t_dlcontrid = dl.t_dlcontrid "+
+              "    AND subsf.t_id = mp.t_sfcontrid "+
+              "    AND subsf.t_servkind = case when brokacc.t_servkind = 0 then 1 else  brokacc.t_servkind end "+
+              "    AND subsf.t_servkindsub = case when brokacc.t_servkindsub = 0 then 8 else brokacc.t_servkindsub end "+
+              "    AND subsf.t_dateclose = TO_DATE('01010001','ddmmyyyy') "+
+              " ORDER BY mp.t_marketid";
+      Params = makeArray( SQLParam("p_Account"     , AccountNumber ),
+                          SQLParam("p_ContrNumber" , ContrNumber) );
+   else 
+      Error = "Нe определен тип клиента ";
+      return -1;
+   end;
+
+   DataSet = execSQLselect( Query, Params );
+   if(DataSet.MoveNext) 
+      m_client       = DataSet.Value("t_partyid"      , NULL, V_INTEGER);
+      m_clientcontr  = DataSet.Value("t_id"           , NULL, V_INTEGER);
+      m_ServKind     = DataSet.Value("t_servkind"     , NULL, V_INTEGER);
+      m_ServKindSub  = DataSet.Value("t_servkindsub"  , NULL, V_INTEGER);
+   else
+      Error = "Нe удалось найти договор "+ContrNumber;
+      return -1;
+   end;
+   
+   if (m_ServKind == PTSK_STOCKDL)
+      if (m_ServKindSub == SERV_SUBKIND_STOCK)
+         m_old_place_kind = PTK_RC_ORCB;
+         m_old_place =  GetCodeParty("НРД",PTCK_CONTR); 
+         m_old_sector = 2;
+      elif (m_ServKindSub == SERV_SUBKIND_STOCK_OVER)
+         m_old_place_kind = PTK_BANK;
+         m_old_place =  GetCodeParty("00#Б#42198",PTCK_CONTR); 
+      end;
+   elif (m_ServKind == PTSK_DV)
+      m_old_place_kind = PTK_RC_ORCB;
+      m_old_place =  GetCodeParty("НРД",PTCK_CONTR); 
+      m_old_sector = 8;
+   elif (m_ServKind == PTSK_CM)
+      m_old_place_kind = PTK_RC_ORCB;
+      m_old_place =  GetCodeParty("НРД",PTCK_CONTR); 
+      m_old_sector = 9;
+   end;
+   
+   // запрос #305561 - не должны заполняться, но пока так
+   m_new_place_kind = m_old_place_kind;
+   m_new_place      = m_old_place;
+   m_new_marketplace= m_old_marketplace;
+   m_new_sector     = m_old_sector;
+   
+   v_stat = CreateDL_ACC(  m_opertype,       //OPER_TYPE
+                           m_fikind,         //FIKIND
+                           m_fiid,           //FIID
+                           m_old_place_kind, //OLD_PLACE_KIND
+                           m_old_place,      //OLD_PLACE
+                           m_old_marketplace,//OLD_MARKET_PLACE
+                           m_old_sector,     //OLD_MARKET_SECTOR
+                           m_old_sector,     //OLD_CONTR
+                           m_new_place_kind, //NEW_PLACE_KIND
+                           m_new_place,      //NEW_PLACE
+                           m_new_marketplace,//NEW_MARKET_PLACE
+                           m_new_sector,     //NEW_MARKET_SECTOR
+                           0,                //NEW_CONTR
+                           m_amount,         //SUM
+                           m_date,           //DATE
+                           m_date,           //VALUE_DATE
+                           m_run,            //RUN
+                           null,             //SPGROUND_ID
+                           null,             //SPGROUND_KIND,
+                           "",               //SPGOUND_CODE
+                           null,             //SPGROUND_DATE
+                           m_client,         //CLIENT
+                           m_clientcontr,    //CLIENTCONTR
+                           5,                //BACKOFFICE
+                           m_ID              //RETURN_ID
+                        );
+
+   if (v_stat != 0)
+      Error = "Ошибка создания комиссии "+GetErrMsg;
+      PaymentId = 0;
+
+      // DEF-77594
+      // DEF-80324 Обернул в функцию WriteNewLogger() для переиспользования
+      WriteNewLogger("AddAccountingEntriesRequestMsg.mac.CreateDL_ACC"
+        , string(
+            " m_opertype=", m_opertype,       
+            " m_fikind=", m_fikind,         
+            " m_fiid=", m_fiid,           
+            " m_old_place_kind=", m_old_place_kind, 
+            " m_old_place=", m_old_place,      
+            " m_old_marketplace=", m_old_marketplace,
+            " m_old_sector=", m_old_sector,     
+            " m_new_place_kind=", m_new_place_kind, 
+            " m_new_place=", m_new_place,      
+            " m_new_marketplace=", m_new_marketplace,
+            " m_new_sector=", m_new_sector,     
+            " m_amount=", m_amount,         
+            " m_date=", m_date,           
+            " m_run=", m_run,            
+            " m_client=", m_client,         
+            " m_clientcontr=", m_clientcontr,    
+            " m_ID=", m_ID
+      ));
+   else 
+      Error = "";
+      PaymentId = m_ID;
+      
+      // обновление сектора, так как АПИ игнорирует
+       Query = " UPDATE ddl_acc_dbt " +
+               "    SET t_oldcentroffice = :p_old_sector, " +
+               "        t_newcentroffice = :p_new_sector " +
+               "  WHERE t_id  = :p_PaymentId; ";
+ 
+      Params = Null;
+      Params = makeArray( SQLParam("p_old_sector", m_old_sector),
+                          SQLParam("p_new_sector", m_new_sector),
+                          SQLParam("p_PaymentId", PaymentId) );
+      execSQL( Query, Params );
+   end;
+
+   return v_stat;
+end;
+
+
+/**
+@brief Проверка отправителя для ЮЛ
+@param[in] _AccountNumber номер счета по кредиту
+@param[in] _LegalEntityPayerDetails плательщик
+@return true/false
+*/
+macro CheckPayerForLegalEntity(_AccountNumber, _LegalEntityPayerDetails)
+   var sql_str, cmd, rs;
+   var res = true;
+   var stat = 0;
+   var name_client = "";
+   var fullinn_client = "";
+   var inn_client = "", kpp_client = "";
+
+   if ( (ValType(_LegalEntityPayerDetails) == V_UNDEF) or 
+        (ValType(_LegalEntityPayerDetails) == 26)
+       ) 
+      res = false;
+   end;
+
+   if (res)
+      sql_str = String(
+          "select acc.t_account, acc.t_client, \n",
+          "       p.t_name,                    \n",
+          "       nvl(obj.t_code,'-') as inn   \n",
+          "  from                              \n",
+          "    daccount_dbt acc,               \n",
+          "    dparty_dbt p,                   \n",
+          "    dobjcode_dbt obj                \n",
+          " where acc.t_client = p.t_partyid   \n",
+          "   and obj.t_objecttype(+) = :pobjtype \n", 
+          "   and obj.t_codekind(+) = :pcodekind  \n",
+          "   and obj.t_bankclosedate(+) = to_date('01010001','ddmmyyyy') \n",
+          "   and obj.t_objectid(+) = p.t_partyid \n",
+          "   and acc.t_account = :paccount");
+      cmd = RSDCommand(sql_str);
+      cmd.AddParam("pobjtype", RSDBP_IN, OBJTYPE_PARTY);
+      cmd.AddParam("pcodekind", RSDBP_IN, PTCK_INN);
+      cmd.AddParam("paccount", RSDBP_IN, _AccountNumber);
+      rs = RSDRecordSet(cmd);
+      if (rs.movenext)
+         name_client = rs.value("t_name"); 
+         fullinn_client = rs.value("inn");
+      else 
+         res = false;
+      end;
+   end;
+
+   if (res)
+      if (name_client != _LegalEntityPayerDetails.LEPayerName)
+         res = false;
+      end;
+   end;
+
+   if (res)
+      if (Index(fullinn_client,"/") > 0)
+         stat = SplitFullINN(fullinn_client, inn_client, kpp_client);
+         if (stat != 0)
+            res = false;
+         end;
+      else 
+         inn_client = fullinn_client;
+      end;
+   end;
+
+   if (res)
+      if (inn_client != _LegalEntityPayerDetails.INN)
+         res = false;
+      end;
+   end;
+
+   return res;
+end;
+
+
+macro AddAccountingEntriesRequestMsg( RequestObj_ :object )
+var RequestObj :TAddAccountingEntriesReq = TAddAccountingEntriesReq( RequestObj_ ),
+    ResponseObj :TAddAccountingEntriesResp,
+    ErrObj :object,
+    ErrMsg :string = "",
+    Params :TArray = TArray(),
+    state :integer = 0,
+    PartyId :integer = -1,
+    LegalForm :integer = 0,
+    PartyIdBank :integer = -1,
+    ContrNumber :string = "",
+    ContrId :integer = 0,
+    ContrAccountId :integer,
+    SfSiAccountParty :string = "",
+    ServKind :integer,
+    Mode :integer = 0,
+    i :integer = 0,
+    j : integer = 0,
+    ai : integer = 0,
+    PaymentId :integer = 0,
+    Paym :TPmInput,
+    Pm :RsbPayment, 
+    ToBackOffice :string = "",
+    BOPriority :integer = 2147483647, //Максимальное число integer
+    Query, DataSet,
+    sql,cmd,rs,
+    AccTrntId,AccTrn,
+    err,
+    cur_Transaction_Entry;
+    
+   // BIQ-10484
+    var cur_OperationCode = null;
+    const NOTEKIND_EXTERNALID = 102;
+    const NOTEKIND_GROUND = 103;
+    const OBJTYPE_OPERATION = 159;
+    const NOTEKIND_CURR_CREDIT = 104;
+    const NOTEKIND_AMOUNT_CREDIT = 105;
+    const NOTEKIND_ENTRYNUMBER = 106;
+    const NOTEKIND_NPTXOP_GROUND = 109;
+
+/* 20190226 - kva: Не обрабатываем платежи со счетами 30601 и 30606 по дебету */
+const CV_DEBIT_EXCLUDE = "30601;30606";
+private var v_service_msg;
+const STATUS_KWIT = 2995;
+
+//Маршрутизация по БО входящего объекта !!!!!!!!!
+ ResponseObj = Null;
+ ResponseObj = TAddAccountingEntriesResp( );
+ i = 0;
+ cur_Transaction_Entry = null;
+ while( i < RequestObj.AddAccountingEntriesRequest.TransactionList.Size ) //цикл по платежам объекта
+   cur_Transaction_Entry = RequestObj.AddAccountingEntriesRequest.TransactionList[i].EntryList[0];
+   cur_OperationCode = RequestObj.AddAccountingEntriesRequest.TransactionList[i].OperationCode;
+
+   Mode = 0;
+   if (Valtype(cur_OperationCode) != V_UNDEF) 
+      if (StrUpr(cur_OperationCode.RecordCode) == StrUpr("DepCom")) // BIQ-10484 запрос на депозитарную комиссию
+         Mode = 7;
+      end;
+   else 
+      /* 20190226 - kva: Не обрабатываем платежи со счетами 30601 и 30606 по дебету */
+      if(index(CV_DEBIT_EXCLUDE, substr(cur_Transaction_Entry.DebitAccount.AccountNumber, 1, 5)) != 0)
+         v_service_msg = "В СОФР временно не обрабатываются платежи со счетами 30601 и 30606 по дебету";
+         RunError(v_service_msg, c_usr_err_obj(v_service_msg));
+      end;
+   end;
+
+   ResponseObj.AddAccountingEntriesResponseMsg.AddAccountingEntriesResponse.AddTransactionResult(RequestObj.AddAccountingEntriesRequest.TransactionList[i]);
+
+
+   if (Mode == 0)
+      if((substr(cur_Transaction_Entry.CreditAccount.AccountNumber,1,5) == "30424") or
+         (substr(cur_Transaction_Entry.CreditAccount.AccountNumber,1,5) == "30413"))
+         Mode = 6;
+      elif( (Substr(cur_Transaction_Entry.CreditAccount.AccountNumber, 1, 5) == "30601") or 
+            (Substr(cur_Transaction_Entry.CreditAccount.AccountNumber, 1, 5) == "30606") )
+         Mode = 5;
+      end;
+   end;
+   
+   //проверим наличие платежа с кодом АБС
+   Params = Null;
+   Params = makeArray( SQLParam("p_BiscottoId", cur_Transaction_Entry.ReferenceId.ObjectId ) ); 
+   //DEF-45207 возвращаем id в ошибочных запросах
+   var SofrID;
+   SofrID = execStoredFunc( "USR_PKG_IMPORT_SOFR.FindSofrIdByBiscotto", V_INTEGER, Params );
+
+   Params = Null;
+   //проверим наличие платежа с кодом АБС
+   if (SofrID > 0)
+      state = 90378;
+      ErrMsg = "Не добавлена операция в SOFR - дублирование ИД " + cur_Transaction_Entry.ReferenceId.ObjectId;
+      ResponseObj.AddAccountingEntriesResponseMsg.AddAccountingEntriesResponse.TransactionResultList[i].AddEntryResultList( 
+         RequestObj.AddAccountingEntriesRequest.TransactionList[i].EntryList[0], string(state) );
+      if(mode == 6)
+         SofrID = "inpaym" + string(SofrID);
+      elif(mode == 0)
+         SofrID = "inpaym" + string(SofrID);
+      elif( Mode == 5 )
+         SofrID = "nptxop" + string(SofrID);
+      elif (Mode == 7)
+         SofrID = "depcom" + string(SofrID);
+      end;
+      ai = ResponseObj.AddAccountingEntriesResponseMsg.AddAccountingEntriesResponse.TransactionResultList[i].EntryResultList.Size-1;
+      ResponseObj.AddAccountingEntriesResponseMsg.AddAccountingEntriesResponse.TransactionResultList[i].EntryResultList[ai].DocumentNumberInSOFR = SofrID;
+   else 
+      //добавляем код АБС в первую очередь
+      state = AddBiscottoId_autonomous(cur_Transaction_Entry.ReferenceId.ObjectId);
+      if( state != 0 )
+         state = 90377;
+         ErrMsg = "Не добавлена проводка в SOFR - дублирование ИД ЦФТ на этапе вставки кода "+cur_Transaction_Entry.ReferenceId.ObjectId;
+         ResponseObj.AddAccountingEntriesResponseMsg.AddAccountingEntriesResponse.TransactionResultList[i].AddEntryResultList( 
+            RequestObj.AddAccountingEntriesRequest.TransactionList[i].EntryList[0], string(state) );
+      end;
+   end;
+
+   if(mode == 6)
+      if( state == 0 )
+         AccTrn = AccTrans (cur_Transaction_Entry,i);
+         AccTrn.Carry(ACCTRN_STATUS_DOCUMENT, err);
+         if( (AccTrn.Acctrnid > 0) and (valtype(err) == V_UNDEF))
+            AccTrntId = AccTrn.Acctrnid;
+
+            if( UpdateTrnUserfield( AccTrntId, cur_Transaction_Entry.ReferenceId.ObjectId ) != 0 ) //храним входящий код АБС
+               state = 90379;
+            end;
+         else
+            state = 90376;
+         end;
+         // DEF-80324 проверка даты проводки и доп.догирование
+         CheckDateCarry("AddAccountingEntriesRequestMsg", {CurDate}, AccTrn.Date_Carry, AccTrn.Acctrnid); 
+         if (state > 0)
+            // освободим код
+            DeleteBiscottoId_autonomous(cur_Transaction_Entry.ReferenceId.ObjectId);
+         else 
+            UpdateBiscottoId_autonomous(AccTrntId, 1, cur_Transaction_Entry.ReferenceId.ObjectId);
+         end;
+      end;
+
+      ResponseObj.AddAccountingEntriesResponseMsg.AddAccountingEntriesResponse.TransactionResultList[i].AddEntryResultList( cur_Transaction_Entry, string(state) );
+
+      if(state != 0 )
+         if(state == 90376)
+            ErrMsg = "Не добавлена проводка в SOFR: "+err;
+         elif(state == 90378)
+            ErrMsg = "Не добавлена проводка в SOFR - дублирование ИД Бисквит " + cur_Transaction_Entry.ReferenceId.ObjectId;
+         elif(state == 90379)
+            ErrMsg = "Не выполнено обновление поля проводки USERFIELD4 AccTrnId = "  + string( AccTrntId );
+         else
+            ErrMsg = GetErrMessage( state );
+         end;
+      else
+         ai = ResponseObj.AddAccountingEntriesResponseMsg.AddAccountingEntriesResponse.TransactionResultList[i].EntryResultList.Size-1;
+         ResponseObj.AddAccountingEntriesResponseMsg.AddAccountingEntriesResponse.TransactionResultList[i].EntryResultList[ai].ErrorList = Null;
+         if(AccTrntId > 0 )
+            ResponseObj.AddAccountingEntriesResponseMsg.AddAccountingEntriesResponse.TransactionResultList[i].EntryResultList[ai].DocumentNumberInSOFR = "inpaym" + string(AccTrntId);
+         else
+            ResponseObj.AddAccountingEntriesResponseMsg.AddAccountingEntriesResponse.TransactionResultList[i].EntryResultList[ai].DocumentNumberInSOFR = "";
+         end;
+      end;
+   end;
+
+   if( Mode == 0 )
+   //зачисления на счета БУ для ФИССиКО
+      if( state == 0 )
+         Paym = TPmInput( cur_Transaction_Entry, i);
+         Paym.Insert();
+
+         if( Paym.Obj.PaymentId > 0 )
+            PaymentId = Paym.Obj.PaymentId;
+
+            //shev 23.08.2019 устанавливаем в категорию код документа бисквит
+            var connect_date;
+            Query = " select trunc(sysdate) from dual" ;
+            DataSet = execSQLselect( Query, Params );
+
+            if( DataSet.MoveNext )
+               connect_date = DataSet.value(0);
+            end;
+            Query = Null; Params = Null; Dataset = Null;
+
+            //Simanov - 20200218
+            var DocumentTypeCode = cur_Transaction_Entry.DocumentTypeCode.RecordCode;
+            var Valid_from_date = ifThenElse(connect_date<Paym.Obj.ValueDate, connect_date,  Paym.Obj.ValueDate);
+
+            //Simanov - 20200218
+            if(ValType(DocumentTypeCode) != V_UNDEF)
+               Params = Null;
+               Params = makeArray( SQLParam("p_ObjType",       OBJTYPE_PAYMENT ),
+                                   SQLParam("p_GroupId",       102 ),
+                                   SQLParam("p_ObjId",         String(paymentid:o:10) ),
+                                   SQLParam("p_AttrId",        Get_attrid_by_name(OBJTYPE_PAYMENT, 102, DocumentTypeCode) ),
+                                   SQLParam("p_ValidFromDate", Valid_from_date ) ); 
+               execStoredFunc( "USR_PKG_IMPORT_SOFR.ConnectAttr", V_INTEGER, Params ); 
+               Params = Null;
+            end;
+
+            var PaymeObj = RsbPayment(PaymentId);
+
+            //20200220 - Simanov принудительная установка схемы расчётов платежу.
+            var debitacc = cur_Transaction_Entry.DebitAccount.AccountNumber;
+            var factCorschem:integer = findCorschem(debitacc);
+            if ( factCorschem >= 0 )
+               if ( (PaymeObj.BaseFIID != 0) and (PaymeObj.InCorschem != factCorschem) ) //для рублей корсхему не трогаем
+                  PaymeObj.SetPayerPI (
+                              PAYMENTS_GROUP_UNDEF,       // Group
+                              PaymeObj.PayerBankID,       // BankID
+                              PaymeObj.PayerBankCodeKind, // BankCodeKind 
+                              PaymeObj.PayerBankCode,     // BankCode
+                              PaymeObj.PayerBankName,     // BankName
+                              debitacc,                   // CorrAcc
+                              PaymeObj.BaseFIID,          // AccountFI
+                              PaymeObj.Chapter,           // AccountChapter
+                              PaymeObj.PayerAccount,      // Account
+                              PaymeObj.Payer,             // ClientID
+                              PaymeObj.PayerName,         // ClientName
+                              PaymeObj.PayerINN,          // ClientINN
+                              PaymeObj.PayerCodeKind,     // ClientCodeKind
+                              PaymeObj.PayerCode,         // ClientCode
+                              factCorschem,               // Corschem 
+                              PM_CORRPOS_TYPE_USER        // CorrPosType 
+                           );
+                  PaymeObj.Update();
+               end;
+            end;
+
+            //shev 040619  маршрутизация платежа до бэкофиса
+            var dockind;
+            var FindAccount = Paym.Obj.ReceiverAccount;
+
+            //Simanov. В платежах ЕД107 счёт для маршрутизации стоит в поле "BankAccount"
+            if ( (SubStr(FindAccount, 1, 5) == "47416") and (Paym.BankAccount != "") )
+               FindAccount = Paym.BankAccount;
+               AddNoteForObject (501, string(PaymeObj.paymentid:o:10), 101, FindAccount); //16.01.202 Simanov. Сохраняем счёт в примечание, чтобы потом юзать его в квитовке
+            end;
+
+            //поиск первички для дальнейшей маршрутизации - основной вид маршрутизации
+            Query = " select t_dockind from dmcaccdoc_dbt where t_account = :p_Account and t_dockind != 0 order by t_activatedate desc" ;
+            Params = makeArray( SQLParam("p_Account", FindAccount));
+            DataSet = execSQLselect( Query, Params );
+
+            if( DataSet.MoveNext )
+               dockind = DataSet.value("t_dockind");
+            end;
+
+            Query = Null; Params = Null; Dataset = Null;
+
+            /*маршрутизация по ключевому слову в основании платежа - запасной вид маршрутизации
+            Simanov - 20191223 - добавлен приоритет
+            Приоритет - значение из t_flag. Чем больше число, тем ниже приоритет.
+            Сначала ищутся все совпадения слов из основания платежа со словами из справочника. Без учета регистра
+               1. Если приоритет больше текущего: сохраняется бэк-офис и новый приоритет
+               2. Если приоритет равен текущему:
+                    a. Если бэк-офисы отличаются - бэк-офис очищается
+                    b. Если бэк-офис такой же - ничего не делается
+                    c. Если бэк-офис пустой - отрабатывал п. a, ничего не делается
+            */
+            if (ValType(Dockind) == V_UNDEF) 
+
+// 2021-05-11 Cherednichenko is527829 Если в назначении платежа есть апострофы - неверно формируется запрос, добавил экранирование
+               Query = "select t_name, t_flag from dllvalues_dbt where t_list = 5025 and nvl(regexp_count(q'["+PaymeObj.ground+"]', t_code, 1, 'i'), 0) > 0";
+               DataSet = execSQLselect( Query);
+
+               while (Dataset.MoveNext )
+                  if ( DataSet.value("t_flag") < BOPriority )
+                     BOPriority = DataSet.value("t_flag");
+                     ToBackOffice = Dataset.value("t_name");
+                  elif ( DataSet.value("t_flag") == BOPriority )
+
+                     if ( (ToBackOffice != "") and (ToBackOffice != Dataset.value("t_name")) )
+                        ToBackOffice = "";
+                     end;
+                  end;
+               end;
+
+               if(ToBackOffice != "")
+                  PaymeObj.ToBackOffice = ToBackOffice; // выставляем букву бэкофиса
+                  PaymeObj.Paymstatus = STATUS_KWIT; // если прошла маршрутизация, то меняем статус на готов к квитовки
+                  PaymeObj.update();
+               end;
+            end;
+
+            /*Simanov - 20191220 - маршрутизация по счёту из уже существующих платежей - третий приоритет маршрутизации.
+              Создан из-за того, что многие непосделочные счета в фиссико (чаще всего) 47407/47408 не привязываются к сделкам фиссико и по ним не работает первый вид маршрутизации.
+            */
+            if ( (ValType(Dockind) == V_UNDEF) and (ToBackOffice == "") )
+               Query = " select t_dockind from dpmpaym_dbt where t_receiveraccount = :p_Account and t_dockind != 322 order by t_valuedate desc" ;
+               Params = makeArray( SQLParam("p_Account", FindAccount));
+               DataSet = execSQLselect( Query, Params );
+
+               if( DataSet.MoveNext )
+                  dockind = DataSet.value("t_dockind");
+               end;
+
+               Query = Null; Params = Null; Dataset = Null;
+            end;
+
+            if( (ValType(Dockind) != V_UNDEF) and (ToBackOffice == "") )
+
+               Query = " select t_boffice from RSHB_FD_GROUPS where t_dockind = :p_Dockind and t_boffice !=chr(1) "; 
+               Params = makeArray( SQLParam("p_Dockind", Dockind));
+               DataSet = execSQLselect( Query, Params );
+
+               if( DataSet.MoveNext )
+                  PaymeObj.ToBackOffice = DataSet.value("t_boffice"); // выставляем букву бэкофиса
+                  PaymeObj.Paymstatus = STATUS_KWIT; // если прошла маршрутизация, то меняем статус на готов к квитовки
+                  PaymeObj.update();
+               end;
+
+               Query = Null; Params = Null; Dataset = Null;
+            end;
+
+            if( UpdatePmUserfield( PaymentId, cur_Transaction_Entry.ReferenceId.ObjectId ) != 0 ) //храним входящий код Бисквит
+               state = 90379;
+            end;
+            
+            UpdateBiscottoId_autonomous(PaymentId, Paym.Obj.DocKind, cur_Transaction_Entry.ReferenceId.ObjectId);
+
+         else
+            state = 90376;
+            // освободим код
+            DeleteBiscottoId_autonomous(cur_Transaction_Entry.ReferenceId.ObjectId);
+         end;
+      end;
+
+      ResponseObj.AddAccountingEntriesResponseMsg.AddAccountingEntriesResponse.TransactionResultList[i].AddEntryResultList( cur_Transaction_Entry, string(state) );
+      if( state != 0 )
+         if(state == 90376)
+            ErrMsg = "Не добавлен платеж в SOFR";
+         elif(state == 90378)
+            ErrMsg = "Не добавлен платеж в SOFR - дублирование ИД Бисквит " + cur_Transaction_Entry.ReferenceId.ObjectId;
+         elif(state == 90379)
+            ErrMsg = "Не выполнено обновление поля платежа USERFIELD4 PaymentId = "  + string( PaymentId );
+         else
+            ErrMsg = GetErrMessage( state );
+         end;
+      else
+         ai = ResponseObj.AddAccountingEntriesResponseMsg.AddAccountingEntriesResponse.TransactionResultList[i].EntryResultList.Size-1;
+         ResponseObj.AddAccountingEntriesResponseMsg.AddAccountingEntriesResponse.TransactionResultList[i].EntryResultList[ai].ErrorList = Null;
+         if( PaymentId > 0 )
+            ResponseObj.AddAccountingEntriesResponseMsg.AddAccountingEntriesResponse.TransactionResultList[i].EntryResultList[ai].DocumentNumberInSOFR = "inpaym" + string(PaymentId);
+         else
+            ResponseObj.AddAccountingEntriesResponseMsg.AddAccountingEntriesResponse.TransactionResultList[i].EntryResultList[ai].DocumentNumberInSOFR = "";
+         end;
+      end;
+   //зачисления на счета БУ для ФИССиКО
+
+   elif( Mode == 3)
+   //зачисления на счета БУ для УВ
+
+   //зачисления на счета БУ для УВ
+   elif( Mode == 4)
+   //зачисления на счета БУ для СВ
+
+   //зачисления на счета БУ для СВ
+   elif( Mode == 5 )
+   //зачисление на сводные счета
+      if( state == 0 )
+         ResponseObj.AddAccountingEntriesResponseMsg.AddAccountingEntriesResponse.TransactionResultList[i].AddEntryResultList( cur_Transaction_Entry, string(state) );
+
+         //shev 17.03.2020
+         //Setrstrace(true);  //17-06-2020 по теме 511711
+         OutputIntrace("Трассировка зачислений/списаний "+cur_Transaction_Entry.ReferenceId.ObjectId); 
+
+         var DebitAccountCode = SubStr(cur_Transaction_Entry.DebitAccount.AccountNumber, 1, 5);
+         var isPersonPayerDetailsExist = ((ValType(cur_Transaction_Entry.PersonPayerDetails) != V_UNDEF) and
+                                          (ValType(cur_Transaction_Entry.PersonPayerDetails) != 26));
+         var isLegalEntityPayerDetailsExist = ((ValType(cur_Transaction_Entry.LegalEntityPayerDetails) != V_UNDEF) and
+                                               (ValType(cur_Transaction_Entry.LegalEntityPayerDetails) != 26));
+         LegalForm = 0;
+         
+         // BOSS-8439 Определение формы субъекта
+         if (isPersonPayerDetailsExist or isLegalEntityPayerDetailsExist)
+           if (IsConsolidatedAccount(cur_Transaction_Entry.CreditAccount.AccountNumber))
+             LegalForm = PTLEGF_PERSN;
+           elif ((DebitAccountCode == "40802") or 
+                 (DebitAccountCode == "40804") or 
+                 (DebitAccountCode == "40805") or 
+                 (isLegalEntityPayerDetailsExist and (StrLen(cur_Transaction_Entry.LegalEntityPayerDetails.INN) == 12)) or
+                 ((DebitAccountCode != "47422") and isPersonPayerDetailsExist and (StrLen(cur_Transaction_Entry.PersonPayerDetails.INN) == 12)))
+             LegalForm = 3; // ИП
+           elif ((SubStr(DebitAccountCode, 1, 3) == "407") or
+                 (DebitAccountCode == "47422") or
+                 (isLegalEntityPayerDetailsExist and (StrLen(cur_Transaction_Entry.LegalEntityPayerDetails.INN) == 10)))
+             LegalForm = PTLEGF_INST;
+           else
+             LegalForm = -1;
+             state = -1023;
+             ErrMsg = "Ошибка определения вида субъекта (ФЛ/ЮЛ/ИП)";
+           end;
+         end;
+
+         if (LegalForm == 0)
+           state = -1020;
+           ErrMsg = "Отсутствуют теги PersonPayerDetails или LegalEntityPayerDetails, тип субъекта-плательщика не определен ";
+         elif (LegalForm > 0)
+           var error = "";
+           var enroll = enroll_rec();
+           
+           if (not GetParm(2, enroll.m_JMSMESSAGEID))
+             enroll.m_JMSMESSAGEID = "";
+           end;
+           
+           // Общие параметры для всех видов субъектов
+           enroll.m_ContrNumber = Trim(cur_Transaction_Entry.AgreementNumber); // 150121 обрезаем пустой символ
+           enroll.m_EntryNumber = cur_Transaction_Entry.EntryNumber;
+           enroll.m_Date = cur_Transaction_Entry.OperationalDay;
+           enroll.m_Time = Time();
+           enroll.m_DebetAccount = cur_Transaction_Entry.DebitAccount.AccountNumber;
+           enroll.m_CreditAccount = cur_Transaction_Entry.CreditAccount.AccountNumber;
+           enroll.m_Sum = numeric(cur_Transaction_Entry.CreditAmount);
+           enroll.m_CurrCode = cur_Transaction_Entry.CreditAccount.CurrencyCode;
+           enroll.m_Ground = cur_Transaction_Entry.EntryDetails;
+           enroll.m_DocType = cur_Transaction_Entry.DocumentTypeCode.RecordCode;
+           enroll.m_LegalForm = LegalForm;
+           
+           if (LegalForm == PTLEGF_PERSN)
+             InitNaturalPersonEnroll(enroll, cur_Transaction_Entry);
+           else // ЮЛ и ИП
+             InitLegalPersonEnroll(enroll, cur_Transaction_Entry);
+           end;
+
+           state = usr_CreateNPTXOP(enroll, @PaymentId, @Error);
+           if( state != 0 )
+               ErrMsg = "Не добавлена операция в SOFR. "+Error;
+               // освободим код
+               DeleteBiscottoId_autonomous(cur_Transaction_Entry.ReferenceId.ObjectId);
+            else
+               UpdateBiscottoId_autonomous(PaymentId,5002,cur_Transaction_Entry.ReferenceId.ObjectId);
+               ai = ResponseObj.AddAccountingEntriesResponseMsg.AddAccountingEntriesResponse.TransactionResultList[i].EntryResultList.Size-1;
+               ResponseObj.AddAccountingEntriesResponseMsg.AddAccountingEntriesResponse.TransactionResultList[i].EntryResultList[ai].ErrorList = Null;
+               if( PaymentId > 0 )
+                  ResponseObj.AddAccountingEntriesResponseMsg.AddAccountingEntriesResponse.TransactionResultList[i].EntryResultList[ai].DocumentNumberInSOFR = "nptxop" + string(PaymentId);
+               else
+                  ResponseObj.AddAccountingEntriesResponseMsg.AddAccountingEntriesResponse.TransactionResultList[i].EntryResultList[ai].DocumentNumberInSOFR = "";
+               end;
+            end;
+         end;
+      end;
+      //зачисление на сводные счета
+   elif (Mode == 7) 
+      // BIQ-10484 запрос на депозитарную комиссию
+      if(cur_Transaction_Entry.EntryDetails != "")
+        if( state == 0 )
+           ResponseObj.AddAccountingEntriesResponseMsg.AddAccountingEntriesResponse.TransactionResultList[i].AddEntryResultList( cur_Transaction_Entry, string(state) );
+           state = CreateComOperation(cur_Transaction_Entry, @PaymentId, @ErrMsg);
+           if (state == 0)
+              UpdateBiscottoId_autonomous(PaymentId,48,cur_Transaction_Entry.ReferenceId.ObjectId);
+              // примечания
+              AddNoteForObject (OBJTYPE_OPERATION, string(PaymentId:o:10), NOTEKIND_EXTERNALID, 
+                                RequestObj.AddAccountingEntriesRequest.TransactionList[i].TransactionId.ObjectId );
+              AddNoteForObject (OBJTYPE_OPERATION, string(PaymentId:o:10), NOTEKIND_GROUND, 
+                                cur_Transaction_Entry.EntryDetails); 
+              AddNoteForObject (OBJTYPE_OPERATION, string(PaymentId:o:10), NOTEKIND_ENTRYNUMBER, 
+                                cur_Transaction_Entry.EntryNumber); 
+              // если мультивалютная проводка CCBO-6668
+              if (RequestObj.AddAccountingEntriesRequest.TransactionList[i].EntryList[0].CreditAccount.CurrencyCode!=
+                  RequestObj.AddAccountingEntriesRequest.TransactionList[i].EntryList[0].DebitAccount.CurrencyCode)
+                AddNoteForObject (OBJTYPE_OPERATION, string(PaymentId:o:10), NOTEKIND_CURR_CREDIT, 
+                                  RequestObj.AddAccountingEntriesRequest.TransactionList[i].EntryList[0].CreditAccount.CurrencyCode);
+                AddNoteForObject (OBJTYPE_OPERATION, string(PaymentId:o:10), NOTEKIND_AMOUNT_CREDIT, 
+                                  RequestObj.AddAccountingEntriesRequest.TransactionList[i].EntryList[0].CreditAmount); 
+              end;  
+      
+              ai = ResponseObj.AddAccountingEntriesResponseMsg.AddAccountingEntriesResponse.TransactionResultList[i].EntryResultList.Size-1;
+              ResponseObj.AddAccountingEntriesResponseMsg.AddAccountingEntriesResponse.TransactionResultList[i].EntryResultList[ai].ErrorList = Null;
+              if( PaymentId > 0 )
+                 ResponseObj.AddAccountingEntriesResponseMsg.AddAccountingEntriesResponse.TransactionResultList[i].EntryResultList[ai].DocumentNumberInSOFR = "depcom" + string(PaymentId);
+              else
+                 ResponseObj.AddAccountingEntriesResponseMsg.AddAccountingEntriesResponse.TransactionResultList[i].EntryResultList[ai].DocumentNumberInSOFR = "";
+              end;
+           else 
+              // освободим код
+              DeleteBiscottoId_autonomous(cur_Transaction_Entry.ReferenceId.ObjectId);
+           end;
+        end;
+      else
+          state = -1022;
+          ErrMsg = "Не указано основание платежа (тег EntryDetails) ";
+          ResponseObj.AddAccountingEntriesResponseMsg.AddAccountingEntriesResponse.TransactionResultList[i].AddEntryResultList( cur_Transaction_Entry, string(state) );
+      end;
+   end;
+
+   if (state != 0)
+      ErrObj = null;
+      ErrObj = TIntegrationSimpleErrorData( string(state), ErrMsg );
+      if (state!=90378)
+        ResponseObj.AddAccountingEntriesResponseMsg.AddAccountingEntriesResponse.TransactionResultList[i].AddError( ErrObj );
+        ResponseObj.AddAccountingEntriesResponseMsg.AddAccountingEntriesResponse.TransactionResultList[i].EntryResultList[ResponseObj.AddAccountingEntriesResponseMsg.AddAccountingEntriesResponse.TransactionResultList[i].EntryResultList.Size-1].ResultCode = 
+           ErrObj.ErrorCode;
+      else //CCBO-  45027
+        ResponseObj.AddAccountingEntriesResponseMsg.AddAccountingEntriesResponse.TransactionResultList[i].EntryResultList[ResponseObj.AddAccountingEntriesResponseMsg.AddAccountingEntriesResponse.TransactionResultList[i].EntryResultList.Size-1].ResultCode = 
+           0;
+      end;
+      ErrObj = Null;
+   end;
+   
+   AddPmLog( RequestObj, ResponseObj, i, Mode, PaymentId ); //добавляем в ЛОГ
+
+   i = i + 1;
+  
+   cur_Transaction_Entry = null;
+ end;
+
+ RequestObj = Null;
+ return ResponseObj;
+
+onError(err)
+   if(ValType(state) == V_UNDEF)
+      state = UNIVERSAL_ERROR_CODE;
+   else
+      if(state == 0)
+         state = UNIVERSAL_ERROR_CODE;
+      end;
+   end;
+   ErrObj = Null;
+   ErrObj = TIntegrationSimpleErrorData( string( state ), string("Не создан входящий платеж в SOFR: (",
+                                                                 c_usr_err_obj.obtain_err_code(err), ") ",
+                                                                 c_usr_err_obj.obtain_err_msg(err)));
+
+   ResponseObj.AddAccountingEntriesResponseMsg.AddAccountingEntriesResponse.TransactionResultList[0] = TTransactionResult;
+   ResponseObj.AddAccountingEntriesResponseMsg.AddAccountingEntriesResponse.TransactionResultList[0].TransactionId = TIntegrationSymbolicIdentifierX;
+   // gtv: небезопасный код, но без него ответ все равно не доходит
+   ResponseObj.AddAccountingEntriesResponseMsg.AddAccountingEntriesResponse.TransactionResultList[0].TransactionId.ObjectId = RequestObj_.AddAccountingEntriesRequest.TransactionList[0].TransactionId.ObjectId;
+   ResponseObj.AddAccountingEntriesResponseMsg.AddAccountingEntriesResponse.TransactionResultList[0].EntryResultList[0] = TEntryResult(null, ErrObj.ErrorCode);
+   ResponseObj.AddAccountingEntriesResponseMsg.AddAccountingEntriesResponse.TransactionResultList[0].EntryResultList[0].ErrorList[0] = ErrObj;
+
+   AddPmLog( RequestObj, ResponseObj, i, Mode, PaymentId ); //добавляем в ЛОГ
+   RequestObj = Null;
+
+   return ResponseObj;
+end;
+

@@ -1,0 +1,1527 @@
+/*
+$Name:         dpcr_200.mac
+$Module:       Депозитарий
+$Description:  Обслуживание счета депо/Исполнение выплаты
+*/
+/*
+Операция:      "Обслуживание счета депо"
+Шаг:           "Исполнение выплаты"
+Программист:   Alex V. Mishin (AVM)
+Создан:        18.12.2002
+*/
+
+//!!!С 3149 больше не используется
+
+import InsCarryDoc;
+import OprInter;
+import PaymInter;
+import "dlcarry.inc";
+import opr_depo;
+import likepy;
+import oralib;
+import SPInter;
+import DPInter;
+import "spserv.mac";
+import "nptxfun.mac";
+import "dppmaccfd.mac";
+import "oprkind.mac";
+import "nutxfun.mac";
+
+/* Буферы, передаваемые в макрос */
+private record OprServDoc( dpcorpop ); /*корпортивная операция*/
+record dppmacc( dppmacc );     /*Платежная инструкция получателя*/
+
+private const TYPEKOPER_ISSUE  = "r"; // Погашение выпуска
+private const TYPEKOPER_COUPON = "n"; // Погашение купона
+private const TYPEKOPER_PARTLY = "x"; // Частичное погашение
+
+private var NotUserWhereCond = "obj.t_User != 'X'";
+
+private macro CheckRetireAutoStart():Bool
+  var regValue:Bool = false;
+  var errCode:Integer = 0;
+
+  GetRegistryValue( "DEPO\\АВТОЗАПУСК ПОГАШЕНИЙ В БОЦБ", V_BOOL, regValue, errCode );
+
+  return ( ( errCode == 0 ) and regValue );
+end;
+
+private macro GetSfContrID(
+  servKind:Integer
+ ,receiverID:Integer
+ ,payerID:Integer
+ ,contrDate:Date
+):Integer
+
+  var sfContrID:Integer = 0;
+  var query:String = "";
+  var rsdCmd = null;
+  var dataSet = null;
+
+  query =
+    " SELECT "
+      + " sfcontr.t_ID "
+  + " FROM "
+      + " dsfcontr_dbt sfcontr "
+  + " WHERE "
+      + " sfcontr.t_ServKind = ? "
+  + " AND sfcontr.t_PartyID = ? "
+  + " AND sfcontr.t_ContractorID = ? "
+  + " AND sfcontr.t_DateBegin <= ? "
+  + " AND ( sfcontr.t_DateClose > ? "
+     + " OR sfcontr.t_DateCLose = TO_DATE('01-01-0001','DD-MM-YYYY') ) "
+  + " ORDER BY "
+      + " t_DateBegin ASC ";
+
+  rsdCmd = RsdCommand( query );
+  rsdCmd.AddParam( "", RSDBP_IN, servKind );
+  rsdCmd.AddParam( "", RSDBP_IN, payerID );
+  rsdCmd.AddParam( "", RSDBP_IN, receiverID );
+  rsdCmd.AddParam( "", RSDBP_IN, contrDate );
+  rsdCmd.AddParam( "", RSDBP_IN, contrDate );
+  rsdCmd.Execute();
+
+  dataSet = TRsbDataSet( rsdCmd );
+
+  if( dataSet.MoveNext() )
+    sfContrID = dataSet.ID;
+  end;
+
+  return sfContrID;
+end;
+
+private macro InsertRetire()
+  var stat:Integer = 0;
+  var query:String = "";
+  var rsdCmd = null;
+  var dataSet = null;
+  var tick = TRecHandler( "dl_tick" );
+  var leg = TRecHandler( "dl_leg" );
+
+  tick.Clear();
+  tick.rec.PartyID = -1;
+  tick.rec.TraderID = -1;
+  tick.rec.DepositID = -1;
+  tick.rec.MarketID = -1;
+  tick.rec.BrokerID = -1;
+  tick.rec.ClientID = -1;
+
+  leg.Clear();
+
+  query =
+    " SELECT "
+      + " regstr.t_Date "
+     + " ,regstr.t_StoragePlace "
+     + " ,spgr.t_Xld "
+     + " ,dppmfi.t_FIID "
+     + " ,fin.t_FaceValueFI";
+  if( OprServDoc.PaymentType == DP_CRPPAYMENTTYPE_COUPON )
+    query = query +
+       " ,RSI_RSB_FIInstr.FI_GetCouponDrawingDate( dppmfi.t_FIID, ? ) ";
+  elif( OprServDoc.PaymentType == DP_CRPPAYMENTTYPE_NOMINAL )
+    query = query +
+       " ,RSI_RSB_FIInstr.FI_GetPartialDrawingDate( dppmfi.t_FIID, ? ) ";
+  elif( OprServDoc.PaymentType == DP_CRPPAYMENTTYPE_ISSUE )
+    query = query +
+       " ,RSI_RSB_FIInstr.FI_GetNominalDrawingDate( dppmfi.t_FIID, (select t_Termless from davoiriss_dbt where t_FIID = dppmfi.t_FIID) ) ";
+  end;
+  query = query +
+        " AS t_DrawingDate "
+     + " ,( SELECT "
+            + " SUM( NVL( reglinag.t_HRest, " + String( $0 ) + " ) ) "
+        + " FROM "
+            + " ddpreglin_dbt reglinag "
+        + " START WITH "
+            + " reglinag.t_ReglineID = reglin.t_ReglineID "
+        + " CONNECT BY "
+            + " PRIOR reglinag.t_ReglineID = reglinag.t_Parent ) AS t_HRest "
+  + " FROM "
+      + " dspground_dbt spgr "
+     + " ,ddpregstr_dbt regstr "
+     + " ,ddppmfi_dbt dppmfi "
+     + " ,ddpreglin_dbt reglin "
+     + " ,dfininstr_dbt fin "
+  + " WHERE "
+      + " spgr.t_SourceDocID = ? "
+  + " AND spgr.t_SourceDocKind = ? "
+  + " AND spgr.t_Direction = " + String( ENTERING ) + " "
+  + " AND spgr.t_Division = " + String( DP_SelfDivision ) + " "
+  + " AND regstr.t_DocumentID = ? "
+  + " AND dppmfi.t_RegisterID = regstr.t_RegisterID "
+  + " AND reglin.t_RegisterID = regstr.t_RegisterID "
+  + " AND reglin.t_Type = " + String( DP_REGLINETYPE_DEPOACC ) + " "
+  + " AND reglin.t_HolderAccID = ? "
+  + " AND fin.t_FIID = dppmfi.t_FIID";
+
+  rsdCmd = RsdCommand( query );
+  if( ( OprServDoc.PaymentType == DP_CRPPAYMENTTYPE_COUPON )
+   or ( OprServDoc.PaymentType == DP_CRPPAYMENTTYPE_NOMINAL ) )
+    rsdCmd.AddParam( "", RSDBP_IN, OprServDoc.WarrantNum );
+  end;
+  rsdCmd.AddParam( "", RSDBP_IN, OprServDoc.DocumentID );
+  rsdCmd.AddParam( "", RSDBP_IN, OprServDoc.DocKind );
+  rsdCmd.AddParam( "", RSDBP_IN, OprServDoc.DocumentID );
+  rsdCmd.AddParam( "", RSDBP_IN, dppmacc.HolderAccID );
+  rsdCmd.Execute();
+
+  dataSet = TRsbDataSet( rsdCmd );
+
+  if( dataSet.MoveNext() )
+    // <A0> Вид погашения
+    if( OprServDoc.PaymentType == DP_CRPPAYMENTTYPE_COUPON )
+      tick.rec.DealType = CB_GetFirstValidOpenOpKind( DL_RETIREMENT, OPPF_FITALL, TYPEKOPER_COUPON );
+    elif( OprServDoc.PaymentType == DP_CRPPAYMENTTYPE_NOMINAL )
+      tick.rec.DealType = CB_GetFirstValidOpenOpKind( DL_RETIREMENT, OPPF_FITALL, TYPEKOPER_PARTLY );
+    elif( OprServDoc.PaymentType == DP_CRPPAYMENTTYPE_ISSUE )
+      tick.rec.DealType = CB_GetFirstValidOpenOpKind( DL_RETIREMENT, OPPF_FITALL, TYPEKOPER_ISSUE );
+    end;
+    tick.rec.DealCode       = GetDealCodeNew();         // <A1>     Код операции
+    tick.rec.DealCodeTS     = dataSet.Xld;              // <A2>     Код операции внешний
+    tick.rec.DealDate       = dataSet.DrawingDate;      // <A3>     Дата
+    tick.rec.BOfficeKind    = DL_RETIREMENT;            // <A4>     ДУ
+    tick.rec.Flag1          = "";                       // <A5>     Биржа
+    tick.rec.Flag4          = "";                       // <A6>     Брокер
+    leg.rec.Start           = dataSet.Date;             // <A7>     Дата составления перечня
+    leg.rec.Maturity        = OprServDoc.ValueDate;     // <A8>     Дата получения средств
+    leg.rec.Expiry          = OprServDoc.ValueDate;     // <A8>     Дата получения средств
+    tick.rec.CarryWrt       = "";                       // <A42>    Проводка зачисления средств
+    tick.rec.OFBU           = "";                       // <A9>     ОФБУ
+    tick.rec.ClientID       = dppmacc.HolderID;         // <A10.0>  Клиент
+    // <A10.2> № договора
+    tick.rec.ClientContrID  = GetSfContrID( PTSK_STOCKDL, {OurBank}, dppmacc.HolderID, tick.rec.DealDate );
+    tick.rec.BrokerID       = dataSet.StoragePlace;     // <A11>    Платежный агент
+    tick.rec.PartyID        = dataSet.StoragePlace;     // <A11>    Платежный агент
+    leg.rec.DepositID       = dataSet.StoragePlace;     // <A16>    Депозитарий
+    leg.rec.PFI             = dataSet.FIID;             // <A18.1>  Ценная бумага
+                                                        // <A19.1>  Эмитент
+                                                        // <A20.1>  Номинал
+    leg.rec.CFI = leg.rec.PayFIID = dataSet.FaceValueFI;      // <A23>    Валюта платежа
+    if( OprServDoc.PaymentType == DP_CRPPAYMENTTYPE_COUPON )
+      tick.rec.Number_Coupon  = OprServDoc.WarrantNum;  // <A24>    Купон №
+    elif( OprServDoc.PaymentType == DP_CRPPAYMENTTYPE_NOMINAL )
+      tick.rec.Number_Partly  = OprServDoc.WarrantNum;  // <A25>    Частичное погашение №
+    elif( OprServDoc.PaymentType == DP_CRPPAYMENTTYPE_ISSUE )
+      SP_GetLastCouponORPartialNumber( dataSet.FIID, tick.rec.Number_Partly, false ); // <A25>    Частичное погашение №
+    end;
+    leg.rec.Principal       = dataSet.HRest;            // <A30>    Количество ц/б
+    if( ( OprServDoc.PaymentType == DP_CRPPAYMENTTYPE_NOMINAL )
+     or ( OprServDoc.PaymentType == DP_CRPPAYMENTTYPE_ISSUE ) )
+      leg.rec.Cost          = dppmacc.PayAmount;        // <A31.1>  Погашение номинала на сумму
+    elif( OprServDoc.PaymentType == DP_CRPPAYMENTTYPE_COUPON )
+      leg.rec.NKD           = dppmacc.PayAmount;        // <A32.1>  Процентный/купонный доход
+    end;
+    leg.rec.TotalCost       = dppmacc.PayAmount;        // <A33.1>  Сумма погашения
+    tick.rec.CouponNDFL     = "";                       // <A34.1>  Купон в НДФЛ
+    tick.rec.Department     = {OperDprt};               // <A40>    Филиал
+    tick.rec.Oper           = {Oper};                   // <A41.1>  Исполнитель
+  end;
+
+  if( ( tick.rec.ClientContrID > 0 )
+  and ( not OprInsertSecDeal( tick, leg, $0, null, null, null, null, CheckRetireAutoStart() ) ) )
+    stat = 1;
+  end;
+
+  return stat;
+end;
+
+private var SumTaxAmountNatcur = $0;
+
+private macro InsertHoldTaxCarry()
+  var stat:Integer = 0;
+  var query:String = "";
+  var rsdCmd = null;
+  var dataSet = null;
+  var party = TRecHandler( "party" );
+  var mcaccdoc = TBFile( "mcaccdoc" ); mcaccdoc.Clear();
+  var accountReceiver:String = "", accountPayer:String = "";
+  var ground:String = "";
+  var category:String = "";
+  var PayerAcc = TRecHandler("account.dbt");
+  var SumPayer = $0, SumReceiver = $0;
+
+  SumTaxAmountNatcur = $0;
+
+  query =
+    " SELECT "
+      + " spgr.t_Xld "
+     + " ,spgr.t_RegistrDate "
+  + " FROM "
+      + " dspground_dbt spgr "
+  + " WHERE "
+      + " spgr.t_SourceDocID = ? "
+  + " AND spgr.t_SourceDocKind = ? "
+  + " AND spgr.t_Direction = " + String( ENTERING ) + " "
+  + " AND spgr.t_Division = " + String( DP_SelfDivision ) + " ";
+
+  rsdCmd = RsdCommand( query );
+  rsdCmd.AddParam( "", RSDBP_IN, OprServDoc.DocumentID );
+  rsdCmd.AddParam( "", RSDBP_IN, OprServDoc.DocKind );
+  rsdCmd.Execute();
+
+  dataSet = TRsbDataSet( rsdCmd );
+  if( dataSet.MoveNext() )
+
+    if( ПолучитьСубъекта( dppmacc.HolderID, party ) == 0 )
+      if( party.rec.LegalForm == PTLEGF_INST )
+        category = "-Бюджет, ф.налоги";
+      elif( party.rec.LegalForm == PTLEGF_PERSN )
+        if(DL_GetPartyResident(dppmacc.HolderID) == NPTXPARTY_NOTRESIDENT)
+          category = "НДФЛ к перечислению.нерез";
+        else
+          category = "НДФЛ к перечислению";
+        end;
+      end;
+
+      ground = "Удержание налога по уведомлению №" + String( dataSet.Xld ) + " от " + String( Date( dataSet.RegistrDate ) ) + ". "
+             + "Клиент " + ПолучитьКодСубъекта( dppmacc.HolderID, PTCK_CLIENT ) + " " + party.rec.ShortName;
+
+      accountReceiver = MC_FindAndOpenCommonAcc( category
+                                                ,Date( dataSet.RegistrDate )
+                                                ,MC_OPENACC_CREATE
+                                                ,1
+                                                ,mcaccdoc
+                                                ,0
+                                                ,NATCUR );
+
+      if(CheckDepoChargeIncome() == false)
+        accountPayer = OprServDoc.Account;
+      else
+        var FD = DP_PmaccFD(dppmacc.DocumentID, dppmacc.HolderAccID);
+
+        if(false == FD.OpenAccount( "-Расчеты, Выплаты по ц/б", NULL, NULL, PayerAcc, dataSet.RegistrDate, OprServDoc.Currency ))
+          msgbox("Ошибка при открытии счета");
+          stat = 1;
+        else
+          accountPayer = PayerAcc.rec.Account;
+        end;
+      end;
+
+      SumReceiver = dppmacc.CalcTaxAmount;
+      if(OprServDoc.Currency != NATCUR)
+        ConvSum (SumPayer, SumReceiver, dataSet.RegistrDate, OprServDoc.Currency, NATCUR);
+      else
+        SumPayer = SumReceiver;
+      end;
+
+      if( (accountPayer != "") and (accountReceiver != "") )
+        if(DL_MultyCarry (OprServDoc.Currency, accountPayer, SumPayer,
+                          NATCUR, accountReceiver, SumReceiver, 1,
+                          null, null, dataSet.RegistrDate, null,
+                          ground, null,
+                          null))
+          stat = 1;
+        else
+          SumTaxAmountNatcur = SumReceiver;
+        end;
+
+      else
+        stat = 1;
+      end;
+    else
+      stat = 1;
+    end;
+  else
+    stat = 1;
+  end;
+
+  return stat;
+end;                                                             
+
+PRIVATE MACRO Rs(PtIsRes)
+   if (PtIsRes == NPTXPARTY_RESIDENT)
+      return 9.0;
+   else
+      return 15.0;
+   end;
+END;
+
+PRIVATE MACRO Rg(PtIsRes)
+   if (PtIsRes == NPTXPARTY_RESIDENT)
+      return 13.0;
+   else
+      return 30.0;
+   end;
+END;
+                                    
+private macro GetDepoContr();
+  var query, DataSet, Select;
+  var ID = 0;
+
+  query =  " select sf.t_ID "
+         + "   from dsfcontr_dbt sf, DDEPOACNT_DBT DEPOACNT "
+         + "  where DEPOACNT.t_AutoKey = ? "
+         + "    and sf.t_ObjectType = " + SF_DEPOACC
+         + "    and sf.t_ServKind = " + PTSK_DEPOS
+         + "    and sf.t_Object = depoacnt.t_Code "
+         + "    and sf.t_PartyID = depoacnt.t_Owner";
+  
+  Select = RSDCommand( query );
+  Select.AddParam("", RSDBP_IN, dppmacc.HolderAccID );
+  Select.Execute();
+  
+  DataSet = TRsbDataSet(Select);
+  if (DataSet.movenext())
+    ID =  SQL_ConvTypeInteger(DataSet.ID);
+  end;
+
+  return ID;
+end;
+
+private macro InsertTaxObject(
+  idOperation:Integer
+ ,idStep:Integer
+):Integer
+
+  var stat:Integer = 0;
+  var query:String = "";
+  var rsdCmd = null;
+  var dataSet = null;
+  var direction:Integer = 0;
+  var level:Integer = 0;
+  var vKind:Integer = 0;
+  var sum:Money = $0;
+  var cur:Integer = 0;
+  var analiticKind1:Integer = 0;
+  var analitic3:Integer = -1;
+  var analitic4:Integer = -1;
+  var analitic5:Integer = -1;
+  var comment:String = "";
+  var pClient:integer = dppmacc.HolderID;
+  var pContract = GetDepoContr();
+  var PtIsRes = DL_GetPartyResident(dppmacc.HolderID);
+
+  var Quantity = $0, Year, pBegDate, pEndDate, R, Div_Sec0 = $0, DivPay_Sec0 = $0, MinusSum = $0, PlusSum = $0, ProcSec_TS0 = $0;
+
+  DateSplit( OprServDoc.ValueDate, null, null, Year );
+  pBegDate = Date(1,1,Year);
+  pEndDate = OprServDoc.ValueDate;
+
+  query =
+    " SELECT "
+      + " dppmfi.t_FIID, dppmacfi.t_Quantity "
+     + " ,NPTO.Market1date( dppmfi.t_FIID, ? ) t_Circulate "
+     + " ,NPTO.GetPaperTaxGroupNPTX( dppmfi.t_FIID ) t_TaxGroupNPTX "
+  + " FROM "
+      + " ddpregstr_dbt regstr "
+     + " ,ddppmfi_dbt dppmfi "
+     + " ,ddppmacfi_dbt dppmacfi "
+  + " WHERE "
+      + " regstr.t_DocumentID = ? "
+  + " AND dppmfi.t_RegisterID = regstr.t_RegisterID "
+  + " AND dppmacfi.t_DocumentID = regstr.t_DocumentID "
+  + " AND dppmacfi.t_HolderAccID = ? "
+  + " AND dppmacfi.t_FIID = dppmfi.t_FIID ";
+
+  rsdCmd = RsdCommand( query );
+  rsdCmd.AddParam( "", RSDBP_IN, OprServDoc.ValueDate );
+  rsdCmd.AddParam( "", RSDBP_IN, OprServDoc.DocumentID );
+  rsdCmd.AddParam( "", RSDBP_IN, dppmacc.HolderAccID );
+  rsdCmd.Execute();
+
+  dataSet = TRsbDataSet( rsdCmd );
+  if( dataSet.MoveNext() )
+    analitic3 = dataSet.FIID;
+    analitic4 = Int( dataSet.Circulate );
+    analitic5 = Int( dataSet.TaxGroupNPTX );
+    Quantity = SQL_ConvTypeSum(dataSet.Quantity);
+  end;
+
+  if(OprServDoc.PaymentType == DP_CRPPAYMENTTYPE_DIVIDENDS)
+
+     direction = TXOBJ_DIR_IN;
+     level = 4;
+     vKind = TXOBJ_DIV_SEC;
+     comment = "Выплата суммы дивидендов в Депозитарии";
+     analiticKind1 = TXOBJ_KIND1098;
+     sum = dppmacc.BruttoAmount;
+     cur = OprServDoc.Currency;
+
+     if(OprServDoc.Currency != NATCUR)
+        ConvSum(Div_Sec0, sum, OprServDoc.ValueDate, OprServDoc.Currency, NATCUR);
+     else
+        Div_Sec0 = sum;
+     end;
+   
+     if( sum != $0 )
+        stat = DL_NPTX_InsertTaxObject( OprServDoc.ValueDate  // Дата НДР
+                                       ,dppmacc.HolderID      // Клиент
+                                       ,direction             // Направление
+                                       ,level                 // Уровень
+                                       ,""                    // Признак "Пользовательский"
+                                       ,vKind                 // Вид НДР
+                                       ,sum                   // Сумма дохода/расхода
+                                       ,cur                   // Валюта дохода/расхода
+                                       ,analiticKind1         // Вид аналитики 1
+                                       ,idOperation           // Аналитика 1
+                                       ,0                     // Вид аналитики 2
+                                       ,-1                    // Аналитика 2
+                                       ,TXOBJ_KIND3010        // Вид аналитики 3
+                                       ,analitic3             // Аналитика 3
+                                       ,TXOBJ_KIND4010        // Вид аналитики 4
+                                       ,analitic4             // Аналитика 4
+                                       ,TXOBJ_KIND5010        // Вид аналитики 5
+                                       ,analitic5             // Аналитика 5
+                                       ,TXOBJ_KIND6020        // Вид аналитики 6
+                                       ,pContract             // Аналитика 6
+                                       ,comment               // Комментарий
+                                       ,idOperation           // ID операции
+                                       ,idStep                // ID шага операции
+                                       ,1 );                  // Признак вызова не из операции расчета НОБ
+     end;
+   
+     if( (stat==0) and (OprServDoc.HoldTax == "X") )
+        direction = TXOBJ_DIR_OUT;
+        level = 4;
+        vKind = TXOBJ_DIVPAY_SEC;
+        comment = "Налог с выплаты суммы дивидендов в Депозитарии";
+        analiticKind1 = TXOBJ_KIND1098;
+        sum = dppmacc.CalcTaxAmount;
+        if(OprServDoc.Currency != NATCUR)
+          ConvSum(sum, sum, OprServDoc.ValueDate, OprServDoc.Currency, NATCUR);
+        end;
+
+        DivPay_Sec0 = sum;
+       
+        if( sum != $0 )
+           stat = DL_NPTX_InsertTaxObject( OprServDoc.ValueDate  // Дата НДР
+                                          ,dppmacc.HolderID      // Клиент
+                                          ,direction             // Направление
+                                          ,level                 // Уровень
+                                          ,""                    // Признак "Пользовательский"
+                                          ,vKind                 // Вид НДР
+                                          ,sum                   // Сумма дохода/расхода
+                                          ,NATCUR                // Валюта дохода/расхода
+                                          ,analiticKind1         // Вид аналитики 1
+                                          ,idOperation           // Аналитика 1
+                                          ,0                     // Вид аналитики 2
+                                          ,-1                    // Аналитика 2
+                                          ,TXOBJ_KIND3010        // Вид аналитики 3
+                                          ,analitic3             // Аналитика 3
+                                          ,TXOBJ_KIND4010        // Вид аналитики 4
+                                          ,analitic4             // Аналитика 4
+                                          ,TXOBJ_KIND5010        // Вид аналитики 5
+                                          ,analitic5             // Аналитика 5
+                                          ,TXOBJ_KIND6020        // Вид аналитики 6
+                                          ,pContract             // Аналитика 6
+                                          ,comment               // Комментарий
+                                          ,idOperation           // ID операции
+                                          ,idStep                // ID шага операции
+                                          ,1 );                  // Признак вызова не из операции расчета НОБ
+        end;
+     end;
+
+     if(stat == 0)
+     
+        if(PtIsRes == NPTXPARTY_RESIDENT)
+           vKind = TXOBJ_PLUSG_1010;
+           comment = "ФЛ = резидент";
+        else
+           vKind = TXOBJ_PLUS15_1010;
+           comment = "ФЛ = нерезидент";
+        end;
+
+        PlusSum = Div_Sec0;
+     
+        if(PlusSum != 0)
+          stat = DL_NPTX_InsertTaxObject( OprServDoc.ValueDate  // Дата НДР
+                                         ,pClient               // Клиент
+                                         ,TXOBJ_DIR_IN          // Направление
+                                         ,5                     // Уровень
+                                         ,""                    // Признак "Пользовательский"
+                                         ,vKind                 // Вид НДР
+                                         ,PlusSum               // Сумма дохода/расхода
+                                         ,NATCUR                // Валюта дохода/расхода
+                                         ,analiticKind1         // Вид аналитики 1
+                                         ,idOperation           // Аналитика 1
+                                         ,0                     // Вид аналитики 2
+                                         ,-1                    // Аналитика 2
+                                         ,0                     // Вид аналитики 3
+                                         ,-1                    // Аналитика 3
+                                         ,0                     // Вид аналитики 4
+                                         ,-1                    // Аналитика 4
+                                         ,0                     // Вид аналитики 5
+                                         ,-1                    // Аналитика 5
+                                         ,TXOBJ_KIND6020                 
+                                         ,pContract
+                                         ,comment               // Комментарий
+                                         ,idOperation           // ID операции
+                                         ,idStep                // ID шага операции
+                                         ,1 );                  // Признак вызова не из операции расчета НОБ
+        end;
+  
+     end;
+
+     if(stat == 0)
+     
+        if( PtIsRes == NPTXPARTY_RESIDENT )
+          R = Rg(PtIsRes);
+        else
+          R = Rs(PtIsRes);
+        end;
+     
+        MinusSum = Div_Sec0 - DivPay_Sec0 / R;
+     
+        if(PtIsRes == NPTXPARTY_RESIDENT)
+           vKind = TXOBJ_MINUSG_601;
+           comment = "ФЛ = резидент, Rg = 13%";
+        else
+           vKind = TXOBJ_MINUS15_601;
+           comment = "ФЛ=нерезидент, Rs = 15%";
+        end;
+     
+        if( MinusSum != 0 )
+          stat = DL_NPTX_InsertTaxObject( OprServDoc.ValueDate  // Дата НДР
+                                         ,pClient               // Клиент
+                                         ,TXOBJ_DIR_OUT         // Направление
+                                         ,5                     // Уровень
+                                         ,""                    // Признак "Пользовательский"
+                                         ,vKind                 // Вид НДР
+                                         ,MinusSum              // Сумма дохода/расхода
+                                         ,NATCUR                // Валюта дохода/расхода
+                                         ,analiticKind1         // Вид аналитики 1
+                                         ,idOperation           // Аналитика 1
+                                         ,0                     // Вид аналитики 2
+                                         ,-1                    // Аналитика 2
+                                         ,0                     // Вид аналитики 3
+                                         ,-1                    // Аналитика 3
+                                         ,0                     // Вид аналитики 4
+                                         ,-1                    // Аналитика 4
+                                         ,0                     // Вид аналитики 5
+                                         ,-1                    // Аналитика 5
+                                         ,TXOBJ_KIND6020                 
+                                         ,pContract
+                                         ,comment               // Комментарий
+                                         ,idOperation           // ID операции
+                                         ,idStep                // ID шага операции
+                                         ,1 );                  // Признак вызова не из операции расчета НОБ
+     
+        end;
+     
+     end;
+     
+     if(stat == 0)
+
+       if(PtIsRes == NPTXPARTY_RESIDENT)
+          comment = "ФЛ = резидент";
+       else
+          comment = "ФЛ = нерезидент";
+       end;
+      
+       sum = Max(0,PlusSum - MinusSum);
+      
+       if(sum != 0)
+          stat = DL_NPTX_InsertTaxObject( OprServDoc.ValueDate  // Дата НДР
+                                         ,pClient               // Клиент
+                                         ,TXOBJ_DIR_IN          // Направление
+                                         ,7                     // Уровень
+                                         ,""                    // Признак "Пользовательский"
+                                         ,TXOBJ_BASESPECIAL_DIV // Вид НДР
+                                         ,sum                   // Сумма дохода/расхода
+                                         ,NATCUR                // Валюта дохода/расхода
+                                         ,analiticKind1         // Вид аналитики 1
+                                         ,idOperation           // Аналитика 1
+                                         ,0                     // Вид аналитики 2
+                                         ,-1                    // Аналитика 2
+                                         ,0                     // Вид аналитики 3
+                                         ,-1                    // Аналитика 3
+                                         ,0                     // Вид аналитики 4
+                                         ,-1                    // Аналитика 4
+                                         ,0                     // Вид аналитики 5
+                                         ,-1                    // Аналитика 5
+                                         ,TXOBJ_KIND6020                 
+                                         ,pContract
+                                         ,comment               // Комментарий
+                                         ,idOperation           // ID операции
+                                         ,idStep                // ID шага операции
+                                         ,1 );                  // Признак вызова не из операции расчета НОБ
+       end;
+
+     end;
+
+  elif(OprServDoc.PaymentType == DP_CRPPAYMENTTYPE_COUPON)
+       
+     if( DL_NPTX_IsCorpBondAfter2018(analitic3, OprServDoc.WarrantNum) )
+        comment = "Купонный доход для выплат от эмитента по корпоративным облигациям";
+        analiticKind1 = TXOBJ_KIND1095;
+        ProcSec_TS0 = DL_NPTX_GetTaxBaseCorpBondAfter2018(analitic3, OprServDoc.WarrantNum, Quantity);/*Сумма рассчитанной НОБ*/
+
+        if( ProcSec_TS0 != $0 )
+           stat = DL_NPTX_InsertTaxObject( OprServDoc.ValueDate  // Дата НДР
+                                          ,dppmacc.HolderID      // Клиент
+                                          ,TXOBJ_DIR_IN          // Направление
+                                          ,2                     // Уровень
+                                          ,""                    // Признак "Пользовательский"
+                                          ,TXOBJ_PROCSEC_TS_35   // Вид НДР
+                                          ,ProcSec_TS0           // Сумма дохода/расхода
+                                          ,NATCUR                // Валюта дохода/расхода
+                                          ,analiticKind1         // Вид аналитики 1
+                                          ,idOperation           // Аналитика 1
+                                          ,0                     // Вид аналитики 2
+                                          ,-1                    // Аналитика 2
+                                          ,TXOBJ_KIND3010        // Вид аналитики 3
+                                          ,analitic3             // Аналитика 3
+                                          ,TXOBJ_KIND4010        // Вид аналитики 4
+                                          ,analitic4             // Аналитика 4
+                                          ,TXOBJ_KIND5010        // Вид аналитики 5
+                                          ,analitic5             // Аналитика 5
+                                          ,TXOBJ_KIND6020        // Вид аналитики 6
+                                          ,pContract             // Аналитика 6
+                                          ,comment               // Комментарий
+                                          ,idOperation           // ID операции
+                                          ,idStep                // ID шага операции
+                                          ,1 );                  // Признак вызова не из операции расчета НОБ
+        end;
+
+        if( stat == 0 )
+           if(PtIsRes == NPTXPARTY_RESIDENT)
+              comment = "Клиент = резидент";
+              if( ProcSec_TS0 != $0 )
+                 stat = DL_NPTX_InsertTaxObject( OprServDoc.ValueDate  // Дата НДР
+                                                ,dppmacc.HolderID      // Клиент
+                                                ,TXOBJ_DIR_IN          // Направление
+                                                ,7                     // Уровень
+                                                ,""                    // Признак "Пользовательский"
+                                                ,TXOBJ_BASE_35         // Вид НДР
+                                                ,ProcSec_TS0           // Сумма дохода/расхода
+                                                ,NATCUR                // Валюта дохода/расхода
+                                                ,analiticKind1         // Вид аналитики 1
+                                                ,idOperation           // Аналитика 1
+                                                ,0                     // Вид аналитики 2
+                                                ,-1                    // Аналитика 2
+                                                ,0                     // Вид аналитики 3
+                                                ,-1                    // Аналитика 3
+                                                ,0                     // Вид аналитики 4
+                                                ,-1                    // Аналитика 4
+                                                ,0                     // Вид аналитики 5
+                                                ,-1                    // Аналитика 5
+                                                ,TXOBJ_KIND6020        // Вид аналитики 6
+                                                ,pContract             // Аналитика 6
+                                                ,comment               // Комментарий
+                                                ,idOperation           // ID операции
+                                                ,idStep                // ID шага операции
+                                                ,1 );                  // Признак вызова не из операции расчета НОБ
+              end;
+           end;
+        end;
+
+        if( stat == 0 )
+
+           sum = dppmacc.BruttoAmount;
+           cur = OprServDoc.Currency;
+           
+           if(OprServDoc.Currency != NATCUR)
+              ConvSum(sum, sum, OprServDoc.ValueDate, OprServDoc.Currency, NATCUR);
+           end;
+
+           sum = sum - ProcSec_TS0;
+           comment = "Процентные доходы по льготным бумагам";
+
+           if( sum != $0 )
+              stat = DL_NPTX_InsertTaxObject( OprServDoc.ValueDate  // Дата НДР
+                                             ,dppmacc.HolderID      // Клиент
+                                             ,TXOBJ_DIR_IN          // Направление
+                                             ,4                     // Уровень
+                                             ,""                    // Признак "Пользовательский"
+                                             ,TXOBJ_COUP0_GROUP     // Вид НДР
+                                             ,sum                   // Сумма дохода/расхода
+                                             ,NATCUR                // Валюта дохода/расхода
+                                             ,analiticKind1         // Вид аналитики 1
+                                             ,idOperation           // Аналитика 1
+                                             ,0                     // Вид аналитики 2
+                                             ,-1                    // Аналитика 2
+                                             ,TXOBJ_KIND3010        // Вид аналитики 3
+                                             ,analitic3             // Аналитика 3
+                                             ,TXOBJ_KIND4010        // Вид аналитики 4
+                                             ,analitic4             // Аналитика 4
+                                             ,TXOBJ_KIND5010        // Вид аналитики 5
+                                             ,analitic5             // Аналитика 5
+                                             ,TXOBJ_KIND6020        // Вид аналитики 6
+                                             ,pContract             // Аналитика 6
+                                             ,comment               // Комментарий
+                                             ,idOperation           // ID операции
+                                             ,idStep                // ID шага операции
+                                             ,1 );                  // Признак вызова не из операции расчета НОБ
+           end;
+        end;
+
+        if( (stat==0) and (OprServDoc.HoldTax == "X") )
+
+           sum = dppmacc.CalcTaxAmount;
+           if(OprServDoc.Currency != NATCUR)
+             ConvSum(sum, sum, OprServDoc.ValueDate, OprServDoc.Currency, NATCUR);
+           end;
+
+           if(PtIsRes == NPTXPARTY_RESIDENT)
+              vKind = TXOBJ_PAID_35;
+              comment = "Клиент = резидент";
+           else
+              vKind = TXOBJ_PAIDGENERAL;
+              comment = "Клиент = нерезидент";
+           end;
+          
+           if( sum != $0 )
+              stat = DL_NPTX_InsertTaxObject( OprServDoc.ValueDate  // Дата НДР
+                                             ,dppmacc.HolderID      // Клиент
+                                             ,TXOBJ_DIR_OUT         // Направление
+                                             ,8                     // Уровень
+                                             ,""                    // Признак "Пользовательский"
+                                             ,vKind                 // Вид НДР
+                                             ,sum                   // Сумма дохода/расхода
+                                             ,NATCUR                // Валюта дохода/расхода
+                                             ,analiticKind1         // Вид аналитики 1
+                                             ,idOperation           // Аналитика 1
+                                             ,0                     // Вид аналитики 2
+                                             ,-1                    // Аналитика 2
+                                             ,0                     // Вид аналитики 3
+                                             ,-1                    // Аналитика 3
+                                             ,0                     // Вид аналитики 4
+                                             ,-1                    // Аналитика 4
+                                             ,0                     // Вид аналитики 5
+                                             ,-1                    // Аналитика 5
+                                             ,TXOBJ_KIND6020        // Вид аналитики 6
+                                             ,pContract             // Аналитика 6
+                                             ,comment               // Комментарий
+                                             ,idOperation           // ID операции
+                                             ,idStep                // ID шага операции
+                                             ,1 );                  // Признак вызова не из операции расчета НОБ
+           end;
+
+        end;
+
+        if( (stat==0) and (PtIsRes != NPTXPARTY_RESIDENT) )
+           comment = "Клиент = нерезидент";
+           if( ProcSec_TS0 != $0 )
+              stat = DL_NPTX_InsertTaxObject( OprServDoc.ValueDate  // Дата НДР
+                                             ,dppmacc.HolderID      // Клиент
+                                             ,TXOBJ_DIR_IN          // Направление
+                                             ,7                     // Уровень
+                                             ,""                    // Признак "Пользовательский"
+                                             ,TXOBJ_BASEGENERAL     // Вид НДР
+                                             ,ProcSec_TS0           // Сумма дохода/расхода
+                                             ,NATCUR                // Валюта дохода/расхода
+                                             ,analiticKind1         // Вид аналитики 1
+                                             ,idOperation           // Аналитика 1
+                                             ,0                     // Вид аналитики 2
+                                             ,-1                    // Аналитика 2
+                                             ,0                     // Вид аналитики 3
+                                             ,-1                    // Аналитика 3
+                                             ,0                     // Вид аналитики 4
+                                             ,-1                    // Аналитика 4
+                                             ,0                     // Вид аналитики 5
+                                             ,-1                    // Аналитика 5
+                                             ,TXOBJ_KIND6020        // Вид аналитики 6
+                                             ,pContract             // Аналитика 6
+                                             ,comment               // Комментарий
+                                             ,idOperation           // ID операции
+                                             ,idStep                // ID шага операции
+                                             ,1 );                  // Признак вызова не из операции расчета НОБ
+           end;
+        end;
+
+        if( stat==0 )
+           comment = "Купонный доход по корпоративным облигациям";
+           if( ProcSec_TS0 != $0 )
+              stat = DL_NPTX_InsertTaxObject( OprServDoc.ValueDate  // Дата НДР
+                                             ,dppmacc.HolderID      // Клиент
+                                             ,TXOBJ_DIR_IN          // Направление
+                                             ,5                     // Уровень
+                                             ,""                    // Признак "Пользовательский"
+                                             ,TXOBJ_PLUS35_3023     // Вид НДР
+                                             ,ProcSec_TS0           // Сумма дохода/расхода
+                                             ,NATCUR                // Валюта дохода/расхода
+                                             ,analiticKind1         // Вид аналитики 1
+                                             ,idOperation           // Аналитика 1
+                                             ,0                     // Вид аналитики 2
+                                             ,-1                    // Аналитика 2
+                                             ,0                     // Вид аналитики 3
+                                             ,-1                    // Аналитика 3
+                                             ,0                     // Вид аналитики 4
+                                             ,-1                    // Аналитика 4
+                                             ,0                     // Вид аналитики 5
+                                             ,-1                    // Аналитика 5
+                                             ,TXOBJ_KIND6020        // Вид аналитики 6
+                                             ,pContract             // Аналитика 6
+                                             ,comment               // Комментарий
+                                             ,idOperation           // ID операции
+                                             ,idStep                // ID шага операции
+                                             ,1 );                  // Признак вызова не из операции расчета НОБ
+           end;
+        end;
+
+     else/*кроме Корп. облиг. с 2018*/
+        comment = "Выплата суммы купона в Депозитарии";
+        analiticKind1 = TXOBJ_KIND1095;
+        sum = dppmacc.BruttoAmount;
+        cur = OprServDoc.Currency;
+
+        if(OprServDoc.Currency != NATCUR)
+           ConvSum(ProcSec_TS0, sum, OprServDoc.ValueDate, OprServDoc.Currency, NATCUR);
+        else
+           ProcSec_TS0 = sum;
+        end;
+       
+        if( sum != $0 )
+           stat = DL_NPTX_InsertTaxObject( OprServDoc.ValueDate  // Дата НДР
+                                          ,dppmacc.HolderID      // Клиент
+                                          ,TXOBJ_DIR_IN          // Направление
+                                          ,2                     // Уровень
+                                          ,""                    // Признак "Пользовательский"
+                                          ,TXOBJ_PROCSEC_TS      // Вид НДР
+                                          ,sum                   // Сумма дохода/расхода
+                                          ,cur                   // Валюта дохода/расхода
+                                          ,analiticKind1         // Вид аналитики 1
+                                          ,idOperation           // Аналитика 1
+                                          ,0                     // Вид аналитики 2
+                                          ,-1                    // Аналитика 2
+                                          ,TXOBJ_KIND3010        // Вид аналитики 3
+                                          ,analitic3             // Аналитика 3
+                                          ,TXOBJ_KIND4010        // Вид аналитики 4
+                                          ,analitic4             // Аналитика 4
+                                          ,TXOBJ_KIND5010        // Вид аналитики 5
+                                          ,analitic5             // Аналитика 5
+                                          ,TXOBJ_KIND6020        // Вид аналитики 6
+                                          ,pContract             // Аналитика 6
+                                          ,comment               // Комментарий
+                                          ,idOperation           // ID операции
+                                          ,idStep                // ID шага операции
+                                          ,1 );                  // Признак вызова не из операции расчета НОБ
+        end;
+
+        if( (stat == 0) and (analitic5==30) )
+
+           if(PtIsRes == NPTXPARTY_RESIDENT)
+              vKind = TXOBJ_PLUS9_1110;
+              comment = "НГ=30 и клиент = резидент";
+           else
+              vKind = TXOBJ_PLUSG_1110;
+              comment = "НГ=30 и клиент = нерезидент";
+           end;
+
+           if( ProcSec_TS0 != $0 )
+              stat = DL_NPTX_InsertTaxObject( OprServDoc.ValueDate  // Дата НДР
+                                             ,pClient               // Клиент
+                                             ,TXOBJ_DIR_IN          // Направление
+                                             ,5                     // Уровень
+                                             ,""                    // Признак "Пользовательский"
+                                             ,vKind                 // Вид НДР
+                                             ,ProcSec_TS0           // Сумма дохода/расхода
+                                             ,NATCUR                // Валюта дохода/расхода
+                                             ,analiticKind1         // Вид аналитики 1
+                                             ,idOperation           // Аналитика 1
+                                             ,0                     // Вид аналитики 2
+                                             ,-1                    // Аналитика 2
+                                             ,0                     // Вид аналитики 3
+                                             ,-1                    // Аналитика 3
+                                             ,0                     // Вид аналитики 4
+                                             ,-1                    // Аналитика 4
+                                             ,0                     // Вид аналитики 5
+                                             ,-1                    // Аналитика 5
+                                             ,TXOBJ_KIND6020                 
+                                             ,pContract
+                                             ,comment               // Комментарий
+                                             ,idOperation           // ID операции
+                                             ,idStep                // ID шага операции
+                                             ,1 );                  // Признак вызова не из операции расчета НОБ
+           end;
+
+           if( (stat == 0) and (PtIsRes == NPTXPARTY_RESIDENT) )
+          
+              if( ProcSec_TS0 != $0 )
+                 stat = DL_NPTX_InsertTaxObject( OprServDoc.ValueDate  // Дата НДР
+                                                ,pClient               // Клиент
+                                                ,TXOBJ_DIR_IN          // Направление
+                                                ,7                     // Уровень
+                                                ,""                    // Признак "Пользовательский"
+                                                ,TXOBJ_BASESPECIAL     // Вид НДР
+                                                ,ProcSec_TS0           // Сумма дохода/расхода
+                                                ,NATCUR                // Валюта дохода/расхода
+                                                ,analiticKind1         // Вид аналитики 1
+                                                ,idOperation           // Аналитика 1
+                                                ,0                     // Вид аналитики 2
+                                                ,-1                    // Аналитика 2
+                                                ,0                     // Вид аналитики 3
+                                                ,-1                    // Аналитика 3
+                                                ,0                     // Вид аналитики 4
+                                                ,-1                    // Аналитика 4
+                                                ,0                     // Вид аналитики 5
+                                                ,-1                    // Аналитика 5
+                                                ,TXOBJ_KIND6020                 
+                                                ,pContract
+                                                ,comment               // Комментарий
+                                                ,idOperation           // ID операции
+                                                ,idStep                // ID шага операции
+                                                ,1 );                  // Признак вызова не из операции расчета НОБ
+              end;
+          
+           end;
+
+        end;
+
+        if( (stat == 0) and ((analitic5==20)or(analitic5==50)) )
+
+           if(analitic5==20)
+              vKind = TXOBJ_PLUSG_1011;
+              comment = "НГ = 20";
+           else
+              vKind = TXOBJ_COUP0_GROUP;
+              comment = "НГ = 50";
+           end;
+
+           if( ProcSec_TS0 != $0 )
+              stat = DL_NPTX_InsertTaxObject( OprServDoc.ValueDate  // Дата НДР
+                                             ,pClient               // Клиент
+                                             ,TXOBJ_DIR_IN          // Направление
+                                             ,5                     // Уровень
+                                             ,""                    // Признак "Пользовательский"
+                                             ,vKind                 // Вид НДР
+                                             ,ProcSec_TS0           // Сумма дохода/расхода
+                                             ,NATCUR                // Валюта дохода/расхода
+                                             ,analiticKind1         // Вид аналитики 1
+                                             ,idOperation           // Аналитика 1
+                                             ,0                     // Вид аналитики 2
+                                             ,-1                    // Аналитика 2
+                                             ,0                     // Вид аналитики 3
+                                             ,-1                    // Аналитика 3
+                                             ,0                     // Вид аналитики 4
+                                             ,-1                    // Аналитика 4
+                                             ,0                     // Вид аналитики 5
+                                             ,-1                    // Аналитика 5
+                                             ,TXOBJ_KIND6020                 
+                                             ,pContract
+                                             ,comment               // Комментарий
+                                             ,idOperation           // ID операции
+                                             ,idStep                // ID шага операции
+                                             ,1 );                  // Признак вызова не из операции расчета НОБ
+           end;
+
+        end;
+
+        if( (stat == 0) and (not ((PtIsRes == NPTXPARTY_RESIDENT) and (analitic5 == 30))) )
+
+           comment = "Кроме случаев, когда НГ=30 и клиент = резидент";
+
+           if( ProcSec_TS0 != $0 )
+              stat = DL_NPTX_InsertTaxObject( OprServDoc.ValueDate  // Дата НДР
+                                             ,pClient               // Клиент
+                                             ,TXOBJ_DIR_IN          // Направление
+                                             ,7                     // Уровень
+                                             ,""                    // Признак "Пользовательский"
+                                             ,TXOBJ_BASEGENERAL     // Вид НДР
+                                             ,ProcSec_TS0           // Сумма дохода/расхода
+                                             ,NATCUR                // Валюта дохода/расхода
+                                             ,analiticKind1         // Вид аналитики 1
+                                             ,idOperation           // Аналитика 1
+                                             ,0                     // Вид аналитики 2
+                                             ,-1                    // Аналитика 2
+                                             ,0                     // Вид аналитики 3
+                                             ,-1                    // Аналитика 3
+                                             ,0                     // Вид аналитики 4
+                                             ,-1                    // Аналитика 4
+                                             ,0                     // Вид аналитики 5
+                                             ,-1                    // Аналитика 5
+                                             ,TXOBJ_KIND6020                 
+                                             ,pContract
+                                             ,comment               // Комментарий
+                                             ,idOperation           // ID операции
+                                             ,idStep                // ID шага операции
+                                             ,1 );                  // Признак вызова не из операции расчета НОБ
+           end;
+
+           if( (stat==0) and (OprServDoc.HoldTax == "X") )
+
+              sum = dppmacc.CalcTaxAmount;
+              if(OprServDoc.Currency != NATCUR)
+                ConvSum(sum, sum, OprServDoc.ValueDate, OprServDoc.Currency, NATCUR);
+              end;
+             
+              if( sum != $0 )
+                 stat = DL_NPTX_InsertTaxObject( OprServDoc.ValueDate  // Дата НДР
+                                                ,dppmacc.HolderID      // Клиент
+                                                ,TXOBJ_DIR_OUT         // Направление
+                                                ,8                    // Уровень
+                                                ,""                    // Признак "Пользовательский"
+                                                ,TXOBJ_PAIDGENERAL     // Вид НДР
+                                                ,sum                   // Сумма дохода/расхода
+                                                ,NATCUR                // Валюта дохода/расхода
+                                                ,analiticKind1         // Вид аналитики 1
+                                                ,idOperation           // Аналитика 1
+                                                ,0                     // Вид аналитики 2
+                                                ,-1                    // Аналитика 2
+                                                ,0                     // Вид аналитики 3
+                                                ,-1                    // Аналитика 3
+                                                ,0                     // Вид аналитики 4
+                                                ,-1                    // Аналитика 4
+                                                ,0                     // Вид аналитики 5
+                                                ,-1                    // Аналитика 5
+                                                ,TXOBJ_KIND6020        // Вид аналитики 6
+                                                ,pContract             // Аналитика 6
+                                                ,comment               // Комментарий
+                                                ,idOperation           // ID операции
+                                                ,idStep                // ID шага операции
+                                                ,1 );                  // Признак вызова не из операции расчета НОБ
+              end;
+
+           end;
+
+        end;
+
+        if( (stat==0) and (OprServDoc.HoldTax == "X") and ((PtIsRes == NPTXPARTY_RESIDENT) and (analitic5 == 30)) )
+
+           analiticKind1 = TXOBJ_KIND1095;
+           sum = dppmacc.CalcTaxAmount;
+           if(OprServDoc.Currency != NATCUR)
+             ConvSum(sum, sum, OprServDoc.ValueDate, OprServDoc.Currency, NATCUR);
+           end;
+          
+           if( sum != $0 )
+              stat = DL_NPTX_InsertTaxObject( OprServDoc.ValueDate  // Дата НДР
+                                             ,dppmacc.HolderID      // Клиент
+                                             ,TXOBJ_DIR_OUT         // Направление
+                                             ,8                     // Уровень
+                                             ,""                    // Признак "Пользовательский"
+                                             ,TXOBJ_PAIDSPECIAL     // Вид НДР
+                                             ,sum                   // Сумма дохода/расхода
+                                             ,NATCUR                // Валюта дохода/расхода
+                                             ,analiticKind1         // Вид аналитики 1
+                                             ,idOperation           // Аналитика 1
+                                             ,0                     // Вид аналитики 2
+                                             ,-1                    // Аналитика 2
+                                             ,0                     // Вид аналитики 3
+                                             ,-1                    // Аналитика 3
+                                             ,0                     // Вид аналитики 4
+                                             ,-1                    // Аналитика 4
+                                             ,0                     // Вид аналитики 5
+                                             ,-1                    // Аналитика 5
+                                             ,TXOBJ_KIND6020        // Вид аналитики 6
+                                             ,pContract             // Аналитика 6
+                                             ,comment               // Комментарий
+                                             ,idOperation           // ID операции
+                                             ,idStep                // ID шага операции
+                                             ,1 );                  // Признак вызова не из операции расчета НОБ
+           end;
+
+        end;
+       
+     end;
+
+  end;
+ 
+  // Отсутствует лицензия на использование операции| "%s".
+  if( stat == 31899 )
+    stat = 0;
+  end;
+ 
+  return stat;
+end;
+
+private macro InsertNUTaxObjects()
+  var query, cmd, DataSet;
+  var FactReceiverID = GetFactReceiverForNUTX(dppmacc.HolderID);
+  var pContract = GetDepoContr();
+  var stat = 0;
+  var sum = $0, cur = -1, Comment = "";
+
+  query =   " SELECT dppmfi.t_FIID, dppmacfi.t_Quantity, fin.t_AvoirKind, "
+          + "        RSI_NUTX.GetNUTaxGroup(dppmfi.t_FIID, ?) TaxGroupNUTX "
+          + "   FROM ddpregstr_dbt regstr, ddppmfi_dbt dppmfi, ddppmacfi_dbt dppmacfi, dfininstr_dbt fin "
+          + "  WHERE regstr.t_DocumentID = ? "
+          + "    AND dppmfi.t_RegisterID = regstr.t_RegisterID "
+          + "    AND dppmacfi.t_DocumentID = regstr.t_DocumentID "
+          + "    AND dppmacfi.t_HolderAccID = ? "
+          + "    AND dppmacfi.t_FIID = dppmfi.t_FIID "
+          + "    AND fin.t_FIID = dppmacfi.t_FIID";
+
+  cmd = DL_RsdCommand( query );
+  cmd.AddParam(OprServDoc.ValueDate);
+  cmd.AddParam(OprServDoc.DocumentID);
+  cmd.AddParam(dppmacc.HolderAccID);
+  dataSet = cmd.Execute();
+
+  if( dataSet.MoveNext() )
+
+    if(OprServDoc.PaymentType == DP_CRPPAYMENTTYPE_DIVIDENDS)
+      sum = dppmacc.BruttoAmount;
+      cur = OprServDoc.Currency;
+
+      if(OprServDoc.Currency != NATCUR)
+        ConvSum(sum, sum, OprServDoc.ValueDate, OprServDoc.Currency, NATCUR);
+      end;
+
+      if(0 != DL_NUTX_InsertTaxObjectOnStep( OprServDoc.ValueDate  // Дата НДР
+                                            ,dppmacc.HolderID      // Клиент
+                                            ,FactReceiverID        // Фактический получатель дохода
+                                            ,NUTXOBJ_DIR_IN        // Направление
+                                            ,4                     // Уровень
+                                            ,""                    // Признак "Пользовательский"
+                                            ,NUTXOBJ_PLUS_01       // Вид НДР
+                                            ,sum                   // Сумма дохода/расхода
+                                            ,cur                   // Валюта дохода/расхода
+                                            ,TXOBJ_KIND1098        // Вид аналитики 1
+                                            ,OprServDoc.DocumentID // Аналитика 1
+                                            ,0                     // Вид аналитики 2
+                                            ,-1                    // Аналитика 2
+                                            ,TXOBJ_KIND3010        // Вид аналитики 3
+                                            ,DataSet.FIID          // Аналитика 3
+                                            ,0                     // Вид аналитики 4
+                                            ,-1                    // Аналитика 4
+                                            ,TXOBJ_KIND5010        // Вид аналитики 5
+                                            ,DataSet.TaxGroupNUTX  // Аналитика 5
+                                            ,TXOBJ_KIND6020                 
+                                            ,pContract
+                                            ,"Дивиденды в Депозитарии" )         // Комментарий
+       )
+         MsgBox( "Ошибка при создании объекта НДР" );
+         return 1;
+      end;
+
+    elif(OprServDoc.PaymentType == DP_CRPPAYMENTTYPE_COUPON)
+      var NuTxKind = 0;
+
+      if(  FI_AvrKindsEQ( FIKIND_AVOIRISS, AVOIRISSKIND_BOND_STATE, DataSet.AvoirKind ) //Государственная
+        or FI_AvrKindsEQ( FIKIND_AVOIRISS, AVOIRISSKIND_BOND_MUNICIPAL, DataSet.AvoirKind ) //Муниципальная
+        )
+        NuTxKind = NUTXOBJ_PLUS_10;
+        Comment  = "Купон по государственным/муниципальным облигациям в Депозитарии";
+      else
+        NuTxKind = NUTXOBJ_PLUS_11;
+        Comment  = "Купону по прочим облигациям в Депозитарии";
+      end;
+
+      sum = dppmacc.BruttoAmount;
+      cur = OprServDoc.Currency;
+
+      if(OprServDoc.Currency != NATCUR)
+        ConvSum(sum, sum, OprServDoc.ValueDate, OprServDoc.Currency, NATCUR);
+      end;
+
+      if(0 != DL_NUTX_InsertTaxObjectOnStep( OprServDoc.ValueDate  // Дата НДР
+                                            ,dppmacc.HolderID      // Клиент
+                                            ,FactReceiverID        // Фактический получатель дохода
+                                            ,NUTXOBJ_DIR_IN        // Направление
+                                            ,4                     // Уровень
+                                            ,""                    // Признак "Пользовательский"
+                                            ,NuTxKind              // Вид НДР
+                                            ,sum                   // Сумма дохода/расхода
+                                            ,cur                   // Валюта дохода/расхода
+                                            ,TXOBJ_KIND1098        // Вид аналитики 1
+                                            ,OprServDoc.DocumentID // Аналитика 1
+                                            ,0                     // Вид аналитики 2
+                                            ,-1                    // Аналитика 2
+                                            ,TXOBJ_KIND3010        // Вид аналитики 3
+                                            ,DataSet.FIID          // Аналитика 3
+                                            ,0                     // Вид аналитики 4
+                                            ,-1                    // Аналитика 4
+                                            ,TXOBJ_KIND5010        // Вид аналитики 5
+                                            ,DataSet.TaxGroupNUTX  // Аналитика 5
+                                            ,TXOBJ_KIND6020                 
+                                            ,pContract
+                                            ,Comment )             // Комментарий
+       )
+         MsgBox( "Ошибка при создании объекта НДР" );
+         return 1;
+      end;
+
+    end;
+
+    if(IsInstNeresForNUTX(FactReceiverID, OprServDoc.ValueDate) == true) //Фактический получатель - юрлицо-нерезидент
+    
+      sum = dppmacc.CalcTaxAmount;
+      if(OprServDoc.Currency != NATCUR)
+        ConvSum(sum, sum, OprServDoc.ValueDate, OprServDoc.Currency, NATCUR);
+      end;
+
+      if(sum > 0)
+        if(0 != DL_NUTX_InsertTaxObjectOnStep( OprServDoc.ValueDate  // Дата НДР
+                                              ,dppmacc.HolderID      // Клиент
+                                              ,FactReceiverID        // Фактический получатель дохода
+                                              ,NUTXOBJ_DIR_OUT       // Направление
+                                              ,5                     // Уровень
+                                              ,""                    // Признак "Пользовательский"
+                                              ,NUTXOBJ_DUETAX        // Вид НДР
+                                              ,sum                   // Сумма дохода/расхода
+                                              ,cur                   // Валюта дохода/расхода
+                                              ,TXOBJ_KIND1098        // Вид аналитики 1
+                                              ,OprServDoc.DocumentID // Аналитика 1
+                                              ,0                     // Вид аналитики 2
+                                              ,-1                    // Аналитика 2
+                                              ,TXOBJ_KIND3010        // Вид аналитики 3
+                                              ,DataSet.FIID          // Аналитика 3
+                                              ,0                     // Вид аналитики 4
+                                              ,-1                    // Аналитика 4
+                                              ,TXOBJ_KIND5010        // Вид аналитики 5
+                                              ,DataSet.TaxGroupNUTX  // Аналитика 5
+                                              ,TXOBJ_KIND6020                 
+                                              ,pContract
+                                              ,"Налог, подлежащей уплате в Деопзитарии" ) // Комментарий
+         )
+           MsgBox( "Ошибка при создании объекта НДР" );
+           return 1;
+        end;
+      end;
+
+      if(SumTaxAmountNatcur > 0)
+        if(0 != DL_NUTX_InsertTaxObjectOnStep( OprServDoc.ValueDate  // Дата НДР
+                                              ,dppmacc.HolderID      // Клиент
+                                              ,FactReceiverID        // Фактический получатель дохода
+                                              ,NUTXOBJ_DIR_OUT       // Направление
+                                              ,6                     // Уровень
+                                              ,""                    // Признак "Пользовательский"
+                                              ,NUTXOBJ_PAIDTAX       // Вид НДР
+                                              ,SumTaxAmountNatcur    // Сумма дохода/расхода
+                                              ,cur                   // Валюта дохода/расхода
+                                              ,TXOBJ_KIND1098        // Вид аналитики 1
+                                              ,OprServDoc.DocumentID // Аналитика 1
+                                              ,0                     // Вид аналитики 2
+                                              ,-1                    // Аналитика 2
+                                              ,TXOBJ_KIND3010        // Вид аналитики 3
+                                              ,DataSet.FIID          // Аналитика 3
+                                              ,0                     // Вид аналитики 4
+                                              ,-1                    // Аналитика 4
+                                              ,TXOBJ_KIND5010        // Вид аналитики 5
+                                              ,DataSet.TaxGroupNUTX  // Аналитика 5
+                                              ,TXOBJ_KIND6020                 
+                                              ,pContract
+                                              ,"Удержанный налог в Деопзитарии" ) // Комментарий
+         )
+           MsgBox( "Ошибка при создании объекта НДР" );
+           return 1;
+        end;
+      end;
+
+    end;
+  end;
+
+  return stat;
+end;
+
+macro ExecuteStep( d, dpac, docKind, idOperation, idStep )
+  var tr, PaymentObj = null;
+  var party = TRecHandler( "party" );
+  var State, IsReturnIncome = false;
+  var IsIntegrated, IsExtCarry;
+ 
+  //клиентский ли счет?
+  private macro IsClientAcc(Account)
+    var МаскиСчетовКлиентов = "", err;
+    GetRegistryValue("PS\\REQOPENACC\\СЧЕТА КЛИЕНТОВ", V_STRING, МаскиСчетовКлиентов, err);
+    if (StrLen (МаскиСчетовКлиентов)==0)
+      return false; //масок нет - сравнивать не с чем
+    end;
+    МаскиСчетовКлиентов = StrSubst ( МаскиСчетовКлиентов, ";", "," );
+    if(CompareStrWithMasks (МаскиСчетовКлиентов,Account) == 0)
+      return true; //счет подходит под маску - значит клиентский
+    end;
+    return false;
+  end;
+ 
+  // Является ли счет счетом заданного типа?
+  private macro CheckAccount_Type( Account:string, Chapter:integer, FIID:integer, AccType:string ):bool
+ 
+    var SelectStr:string;
+    var params:TArray;
+    var rs:object;
+ 
+    SelectStr = "select count(1) " +
+                "from daccount_dbt acc " +
+                "where  acc.t_Account       = :Account " +
+                "  and  acc.t_Chapter       = :Chapter " +
+                "  and  acc.t_Code_Currency = :FIID    " +
+                "  and  acc.t_Type_Account like '%" + AccType + "%' ";
+ 
+    params = makeArray( SQLParam( "Account", Account ),
+                        SQLParam( "Chapter", Chapter ),
+                        SQLParam( "FIID"   , FIID    ));
+ 
+    rs = execSQLselect( SelectStr, params, FALSE );
+ 
+    if( rs AND rs.moveNext() )
+      if( rs.value(0) > 0 )
+        return true;
+      end;
+    end;
+ 
+    return false;
+  end;
+ 
+  macro FillCarry(tr, PaymentObj)
+ 
+    tr.Date_Carry = PaymentObj.ValueDate;
+ 
+    tr.Chapter         = 1;
+    tr.Department      = {OperDprt};
+ 
+    tr.Number_Pack     = PaymentObj.NumberPack;
+    tr.Numb_Document   = PaymentObj.Number;
+    tr.Ground          = PaymentObj.Ground;
+    tr.FIIDPayer       = PaymentObj.FuturePayerFIID;
+    tr.FIIDReceiver    = PaymentObj.FutureReceiverFIID;
+    tr.SumPayer        = PaymentObj.FuturePayerAmount;
+    tr.SumReceiver     = PaymentObj.FutureReceiverAmount;
+    tr.AccountPayer    = PaymentObj.FuturePayerAccount;
+    tr.AccountReceiver = PaymentObj.FutureReceiverAccount;
+ 
+    //определить шифр проводки
+    //Условия, при которых устанавливается значение Шифра равное 17:
+    //   - кредитуемый  счет  является "клиентским счетом"
+    // И
+    //   - дебетуемый счет  -  не является "клиентским счетом" и не является корсчетом
+ 
+    if( (IsClientAcc(tr.AccountReceiver)) AND (NOT IsClientAcc(tr.AccountPayer)) AND (NOT CheckAccount_Type( tr.AccountPayer, tr.Chapter, tr.FIIDPayer, "К" )) )
+      tr.Shifr_Oper = 17;
+    end;
+ 
+  end;
+ 
+  macro GetPaymentID()
+    var PmID = 0;
+    var cmd, DataSet;
+ 
+    cmd = DL_RSDCommand(  "select t_PaymentID from dpmpaym_dbt"
+                        + " where t_DocKind = " + SP_DEPOPER_DIVIDEND
+                        + "   and t_DocumentID = ? "
+                        + "   and t_Purpose IN (" + PM_PURP_SECUR_INCOME + ", " + PM_PURP_RETURNINCOME+")"
+                        + "   and t_SubPurpose = ? "
+                       );
+    cmd.AddParam(dppmacc.DocumentID);
+    cmd.AddParam(dppmacc.HolderAccID);
+ 
+    DataSet = cmd.Execute();
+    if(DataSet.moveNext())
+      PmID = DataSet.PaymentID;
+    end;
+
+    return PmID;
+  end;
+
+  macro GetIsIntegrated()
+    var ErrCode, Path = "COMMON\\WORK_MODE\\INTEGRATED", Integr = false;
+
+    GetRegistryValue(Path, V_BOOL, Integr, ErrCode);
+    if( ErrCode != 0 )
+       MsgBox("Ошибка при получении значения настройки \"" + Path + "\"");
+       Integr = false;
+    end;
+
+    return Integr;
+  end;
+
+  macro GetIsExtCarry():bool
+    var ErrCode, Path = "COMMON\\WORK_MODE\\ПРОВОДКА ПО ИСХОДЯЩИМ ПЛАТЕЖАМ", ExtCarry = false;
+
+    GetRegistryValue(Path, V_BOOL, ExtCarry, ErrCode);
+    if( ErrCode != 0 )
+       MsgBox("Ошибка при получении значения настройки \"" + Path + "\"");
+       ExtCarry = false;
+    end;
+
+    return ExtCarry;
+  end;
+
+  /////////////////////////////////////////////////////////////////////////////
+
+  if((dppmacc.PaymentWay == PW_INPAYMENT)
+  or (dppmacc.PaymentWay == PW_OUTPAYMENT)
+  or (dppmacc.PaymentWay == PW_CONSOLIDATED)) /* Если выплата через банк */
+
+    var PaymentID = GetPaymentID();
+    if( PaymentID > 0 )
+      PaymentObj = RSBPayment( PaymentID );
+    else
+      msgbox("Не найден платеж");
+      return 1;
+    end;
+
+    IsIntegrated = GetIsIntegrated();
+    IsExtCarry = GetIsExtCarry();
+
+    // Если (НЕинтегрированный режим и платеж внутренний) либо (ИНТЕГРИРОВАННЫЙ режим и ПРОВОДКА_ПО_ИСХ_ПЛАТЕЖАМ)
+    // то проводку по платежу формируем и оплачиваем
+    if(((NOT IsIntegrated) AND (PaymentObj.ReceiverBankID == {OurBank})) OR
+      (IsIntegrated AND ((IsExtCarry) OR (PaymentObj.ReceiverBankID == {OurBank}))) )
+
+      tr = PaymentObj.MakeTransaction();
+
+      if(tr == null)
+        msgbox("Ошибка при создании проводки");
+        return 1;
+      end;
+
+      FillCarry(tr, PaymentObj);
+
+      if( not tr.Carry() )
+        msgbox("Ошибка при вставке проводки");
+        return 1;
+      end;
+    end;
+
+    if((NOT IsIntegrated) OR ((not IsExtCarry) AND (PaymentObj.ReceiverBankID == {OurBank}))) // Если НЕинтегрированный или внутренний платеж - платеж закрываем
+      PaymentObj.PaymStatus = PM_FINISHED;
+    else // Если ИНТЕГРИРОВАННЫЙ - отправим его в модуль межбанковских расчетов
+      PaymentObj.PaymStatus = PM_READY_TO_SEND;
+      PaymentObj.IsFactPaym = SET_CHAR;
+    end;
+
+    if(PaymentObj.Purpose == PM_PURP_RETURNINCOME)
+      IsReturnIncome = true;
+    end;
+  else
+    /* Выдача наличными - в текущей версии не поддерживается */
+  end;
+
+  State = DPPMAC_STATE_PAID;
+  if(IsReturnIncome)
+    State = DPPMAC_STATE_RET;
+  end;
+
+  if(not DP_ChangePMACCState(dppmacc.DocumentID, dppmacc.HolderAccID, State, {curdate}, true))
+    msgbox("Ошибка при изменении статуса выплаты");
+    return 1;
+  end;
+
+  if(PaymentObj != NULL)
+    if(not DP_GetPmRAccDescription(dppmacc.DocumentID, dppmacc.HolderAccID, State, {curdate}, PaymentObj.Ground))
+      msgbox("Ошибка заполнения поля \"Основание\"");
+      return 1;
+    end;
+  end; 
+
+  if(IsReturnIncome == false)
+    if( SP_CheckLicence()
+    and DL_WORKWITHDEPOSITARY
+    and ( OprServDoc.PaymentType != DP_CRPPAYMENTTYPE_DIVIDENDS ) )
+      if( InsertRetire() != 0 )
+        MsgBox( "Ошибка при вставке погашения" );
+        return 1;
+      end;
+    end;
+
+    if( (OprServDoc.HoldTax == "X") and (dppmacc.CalcTaxAmount != 0))
+      if( InsertHoldTaxCarry() != 0 )
+        MsgBox( "Ошибка при вставке проводки по оплате налога" );
+        return 1;
+      end;
+    end;
+
+    if( ( ПолучитьСубъекта( dppmacc.HolderID, party ) == 0 )
+    and ( ( OprServDoc.PaymentType == DP_CRPPAYMENTTYPE_DIVIDENDS )
+       or ( OprServDoc.PaymentType == DP_CRPPAYMENTTYPE_COUPON ) ) )
+        if(party.rec.LegalForm == PTLEGF_PERSN)
+          // Получение дохода (НДР по выплате)
+          if( InsertTaxObject( idOperation, idStep ) != 0 )
+            MsgBox( "Ошибка формирования объектов НДР" );
+            return 1;
+          end;
+        elif((party.rec.LegalForm == PTLEGF_INST) and 
+             (DL_UseNUTX() == true) and
+             (IsNeresidentForNUTX(party.rec.PartyID, OprServDoc.ValueDate) == true)
+            )
+          if( InsertNUTaxObjects() != 0 )
+            MsgBox( "Ошибка формирования объектов НДР" );
+            return 1;
+          end;
+        end;
+    end;
+  end;
+
+  return 0;
+end;

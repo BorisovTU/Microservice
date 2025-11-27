@@ -1,0 +1,374 @@
+/**
+ @file IPS.mac
+ @brief Функционал для получения отчетов посредством IPS documents factory.
+ 
+ Файл содержит функционал для получения отчетов посредством IPS documents factory.
+ 
+  # tag
+ - functional_block:Отчетность_Клиент
+ - code_type:API
+ - code_type:Report
+ - Квалификация
+ 
+  # changeLog
+ |date       |author         |tasks                                                     |note                                                        
+ |-----------|---------------|----------------------------------------------------------|-------------------------------------------------------------
+ |15.05.2025 |Топорков Д.В.  |BOSS-7878                                                 | Создание
+*/
+import "err_handl.mac";
+import "dlutils.mac";
+import "cb_sql.mac";
+import "StorageInfo.mac";
+
+private const RESULT_CODE_SUCCESS = 0;
+private const RESULT_CODE_ERROR = 1;
+private const RESULT_CODE_ANSWER_NOT_FOUND = -1;
+
+private const IPS_WAITING_TIME_REGVAL_NAME = "РСХБ\\ИНТЕГРАЦИЯ\\ВРЕМЯ ОЖИДАНИЯ ОТВЕТА ОТ IPS";
+private const IPS_MINIO_ENDPOINT_REGVAL_NAME = "РСХБ\\ИНТЕГРАЦИЯ\\INTEGR_SERV_PRM\\IPS\\MINIO ENDPOINT";
+private const IPS_MINIO_ACCESS_KEY_REGVAL_NAME = "РСХБ\\ИНТЕГРАЦИЯ\\INTEGR_SERV_PRM\\IPS\\MINIO ACCESS KEY";
+private const IPS_MINIO_SECRET_KEY_REGVAL_NAME = "РСХБ\\ИНТЕГРАЦИЯ\\INTEGR_SERV_PRM\\IPS\\MINIO SECRET KEY";
+
+private const IPS_DFACTORY_BUCKET_NAME = "ips-document-factory";
+private const SEARCH_PERIOD_MSEC = 3000;
+private const ERROR_FILE_SIZE_LIMIT = 1000;
+
+ /**
+@brief Функция выбора значения в зависимости от условия
+@param[in] condition Условие для выбора (true/false !0/0)
+@param[in] valueTrue Значение которое вернет функция при condition = true (тип Variant)
+@param[in] valueFalse Значение которое вернет функция при condition = false (тип Variant)
+@return valueTrue при condition=true, valueFalse при condition=false (тип Variant)
+*/
+private macro IIF(condition, resultOnTrue, resultOnFalse)
+   if (condition)
+      return resultOnTrue;
+   else
+      return resultOnFalse;
+   end;
+end;
+
+/**
+@brief Класс результата выполнения
+*/
+class CResultObject(pErrorCode: Integer, pErrorDesc: String)
+  var errorCode = IIF(ValType(pErrorCode) == V_INTEGER, pErrorCode, 0);
+  var errorDesc = IIF(ValType(pErrorDesc) == V_STRING, pErrorDesc, "");
+  var data;
+end;
+
+/**
+@brief Классы данных результата выполнения
+*/
+class CGUIDData(pGUID)
+  var GUID = pGUID;
+end;
+
+class CFileInfoData(pFileName)
+  var fileName = pFileName;
+end;
+
+/**
+@brief Вызвать хранимую процедуру, формирующую данные и запрос в IPS Фабрику документов
+@param[in] storedProcName Наименование хранимой процедуры формирования запроса в фабрику документов
+@param[in] inputParamsArray Массив входных переменных для хранимой процедуры
+@return CResultObject, содержащий GUID для поиска ответа от IPS
+
+Предполагается, что параметры хранимой процедуры представлены в виде (param1 IN, ... paramN IN, GUID OUT VARCHAR2, ErrorCode OUT NUMBER, ErrorDesc OUT VARCHAR2)
+где GUID - GUID для поиска ответа от фабрики документов
+*/
+macro IPSDFactoryRunStoredProc(storedProcName: String, inputParamsArray: TArray): CResultObject
+  var result = CResultObject();
+
+  var paramsStr = "?, ?, ?";
+  var paramIndex = 0;
+  
+  while (paramIndex < inputParamsArray.size)
+    paramsStr = paramsStr + ", ?";
+    paramIndex = paramIndex + 1;
+  end;
+  
+  var cmd = RSDCommand("{call " + storedProcName + "(" + paramsStr + ")}");
+  
+  paramIndex = 0;
+  
+  while (paramIndex < inputParamsArray.size)
+    cmd.AddParam("", RSDBP_IN, inputParamsArray(paramIndex));
+    paramIndex = paramIndex + 1;
+  end;
+  
+  cmd.AddParam("GUID", RSDBP_OUT, V_STRING, 50);
+  cmd.AddParam("errorCode", RSDBP_OUT, V_INTEGER);
+  cmd.AddParam("errorDesc", RSDBP_OUT, V_STRING, 2000);
+  
+  cmd.Execute();
+  
+  result.errorCode = cmd.Value("errorCode");
+  result.errorDesc = SQL_ConvTypeStr(cmd.Value("errorDesc"));
+  result.data = CGUIDData(SQL_ConvTypeStr(cmd.Value("GUID")));
+  
+  return result;
+  
+OnError(err)
+  return CResultObject(err.Code, GetFullErrorMessage(err));
+end;
+
+/**
+@brief Получить переменную V_TIME из кол-ва секунд
+@param[in] seconds Количество секунд
+@return V_TIME переменная
+*/
+private macro GetTimeFromSeconds(seconds: Integer)
+  var hours: Integer = seconds / 3600;
+  seconds = Mod(seconds, 3600);
+  var minutes: Integer = seconds / 60;
+  seconds = Mod(seconds, 60);
+  return time(hours, minutes, seconds);
+end;
+
+/**
+@brief Переместить файл
+@param[in] fullSourceFileName Путь к перемещаемому файлу
+@param[in] fullTargetFileName Полный путь к результирующему файлу, расширение игнорируется (возможна передача без указания имени файла, только путь)
+@return CResultObject, содержащий путь к результирующему файлу
+*/
+macro MoveFile(fullSourceFileName: String, fullTargetFileName: String): CResultObject
+  var targetFileName;
+  var sourceFileName;
+  var sourceFileExt;
+  
+  var targetDir = SplitFile(fullTargetFileName, targetFileName);
+  var sourceDir = SplitFile(fullSourceFileName, sourceFileName, sourceFileExt);
+  
+  if (targetFileName == "")
+    targetFileName = sourceFileName;
+  end;
+  
+  fullTargetFileName = GetUnexistedFilename(targetDir + targetFileName + sourceFileExt);
+  
+  if (not CopyFile(fullSourceFileName, fullTargetFileName))
+    return CResultObject(RESULT_CODE_ERROR, "Ошибка копирования файла " + fullSourceFileName + " в " + fullTargetFileName);
+  end;
+
+  var result = CResultObject(RESULT_CODE_SUCCESS);
+  result.data = CFileInfoData(fullTargetFileName);
+  RemoveFile(fullSourceFileName);
+  
+  return result;
+end;
+
+/**
+@brief Проверить скачанный из minio файл
+@param[in] filename Имя скаченного файла
+@return CResultObject, с кодом ошибки
+Файл проверяется на существование + в случае ошибки скачивания в файл может записаться xml с ошибкой
+*/
+private macro CheckDownloadedFile(filename)
+  macro IsErrorXmlFile(filename)
+     var downloadedFile = TStreamDoc(filename, "r", "utf8");
+     var fileContext = "";
+     if (downloadedFile.ReadLine(@fileContext) and (Index(fileContext, "<?xml") > 0) and downloadedFile.ReadLine(@fileContext) and (Index(fileContext, "<Error>") > 0))
+       return true;
+     end;
+
+     return false;
+  onerror(err)
+    return true;
+  end;
+
+  var downloadedFileSize = 0;
+
+  if (not GetFileInfo(filename, null, null, downloadedFileSize))
+    return CResultObject(RESULT_CODE_ERROR, "Ошибка скачивания из хранилища minio: файл не найден");
+  elif ((downloadedFileSize < ERROR_FILE_SIZE_LIMIT) and (IsErrorXmlFile(filename)))
+    return CResultObject(RESULT_CODE_ERROR, "Ошибка скачивания из хранилища minio: получен xml с ошибкой");
+  end;
+
+  return CResultObject(RESULT_CODE_SUCCESS);
+end;
+
+/**
+@brief Скачать файл на СП из IPS фабрика документов
+@param[in] fileLink Ссылка на файл (значение x-document-path ответа IPS фабрики документов)
+@return CResultObject, содержащий ссылку на файл на сервере приложений
+*/
+macro IPSDFactoryDownloadFile(fileLink: String): CResultObject
+  var IPSMinioEndpoint = GetRegValueOrDefValue(IPS_MINIO_ENDPOINT_REGVAL_NAME, V_STRING, "");
+  var IPSMinioAccessKey = GetRegValueOrDefValue(IPS_MINIO_ACCESS_KEY_REGVAL_NAME, V_STRING, "");
+  var IPSMinioSecretKey = GetRegValueOrDefValue(IPS_MINIO_SECRET_KEY_REGVAL_NAME, V_STRING, "");
+  
+  if ((StrLen(IPSMinioEndpoint) == 0) or (StrLen(IPSMinioAccessKey) == 0) or (StrLen(IPSMinioSecretKey) == 0))
+    return CResultObject(RESULT_CODE_ERROR, "Ошибка чтения параметров подключения к IPS MINIO");
+  end;
+  
+  var linkFileName, linkFileExt;
+  SplitFile(fileLink, linkFileName, linkFileExt);
+  var downloadedFileName = GetFullTxtPath(false) + linkFileName + linkFileExt;
+
+  var res = StartProg("start", "/wait minioget.sh " + IPSMinioEndpoint + " " 
+                                                    + IPSMinioAccessKey + " " 
+                                                    + IPSMinioSecretKey + " " 
+                                                    + IPS_DFACTORY_BUCKET_NAME + " "
+                                                    + "\"" + fileLink + "\" "
+                                                    + "\"../TxtFile/" + linkFileName + linkFileExt + "\"", false);
+  RslWait(500);
+
+  var result = CheckDownloadedFile(downloadedFileName);
+  result.data = CFileInfoData(downloadedFileName);
+  
+  return result;
+  
+OnError(err)
+  return CResultObject(err.Code, GetFullErrorMessage(err));
+end;
+
+/**
+@brief Получить результат обработки запроса от IPS фабрика документов
+@param[in] resultGUID GUID по которому производится поиск ответа по формированию документа в IPS фабрике документов
+@return CResultObject, содержащий ссылку на файл в ответе от IPS (значение x-document-path)
+*/
+private macro IPSGetResultInfo(resultGUID: String): CResultObject
+  var query = "DECLARE \n" +
+                "v_json CLOB; \n" +
+                "v_xml XMLType; \n" +
+                "v_requestState VARCHAR2(5); \n" +
+                "v_errorCode PLS_INTEGER := 0; \n" +
+                "v_requestErrors VARCHAR2(2000); \n" +
+                "v_url VARCHAR2(2000); \n" +
+              "BEGIN \n" +
+                "BEGIN \n" +
+                  "SELECT messBody, XMLTYPE(messmeta) \n" +
+                    "INTO v_json, v_xml \n" +
+                    "FROM itt_q_message_log \n" +
+                   "WHERE corrMsgID = :GUID; \n" +
+                "EXCEPTION WHEN NO_DATA_FOUND THEN \n" +
+                  "v_errorCode := -1; \n" +
+                  "v_requestErrors := 'Ответ от IPS не найден'; \n" +
+                "END; \n" +
+
+                "IF v_errorCode = 0 THEN \n" +
+                  "SELECT JSON_VALUE(v_json, '$.isSuccess' NULL ON ERROR) \n" +
+                    "INTO v_requestState \n" +
+                    "FROM dual; \n" +
+  
+                  "IF v_requestState = 'true' THEN \n" +
+                    "BEGIN \n" +
+                      "v_json := REPLACE(v_xml.extract('//KAFKA/Header/text()').getClobVal(), '&quot;', '\"'); \n" +
+                      "v_url := JSON_VALUE(v_json, '$.\"x-document-path\"'); \n" +
+                    "EXCEPTION WHEN OTHERS THEN \n" +
+                      "NULL; \n" +
+                    "END; \n" +
+    
+                    "IF v_url IS NULL THEN \n" +
+                      "v_errorCode := 1; \n" +
+                      "v_requestErrors := 'Ошибка разбора ответа от IPS'; \n" +
+                    "END IF; \n" +
+                  "ELSE \n" +
+                    "v_errorCode := 1; \n" +
+                    "SELECT SUBSTR(LISTAGG(errVal, '; '), 1, 2000) \n" +
+                      "INTO v_requestErrors \n" +
+                      "FROM (SELECT jt.errVal FROM JSON_TABLE(v_json, '$.errors[*]' COLUMNS (errVal VARCHAR2(2000) PATH '$.\"errorMessage\"')) jt); \n" +
+
+                    "IF v_requestErrors IS NULL THEN \n" +
+                      "v_requestErrors := 'Ответ от IPS не содержит признака \"Успех\"'; \n" +
+                    "END IF; \n" +
+                  "END IF; \n" +
+                "END IF; \n" +
+
+                ":errorCode := v_errorCode; \n" +
+                ":errorDesc := v_requestErrors; \n" +
+                ":url := v_url; \n" +
+              "END; ";
+  var cmd = RSDCommand(query);
+  
+  cmd.AddParam("GUID", RSDBP_IN, resultGUID);
+  cmd.AddParam("errorCode", RSDBP_OUT, V_INTEGER);
+  cmd.AddParam("errorDesc", RSDBP_OUT, V_STRING, 2000);
+  cmd.AddParam("url", RSDBP_OUT, V_STRING, 2000);
+  cmd.Execute();
+  
+  var result = CResultObject(cmd.Value("errorCode"), SQL_ConvTypeStr(cmd.Value("errorDesc")));
+  result.data = CFileInfoData(SQL_ConvTypeStr(cmd.Value("url")));
+  
+  return result;
+  
+OnError(err)
+  return CResultObject(err.Code, GetFullErrorMessage(err));
+end;
+
+/**
+@brief Получить результат запроса в IPS фабрику документов и сохранить сформированный файл на СП
+@param[in] resultGUID GUID по которому производится поиск ответа по формированию документа в IPS фабрике документов
+@param[in] waitingPeriod Максимальное время ожидания ответа в секундах
+@return CResultObject, содержащий имя загруженного файла на СП
+*/
+macro IPSDFactoryGetResult(resultGUID: String, waitingPeriod: Integer): CResultObject
+  var result = CResultObject(RESULT_CODE_ANSWER_NOT_FOUND);
+  
+  if ((ValType(resultGUID) != V_STRING) or (StrLen(resultGUID) != 36))
+    return CResultObject(RESULT_CODE_ERROR, "Некорректный GUID " + String(resultGUID));
+  end;
+  
+  var waitingPeriodLimit = GetRegValueOrDefValue(IPS_WAITING_TIME_REGVAL_NAME, V_INTEGER, 120);
+  
+  if ((ValType(waitingPeriod) != V_INTEGER) or (waitingPeriod < 0) or (waitingPeriod > waitingPeriodLimit))
+    waitingPeriod = waitingPeriodLimit;
+  end;
+
+  var searchEndTime = Time() + GetTimeFromSeconds(waitingPeriod);
+  
+  while (result.errorCode == RESULT_CODE_ANSWER_NOT_FOUND)
+    result = IPSGetResultInfo(resultGUID);
+    
+    if (result.errorCode != RESULT_CODE_ANSWER_NOT_FOUND)
+      break;
+    elif (Time() >= searchEndTime)
+      result = CResultObject(RESULT_CODE_ERROR, "Превышено время ожидания ответа от IPS");
+    else
+      RslWait(SEARCH_PERIOD_MSEC);
+    end;
+  end;
+  
+  if (result.errorCode == RESULT_CODE_SUCCESS)
+    result = IPSDFactoryDownloadFile(result.data.fileName);
+  end;
+  
+  return result;
+  
+OnError(err)
+  return CResultObject(err.Code, GetFullErrorMessage(err));
+end;
+
+/**
+@brief Выполнить шаги по формированию документа посредством сервиса IPS фабрика документов
+@param[in] targetFileName Полный путь сохранения и желаемое имя файла с расширением (необязательный параметр)
+@param[in] storedProcName Наименование хранимой процедуры формирования запроса в фабрику документов
+@param[in] inputParamsArray Массив входных переменных для хранимой процедуры
+@return CResultObject, содержащий имя загруженного файла
+
+Расширение в параметре targetFileName игнорируется, будет установлено расширение согласно готового файла из IPS ФД
+*/
+macro IPSDFactoryRequest(targetFileName: String, storedProcName: String, inputParamsArray: TArray): CResultObject
+  BegAction(0, "Подготовка данных", false);
+  var result = IPSDFactoryRunStoredProc(storedProcName, inputParamsArray);
+  EndAction(0);
+  
+  if (result.errorCode == RESULT_CODE_SUCCESS)
+    RslWait(500);
+    BegAction(0, "Формирование документа", false);
+    result = IPSDFactoryGetResult(result.data.GUID);
+    
+    if (result.errorCode == RESULT_CODE_SUCCESS)
+      if ((ValType(targetFileName) == V_STRING) and (StrLen(targetFileName) > 0))
+        result = MoveFile(result.data.fileName, targetFileName);
+      end;
+    end;
+    EndAction(0);
+  end;
+  
+  return result;
+  
+OnError(err)
+  EndAction(0);
+  return CResultObject(err.Code, GetFullErrorMessage(err));
+end;

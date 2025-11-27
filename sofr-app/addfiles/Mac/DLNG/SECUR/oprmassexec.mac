@@ -1,0 +1,478 @@
+/*
+$Name:         oprmassexec.mac
+$Module:       Ценные бумаги
+$Description:  Вспомогательные общие ф-и для массового исполнения сделок
+*/
+import rsd, "cb_sql.mac", "sp_car.mac", "sp_class.mac";
+
+PRIVATE CONST PARTONEVIEWNAME = "DV_MKDEAL_MASS_EXEC_CALEND";
+PRIVATE CONST PARTTWOVIEWNAME = "DV_MKDEAL_MASS_EXEC_2_CALEND";
+
+MACRO SP_Mass_GetOperationGroup():INTEGER
+  VAR DataSet, Group = 0,
+      cmd = RSDCommand( "SELECT T_KIND_OPERATION FROM DOPRTEMP_VIEW WHERE ROWNUM = 1" );
+
+  cmd.execute();
+  DataSet = TRsbDataSet( cmd );
+  if( DataSet.MoveNext() )
+     Group = GetOperationGroup( DataSet.Kind_Operation )
+  end;
+  return Group;
+END;
+
+PRIVATE MACRO SP_OprDateKindID( NumberDate:INTEGER, DocKind:INTEGER ):INTEGER
+
+  var RetVal:integer = 0;
+
+  if( (DocKind != NULL) and (DocKind == DL_AVRWRT) )
+     RetVal = 12700000+NumberDate; /*для списаний/зачислений*/
+  elif( (DocKind != NULL) and (DocKind == DL_SECUROWN) )
+     RetVal = 483000000+NumberDate; /*для сделок СЭБ*/
+  elif( (DocKind != NULL) and (DocKind == DL_AVRWRTOWN) )
+     RetVal = 483100000+NumberDate; /*для зачислений/списаний СЭБ*/
+  else
+     RetVal = 10100000+NumberDate; /*для сделок !*/
+  end;
+
+  return RetVal;
+END;
+
+// Установить статус операции в массовом режиме 
+// Аналог InsertOprStatus для единичного режима исполнения
+CLASS SP_MassOperStatus()
+  PRIVATE VAR m_init = false;
+
+  PRIVATE MACRO Init():INTEGER
+    SQL_Truncate( "doprstval_tmp" );
+    m_init = true;
+
+    return 0;
+  ONERROR
+    return 1;
+  END;
+
+  MACRO Execute( Msg:STRING ):INTEGER
+     if( m_init )
+        m_init = false;
+
+        SQL_Execute( "{ CALL RSI_RsbOperation.procSetOprStatusValue() }", Msg, true );
+     end;
+
+     return 0;
+  ONERROR
+     return 1;
+  END;
+
+  MACRO Insert( StatusKindID:INTEGER, NumValue:INTEGER, where:STRING /*, ... параметры WHERE */ ):INTEGER
+     
+     var cmd = RsdCommand( " INSERT INTO doprstval_tmp (t_ID_Operation, t_StatusKindID, t_DocKind, t_ID_Step, t_NumValue) " +
+                           " SELECT t_ID_Operation, ?, T_BofficeKind, t_ID_Step, ?" +                       
+                           "   FROM "+PARTONEVIEWNAME+
+                           IIF( where != NULL, " WHERE " + where, "" )
+                         );
+
+     cmd.addParam( "", RSDBP_IN, StatusKindID  );
+     cmd.addParam( "", RSDBP_IN, NumValue ); 
+
+     VAR i = 4, Val;
+     while( getparm( i, Val ) )
+       cmd.addParam( "", RSDBP_IN, Val ); 
+       i = i + 1;
+     end;
+
+     if( not m_init )
+        Init();
+     end;
+
+     SQL_Execute( cmd );
+     return 0;
+
+  ONERROR
+     return 1;
+  END;
+
+END;
+
+// Установить даты операции в массовом режиме 
+// Аналог DefineOprDate для единичного режима исполнения
+CLASS SP_MassOperDate(DocKind)
+  PRIVATE VAR m_init = false;
+  PRIVATE VAR m_DocKind = DocKind;
+  if (ValType(m_DocKind)==V_UNDEF)
+    m_DocKind = DL_SECURITYDOC;
+  end;
+
+  PRIVATE MACRO Init():INTEGER
+    SQL_Truncate( "doprsetdates_tmp" );
+    m_init = true;
+
+    return 0;
+  ONERROR
+    return 1;
+  END;
+
+  MACRO Execute( Msg:STRING ):INTEGER
+     if( m_init )     
+        m_init = false;
+
+        SQL_Execute( "DECLARE "+
+                     " v_Error INTEGER; "+
+                     "BEGIN "+
+                     " v_Error := RSI_RsbOperation.procMassSetOprDates( true ); "+
+                     " IF( v_Error != 0 ) THEN "+
+                     "   RAISE_APPLICATION_ERROR( -20101, 'Error procMassSetOprDates' ); "+
+                     " END IF; "+
+                     "END; ", Msg, true );
+     end;
+
+     return 0;
+  ONERROR
+     return 1;
+  END;
+
+  PRIVATE MACRO __Insert( ViewName:STRING, NumberDate:INTEGER, FldDate:STRING, where:STRING ):INTEGER
+     
+     var cmd = RsdCommand( " INSERT INTO doprsetdates_tmp( t_ID_Operation, t_ID_Step, t_DateKindID, t_DateNew ) " +
+                           " SELECT t_ID_Operation, t_ID_Step, ?, "+FldDate+                       
+                           "   FROM "+ ViewName + " " +
+                           IIF( where != NULL, " WHERE " + where, "" )
+                         );
+
+     cmd.addParam( "", RSDBP_IN, SP_OprDateKindID(NumberDate, m_DocKind)  );
+
+     if( not m_init )
+        Init();
+     end;
+
+     SQL_Execute( cmd );
+     return 0;
+
+  ONERROR
+     return 1;
+  END;
+
+  /*по первой части сделки*/
+  MACRO Insert( NumberDate:INTEGER, FldDate:STRING, where:STRING ):INTEGER
+     return __Insert(PARTONEVIEWNAME, NumberDate, FldDate, where );
+  END;
+
+  /*по второй части сделки*/
+  MACRO Insert_2( NumberDate:INTEGER, FldDate:STRING, where:STRING ):INTEGER
+     return __Insert(PARTTWOVIEWNAME, NumberDate, FldDate, where );
+  END;
+
+END;
+
+// Добавить SQL код, вызываемый при откате операции. 
+// Используется в транзакции массового исполнения шагов операций для дальнейшего восстановления объекта при откате операции
+PRIVATE MACRO Opr_SetBkoutData( ExecStr:STRING, AddFrom:STRING, AddWhere:STRING, Mes:STRING ):INTEGER
+  VAR SqlCmd = 
+        "DECLARE "+
+         "c_RollbackData RSI_RsbOperation.BkoutData_cur; "+
+        "BEGIN "+
+          "open c_RollbackData for select Deals.t_ID_Operation, Deals.t_ID_Step, "+ ExecStr +
+                                   " from "+PARTONEVIEWNAME+" Deals "+ IIF(AddFrom != NULL, ", "+AddFrom, "" ) + IIF(AddWhere != NULL, " WHERE "+AddWhere, "" )+"; "+
+          "  RSI_RsbOperation.SetBkoutDataForAll( c_RollbackData ); "+
+          "close c_RollbackData; "+
+        " END; ";
+
+  SQL_Execute( SqlCmd, Mes, true );
+  return 0;
+
+ONERROR
+  return 1;
+END;
+
+// Сохранить состояние DL_LEG в транзакции массового исполнения шагов операций для дальнейшего восстановления при откате операции
+// Для последующего изменения стстуса можно использовать SP_Mass_UpdateLegStatus
+MACRO SP_Mass_SaveLegStatus( AddWhere:STRING ):INTEGER
+
+  return Opr_SetBkoutData( "'UPDATE ddl_leg_dbt ul' || "+
+                                 "' SET  ul.t_OperState =' || to_char(leg.t_OperState) || "+
+                                 "'     ,ul.t_BitMask   =' || to_char(leg.t_BitMask) || "+
+                               "' WHERE ul.t_ID =' || to_char(leg.T_ID) ",
+                               "ddl_leg_dbt leg",  
+                               "Deals.T_LegID = leg.t_ID " + IIF(AddWhere != NULL, " AND "+AddWhere, "" ),
+                               "Сохранение статуса части сделки для возможности дальнейшего отката изменений."
+                         );
+END;
+
+// Обновить статус части сделки (DL_LEG.t_OperState + DL_LEG.t_BitMask) в транзакции массового исполнения шагов операций. 
+// Аналог ОбновитьСтатусЧастиСделки для единичного режима исполнения
+MACRO SP_Mass_UpdateLegStatus( SqlCond:STRING, NewStatus:INTEGER ):INTEGER
+
+ VAR cmd = RsdCommand(
+       "UPDATE DDL_LEG_DBT leg SET leg.t_OperState = ? "+
+        IIF( NewStatus == DL_LEG_OUTBAL, ", leg.t_BitMask = RSI_rsb_bitwise.b_or( leg.t_BitMask, 536870912 /*0x20000000 DL_LEG_OFFBALANCEDEAL*/ )", "") +
+        " WHERE leg.t_ID IN (SELECT t_LegID FROM "+PARTONEVIEWNAME+" Deals "+ IIF(SqlCond != NULL, " WHERE " + SqlCond, "") +" )"                                        
+      );
+  cmd.addParam( "", RSDBP_IN, NewStatus );
+
+  SQL_Execute( cmd, "Обновление статуса части сделки.", true );
+
+  return 0;
+
+ONERROR
+  return 1;
+END;
+
+// Сохранить состояние ТО (DDLRQ_DBT) в транзакции массового исполнения шагов операций для дальнейшего восстановления при откате операции
+// Для последующего изменения стстуса можно использовать SP_Mass_UpdateRqStatus
+PRIVATE MACRO Mass_SaveRqStatus( AddWhere:STRING, DealPart:INTEGER ):INTEGER
+
+  return Opr_SetBkoutData( "'call RSI_DLRQ.RSI_RestoreRQ( '||to_char(Deals.t_ID_Operation)||', '||to_char(Deals.t_ID_Step)||', "+string(DLRQ_ACTION_UPDATE)+", '||to_char(rq.t_ID)||')'",
+                           "ddlrq_dbt rq",  
+                           "Deals.T_DealID = rq.t_DocID AND rq.t_DocKind in ("+DL_SECURITYDOC+", "+DL_AVRWRT+", "+DL_SECUROWN+", "+DL_AVRWRTOWN+") AND rq.t_DealPart = "+string(DealPart) + " " + IIF(AddWhere != NULL, " AND "+AddWhere, "" ),
+                           "Сохранение статуса ТО для возможности дальнейшего отката изменений."
+                         );
+END;
+
+// Сохранить состояние ТО (DDLRQ_DBT) в транзакции массового исполнения шагов операций для дальнейшего восстановления при откате операции
+// Для последующего изменения стстуса можно использовать SP_Mass_UpdateRqStatus
+MACRO SP_Mass_SaveRqStatus( RqType:INTEGER, DealPart:INTEGER ):INTEGER
+   return Mass_SaveRqStatus( "rq.t_Type = "+string(RqType), DealPart );
+END;
+
+// Сохранить состояние ТО (DDLRQ_DBT) в транзакции массового исполнения шагов операций для дальнейшего восстановления при откате операции
+// Для последующего изменения стстуса можно использовать SP_Mass_UpdateRqStatus
+// Для шага "Исполнение операции", меняются сразу оплата и поставка
+MACRO SP_Mass_SaveRqStatus_ExecOper( DealPart:INTEGER ):INTEGER
+   return Mass_SaveRqStatus( "(rq.t_Type = "+string(DLRQ_TYPE_PAYMENT)+" OR rq.t_Type = "+string(DLRQ_TYPE_DELIVERY)+")", DealPart );
+END;
+
+// Обновить статус ТО (DDLRQ_DBT) в транзакции массового исполнения шагов операций. 
+// Аналог УстановитьСтатусТО для единичного режима исполнения
+MACRO SP_Mass_UpdateRqStatus( Type:INTEGER, State:INTEGER, ChangeDateNumber:INTEGER, DealPart:INTEGER, DocKind:INTEGER ):INTEGER
+
+  VAR cmd = RsdCommand( "{ CALL RSI_DLRQ.Mass_UpdateStatus(?,?,?,?) }" );
+
+  cmd.addParam( "", RSDBP_IN, Type );
+  cmd.addParam( "", RSDBP_IN, IIF( DealPart == NULL, 1, DealPart ) );
+  cmd.addParam( "", RSDBP_IN, State );
+  cmd.addParam( "", RSDBP_IN, SP_OprDateKindID(ChangeDateNumber, DocKind) );
+
+  SQL_Execute( cmd, "Установка статуса ТО.", true );
+  return 0;
+
+ONERROR
+  return 1;
+END;
+
+// Обновить статус ТО (DDLRQ_DBT) в транзакции массового исполнения шагов операций. 
+// Аналог SP_Mass_UpdateRqStatus
+// Для шага "Исполнение операции", меняются сразу оплата и поставка
+MACRO SP_Mass_UpdateRqStatus_ExecOper( NumberDate:INTEGER, DealPart:INTEGER, DocKind:INTEGER ):INTEGER
+
+  VAR cmd = RsdCommand( "{ CALL RSI_DLRQ.Mass_UpdateStatus_ExecOper(?,?) }" );
+  cmd.addParam( "", RSDBP_IN, IIF( DealPart == NULL, 1, DealPart ) );
+  cmd.addParam( "", RSDBP_IN, SP_OprDateKindID(NumberDate, DocKind) );
+
+  SQL_Execute( cmd, "Установка статуса ТО.", true );
+  return 0;
+
+ONERROR
+  return 1;
+END;
+
+// Сохранить состояние графика сделки (DDLGRDEAL_DBT) в транзакции массового исполнения шагов операций для дальнейшего восстановления при откате операции
+// Для последующего изменения стстуса можно использовать SP_Mass_UpdateGrDealAcc
+MACRO SP_Mass_SaveDLGRDEAL( TemplNum:INTEGER, AccNum:INTEGER ):INTEGER
+                                        
+  return Opr_SetBkoutData( "'call RSI_DLGR.RSI_BackUpdateGrDealAcc( '||to_char(Deals.T_BofficeKind)||','||to_char(Deals.T_DealID)||','||to_char(Deals.t_PFI)||',"+TemplNum+", "+AccNum+",'||to_char(Deals.t_ID_Operation)||','||to_char(Deals.t_ID_Step)||');'",
+                           NULL,  
+                           NULL,
+                           "Сохранение статуса графика сделки для возможности дальнейшего отката изменений."
+                         );
+END;
+
+MACRO SP_Mass_SaveDLGRDEALInsert( TemplNum:INTEGER , PFI:INTEGER):INTEGER
+                                        
+  return Opr_SetBkoutData( "'call RSI_DLGR.RSI_BackInsertGrDeal( '||to_char(Deals.T_BofficeKind)||','||to_char(Deals.T_DealID)||','||to_char(Deals.t_ID_Operation)||','||to_char(Deals.t_ID_Step)||',"+TemplNum+","+PFI+");'",
+                           NULL,  
+                           NULL,
+                           "Сохранение состояния графика сделки для возможности дальнейшего отката изменений."
+                         );
+END;
+
+// Сохранить денежные параметры сделки ПРЕПО в транзакции массового исполнения шагов операций для дальнейшего восстановления при откате операции
+MACRO SP_Mass_SaveCurrParmREPO():INTEGER
+                                        
+  return Opr_SetBkoutData( "'call RSB_PMWRTOFF.RSI_WRTRestoreCurrParmREPO('||to_char(Deals.T_DealID)||','||to_char(Rsb_Secur.GetDealMarketTestAttrID(to_char(Deals.t_BofficeKind),to_char(Deals.t_DealID)))||','||to_char(Deals.t_ID_Operation)||','||to_char(Deals.t_ID_Step)||');'",
+                           NULL,  
+                           NULL,                                               
+                           "Сохранение денежных параметров сделки ПРЕПО для возможности дальнейшего отката изменений."
+                         );
+END;
+
+// Создание денежных параметров сделки ПРЕПО в транзакции массового исполнения шагов операций. 
+// Аналог DL_WRTCreateCurrParmREPO для единичного режима исполнения
+MACRO SP_Mass_CreateCurrParmREPO():INTEGER
+
+  VAR cmd = RsdCommand( "{ CALL RSB_PMWRTOFF.RSI_Mass_CreateCurrParmREPO }" );
+  SQL_Execute( cmd, "Создание денежных параметров сделки ПРЕПО.", true );
+  return 0;
+
+ONERROR
+  return 1;
+END;
+
+// Сохранить состояние графика сделки (DDLGRDEAL_DBT) в транзакции массового исполнения шагов операций для дальнейшего восстановления при откате операции
+// Для последующего изменения стстуса можно использовать SP_Mass_UpdateGrDealAcc
+// Для шага "Исполнение операции", меняются сразу оплата и поставка
+MACRO SP_Mass_SaveDLGRDEAL_ExecOper( DealPart:INTEGER ):INTEGER
+  VAR templ_payment, templ_delivaery;
+
+  if( (DealPart != null) AND (DealPart == 2) )
+     templ_payment   = DLGR_TEMPL_PAYMENT2; 
+     templ_delivaery = DLGR_TEMPL_DELIVERY2;
+  else 
+     templ_payment   = DLGR_TEMPL_PAYMENT;
+     templ_delivaery = DLGR_TEMPL_DELIVERY;
+  end;
+
+  return Opr_SetBkoutData("'BEGIN "+
+                            " RSI_DLGR.RSI_BackUpdateGrDealAcc('||to_char(Deals.T_BofficeKind)||','||to_char(Deals.T_DealID)||','||to_char(Deals.t_PFI)||',"+string(templ_payment) +","+string(DLGR_ACCKIND_BACKOFFICE)+",'||to_char(Deals.t_ID_Operation)||','||to_char(Deals.t_ID_Step)||');"+
+                            " RSI_DLGR.RSI_BackUpdateGrDealAcc('||to_char(Deals.T_BofficeKind)||','||to_char(Deals.T_DealID)||','||to_char(Deals.t_PFI)||',"+string(templ_delivaery)+","+string(DLGR_ACCKIND_BACKOFFICE)+",'||to_char(Deals.t_ID_Operation)||','||to_char(Deals.t_ID_Step)||');"+
+                           "END;'",
+                           NULL,  
+                           NULL,
+                           "Сохранение статуса графика сделки для возможности дальнейшего отката изменений."
+                         );
+END;
+
+// Обновить статус графика сделки (DDLGRDEAL_DBT) в транзакции массового исполнения шагов операций. 
+// Аналог DL_UpdateGrDealAcc для единичного режима исполнения
+MACRO SP_Mass_UpdateGrDealAcc( TemplNum:INTEGER, AccNum:INTEGER, State:INTEGER ):INTEGER
+
+  VAR cmd = RsdCommand( "{ CALL RSI_DLGR.Mass_UpdateGrDealAcc(?,?,?) }" );
+
+  cmd.addParam( "", RSDBP_IN, TemplNum );
+  cmd.addParam( "", RSDBP_IN, AccNum );
+  cmd.addParam( "", RSDBP_IN, State );
+
+  SQL_Execute( cmd, "Установка статуса графика сделки.", true );
+  return 0;
+
+ONERROR
+  return 1;
+END;
+
+// Обновить статус графика сделки (DDLGRDEAL_DBT) в транзакции массового исполнения шагов операций. 
+// Аналог DL_UpdateGrDealAcc для единичного режима исполнения
+// Для шага "Исполнение операции", меняются сразу оплата и поставка
+MACRO SP_Mass_UpdateGrDealAcc_ExecOper( DealPart:INTEGER ):INTEGER
+
+  SQL_Execute( "{ CALL RSI_DLGR.Mass_UpdateGrDealAcc_ExecOper( "+string( IIF( DealPart == NULL, 1, DealPart ) )+" ) }", "Установка статуса графика сделки.", true );
+  return 0;
+
+ONERROR
+  return 1;
+END;
+
+// аналог СконвертироватьСуммыСделки для массового режима
+MACRO SP_Mass_ConvertDealSum( NumberDate:INTEGER, ChangeRQ:BOOL ):INTEGER
+  VAR cmd, DS, stat = 0;
+
+  cmd = RSDCommand(" SELECT Deal.t_DealID, "+
+                          " (SELECT t_Date FROM doprdates_dbt WHERE t_ID_Operation=Deal.t_ID_Operation AND t_DateKindID=?) AS Dp "+
+                     " FROM "+PARTONEVIEWNAME+" Deal, dfininstr_dbt fi" +
+                    " WHERE fi.t_fiid = Deal.t_PFI AND Deal.t_NKD > 0 AND Deal.t_CFI != fi.t_FaceValueFI"
+                  );
+  cmd.addParam( "", RSDBP_IN, SP_OprDateKindID( NumberDate ) );
+  cmd.execute();
+
+  DS = TRsbDataSet( cmd );
+
+  while( DS.MoveNext() )
+     if( not СконвертироватьСуммыСделки( SPFirstDoc( LEG_KIND_DL_TICK, DS.DealID ), SQL_ConvTypeDate(DS.Dp), ChangeRQ ) )
+        stat = 1;
+        break;
+     end;
+  end;
+
+  return stat;
+END;
+
+/* Проверить просроченность DDLRQ_DBT в транзакции массового исполнения шагов операций */
+MACRO SC_MassRQCheckOverdue( Type:INTEGER, DealPart:INTEGER, RqName:STRING ):INTEGER
+
+  var cmd = RsdCommand("{ CALL RSI_DLRQ.SC_MassRQCheckOverdue(?,?,?) }");
+
+  cmd.addParam("", RSDBP_IN, Type);
+  cmd.addParam("", RSDBP_IN, IIF(DealPart == NULL, 1, DealPart));
+  cmd.addParam("", RSDBP_IN, RqName);
+
+  SQL_Execute(cmd, "Проверка ТО на просроченность.", true);
+  return 0;
+
+ONERROR
+  return 1;
+END;
+
+MACRO SP_Mass_CreateMassError( ErrorNumber:INTEGER, ErrorMessage:STRING, id_operation:INTEGER ):INTEGER
+  VAR cmd;
+  CreateErrMsg( ErrorNumber, ErrorMessage );
+
+  if( (id_operation != NULL) AND (id_operation > 0) )
+     cmd = RSDCommand( "UPDATE doprtemp_tmp SET t_errorstatus = ?, t_errormessage = ? WHERE t_id_operation = ?" );
+     cmd.addParam( "", RSDBP_IN, ErrorNumber ); 
+     cmd.addParam( "", RSDBP_IN, ErrorMessage ); 
+     cmd.addParam( "", RSDBP_IN, id_operation ); 
+  else
+     cmd = RSDCommand( "UPDATE doprtemp_tmp SET t_errorstatus = ?, t_errormessage = ? ");
+     cmd.addParam( "", RSDBP_IN, ErrorNumber ); 
+     cmd.addParam( "", RSDBP_IN, ErrorMessage ); 
+  end;
+
+  cmd.NullConversion = true;
+  cmd.execute();
+
+  return 0;
+
+ONERROR
+  return 1;
+END;
+
+
+MACRO SP_Mass_SaveDealMarketTestOwn():INTEGER
+
+  return Opr_SetBkoutData( "'CALL RSB_SECUR.SetDealMarketTestAttrID('||to_char(Deals.T_DealID)||', '''||to_char(NVL(atcor.T_ValidFromDate, "+GetSQLDate(date(0,0,0))+"))||''', '||to_char(NVL(atcor.T_AttrID, 0))||');'",
+                           "dobjatcor_dbt atcor",
+                           "atcor.t_ObjectType(+) = rsb_secur.GetDealObjType(Deals.T_BOfficeKind) AND atcor.t_Object(+) = LPAD(Deals.T_DealID, 34, '0') AND atcor.t_GroupID(+) = 47",
+                           "Сохранение теста на рыночность для возможности дальнейшего отката изменений."
+                         );
+END;
+
+MACRO SP_Mass_ExecDealMarketTestOwn():INTEGER
+
+  VAR cmd = RsdCommand( "{ CALL RSB_SECUR.Mass_ExecDealMarketTestOwn() }" );
+
+  SQL_Execute( cmd, "Проведение теста на рыночность.", true );
+  return 0;
+
+ONERROR
+  return 1;
+END;
+
+
+MACRO SP_Mass_ExecDealInTaxAttr():INTEGER
+
+  VAR cmd = RsdCommand( "{ CALL RSB_SECUR.Mass_ExecDealInTaxAttr() }" );
+
+  SQL_Execute( cmd, "Установка признаков зачисления НДФЛ.", true );
+  return 0;
+
+ONERROR
+  return 1;
+END;
+
+
+MACRO SP_Mass_SaveDealInTaxAttr():INTEGER
+
+  return Opr_SetBkoutData( "'CALL RSB_SECUR.SetDealInTaxAttrID('||to_char(Deals.T_DealID)||', '''||to_char(NVL(Deals.T_DEALDATE, "+GetSQLDate(date(0,0,0))+"))||''', 0);'",
+                           NULL,
+                           "INSTR(RSB_SECUR.get_OperSysTypes( Deals.T_KIND_OPERATION, NULL ), 'T') > 0 AND Deals.T_BOFFICEKIND = "+DL_AVRWRT,
+                           "Сохранение признака зачисления НДФЛ для возможности дальнейшего отката изменений."
+                         );
+                                        
+END;

@@ -1,0 +1,283 @@
+/*
+$Name:               pmbencom.mac
+$Module:            РКО, ББ
+$Description:      Оплата комиссии типа BEN
+*/
+
+import PaymInter, OprInter, FIInter, SFInter, oralib, likepy, cbctuncs, pm_tools, sfgetcat, InsCarryDoc;
+
+//Возможные исходы событий
+private const PMSF_ACTION_OK    :integer = 0, //Ok
+              PMSF_ACTION_ERROR :integer = 1; //Возникла ошибка
+
+macro PayBenFromCorr():bool
+  var PayBenFromCorr:bool = false;
+  var err:integer = 0;
+
+  GetRegistryValue( "PS\\CPORDER\\ORDER\\PAYBENFROMCORR", V_BOOL, PayBenFromCorr, err );
+  if( err != 0 )
+    msgbox(" Ошибка чтения настройки PS\\CPORDER\\ORDER\\PAYBENFROMCORR ");
+    return false;
+  end;
+
+  return PayBenFromCorr;
+end;
+
+//-----------------------------------------------------------------------------
+// Оплата комиссии типа BEN (комиссии передаются первым параметром)
+//-----------------------------------------------------------------------------
+macro PayCommisArrayBEN( OprComList:TArray, PaymentObj:RsbPayment, CommisPayerAccount:string, CommisPayerFIID:integer )
+  //file oprcom( "oprsfcom.dbt" );
+  file contr( "sfcontr.dbt") key 0;
+  file sfcomiss( "sfcomiss.dbt" );
+  // для обработки единовременных
+  var sicredit = TRecHandler("sfsi.dbt");
+  var siNDS    = TRecHandler("sfsi.dbt");
+
+  var NewTaxSum, NewNDSSum, СуммаДебета, deltaBaseAmount, delta, Department:integer;
+  var i:integer = 0;
+  RECORD oprcom( oprsfcom );
+  var CarryKind = GetPaymentCarryKind( PaymentObj );
+  var PayerChargeOffSum = $0;// сумма списания со счета плательщика
+ 
+  while( i < OprComList.Size )
+
+    Copy(oprcom, OprComList[i]);
+
+    NewTaxSum = oprcom.Sum; 
+    NewNDSSum = oprcom.SumNDS;
+    Department = -1;
+
+    // Найти договор обслуживания, заданный oprcom.SfContrID    
+    contr.ID = oprcom.SfContrID;
+    if( not getEQ( contr ) )
+      MsgBox("Не найден договор обслуживания: ", oprcom.SfContrID);
+      return PMSF_ACTION_ERROR;
+    end;
+
+    // Найти комиссию sfcomiss, заданную oprcom.FeeType и oprcom.CommNumber
+    sfcomiss.feeType = oprcom.FeeType;
+    sfcomiss.number = oprcom.CommNumber;
+    if( not getEQ( sfcomiss ) )
+      MsgBox("Не найдена комиссия");
+      return PMSF_ACTION_ERROR;
+    end;
+
+    // Вид создаваемых платежных инструкций ПЗО
+    var kindSfSiCredit = IfThenElse( oprcom.IsIncluded == "X", CALC_SFSI_KIND   , COMISS_SFSI_KIND ); 
+    var kindSfSiNDS    = IfThenElse( oprcom.IsIncluded == "X", CALCNDS_SFSI_KIND, NDS_SFSI_KIND    );
+
+    // Получить платежные инструкции
+    if( ( not GetDefComSfSi( oprcom.feeType, oprcom.ID, kindSfSiCredit, "", NULL, NULL, NULL, sicredit ) ) or
+        ( oprcom.SumNDS != 0 and 
+          not GetDefComSfSi( oprcom.feeType, oprcom.ID, kindSfSiNDS   , "", NULL, NULL, NULL, siNDS    ) ) )
+      MsgBox("Ошибка при взятии платежных инструкций");
+      return PMSF_ACTION_ERROR;
+    end;
+
+    // Проверить наличие валюты в sicredit
+    if( sicredit.rec.FIID < 0 )
+      msgbox("Не задана валюта в ПИ ПЗО");
+      return PMSF_ACTION_ERROR;
+    end;
+
+    if( (sicredit.rec.Account == "") or
+        (not AccountExistOpen(sicredit.rec.FIID, sicredit.rec.Account, 1/*CHAPT1*/, Department)) 
+      )
+      msgbox("Не задан получатель в ПИ ПЗО");
+      return PMSF_ACTION_ERROR;
+    end;
+    
+    // проверить, чтобы получатель ПЗО находился в нашем банке (в филиале pmpaym.Department);
+    if( Department != PaymentObj.Department )
+      msgbox("При оплате комиссий проводками счет получателя комиссий должен быть в нашем банке");
+      return PMSF_ACTION_ERROR;
+    end;
+
+    if( oprcom.FIID_Sum != sicredit.rec.FIID )
+      if( ConvSum(NewTaxSum, oprcom.Sum, PaymentObj.ValueDate, oprcom.FIID_Sum, sicredit.rec.FIID) )
+        msgbox("Невозможно конвертировать сумму комиссии");
+        return PMSF_ACTION_ERROR;
+      end;
+      if( oprcom.SumNDS > 0 )
+        if( ConvSum( NewNDSSum, oprcom.SumNDS, PaymentObj.ValueDate, oprcom.FIID_Sum, siNDS.FIID ) )
+          msgbox("Невозможно конвертировать сумму НДС");
+          return PMSF_ACTION_ERROR;
+        end;
+      end;
+    end;
+
+    
+    // Сформировать проводку (возможно, мультивалютную) оплаты комиссии
+    var accTrn:object = PaymentObj.MakeTransaction();
+
+    if( accTrn == NULL )
+      msgbox("Ошибка при создании проводки оплаты комиссии");
+      return PMSF_ACTION_ERROR;
+    end;
+
+    accTrn.Chapter       = PaymentObj.Chapter;    
+    accTrn.Ground        = "Комиссия за перевод платежного поручения №" + PaymentObj.Number + " от " + PaymentObj.Date + ".";
+    accTrn.Date_Carry    = PaymentObj.ValueDate;
+    accTrn.Department    = PaymentObj.Department;
+    accTrn.ResultCarry   = SFPAY_CARRY;
+
+    accTrn.FIIDPayer     = CommisPayerFIID;
+    accTrn.AccountPayer  = CommisPayerAccount;
+
+    if( ConvSum(СуммаДебета, oprcom.Sum, PaymentObj.ValueDate, oprcom.FIID_Sum, accTrn.FIIDPayer) )
+      msgbox("Невозможно конвертировать сумму комиссии");
+      return PMSF_ACTION_ERROR;
+    end;
+
+    accTrn.SumPayer         = СуммаДебета;
+    accTrn.AccountReceiver  = sicredit.rec.Account;
+    accTrn.FIIDReceiver     = sicredit.rec.FIID;
+    accTrn.SumReceiver      = NewTaxSum;
+    accTrn.ClaimID          = GetClaimID( PaymentObj, accTrn.AccountPayer, accTrn.Chapter, accTrn.FIIDPayer );
+    accTrn.Status_After     = CarryKind;
+
+    PayerChargeOffSum = PayerChargeOffSum + accTrn.SumPayer;
+
+    if( not accTrn.Carry )
+      msgbox("Ошибка при актуализации проводки|оплаты комиссии за перевод");
+      return PMSF_ACTION_ERROR;
+    end;
+
+    // Уменьшить сумму платежа на сумму комиссии
+    if( oprcom.FIID_Sum != PaymentObj.BaseFIID )
+      if( ConvSum(deltaBaseAmount, oprcom.Sum, PaymentObj.ValueDate, oprcom.FIID_Sum, PaymentObj.BaseFIID) )
+        msgbox("Невозможно конвертировать сумму комиссии");
+        return PMSF_ACTION_ERROR;
+      end;
+      PaymentObj.FutureBaseAmount = PaymentObj.FutureBaseAmount - deltaBaseAmount;
+      PaymentObj.ActuateFutureAmounts( TBA_AMOUNT );
+    else
+      PaymentObj.FutureBaseAmount = PaymentObj.FutureBaseAmount - oprcom.Sum;
+      PaymentObj.ActuateFutureAmounts( TBA_AMOUNT );
+      deltaBaseAmount = oprcom.Sum;
+    end;
+
+    if( NewNDSSum != 0 )
+      var accNDSTrn:object = PaymentObj.MakeTransaction();
+
+      if( accNDSTrn == NULL )
+        msgbox("Ошибка при создании проводки по переводу НДС");
+        return PMSF_ACTION_ERROR;
+      end;
+
+      // НДС по комиссии за перевод 
+      accNDSTrn.Chapter       = PaymentObj.Chapter;
+      accNDSTrn.Ground        = "НДС по комиссии за перевод платежного поручения №" + PaymentObj.Number + " от " + PaymentObj.Date + ".";
+      accNDSTrn.Date_Carry    = PaymentObj.ValueDate;
+      accNDSTrn.Department    = PaymentObj.Department;
+      accNDSTrn.ResultCarry   = SFPAY_CARRY;
+
+      accNDSTrn.FIIDPayer     = CommisPayerFIID;
+      accNDSTrn.AccountPayer  = CommisPayerAccount;
+      
+      if( ConvSum(СуммаДебета, oprcom.SumNDS, PaymentObj.ValueDate, oprcom.FIID_Sum, accNDSTrn.FIIDPayer) )
+        msgbox("Невозможно конвертировать сумму комиссии");
+        return PMSF_ACTION_ERROR;
+      end;
+
+      accNDSTrn.SumPayer        = СуммаДебета;
+      accNDSTrn.FIIDReceiver    = siNDS.FIID;
+      accNDSTrn.SumReceiver     = NewNDSSum;
+      accNDSTrn.AccountReceiver = siNDS.Account;
+      accNDSTrn.ClaimID         = GetClaimID( PaymentObj, accNDSTrn.AccountPayer, accNDSTrn.Chapter, accNDSTrn.FIIDPayer );
+      accNDSTrn.Status_After    = CarryKind;    
+
+      PayerChargeOffSum = PayerChargeOffSum + accNDSTrn.SumPayer;
+      
+      if( not accNDSTrn.Carry )
+        msgbox("Ошибка при актуализации проводки НДС по комиссии за перевод");
+        return PMSF_ACTION_ERROR;
+      end;
+
+      // Уменьшить сумму платежа на сумму NDS:
+      if( oprcom.FIID_Sum != PaymentObj.BaseFIID )
+        if( ConvSum(deltaBaseAmount, oprcom.SumNDS, PaymentObj.ValueDate, oprcom.FIID_Sum, PaymentObj.BaseFIID) )
+          msgbox("Невозможно конвертировать сумму комиссии");
+          return PMSF_ACTION_ERROR;
+        end;
+        PaymentObj.FutureBaseAmount = PaymentObj.FutureBaseAmount - deltaBaseAmount;
+        PaymentObj.ActuateFutureAmounts( TBA_AMOUNT );
+      else
+        PaymentObj.FutureBaseAmount = PaymentObj.FutureBaseAmount - oprcom.SumNDS;
+        PaymentObj.ActuateFutureAmounts( TBA_AMOUNT );
+        deltaBaseAmount = oprcom.SumNDS;
+      end;
+
+    end;
+
+    if( SfComSetState( oprcom, OPRSFCOM_STATUS_PAY ) )
+      msgbox("Ошибка при смене статуса комиссии");
+      return PMSF_ACTION_ERROR;
+    end;
+
+    i = i + 1;
+
+  end;
+
+  if( CarryKind == ACCTRN_STATUS_DOCUMENT )
+    ChangeReserve( GetClaimID( PaymentObj, PaymentObj.PayerAccount, PaymentObj.Chapter, PaymentObj.PayerFIID ), PayerChargeOffSum );
+  end;
+
+  if( (PaymentObj.FutureBaseAmount <= 0) or (PaymentObj.FuturePayerAmount <= 0) or (PaymentObj.FutureReceiverAmount <= 0) )
+    msgbox("Сумма комиссий должна быть меньше суммы платежа");
+    return PMSF_ACTION_ERROR;
+  end;
+
+  return PMSF_ACTION_OK;
+
+end;
+
+// Пометить комиссии как оплаченные, чтобы механизм операций их не взялся оплачивать
+macro MarkPaidCommisArrayBEN( OprComList )
+  var i:integer = 0;
+  RECORD oprcom( oprsfcom );
+ 
+  while( i < OprComList.Size )
+
+    Copy(oprcom, OprComList[i]);
+
+    if( SfComSetState( oprcom, OPRSFCOM_STATUS_PAY ) )
+      msgbox("Ошибка при смене статуса комиссии");
+      return PMSF_ACTION_ERROR;
+    end;
+
+    i = i + 1;
+
+  end;
+
+  return PMSF_ACTION_OK;
+end;
+
+//-----------------------------------------------------------------------------
+// Оплата комиссии типа BEN (комиссии определяются автоматически)
+//-----------------------------------------------------------------------------
+macro PayCommisBEN( PaymentObj:RsbPayment, CommisPayerAccount:string, CommisPayerFIID:integer, ID_Operation : integer, ID_Step : integer )
+  var OprComList:TArray = TArray();
+  var i:integer;
+  file oprcom( "oprsfcom.dbt" );
+  
+  if( PaymentObj.ComissCharges != PM_CHRG_BEN )
+    return PMSF_ACTION_ERROR;
+  end;
+
+  if( CommisPayerAccount == "" )
+    MsgBox("Не определен плательщик комиссии");
+    return PMSF_ACTION_ERROR;
+  end;
+
+  // Найти все комиссии, рассчитанные для операции, но еще не оплаченные
+  while( SfGetOperCommission(ID_Operation, ID_Step, oprcom) and (oprcom.Department == PaymentObj.Department) )
+    i = OprComList.size;
+    OprComList[i] = TRecHandler("oprsfcom.dbt");
+    Copy(OprComList[i], oprcom);
+  end;
+
+  return PayCommisArrayBEN( OprComList, PaymentObj, CommisPayerAccount, CommisPayerFIID );
+
+end;

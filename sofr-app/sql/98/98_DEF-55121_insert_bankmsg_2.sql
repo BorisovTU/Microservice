@@ -1,0 +1,15 @@
+/* обновление справочников */
+BEGIN
+   INSERT INTO DBANK_MSG (T_NUMBER, T_PAGE, T_CONTENTS )
+   VALUES (26049,0,'Связанная операция расчета НОБ не выполнена.');
+EXCEPTION 
+   WHEN DUP_VAL_ON_INDEX THEN NULL;
+END;
+/
+
+BEGIN
+ EXECUTE IMMEDIATE 'COMMIT';
+EXCEPTION
+  WHEN OTHERS THEN NULL;
+END;
+/

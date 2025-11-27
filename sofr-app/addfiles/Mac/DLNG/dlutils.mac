@@ -1,0 +1,586 @@
+ /*
+ $Name: dlutils.mac
+ $Module: Ядро Dealing
+ $Description: Общие утилитные функции
+
+  # tag
+  - code_type: API 
+  
+  # changelog
+  |date       |author         |tasks                                                   |note                                                        
+  |-----------|---------------|--------------------------------------------------------|-------------------------------------------------------------
+  |2024.04.17 |Сенников И.В.  |DEF-52575                                               | Создание
+
+*/
+import cb_sql, CTInter, PTInter, "dlquery.mac", "likepy.mac", "dlmisc.mac", "oralib.mac", "err_handl.mac", ostoolsdlm;
+import "uws_exchng_log.mac";           /* Функционал логирования */
+
+private const DirectorySeparatorChar = "\\";
+private const AltDirectorySeparatorChar  = "/";
+private const VolumeSeparatorChar = ":";
+
+private const InvalidPathChars = "\"<>|" +
+            StrFor(0) + StrFor(1)+ StrFor(2)+ StrFor(3)+ StrFor(4)+ StrFor(5)+ StrFor(6)+ StrFor(7)+ StrFor(8)+ StrFor(9)+ StrFor(10)+
+            StrFor(11)+ StrFor(12)+ StrFor(13)+ StrFor(14)+ StrFor(15)+ StrFor(16)+ StrFor(17)+ StrFor(18)+ StrFor(19)+ StrFor(20)+
+            StrFor(21)+ StrFor(22)+ StrFor(23)+ StrFor(24)+ StrFor(25)+ StrFor(26)+ StrFor(27)+ StrFor(28)+ StrFor(29)+ StrFor(30)+
+            StrFor(31);
+
+macro CreateSeparateRsdConnection()
+  var env = RsdEnvironment( "RDDrvO", "RDDrvO.dll" );
+  var ConString = GetIniString("CONNSTRING", "rsreq.ini");
+  return RsdConnection(env, ConString);
+end;
+
+/**
+@brief Класс для создания межсессионных блокировок
+@param[in] lockId - Идентификатор блокировки
+@param[in] _timeout - Время ожидания в секундах (0 - не ждём)
+@param[in] _nonexclusive - НЕ монопольная блокировка (по умолчанию - монопольная)
+
+Класс с деструктором, в котором снимаются все блокировки, поэтому вызывать разблокировку явно не обязательно
+*/
+class UniConcurrentLocker(_lockId:string, _timeout:integer, _nonexclusive:bool, _noSepCon:bool)
+  private var connection = RslDefCon;
+
+  private var isLock = false;
+  private var noSepCon = false;
+  if ((ValType(_noSepCon) == V_BOOl) and (_noSepCon == true))
+    noSepCon = true;
+  end;
+  
+  private var conIsOpen = false;
+
+  private var LockID = _lockId;
+
+  private var TimeOut = 0;
+  if ((ValType(_timeout) == V_INTEGER) and (_timeout > 0))
+    TimeOut = _timeout;
+  end;
+
+  private var Exclusive = true;
+  if ((ValType(_nonexclusive) == V_BOOl) and (_nonexclusive == true))
+    Exclusive = false;
+  end;
+
+  if (ValType(LockID) != V_STRING)
+    RunError("Не определен идентификатор блокировки");
+  end;
+
+  private macro GetCon()
+    if ((not noSepCon) and (not conIsOpen))
+      connection = CreateSeparateRsdConnection();
+      connection.Open();
+      conIsOpen = true;
+    end;
+    return connection;
+  end;
+
+  macro Lock()
+    if (not isLock)
+      var sql = 
+        " begin "
+       +"   LOCK_UTILS.SET_LOCK_MUST('"+LockID+"', false, "+IIF(Exclusive,"true","false")+", "+ string(TimeOut)+"); "
+       +" end; ";
+      BegAction(2000, "Ожидание освобождения ресурса ("+String(TimeOut)+" секунд)", false);
+      RsdCommand(GetCon(),sql).execute();
+      EndAction();
+      isLock = true;
+    end;
+    return true;
+  OnError(er)
+    EndAction();
+    return false;
+  end;
+
+  macro Unlock()
+    if (isLock)
+      var sql = 
+        " begin "
+      +"   LOCK_UTILS.RELEASE_LOCK('"+LockID+"'); "
+      +" end; ";
+      RsdCommand(GetCon(),sql).execute();
+      if ((conIsOpen) and (not noSepCon))
+        GetCon().Close();
+        conIsOpen = false;
+      end;
+      isLock = false;
+    end;
+  end;
+
+  macro CheckLockExists()
+    var lockSuccess = Lock();
+    if (lockSuccess)
+      Unlock();
+    end;
+    //если заблокировать не смогли, то значит блокировка была
+    return not lockSuccess;
+  end;
+
+  macro Destructor()
+    Unlock();
+  end;
+
+  macro GetLockId()
+    return LockID;
+  end;
+end;
+
+macro AddDBLogDebug(prefix,text)
+  execSQL("begin it_log.log(?,it_log.C_MSG_TYPE__DEBUG); end;", makeArray(SQLParam("msg", SubStr((prefix+": " + text),1,4000))), true);
+end;
+
+macro AddDBLogWithErrorObj(prefix,errObj)
+  execSQL("begin it_log.log(?,it_log.C_MSG_TYPE__ERROR); end;", makeArray(SQLParam("msg", SubStr((prefix+": " + GetFullErrorMessage(errObj)),1,4000))), true);
+end;
+
+macro AddDBLogDebug2(prefix,text)
+  execSQL("begin it_log.log_handle(?,?,it_log.C_MSG_TYPE__DEBUG); end;", makeArray(SQLParam("obj", SubStr(prefix,1,100)),SQLParam("msg", SubStr(text,1,4000))), true);
+end;
+
+macro IsNoInterfaceRun()
+  return DL_IsWebService() or IsShedulerRunning();
+end;
+
+private macro IsPathRooted(Path)
+  if (ValType(Path) == V_STRING)
+    var len = StrLen(Path);
+
+    if (((len >= 1) and ((SubStr(Path,1,1) == DirectorySeparatorChar) or (SubStr(Path,1,1) == AltDirectorySeparatorChar))) or ((len >= 2) and (SubStr(Path,2,1) == VolumeSeparatorChar)))
+      return true;
+    end;
+  end;
+  return false;
+end;
+
+private macro CombinePathNoChecks(Path1, Path2)
+  if (StrLen(Trim(Path2)) == 0)
+    return Path1;
+  end;
+  if (StrLen(Trim(Path1)) == 0)
+    return Path2;
+  end;
+
+  if (IsPathRooted(Path2))
+    return Path2;
+  end;
+
+  var lastChr = SubStr(Path1,StrLen(Path1),1);
+  var firstChrSecPath = SubStr(Path2,1,1);
+
+  if ((lastChr != DirectorySeparatorChar) and (lastChr != AltDirectorySeparatorChar) and (lastChr != VolumeSeparatorChar) and (firstChrSecPath != ".")) 
+    return Path1 + DirectorySeparatorChar + Path2;
+  end;
+
+  return Path1 + Path2;
+end;
+
+macro PathCombine(Path1, Path2)
+  if ((ValType(Path1) != V_STRING) or (ValType(Path2) != V_STRING))
+    RunError("Ошибка параметров");
+  end;
+
+  return CombinePathNoChecks(Path1, Path2);
+end;
+
+macro PathCombine2(Path1, Path2, Path3)
+  if ((ValType(Path1) != V_STRING) or (ValType(Path2) != V_STRING) or (ValType(Path3) != V_STRING))
+    RunError("Ошибка параметров");
+  end;
+
+  return CombinePathNoChecks(CombinePathNoChecks(Path1, Path2),Path3);
+end;
+
+macro PathCombine3(Path1, Path2, Path3, Path4)
+  if ((ValType(Path1) != V_STRING) or (ValType(Path2) != V_STRING) or (ValType(Path3) != V_STRING) or (ValType(Path4) != V_STRING))
+    RunError("Ошибка параметров");
+  end;
+
+  return CombinePathNoChecks(CombinePathNoChecks(CombinePathNoChecks(Path1, Path2),Path3),Path4);
+end;
+
+MACRO PrcPath( p_path )
+  var l_str, l_p, l_path = "";
+
+  p_path = trim( p_path );
+
+  if( substr( p_path, 1, 2 ) == ".." ) /* ссылка на вышестоящий каталог */
+    p_path = substr( p_path, 3 );
+ 
+    l_str  = getCWD(false);
+    l_p    = strbrk( l_str, "\\" );
+    while( l_p != 0 )
+      l_path = l_path + substr( l_str, 1, l_p - 1 ) + "\\";
+      l_str  = substr( l_str, l_p + 1 );
+      l_p    = strbrk( l_str, "\\" );
+    end;
+    p_path = ( substr( l_path, 1, strlen( l_path ) - 1 ) + p_path );
+  elif( substr( p_path, 1, 1 ) == "." ) /* ссылка на текущий каталог */
+    p_path = ( getCWD + substr( p_path, 2 ) );
+  end;
+
+  return DLM_PathCanonicalize(p_path);
+END;
+
+macro GetRegValueOrDefValue(regPath, regType, defValue)
+  var retValue = defValue;
+  var regRetValue = null;
+  var err = 0;
+
+  GetRegistryValue(regPath, regType, regRetValue, err);
+  if((err == 0) and (ValType(regRetValue) == regType))
+    retValue = regRetValue;
+  end;
+  return retValue;
+end;
+
+macro GetStringRegValueOrDefValue(regPath, defValue)
+  var retValue = defValue;
+  var regRetValue = null;
+  var err = 0;
+
+  GetRegistryValue(regPath, V_STRING, regRetValue, err);
+  if((err == 0) and (ValType(regRetValue) == V_STRING) and (ValType(regRetValue) == V_STRING) and (Trim(regRetValue) != ""))
+    retValue = Trim(regRetValue);
+  end;
+  return retValue;
+end;
+
+macro GetTxtPathFromReg()
+  const txtRegPath = "BANK_INI\\ОБЩИЕ ПАРАМЕТРЫ\\ДИРЕКТОРИИ\\TEXTDIR";
+  var Path = "";
+  var err = 0;
+
+  GetRegistryValue(txtRegPath, V_STRING, Path, err);
+  if(err != 0) 
+    RunError("Ошибка настройки", CustomError("Ошибка при получении значения настройки \"" + txtRegPath + "\""));
+  end;
+  return Path;
+END;
+
+MACRO GetProfilerEnab()
+  const registryPath = "РСХБ\\ПРОФИЛИРОВАНИЕ_ВЫПОЛНЕНИЯ";
+  return GetRegValueOrDefValue(registryPath, V_BOOL, false);
+END;
+
+class StartStopProfilingBySetting()
+  private var profObj = null;
+  if (GetProfilerEnab())
+    profObj = StartStopProfiling(true);
+  end;
+
+  macro Destructor()
+    profObj = null;
+  end;
+end;
+
+macro GetAbsoluteTxtPath()
+  return PrcPath(GetTxtPathFromReg());
+end;
+
+/* добавить записи из массивов к целевому массиву */
+MACRO addElemsToArr(dstArr):TArray
+  var parm:TArray,
+      i:integer = 1,
+      j:integer;
+  while( GetParm(i, parm) )
+    j = 0;
+    while( j < parm.size )
+      dstArr[dstArr.size] = parm[j];
+      j = j + 1;
+    end;
+    i = i + 1;
+  end;
+  return dstArr;
+END;
+
+private macro CheckInvalidPathChars(path)
+  if (StrBrk(path, InvalidPathChars))
+    RunError("Invalid path chars");
+  end;
+end;
+
+macro GetExtension(path)
+  if (ValType(path) != V_STRING)
+    return null;
+  end;
+  var fileName, fileExt;
+  SplitFile( path, fileName, fileExt );
+  return fileExt;
+end;
+
+macro IsRunFromWine(checkOnlyOnServer)
+  return true; //Со 116-го патча только Астра на СП и терминале. Проверку отключаем, считаем, что всегда Wine
+  
+  
+  var checkOnServer = false;
+  //если принудительно проверяем только на сервер
+  if ((ValType(checkOnlyOnServer) == V_BOOL) and (checkOnlyOnServer == true))
+    checkOnServer = true;
+  //если мы сейчас работаем в режиме веб сервиса (запуск от томката или iis)
+  elif (DL_IsWebService())
+    checkOnServer = true;
+  //если если мы сейчас в двузвенке
+  elif (isStandalone())
+    checkOnServer = true;
+  end;
+  
+  if (checkOnServer)
+    return DL_GetOSType() == OS_TYPE_WINE;
+  else
+    //проверяем на терминале.
+    var libName = "ostoolsdlm"; 
+    var macroName = "checkostype.mac";
+    var termDir = PathCombine(GetCurDir(true),"Mac");
+    if (not ((GetFileInfo("$"+PathCombine2(termDir,libName,".d32"))) and (GetFileInfo("$"+PathCombine(termDir,macroName)))))
+      var dlmLibPath = PathCombine2(GetCurDir(false),libName,".d32");
+      var macroServPath = PathCombine(GetAbsoluteTxtPath(),macroName);
+      if (not GetFileInfo(dlmLibPath))
+        RunError("Не найдена библиотека "+libName+". Проверьте корректность настройки СП");
+      end;
+      //копируем библиотеку на терминал
+      CopyFile(dlmLibPath, "$" + PathCombine2(termDir,libName,".d32"));
+      //создаем макрос проверки
+      var oldOutPut = SetOutPut(macroServPath);
+      println("import "+libName+";");
+      println("macro IsRunFromWine()");
+      println("  return DLM_GetOSType() == "+OS_TYPE_WINE+";");
+      println("end;");
+      SetOutPut(oldOutPut);
+      CopyFile(macroServPath, "$" + PathCombine(termDir,macroName));
+    end;
+    return CallRemoteRsl(macroName,"IsRunFromWine");
+  end;
+end;
+
+//скопировать файл по относительному (против корня терминала) или сетевому пути
+//чтобы не было путаницы, начальные $ будут игнорироваться, и подставляться в нужный момент самой функцией
+//первый параметр - полный путь копируемого файла
+//второй параметр - относительный путь до каталога от терминала, куда будут копироваться файлы
+macro CopyFileToNetOrRelPath(FilePath, ToPathWithFileName)
+  FilePath = StrSubst(FilePath,"$","");
+  ToPathWithFileName = StrSubst(ToPathWithFileName,"$","");
+  var firstTwoChars = SubStr(ToPathWithFileName,1,2);
+  var toFullPath = "";
+  //если путь сетевой то просто туда копируем
+  if (firstTwoChars == "\\\\")
+    toFullPath = ToPathWithFileName;
+  //если мы в 2-звенке или работаем в режиме сервиса
+  elif (isStandalone() or DL_IsWebService())
+    toFullPath = PathCombine(GetCurDir(false),ToPathWithFileName);
+  else
+    //если в терминале
+    toFullPath = "$" + PathCombine(GetCurDir(true),ToPathWithFileName);
+  end;
+  if (not CopyFile(FilePath, toFullPath))
+    RunError("Ошибка копирования", CustomError("Не удалось скопировать файл из \""+FilePath+"\" в \""+toFullPath+"\""));
+  end;
+end;
+
+macro StringLeftZero( num, len )
+  var str1, len1;
+  str1 = trim( string( num ) );
+  len1 = strlen( str1 );
+  if ( len1 >= len ) return str1;
+  else  return  mkstr("0", len-len1 ) + str1;
+  end;
+end;
+
+class ProcessProtocol(_Enc, _GUID, _Multithread, _Format, _KeepFile)
+  private var GUID = "";
+  private var localGUID = "";
+  private var Multithread = false;
+  private var Format = ".log";
+  private var HasData = false;
+  private var Encoding = "rsoem";
+  private var row_number = 1;
+  private var KeepFile = false;
+
+  if ((ValType(_GUID) == V_STRING) and (Trim(_GUID) != ""))
+    GUID = Trim(_GUID);
+  else
+    GUID = CreateGUID();
+  end;
+  if ((ValType(_Multithread) == V_BOOL))
+    Multithread = _Multithread;
+  end;
+  if ((ValType(_Format) == V_STRING) and (Trim(_Format) != ""))
+    Format = Trim(_Format);
+  end;
+  if ((ValType(_Enc) == V_STRING) and (Trim(_Enc) != ""))
+    Encoding = Trim(_Enc);
+  end;
+  if ((ValType(_KeepFile) == V_BOOL))
+    KeepFile = _KeepFile;
+  end;
+
+  var pathName = GetAbsoluteTxtPath();
+  var fileName = "";
+
+  if (not Multithread)
+    fileName = PathCombine(pathName, (SubStr(GUID, 2, 36) + Format));
+  else
+    localGUID = CreateGUID();
+    fileName = PathCombine(pathName, (SubStr(localGUID, 2, 36) + Format));
+  end;
+
+  private macro RowNumberReplace(str)
+    if (Index(str,"{row_number}"))
+      str = StrSubst(str, "{row_number}", string(row_number));
+      row_number = row_number + 1;
+    end;
+    return str;
+  end;
+
+  macro WriteLine(str)
+    var outFl =  TStreamDoc(fileName, "A", Encoding);
+    if (not Multithread)
+      str = RowNumberReplace(str);
+    end;
+    outFl.WriteLine(str);
+    outFl = null;
+    HasData = true;
+    if (Multithread)
+      AddDBLogDebug2(GUID, str);
+    end;
+  end;
+
+  macro GetFilePath()
+    return fileName;
+  end;
+
+  macro SetFilePath(path)
+    fileName = path;
+  end;
+
+  macro IsHasData()
+    return HasData;
+  end;
+
+  macro IsMultithread()
+    return Multithread;
+  end;
+
+  macro View()
+    if (ExistFile(fileName))
+      ViewFile(fileName);
+    end;
+  end;
+
+  macro CopyLogFileToPath(saveFilePath)
+    return CopyFile(fileName, saveFilePath);
+  end;
+
+  macro Destructor()
+    if ((not KeepFile) and (ExistFile(fileName)))
+      RemoveFile(fileName);
+    end;
+  end;
+
+  macro CombineAndSaveMultithreadLog(saveFilePath)
+    if (not Multithread)
+      RunError("Протокол не находится в многопоточном режиме");
+    end;
+
+    var rs = ExecSQLSelect(" select MSG from ITT_LOG where OBJECT_NAME = :objName order by CREATE_SYSDATE, ID_LOG",
+                           MakeArray(SQLParam("objName", GUID)),
+                           false);
+    var resfl = TStreamDoc(saveFilePath, "W", Encoding);
+    while(rs.MoveNext())
+      var curLine = SQL_ConvTypeStr(rs.value("MSG"));
+      if (Trim(curLine) != "")
+        resfl.WriteLine(RowNumberReplace(curLine));
+      end;
+    end;
+    execSQL("delete from ITT_LOG where OBJECT_NAME = :objName", MakeArray(SQLParam("objName", GUID)));
+  end;
+end;
+
+class TempFileToServerMover()
+  private var tempFilePath = "";
+  
+  macro CreateTempFromAbsolutTermOrServPath(termOrServPath)
+    var dirPath, fileName, fileExt;
+    if (SubStr( termOrServPath, 1, 1 ) == "$")
+      termOrServPath = SubStr(termOrServPath, 2);
+    end;
+    dirPath = SplitFile( termOrServPath, fileName, fileExt );
+    tempFilePath = PathCombine(GetAbsoluteTxtPath(),GetExlusiveFileName(SubStr(fileExt,2)));
+    if (GetFileInfo("$"+termOrServPath))
+      if (not CopyFile("$"+termOrServPath, tempFilePath))
+        RunError("Ошибка копирования", CustomError("Не удалось скопировать файл из \""+"$"+termOrServPath+"\" в \""+tempFilePath+"\""));
+      end;
+    else
+      if (not GetFileInfo(termOrServPath))
+        RunError("Ошибка поиска файла", CustomError("Не удалось найти файл \""+termOrServPath+"\" не на сервере, не на терминале"));
+      end;
+      if (not CopyFile(termOrServPath, tempFilePath))
+        RunError("Ошибка копирования", CustomError("Не удалось скопировать файл из \""+termOrServPath+"\" в \""+tempFilePath+"\""));
+      end;
+    end;
+  end;
+
+  macro CreateTempFromAbsolutPath(absolutPath)
+    var dirPath, fileName, fileExt;
+    dirPath = SplitFile( absolutPath, fileName, fileExt );
+    tempFilePath = PathCombine(GetAbsoluteTxtPath(),GetExlusiveFileName(SubStr(fileExt,2)));
+    if (GetFileInfo(absolutPath))
+      if (not CopyFile(absolutPath, tempFilePath))
+        RunError("Ошибка копирования", CustomError("Не удалось скопировать файл из \""+absolutPath+"\" в \""+tempFilePath+"\""));
+      end;
+    else
+      RunError("Ошибка копирования", CustomError("Не удалось найти файл \""+absolutPath+"\""));
+    end;
+  end;
+
+  macro GetTempFilePath()
+    if (tempFilePath == "")
+      RunError("Ошибка временного файла. Файл не создан.");
+    end;
+    return tempFilePath;
+  end;
+
+  macro Destructor()
+    if (ExistFile(tempFilePath))
+      RemoveFile(tempFilePath);
+    end;
+  end;
+
+end;
+
+macro GetIntArrFromRegPath(regPath)
+  var retArr = TArray();
+  var regVal = GetRegValueOrDefValue(regPath, V_STRING, "");
+  for (var curVal, split( regVal,  "," ))
+    var cVal = Trim(curVal);
+    if (StrIsNumber(cVal))
+      retArr[retArr.size] = Int(cVal);
+    end;
+  end;
+  return retArr;
+end;
+
+macro CreateAllDirs(path)
+  macro CheckNeedCreateDir(p_path,p_part)
+    if (StrBrk(p_part,".:"))
+      return false;
+    end;
+    return not GetFileInfo(p_path);
+  end;
+
+  path = StrSubst(path,"/","\\");
+  // Разбиваем путь на части по разделителю
+  var parts = split(path, "\\");
+  var currentPath = "";
+  // Построение пути по частям и создание каталогов
+  var i = -1;
+  while ((i=i+1) < parts.size())
+    if (Trim(parts[i]) == "")
+      continue;
+    end;
+    currentPath = currentPath + parts[i];
+    if (CheckNeedCreateDir(currentPath, parts[i]));
+      MakeDir(currentPath);
+    end;
+    currentPath = currentPath + "\\";
+  end;
+end;

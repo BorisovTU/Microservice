@@ -1,0 +1,824 @@
+/*
+$Name:        mme_j0.mac
+$Module:      МБ Кредиты
+$Description: макрос выполнения шага "Исполнение входящих платежей"
+*/
+IMPORT "dlcarry.inc", mmcateg, mmlib, mmlibr, mmcnst_j,
+       mmlb_j, mpclb, mmcarry, InsCarryDoc,
+       mmadd_j, mmpaymentcls, "sp_car.mac", mmclfnc, mmpenalt, mmservop;
+
+/* Массивы с информацией о исполняемых платежах для квитовки */
+/* Инициализируются бэк-офисом */
+PRIVATE VAR
+    PlanIDs       = TArray,
+    FactIDs       = TArray,
+    KvitAmounts   = TArray,
+    PlanValueDate = TArray,
+    ExecDate;
+	
+/* значения изменяемые после исполнения платежей */
+PRIVATE VAR
+    FutureAmounts              = TArray,
+    PlanFuturePayerAccounts    = TArray,
+    PlanFutureReceiverAccounts = TArray,
+    FactFuturePayerAccounts    = TArray,
+    FactFutureReceiverAccounts = TArray;
+
+/*Глобальные переменные*/
+PRIVATE VAR 
+    deal_pd   = NULL,
+    PlanPayms = TArray,     /*Массив планируемых обрабатываемых платежей*/
+    FactPayms = TArray,     /*Массив фактических обрабатываемых платежей*/
+    ContrIsBankrupt = false; /*Призна контрагента-банкрота*/
+
+PRIVATE VAR
+    ID_Operation = 0,
+    ID_Step      = 0;
+
+/*Записать все платежи в массивы*/
+PRIVATE MACRO GetAllPayms
+    /*плановые платежи*/
+  VAR
+      i = 0,
+      previd = -1;
+
+  while (i < PlanIDs.size)
+      if (previd == PlanIDs(i))
+          PlanPayms(i) = PlanPayms(i-1);
+          i = i+1;
+      else
+          PlanPayms(i) = RsbPayment(PlanIDs(i));	
+
+          if (PlanPayms(i).PaymentID == 0)
+              mm_error ("Не найден платеж");
+              return false;
+          end;	  
+		  
+          if (PlanPayms(i).ValueDate != ExecDate)
+              if( not GetTrue( true, "Планируемая дата платежа "+
+                                      "|не равна дате исполнения."+
+                                      "|Исполнить платеж ?" )) 
+                  return false;
+              end;
+          end;
+		  
+          previd = PlanIDs(i); 
+      end;
+	  
+      i = i+1;
+  end;
+
+    /*фактические платежи*/
+  i = 0;
+  previd = -1;
+  while (i<FactIDs.size)
+      if (previd == FactIDs(i))
+          FactPayms(i) = FactPayms(i-1);
+      else
+          if (FactIDs(i))
+              FactPayms(i) = RsbPayment(FactIDs(i));
+		  	  if (FactPayms(i).PaymentID == 0)
+                  mm_error ("Не найден платеж");
+                  return false;
+              end;
+              if (FactPayms(i).BaseFIID != deal_pd.GetLeg().PFI)
+                  mm_error ("Валюта платежа не соответствует валюте договора");
+                  return false;
+              end;			  
+          end;
+      end;
+      previd = FactIDs(i);
+      i = i+1;
+  end;
+
+  return true;
+END;
+
+PRIVATE MACRO KvitPayms ()
+  VAR
+    pml = TRecHandler("pmlink.dbt"),
+    i = 0;
+
+  // Kirakozov, По запросу #123612:
+  // В этом блоке мы списываем квитуемые суммы с фактических платежей, т.к. в сишниках
+  // это не работает: pmkvit.c, функция InitPMLINK, case PMLINK_KIND_KVITING, pml->PPSign = '\0'; 
+  // а для того, чтобы списывалось, надо pml->PPSign = '-'; и вообще, там списывается
+  // с FuturePayerAmount, а надо с FutureReceiverAmount
+  i = 0; 
+  while( (i < FactIDs.size) and (FactIDs(i) != NULL) and (KvitAmounts(i) > $0) )
+      FutureAmounts(i) = PlanPayms(i).FuturePayerAmount;
+      PlanFuturePayerAccounts(i)    = PlanPayms(i).FuturePayerAccount;
+      PlanFutureReceiverAccounts(i) = PlanPayms(i).FutureReceiverAccount;
+      FactFuturePayerAccounts(i)    = FactPayms(i).FuturePayerAccount;
+      FactFutureReceiverAccounts(i) = FactPayms(i).FutureReceiverAccount;
+  
+      pml.rec.Amount = KvitAmounts(i);
+      pml.rec.FIID   = FactPayms(i).BaseFIID;
+      pml.rec.IPSign = "-";
+      pml.rec.PPSign = "-";
+      PlanPayms(i).LinkPayment(FactPayms(i), PMLINK_KIND_KVITING, pml);
+
+      i = i + 1;
+  end;
+   
+  return true;
+END;
+
+PRIVATE MACRO SimulateKvitPayments ()
+  VAR
+      PlanPaym    = NULL,
+      MM_PaymObj  = NULL,
+      NewPaym     = NULL;
+
+    PlanPaym = RsbPayment(PlanPayms(0).PaymentID);
+    MM_PaymObj = MM_RsbPayment(MMPAYM_CREATEBYPAYMOBJ, PlanPaym, PlanPaym.SubPurpose, KvitAmounts(0), ExecDate);
+    NewPaym = MM_PaymObj.Payment;
+
+    NewPaym.IsFactPaym = "X";
+    NewPaym.PaymStatus = PM_READIED;
+	
+	NewPaym.ValueDate = ExecDate;
+
+    FactPayms[FactPayms.size] = NewPaym;
+
+    return KvitPayms();
+END;
+
+PRIVATE MACRO MakeFactPaym ()
+  if ((PlanIDs.size==1) and
+       (money(round(PlanPayms(0).FuturePayerAmount,2)) == money(round(KvitAmounts(0),2)) ) 
+      ) 
+  /*Просто ставим на платеж признак исполненного*/
+      FutureAmounts(0) = PlanPayms(0).FuturePayerAmount;
+      PlanFuturePayerAccounts(0)    = FactFuturePayerAccounts(0)    = PlanPayms(0).FuturePayerAccount;
+      PlanFutureReceiverAccounts(0) = FactFutureReceiverAccounts(0) = PlanPayms(0).FutureReceiverAccount;
+  
+      PlanPayms(0).PaymStatus = PM_FINISHED;
+      PlanPayms(0).IsFactPaym = "X";  
+
+      PlanPayms(0).FutureBaseAmount = 0;
+      PlanPayms(0).ActuateFutureAmounts(TBA_AMOUNT);
+      
+      PlanPayms(0).ValueDate = ExecDate; 
+
+      FactPayms(0) = PlanPayms(0);
+  else
+      return SimulateKvitPayments;
+  end;
+
+  return true;
+END;
+/***************************************************************************/
+PRIVATE MACRO SaveNalogHistory(OpDate, DealID, SumPerc, SumNalog, Rate)
+    var com = RSDCommand("INSERT INTO dmmnalog_tmp (t_DateStep, t_DealID, t_Sum, t_Sum_Nalog, t_Rate_Nalog)" +
+                         " VALUES ("
+                         "to_date('" + OpDate + "', 'dd.mm.yyyy')" +
+                         ", " + DealID +
+                         ", " + SumPerc + 
+                         ", " + SumNalog +
+                         ", " + Rate + ")");
+    com.execute();
+end;
+
+/***************************************************************************/
+PRIVATE MACRO GetPayerAccAndPayFIID (i, Счет, ВП)
+  VAR paym = NULL; 
+
+  if (FactIDs(i))
+      paym = FactPayms(i);
+  else
+      paym = PlanPayms(i);
+  end;
+  
+  ВП = paym.PayerFIID;
+  Счет = paym.FuturePayerAccount;
+  
+  SetParm (1, Счет);
+  SetParm (2, ВП);
+  
+  return true;
+END;
+
+PRIVATE MACRO ПроверкаВыпШагаЗачет(ДогЗачета)
+var
+   stat = false, DocumentID = "";
+
+   VS_MakeDocumentID(ДогЗачета, DocumentID, DL_VSINTERCHANGE);
+ 
+   if(DocumentID != "")
+     stat = Opr_GetLastExecStepBySymbol(ДогЗачета.rec.DocKind, DocumentID, "З");
+   end;
+
+   return stat;
+END;
+
+
+PRIVATE MACRO InsertCLDocsPrinc(i)
+    VAR Sum = KvitAmounts(i), carry = MM_Carry, Account = "";
+    if (deal_pd.GetTick().ParentID <= 0)
+        return true;
+    end;
+    var cl_pd = MMFirstDoc(DL_CREDITLN, deal_pd.GetTick().ParentID, true);
+    if (cl_pd.GetTick().BOfficeKind == DL_IBCDOC)
+        return true;
+    end;
+    // проводка не формируются, если был выполнен шаг списания лимита
+    if (LimitWasWrittenOff(cl_pd.GetTick().DealID))
+        return true;
+    end;
+
+    carry.FIIDPayer    = cl_pd.GetTick().LimitCur;
+    carry.FIIDReceiver = cl_pd.GetTick().LimitCur;
+    carry.Chapter      = 3;
+    carry.date_carry   = {curdate};
+    carry.PrimaryDoc   = cl_pd;  
+    carry.PaymentObj   = FactPayms(i);
+    
+    if (isSale(GetOperationGroup(deal_pd.GetTick().DealType)))
+    // размещение
+        var Srestor;
+        if ((cl_pd.GetTick().IssuanceLimit >= 0.0) and (cl_pd.GetTick().DebtLimit == 0.0))
+            return true;
+        elif ((cl_pd.GetTick().IssuanceLimit == 0.0) and (cl_pd.GetTick().DebtLimit > 0.0))
+            if (cl_pd.GetTick().LimitCur != deal_pd.GetLeg().PFI)
+                ConvSumCross(Srestor, Sum, {curdate}, deal_pd.GetLeg().PFI, cl_pd.GetTick().LimitCur);
+            end;   
+        elif ((cl_pd.GetTick().IssuanceLimit > 0.0) and (cl_pd.GetTick().DebtLimit > 0.0))
+            var UnusedIssuanceLimit = GetCLUnusedIssuanceLimit(cl_pd.GetTick().DealID, cl_pd.GetTick().IssuanceLimit);
+            var UnusedDebtLimit     = GetCLUnusedDebtLimit(cl_pd.GetTick().DealID, cl_pd.GetTick().DebtLimit);
+            var Sl, Slnew;
+            if (UnusedIssuanceLimit < UnusedDebtLimit)
+                Sl = UnusedIssuanceLimit;
+            else
+                Sl = UnusedDebtLimit;
+            end;
+            ConvSum(Sum, Sum, {curdate}, deal_pd.GetLeg().PFI, cl_pd.GetTick().LimitCur);
+            var UnusedDebtLimitAfterOP = UnusedDebtLimit + Sum;
+            if (UnusedIssuanceLimit < UnusedDebtLimitAfterOP)
+                Slnew = UnusedIssuanceLimit;
+            else
+                Slnew = UnusedDebtLimitAfterOP;
+            end;
+            Srestor = Slnew - Sl;
+        end;
+        Account = MC_FindAndOpenCommonAccByFD(tdr_corespacc_vb, deal_pd, {curdate}, 0, MC_OPENACC_CREATE, NULL,cl_pd.GetTick().LimitCur, 
+                                             NULL, NULL, NULL, FIROLE_CORACC_PASSIVE, NULL, NULL, NULL, NULL, NULL, false, false);
+        carry.SumReceiver      = Srestor;
+        carry.AccountPayer     = Account;
+        carry.CatReceiver      = tdr_oblP;
+        carry.Ground           = "Восстановление лимита задолженности по договору КЛ, размещение";
+    else
+    // привлечение
+        var LimitSum;
+        ПолучитьОстатокСчета(cl_pd, tdr_oblR, "", 3, LimitSum, {curdate}, cl_pd.GetTick().LimitCur);
+        //ConvSumCross(LimitSum, LimitSum, {curdate}, cl_pd.GetTick().LimitCur, deal_pd.GetLeg().PFI);
+        if (cl_pd.GetTick().LimitCur != deal_pd.GetLeg().PFI)
+            ConvSumCross(Sum, Sum, {curdate}, deal_pd.GetLeg().PFI, cl_pd.GetTick().LimitCur);
+        end;
+
+        if (LimitSum < Sum)
+            mm_error("Сумма платежа превышает сумму лимита по договору кредитной линии");
+            return false;
+        end;
+
+        Account = MC_FindAndOpenCommonAccByFD(tdr_corespacc_vb, deal_pd, {curdate}, 0, MC_OPENACC_CREATE, NULL,cl_pd.GetTick().LimitCur, 
+                                             NULL, NULL, NULL, FIROLE_CORACC_ACTIVE, NULL, NULL, NULL, NULL, NULL, false, false);
+        carry.SumReceiver      = Sum;
+        carry.AccountPayer     = Account;
+        //carry.CatPayer         = tdr_corespacc_vb;
+        //carry.FiRolePayer      = FIROLE_CORACC_ACTIVE;
+        carry.CatReceiver      = tdr_oblR;
+        carry.Ground           = "Уменьшение лимита по договору КЛ при выдаче, привлечение";
+    end;
+    //carry.SumReceiver = Sum;
+
+    return carry.carry();
+END;
+
+PRIVATE MACRO UNI_InsertDocs (i, КатегорияД, КатегорияК, ВПД, ВПК, SumD, SumC, Chapter, Ground, FIRolePayer, FIRoleReceiver)
+  VAR СчетДебет = "",
+       ВД        = deal_pd.GetLeg().PFI,
+       ct       = MM_Carry;
+
+  ct.FIIDActive      = ВД;
+  ct.CatReceiver     = КатегорияК;
+
+  if (ValType(Chapter) == V_UNDEF)
+      Chapter = 1;
+  end;
+  ct.Chapter         = Chapter;
+  if ((ValType(КатегорияД) != V_STRING) OR (КатегорияД == ""))
+      if (Chapter == 1)
+          if (substr(FactPayms(i).ReceiverAccount, 1, 5) == "47416")
+              СчетДебет = FactPayms(i).ReceiverAccount;
+          elif (ValType(ВПД) == V_UNDEF)
+              GetPayerAccAndPayFIID(i, СчетДебет, ВПД);
+          else
+              GetPayerAccAndPayFIID(i, СчетДебет);
+          end;
+          ct.AccountPayer    = СчетДебет;	  
+      elif (Chapter == 3)
+          ct.CatPayer        = tdr_corespacc_vb;
+          ct.FiRolePayer     = FIROLE_CORACC_ACTIVE;
+     end;
+  else
+    ct.CatPayer = КатегорияД;
+    ct.FiRolePayer = FIROLE_FIDOC;
+  end;
+
+  if (ValType(FIRolePayer) != V_UNDEF)
+      ct.FiRolePayer = FIRolePayer;
+  end;
+
+  if (ValType(ВПД) == V_UNDEF)
+      ВПД = ВД;
+  end;
+  ct.FIIDPayer       = ВПД;
+
+  if (ValType(ВПК) == V_UNDEF)
+      ВПК = ВД;
+  end;
+  ct.FIIDReceiver    = ВПК;
+
+  if (ValType(FIRoleReceiver) == V_UNDEF)
+    ct.FiRoleReceiver = deal_pd.GetFIRoleByCategory(КатегорияК, ВПК);
+  else
+    ct.FiRoleReceiver = FIRoleReceiver;
+  end;
+  ct.Date_carry      = ExecDate;
+  ct.Ground          = Ground;
+
+  if (ValType(SumD) != V_UNDEF)
+      ct.SumPayer = SumD;
+  end;
+
+  if (ValType(SumC) != V_UNDEF)
+      ct.SumReceiver = SumC;
+  end;  
+
+  ct.PrimaryDoc      = deal_pd;
+  ct.PaymentObj      = FactPayms(i);
+
+  return ct.carry();
+END;
+
+PRIVATE MACRO GetAdjRest()
+    VAR Остаток = 0, Счет = "";
+    
+    ПолучитьОстатокСчетаУчетЗнака(deal_pd, tdr_adjplR, Счет, 1, Остаток, ExecDate, NATCUR);
+    if (Остаток == 0)
+        Счет = "";
+        ПолучитьОстатокСчетаУчетЗнака(deal_pd, tdr_adjplP, Счет, 1, Остаток, ExecDate, NATCUR);
+    end;
+    return -Остаток;
+END;
+
+PRIVATE MACRO GetAdjRestCM()
+    VAR Остаток = 0, Счет = "";
+    ПолучитьОстатокСчетаУчетЗнака(deal_pd, tdr_adjcmP, Счет, 1, Остаток, ExecDate, NATCUR);
+    if (Остаток == 0)
+        Счет = "";
+        ПолучитьОстатокСчетаУчетЗнака(deal_pd, tdr_adjcmR, Счет, 1, Остаток, ExecDate, NATCUR);
+    end;
+    return -Остаток;
+END;
+
+PRIVATE MACRO InsertDocsPrinc (i)
+  VAR stat = true, КОРост, Sk, Сод = $0, Спод = $0, Счет = "", NatcurSum = KvitAmounts(i), OldVal = $0,
+  Сном = deal_pd.GetLeg().Principal;
+  if (not InsertCLDocsPrinc(i))
+    return false;
+  end;
+
+  if (PlanPayms(i).Purpose == PM_PURP_PRINC)
+    return UNI_InsertDocs (i, NULL, tdr_rest(deal_pd.GetTick().FlagTypeDeal), NULL, NULL, KvitAmounts(i), NULL, NULL, "Привлечение средств");
+  else
+    if (IsCLAIMSACQ(GetOperationGroup(deal_pd.GetTick().DealType)))
+        КОРост = GetAdjRestCM();
+        stat = ПолучитьОстатокСчета(deal_pd, tdr_rights, Счет, 1, Сод, ExecDate, deal_pd.GetLeg().PFI);
+        ConvSum(Сод,       Сод,       ExecDate, deal_pd.GetLeg().PFI, NATCUR);
+        ConvSum(NatcurSum, NatcurSum, ExecDate, deal_pd.GetLeg().PFI, NATCUR);
+        ConvSum(Сном,      Сном,      ExecDate, deal_pd.GetLeg().PFI, NATCUR);
+        if (stat and (Сод > 0) and (not IsGraphPaym(deal_pd.GetTick().DealID, DL_IBCDOC, PM_PURP_PRINC_RET)))
+            Спод = Сод*Сном/NatcurSum;
+            Sk = (abs(КОРост)*Спод)/Сод;
+            if (stat)
+                stat = UNI_InsertDocs (i, tdr_retirement, tdr_rights, NATCUR, NULL, Спод, NULL, NULL, "Погашение приобретенных прав требования");
+            end;
+            if (КОРост > 0)
+                stat = UNI_InsertDocs (i, tdr_plodP(deal_pd.GetTick().TypeDoc), tdr_adjcmR, NATCUR, NATCUR, Sk, NULL, NULL, "Списание корректировки, увеличивающей стоимость сделки приобретения прав требования МБК");
+            else
+                stat = UNI_InsertDocs (i, tdr_adjcmP, tdr_plodR(deal_pd.GetTick().TypeDoc), NATCUR, NATCUR, Sk, NULL, NULL, "Списание корректировки, уменьшающей стоимость сделки приобретения прав требования МБК");
+            end;
+            if (stat)
+                VAR ВД = deal_pd.GetLeg().PFI,
+                    ct = MM_Carry,
+                    Account = MC_FindAndOpenCommonAccByFD(tdr_corespacc_vb, deal_pd, ExecDate, 0, MC_OPENACC_CREATE, NULL, ВД, 
+                                         NULL, NULL, NULL, FIROLE_CORACC_ACTIVE, NULL, NULL, NULL, NULL, NULL, false, false);
+
+                ct.FIIDActive   = ВД;
+                ct.CatReceiver  = tdr_nomcost;
+                ct.Chapter      = 3;
+                ct.AccountPayer = Account;
+                ct.FIID         = ВД;
+                ct.Date_carry   = ExecDate;
+                ct.Ground       = "Списание номинальной стоимости по приобретенным правам требования";
+                ct.SumPayer     = KvitAmounts(i);
+                ct.PrimaryDoc   = deal_pd;
+                ct.PaymentObj   = FactPayms(i);
+
+                stat = ct.carry();
+            end;
+        end;
+        if (stat)
+            var Sпрем = MM_CalcPrize(deal_pd.GetTick().BOfficeKind, deal_pd.GetTick().DealID, ExecDate, 10, 0, 0, KvitAmounts(i));
+            var NcSпрем;
+            ConvSum(NcSпрем, Sпрем, ExecDate, deal_pd.GetLeg().PFI, NATCUR);
+            if (Sпрем > 0)
+                stat = UNI_InsertDocs (i, tdr_retirement, tdr_plodR(deal_pd.GetTick().TypeDoc), NATCUR, NATCUR, NULL, NcSпрем, NULL, "Отражение финансового результата по сделке приобретения прав требования МБК");
+                if (stat)
+                    OldVal = ПолучитьЗначениеПримечания(OBJTYPE_MMARKDEAL, UniID(deal_pd.tick, OBJTYPE_MMARKDEAL), 16/*MN_PRIZE*/, ExecDate);
+                    MM_ChangeNoteText(OBJTYPE_MMARKDEAL, UniID(deal_pd.tick, OBJTYPE_MMARKDEAL), 16/*MN_PRIZE*/, ExecDate, Money(OldVal - Sпрем));
+                end;
+            end;
+        end;
+        if (stat)
+            var Дисконт = deal_pd.GetRestAccount(tdr_discount_cm, ExecDate, deal_pd.GetLeg().PFI, 1);
+            var Sдиск = MM_CalcDiscount(deal_pd.GetTick().BOfficeKind, deal_pd.GetTick().DealID, ExecDate, 10, 0, 0, KvitAmounts(i));
+            var NcSдиск;
+            ConvSum(NcSдиск, Sдиск,   ExecDate, deal_pd.GetLeg().PFI, NATCUR);
+            ConvSum(Дисконт, Дисконт, ExecDate, deal_pd.GetLeg().PFI, NATCUR);
+            if (Дисконт > 0)
+                stat = UNI_InsertDocs (i, tdr_retirement, tdr_discount_cm, NATCUR, NULL, Дисконт, NULL, NULL, "Погашение начисленного дисконта по сделке приобретения прав требования МБК");
+            end;
+            if (stat and (Sдиск > 0))
+                stat = UNI_InsertDocs (i, tdr_plodP(deal_pd.GetTick().TypeDoc), tdr_retirement, NATCUR, NATCUR, NULL, NcSдиск - Дисконт, NULL, "Отражение финансового результата по сделке приобретения прав требования МБК");
+                if (stat)
+                    OldVal = ПолучитьЗначениеПримечания(OBJTYPE_MMARKDEAL, UniID(deal_pd.tick, OBJTYPE_MMARKDEAL), 17/*MN_DISCOUNT*/, ExecDate);
+                    MM_ChangeNoteText(OBJTYPE_MMARKDEAL, UniID(deal_pd.tick, OBJTYPE_MMARKDEAL), 17/*MN_DISCOUNT*/, ExecDate, Money(OldVal - Sдиск));
+                end;
+            end;
+        end;
+        if (stat)
+           stat = UNI_InsertDocs (i, NULL, tdr_retirement, NULL, NATCUR, KvitAmounts(i), NULL, NULL, "Погашение приобретенных прав требования");
+        end;
+    else
+        КОРост = GetAdjRest();
+        stat = UNI_InsertDocs (i, NULL, tdr_rest(deal_pd.GetTick().FlagTypeDeal), NULL, NULL, KvitAmounts(i), NULL, NULL, "Погашение основного долга");
+        if (stat)
+            stat = ПолучитьОстатокСчета(deal_pd, tdr_rest(deal_pd.GetTick().FlagTypeDeal), Счет, 1, Сод, ExecDate, deal_pd.GetLeg().PFI);
+            ConvSum(Сод,       Сод,       ExecDate, deal_pd.GetLeg().PFI, NATCUR);
+            ConvSum(NatcurSum, NatcurSum, ExecDate, deal_pd.GetLeg().PFI, NATCUR);
+            if (stat and (Сод > 0) and (not IsGraphPaym(deal_pd.GetTick().DealID, DL_IBCDOC, PM_PURP_PRINC_RET)))
+                Sk = (abs(КОРост)*NatcurSum)/Сод;
+                if (КОРост > 0)
+                    stat = UNI_InsertDocs (i, tdr_plodP(deal_pd.GetTick().TypeDoc), tdr_adjplP, NATCUR, NATCUR, Sk, NULL, NULL, "Списание корректировки, увеличивающей стоимость сделки размещения МБК");
+                else
+                    stat = UNI_InsertDocs (i, tdr_adjplR, tdr_plodR(deal_pd.GetTick().TypeDoc), NATCUR, NATCUR, Sk, NULL, NULL, "Списание корректировки, уменьшающей стоимость сделки размещения МБК");
+                end;
+            end;
+        end;
+    end;
+    return stat;
+  end;
+END;
+
+PRIVATE MACRO InsertDocsOvdPrinc(i)
+  if (not InsertCLDocsPrinc(KvitAmounts(i)))
+    return false;
+  end;
+  var CredFIID = deal_pd.GetLeg().PFI;
+  if (ContrIsBankrupt)
+    CredFIID = NATCUR;
+  end;
+  return UNI_InsertDocs (i, NULL, tdr_exprestR, NULL, CredFIID, KvitAmounts(i), NULL, NULL, "Погашение просроченного основного долга");
+END;
+
+PRIVATE MACRO ПолучитьСуммуУплаченныхСверхНачисленных(PcDate)
+    var 
+        СуммаНачисленых = TRsbDataSet("select NVL(Sum(t_SumCalc), 0) as SumAdd from DPRCCNTSCHED_DBT where " +
+                                      "T_CONTRACTID = " + MM_GetPercContractID(PC_IBC_CON, deal_pd.GetTick().DealCode) + " and T_SCHEDULEKIND = 2 and T_SPECIALTYPE = 0 " +
+                                      "and T_DATE <= TO_DATE('" + PcDate + "') "),
+        СуммаУплаченных = TRsbDataSet("select NVL(sum(pml.t_Amount), 0) as SumPay " +
+                                      "from dpmlink_dbt pml, dpmpaym_dbt pm " +
+                                      "where (pml.t_initialpayment = pm.t_PaymentID) " +
+                                      "and(pml.t_InitialPayment = pml.t_PurposePayment) " +
+                                      "and(pm.t_DocKind = " + DL_IBCDOC + ") and(pm.t_Purpose = " + PM_PURP_PERCENT + ") " +
+                                      "and(pm.t_DocumentID = " + deal_pd.GetTick().DealID + ")and(pm.t_ValueDate <= TO_DATE('" + PcDate + "'))"),
+        СуммаСверхНачисленных = 0;
+
+
+
+    СуммаНачисленых.MoveNext;
+    СуммаУплаченных.MoveNext;
+
+    СуммаСверхНачисленных = СуммаУплаченных.SumPay - СуммаНачисленых.SumAdd;
+
+    if (СуммаСверхНачисленных < 0)
+        СуммаСверхНачисленных = 0;
+    end;
+	  
+    return СуммаСверхНачисленных;
+END;
+
+PRIVATE MACRO InsertDocsPercent (i)
+    VAR СчетПроцентов, ok, claim_cat, at,
+        СуммаПолученных,  
+        УплачНачБ, ПолучСверхНач,
+        НачбалансСрочн = 0,
+        ДоНачисленные = 0, stat,
+        НалогСтавка = 0, НалогОбщий = 0, НалогНачбалансСрочн = 0, НалогНеНач = 0;
+
+    if (PlanPayms(i).PayerAmount == 0)
+        return true;
+    end;
+
+    СуммаПолученных = min(PlanPayms(i).PayerAmount, KvitAmounts(i));
+
+    if (isSale(GetOperationGroup(deal_pd.GetTick().DealType)))
+        claim_cat = tdr_claimR;
+    else
+        claim_cat = tdr_perc3R;
+    end;
+
+    if (not ПолучитьОстатокСчета(deal_pd, claim_cat, NULL, NULL, НачбалансСрочн, ExecDate, deal_pd.GetLeg().PFI))
+        mm_error ("Ошибка при получении остатков на счетах");
+        return false;
+    end;
+
+    ПолучСверхНач = СуммаПолученных;
+    УплачНачБ     = min(НачбалансСрочн, ПолучСверхНач);
+    ПолучСверхНач = ПолучСверхНач - УплачНачБ;
+    VAR party  = TBfile("party.dbt",    "R", 0);
+            party.rec.PartyID = deal_pd.GetTick().PartyID;
+            party.getEQ;
+
+    if (ПолучСверхНач > 0)
+        mm_error("Сумма платежа превышает сумму начисленных процентов: " + НачбалансСрочн);
+        return false;
+    end;
+
+    НалогСтавка = double(readNoteForObject(OBJTYPE_PARTY, UniID(party, OBJTYPE_PARTY), 59, {curdate}, date(0,0,0)));
+    
+    if (VALTYPE(НалогСтавка) == V_UNDEF)
+        НалогСтавка = 0;
+    end;
+    
+    НалогНачбалансСрочн = УплачНачБ * (НалогСтавка/100);
+    НалогНеНач = ПолучСверхНач * (НалогСтавка/100);
+    
+    НалогОбщий = НалогНачбалансСрочн + НалогНеНач;
+    НалогОбщий = round(НалогОбщий, 2);
+
+    //сделка привлечения, отрицательная ставка
+    if (deal_pd.GetTick().NegativeRate == "X")
+
+        if (УплачНачБ > 0)
+            at = MM_Carry;
+            at.date_carry       = ExecDate;
+            at.PrimaryDoc       = deal_pd;
+            at.FIIDPayer        = deal_pd.GetLeg().PFI;
+            at.FIIDReceiver     = deal_pd.GetLeg().PFI;
+            at.AccountPayer     = FactPayms(i).FuturePayerAccount;
+            at.CatReceiver      = tdr_perc3R;
+            at.SumReceiver      = round(УплачНачБ - НалогНачбалансСрочн, 2);
+            at.Chapter          = 1;
+            at.Ground           = "Погашение процентных требований по сделкам с отриц. ставками";
+            at.PaymentObj       = FactPayms(i);
+
+            if (not at.carry())
+                return false; 
+            end;
+
+            //ConvSum( НалогНачбалансСрочн, НалогНачбалансСрочн, ExecDate, deal_pd.GetLeg().PFI, NATCUR);
+            at = MM_Carry;
+            at.date_carry       = ExecDate;
+            at.PrimaryDoc       = deal_pd;
+            at.FIIDPayer        = NATCUR;
+            at.FIIDReceiver     = deal_pd.GetLeg().PFI;
+            at.CatPayer         = tdr_federal_tax;
+            at.CatReceiver      = tdr_perc3R;
+            at.SumReceiver      = round(НалогНачбалансСрочн, 2);
+            at.Chapter          = 1;
+            at.Ground           = "Учет удержанного налога на доходы по процентам";
+            at.PaymentObj       = FactPayms(i);
+
+            if (not at.carry())
+                return false; 
+            end;
+        end;
+    // сделка размещения
+    else
+        /*Выполняем проводки*/  
+        if (УплачНачБ > 0)
+		    var РазницаБ = round(УплачНачБ-НалогНачбалансСрочн, 2);
+            ok = UNI_InsertDocs (i, NULL, tdr_claimR, NULL, NULL, NULL, РазницаБ, 1, "Погашение процентных требований без нарушения срока по сделке");
+            if( not ok) return false; end;
+        end;
+
+        if (НалогНачбалансСрочн > 0)
+            var НалогНачбалансСрочнОкр = round(НалогНачбалансСрочн, 2);
+            ok = UNI_InsertDocs ( i, tdr_federal_tax, tdr_claimR, NATCUR, NULL, NULL, НалогНачбалансСрочнОкр, 1, "Учет удержанного налога на доходы по процентам");
+            if (not ok) return false; end;
+        end;
+
+        if (НалогОбщий > 0)
+            SaveNalogHistory(ExecDate, deal_pd.GetTick().DealId, (УплачНачБ + ПолучСверхНач), НалогОбщий, НалогСтавка);
+        end;
+
+    end;
+    
+    return true;    
+END;
+
+PRIVATE MACRO InsertDocsOvdPerc (i)
+  VAR party  = TBfile("party.dbt",    "R", 0);
+              party.rec.PartyID = deal_pd.GetTick().PartyID;
+              party.getEQ;
+  VAR НалогСтавка = double(readNoteForObject(OBJTYPE_PARTY, UniID(party, OBJTYPE_PARTY), 59, {curdate}, date(0,0,0)));
+  if (ValType(НалогСтавка) == V_UNDEF)
+    НалогСтавка = 0;
+  end;
+  VAR Сумма = KvitAmounts(i);
+  VAR Налог = Сумма* (НалогСтавка/100);
+  Налог = round(Налог, 2);
+  var CredFIID = deal_pd.GetLeg().PFI;
+  if (ContrIsBankrupt)
+    CredFIID = NATCUR;
+  end;
+  
+  VAR ok = UNI_InsertDocs ( i, NULL, tdr_exppercR, NULL, CredFIID, (Сумма - Налог), NULL, 1, "Погашение просроченных процентных требований по сделке.") and
+           UNI_InsertDocs ( i, tdr_federal_tax, tdr_exppercR, NATCUR, CredFIID, Налог, NULL, 1, "Учет удержанного налога на доходы по процентам.");
+  if (Налог > 0)
+      SaveNalogHistory(ExecDate, deal_pd.GetTick().DealId, Сумма, Налог, НалогСтавка);
+  end;
+  return ok;
+END;
+
+PRIVATE MACRO InsertDocsComOvdReceiving (i)
+  VAR Ground = "Получение комиссии Банком", DataSet,tdr_cat, ТипКомиссии;
+  DataSet = TRsbDataSet("SELECT t_type FROM dmmcomiss_dbt " +
+        " INNER JOIN ddlcomis_dbt ON ddlcomis_dbt.t_feetype = dmmcomiss_dbt.t_feetype AND ddlcomis_dbt.t_comnumber = dmmcomiss_dbt.t_number " +
+        " WHERE ddlcomis_dbt.t_ID = "+FactPayms[i].SubPurpose);
+  if(not DataSet.MoveNext())
+    return false;
+  end;
+  ТипКомиссии = DataSet.Type;
+  if (ТипКомиссии == 1)
+    tdr_cat = tdr_pccomreq;
+  else
+    tdr_cat = tdr_opcomreq;
+  end;
+
+  var CredFIID = deal_pd.GetLeg().PFI;
+  if (ContrIsBankrupt)
+    CredFIID = NATCUR;
+  end;
+
+  return UNI_InsertDocs (i, NULL, tdr_cat, NULL, CredFIID, KvitAmounts(i), NULL, NULL, Ground, NULL, 10000 + FactPayms[i].SubPurpose);
+END;
+
+PRIVATE MACRO InsertDocsComReceiving (i)
+  VAR Ground = "Получение комиссии Банком";
+  if (isSale(GetOperationGroup(deal_pd.GetTick().DealType)))
+    return UNI_InsertDocs (i, NULL, get_inccalcs(deal_pd.GetTick().DealType), NULL, NULL, KvitAmounts(i), NULL, NULL, Ground, NULL, 10000 + FactPayms[i].SubPurpose);
+  end;
+  return UNI_InsertDocs (i, NULL, tdr_comreq, NULL, NULL, KvitAmounts(i), NULL, NULL, Ground, NULL, 10000 + FactPayms[i].SubPurpose);
+END;
+
+PRIVATE MACRO InsertDocsPenalty (i)
+  VAR НачШтраф, ДатаВвода, tdr_penny_cat, Ground, stat, Account = "";
+  GetRegistryValue("COMMON\\МСФО\\ДАТА_ВВОДА",
+    V_STRING, ДатаВвода, stat);
+  if (stat)
+    mm_error("Ошибка при работе с реестром");
+    return false;
+  end;
+  ДатаВвода = date (ДатаВвода);
+
+  if (PlanPayms(i).Purpose == PM_PURP_PENALTY_PRINC)
+    tdr_penny_cat = tdr_penny_ODR;
+    Ground        = "Погашение штрафов за просроченный основной долг";
+  else
+    tdr_penny_cat = tdr_penny_percR;
+    Ground        = "Погашение штрафов за просроченные проценты";
+  end;
+
+  if ((ДатаВвода <= ExecDate) or ((ДатаВвода > ExecDate) 
+        and СчетСделки(tdr_penny_cat, deal_pd.GetTick().DealID, Account, ExecDate, NULL, true)))
+
+    ПолучитьОстатокСчета(deal_pd, tdr_penny_cat, NULL, 1, НачШтраф, ExecDate, deal_pd.GetLeg().PFI);
+    if (KvitAmounts(i) > НачШтраф)
+      // начисление неустоек
+      InsertDocs(deal_pd, PlanPayms(i).Purpose, (KvitAmounts(i)-НачШтраф));
+    end;
+
+    return UNI_InsertDocs (i, NULL, tdr_penny_cat, NULL, NULL, KvitAmounts(i), NULL, NULL, Ground);
+  else
+    return UNI_InsertDocs (i, NULL, tdr_pennyR, NULL, NATCUR, KvitAmounts(i), NULL, NULL, Ground);
+  end;
+END;
+
+PRIVATE MACRO InsertDocs(i)
+  if (KvitAmounts(i) == 0)
+      return true;
+  end;
+
+  RSDCommand("truncate table dmmnalog_tmp").execute();
+
+  if (PlanPayms(i).Purpose == PM_PURP_PRINC)
+      return InsertDocsPrinc (i);
+  elif (PlanPayms(i).Purpose == PM_PURP_PRINC_RET)
+      return InsertDocsPrinc (i);
+  elif (PlanPayms(i).Purpose == PM_PURP_PERCENT)
+      return InsertDocsPercent (i);
+  elif (PlanPayms(i).Purpose == PM_PURP_OVD_PRINC)
+      return InsertDocsOvdPrinc (i);
+  elif (PlanPayms(i).Purpose == PM_PURP_OVD_PERC)
+      return InsertDocsOvdPerc (i);
+  elif (PlanPayms(i).Purpose == PM_PURP_PENALTY_PRINC)
+      return InsertDocsPenalty (i);
+  elif (PlanPayms(i).Purpose == PM_PURP_PENALTY_PERC)
+      return InsertDocsPenalty (i);
+  elif (PlanPayms(i).Purpose == PM_PURP_COMRECEIVING)
+      return InsertDocsComReceiving (i);
+  elif (PlanPayms(i).Purpose == PM_PURP_OVD_COMRECEIVING)
+      return InsertDocsComOvdReceiving (i);
+  end;
+
+  return true;
+END;
+
+PRIVATE MACRO InsertAllDocs
+  VAR i = 0;
+
+  while( i < PlanIDs.size )
+      if (not InsertDocs (i))
+          return false;
+      else
+        PlanPayms(i).FuturePayerAccount    = PlanFuturePayerAccounts(i);
+        PlanPayms(i).FutureReceiverAccount = PlanFutureReceiverAccounts(i);
+        FactPayms(i).FuturePayerAccount    = FactFuturePayerAccounts(i);
+        FactPayms(i).FutureReceiverAccount = FactFutureReceiverAccounts(i);
+      end;
+      i = i + 1;
+  end;
+  
+  return true;
+END;
+
+/*----------------------------------------------------------------------------
+    Выполнение шага
+----------------------------------------------------------------------------*/
+MACRO ExecuteStep( Buffer, Document, DocKind, IDOperation, IDStep)
+  VAR BankruptStatus = 0, rvstat = 0;
+
+  record deal( dl_tick );
+
+  SetBuff( deal, Document );
+  DL_PrepareCarryBuffer (Buffer);
+
+  ID_Operation = IDOperation;
+  ID_Step      = IDStep;
+
+  deal_pd = MMFirstDoc(DL_IBCDOC, deal.DealID, true);
+  
+  if (CheckExistence(LEG_LegKind_DealID_LegID, LEG_KIND_DL_TICK, deal.DealID, 1))
+      mm_error( "Не найден транш сделки ", deal.DealCode );
+      return 1;
+  end;
+
+  if (KvitAmounts[0] < $0)
+      return 1;
+  end;
+
+  if (not GetAllPayms)
+      return 1;
+  end;
+
+  rvstat = GetPartyBankruptStatus(deal.PartyID, {curdate}, @BankruptStatus);
+  if((rvstat == 0) AND (BankruptStatus != 10))
+    ContrIsBankrupt = true;
+  else
+    ContrIsBankrupt = false;
+  end;
+
+  if (FactIDs(0) == 0)
+      /*Симуляция исполнения - фактический платеж создаем сами*/
+      if (not MakeFactPaym ())
+          return 1;
+      end;
+  else
+      if (not KvitPayms)
+          return 1;
+      end;
+  end;
+
+  if (not InsertAllDocs)
+      return 1;
+  end;
+
+  return 0;
+END;
+
+NameMacroFile = "mme_j.mac";

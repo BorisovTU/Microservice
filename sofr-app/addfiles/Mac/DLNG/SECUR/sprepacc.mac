@@ -1,0 +1,2005 @@
+/*
+$Name:         sprepacc.mac
+$Module:       Депозитарий
+$Description:  Печать отчета "Выписка о состоянии счета депо"
+*/
+import deposerv, SFInter, CurrInter, dlquery, cb_sql, opr_depo, scsrvrepfun;
+import RsbDataSet;
+
+const UNDEF_ID = -1;
+const OPENAC = "";
+const CLOSEAC = "З";
+const Depo_chapt =  5;
+private const UnknownParty = -1;
+private const SYS_ANL_AINPACCOUNTING = 2;
+private const ALG_VS_TYPE = 3505; //Виды векселей: Простой/переводной   
+private const SP_DEPOPER_ADMOPER = 825;
+private const OBJTYPE_DEPODOC = 115;
+private const IRCAG_ROLE_PAWNER = 7, IRCAG_ROLE_DEBTOR = 16;
+
+/* для внутреннего использования */
+const MOD_SIMPLE = 0;
+const MOD_EXT = 1;
+
+var is_print = false;
+
+/* виды значений объекта - Сторона баланса (1000) */
+const SIDEBALANCE_UNDEFINE = 0;  /* не установлен */
+private const SIDEBALANCE_ACTIVE   = 1;  /* активный      */
+private const SIDEBALANCE_PASSIVE  = 2;  /* пассивный     */
+
+private const DEPO_ACC_ALL = 0;
+private const DEPO_ACC_ACTIV = 1;
+private const DEPO_ACC_PASSIV = 2;
+
+
+/* данные для отчета */
+var acc_kind, DepoPart, DepoAcc, Party, Department, RepDate, FIID, SecurQual, Issuer, AvoirKind, InvCardID, correspond_acc, correspond_part, showPawn, mortgagee;
+/* вспомогательные данные */                                                                   
+var LogOprID, Partitions, Apostr,  NullOvers, result_by_acc, result_by_docfi;
+private var RepFormatKind, withAmortization, withStoragePlace, Comment;
+private var PrintMode, Copies, IsWebService;
+
+private macro ПолучитьТипСчета(Type)
+  var query, DataSet;
+  var Select;
+
+  query =   " select dpac.t_Name Name " +
+            " from ddepoac_dbt dpac " +
+            " where dpac.t_ID = ? /*1*/";
+
+  Select = DL_RSDCommand( query );
+
+  Select.AddParam(Type);  /*1*/
+
+  DataSet = Select.Execute();
+
+  if(DataSet.moveNext())
+    return DataSet.Name;
+  end;
+
+  return "";
+end;
+
+private macro GetLLVALUES( List, Elem )
+  file llvalues("llvalues");
+
+  ClearRecord(llvalues);
+  llvalues.List    = List;
+  llvalues.Element = Elem;
+  if( GetEQ(llvalues) )
+    return llvalues.Name;
+  end;
+
+  return "-";
+end;
+
+
+// Класс подготовки данных для отправки сообщения в RS-Payments
+private class DP_ExtrAccMessage(AutoKey, _TmpTable)
+  private var WillWork = false; // Можно ли работать с сообщением?
+  private var Receiver;
+  private var extr_head = TBFile("dpaccrep.tmp", "W");
+  private var TmpTable = _TmpTable;
+
+
+  private macro ClearTmpFiles()
+    SQL_Execute("DELETE FROM DDPACCREP_TMP", "", false );
+    SQL_Execute("DELETE FROM DDPACCREPPART_TMP", "", false );
+    SQL_Execute("DELETE FROM DDPACCREPFI_TMP", "", false );
+    SQL_Execute("DELETE FROM DDPACCREPREST_TMP", "", false );
+  end;
+
+
+  private macro EnableSend(SendInstruction) // Должна вызываться первой, только если отчет выпускается из ИО, по одному счету депо, в попытке решить будет ли отсылаться сообщение
+    var Transport;
+
+    if((NOT GetTransport(Transport)) AND (Transport == DPTRANSP_PAYMENTS)) // Если включена работа с RS-Payments
+      if(DepoAcc > 0 ) // По одному счету депо
+        if(NOT FindDpMessageByDraft(extr_head.rec.DraftID, RSPMDK_INFOPER)) // Если сообщение по поручению еще не сформировано
+          if(SendInstruction == SET_CHAR) // Если в ИО установлен признак отправки
+            WillWork = true;
+
+            ClearTmpFiles();
+          end;
+        end;
+      end;
+    end;
+  end;
+
+
+  macro FillFromLogOpr(lo, acnt)
+    EnableSend(lo.rec.SendInstruction);
+    if(WillWork)
+      // extr_head.rec.PrepDate заполняется в С после установки статуса "Закрыта"
+      extr_head.rec.StatDate = RepDate;
+      extr_head.rec.ReportPeriod = "ADHO";
+      extr_head.rec.ReportSize = "DELT";
+      extr_head.rec.ExtrType = "CUST";
+      extr_head.rec.SafeDepo = acnt.rec.BriefCode;
+      if(Partitions)
+        extr_head.rec.ExtCons = "Y";
+      else
+        extr_head.rec.ExtCons = "N";
+      end;
+      // extr_head.rec.ExtActi заполняется по итогам формирования данных выписки
+    end;
+  end;
+
+  macro FillFromExGround(spgr)
+    if(WillWork)
+      Receiver = spgr.rec.Party;
+
+      extr_head.rec.ReceiverBIC = ПолучитьКодСубъекта(spgr.rec.Party, PTCK_SWIFT);
+      extr_head.rec.NumRep = spgr.rec.Xld;
+    end;
+  end;
+
+
+  private macro GetExtActi()
+    var query, DataSet;
+    var Select;
+    var ExtActi = "N";
+
+    query = " SELECT DECODE((SELECT COUNT(1) FROM DDPACCREPPART_TMP part WHERE part.t_DraftID = ?), 0, 'N', 'Y') t_ExtActi " +
+            " FROM DUAL ";
+
+    Select = DL_RSDCommand( query );
+    Select.AddParam(extr_head.rec.DraftID); /*1*/
+    DataSet = Select.Execute();
+
+    if(DataSet.moveNext())
+      ExtActi = string(DataSet.ExtActi);
+    end;
+
+    return ExtActi;
+  end;
+
+
+  macro Insert()
+    var stat = true;
+    var RootPart = "";
+    var query, cmd;
+    const TYPE_AVAI = "'AVAI'", TYPE_NAVAIL = "'NAVL'";
+
+    if(WillWork)
+
+      // Сначала вставляем остатки
+      if(Partitions)
+        RootPart = "t_AcntPart";
+      else
+        RootPart = "t_AcntRoot";
+      end;
+
+      // Выбираем все ненулевые остатки, просуммированные по разделам и по ФИ, в пределах одного типа остатка
+      query = " INSERT INTO DDPACCREPREST_TMP (T_DRAFTID, T_SAFEDEPOPART, T_FIID, T_RESTYPE, T_QUANTITY) " +
+              " SELECT * FROM (WITH accrest AS ( SELECT repacc.t_FIID, " +
+                                                      " repacc.t_Rest, " +
+                                                      " repacc." + RootPart + ", " +
+                                                      " NVL((SELECT CASE when llval.t_Code = '000' then " + TYPE_AVAI +
+                                                                       " when llval.t_Code = 'W11' then " + TYPE_NAVAIL +
+                                                                       " when llval.t_Code = 'W12' then " + TYPE_NAVAIL +
+                                                                       " when llval.t_Code = 'W13' then " + TYPE_NAVAIL +
+                                                                       " when llval.t_Code = 'W14' then " + TYPE_NAVAIL +
+                                                                       " when llval.t_Code = 'W15' then " + TYPE_AVAI +
+                                                                       " when llval.t_Code = 'W16' then " + TYPE_NAVAIL +
+                                                                       " when llval.t_Code = 'W17' then " + TYPE_AVAI +
+                                                                       " when llval.t_Code = 'W21' then " + TYPE_AVAI +
+                                                                       " when llval.t_Code = 'W22' then " + TYPE_AVAI +
+                                                                       " when llval.t_Code = 'R23' then " + TYPE_AVAI +
+                                                                       " when llval.t_Code = 'R28' then " + TYPE_AVAI +
+                                                                       " when llval.t_Code = 'S24' then " + TYPE_AVAI +
+                                                                       " when llval.t_Code = 'W25' then " + TYPE_NAVAIL +
+                                                                       " when llval.t_Code = 'W26' then " + TYPE_NAVAIL +
+                                                                       " when llval.t_Code = 'W27' then " + TYPE_AVAI +
+                                                                       " when llval.t_Code = 'W31' then " + TYPE_NAVAIL +
+                                                                       " when llval.t_Code = 'W32' then " + TYPE_NAVAIL +
+                                                                       " when llval.t_Code = 'W41' then " + TYPE_NAVAIL +
+                                                                       " when llval.t_Code = 'W42' then " + TYPE_AVAI +
+                                                                       " when llval.t_Code = 'W43' then " + TYPE_AVAI +
+                                                                       " when llval.t_Code = 'W44' then " + TYPE_AVAI +
+                                                                       " when llval.t_Code = 'W45' then " + TYPE_AVAI +
+                                                                       " when llval.t_Code = 'W46' then " + TYPE_AVAI +
+                                                                       " when llval.t_Code = 'W47' then " + TYPE_AVAI +
+                                                                       " when llval.t_Code = 'W48' then " + TYPE_AVAI +
+                                                                       " when llval.t_Code = 'W49' then " + TYPE_AVAI +
+                                                                       " when llval.t_Code = 'Z51' then " + TYPE_AVAI +
+                                                                       " when llval.t_Code = 'Z52' then " + TYPE_AVAI +
+                                                                       " when llval.t_Code = 'Z53' then " + TYPE_NAVAIL +
+                                                                  " END " +
+                                                             " FROM ddepoatvl_dbt atvl, dllvalues_dbt llval " +
+                                                            " WHERE atvl.t_IsType = CHR(0) " +
+                                                              " AND atvl.t_ID = repacc.t_AcntPart " +
+                                                              " AND atvl.t_AttrNum = 6 " +
+                                                              " AND llval.t_List = atvl.t_List " +
+                                                              " AND TO_CHAR(llval.t_Element) = atvl.t_Value), 'AVAI') t_RestType " +
+                                                "  FROM " + TmpTable + " repacc " +
+                                                " WHERE repacc.t_AcntRoot = " + DepoAcc +
+                                                "   AND repacc.t_Rest != 0 " +
+                                                "   AND repacc.t_IndoorStorage = 0) " +
+                             " SELECT " + extr_head.rec.DraftID + ", acnt.t_BriefCode,  accrest.t_FIID, accrest.t_RestType, Sum(accrest.t_Rest) t_Rest " +
+                               " FROM accrest, ddepoacnt_dbt acnt " +
+                              " WHERE acnt.t_AutoKey = accrest." + RootPart +
+                              " GROUP BY (acnt.t_BriefCode, accrest.t_FIID, accrest.t_RestType) ) ";
+
+      SQL_Execute(query, "", false );
+
+
+      // На основе остатков собираем список ФИ
+      query = " INSERT INTO DDPACCREPFI_TMP (T_DRAFTID, " +
+                                           " T_SAFEDEPOPART, " +
+                                           " T_FIID, " +
+                                           " T_ISSUENAME, " +
+                                           " T_ISIN, " +
+                                           " T_LSIN, " +
+                                           " T_ISSUEOTHRCODEKIND, " +
+                                           " T_ISSUEOTHRCODE, " +
+                                           " T_ISSUENOMINAL, " +
+                                           " T_ISSUENOMCURRENCY) " +
+              " SELECT distinct " + extr_head.rec.DraftID + ", "
+                     " rest.t_SafeDepoPart, " +
+                     " rest.t_FIID, " +
+                     " fi.t_Name t_IssueName, " +
+                     " avr.t_ISIN t_ISIN, " +
+                     " avr.t_LSIN t_LSIN, " +
+                     " CASE " +
+                       " WHEN rsi_rsbparty.PT_GetPartyCode (" + Receiver + ", 1) = 'НРД' " +
+                       " THEN  " +
+                          " 'NSD' " +
+                        " ELSE " +
+                           " CHR (1) " +
+                     " END t_IssueOthrCodeKind, " +
+                     " CASE " +
+                       "  WHEN rsi_rsbparty.PT_GetPartyCode (" + Receiver + ", 1) = 'НРД' " +
+                        " THEN " +
+                          " NVL((SELECT oc.t_Code " +
+                               " FROM DOBJCODE_DBT oc " +
+                               " WHERE oc.t_ObjectType = 9 " +
+                                 " AND oc.t_CodeKind = 14 " +
+                                 " AND oc.t_ObjectID = fi.t_FIID), CHR(1)) " +
+                        " ELSE " +
+                          " CHR (1) " +
+                     " END t_IssueOthrCode, " +
+                     " rsi_rsb_fiinstr.FI_GetNominalOnDate (fi.t_FIID, " + GetSQLDate(extr_head.rec.StatDate) + ", 1) t_IssueNominal, " +
+                     " (SELECT fvc.t_Ccy FROM dfininstr_dbt fvc WHERE fvc.t_FIID = fi.t_FaceValueFI) t_IssueNomCurrency " +
+              " FROM DDPACCREPREST_TMP rest, dfininstr_dbt fi,  DAVOIRISS_DBT avr" +
+              " WHERE rest.t_DraftID = " + extr_head.rec.DraftID +
+                " AND fi.t_FIID = rest.t_FIID " +
+                " AND avr.t_FIID = fi.t_FIID ";
+
+      SQL_Execute(query, "", false );
+
+      // Формируем запись о счете (если есть хотя бы один остаток) или разделах (их берем независимо от остатков)
+      if(Partitions)
+
+        query = " INSERT INTO DDPACCREPPART_TMP (T_DRAFTID, T_SAFEDEPOPART, T_PARTACTI) " +
+                " SELECT DISTINCT " + extr_head.rec.DraftID + ", " +
+                                  " acnt.t_BriefCode, " + 
+                                  " DECODE((SELECT COUNT(1) " +
+                                          " FROM DDPACCREPREST_TMP rest " +
+                                          " WHERE rest.t_SafeDepoPart = acnt.t_BriefCode), 0, 'N', 'Y') t_PartActi " +
+                " FROM " + TmpTable + " repacc, ddepoacnt_dbt acnt " +
+                " WHERE repacc.t_AcntRoot = " + DepoAcc +
+                "  AND repacc.t_IndoorStorage = 0 " +
+                "  AND acnt.t_AutoKey = repacc.t_AcntPart ";
+      else
+
+        query = " INSERT INTO DDPACCREPPART_TMP (T_DRAFTID, T_SAFEDEPOPART, T_PARTACTI) " +
+                " SELECT " + extr_head.rec.DraftID + ", acnt.t_BriefCode, 'Y' t_PartActi " +
+                " FROM ddepoacnt_dbt acnt " +
+                " WHERE acnt.t_AutoKey = " + DepoAcc +
+                "   AND EXISTS (SELECT 1  FROM DDPACCREPREST_TMP rest WHERE rest.t_SafeDepoPart = acnt.t_BriefCode) ";
+      end;
+
+      SQL_Execute(query, "", false );
+
+      // Дозаполним заголовок выписки - если есть хотя бы одна запись о счете/разделе, значит выписка не пустая
+      extr_head.rec.ExtActi = GetExtActi();
+
+      if(extr_head.rec.ExtActi == "N")
+        extr_head.rec.ExtCons = "N";
+      end;
+
+      // Вставим сам заголовок выписки
+      stat = extr_head.Insert();
+
+      if(not stat)
+        msgbox("Ошибка при формировании данных сообщения!");
+      end;
+    end;
+
+    return stat;
+  end;
+
+
+  extr_head.Clear();
+  extr_head.rec.DraftID = AutoKey;
+end;
+
+
+PRIVATE CLASS DP_Sprepacc
+  private var depoacnt;
+  var TmpTable = "ddprepacc_tmp";
+  private var ExtrMessage = DP_ExtrAccMessage(LogOprID, TmpTable);
+  PRIVATE VAR m_rep:T_XML_Rep;
+  PRIVATE VAR m_CellColor = "CAF9FA";
+  PRIVATE VAR m_TableHeadStyle = "BOR;P=C;IC="+m_CellColor+";";
+  PRIVATE VAR m_RepFormatKindName = "";
+
+  PRIVATE MACRO GetAccDocInfo(AccCode)
+    var query, DataSet;
+    var Select;
+    var AccDocInfo = "";
+
+    query = " select sub.t_Name DocName, sf.t_Number DocNumber , sf.t_DateBegin DocDate " +
+            " from dsfcontr_dbt sf, dservksub_dbt sub " +
+            " where sf.t_ObjectType = " + SF_DEPOACC +
+            " AND sf.t_ServKind = " + PTSK_DEPOS +
+            " AND sf.t_Object = ? /*1*/ " +
+            " AND sub.t_ServiceKind = sf.t_ServKind " +
+            " AND sub.t_ServiceKindSub = sf.t_ServKindSub";
+
+    Select = DL_RSDCommand( query );
+    Select.AddParam(AccCode); /*1*/
+    DataSet = Select.Execute();
+
+    if(DataSet.moveNext())
+      AccDocInfo = ", " + string(DataSet.DocName) + " №" + string(DataSet.DocNumber) + " от " + Date(DataSet.DocDate) ;
+    end;
+
+    return AccDocInfo;
+  END;
+
+  PRIVATE MACRO GetDepoPartInfo(DepoID, Code:@variant, BriefCode:@variant, Synt:@variant, Blncname:@variant)
+    var query, DataSet;
+    var Select;
+    var Name = "";
+
+    query = " select dpac.t_Name Name, dpac.t_Code Code, dpac.t_BriefCode BriefCode, dpac.t_Synt Synt, blnc.t_Name_Part BlncName" +
+            " from ddepoacnt_dbt dpac, dbalance_dbt blnc "
+            " where dpac.t_AutoKey = ? /*1*/ " +
+            " AND blnc.t_Chapter = " + DEPO_CHAPT +
+            " AND blnc.t_INumPlan = 0 " +
+            " AND blnc.t_Balance = dpac.t_Synt";
+
+    Select = DL_RSDCommand( query );
+
+    Select.AddParam(DepoID);  /*1*/
+
+    DataSet = Select.Execute();
+
+    if(DataSet.moveNext())
+      Name = string(DataSet.Name);
+      Code = string(DataSet.Code); 
+      BriefCode = string(DataSet.BriefCode);
+      Synt = string(DataSet.Synt);
+      Blncname = string(DataSet.BlncName);
+    else
+      MsgBox("Ошибка поиска данных для раздела счета депо с Autokey = ", DepoID);
+    end;
+
+    return Name;
+  END;
+
+  PRIVATE MACRO DefineRepParams()
+    var query, DataSet;
+    var Select;
+    var Name, Code, BriefCode, Synt, Blncname;
+    var p = "";
+    var cIssuer = NULL;
+
+    if( SecurQual == SECURQUAL_QUAL)
+      p = p + "квалифицированные ценные бумаги";
+    elif(SecurQual == SECURQUAL_NOQUAL)
+      p = p + "неквалифицированные ценные бумаги";
+    else
+      p = p + "все учтенные ценные бумаги";
+    end;
+
+    if(showPawn)
+      p = p + ", ценные бумаги в залоге";
+    end;
+
+    if(DepoPart)
+      Name = GetDepoPartInfo(DepoPart, @Code, @BriefCode, @Synt, @Blncname);
+      p = p + ", по разделу " + Name + " " + Code + " (короткий " + BriefCode + ")";
+    else
+      if(Partitions)
+        p = p + ", по всем разделам";
+      end;
+    end;
+
+    if(NullOvers == true)
+      p = p + ", c нулевыми остатками";
+    end;
+
+    if(result_by_acc == true)
+      p = p + ", с итогом за счет";
+    end;
+
+    if(result_by_docfi == true)
+      p = p + ", с итогом по док. ц/б";
+    end;
+
+    if(Issuer != UnknownParty)
+      cIssuer = CDPParty(Issuer, RepDate);
+      if( cIssuer == NULL )
+        msgbox("Не найден эмитент с ID = ", Issuer);
+      else
+        p = p + ", по эмитенту " + cIssuer.ShortName();
+      end;
+    end;
+
+    if(AvoirKind)
+      query = " select avrk.t_Name Name " +
+              " from davrkinds_dbt avrk " +
+              " where avrk.t_FI_Kind = " + FIKIND_AVOIRISS +
+              "   AND avrk.t_AvoirKind = ? /*1*/";
+
+      Select = DL_RSDCommand( query );
+
+      Select.AddParam(AvoirKind);  /*1*/
+
+      DataSet = Select.Execute();
+
+      if(DataSet.moveNext())
+        p = p + ", по виду ц/б " + string(DataSet.Name);
+      else
+        msgbox("Не найден вид ценной бумаги с ID = ", AvoirKind);
+      end;
+    end;
+
+    if(FIID != ALLFININSTR)
+      p = p + ", по выпуску ц/б " + ПолучитьИмяФинИн(FIID);
+    end;
+
+    if(InvCardID)
+      var ic = TBFile("invcard.dbt");
+      ic.Clear();
+      ic.rec.InvCardID = InvCardID;
+      if(ic.GetEQ())
+        p = p + ", по ИК №" + ic.rec.Number;
+      end;
+    end;
+
+    if(correspond_acc)
+      Name = GetDepoPartInfo(correspond_acc, @Code, @BriefCode, @Synt, @Blncname);
+      p = p + ", по корресп. счету " + Code + " (" + BriefCode + ")";
+    end;
+
+    if(correspond_part)
+      Name = GetDepoPartInfo(correspond_part, @Code, @BriefCode, @Synt, @Blncname);
+      p = p + ", по разделу корресп. счета " + Code + " (" + BriefCode + ")";
+    end;
+
+    if( mortgagee > 0)
+      var party  = TBFile("party");
+      party.rec.partyID = mortgagee;
+      if (party.GetEQ())
+        p = p + ", залогодержатель: " + party.rec.ShortName;
+      end;
+    end;
+
+    return p;
+  END;
+
+
+  PRIVATE MACRO RepHeader(DepoCount)
+    var grXld = "", Reciever = "-", grDoc = "-";
+    var logopr = TBFile("splogopr");
+    var ground = TBFile("spground");
+    var party  = TBFile("party");
+    var cReceiver, cOwner;
+    var tableWidth = 5;
+    
+    m_RepFormatKindName = "Выписка";
+
+    if(withAmortization == true)
+      tableWidth = tableWidth + 1;
+    end;
+
+    if(result_by_acc == false)
+      tableWidth = tableWidth -1;
+    end;
+
+    if(RepFormatKind > 0)
+      m_RepFormatKindName = DL_GetNameAlg( ALG_REPFORMATKIND, RepFormatKind );
+    end;
+
+    if( DepoAcc <= 0 )
+      DP_StdHeaderLO_Ex( null, null, m_RepFormatKindName+" по счету ДЕПО", LogOprID, DepoCount+1, true, RepDate, null, tableWidth, null, null, m_rep );
+    else
+      DP_StdHeaderLO_Ex( null, null, m_RepFormatKindName+" по счету ДЕПО", LogOprID, 0, false, RepDate, null, tableWidth, null, null, m_rep );
+    end;
+
+    if( DepoAcc > 0 )
+      /* № и дата очета */
+      if (LogOprID != 0)
+        logopr.rec.AutoKey = LogOprID;
+        if (logopr.GetEQ() )
+          ExtrMessage.FillFromLogOpr(logopr, depoacnt);
+
+          ground.rec.SPgroundID = logopr.rec.Draft;
+          if (ground.GetEQ())
+            grDoc = GetLLVALUES(OBJTYPE_KINDDOC, ground.rec.Kind) + " вх№ " + ground.rec.Xld + " от " + string(ground.rec.RegistrDate:f);
+          end;
+        end;
+        /* получатель */
+        ground.KeyNum = 6;
+        ground.rec.SourceDocKind = 830;
+        ground.rec.SourceDocID = LogOprID;
+        ground.rec.Direction = EXITING;
+        ground.rec.Division = SelfDivision;
+        if (ground.GetEQ()) 
+
+          ExtrMessage.FillFromExGround(ground);
+
+          Reciever = ground.rec.PartyName;
+          if(Reciever == "")
+            cReceiver = CDPParty( ground.rec.Party, ground.rec.RegistrDate );
+            Reciever = cReceiver.Name();
+          end;
+        else
+          Reciever = "-";
+        end;
+
+        if(Reciever == "")
+          Reciever = "-";
+        end;
+      end;
+
+      if( mortgagee > 0)
+        party.rec.partyID = mortgagee;
+        if (party.GetEQ())
+          Reciever = party.rec.ShortName;
+        end;
+
+      end;
+      cOwner = CDPParty( depoacnt.rec.Owner, RepDate );
+
+      m_rep.Set_WrapText(0);
+
+      m_rep.Put_Str("Отправитель отчета", "START;");
+      m_rep.Put_Str(GetPartyName( {OurBank}, true ), "END;");
+
+      m_rep.Put_Str("Получатель отчета", "START;");
+      m_rep.Put_Str(Reciever, "END;");
+
+      m_rep.Put_Str("Основание выдачи отчета", "START;");
+      m_rep.Put_Str(GrDoc, "END;");
+
+      m_rep.Blank_Line();
+
+      m_rep.Put_Str("Счет Депо", "START;");
+      m_rep.Put_Str(depoacnt.rec.Code + " (короткий " + depoacnt.rec.BriefCode + ")" + GetAccDocInfo(depoacnt.rec.Code), "END;");
+
+      m_rep.Put_Str("Наименование счета", "START;");
+      m_rep.Put_Str(depoacnt.rec.name, "END;");
+
+      m_rep.Put_Str("Депонент", "START;");
+      m_rep.Put_Str(cOwner.Name(), "END;");
+
+      m_rep.Put_Str("Тип счета", "START;");
+      m_rep.Put_Str(ПолучитьТипСчета(depoacnt.rec.Type), "END;");
+
+      m_rep.Blank_Line();
+
+      m_rep.Put_Str("Фильтр формирования выписки:", "START;");
+      m_rep.Put_Str(DefineRepParams(), "END;");
+
+      m_rep.Blank_Line();
+     end;
+  END;
+
+  private macro WriteDepoPartDocs(DepoPart)
+    var query, DataSet;
+    var Select;
+    var IsFirst;
+    var StrDocInfo;
+
+    query =   " SELECT spgr.t_Kind, spgr.t_AltXld, spgr.t_SignedDate, llv.t_Name, "
+            + "        NVL((SELECT LTRIM (MAX (SYS_CONNECT_BY_PATH (q.t_Name, ', ')), ' ,') "
+            + "               FROM (SELECT pt.t_Name, acap.t_APartyGround, ROW_NUMBER () OVER (ORDER BY acap.t_APID) rn "
+            + "                       FROM dparty_dbt pt, ddpacap_dbt acap, ddepoacnt_dbt part "
+            + "                      WHERE part.t_AutoKey = ? /*1*/"
+            + "                        AND acap.t_ApNodeID = part.t_Root "
+            + "                        AND acap.t_Role = " + DEPOACAPROLE_MORTGAGEE
+            + "                        AND acap.t_FromDate <= ? /*2*/ "
+            + "                        AND (acap.t_ToDate >= ? /*3*/ or acap.t_ToDate = "+GetSQLDate(date(0,0,0))+")"
+            + "                        AND Exists(select 1 from ddpacapau_dbt au where au.t_APID = acap.t_APID and au.t_AuNodeID = ? /*4*/)"
+            + "                        AND pt.t_PartyID = acap.t_APartyID "
+            + "                    ) q"
+            + "              WHERE q.t_APartyGround = spgr.t_SPgroundID "
+            + "              START WITH q.rn = 1"
+            + "              CONNECT BY PRIOR q.rn = q.rn - 1"
+            + "            ), CHR(1)) as MortgageeName "
+            + "   FROM dspground_dbt spgr, dllvalues_dbt llv "
+            + "  WHERE (  spgr.t_spgroundid IN ( SELECT TO_NUMBER (atvl.t_value) "
+            + "                                    FROM ddepoatvl_dbt atvl "
+            + "                                   WHERE atvl.t_istype = CHR (0) "
+            + "                                     AND atvl.t_id = ? /*5*/ "
+            + "                                     AND atvl.t_list = " + OBJTYPE_DEPODOC
+            + "                                ) "
+            + "        OR spgr.t_spgroundid IN ( SELECT acap.t_APartyGround "
+            + "                                    FROM ddpacap_dbt acap, ddepoacnt_dbt part "
+            + "                                   WHERE part.t_AutoKey = ? /*6*/"
+            + "                                     AND acap.t_ApNodeID = part.t_Root "
+            + "                                     AND acap.t_Role = " + DEPOACAPROLE_MORTGAGEE
+            + "                                     AND acap.t_FromDate <= ? /*7*/ "
+            + "                                     AND (acap.t_ToDate >= ? /*8*/ or acap.t_ToDate = "+GetSQLDate(date(0,0,0))+")"
+            + "                                     AND Exists(select 1 from ddpacapau_dbt au where au.t_APID = acap.t_APID and au.t_AuNodeID = ? /*9*/)"
+            + "                                )"
+            + "        OR (spgr.t_spgroundid IN ( SELECT spgrd.t_spgroundid "
+            + "                                     FROM ddepoadmo_dbt adm, dspgrdoc_dbt spgrd "
+            + "                                     WHERE adm.t_item = " + SPDP_DEPO_PARTITION
+            + "                                       AND adm.t_partyid = ? /*10*/ "
+            + "                                       AND adm.t_depoacc = ? /*11*/ "
+            + "                                       AND adm.t_depopart = ? /*12*/ "
+            + "                                       AND adm.t_fiid = " + ALLFININSTR
+            + "                                       AND adm.t_account = CHR (1) "
+            + "                                       AND adm.t_operkind = " + SPAO_CON_REGISTERING
+            + "                                       AND spgrd.t_sourcedockind = " + SP_DEPOPER_ADMOPER
+            + "                                       AND spgrd.t_sourcedocid = adm.t_admoprid "
+            + "                              ) "
+            + "            AND spgr.t_Direction != " + EXITING
+            + "           )"
+            + "        )"
+            + "  AND llv.t_List = " + OBJTYPE_KINDDOC
+            + "  AND llv.t_Element = spgr.t_Kind ";
+
+    Select = DL_RSDCommand( query );
+
+    Select.AddParam(DepoPart);  /*1*/
+    Select.AddParam(RepDate);   /*2*/
+    Select.AddParam(RepDate);   /*3*/
+    Select.AddParam(DepoPart);  /*4*/
+
+    Select.AddParam(DepoPart);  /*5*/
+
+    Select.AddParam(DepoPart);  /*6*/
+    Select.AddParam(RepDate);   /*7*/
+    Select.AddParam(RepDate);   /*8*/
+    Select.AddParam(DepoPart);  /*9*/
+
+    Select.AddParam(depoacnt.rec.Owner );  /*10*/
+    Select.AddParam(depoacnt.rec.Root );   /*11*/
+    Select.AddParam(DepoPart );            /*12*/
+
+    DataSet = Select.Execute();
+
+    IsFirst = true;
+    while(DataSet.moveNext())
+      if(IsFirst)
+
+        m_rep.Set_WrapText(0);
+        m_rep.Put_Str("Раздел открыт на основании следующих документов:", "START;END;");
+        m_rep.Blank_Line();
+
+        IsFirst = false;
+      end;
+
+      StrDocInfo = "       " + string(DataSet.Name) + " №" + IIF(string(DataSet.AltXld)=="", "б/н", string(DataSet.AltXld)) + " от " + DL_DateToStr(date(DataSet.SignedDate));
+
+      if(DataSet.MortgageeName != "")
+        StrDocInfo = StrDocInfo + ", Залогодержатель: " + string(DataSet.MortgageeName);
+      end;
+
+      m_rep.Set_WrapText(0);
+      m_rep.Put_Str(StrDocInfo, "START;END;");
+
+    end;
+ 
+  end;
+
+  private macro WriteDepoPartInfo(DepoPart)
+    var StrPartition;
+    var Name, Code, BriefCode, Synt, Blncname;
+
+    Name = GetDepoPartInfo(DepoPart, @Code, @BriefCode, @Synt, @Blncname);
+
+    StrPartition = "Раздел: " + Name + " " + Code + " (короткий " + BriefCode + "), синтетический счет " + 
+                            Synt + " \"" + BlncName + "\"";
+
+    m_rep.Set_WrapText(0);
+    m_rep.Put_Str(StrPartition, "START;END;");
+
+    WriteDepoPartDocs(DepoPart);
+  end;
+
+  
+  PRIVATE MACRO AddLeadNull(NumberStr, TotalLen)
+    var str = NumberStr;
+    var len = strlen(str);
+    var i = 0;
+
+    if(len < TotalLen)
+      i = len;
+      while(i < TotalLen)
+        str = "0" + str;
+        i = i + 1;
+      end;
+    end;
+
+    return str;
+  END;
+
+  PRIVATE MACRO GetSummNominalRest(AcntRoot, AcntPart, AvoirKind, Issuer, FI_Name, FaceValueFI, Nominal:@variant, Rest:@variant)
+    var query, DataSet;
+    var Select;
+    var i = 0;
+
+    Nominal = $0;
+    Rest = $0;
+
+    Select = DL_RSDCommand();
+
+    query =   " SELECT cast(NVL(SUM(repacc.t_FaceValue*repacc.t_Rest),0) as number(32,12)) as SumNominal, cast(NVL(SUM(repacc.t_Rest),0) as number(32,12)) as SumRest "
+            + "   FROM " + TmpTable + " repacc, dfininstr_dbt fin "
+            + "  WHERE repacc.t_AcntRoot = ? /*1*/"
+            + "    AND fin.t_FIID = repacc.t_FIID";
+
+    Select.AddParam(AcntRoot);
+
+    if(AcntPart > 0)
+      query = query + " AND repacc.t_AcntPart = ? /*2*/"; 
+      Select.AddParam(AcntPart);
+    end;
+
+    if(AvoirKind > 0)
+      query = query + " AND repacc.t_AvoirKind = ? /*3*/"; 
+      Select.AddParam(AvoirKind);
+    end;
+
+    if(Issuer > 0)
+      query = query + " AND repacc.t_Issuer = ? /*4*/"; 
+      Select.AddParam(Issuer);
+    end;
+
+    if(FI_Name != "")
+      query = query + " AND ? /*4*/ = (CASE WHEN repacc.t_IndoorStorage <> 0 AND repacc.t_CertifID <> 0 THEN "
+                     + "                                      fin.t_Name || ' ' || rsb_deals.GetFicertIssuerName((select ic.t_FiCertID from dinvcard_dbt ic where ic.t_InvCardID = repacc.t_CertifID)) " 
+                     + "                    ELSE fin.t_Name END)";
+      Select.AddParam(FI_Name);
+    end;
+
+    if(FaceValueFI > -2)
+      query = query + " AND repacc.t_FaceValueFI = ? /*5*/"; 
+      Select.AddParam(FaceValueFI);
+    end; 
+    
+    DataSet = Select.Execute(query);
+
+    if(DataSet.moveNext())
+      Nominal = DataSet.SumNominal;
+      Rest    = DataSet.SumRest;   
+    end;
+  END;
+
+
+  PRIVATE MACRO GetMortIssuerRole()
+    var Role = IRCAG_ROLE_DEBTOR, mortgageIssuerPawner = 0, err;
+
+    GetRegistryValue( "DEPO\\MORTGAGEISSUER", V_INTEGER, mortgageIssuerPawner, err );
+  
+    if(mortgageIssuerPawner)
+      Role = IRCAG_ROLE_PAWNER;
+    end;
+
+    return Role;
+  END;
+
+
+  PRIVATE MACRO GetAddSeriesNum(AvoirKind, InvCardID, SeriesNum)
+    var AddSeriesNum = "";
+    var query, Select, DataSet, mortgageIssuerPawner = 0, err;
+
+    if(DP_CheckAvoirKind(AvoirKind, AVOIRISSKIND_MORTGAGE)) 
+      query =   " SELECT LTRIM (MAX (SYS_CONNECT_BY_PATH (t_LSIN, ', ')), ' ,') AS LSIN "
+              + "   FROM (SELECT obj.t_LSIN, ROW_NUMBER () OVER (ORDER BY obj.t_AutoKey) rn "
+              + "           FROM dinvcard_dbt ic, dficert_dbt fc, dmortobj_dbt obj "
+              + "          WHERE ic.t_InvCardID = ? "
+              + "            AND fc.t_FicertID = ic.t_FicertID "
+              + "            AND obj.t_MortgageID = fc.t_CertID ) "
+              + "   START WITH rn = 1 "
+              + "   CONNECT BY PRIOR rn = rn - 1 ";
+      Select = DL_RSDCommand(query);
+
+      Select.AddParam(InvCardID);
+
+      DataSet = Select.Execute();
+
+      if(DataSet.MoveNext())
+        AddSeriesNum = DataSet.LSIN;
+      end;
+
+      return AddSeriesNum;
+    else
+      return SeriesNum;
+    end;
+  END;
+
+
+  PRIVATE MACRO PrintReport(DepoCount)
+    var query, DataSet, Select;
+    var i = 0;
+    var PrevAcnt = 0;
+    var PrevFIID = 0;
+    var PrevFI_Name = "";
+    var PrevCorrespPart = 0;
+    var PrevIssuer = 0;
+    var PrevAvoirKind = 0;
+    var PrevFaceValueFI = 0;
+    var PrevIndoorStorage = -1;
+    var PrevFaceValuePoint = 0;
+    var PrevPoints = AVOIRISS_SUM_PRECISION;
+    var PrevPawnRightMeeting = 0;    
+    var PrevPawnRightIncome = 0;     
+    var PrevPawnRightGlobal = 0;     
+    var PrevPawnAssignmentRights = 0;
+    var PrevPawnSubsequent = 0;      
+    var PrevPawnRecoveryKind = 0;    
+    var PrevPawnRecoveryDate = date(0,0,0);    
+    var FiCCY = "";
+    var stat = 0;
+    var cntnull = 0;
+    var cntsymb = 0;
+    var FI_Number = "";
+    var RestPartPrinted = false;
+    var RestAcntPrinted = false;
+    var IsData = false;
+    var Nominal = $0, Rest = $0;
+    var tableWidth = 0;
+    
+    RepHeader(DepoCount);
+
+    if(Partitions)
+      query =   " SELECT q.* FROM "
+              + "   ((SELECT repacc.t_AcntPart AS AcntPart, "
+              + "            repacc.t_AcntRoot AS AcntRoot, "
+              + "            repacc.t_AvoirKind AS AvoirKind, "
+              + "            repacc.t_Issuer AS Issuer, "
+              + "            repacc.t_FaceValueFI AS FaceValueFI, "
+              + "            repacc.t_IndoorStorage AS IndoorStorage, "
+              + "            repacc.t_FIID AS FIID, "
+              + "            fin.t_SumPrecision AS Points, " 
+              + "            (fin.t_Point+2) AS FaceValuePoint, "
+              + "            repacc.t_CertifID AS InvCardID, "
+              + "            repacc.t_CorrespPart AS CorrespPart, "
+              + "            fin.t_Name AS FI_Name, "
+              + "            cacnt.t_Name || ' ' || cacnt.t_Code AS CorrespPartName, "
+              + "            CHR(0) AS FI_Series, "
+              + "            DECODE(iss.t_LSIN, CHR(1), DECODE(iss.t_ISIN, CHR(1), fin.t_FI_Code, iss.t_ISIN), iss.t_LSIN) AS FI_Number,"
+              + "            rsb_fiinstr.FI_IsQualified(fin.t_FIID, ? /*1*/) AS FI_Qual, "
+              + "            repacc.t_FaceValue AS FI_FaceValue, "
+              + "            repacc.t_CurrFaceValue AS FI_CurrFaceValue, "
+              + "            curr.t_CCY AS FI_CCY, "
+              + "            repacc.t_Rest AS Rest,"
+              + "            part.t_PawnRightMeeting, "      
+              + "            part.t_PawnRightIncome, "       
+              + "            part.t_PawnRightGlobal, "       
+              + "            part.t_PawnAssignmentRights, "  
+              + "            part.t_PawnSubsequent, "        
+              + "            part.t_PawnRecoveryKind, "      
+              + "            part.t_PawnRecoveryDate, "      
+              + "            part.t_PawnAddConditions "
+              + "      FROM " + TmpTable + " repacc, dfininstr_dbt fin, ddepoacnt_dbt cacnt, ddepoacnt_dbt part, davoiriss_dbt iss, dfininstr_dbt curr "
+              + "     WHERE repacc.t_AcntRoot = ? /*2*/ "
+              + "       AND repacc.t_IndoorStorage = 0 "
+              + "       AND fin.t_FIID = repacc.t_FIID "
+              + "       AND iss.t_FIID = fin.t_FIID "
+              + "       AND curr.t_FIID = repacc.t_FaceValueFI "
+              + "       AND cacnt.t_AutoKey = repacc.t_CorrespPart "
+              + "       AND part.t_AutoKey = repacc.t_AcntPart"
+              + "    ) UNION ALL "
+              + "    (SELECT repacc.t_AcntPart AS AcntPart, "
+              + "            repacc.t_AcntRoot AS AcntRoot, "
+              + "            repacc.t_AvoirKind AS AvoirKind, "
+              + "            repacc.t_Issuer AS Issuer, "
+              + "            repacc.t_FaceValueFI AS FaceValueFI, "
+              + "            repacc.t_IndoorStorage AS IndoorStorage, "
+              + "            repacc.t_FIID AS FIID, "
+              + "            fin.t_SumPrecision AS Points, " 
+              + "            (fin.t_Point+2) AS FaceValuePoint, "
+              + "            repacc.t_CertifID AS InvCardID, "
+              + "            repacc.t_CorrespPart AS CorrespPart, "
+              + "            fin.t_Name || ' ' || rsb_deals.GetFicertIssuerName(vficert.t_FiCertID) AS FI_Name, "
+              + "            cacnt.t_Name || ' ' || cacnt.t_Code AS CorrespPartName, "
+              + "            vficert.t_Series AS FI_Series, "
+              + "            TO_CHAR(LTRIM(vficert.t_Number)) AS FI_Number, "
+              + "            rsb_fiinstr.FI_IsQualified(fin.t_FIID, ? /*3*/) AS FI_Qual, "
+              + "            repacc.t_FaceValue AS FI_FaceValue, "
+              + "            repacc.t_CurrFaceValue AS FI_CurrFaceValue, "
+              + "            NVL(curr.t_CCY, CHR(0)) AS FI_CCY, "
+              + "            repacc.t_Rest AS Rest,"
+              + "            part.t_PawnRightMeeting, "      
+              + "            part.t_PawnRightIncome, "       
+              + "            part.t_PawnRightGlobal, "       
+              + "            part.t_PawnAssignmentRights, "  
+              + "            part.t_PawnSubsequent, "        
+              + "            part.t_PawnRecoveryKind, "      
+              + "            part.t_PawnRecoveryDate, "      
+              + "            part.t_PawnAddConditions "
+              + "      FROM " + TmpTable + " repacc, dfininstr_dbt fin, ddepoacnt_dbt cacnt, ddepoacnt_dbt part, davoiriss_dbt iss, dfininstr_dbt curr, davrkinds_dbt avrk, dinvcard_dbt ic, "
+              + "           dv_ficert_dbt vficert ,dparty_dbt issuer "
+              + "     WHERE repacc.t_AcntRoot = ? /*4*/ "
+              + "       AND repacc.t_IndoorStorage <> 0 AND repacc.t_CertifID <> 0"
+              + "       AND ic.t_InvCardID = repacc.t_CertifID "
+              + "       AND vficert.t_FiCertID = ic.t_FiCertID "
+              + "       AND fin.t_FIID = repacc.t_FIID "
+              + "       AND iss.t_FIID = fin.t_FIID "
+              + "       AND avrk.t_FI_Kind = fin.t_FI_Kind "
+              + "       AND avrk.t_AvoirKind = fin.t_AvoirKind "
+              + "       AND issuer.t_PartyID(+) = vficert.t_Issuer "
+              + "       AND curr.t_FIID(+) = repacc.t_FaceValueFI "
+              + "       AND cacnt.t_AutoKey = repacc.t_CorrespPart"
+              + "       AND part.t_AutoKey = repacc.t_AcntPart"
+              + "    ) UNION ALL "
+              + "    (SELECT repacc.t_AcntPart AS AcntPart, "
+              + "            repacc.t_AcntRoot AS AcntRoot, "
+              + "            repacc.t_AvoirKind AS AvoirKind, "
+              + "            repacc.t_Issuer AS Issuer, "
+              + "            repacc.t_FaceValueFI AS FaceValueFI, "
+              + "            repacc.t_IndoorStorage AS IndoorStorage, "
+              + "            repacc.t_FIID AS FIID, "
+              + "            fin.t_SumPrecision AS Points, " 
+              + "            (fin.t_Point+2) AS FaceValuePoint, "
+              + "            repacc.t_CertifID AS InvCardID, "
+              + "            0 AS CorrespPart, "
+              + "            fin.t_Name AS FI_Name, "
+              + "            CHR(0) AS CorrespPartName, "
+              + "            CHR(0) AS FI_Series, "
+              + "            DECODE(iss.t_LSIN, CHR(1), DECODE(iss.t_ISIN, CHR(1), fin.t_FI_Code, iss.t_ISIN), iss.t_LSIN) AS FI_Number, "
+              + "            rsb_fiinstr.FI_IsQualified(fin.t_FIID, ? /*5*/) AS FI_Qual, "
+              + "            repacc.t_FaceValue AS FI_FaceValue, "
+              + "            repacc.t_CurrFaceValue AS FI_CurrFaceValue, "
+              + "            NVL(curr.t_CCY, CHR(0)) AS FI_CCY, "
+              + "            repacc.t_Rest AS Rest,"
+              + "            part.t_PawnRightMeeting, "      
+              + "            part.t_PawnRightIncome, "       
+              + "            part.t_PawnRightGlobal, "       
+              + "            part.t_PawnAssignmentRights, "  
+              + "            part.t_PawnSubsequent, "        
+              + "            part.t_PawnRecoveryKind, "      
+              + "            part.t_PawnRecoveryDate, "      
+              + "            part.t_PawnAddConditions "
+              + "      FROM " + TmpTable + " repacc, ddepoacnt_dbt part, dfininstr_dbt fin, davoiriss_dbt iss, dfininstr_dbt curr, davrkinds_dbt avrk "
+              + "     WHERE repacc.t_AcntRoot = ? /*6*/ "
+              + "       AND repacc.t_IndoorStorage <> 0 AND repacc.t_CertifID = 0"
+              + "       AND part.t_AutoKey = repacc.t_AcntPart"
+              + "       AND fin.t_FIID = repacc.t_FIID "
+              + "       AND iss.t_FIID = fin.t_FIID "
+              + "       AND avrk.t_FI_Kind = fin.t_FI_Kind "
+              + "       AND avrk.t_AvoirKind = fin.t_AvoirKind "
+              + "       AND curr.t_FIID (+)= repacc.t_FaceValueFI )) q "
+              + "  ORDER BY q.AcntPart desc, q.AvoirKind asc, q.Issuer desc, q.FI_Name desc, q.FaceValueFI desc, q.FIID desc, q.CorrespPart desc ";
+
+      Select = DL_RSDCommand();
+      Select.AddParam(RepDate);               /*1*/
+      Select.AddParam(depoacnt.rec.AutoKey);  /*2*/
+      Select.AddParam(RepDate);               /*3*/
+      Select.AddParam(depoacnt.rec.AutoKey);  /*4*/
+      Select.AddParam(RepDate);               /*5*/
+      Select.AddParam(depoacnt.rec.AutoKey);  /*6*/
+
+      DataSet = Select.execute(query);
+      stat = DataSet.moveNext();
+      if(stat)
+        IsData = true;
+      end;
+
+      while(stat)
+        if(PrevAcnt != DataSet.AcntPart)
+          //печатать заголовок нового раздела
+          WriteDepoPartInfo(DataSet.AcntPart);
+
+           tableWidth = 4;
+           m_rep.Blank_Line();
+           m_rep.Set_WrapText(1);
+           m_rep.Put_Str("Финансовый инструмент",                                 m_TableHeadStyle+"START;");
+           if(withStoragePlace == true)
+             m_rep.Put_Str("Корреспондирующий счет/раздел",                         m_TableHeadStyle);
+             tableWidth = tableWidth + 1;
+           end;
+           m_rep.Put_Str("Код гос. регистрации/ ISIN/ Серия и номер сертификата", m_TableHeadStyle);
+           m_rep.Put_Str("Номинал",                                               m_TableHeadStyle);
+           if(withAmortization == true)
+             m_rep.Put_Str("Текущий номинал",                                       m_TableHeadStyle);
+             tableWidth = tableWidth + 1;
+           end;
+           m_rep.Put_Str("Количество, шт.",                                       m_TableHeadStyle);
+           m_rep.Put_Str("","END;");
+
+
+          RestPartPrinted = false;
+        end;
+
+        if(((NullOvers) and (DataSet.Rest == 0)) or (DataSet.Rest != 0))
+          if(DataSet.InvCardID > 0)
+            //если карточка диапазонная, то печатаем каждый номер диапазона отдельно
+            i = 0;
+            cntsymb = strlen(DataSet.FI_Number);
+            FI_Number = DataSet.FI_Number;
+            while(i < DataSet.Rest)
+              if(i > 0)
+                FI_Number = AddLeadNull(ЧислоCЗаданнойТочностью(numeric(FI_Number)+1, 0, ""), cntsymb);
+              end;
+
+              m_rep.Set_WrapText(1);
+              m_rep.Put_Str(IIF((i!=0) OR ((PrevAcnt == DataSet.AcntPart) AND (PrevFIID == DataSet.FIID) AND (PrevIssuer == DataSet.Issuer) AND (PrevFI_Name == DataSet.FI_Name)), "", DataSet.FI_Name), "START;BOR;");
+              if(withStoragePlace == true)
+                m_rep.Put_Str(IIF((i!=0) OR ((PrevAcnt == DataSet.AcntPart) AND (PrevFIID == DataSet.FIID) AND (PrevIssuer == DataSet.Issuer) AND (PrevCorrespPart == DataSet.CorrespPart)), "", DataSet.CorrespPartName), "BOR;");
+              end;
+              m_rep.Put_Str(GetAddSeriesNum( DataSet.AvoirKind, DataSet.InvCardID, DataSet.FI_Series + " " + FI_Number + IIF(DataSet.FI_Qual, "", " (НКЦБ)")), "BOR;");
+              if(withAmortization == true)
+                m_rep.Put_Str(ЧислоCЗаданнойТочностью(DataSet.FI_FaceValue, DataSet.FaceValuePoint, IIF(Apostr, "a", "")) + " " + DataSet.FI_CCY, "BOR;HA=R;");
+                m_rep.Put_Str(ЧислоCЗаданнойТочностью(DataSet.FI_CurrFaceValue, DataSet.FaceValuePoint, IIF(Apostr, "a", "")) + " " + DataSet.FI_CCY, "BOR;HA=R;");
+              else
+                m_rep.Put_Str(ЧислоCЗаданнойТочностью(DataSet.FI_CurrFaceValue, DataSet.FaceValuePoint, IIF(Apostr, "a", "")) + " " + DataSet.FI_CCY, "BOR;HA=R;");
+              end;
+              m_rep.Put_Str("1", "BOR;HA=R;");
+              m_rep.Put_Str("","END;");
+
+              
+              i = i + 1;
+
+            end;
+          else
+            m_rep.Set_WrapText(1);
+            m_rep.Put_Str(DataSet.FI_Name, "START;BOR;");
+            if(withStoragePlace == true)
+              m_rep.Put_Str(IIF(DataSet.Rest != 0, DataSet.CorrespPartName, ""), "BOR;");
+            end;
+            m_rep.Put_Str(DataSet.FI_Series + " " + DataSet.FI_Number + IIF(DataSet.FI_Qual, "", " (НКЦБ)"), "BOR;");
+            if(withAmortization == true)
+              m_rep.Put_Str(ЧислоCЗаданнойТочностью(DataSet.FI_FaceValue, DataSet.FaceValuePoint, IIF(Apostr, "a", "")) + " " + DataSet.FI_CCY, "BOR;HA=R;");
+              m_rep.Put_Str(ЧислоCЗаданнойТочностью(DataSet.FI_CurrFaceValue, DataSet.FaceValuePoint, IIF(Apostr, "a", "")) + " " + DataSet.FI_CCY, "BOR;HA=R;");
+            else
+              m_rep.Put_Str(ЧислоCЗаданнойТочностью(DataSet.FI_CurrFaceValue, DataSet.FaceValuePoint, IIF(Apostr, "a", "")) + " " + DataSet.FI_CCY, "BOR;HA=R;");
+            end;
+            m_rep.Put_Str(ЧислоCЗаданнойТочностью(DataSet.Rest, DP_GetPrecision(DataSet.Rest, DataSet.Points), IIF(Apostr, "a", "")), "BOR;HA=R;");
+            m_rep.Put_Str("","END;");
+
+          end;
+          RestPartPrinted = true;
+        end;
+
+        PrevAcnt = DataSet.AcntPart;
+        PrevFIID = DataSet.FIID;
+        PrevFI_Name = DataSet.FI_Name;
+        PrevCorrespPart = DataSet.CorrespPart;
+        PrevIssuer = DataSet.Issuer;
+        PrevAvoirKind = DataSet.AvoirKind;
+        PrevFaceValueFI = DataSet.FaceValueFI;
+        PrevIndoorStorage = DataSet.IndoorStorage;
+        PrevFaceValuePoint = DataSet.FaceValuePoint;
+        PrevPoints = DataSet.Points;
+        PrevPawnRightMeeting     = DataSet.PawnRightMeeting;    
+        PrevPawnRightIncome      = DataSet.PawnRightIncome;     
+        PrevPawnRightGlobal      = DataSet.PawnRightGlobal;     
+        PrevPawnAssignmentRights = DataSet.PawnAssignmentRights;
+        PrevPawnSubsequent       = DataSet.PawnSubsequent;      
+        PrevPawnRecoveryKind     = DataSet.PawnRecoveryKind;    
+        PrevPawnRecoveryDate     = DataSet.PawnRecoveryDate;        
+
+        FiCCY = DataSet.FI_CCY;
+
+        stat = DataSet.moveNext();
+
+        if(result_by_docfi)
+          if((PrevIndoorStorage == 1) and ((not stat) or 
+                                           (PrevAcnt != DataSet.AcntPart) or
+                                           (PrevIndoorStorage != DataSet.IndoorStorage) or 
+                                           (PrevIssuer != DataSet.Issuer) or
+                                           (PrevFI_Name != DataSet.FI_Name) or
+                                           (PrevAvoirKind != DataSet.AvoirKind) or
+                                           (PrevFaceValueFI != DataSet.FaceValueFI)  
+                                          )
+            )
+            
+            GetSummNominalRest(depoacnt.rec.AutoKey, PrevAcnt, PrevAvoirKind, PrevIssuer, PrevFI_Name, PrevFaceValueFI, @Nominal, @Rest);
+
+            if(Rest > 1.0) //только если кол-во сертификатов больше 1
+              m_rep.Set_WrapText(1);
+              m_rep.Put_Str("", "START;BOR;");
+              if(withStoragePlace == true)
+                m_rep.Put_Str("", "BOR;");
+              end;
+              m_rep.Put_Str("ИТОГО по инструменту", "BOR;");
+              if(withAmortization == true)
+                m_rep.Put_Str(ЧислоCЗаданнойТочностью(Nominal, PrevFaceValuePoint, IIF(Apostr, "a", "")) + " " + FiCCY, "BOR;HA=R;");
+                m_rep.Put_Str(ЧислоCЗаданнойТочностью(Nominal, PrevFaceValuePoint, IIF(Apostr, "a", "")) + " " + FiCCY, "BOR;HA=R;");
+              else
+                m_rep.Put_Str(ЧислоCЗаданнойТочностью(Nominal, PrevFaceValuePoint, IIF(Apostr, "a", "")) + " " + FiCCY, "BOR;HA=R;");
+              end;
+              m_rep.Put_Str(ЧислоCЗаданнойТочностью(Rest, DP_GetPrecision(Rest, PrevPoints)), "BOR;HA=R;");
+              m_rep.Put_Str("","END;");
+            end;
+
+          end;
+        end;
+
+
+        if((not stat) or (PrevAcnt != DataSet.AcntPart))
+          if(RestPartPrinted == false)
+            m_rep.Set_WrapText(1);
+            m_rep.Put_Str("Ценные бумаги на счете депо (разделе) отсутствуют", "START;BOR;R="+(tableWidth-1)+";END;");
+          end;
+
+          m_rep.Blank_Line();
+
+          //условия залога
+          if((PrevPawnRightMeeting != 0) or    
+             (PrevPawnRightIncome != 0) or     
+             (PrevPawnRightGlobal != 0) or     
+             (PrevPawnAssignmentRights != 0) or
+             (PrevPawnSubsequent != 0) or      
+             (PrevPawnRecoveryKind != 0)    
+            )
+
+            tableWidth = 5;
+
+            m_rep.Set_WrapText(1);
+            m_rep.Put_Str("Условия залога",          m_TableHeadStyle+"START;R="+(tableWidth-1)+";END;");
+
+            m_rep.Put_Str("На период обременения ценных бумаг залогом", m_TableHeadStyle+"START;R=2;");
+            m_rep.Put_Str("Залогодателю",                               m_TableHeadStyle);
+            m_rep.Put_Str("Залогодержателю",                            m_TableHeadStyle+"END;");
+
+            if(PrevPawnRightMeeting != 0)
+                m_rep.Set_WrapText(1);
+                m_rep.Put_Str("Право на участие в собрании акционеров принадлежит:", "START;R=2;BOR;");
+                m_rep.Put_Str(IIF(PrevPawnRightMeeting == DP_PAWNRIGHTOWNER_MORTGAGOR, "Да", "Нет"), "BOR;HA=C;");
+                m_rep.Put_Str(IIF(PrevPawnRightMeeting == DP_PAWNRIGHTOWNER_MORTGAGEE, "Да", "Нет"), "BOR;HA=C;");
+                m_rep.Put_Str("","END;");
+            end;
+
+            if(PrevPawnRightIncome != 0)
+              m_rep.Set_WrapText(1);
+              m_rep.Put_Str("Право на получение дохода по ценным бумагам принадлежит:", "START;R=2;BOR;");
+              m_rep.Put_Str(IIF(PrevPawnRightIncome == DP_PAWNRIGHTOWNER_MORTGAGOR, "Да", "Нет"), "BOR;HA=C;");
+              m_rep.Put_Str(IIF(PrevPawnRightIncome == DP_PAWNRIGHTOWNER_MORTGAGEE, "Да", "Нет"), "BOR;HA=C;");
+              m_rep.Put_Str("","END;");
+            end;
+
+            if(PrevPawnRightGlobal != 0)
+              m_rep.Set_WrapText(1);
+              m_rep.Put_Str("Права, приобретённые в результате корпоративного действия эмитента, не требующего участия акционера (конвертация, сплит, дробление, консолидация, бонусная эмиссия и др.), принадлежат:", "START;R=2;BOR;");
+              m_rep.Put_Str(IIF(PrevPawnRightGlobal == DP_PAWNRIGHTOWNER_MORTGAGOR, "Да", "Нет"), "BOR;HA=C;");
+              m_rep.Put_Str(IIF(PrevPawnRightGlobal == DP_PAWNRIGHTOWNER_MORTGAGEE, "Да", "Нет"), "BOR;HA=C;");
+              m_rep.Put_Str("","END;");
+            end;
+
+            if(PrevPawnAssignmentRights != 0)
+              m_rep.Set_WrapText(1);
+              m_rep.Put_Str("Уступка Залогодержателем прав по договору залога ценных бумаг без согласия Залогодателя", "START;R=2;BOR;");
+              m_rep.Put_Str("", "BOR;HA=C;");
+              m_rep.Put_Str(IIF(PrevPawnAssignmentRights == DP_PAWNSOLVE_YES, "Разрешается", "Не разрешается"), "BOR;HA=C;");
+              m_rep.Put_Str("","END;");
+            end;
+
+            if(PrevPawnSubsequent != 0)
+              m_rep.Set_WrapText(1);
+              m_rep.Put_Str("Последующий залог ценных бумаг без согласия Залогодержателя", "START;R=2;BOR;");
+              m_rep.Put_Str(IIF(PrevPawnSubsequent == DP_PAWNSOLVE_YES, "Разрешается", "Не разрешается"), "BOR;HA=C;");
+              m_rep.Put_Str("", "BOR;HA=C;");
+              m_rep.Put_Str("","END;");
+            end;
+
+            if(PrevPawnRecoveryKind != 0)
+              m_rep.Set_WrapText(1);
+              m_rep.Put_Str("Обращение взыскания на заложенные ценные бумаги", "START;R=2;BOR;");
+              m_rep.Put_Str(IIF(PrevPawnRecoveryKind == DP_PAWNRECOVERY_KIND_COURTOREDER, "В судебном порядке", "Во внесудебном порядке"), "BOR;HA=C;");
+              m_rep.Put_Str(IIF(PrevPawnRecoveryKind == DP_PAWNRECOVERY_KIND_COURTOREDER, "В судебном порядке", "Во внесудебном порядке, Дата, начиная с которой залогодержатель вправе обратить взыскание (с правом подавать в Депозитарий подписанные Залогодержателем поручения):"+string(date(PrevPawnRecoveryDate):f)), "BOR;HA=C;");
+              m_rep.Put_Str("","END;");
+            end;
+
+            m_rep.Blank_Line();
+          end;
+          
+        end;
+      end;
+
+    end;
+
+    //итоги по счету
+    if(result_by_acc)
+      query =   " SELECT q.* FROM "
+              + "   ((SELECT rq.t_FIID AS FIID,"
+              + "            fin.t_SumPrecision AS Points, " 
+              + "            (fin.t_Point+2) AS FaceValuePoint, "
+              + "            fin.t_AvoirKind AS AvoirKind, "
+              + "            RSI_RSB_FIInstr.FI_GetIssuerOnDate( fin.t_FIID, ? )   AS Issuer, "
+              + "            -1 AS FaceValueFI, "
+              + "            0 AS IndoorStorage, "
+              + "            0 AS InvCardID, "
+              + "            fin.t_Name AS FI_Name, "
+              + "            avrk.t_Name || ' ' || issuer.t_Name || ' ' || DECODE(iss.t_Issue, CHR(1), '', iss.t_Issue || ' ') "
+              + "             || DECODE(RSB_FIInstr.FI_AvrKindsEQ("+FIKIND_AVOIRISS+", "+AVOIRISSKIND_SHARE+", Fin.t_AvoirKind), 1, DECODE(fin.t_IsAdditional, 'X', 'дополнительный выпуск', 'объединенный выпуск'), '') "
+              + "             || ' ' || (CASE WHEN iss.t_tranche = CHR(1) OR iss.t_tranche = CHR(0) OR iss.t_tranche IS NULL THEN '' ELSE iss.t_tranche || ' транша,' END) || DECODE(fin.t_DrawingDate, TO_DATE('01.01.0001', 'DD.MM.YYYY'), '', ' дата погашения ' || TO_CHAR(fin.t_DrawingDate, 'DD.MM.YYYY')) || ' ' "
+              + "             || DECODE(RSB_FIInstr.FI_AvrKindsEQ("+FIKIND_AVOIRISS+", "+AVOIRISSKIND_BOND+", Fin.t_AvoirKind), 1, 'с амортизацией долга', '') AS FI_Descript,"                 
+              + "            CHR(0) AS FI_Series, "
+              + "            DECODE(iss.t_LSIN, CHR(1), DECODE(iss.t_ISIN, CHR(1), fin.t_FI_Code, iss.t_ISIN), iss.t_LSIN) AS FI_Number,"
+              + "            rsb_fiinstr.FI_IsQualified(fin.t_FIID, ? /*1*/ ) AS FI_Qual, "
+              + "            (CASE WHEN RSB_FIInstr.FI_AvrKindsEQ(" + FIKIND_AVOIRISS + ", "+AVOIRISSKIND_INVESTMENT_SHARE+", fin.t_AvoirKind) > 0 THEN (SELECT t_FormValue FROM davrinvst_dbt where t_FIID = fin.t_FIID) ELSE fin.t_FaceValue END) AS FI_FaceValue, "        
+              + "            (CASE WHEN RSB_FIInstr.FI_AvrKindsEQ(" + FIKIND_AVOIRISS + ", "+AVOIRISSKIND_INVESTMENT_SHARE+", fin.t_AvoirKind) > 0 THEN (SELECT t_FormValue FROM davrinvst_dbt where t_FIID = fin.t_FIID) ELSE rsi_rsb_fiinstr.FI_GetNominalOnDate(fin.t_FIID, ?) END) AS FI_CurrFaceValue, "        
+              + "            curr.t_CCY AS FI_CCY, "
+              + "            rq.t_Rest AS Rest"
+              + "       FROM (SELECT sum(repacc.t_Rest) AS t_Rest, repacc.t_FIID AS t_FIID "
+              + "               FROM ddprepacc_tmp repacc "
+              + "              WHERE repacc.t_IndoorStorage = 0 "
+              + "                AND repacc.t_AcntRoot = ? /*2*/ "
+              + "              GROUP BY repacc.t_FIID) rq, dfininstr_dbt fin, davoiriss_dbt iss, dfininstr_dbt curr, dparty_dbt issuer, davrkinds_dbt avrk "
+              + "      WHERE fin.t_FIID = rq.t_FIID "
+              + "        AND iss.t_FIID = fin.t_FIID "
+              + "        AND issuer.t_PartyID = fin.t_Issuer "
+              + "        AND curr.t_FIID = (CASE WHEN RSB_FIInstr.FI_AvrKindsEQ(" + FIKIND_AVOIRISS + ", "+AVOIRISSKIND_INVESTMENT_SHARE+", fin.t_AvoirKind) > 0 THEN (SELECT t_FormValueFIID FROM davrinvst_dbt where t_FIID = fin.t_FIID) ELSE fin.t_FaceValueFI END) "
+              + "        AND avrk.t_FI_Kind = fin.t_FI_Kind "
+              + "        AND avrk.t_AvoirKind = fin.t_AvoirKind "
+              + "    ) "
+              + "    UNION ALL "
+              + "    (SELECT repacc.t_FIID AS FIID, "
+              + "            fin.t_SumPrecision AS Points, " 
+              + "            (fin.t_Point+2) AS FaceValuePoint, "
+              + "            repacc.t_AvoirKind AS AvoirKind, "
+              + "            repacc.t_Issuer AS Issuer, "
+              + "            repacc.t_FaceValueFI AS FaceValueFI, "
+              + "            repacc.t_IndoorStorage AS IndoorStorage, "
+              + "            repacc.t_CertifID AS InvCardID, "
+              + "            fin.t_Name || ' ' || rsb_deals.GetFicertIssuerName(vficert.t_FiCertID) AS FI_Name, "
+              + "            fin.t_Name || ' ' || (CASE WHEN RSB_FIInstr.FI_AvrKindsEQ("+FIKIND_AVOIRISS+", "+AVOIRISSKIND_BILL+", fin.t_AvoirKind) > 0 "
+              + "                                         THEN (SELECT alg.t_SzNameAlg "
+              + "                                         FROM dnamealg_dbt alg, dvsbanner_dbt bnr "
+              + "                                        WHERE bnr.t_BCID = vficert.t_CertID "
+              + "                                          AND bnr.t_Department = ic.t_Department "
+              + "                                          AND alg.t_iTypeAlg = "+ALG_VS_TYPE
+              + "                                          AND alg.t_iNumberAlg = bnr.t_IssueKind) "
+              + "                                    ELSE CHR(1) END ) || ' ' || rsb_deals.GetFicertIssuerName(vficert.t_FiCertID) AS FI_Descript,"                                
+              + "            vficert.t_Series AS FI_Series, "
+              + "            vficert.t_Number AS FI_Number, "
+              + "            rsb_fiinstr.FI_IsQualified(fin.t_FIID, ? /*3*/ ) AS FI_Qual, "
+              + "            repacc.t_FaceValue AS FI_FaceValue, "
+              + "            repacc.t_CurrFaceValue AS FI_CurrFaceValue, "
+              + "            curr.t_CCY AS FI_CCY, "
+              + "            TO_NUMBER(repacc.t_Rest) AS Rest"
+              + "      FROM " + TmpTable + " repacc left join dparty_dbt issuer on issuer.t_PartyID = repacc.t_Issuer, "
+              + "           dfininstr_dbt fin, ddepoacnt_dbt cacnt, davoiriss_dbt iss, dfininstr_dbt curr, davrkinds_dbt avrk, dinvcard_dbt ic, dv_ficert_dbt vficert"
+              + "     WHERE repacc.t_AcntRoot = ? /*4*/ "
+              + "       AND repacc.t_IndoorStorage <> 0 AND repacc.t_CertifID <> 0"
+              + "       AND ic.t_InvCardID = repacc.t_CertifID "
+              + "       AND vficert.t_FiCertID = ic.t_FiCertID "
+              + "       AND fin.t_FIID = repacc.t_FIID "
+              + "       AND iss.t_FIID = fin.t_FIID "
+              + "       AND avrk.t_FI_Kind = fin.t_FI_Kind "
+              + "       AND avrk.t_AvoirKind = fin.t_AvoirKind "
+              + "       AND curr.t_FIID = repacc.t_FaceValueFI "
+              + "       AND cacnt.t_AutoKey = repacc.t_CorrespPart"
+              + "    ) "
+              + "    UNION ALL "
+              + "    (SELECT repacc.t_FIID AS FIID, "
+              + "            fin.t_SumPrecision AS Points, " 
+              + "            (fin.t_Point+2) AS FaceValuePoint, "
+              + "            repacc.t_AvoirKind AS AvoirKind, "
+              + "            repacc.t_Issuer AS Issuer, "
+              + "            repacc.t_FaceValueFI AS FaceValueFI, "
+              + "            repacc.t_IndoorStorage AS IndoorStorage, "
+              + "            repacc.t_CertifID AS InvCardID, "
+              + "            fin.t_Name || ' ' || DECODE(repacc.t_Issuer, -1, CHR(0), (SELECT t_Name from dparty_dbt where t_PartyID = repacc.t_Issuer)) AS FI_Name, "
+              + "            avrk.t_Name || ' ' || DECODE(repacc.t_Issuer, -1, CHR(0), (SELECT t_Name from dparty_dbt where t_PartyID = repacc.t_Issuer)) || ' ' || DECODE(iss.t_Issue, CHR(1), '', iss.t_Issue || ' ') AS FI_Descript, "
+              + "            iss.t_Series AS FI_Series, "
+              + "            DECODE(iss.t_LSIN, CHR(1), DECODE(iss.t_ISIN, CHR(1), fin.t_FI_Code, iss.t_ISIN), iss.t_LSIN) AS FI_Number, "
+              + "            rsb_fiinstr.FI_IsQualified(fin.t_FIID, ? /*5*/ ) AS FI_Qual, "
+              + "            repacc.t_FaceValue AS FI_FaceValue, "
+              + "            repacc.t_CurrFaceValue AS FI_CurrFaceValue, "
+              + "            DECODE(repacc.t_FaceValueFI, -1, CHR(0), (SELECT t_CCY FROM dfininstr_dbt WHERE t_FIID = repacc.t_FaceValueFI)) AS FI_CCY, "
+              + "            TO_NUMBER(repacc.t_Rest) AS Rest"
+              + "      FROM " + TmpTable + " repacc, dfininstr_dbt fin, davoiriss_dbt iss, davrkinds_dbt avrk "
+              + "     WHERE repacc.t_AcntRoot = ? /*6*/ "
+              + "       AND repacc.t_IndoorStorage <> 0 AND repacc.t_CertifID = 0"
+              + "       AND fin.t_FIID = repacc.t_FIID "
+              + "       AND iss.t_FIID = fin.t_FIID "
+              + "       AND avrk.t_FI_Kind = fin.t_FI_Kind "
+              + "       AND avrk.t_AvoirKind = fin.t_AvoirKind)"  
+              + "  ) q "
+              + "  ORDER BY q.AvoirKind asc, q.Issuer desc, q.FI_Name desc, q.FaceValueFI desc, q.FIID desc";
+      
+      Select = DL_RSDCommand();
+      Select.AddParam(RepDate);
+      Select.AddParam(RepDate);
+      Select.AddParam(RepDate);                /*1*/
+      Select.AddParam(depoacnt.rec.AutoKey);   /*2*/
+      Select.AddParam(RepDate);                /*3*/
+      Select.AddParam(depoacnt.rec.AutoKey);   /*4*/
+      Select.AddParam(RepDate);                /*5*/
+      Select.AddParam(depoacnt.rec.AutoKey);   /*6*/
+
+      DataSet = Select.execute(query);
+      stat = DataSet.moveNext();
+      if(stat)
+        IsData = true;
+      end;
+
+      m_rep.Blank_Line();
+      m_rep.Set_WrapText(0);
+      m_rep.Put_Str("ИТОГО по счету депо:", "START;END;");
+
+      tableWidth = 5;
+
+      m_rep.Blank_Line();
+      m_rep.Set_WrapText(1);
+      m_rep.Put_Str("Финансовый инструмент",                                 m_TableHeadStyle+"START;");
+      m_rep.Put_Str("Описание инструмента",                                  m_TableHeadStyle);
+      m_rep.Put_Str("Код гос. регистрации/ ISIN/ Серия и номер сертификата", m_TableHeadStyle);
+      m_rep.Put_Str("Номинал",                                               m_TableHeadStyle);
+      if(withAmortization == true)
+        m_rep.Put_Str("Текущий номинал",                                       m_TableHeadStyle);
+        tableWidth = tableWidth + 1;
+      end;
+      m_rep.Put_Str("Количество, шт.",                                       m_TableHeadStyle);
+      m_rep.Put_Str("","END;");
+
+      if(stat)
+        PrevFIID = 0;
+        PrevIssuer = 0;
+        while(stat)
+          
+          if(((NullOvers) and (DataSet.Rest == 0)) or (DataSet.Rest != 0))
+            if(DataSet.InvCardID > 0)
+              //если карточка диапазонная, то печатаем каждый номер диапазона отдельно
+              i = 0;
+              cntsymb = strlen(DataSet.FI_Number);
+              FI_Number = DataSet.FI_Number;
+              while(i < DataSet.Rest)
+                if(i > 0)
+                  FI_Number = AddLeadNull(ЧислоCЗаданнойТочностью(numeric(FI_Number)+1, 0, ""), cntsymb);
+                end;  
+                m_rep.Set_WrapText(1);
+                m_rep.Put_Str(IIF((i!=0) OR ((PrevFIID == DataSet.FIID) AND (PrevIssuer == DataSet.Issuer) AND (PrevFI_Name == DataSet.FI_Name)), "", DataSet.FI_Name), "START;BOR;");
+                m_rep.Put_Str(IIF((i!=0) OR ((PrevFIID == DataSet.FIID) AND (PrevIssuer == DataSet.Issuer) AND (PrevFI_Name == DataSet.FI_Name)), "", DataSet.FI_Descript), "BOR;");
+                m_rep.Put_Str(GetAddSeriesNum(DataSet.AvoirKind, DataSet.InvCardID, DataSet.FI_Series + " " + FI_Number + IIF(DataSet.FI_Qual, "", " (НКЦБ)")), "BOR;");
+                
+                if(withAmortization == true)
+                  m_rep.Put_Str(ЧислоCЗаданнойТочностью(DataSet.FI_FaceValue, DataSet.FaceValuePoint, IIF(Apostr, "a", "")) + " " + DataSet.FI_CCY, "BOR;HA=R;");
+                  m_rep.Put_Str(ЧислоCЗаданнойТочностью(DataSet.FI_CurrFaceValue, DataSet.FaceValuePoint, IIF(Apostr, "a", "")) + " " + DataSet.FI_CCY, "BOR;HA=R;");
+                else
+                  m_rep.Put_Str(ЧислоCЗаданнойТочностью(DataSet.FI_CurrFaceValue, DataSet.FaceValuePoint, IIF(Apostr, "a", "")) + " " + DataSet.FI_CCY, "BOR;HA=R;");
+                end;
+                m_rep.Put_Str("1", "BOR;HA=R;");
+                m_rep.Put_Str("","END;");
+
+                i = i + 1;
+
+              end;
+            else
+              m_rep.Set_WrapText(1);
+              m_rep.Put_Str(DataSet.FI_Name, "START;BOR;");
+              m_rep.Put_Str(DataSet.FI_Descript, "BOR;");
+              m_rep.Put_Str(DataSet.FI_Series + " " + DataSet.FI_Number + IIF(DataSet.FI_Qual, "", " (НКЦБ)"), "BOR;");
+              if(withAmortization == true)
+                m_rep.Put_Str(ЧислоCЗаданнойТочностью(DataSet.FI_FaceValue, DataSet.FaceValuePoint, IIF(Apostr, "a", "")) + " " + DataSet.FI_CCY, "BOR;HA=R;");
+                m_rep.Put_Str(ЧислоCЗаданнойТочностью(DataSet.FI_CurrFaceValue, DataSet.FaceValuePoint, IIF(Apostr, "a", "")) + " " + DataSet.FI_CCY, "BOR;HA=R;");
+              else
+                m_rep.Put_Str(ЧислоCЗаданнойТочностью(DataSet.FI_CurrFaceValue, DataSet.FaceValuePoint, IIF(Apostr, "a", "")) + " " + DataSet.FI_CCY, "BOR;HA=R;");
+              end;
+              m_rep.Put_Str(ЧислоCЗаданнойТочностью(DataSet.Rest, DP_GetPrecision(DataSet.Rest, DataSet.Points),IIF(Apostr, "a", "")), "BOR;HA=R;");
+              m_rep.Put_Str("","END;");
+            end;
+
+            RestAcntPrinted = true;
+          end;
+
+          PrevFIID = DataSet.FIID;
+          PrevIssuer = DataSet.Issuer;
+          PrevFI_Name = DataSet.FI_Name;
+          PrevAvoirKind = DataSet.AvoirKind;
+          PrevFaceValueFI = DataSet.FaceValueFI;
+          PrevIndoorStorage = DataSet.IndoorStorage;
+          PrevFaceValuePoint = DataSet.FaceValuePoint;
+          PrevPoints = DataSet.Points;
+          FiCCY = DataSet.FI_CCY;
+
+          stat = DataSet.moveNext();
+
+          if(result_by_docfi)
+            if((PrevIndoorStorage == 1) and ((not stat) or 
+                                             (PrevIndoorStorage != DataSet.IndoorStorage) or 
+                                             (PrevIssuer != DataSet.Issuer) or
+                                             (PrevFI_Name != DataSet.FI_Name) or
+                                             (PrevAvoirKind != DataSet.AvoirKind) or
+                                             (PrevFaceValueFI != DataSet.FaceValueFI)  
+                                            )
+              )
+
+              GetSummNominalRest(depoacnt.rec.AutoKey, 0, PrevAvoirKind, PrevIssuer, PrevFI_Name, PrevFaceValueFI, @Nominal, @Rest);
+
+              if(Rest > 1.0) //только если кол-во сертификатов больше 1
+                m_rep.Set_WrapText(1);
+                m_rep.Put_Str("", "START;BOR;");
+                m_rep.Put_Str("", "BOR;");
+                m_rep.Put_Str("ИТОГО по инструменту", "BOR;");
+                if(withAmortization == true)
+                  m_rep.Put_Str(ЧислоCЗаданнойТочностью(Nominal, PrevFaceValuePoint, IIF(Apostr, "a", "")) + " " + FiCCY, "BOR;HA=R;");
+                  m_rep.Put_Str(ЧислоCЗаданнойТочностью(Nominal, PrevFaceValuePoint, IIF(Apostr, "a", "")) + " " + FiCCY, "BOR;HA=R;");
+                else
+                  m_rep.Put_Str(ЧислоCЗаданнойТочностью(Nominal, PrevFaceValuePoint, IIF(Apostr, "a", "")) + " " + FiCCY, "BOR;HA=R;");
+                end;
+                m_rep.Put_Str(ЧислоCЗаданнойТочностью(Rest, DP_GetPrecision(Rest, PrevPoints), IIF(Apostr, "a", "")), "BOR;HA=R;");
+                m_rep.Put_Str("","END;");
+              end;
+
+            end;
+          end;
+        end;
+      end;
+
+      
+      if(not stat)
+        if(RestAcntPrinted == false)
+          m_rep.Set_WrapText(1);
+          m_rep.Put_Str("Ценные бумаги на счете депо (разделе) отсутствуют", "START;BOR;R="+(tableWidth-1)+";END;");
+        end;
+
+        m_rep.Blank_Line();
+      end;
+      
+    end;
+
+    if((IsData == false) and (not result_by_acc))
+      m_rep.Set_WrapText(0);
+      m_rep.Put_Str("Ценные бумаги на счете депо (разделе) отсутствуют", "START;END;");
+      m_rep.Blank_Line();   
+    end;
+
+    ExtrMessage.Insert();
+
+    m_rep.Set_WrapText(0);
+    m_rep.Blank_Line();
+    if(Copies > 0)
+      m_rep.Put_Str(m_RepFormatKindName+" сформирована в "+Copies+" экз.", "START;HA=L;END;");
+    end;
+    
+    m_rep.Put_Val("Комментарий", "START;HA=L;",50);
+    m_rep.Put_Val(Comment, "HA=L;R=3;WT;END;");
+    m_rep.Blank_Line();
+   
+    DP_StdAuthPerson_Ex(null, null, m_rep);
+    DP_StdDeposInfo_Ex(null, null, 0, m_rep);
+    DP_StdExecReport_Ex(null, null, NULL, NULL, 0, m_rep);
+
+  END;
+
+  //заполнить временную таблицу данными
+  PRIVATE MACRO FillTMP(AcntRoot)
+    var query;
+    var Params = TArray;
+    
+    //1. По открытому хранению
+    query = " INSERT INTO " + TmpTable + " ( "
+                                       + "   T_ACNTROOT, "
+                                       + "   T_ACNTPART, "            
+                                       + "   T_FIID, "
+                                       + "   T_AVOIRKIND, "
+                                       + "   T_ISSUER, "
+                                       + "   T_FACEVALUE, "
+                                       + "   T_CURRFACEVALUE, "
+                                       + "   T_FACEVALUEFI, "
+                                       + "   T_CERTIFID, "            
+                                       + "   T_CORRESPPART, "         
+                                       + "   T_REST,  "
+                                       + "   T_INDOORSTORAGE )"
+                                       + " SELECT acnt.t_Root, "            //T_ACNTROOT          
+                                       + "        acnt.t_AutoKey, "         //T_ACNTPART          
+                                       + "        acc.t_Code_Currency, "    //T_FIID
+                                       + "        fin.t_AvoirKind, "        //T_AVOIRKIND, 
+                                       + "       RSI_RSB_FIInstr.FI_GetIssuerOnDate( fin.t_FIID, " + GetSQLDate(RepDate) + " ) , "           //T_ISSUER, 
+                                       + "        (CASE WHEN RSB_FIInstr.FI_AvrKindsEQ(" + FIKIND_AVOIRISS + ", "+AVOIRISSKIND_INVESTMENT_SHARE+", fin.t_AvoirKind) > 0 THEN (SELECT t_FormValue FROM davrinvst_dbt where t_FIID = fin.t_FIID) ELSE fin.t_FaceValue END), "        //T_FACEVALUE, 
+                                       + "        (CASE WHEN RSB_FIInstr.FI_AvrKindsEQ(" + FIKIND_AVOIRISS + ", "+AVOIRISSKIND_INVESTMENT_SHARE+", fin.t_AvoirKind) > 0 THEN (SELECT t_FormValue FROM davrinvst_dbt where t_FIID = fin.t_FIID) ELSE rsi_rsb_fiinstr.FI_GetNominalOnDate(fin.t_FIID, "+GetSQLDate(RepDate)+") END), "        //T_CURRFACEVALUE, 
+                                       + "        (CASE WHEN RSB_FIInstr.FI_AvrKindsEQ(" + FIKIND_AVOIRISS + ", "+AVOIRISSKIND_INVESTMENT_SHARE+", fin.t_AvoirKind) > 0 THEN (SELECT t_FormValueFIID FROM davrinvst_dbt where t_FIID = fin.t_FIID) ELSE fin.t_FaceValueFI END), "      //T_FACEVALUEFI, 
+                                       + "        0, "                      //T_CERTIFID
+                                       + "        cacnt.t_AutoKey,"         //T_CORRESPPART      
+                                       + "        NVL(rsb_account.restsa(sub.t_AccAnaliticsID, sub.t_SubAccountID, "+GetSQLDate(RepDate)+", 1), 0),"  //T_REST              
+                                       + "        0 " //T_INDOORSTORAGE
+                                       + "   FROM ddepoacnt_dbt acnt, daccount_dbt acc, daccsub_dbt sub, daccvanl_dbt vanl, dfininstr_dbt fin, "
+                                       + "        daccount_dbt cacc, ddepoacnt_dbt cacnt"
+                                       + "  WHERE acnt.t_Root = " + AcntRoot
+                                       + "    AND acnt.t_Department = " + Department
+                                       + "    AND acnt.t_OpenDate <= " + GetSQLDate(RepDate)
+                                       + "    AND acc.t_Chapter = " + Depo_chapt
+                                       + "    AND acc.t_Department = acnt.t_Department "  
+                                       + "    AND acc.t_DepoAcc = acnt.t_AutoKey "
+                                       + "    AND instr(acc.t_Type_Account, 'I') = 0 " //не закрытое хранение
+                                       + "    AND fin.t_FIID = acc.t_Code_Currency "
+                                       + "    AND vanl.t_FIID = acc.t_Code_Currency ";
+
+    if( DepoPart != 0 )
+      query = query + " and acnt.t_AutoKey = " + DepoPart; 
+    end;
+
+    if( showPawn )
+      if( mortgagee > 0)
+        query = query + " and acnt.t_AutoKey IN (SELECT atvl.t_ID "
+              +"  FROM ddepoatvl_dbt atvl, ddpacap_dbt acap,ddpacapau_dbt acapau "
+              +"  WHERE     atvl.t_IsType = CHR (0) "
+              +"    AND atvl.t_AttrNum = 15 "
+              +"    AND TO_CHAR (acap.t_APartyGround) = atvl.t_Value "
+              +"    AND acap.t_ApartyId = " + mortgagee
+              +"    AND acap.t_role = 4 "
+              +"    AND acapau.t_APID = acap.t_APID "
+//              + "   AND (acap.t_ToDate >= " + GetSQLDate(RepDate) + " or acap.t_ToDate = " + GetSQLDate(date(0,0,0)) + ") "
+              +"    and acapau.t_AUNodeID IN (select ac.t_AutoKey from ddepoacnt_dbt ac start with ac.t_AutoKey = atvl.t_ID connect by ac.t_AutoKey = prior ac.t_Superior))";
+      else
+        query = query + " and acnt.t_AutoKey IN (Select atvl.t_ID from ddepoatvl_dbt atvl Where atvl.t_IsType = CHR(0) AND atvl.t_AttrNum = 15) ";  // в залоге
+      end;
+
+    end;
+
+    if( SecurQual == SECURQUAL_QUAL)
+      query = query + " and rsb_fiinstr.FI_IsQualified(fin.t_FIID, "+GetSQLDate(RepDate)+") <> 0";
+    elif(SecurQual == SECURQUAL_NOQUAL)
+      query = query + " and rsb_fiinstr.FI_IsQualified(fin.t_FIID, "+GetSQLDate(RepDate)+") = 0";
+    end;
+
+    if(Issuer != UnknownParty)
+      query = query + " AND RSI_RSB_FIInstr.FI_GetIssuerOnDate( fin.t_FIID, " + GetSQLDate(RepDate) + " )  = " + Issuer;
+    end;
+
+    if(AvoirKind)
+      query = query + " AND RSB_FIInstr.FI_AvrKindsEQ(" + FIKIND_AVOIRISS + ", "+AvoirKind+", fin.t_AvoirKind) > 0 ";
+    end;
+
+    if(FIID != ALLFININSTR)
+      query = query + " AND fin.t_FIID = " + FIID;
+    end;
+
+    if(correspond_acc > 0)
+      query = query + " AND cacnt.t_Root = " + correspond_acc;
+    end;
+
+    if(correspond_part > 0)
+      query = query + " AND cacnt.t_AutoKey = " + correspond_part;
+    end;
+
+    if( acc_kind == DEPO_ACC_ACTIV )
+      query = query + " and vanl.t_AccAnaliticsID = sub.t_AccAnaliticsID "
+                    + " and sub.t_AnaliticsID = " + SYS_ANL_AINPACCOUNTING
+                    + " and sub.t_SubAccountCode = acc.t_Account "
+                    + " and cacc.t_Account = vanl.t_Account "
+                    + " and cacc.t_Chapter = acc.t_Chapter "
+                    + " and cacc.t_Code_Currency = acc.t_Code_Currency ";
+    else
+      query = query + " and vanl.t_Account = acc.t_Account "
+                    + " and vanl.t_AccAnaliticsID = sub.t_AccAnaliticsID "
+                    + " and sub.t_AnaliticsID = " + SYS_ANL_AINPACCOUNTING
+                    + " and cacc.t_Account = sub.t_SubAccountCode "
+                    + " and cacc.t_Chapter = acc.t_Chapter "
+                    + " and cacc.t_Code_Currency = acc.t_Code_Currency ";
+    end;  
+
+    query = query + " and cacnt.t_AutoKey = cacc.t_DepoAcc ";
+    
+    SQL_Execute(query, "", false );
+
+
+    //2. По закрытому хранению 
+    query = " INSERT INTO " + TmpTable + " ( "
+                                       + "   T_ACNTROOT, "
+                                       + "   T_ACNTPART, "            
+                                       + "   T_FIID, "
+                                       + "   T_AVOIRKIND, "
+                                       + "   T_ISSUER, "
+                                       + "   T_FACEVALUE, "
+                                       + "   T_CURRFACEVALUE, "
+                                       + "   T_FACEVALUEFI, "           
+                                       + "   T_CERTIFID, "             
+                                       + "   T_CORRESPPART, "         
+                                       + "   T_REST, "
+                                       + "   T_INDOORSTORAGE )"
+                                       + " SELECT acnt.t_Root, "            //T_ACNTROOT          
+                                       + "        acnt.t_AutoKey, "         //T_ACNTPART          
+                                       + "        acc.t_Code_Currency, "    //T_FIID
+                                       + "        fin.t_AvoirKind, "        //T_AVOIRKIND, 
+                                       + "        vficert.t_Issuer, "           //T_ISSUER, 
+                                       + "        vficert.t_FaceValue, "        //T_FACEVALUE,
+                                       + "        vficert.t_FaceValue, "        //T_CURRFACEVALUE, 
+                                       + "        vficert.t_FaceValueFI, "      //T_FACEVALUEFI,
+                                       + "        ic.t_InvCardID, "         //T_CERTIFID    
+                                       + "        cacnt.t_AutoKey,"         //T_CORRESPPART       
+                                       + "        1, "  //T_REST              
+                                       + "        1" //T_INDOORSTORAGE
+                                       + "   FROM ddepoacnt_dbt acnt, daccount_dbt acc, dinvcard_dbt ic, dv_ficert_dbt vficert, "
+                                       + "        daccount_dbt cacc, ddepoacnt_dbt cacnt, dfininstr_dbt fin "
+                                       + "  WHERE acnt.t_Root = " + AcntRoot
+                                       + "    AND acnt.t_Department = " + Department
+                                       + "    AND acnt.t_OpenDate <= " + GetSQLDate(RepDate)
+                                       + "    AND acc.t_Chapter = " + Depo_chapt
+                                       + "    AND acc.t_Department = acnt.t_Department "  
+                                       + "    AND acc.t_DepoAcc = acnt.t_AutoKey "
+                                       + "    AND fin.t_FIID = acc.t_Code_Currency "
+                                       + "    AND instr(acc.t_Type_Account, 'I') <> 0 " //закрытое хранение
+                                       + "    AND acc.t_AccountID = rsb_depo.icaccountid(ic.t_InvCardID, DECODE("+acc_kind+", "+DEPO_ACC_ACTIV+", 1, 0), "+GetSQLDate(RepDate)+") "
+                                       + "    AND rsb_depo.icstatus(ic.t_InvCardID, "+GetSQLDate(RepDate)+") = " + INVCARD_STATUS_INCUSTODY
+                                       + "    AND cacc.t_AccountID = rsb_depo.icaccountid(ic.t_InvCardID, DECODE("+acc_kind+", "+DEPO_ACC_ACTIV+", 0, 1), "+GetSQLDate(RepDate)+")"
+                                       + "    AND ic.t_FiCertID = vficert.t_FiCertID ";
+
+    query = query + " and cacnt.t_AutoKey = cacc.t_DepoAcc ";
+    
+    if( DepoPart != 0 )
+      query = query + " and acnt.t_AutoKey = " + DepoPart; 
+    end;
+
+    if( showPawn )
+      if( mortgagee > 0)
+        query = query + " and acnt.t_AutoKey IN (SELECT atvl.t_ID "
+              +"  FROM ddepoatvl_dbt atvl, ddpacap_dbt acap,ddpacapau_dbt acapau "
+              +"  WHERE     atvl.t_IsType = CHR (0) "
+              +"    AND atvl.t_AttrNum = 15 "
+              +"    AND TO_CHAR (acap.t_APartyGround) = atvl.t_Value "
+              +"    AND acap.t_ApartyId = " + mortgagee
+              +"    AND acap.t_role = 4 "
+              +"    AND acapau.t_APID = acap.t_APID "
+//              + "   AND (acap.t_ToDate >= " + GetSQLDate(RepDate) + " or acap.t_ToDate = " + GetSQLDate(date(0,0,0)) + ") "
+              +"    and acapau.t_AUNodeID IN (select ac.t_AutoKey from ddepoacnt_dbt ac start with ac.t_AutoKey = atvl.t_ID connect by ac.t_AutoKey = prior ac.t_Superior))";
+      else
+        query = query + " and acnt.t_AutoKey IN (Select atvl.t_ID from ddepoatvl_dbt atvl Where atvl.t_IsType = CHR(0) AND atvl.t_AttrNum = 15) ";  // в залоге
+      end;
+
+    end;
+
+    if( SecurQual == SECURQUAL_QUAL)
+      query = query + " and rsb_fiinstr.FI_IsQualified(fin.t_FIID, "+GetSQLDate(RepDate)+") <> 0";
+    elif(SecurQual == SECURQUAL_NOQUAL)
+      query = query + " and rsb_fiinstr.FI_IsQualified(fin.t_FIID, "+GetSQLDate(RepDate)+") = 0";
+    end;
+
+    if(InvCardID)
+       query = query + " and ic.t_InvCardID = "+InvCardID;
+    end;
+
+    if(Issuer != UnknownParty)
+      query = query + " and 1 = (case when 1 = RSB_FIInstr.FI_AvrKindsEQ("+FIKIND_AVOIRISS+", " + string(AVOIRISSKIND_MORTGAGE) + ", fin.t_AvoirKind) "
+                    + "           and Exists(select 1 from dvsircag_dbt ag where ag.t_AvoirKind = vficert.t_AvoirKind and ag.t_BCID = vficert.t_CertID and ag.t_AgentRole = " + GetMortIssuerRole() + " and ag.t_Agent = " + Issuer + ") "
+                    + "               then 1 "
+                    + "          when 1 <> RSB_FIInstr.FI_AvrKindsEQ("+FIKIND_AVOIRISS+", " + string(AVOIRISSKIND_MORTGAGE) + ", fin.t_AvoirKind) "
+                    + "           and vficert.t_Issuer = " + Issuer
+                    + "               then 1 "
+                    + "     else 0 end)";
+    end;
+
+    if(AvoirKind)
+      query = query + " AND RSB_FIInstr.FI_AvrKindsEQ(" + FIKIND_AVOIRISS + ", "+AvoirKind+", fin.t_AvoirKind) > 0 ";
+    end;
+
+    if(FIID != ALLFININSTR)
+      query = query + " AND fin.t_FIID = " + FIID;
+    end;
+
+    if(correspond_acc > 0)
+      query = query + " AND cacnt.t_Root = " + correspond_acc;
+    end;
+
+    if(correspond_part > 0)
+      query = query + " AND cacnt.t_AutoKey = " + correspond_part;
+    end;
+    
+    SQL_Execute(query, "", false );
+             
+    //нулевые остатки по закрытому хранению
+    if((NullOvers) and (correspond_acc == 0) and (InvCardID == 0) and (correspond_part == 0))
+      query = " INSERT INTO " + TmpTable + " ( "
+                                         + "   T_ACNTROOT, "
+                                         + "   T_ACNTPART, "            
+                                         + "   T_FIID, "
+                                         + "   T_AVOIRKIND, "
+                                         + "   T_ISSUER, "
+                                         + "   T_FACEVALUE, "
+                                         + "   T_CURRFACEVALUE, "
+                                         + "   T_FACEVALUEFI, "              
+                                         + "   T_CERTIFID, "             
+                                         + "   T_CORRESPPART, "         
+                                         + "   T_REST, "
+                                         + "   T_INDOORSTORAGE )"
+                                         + " SELECT acnt.t_Root, "            //T_ACNTROOT          
+                                         + "        acnt.t_AutoKey, "         //T_ACNTPART          
+                                         + "        acc.t_Code_Currency, "    //T_FIID
+                                         + "        fin.t_AvoirKind, "        //T_AVOIRKIND, 
+                                         + "        RSI_RSB_FIInstr.FI_GetIssuerOnDate( fin.t_FIID, " + GetSQLDate(RepDate) + " ) , "           //T_ISSUER,
+                                         + "        fin.t_FaceValue, "        //T_FACEVALUE, 
+                                         + "        fin.t_FaceValue, "        //T_CURRFACEVALUE,
+                                         + "        fin.t_FaceValueFI, "      //T_FACEVALUEFI,
+                                         + "        0, "         //T_CERTIFID    
+                                         + "        0,"          //T_CORRESPPART       
+                                         + "        0, "         //T_REST              
+                                         + "        1"           //T_INDOORSTORAGE
+                                         + "   FROM ddepoacnt_dbt acnt, daccount_dbt acc, dfininstr_dbt fin"
+                                         + "  WHERE acnt.t_Root = " + AcntRoot
+                                         + "    AND acnt.t_Department = " + Department
+                                         + "    AND acnt.t_OpenDate <= " + GetSQLDate(RepDate)
+                                         + "    AND acc.t_Chapter = " + Depo_chapt
+                                         + "    AND acc.t_Department = acnt.t_Department "  
+                                         + "    AND acc.t_DepoAcc = acnt.t_AutoKey "
+                                         + "    AND fin.t_FIID = acc.t_Code_Currency "
+                                         + "    AND instr(acc.t_Type_Account, 'I') <> 0 " //закрытое хранение
+                                         + "    AND rsb_account.restac(acc.t_Account, acc.t_Code_Currency, "+GetSQLDate(RepDate)+", acc.t_Chapter, null) = 0 ";
+      
+      if( DepoPart != 0 )
+        query = query + " and acnt.t_AutoKey = " + DepoPart; 
+      end;
+
+    if( showPawn )
+      if( mortgagee > 0)
+        query = query + " and acnt.t_AutoKey IN (SELECT atvl.t_ID "
+              +"  FROM ddepoatvl_dbt atvl, ddpacap_dbt acap,ddpacapau_dbt acapau "
+              +"  WHERE     atvl.t_IsType = CHR (0) "
+              +"    AND atvl.t_AttrNum = 15 "
+              +"    AND TO_CHAR (acap.t_APartyGround) = atvl.t_Value "
+              +"    AND acap.t_ApartyId =  " + mortgagee
+              +"    AND acap.t_role = 4 "
+              +"    AND acapau.t_APID = acap.t_APID "
+//              + "   AND (acap.t_ToDate >= " + GetSQLDate(RepDate) + " or acap.t_ToDate = " + GetSQLDate(date(0,0,0)) + ") "
+              +"    and acapau.t_AUNodeID IN (select ac.t_AutoKey from ddepoacnt_dbt ac start with ac.t_AutoKey = atvl.t_ID connect by ac.t_AutoKey = prior ac.t_Superior))";
+      else
+        query = query + " and acnt.t_AutoKey IN (Select atvl.t_ID from ddepoatvl_dbt atvl Where atvl.t_IsType = CHR(0) AND atvl.t_AttrNum = 15) ";  // в залоге
+      end;
+
+    end;
+
+      if( SecurQual == SECURQUAL_QUAL)
+        query = query + " and rsb_fiinstr.FI_IsQualified(fin.t_FIID, "+GetSQLDate(RepDate)+") <> 0";
+      elif(SecurQual == SECURQUAL_NOQUAL)
+        query = query + " and rsb_fiinstr.FI_IsQualified(fin.t_FIID, "+GetSQLDate(RepDate)+") = 0";
+      end;
+
+      if(Issuer != UnknownParty)
+        query = query + " AND RSI_RSB_FIInstr.FI_GetIssuerOnDate( fin.t_FIID, " + GetSQLDate(RepDate) + " )  = " + Issuer;
+      end;
+
+      if(AvoirKind)
+        query = query + " AND RSB_FIInstr.FI_AvrKindsEQ(" + FIKIND_AVOIRISS + ", "+AvoirKind+", fin.t_AvoirKind) > 0 ";
+      end;
+
+      if(FIID != ALLFININSTR)
+        query = query + " AND fin.t_FIID = " + FIID;
+      end;
+      
+      SQL_Execute(query, "", false );
+    end;
+
+
+  END;
+
+  MACRO CreateRep()
+    var sQuery = "", cmd;
+    var records = 0, i = 0;
+    var Progress = CProgressBar;
+    var countedDAcc = 0;
+    var stat = 0;
+    
+    SQL_Execute("DELETE FROM "+TmpTable, "", false );
+    
+    cmd = DL_RSDCommand();
+
+    sQuery  =   " select t_AutoKey, t_Root, t_Code, t_BriefCode, t_Name, t_Owner, t_Type "
+              + "   from ddepoacnt_dbt "
+              + "  where t_Superior = 0  "
+              + "    and t_Department = ? "
+              + "    and t_OpenDate <= ? ";
+
+    cmd.AddParam(Department);
+    cmd.AddParam(RepDate);
+
+    if( Party != -1 )
+       sQuery = sQuery + " and t_Owner = ? ";
+       cmd.AddParam(Party);
+    end;
+    
+    if( DepoAcc != 0 )
+       sQuery = sQuery + " and t_AutoKey = ? ";
+       cmd.AddParam(DepoAcc); 
+    end;
+
+    if( acc_kind == DEPO_ACC_ACTIV )
+       sQuery = sQuery + " and t_Kind = "+DEPO_ACC_ACTIV;
+    elif( acc_kind == DEPO_ACC_PASSIV )
+       sQuery = sQuery + " and t_Kind = "+DEPO_ACC_PASSIV;
+    end;
+    
+    records = cmd.GetCount(sQuery);
+    //изначально отбираем все подходщие счета, т.е. головы
+    if(records > 0 )
+      Progress.Init(records, "Поиск счетов для отчета", "Просмотр счетов ДЕПО");
+      depoacnt = cmd.Execute(sQuery);
+      while(depoacnt.MoveNext())
+        //для каждого счета добавить данные во временную таблицу
+        FillTMP(depoacnt.AutoKey);
+        i = Progress.Use();
+      end;
+      
+      Progress.Remove();
+
+      i = 0;
+      Progress.Init(records, "Формирование отчета", "Формирование отчета");
+      depoacnt = cmd.Execute(sQuery);
+      while(depoacnt.MoveNext())
+        //для каждого счета печатаем отчет
+        PrintReport(i + 1);
+        i = Progress.Use();
+      end;
+
+      Progress.Remove();
+    end;
+
+    if((records == 0) and (GetDialogFlag() == 0))
+      msgbox("Нет данных, удовлетворяющих параметрам отчета");
+    end;
+
+    return records;
+  END;
+
+
+  MACRO Create()
+    return DP_StdReportControl( LogOprID, this.CreateRep(), NULL, 0, true, null, null, m_rep, NULL, NULL, this );
+  END;
+
+  MACRO CreateEmptyRep()
+    
+    if(DepoAcc > 0)
+      var query =   " select t_AutoKey, t_Root, t_Code, t_BriefCode, t_Name, t_Owner, t_Type "
+                  + "   from ddepoacnt_dbt "
+                  + "  where t_AutoKey = ? ";
+      var cmd = DL_RSDCommand(query);
+      cmd.AddParam(DepoAcc);
+
+      depoacnt = cmd.Execute();
+
+      depoacnt.moveNext();
+    end;
+     
+    RepHeader(0);
+
+    m_rep.Set_WrapText(0);
+    m_rep.Put_Str("Нет данных, удовлетворяющих параметрам отчета", "START;END;");
+
+    DP_StdAuthPerson_Ex(null, null, m_rep);
+    DP_StdDeposInfo_Ex(null, null, 0, m_rep);
+    DP_StdExecReport_Ex(null, null, NULL, NULL, 0, m_rep);
+     
+  END;
+  
+  //Создание файла отчета следующим образом:
+  //если отчет выпускается сам по себе, т.е. из пункта меню:
+  // - в двухзвенке он формируется на СП,  
+  // - в трехзвенке на терминале
+  //если отчет выпускается в процедуре подготовки выписок по счетам:
+  // - в двухзвенке он формируется на СП
+  // - в трехзвенке при работе с конвейерами он формируется на СП
+  // - в трехзвенке без конвейеров он формируется на терминале
+  MACRO Run()
+    var CreateDate = date();
+    var CreateTime = time();
+    var day, mon, year;
+    var hour, min, sec;
+    var CreateOnTerm = ((IsWebService == false) and (not isStandAlone()));
+    DateSplit(CreateDate, day, mon, year);
+    TimeSplit(CreateTime, hour, min, sec);
+
+    var CurrentRepName = "repacc_"+DL_GetGUID()
+                         +"_"+string(year)+string(mon:f)+string(day:f)
+                         +"_"+string(hour:f)+string(min:f)+string(sec:f);
+    var FullPath = DP_GetStatementPath(CreateOnTerm);
+    var xmlNameFile = FullPath + string(CurrentRepName+".xml");
+
+    MakeDir(FullPath);
+
+    Dl_CallInsertStat(DL_OUTREPORT_EXCEL, 0, CodeFor("Z"), "Выписка по счету депо");
+
+    m_rep.Init("utf8", Apostr);
+
+    m_rep.Set_Column_Width(/* 1*/  145,
+                           /* 2*/  116,
+                           /* 3*/  116,
+                           /* 4*/  106,
+                           /* 5*/  106,
+                           /* 6*/  106
+                           );
+
+    m_rep.Set_Landscape(false); //Книжная
+    m_rep.Set_Indent(0);
+
+    m_rep.Print_Header("Выписка", "Times New Roman", 9);
+    
+    Create();
+
+    m_rep.Print_Bottom();
+    m_rep.Move(IIF(CreateOnTerm, "$", "") + xmlNameFile);
+
+    var resultFileName = currentRepName + ".xlsx";
+    
+    var err = SC_ConvertToFormat(xmlNameFile, FullPath+resultFileName, SC_SRVREPFORMAT_EXCEL_XLSX, IsWebService);
+    
+    if(not err)
+      if((PrintMode == DP_PRINTMODE_PRINT) or (PrintMode == DP_PRINTMODE_SHOWANDPRINT))
+        SC_PrintExcelFile(FullPath+resultFileName, Copies, IsWebService);
+      end;
+      if((PrintMode == DP_PRINTMODE_SHOW) or (PrintMode == DP_PRINTMODE_SHOWANDPRINT))
+        SC_ShowFile(IIF(CreateOnTerm, "$", "") + FullPath, resultFileName);
+      end;
+    end;
+    
+    RemoveFile(IIF(CreateOnTerm, "$", "") + xmlNameFile);
+
+    return err;
+  END;
+
+END;
+
+macro printReport(_Department:integer,  /* филиал*/
+                  _RepFormatKind:integer, /*вид формата отчета*/
+                  _RepDate:date,        /* дата на которую выпускается отчкт */
+                  _Party:integer,       /* владелец счета */
+                  _acc_kind:integer,
+                  _DepoAcc:integer,     /* счет депо */
+                  _DepoPart:integer,    /* раздел */
+                  _correspond_acc:integer, /* корреспондентский счет*/
+                  _correspond_part:integer,/* корреспондентский раздел*/
+                  _showPawn:bool,        /* показывать залог */
+                  _mortgagee:integer,    /* залогодержатель */
+                  _SecurQual:integer,   /* квалифицированные/неквалифицированные ц/б*/
+                  _Issuer:integer,      /* эмитент */
+                  _AvoirKind:integer,   /* вид ц/б */
+                  _FIID:integer,        /* ц/б */
+                  _InvCardID:integer,       /* ИК */
+                  _Partitions:bool,     /* печать по разделам? */
+                  _NullOvers:bool,
+                  _result_by_acc:bool,
+                  _result_by_docfi:bool,
+                  _withAmortization:bool,
+                  _withStoragePlace:bool,
+                  _ToExcel:bool,
+                  _Apostr:bool,
+                  _LogOprID:integer,
+                  _Comment:string,
+                  _PrintMode:integer,
+                  _Copies:integer,
+                  _IsWebService:bool
+                  )
+  
+  acc_kind  = _acc_kind;
+  DepoPart  = _DepoPart;
+  DepoAcc   = _DepoAcc;
+  Party     = _Party; 
+  RepDate   = _RepDate;
+  SecurQual = _SecurQual;
+  Issuer    = _Issuer;
+  AvoirKind = _AvoirKind;
+  FIID      = _FIID;
+  InvCardID = _InvCardID;
+  correspond_acc  = _correspond_acc; 
+  correspond_part = _correspond_part;
+  showPawn  = _showPawn;
+  mortgagee = _mortgagee;
+  Partitions= _Partitions;
+  LogOprID  = _LogOprID;
+  NullOvers = _NullOvers;
+  Apostr    = _Apostr;
+  result_by_acc   = _result_by_acc;  
+  result_by_docfi = _result_by_docfi;
+
+  Department = _Department;
+
+  RepFormatKind    = _RepFormatKind;
+  withAmortization = _withAmortization;
+  withStoragePlace = _withStoragePlace;
+  Comment          = _Comment;
+
+  PrintMode = _PrintMode;
+  Copies    = _Copies;
+
+  IsWebService = _IsWebService;
+  
+  var stat = 0;
+
+  var RepObj = DP_Sprepacc();
+  
+  stat = RepObj.Run();
+
+  return stat;
+end;

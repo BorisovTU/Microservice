@@ -1,0 +1,1033 @@
+/*
+$Name:        dv_class.mac
+$Module:      Производные инструменты
+$Description: Классы для работы c категориями учета
+*/
+IMPORT "dv_cattp.mac","dl_calendcore.mac",mccatacf, fx_globals, oralib;
+
+PRIVATE VAR DvUseCachingAccounts:bool = false; // Глобальная переменная кэширования счетов
+PRIVATE VAR CacheAccountsArr = TArray(); // Кэш счетов по категориям учёта
+
+MACRO GetCacheAccountsArr(ArrNum)
+   return CacheAccountsArr[ArrNum];
+END;
+
+MACRO UnsetCacheAccountsArr(ArrNum)
+   CacheAccountsArr[ArrNum] = null;
+END;
+
+//TEG 26.04.19 нужно актуализировать список категорий согласно расклада банка
+PRIVATE MACRO IsCatCodeCache( CatCode:string ):bool // Кэшируются ли счета по категории
+  var RetVal:bool = false;
+
+  if(
+      //Счета с единственным шаблоном 
+      (CatCode == "+НДС") or 
+      (CatCode == "-НДС") or 
+      (CatCode == "-КВ, ц/б") or
+      (CatCode == "-Бюджет, ф.налоги") or
+      (CatCode == "-КВ, ц/б1") or  //TEG наши категори
+      (CatCode == "-КВ, ц/б сроч") or //TEG наши категори
+      //Счета с параметрами Вид БА и Вид ПФИ
+      (CatCode == "-КВ, к/о") or 
+      (CatCode == "-Реализация, ц/б") or 
+      (CatCode == "Доходы ПФИ") or
+      (CatCode == "Расходы ПФИ") or
+      //Счета, открывающиеся по сделкам
+      (CatCode == "+ПФИ") or 
+      (CatCode == "-ПФИ") or 
+      (CatCode == "+Форвард, РПИ") or
+      (CatCode == "-Форвард, РПИ") or
+      (CatCode == "Выбытие ПФИ") or //TEG далее наши категори
+      (CatCode == "+Форвард, РПИ1") or
+      (CatCode == "-Форвард, РПИ1") 
+    )
+     RetVal = true;
+  end;
+
+  return RetVal;
+END;
+
+MACRO GL_DvUseCachingAccounts( UseCachingAccounts:bool ) // Установка признака кэширования
+  DvUseCachingAccounts = UseCachingAccounts;
+
+  if( DvUseCachingAccounts )
+     CacheAccountsArr = TArray();
+  end;
+END;
+
+/*********************************************************************************/
+/* базовый класс - первичные документы для работы с категориями учета            */ 
+/*********************************************************************************/
+CLASS DVFirst( )
+
+    PRIVATE VAR 
+       ParmA        = TArray(), /* массив значений параметров. Доступ только через GetParametr*/
+       FIRoleBArray = TArray(); /* массив базисных ролей ФИ */
+
+    private var 
+      v_Bal304:bool,      /* б/счет в схеме расчетов с биржей 304 */
+      v_Bal302:bool;      /* б/счет в схеме расчетов с биржей 302 */
+
+    private var v_FIIDCorAcc:integer;/*FIID корреспондирующего счета со cчетом <СчКорреспГлаваГ>*/
+    private var v_CatCode:string;/*код категории учета*/
+
+    var
+       Error = 0,       /* Номер ошибки. Используется для анализа ошибок в ф-ях категорий*/
+       Kind  = 0,       /* вид первичного документа*/
+       ID    = 0;       /* ID первичного документа*/
+
+    var 
+       correctAccOpenDate = null; /* Дата для корректировки даты открытия счета (для случаев если дата больше опердня) */
+
+    MACRO GetParametr( ParmKind:INTEGER )
+       return ParmA[ParmKind];
+    END;
+
+    MACRO SetParametr( Index:INTEGER, Val:VARIANT )
+       ParmA[Index] = Val;
+    END;
+
+    MACRO IsTrust()
+       return false;
+    END;
+
+    MACRO IsCurrMarket():bool
+       return false;
+    END;
+
+    /*инициализация массива ролей ФИ, в классах наследниках может переопределяться*/
+    MACRO InitFIRoleBArray()
+       FIRoleBArray[FIRoleBArray.Size] = FIROLE_FIDOC; 
+    END;
+
+    macro Is304()
+       if( v_Bal304 == NULL) 
+          if( SQL_GetNRecs( "select * from ddlmarket_dbt where t_ID = " + string(this.GetMarketSchemeID()) + " and t_Balance = '304'"  ) > 0 )
+             v_Bal304 = true;
+          else
+             v_Bal304 = false;
+          end;
+       end;
+       return v_Bal304;
+    end;
+
+    macro Is302()
+       if( v_Bal302 == NULL) 
+          if( SQL_GetNRecs( "select * from ddlmarket_dbt where t_ID = " + string(this.GetMarketSchemeID()) + " and t_Balance = '302'"  ) > 0 )
+             v_Bal302 = true;
+          else
+             v_Bal302 = false;
+          end;
+       end;
+       return v_Bal302;
+    end;
+
+    MACRO GetMarketSchemeID():INTEGER
+       return -1;
+    END;
+
+    MACRO GetCatNum(CatCode, PairAccNum:@INTEGER)
+       record categ( mccateg ); 
+       if( MC_FindMCCATEG(CatCode, categ) )
+          PairAccNum = categ.PairCatID;
+          return categ.ID;
+       else
+          return 0;
+       end;
+    END;
+                                                                                                                                                               
+    /*Получить параметры шаблона                    */
+    MACRO GetParametrTemplate
+    ( 
+        ObjectID,       /*   параметр - номер справочника                 */
+        Classificator,  /*   классификатор - номер классификатора, если он задан */
+        OperDate,       /*   дата, на которую надо вернуть характеристики*/
+        FIRole
+    )  
+       if( ((v_CatCode == "+Маржа, ИВ и ДМ") OR (v_CatCode == "-Маржа, ИВ и ДМ")) AND (ObjectID == OBJTYPE_CODE_FI) AND (Classificator == LLCLASS_CODE_FI) )
+          return 0;/*всегда ВСЕ*/
+       else
+          return DV_GetParametrTemplate( this, ObjectID, Classificator, OperDate, FIRole );
+       end;
+    END;
+
+    /*Макрос корректировки открываемого счета. Account, accblnc, ORScheme можно менять*/
+    MACRO CorrectAccount(account, accblnc, ORScheme, categ, templ, accdoc,  OperDate)
+      
+      /*ставим признак овердрафта на счета открываеммые по указанным категориям*/
+      if( (categ.rec.Code == "+Форвард, расчеты") OR ((categ.rec.Code == "-Форвард, расчеты")) )
+         if( Index(account.rec.Type_Account,"О") == 0 ) 
+            account.rec.Type_Account = account.rec.Type_Account + "О";
+         end;
+      end;
+
+      if( (categ.rec.Code == "+За ц/б") OR ((categ.rec.Code == "-За ц/б")) )
+         if( (Index(account.rec.Type_Account,"О") == 0) AND (Index(account.rec.Kind_Account,"АП") == 0) ) 
+            account.rec.Type_Account = account.rec.Type_Account + "О";
+         end;
+      end;
+      
+      if( (categ.rec.Code == "ФО Банка, ВУ") OR (categ.rec.Code == "ФО Клиента, ВУ") OR (categ.rec.Code == "ФО, Прч. счета банка, ВУ") OR
+          (categ.rec.Code == "ФО, Расч. с клиентом, ВУ") )
+         if( Index(account.rec.Type_Account,"О") == 0 ) 
+            account.rec.Type_Account = account.rec.Type_Account + "О";
+         end;
+      end;
+
+      if (ValType(correctAccOpenDate) == V_DATE) //для вставки счетов с будущими относительно опердня датами открытия счета
+        account.rec.Open_Date = max(correctAccOpenDate,account.rec.Open_Date);
+        correctAccOpenDate = null;
+      end;
+      
+      return true;
+    END;
+
+    /*Установить ошибку. 
+      Если IsCriticalError=true или не задан, то прервать выполнение макроса*/
+    MACRO SetError( StrError, IsCriticalError )  
+
+       this.Error = 1;
+       if( IsCriticalError == null )
+         IsCriticalError = true;
+       end;
+
+       if( IsCriticalError AND (not GetisErrorMacReplaced()) )
+          RunError( ".|Ошибка при создании класса "+GenClassName(this) );
+       else
+          MsgBox( StrError ); 
+       end;
+
+    OnError( RslErrObj )
+       msgbox( RslErrObj.Message + ".|"+ StrError ); 
+       RunError();
+    END;
+
+   MACRO New_account(pa1,pa2)
+    private var que,rez,rs51,rs5;
+    rez="";
+    que="select a.t_account from dmcaccdoc_dbt a, dmccateg_dbt b where a.t_docid="+pa1+" and a.t_dockind=4813 and b.t_id=a.t_catid and b.t_code='"+pa2+"'";
+    rs51 = ExecSQLselect(que);
+    if(rs51 != null)
+      if (rs51.moveNext) 
+         if (rs51.value(0) > 0 )
+            que="select a.t_account from dmcaccdoc_dbt a, dmccateg_dbt b where a.t_docid="+pa1+" and a.t_dockind=4813 and b.t_id=a.t_catid and b.t_code='"+pa2+"'";
+            rs5 = ExecSQLselect(que);
+            if(rs5 != null)
+              if (rs5.moveNext) 
+                rez=rs5.value(0);
+              end;
+           end;
+         end;
+      end;
+    end;
+    return rez;
+    END;
+   /*Устанавливаем переменную accOpenDate и тут же её возвращаем, чтобы задавать можно было из вызова открытия счетов*/
+    macro SetAccOpenDate(openDate:date)
+      correctAccOpenDate = openDate;
+      return correctAccOpenDate;
+    end;
+
+    /* Получить счет по категории учета
+       Вернет false, если ошибка или отказ от ввода счета.
+       ! если не установлен NoErrMes выдаст сообщение об ошибке
+    */
+    PRIVATE MACRO GetAccountByCatCode
+    ( 
+        CatCode:string     ,  /* код категории */
+        FindAccount:string ,  /* здесь вернется номер счета */
+        /*необязательные параметры*/
+        AccCreate:Integer,     /* признак верификации\открытия лицевого счета       */
+        NoErrMes:bool,      /* признак молчаливого выполнения - ошибку не выдаем */
+        FIRole:Variant,        /* роль ФИ или массив ролей*/
+        AccBuf:Variant,        /* буфер для возврата информации по найденному\открытому счету   */
+        PairAcc:Integer,       /* с учетом парности */
+        ActionDate:Date,    /* дата */
+        FIID:Integer,          /*валюта*/
+        Accounts:Variant,      /*массив номеров счетов, соответствующий массиву ролей */  
+        McAccDocBuf:Variant,    /* буфер для возврата данных по счету mcaccdoc.dbt */
+        ActivateDate:Date
+    )
+       var i = 0, loop = true, open_acc = true, _FIRole = null, IsMass;
+       var catNum = 0, pairCatNum = 0;
+       var ID_Operation, ID_Step;
+       var CacheAcc = TRecHandler( "account.dbt" );
+
+       if( this.Error != 0 ) return false; end;
+       //TEG 29.07.19 перенесено ниже так как переопределяется CatCode
+       //if( DvUseCachingAccounts and IsCatCodeCache(CatCode) )
+       //   catNum = GetCatNum(CatCode, @pairCatNum);
+       //end;
+
+       if( ((NoErrMes == null) OR (NoErrMes == false)) AND 
+           (not isOprMultiExec()) 
+         )
+          IsMass = 0;
+       else /*либо массовый режим, либо принудительно просим не орать ошибки*/
+          IsMass = 1;
+       end;
+
+       if ( isOprMultiExec() )
+          var Query = " SELECT oprtemp.t_ID_Operation, oprtemp.t_ID_Step, oprtemp.t_Dockind, koper.t_Systypes "
+                    + "   FROM doprtemp_view oprtemp, doproper_dbt oper, doprkoper_dbt koper "
+                    + "  WHERE oprtemp.t_ID_Operation =  oper.T_ID_Operation "
+                    + "    AND oper.T_Kind_Operation = koper.T_Kind_Operation "    
+                    + "  UNION "    //добавил чтение данных из файла ddatasum_dbt при параллельном выполнении через funcObj
+                    + " SELECT ddata.T_OPERID AS ID_Operation, cast(ddata.T_CREDITSUM AS NUMBER(5)) AS ID_Step, "+DL_DVOPER+" AS Dockind, CHR(1) AS Systypes " 
+                    + "   FROM ddatasum_dbt ddata " 
+                    + "  WHERE T_CURRENCY = -1 " 
+                    + "    AND T_MARKETSCHEMEID = 0 " 
+                    + "    AND T_DEBETSUM = 0 " 
+                    + "    AND T_CREDITSUM != 0 ";
+          var cmd = DL_RSDCommand(Query); 
+          var DataSet = cmd.Execute();
+          if( DataSet.moveNext() )
+             if( (DataSet.DocKind == 194) and (DataSet.Systypes == "") )    //DL_DVOPER = 194
+                ID_Operation = DataSet.ID_Operation;
+                ID_Step      = DataSet.ID_Step;
+             end;
+         end;
+      end;
+
+       if( ValType(AccCreate) == V_UNDEF )
+          AccCreate = MC_OPENACC_CREATE;
+       end;
+
+     //v_CatCode = CatCode;/*перенесена ниже CHVA*/
+
+       while( loop ) /*цикл нужен для перебора ролей, если задан массив ролей*/
+
+          if( (FIRole != null) AND (ValType( FIRole ) == V_GENOBJ) ) /*массив ролей*/  
+
+             if(FIRole[i] != null)            
+               loop     = true;                    
+               open_acc = true;
+               _FIRole  = FIRole[i];
+             else
+               loop     = false;                    
+               open_acc = false;
+               _FIRole  = null;
+             end;
+             i = i + 1;    
+
+          else
+             loop       = false; /*перебор не нужен, только одна роль задана*/
+             open_acc   = true;
+             _FIRole    = FIRole;
+	  end;			
+
+	  if (this.kind == 194)
+	      if (this.dvoper.rec.operkind == 12602)//валютный рынок
+                  if (CatCode == "Клиринговый счет" )
+                      if (fiid == 0)
+          	          CatCode = "Клиринговый счетР" ;
+                      else
+          	          CatCode = "Клиринговый счетВ" ;
+           	      end;
+                  elif (CatCode == "+Форвард, расчеты0" )          
+              	     CatCode = "+Форвард, расчеты0Б";
+                  elif (CatCode == "-Форвард, расчеты0" )        
+              	     CatCode = "-Форвард, расчеты0Б";
+                  end;
+              else 
+                 if ( (CatCode == "Клиринговый счет" ) and (DL_ЕдиныйПулОбеспеченияСобств != 1)) 
+                    CatCode =  "Клиринговый счет1" ;
+                 elif ( (CatCode == "Клиринговый счет" ) and (DL_ЕдиныйПулОбеспеченияСобств == 1)) 
+                    CatCode =  "+Обеспечение" ;
+                 elif (CatCode == "СчКорреспГлаваГ" )
+                    CatCode = "СчКорреспГлаваГ1";
+                 end;                              
+              end;
+          elif (this.kind == 4632)
+	        if ((this.comm.rec.partyofficeid == 9) and (this.comm.rec.opersubkind == 1) )//валютный рынок, собственные
+                    if (CatCode == "Клиринговый счет" )
+                        if (fiid == 0)
+          	            CatCode = "Клиринговый счетР" ;
+                        else
+          	            CatCode = "Клиринговый счетВ" ;
+             	        end;
+                    elif (CatCode == "+Форвард, расчеты0" )          
+              	        CatCode = "+Форвард, расчеты0Б";
+                    elif (CatCode == "-Форвард, расчеты0" )        
+              	        CatCode = "-Форвард, расчеты0Б";
+                    end;
+                end;
+          end;	
+          if (this.kind == 192)
+              if (strUpr(genclassname(this))==strupr("DVFIRSTDOCDEAL"))//срочный рынок а точнее проверяем что класс сделка
+                  if(CatCode == "+Расчеты" )
+                     CatCode =  "+РасчетыСР" ;
+                 elif (CatCode == "-КВ, ц/б" ) 
+       	       CatCode = "-КВ, ц/б сроч";
+                 elif (CatCode == "СчКорреспГлаваГ" )
+                     CatCode = "СчКорреспГлаваГ1";
+                 elif ((CatCode == "+Форвард, дрейф" ) or (CatCode == "+Форвард, ФО"))
+                     CatCode = "+Форвард, дрейф1" ;
+                 elif ((CatCode == "-Форвард, дрейф" ) or (CatCode == "-Форвард, ФО"))
+             	       CatCode = "-Форвард, дрейф1" ;
+                 elif ((CatCode == "+ПФИ" ) or (CatCode == "+ПФИ ФО" ))
+                     CatCode = "+ПФИ1" ;
+                 elif ((CatCode == "-ПФИ" ) or (CatCode == "-ПФИ ФО" ))
+                     CatCode = "-ПФИ1" ;
+                 elif ((CatCode == "Выбытие ПФИ" ) or (CatCode == "Выбытие ФО" ))
+                     CatCode = "Выбытие ПФИ1" ;
+                 elif ( (CatCode == "+Форвард, РПИ" ) or (CatCode == "+Форвард, РПИ ФО" ))
+                     CatCode = "+Форвард, РПИ1" ;
+                 elif ( (CatCode == "-Форвард, РПИ" ) or (CatCode == "-Форвард, РПИ ФО" ))
+                     CatCode = "-Форвард, РПИ1" ;      
+                 elif (CatCode == "ДС Банка, ВУ" )//15.06.19 TEG будем учитывать на этом счете собственные средства в РЦБ
+                     CatCode = "ДС в РЦ ОРЦБ, ВУ" ;      
+	          end;
+              end;
+              // msgbox(this.kind + " " +CatCode);
+	  end;
+
+	  if ((this.kind == 4813) or  (this.kind == 4815))
+	       if (CatCode == "+Форвард, расчеты" ) 
+		   CatCode = "+Форвард, расчеты0";
+	       elif (CatCode == "-Форвард, расчеты" ) 
+		   CatCode = "-Форвард, расчеты0";
+		   // teg 14.01.19elif (CatCode == "-Переоц.,поставка ИВ и ДМ" ) //GYA, № 5
+		   // дублирует то что ниже и рвет пару CatCode = "-Переоц,поставка ИВ и ДМ0";
+	       elif ((CatCode == "+ПФИ" ) and (this.kind != 4815))
+		     CatCode = "+ПФИ0";
+	       elif ((CatCode == "-ПФИ" ) and (this.kind != 4815))
+		     CatCode = "-ПФИ0";
+	       elif (CatCode == "СчКорреспГлаваГ" ) 
+		     CatCode = "СчКорреспГлаваГ0";
+	       elif (CatCode == "+Форвард, дрейф внебирж" ) 
+		     CatCode = "+Форвард, дрейф внебирж0";
+	       elif (CatCode == "+Форвард, дрейф" ) 
+		     CatCode = "+Форвард, дрейф0";
+	       elif (CatCode == "+Форвард, ПФИ" ) 
+		     CatCode = "+Форвард, ПФИ0";
+	       elif (CatCode == "-Форвард, дрейф внебирж" ) 
+		     CatCode = "-Форвард, дрейф внебирж0";
+	       elif (CatCode == "-Форвард, ПФИ" ) 
+		     CatCode = "-Форвард, ПФИ0";
+	       elif (CatCode == "+Форвард, прочие" ) 
+		     CatCode = "+Форвард, прочие0";
+	       elif (CatCode == "-Форвард, прочие" ) 
+	  	     CatCode = "-Форвард, прочие0";
+	       elif ((CatCode == "Доходы ПФИ" )  and (this.kind != 4815))
+		     CatCode = "Доходы ПФИ0";
+	       elif ((CatCode == "Расходы ПФИ" ) and (this.kind != 4815))
+		     CatCode = "Расходы ПФИ0";
+	       elif (CatCode == "+Маржа, ИВ и ДМ" ) 
+                   /*PNV 508868*/
+                   if ((this.kind == 4813) and (this.IsBNote()))
+                      /*PNV 510140*/ 
+                       if (this.ВалютаТребования() == NATCUR)
+                           _FiRole = FIROLE_FICOM;
+                       elif (this.ВалютаОбязательства() == NATCUR)
+                           _FiRole = FIROLE_FIREQ;
+                       else
+                           _FiRole = FIROLE_FIREQ;
+                       end;
+                       /*PNV 510140*/
+   		       CatCode = "+МаржаН";
+                   else
+                       CatCode = "+Маржа, ИВ и ДМ0";
+                       if (this.БивалютнаяСделка())
+                           _FiRole = FIROLE_FIREQ;                         
+                       end;
+                   end;   
+                   /*PNV 508868*/
+	       elif (CatCode == "-Маржа, ИВ и ДМ" )
+                   /*PNV 508868*/
+                   if ((this.kind == 4813) and (this.IsBNote()))
+                       CatCode = "-МаржаН";
+                       /*PNV 510140*/
+                       if (this.ВалютаТребования() == NATCUR)
+                           _FiRole = FIROLE_FICOM;
+                       elif (this.ВалютаОбязательства() == NATCUR)
+                           _FiRole = FIROLE_FIREQ;
+                       else
+                           _FiRole = FIROLE_FIREQ;
+                       end;
+                     /*PNV 510140*/
+                   else
+                       CatCode = "-Маржа, ИВ и ДМ0";
+                       if (this.БивалютнаяСделка())
+                           _FiRole = FIROLE_FIREQ;                         
+                       end;
+                   end;		     
+                   /*PNV 508868*/
+	       elif (CatCode == "+Переоц.,поставка ИВ и ДМ" )        
+		     CatCode = "+Переоц.,поставка0";
+                     if (this.БивалютнаяСделка())
+                         _FiRole = FIROLE_FIREQ;                         
+                     end;   
+	       elif (CatCode == "-Переоц.,поставка ИВ и ДМ" )        
+		     CatCode = "-Переоц.,поставка0";
+                     if (this.БивалютнаяСделка())
+                         _FiRole = FIROLE_FIREQ;                         
+                     end;
+	       end;
+              if (( this.deal.rec.contractor  == _NKC )  or (this.deal.rec.contractor == GetCodeParty("АО СПВБ",1))) 
+                   if (CatCode == "Доходы ПФИ" ) 
+			CatCode = "Доходы ПФИ0";
+	            elif (CatCode == "Расходы ПФИ" ) 
+	 	        CatCode = "Расходы ПФИ0";
+		     end;
+              end;
+              if ((this.deal.rec.kind == 2730) or (this.deal.rec.kind == 22730) or (this.deal.rec.kind == 2740)) 
+                   if (( this.deal.rec.contractor  == _NKC )  or (this.deal.rec.contractor == GetCodeParty("АО СПВБ",1)))
+                        if (CatCode == "-Биржа" )     
+                            CatCode = "+Форвард, расчеты0Б";
+                        elif (CatCode == "+Биржа" )     
+                           CatCode = "-Форвард, расчеты0Б";
+                        end;
+      			   if (CatCode == "Клиринговый счет" )
+         	   	       if (fiid == 0)
+           		           CatCode = "Клиринговый счетР" ;
+           		       else
+           			    CatCode = "Клиринговый счетВ" ;
+         		       end;
+         		   elif (CatCode == "+Форвард, расчеты0" )          
+       	      	       CatCode = "+Форвард, расчеты0Б";
+         		   elif (CatCode == "-Форвард, расчеты0" )        
+       	      	       CatCode = "-Форвард, расчеты0Б";
+       		  end;
+                   end;	
+              end;
+          end;
+          if ( (this.kind == 199) or (this.kind == 4811) //график
+               )
+               if (strUpr(genclassname(this))==strupr("DVFIRSTDOCNDEAL")) 
+                   if ( this.deal.rec.contractor  == _NKC ) 
+                        if (CatCode == "+Форвард, расчеты" )          
+                            CatCode = "+Форвард, расчеты0Б";
+                        elif (CatCode == "-Форвард, расчеты" )        
+                            CatCode = "-Форвард, расчеты0Б";
+                        elif (CatCode == "+Форвард, расчеты0" )          
+                            CatCode = "+Форвард, расчеты0Б";
+                        elif (CatCode == "-Форвард, расчеты0" )        
+                            CatCode = "-Форвард, расчеты0Б";
+                        end;
+                   else /*PNV переходим на КУ 5010\5011 для всех сделок ФИССиКо*/
+      	                if (CatCode == "+Форвард, расчеты" ) 
+		            CatCode = "+Форвард, расчеты0";
+	                elif (CatCode == "-Форвард, расчеты" ) 
+		            CatCode = "-Форвард, расчеты0";
+                        end;  
+                   end;  
+               end;  
+               if (CatCode == "СчКорреспГлаваГ" )
+                    CatCode = "СчКорреспГлаваГ1";
+               elif (CatCode == "+Форвард, дрейф внебирж" )                                                
+                    CatCode = "+Форвард, дрейф внебирж" ;
+               elif (CatCode == "-Форвард, дрейф внебирж" )
+                     CatCode = "-Форвард, дрейф внебирж" ;
+               end;
+          end;
+          /*PNV i-support 497404*/
+          if (this.kind == 199)
+	      if (CatCode == "+Маржа, ИВ и ДМ" ) 
+	          CatCode = "+Маржа, ИВ и ДМ0";
+	      elif (CatCode == "-Маржа, ИВ и ДМ" ) 
+	          CatCode = "-Маржа, ИВ и ДМ0";
+              end; 
+              if ( (CatCode == "Клиринговый счет" ) and (DL_ЕдиныйПулОбеспеченияСобств != 1)) 
+                 CatCode =  "Клиринговый счет1" ;
+              elif ( (CatCode == "Клиринговый счет" ) and (DL_ЕдиныйПулОбеспеченияСобств == 1)) 
+                 CatCode =  "+Обеспечение";
+              end; 
+              if (( this.deal.rec.contractor  == _NKC )  or (this.deal.rec.kind == 12690))/*форвард*/
+                   if (CatCode == "Доходы ПФИ" ) 
+		         CatCode = "Доходы ПФИ0";
+                  elif (CatCode == "Расходы ПФИ" )
+	                CatCode = "Расходы ПФИ0";
+                  end;
+              end;
+           end;
+          /*PNV i-support 497404*/
+            //TEG 29.07.19 перенесено сюда так как переопределяется CatCode
+             if( DvUseCachingAccounts and IsCatCodeCache(CatCode) )
+               catNum = GetCatNum(CatCode, @pairCatNum);
+             end;
+
+	     v_CatCode = CatCode;   /*перенесено в этот участок кода, потому что CatCode переопределяется и неправильно передается категория*/
+	       
+          if( (CatCode == "СчКорреспГлаваГ1") and ((_FiRole == FIROLE_CORACC_ACTIVE) or (_FiRole == FIROLE_CORACC_ACTIVE_BACK) or (_FiRole == FIROLE_CORACC_PASSIVE) or (_FiRole == FIROLE_CORACC_PASSIVE_BACK)) )
+               var v_Acc = Get_СчКорреспГлаваГ(_FIRole);
+               if( v_Acc.rec.AccountID > 0 )
+                   copy(AccBuf,v_Acc);
+                   FindAccount = v_Acc.rec.Account;
+                   open_acc =  false;
+               end;
+          end;
+            
+          if( open_acc )                    
+             if(CacheAccountsArr[catNum] == null)                 
+                if( AccCreate != 4 )
+                   FindAccount = MC_FindAndOpenAccountEx (
+                       CatCode,
+                       this,
+                       ActionDate,
+                       IsMass,
+                       AccCreate,
+                       AccBuf, FIID, null, PairAcc, null, _FIRole, null, McAccDocBuf, null, ActivateDate, null, ID_Operation, ID_Step );
+
+                if( CatCode == "СчКорреспГлаваГ1" )
+                     if( (_FiRole == FIROLE_CORACC_ACTIVE) or (_FiRole == FIROLE_CORACC_ACTIVE_BACK) or (_FiRole == FIROLE_CORACC_PASSIVE) or (_FiRole == FIROLE_CORACC_PASSIVE_BACK) )
+                          Set_СчКорреспГлаваГ(_FIRole,AccBuf);
+                     end;
+                else 
+                   if( DvUseCachingAccounts and (catNum > 0) and (FindAccount != "") )
+                      copy (CacheAcc, AccBuf); 
+                      CacheAccountsArr[catNum] = CacheAcc;
+                      if (pairCatNum > 0)
+                         CacheAccountsArr[pairCatNum] = CacheAcc;
+		      end;	 
+                    end;
+                end;
+
+                else
+                   FindAccount = MC_GetAccountNumber (
+                       CatCode,
+                       this,
+                       ActionDate,
+                       IsMass, FIID, _FIRole );
+                end;
+
+                if( FindAccount != "" )
+                   if( (Accounts != null) AND (ValType( Accounts ) == V_GENOBJ) ) /*массив счетов*/  
+                      Accounts[i-1] = FindAccount;
+                   end;
+                end;
+             else
+                copy (AccBuf, CacheAccountsArr[catNum]); 
+                FindAccount = CacheAccountsArr[catNum].rec.Account;   
+             end;
+          end;
+       end;
+
+	     if ( FindAccount == "" )
+	     FindAccount = MC_FindAndOpenAccountEx (
+						CatCode,
+						this,
+						ActionDate,
+						IsMass,
+						AccCreate,
+						AccBuf, FIID, null, PairAcc, null, _FIRole, null, McAccDocBuf, null, ActivateDate , null, ID_Operation, ID_Step);
+       end;
+  
+       v_CatCode = "";
+
+       SetParm( 2, FindAccount );
+       if ( FindAccount=="" )
+          if( IsMass == 0 )
+             MsgBox("Счет категории \"" + CatCode + "\" неопределен или недоступен в данной операции");
+          end;  
+          return false;
+       end;
+
+       return true;
+    END;
+
+    /*актуализация счета (без открытия)*/  
+    MACRO ActualAccount( CatCode, FindAccount, NoErrMes, FIRole, AccBuf, ActionDate, FIID, Accounts );
+       var ret, acnt;
+       ret = GetAccountByCatCode( CatCode, acnt, MC_OPENACC_ACT, NoErrMes, FIRole, AccBuf, null, ActionDate, FIID, Accounts  );
+       setparm( 2, acnt ); 
+       return ret;
+    END;  
+
+    /*Актуализация с проверкой срочности*/  
+    MACRO ActualCheckPeriod( CatCode, FindAccount, NoErrMes, FIRole, AccBuf, ActionDate, FIID, Accounts, McAccDoc, ActivateDate );
+       var ret, acnt;                                          
+       ret = GetAccountByCatCode( CatCode, acnt, MC_OPENACC_CHECKPERIOD, NoErrMes, FIRole, AccBuf, null, ActionDate, FIID, Accounts, McAccDoc, ActivateDate );
+       setparm( 2, acnt ); 
+       return ret;
+    END;  
+
+    /*открытие и актуализация счета*/  
+    MACRO OpenAccount( CatCode, FindAccount, NoErrMes, FIRole, AccBuf, ActionDate, FIID, Accounts, McAccDoc, PairAcc );
+       var ret, acnt;      
+       ret = GetAccountByCatCode( CatCode, acnt, MC_OPENACC_CREATE, NoErrMes, FIRole, AccBuf, PairAcc, ActionDate, FIID, Accounts, McAccDoc );
+       setparm( 2, acnt ); 
+       return ret;
+    END;  
+
+    /*переоткрытие и актуализация счета - если счет нашли, его все равно пересоздать*/  
+    MACRO ReOpenAccount( CatCode, FindAccount, NoErrMes, FIRole, AccBuf, ActionDate, FIID, Accounts, PairAcc )
+       var ret, acnt;      
+       ret = GetAccountByCatCode( CatCode, acnt, MC_OPENACC_RECREATE, NoErrMes, FIRole, AccBuf, PairAcc, ActionDate, FIID, Accounts );
+       setparm( 2, acnt ); 
+       return ret;
+    END;
+
+    /*аннулирование счета по категории*/
+    MACRO CloseAccount( CatCode, CloseDate, FIRole, CurryCurrency, NoErrMes )
+       var ret;
+       ret = MC_FindAndCloseAccount( CatCode, this, CloseDate, FIRole, CurryCurrency ); 
+       if( (ret != 0) AND ((NoErrMes == null) OR (NoErrMes == false)) )
+          msgbox( "Ошибка при аннулировании счета по категории ", CatCode );
+       end;
+       if( ret != 0 )
+          return false; 
+       else
+          return true; 
+       end;      
+    end;
+
+    /*проверка на существование счета*/  
+    MACRO IsExistAccount( CatCode, FindAccount, NoErrMes, FIRole, AccBuf, PairAcc, ActionDate, FIID, Accounts );
+       var ret, acnt;      
+       ret = GetAccountByCatCode( CatCode, acnt, MC_OPENACC_CHECKEXIST, NoErrMes, FIRole, AccBuf, PairAcc, ActionDate, FIID, Accounts );
+       setparm( 2, acnt ); 
+       return ret;
+    END;  
+
+    /*получить - найти или сформировать номер счета (без открытия)*/  
+    MACRO FindNumberAccount( CatCode, FindAccount, NoErrMes, FIRole, FIID, Accounts );
+       var ret, acnt;      
+       ret = GetAccountByCatCode( CatCode, acnt, 4, NoErrMes, FIRole, null, null, null, FIID, Accounts );
+       setparm( 2, acnt ); 
+       return ret;
+    END;  
+
+    MACRO GetBasisFIRole( FIRole, NoMsgErr )
+      var i = 0;
+
+      if( (FIRole == null) OR (FIRole == FIROLE_UNDEF) OR (FIRole == FIROLE_FIDOC) )
+         return FIROLE_FIDOC;
+      end;
+
+      while (i < FIRoleBArray.Size)
+        if (FIRoleBArray[i] == FIRole)
+           return FIRole;
+        end;
+        i = i + 1;
+      end;
+      
+      if( (NoMsgErr == null) OR (NoMsgErr == false) )      
+         this.SetError( "Неверно задана роль ФИ", false );      
+      end;
+      return FIROLE_UNDEF;
+    END;
+
+    MACRO GetFIRoleBArray()
+       return FIRoleBArray;
+    END;
+
+    MACRO РКЦ()
+      VAR PartyID_RCC = -1; /*РКЦ (субъект {MFO_RCC}) */ 
+      PartyID_RCC  = ПолучитьКодСубъекта( {MFO_RCC}, PTCK_BIC ); 
+
+      if( PartyID_RCC <= 0 )
+         MsgBox( "Не найден РКЦ для " + {MFO_Bank} );
+       end;
+
+      return PartyID_RCC;
+    END;
+
+    MACRO РКЦБанкИзСПИ(PayFIID)
+      var Select,DataSettacc;
+
+      if(PayFIID == NATCUR)
+         /*РКЦ банка из параметров банка*/ 
+         return this.РКЦ();
+      else/*банк из СПИ нашего банка в валюте оплаты платежа*/
+
+         Select=RSDCommand( " select settacc.t_BankID from dsettacc_dbt settacc " +
+                            "  where settacc.t_SettAccID = NVL((select pmautoac.t_SettAccID " +
+                                                               " from dpmautoac_dbt pmautoac " +
+                                                              " where pmautoac.t_PartyID = ? " +
+                                                                " and pmautoac.t_FIID = ? " +
+                                                                " and pmautoac.t_ServiceKind = ? " +
+                                                                " and ROWNUM = 1),0)" );
+
+         Select.addParam( "", RSDBP_IN, {OurBank} );
+         Select.addParam( "", RSDBP_IN, PayFIID );
+         Select.addParam( "", RSDBP_IN, PTSK_DV );
+         Select.execute();
+
+         DataSettacc = TRsbDataSet(Select);
+
+         if ( DataSettacc.MoveNext() )
+            return DataSettacc.BankID;
+         else
+            MsgBox( "Не найден банк из СПИ нашего банка в валюте " + ПолучитьКодФинИн(PayFIID) + " оплаты платежа" );
+         end;
+       end;
+
+      return -1;
+    end;
+
+    macro ВУ_СкорректироватьРесчетнуюОперацию( ВидРО, InnAcc:@VARIANT )
+       if( this.Kind == DL_DVOPER )
+          if( this.DVOper.rec.PartyKind == PTK_MARKETPLASE )
+             InnAcc.GroundKind = 320;
+          elif( this.DVOper.rec.PartyKind == PTK_BROKER )
+             InnAcc.GroundKind = 321;
+          end;
+
+          InnAcc.DealKind   = this.DealKindInner;/*вид сделки\операции*/
+       end;
+
+       return 0;
+    end;
+
+    macro ВУ_ПолучитьРО( ВидРО )
+       return ВидРО;
+    end;
+
+    macro ВУ_ПолучитьРольФИ( ВидРО, DebCred )
+       return "";
+    end;
+
+    macro ВУ_ПолучитьКатегориюДебет( ВидРО )
+       return "";
+    end;
+
+    macro ВУ_ПолучитьКатегориюКредит( ВидРО )
+       return "";
+    end;
+
+    macro ВУ_ОснованиеПроводки( ВидРО )
+       return "";
+    end;
+
+    private VAR ChapterFIID = TArray();
+    macro ВУ_ОпределениеГлавы( FIID:INTEGER ):INTEGER
+       VAR v_fininstr;
+
+       if( ChapterFIID[FIID] == NULL )
+          v_fininstr = Trechandler( "fininstr.dbt" ); /* фин. инструмент           */
+
+          if( ПолучитьФинИн( FIID, v_fininstr ) != 0 ) 
+             this.SetError( "Не найден ФИ при определении главы ВУ (FIID = " + FIID + ")", false );
+          else
+             if( v_fininstr.rec.FI_Kind == FIKIND_CURRENCY )
+                ChapterFIID[FIID] = 21;
+             else
+                ChapterFIID[FIID] = 22;
+             end;
+          end;
+       end;
+       return ChapterFIID[FIID];
+    end;
+
+    macro SetFIIDForCorAccNum(pFIIDCorAcc:integer)
+       v_FIIDCorAcc = pFIIDCorAcc;
+    end;
+
+    macro GetFIIDForCorAccNum()
+       return v_FIIDCorAcc;
+    end;
+
+    macro DVGetOprStatus(status)
+      if (not DL_CheckCallFromStep())
+         var retVal = 0;
+         var query = 
+            " SELECT curs.T_NUMVALUE " 
+         +"   FROM doprcurst_dbt curs, doproper_dbt oper " 
+         +"  WHERE oper.t_DocKind      = ? AND " 
+         +"        oper.t_DocumentID   = ? AND " 
+         +"        curs.t_ID_Operation = oper.t_ID_Operation AND " 
+         +"        curs.t_statuskindid = ? AND"
+         +"        curs.t_dockind      = oper.t_DocKind ";
+         var cmd = DL_RSDCommand(query);
+         cmd.addParam(this.Kind);
+         cmd.addParam(UniID(this.Deal, OBJTYPE_OUTOPER_DV));
+         cmd.addParam(status);
+         var DataSet = cmd.Execute();
+         if (DataSet.moveNext())
+           retVal = SQL_ConvTypeInteger(DataSet.NumValue);
+         end;
+         return retVal;
+      else
+        return GetOprStatus(status);
+      end;
+    end;
+
+END;
+
+/* ПД по генеральному соглашению ПИ */
+CLASS (DVFirst) DVFirstGenAgr( parm1, parm2 )
+
+  var genagr = TBFile("dl_genagr.dbt");
+
+  PRIVATE VAR ParmB = TArray(); /* массив значений пользовательских параметров. Доступ только через GetParametr */
+
+  MACRO GetUsParametr( _ParmKind )
+     return ParmB[_ParmKind];
+  END;
+
+  MACRO SetUsParametr( _ParmKind, _Val )
+     ParmB[_ParmKind] = _Val;
+  END;
+
+  macro InitParmArray()
+     ParmA[MC_TYPE_PARAMETR_PLACE]                = {OurBank};
+     ParmA[MC_TYPE_PARAMETR_ISSUER]               = -1;
+     ParmA[MC_TYPE_PARAMETR_CENTR]                = -1;
+     ParmA[MC_TYPE_PARAMETR_MARKET_PLACE_OFFICE]  = 0;
+     ParmA[MC_TYPE_PARAMETR_PAYCURRENCY]          =
+     ParmA[MC_TYPE_PARAMETR_FIID]                 =
+     ParmA[MC_TYPE_PARAMETR_CURRENCY]             = ALLFININSTR;
+     ParmA[MC_TYPE_PARAMETR_BEGDATE]              =
+     ParmA[MC_TYPE_PARAMETR_VALDATE]              = genagr.rec.Start;
+     ParmA[MC_TYPE_PARAMETR_FINDATE]              = genagr.rec.Start + Int(genagr.rec.Duration);
+     ParmA[MC_TYPE_PARAMETR_CLIENT]               = -1;
+     ParmA[MC_TYPE_PARAMETR_CONTRACTOR]           =
+     ParmA[MC_TYPE_PARAMETR_OWNER]                =
+     ParmA[MC_TYPE_PARAMETR_PARTY]                = genagr.rec.PartyID;
+     ParmA[MC_TYPE_PARAMETR_DOCKIND]              = genagr.rec.DocKind;
+     ParmA[MC_TYPE_PARAMETR_DOCID]                = genagr.rec.GenAgrID;
+     ParmA[MC_TYPE_PARAMETR_NUMBER]               = genagr.rec.CodeInAccount;//genagr.rec.Code;
+     ParmA[MC_TYPE_PARAMETR_DEPARTMENT]           = genagr.rec.Department;
+  end;
+
+  /*инициализация массива ролей ФИ, в классах наследниках может переопределяться*/
+  MACRO InitFIRoleBArray()
+     FIRoleBArray[FIRoleBArray.Size] = FIROLE_FIDOC; 
+     /*FIRoleBArray[FIRoleBArray.Size] = FIROLE_SETTL_AGENT;
+     FIRoleBArray[FIRoleBArray.Size] = FIROLE_FIREQ;
+     FIRoleBArray[FIRoleBArray.Size] = FIROLE_FICOM;*/
+  END;
+
+  MACRO GetFIRoleBArray()
+     return FIRoleBArray;
+  END;
+
+  MACRO ReInit()
+     InitParmArray();
+  END;
+
+  /* конструктор */
+  MACRO Construct( DocKind, DocID ) 
+
+     if( (ValType(DocKind) == V_INTEGER) and
+         (ValType(DocID) == V_INTEGER)
+       )
+        genagr.rec.GenAgrID = DocID;
+        if( not genagr.GetEQ() )
+           this.SetError( "Не найдено генеральное соглашение по (Id = " + string(DocID) + ")" );
+        end;
+     else
+        this.SetError( "Неверные параметры инициализации объекта" );        
+     end; 
+
+     this.ID   = DocID;
+     this.Kind = DocKind;
+
+     InitParmArray(); /*инициализация массива параметров*/
+     InitFIRoleBArray();
+  END;
+
+  initDVFirst();
+  this.Construct(parm1, parm2);
+END;
+
+CLASS (DVFirst) DVFirstCSA( DocKind, DocID )
+    var CSA = TBFile("dvcsa.dbt");
+   /*PNV 510918*/
+    var v_GenAgr:TRecHandler; 
+    
+    PRIVATE MACRO GenAgr()
+     if( v_GenAgr == null )
+        v_GenAgr = Trechandler("dl_genagr.dbt");
+        if( CSA.rec.GenAgrID > 0 )
+           DL_GetRecHandler(v_GenAgr, " SELECT * FROM ddl_genagr_dbt WHERE t_GenAgrID = " + string(CSA.rec.GenAgrID));
+        end;
+     end;
+     return v_GenAgr;
+    END;
+   /*PNV 510918*/
+
+    macro InitParmArray()
+        ParmA[MC_TYPE_PARAMETR_PLACE]                = {OurBank};
+        ParmA[MC_TYPE_PARAMETR_PAYCURRENCY]          =
+        ParmA[MC_TYPE_PARAMETR_FIID]                 =
+        ParmA[MC_TYPE_PARAMETR_CURRENCY]             = -1;
+        ParmA[MC_TYPE_PARAMETR_BEGDATE]              =
+        ParmA[MC_TYPE_PARAMETR_VALDATE]              =
+        ParmA[MC_TYPE_PARAMETR_FINDATE]              = CSA.rec.BegDate;
+        ParmA[MC_TYPE_PARAMETR_CLIENT]               =
+        ParmA[MC_TYPE_PARAMETR_CONTRACTOR]           =
+        ParmA[MC_TYPE_PARAMETR_OWNER]                =
+        ParmA[MC_TYPE_PARAMETR_PARTY]                = CSA.rec.PartyID;
+        ParmA[MC_TYPE_PARAMETR_DOCKIND]              = this.Kind;
+        ParmA[MC_TYPE_PARAMETR_DOCID]                = CSA.rec.CSAID;
+        ParmA[MC_TYPE_PARAMETR_NUMBER]               = CSA.rec.Code;
+        ParmA[MC_TYPE_PARAMETR_DEPARTMENT]           = {OperDprt};
+    end;
+    
+    MACRO InitFIRoleBArray()
+        FIRoleBArray[FIRoleBArray.Size] = FIROLE_FIDOC;
+    END;
+
+    MACRO GetFIRoleBArray()
+        return FIRoleBArray;
+    END;    
+
+    macro Construct( DocKind, DocID )
+        if( (ValType(DocKind) == V_INTEGER) and 
+            (ValType(DocID) == V_INTEGER)
+          )
+            CSA.rec.CSAID = DocID;
+            if( not CSA.GetEQ() )
+                this.SetError("Не найдено соглашение CSA по (ID = " + DocID + ")");
+            end;
+        else
+            this.SetError("Неверные параметры инициализации объекта");
+        end;
+        
+        this.ID = DocID;
+        this.Kind = DocKind;
+        
+        InitParmArray();
+        InitFIRoleBArray();
+    end;
+
+    macro ПолучитьКалендКонтрагент()
+      return CSA.rec.PartyID;
+    end;
+
+    macro ПолучитьКалендТип():integer
+      return DL_CALLNK_OUTMARKET;
+    end;
+
+    macro ПолучитьКалендСвязанный():integer
+      return DL_GetCalendByDynParam(158,makeArray(
+         DL_KeyPair("Object",DL_CalendGetOperNameByKind(2795)),
+         DL_KeyPair("ObjectType",ПолучитьКалендТип())
+      ));
+    end;
+
+    macro ПолучитьКалендВалютуВидаДаты():integer
+      return -1;
+    end;
+
+    
+
+    /*Макрос корректировки открываемого счета. Account, accblnc, ORScheme можно менять*/
+    MACRO CorrectAccount(account, accblnc, ORScheme, categ, templ, accdoc,  OperDate)
+
+      if ((categ.rec.code == "-МС") or (categ.rec.code == "+МС"))
+        Account.rec.NameAccount = GetPartyNames(CSA.rec.PartyID, 1)[0] + " договор кредитной поддержки к ген.соглашению от " + string(CSA.rec.BegDate:f);
+      elif (categ.rec.code == "+%МС")
+        Account.rec.NameAccount = "Требования %% " + GetPartyNames(CSA.rec.PartyID, 1)[0];
+      elif (categ.rec.code == "-%МС")
+        Account.rec.NameAccount = "Обязательства по оплате %% " + GetPartyNames(CSA.rec.PartyID, 1)[0];
+     /*PNV 510918*/
+      elif ((categ.rec.code == "+Расчеты_CSA") or (categ.rec.code == "-Расчеты_CSA"))
+           var BalAcc = SubStr(Account.rec.Account,1,5);
+           if ( BalAcc == "47423")
+                Account.rec.NameAccount = "Требования к "+ GetPartyNames(CSA.rec.PartyID, 2)[0] + ". ГЕН. СОГЛАШЕНИЕ № " + GenAgr().rec.code + " ОТ " + GenAgr().rec.date_genagr;
+           elif ( BalAcc == "47422")
+                Account.rec.NameAccount = "Обязательства перед "+ GetPartyNames(CSA.rec.PartyID, 2)[0]  + ". ГЕН. СОГЛАШЕНИЕ № " + GenAgr().rec.code + " ОТ " + GenAgr().rec.date_genagr;
+           end;
+    /*PNV 510918*/
+      end;
+      return true;
+
+    end;
+    
+    initDVFirst();
+    this.Construct(DocKind, DocID);
+END;

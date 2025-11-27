@@ -1,0 +1,6 @@
+--Изменение unptxop_payment_link_dbt
+begin
+  execute immediate 'CREATE UNIQUE INDEX UNPTXOP_PAYMENT_LINK_IDX0 ON UNPTXOP_PAYMENT_LINK_DBT (T_REFILLID)';
+  execute immediate 'CREATE INDEX UNPTXOP_PAYMENT_LINK_IDX4 ON UNPTXOP_PAYMENT_LINK_DBT (T_NPTXOPID)';
+end;
+/

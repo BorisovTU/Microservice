@@ -1,0 +1,13 @@
+DECLARE
+    e_col_exist EXCEPTION;
+    PRAGMA EXCEPTION_INIT (e_col_exist, -01430);
+BEGIN
+    EXECUTE IMMEDIATE 'DELETE FROM DDL_REGIABUF_DBT';
+    COMMIT;
+    EXECUTE IMMEDIATE 'ALTER TABLE DDL_REGIABUF_DBT MODIFY ( ' || 
+            't_execmethod VARCHAR2(20)'  ||
+        ')';
+
+EXCEPTION WHEN e_col_exist THEN NULL;
+END;
+/

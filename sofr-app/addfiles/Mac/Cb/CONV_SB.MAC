@@ -1,0 +1,1720 @@
+/******************************************************************************
+  RS-Bank 6.0
+
+  Заполнение справочника банков из файлов sbik.dbf, acc_ko.dbf, pravopr.dbf
+  ( Справочник отделений Сбербанка России )       
+  17.08.99 Дудин В.А. Создан
+  19.07.2001 доработан менеджер ОПС РССЛ Пантюк А. Бизяев А. (по алгоритмам
+  Северного и Центрально-Черноземного СБРФ)
+  26.10.2003 доработал Васильев Д. для закачки acc_smfr.dbf в ББ
+
+******************************************************************************/  
+
+/******************************************************************************
+  Правила заполнения справочников:
+
+     Party.dbt    - общая информация о контрагенте
+                       Party.PartyID     - внутренний код контрагента
+                       Party.LegalForm   = 1
+                       Party.Name        = Источник.namep
+                       Party.ShortName   = Источник.namen
+                       Party.Address     = Источник.adr
+                       Party.PostIndex   = Источник.ind
+                       Party.Place       = Источник.nnp
+                       Party.Telegraph   = Источник.at1
+                       Party.TelexNumber = Источник.at2
+                       Party.PhoneNumber = Источник.telef
+                       Party.OKPO        = Источник.okpo
+                       Party.Locked - признак блокировки субъекта(определяется по Источник.real)
+     PartCode.dbt - коды контрагентов; для банков вводится БИК
+                       PartCode.PartyID  - внутренний код контрагента
+                       PartCode.CodeKind = PTCK_BIC
+                       PartCode.CodeKind = PTCK_CLIRING
+                       PartCode.Code     = Источник.newnum
+
+                       PartCode.CodeKind = PTCK_SMFR      ─┐
+                       PartCode.Code     = Источник.IDENT ─┴─  идентификатор системы межфилиальных расчетов Сбербанка
+
+     PartyOwn.dbt - принадлежность контрагента к категориям. В данном
+                    случае контрагент - банк
+                       PartyOwn.PartyID   - внутренний код контрагента
+                       PartyOwn.PartyKind = PTK_BANK
+     BankDprt.dbt - информация, специфичная для банков
+                       BankDprt.PartyID   - внутренний код контрагента
+                       BankDprt.CheckAlg  = 1 при вводе новой записи
+                       BankDprt.CheckData = Источник.newnum
+                                            (при вводе новой записи)
+                       BankDprt.Blnc_Rcc  = "  0" при вводе новой записи
+                       BankDprt.CorAcc    = Источник.ksnp
+                       BankDprt.BIC_RCC   = Источник.rkc
+                       BankDprt.Region    = Источник.rgn
+                       BankDprt.Place      определяется по Источник.tnp
+******************************************************************************/  
+
+import BankInter,"mfo_incl.mac",PTInter,globals;  /* в globals.mac описаны общебанковские глобальные переменные */
+import CTInter;
+import "dbf2ora.mac";
+
+VAR ОбновлятьВсегда = True;  /* Если False, обновление только при реальной смене реквизитов*/
+
+var errcode;
+
+Var RegPath = "CB\\PARTY\\ИМПОРТ СПРАВОЧНИКОВ\\ФАЙЛ СПРАВОЧНИКА ОТДЕЛЕНИЙ СБЕР";
+Var txtDir;
+GetRegistryValue(RegPath,V_STRING, txtDir, "");
+
+
+VAR  DbfFileName = txtDir + "\\sbik.dbf"; /* Наименование dbf-файлов */
+VAR  DbfFileNameKO = txtDir + "\\acc_ko.dbf"; /* Наименование dbf-файлов */
+VAR  DbfFileNamePR = txtDir + "\\pravopr.dbf"; /* Наименование dbf-файлов */
+VAR  DbfFileNameSMFR = txtDir +"\\acc_smfr.dbf"; /* Наименование dbf-файлов */
+file Источник("sbik.dbf") dbf;
+// file pr ( txtDir + "\\client.dbf" ) Пока не используется
+
+
+file Party         ( party    ) key 0 write; /*  Контрагент                      */
+file ObjCode       ( objcode ) key 1 write;  /*  Код контрагента (по коду)       */
+file ObjCode_Kind  ( objcode ) key 0 write;  /*  Код контрагента (по виду кода)  */
+file PartyOwn      ( partyown ) key 0 write; /*  Принадлежность к категориям     */
+file BankDprt      ( bankdprt ) key 0 write; /*  Параметры банка                 */
+file SettAcc       ( settacc  ) key 3 write; /*  Счета контрагентов                */
+file ptacc_ls      ( ptacc_ls ) key 0 write; /*  Привязка счетов контрагентов к операм по видам обслуживания */
+file ContactKey    ( contact  ) key 1 write; /*  Способ связи */
+
+var  fSettAcc = TBFile( "settacc", "w", 3 ),
+     fobjcode = TBFile( "objcode", "r", 1 );
+
+PRIVATE VAR fadress :TBFile = TBFile("adress.dbt" , "W"),
+            fcountry:TBFile = TBFile("country.dbt", "R");
+
+record party_r (party);
+record main_party    ( party );
+record assignee_party( party );
+
+array CodeBank, Schem30301, Schem30302;
+
+private var sbik_rset:object; /* рекордсет записей sbic.dbf, отсортированных по коду клиринга */
+
+VAR
+      Superior,
+      ErrText,
+      BtrErr,
+      PartCode_exist = 0,
+      PartyOwn_exist = 0,
+      Party_exist    = 0,
+      Account_exist  = 0,
+      BankDprt_exist = 0,
+      ProcessedOK = 0,
+      ProcessedWithErrors = 0,
+      ProcessedNoWorking = 0,
+      success,
+      Priznak,
+      ClirCode,
+      BIC,
+      BIC_KO,
+      Account,
+      BankID_KO,
+      BankName_KO,
+      SMFR_Code,
+      ActionKind,
+      UpdateParty,
+      i,
+      BankPartyID,
+      bank,
+      bank1,
+      prav,
+      prav1,
+      err,
+      SelfBIC;
+
+
+/* Отбрасывает ведущие пробелы */
+macro TrimZero( str )
+  while( substr( str, 1, 1 ) == "0" )
+    str = substr( str, 2 );
+  end;
+  return str;
+end;
+
+/********************************************************************/
+/* определить тип населенного пункта (поле NumberPlace admterr.dbt) */
+/* по полю TNP sbik.dbf                                             */
+/********************************************************************/
+/*
+ "Г"     - город (TNP="1");
+ "П"     - поселок (TNP="2");
+ "С"     - село (TNP="3");
+ "ПГТ"   - поселок городского типа (TNP="4");
+ "СТ-ЦА" - станица (TNP="5");
+ "АУЛ"   - аул (TNP="6");
+ "РП"    - рабочий поселок (TNP="7").
+*/
+PRIVATE VAR _CodePlaceByTNP:TArray = makeArray( 0, 6, 39, 44, 17, 21, 23, 18 );
+
+PRIVATE MACRO DefineCodePlace( tnp:string ):integer
+  var i:integer = int(trim(tnp));
+  if( (i > 0) and (i < _CodePlaceByTNP.size) )
+    return _CodePlaceByTNP[i];
+  else
+    return 0;
+  end;
+ONERROR(err)
+  return 0;
+END;
+
+/********************************************************************/
+/* Получение страны по числовому коду                               */
+/********************************************************************/
+PRIVATE MACRO FindCountryByNum( codenum:string, country:TRecHandler ):bool
+  fcountry.KeyNum = 3;
+  fcountry.rec.CodeNum3 = codenum;
+  if( fcountry.GetEQ() )
+    Copy(country, fcountry);
+    return TRUE;
+  else
+    ClearRecord(country);
+    return FALSE;
+  end;
+END;
+
+/********************************************************************/
+/* Получение адреса субъекта                                        */
+/********************************************************************/
+PRIVATE MACRO FindAddress( party, type:integer, address:TRecHandler ):bool
+  fadress.KeyNum = 0;
+  fadress.rec.PartyID = party.PartyID;
+  fadress.rec.Type    = Type;
+  if( fadress.GetEQ() )
+    Copy( address, fadress );
+    return TRUE;
+  else
+    ClearRecord( address );
+    return FALSE;
+  end;
+END;
+
+/********************************************************************/
+/* Получение способа связи                                          */
+/********************************************************************/
+PRIVATE MACRO FindContact( party, type:integer, ContactField:integer, contact:TRecHandler ):bool
+  ContactKey.KeyNum = 1;
+  ContactKey.rec.PartyID = party.PartyID;
+  ContactKey.rec.AddressType    = Type;
+  
+  var ContactKind = 0;
+  var ContactType = 0;
+  var IsMain = "X";
+  
+  if (ContactField == CNTADR_PHONENUMBER)
+    ContactKind = 1;
+  elif (ContactField == CNTADR_PHONENUMBER2)
+    ContactKind = 1;
+    IsMain = "";
+  elif (ContactField == CNTADR_FAX)
+    ContactKind = 3;
+  elif (ContactField == CNTADR_TELEGRAPH)
+    ContactKind = 2;
+  elif (ContactField == CNTADR_TELEXNUMBER)
+    ContactKind = 4;
+  elif (ContactField == CNTADR_E_MAIL)
+    ContactKind = 5;
+  elif (ContactField == CNTADR_RS_MAIL)
+    ContactKind = 9;
+  elif ((ContactField == CNTADR_MOBILEPHONE) or (ContactField == CNTADR_MOBILEPROVIDER))
+    ContactKind = 1;
+    ContactType = 1;
+  end;
+  
+  ContactKey.rec.ContactKind = ContactKind;
+  ContactKey.rec.ContactType = ContactType;
+  
+  if( ContactKey.GetEQ() )
+    Copy( contact, ContactKey );
+    return TRUE;
+  else
+    ClearRecord( contact );
+    return FALSE;
+  end;
+END;
+
+/********************************************************************/
+/* Вставка (или обновление) адреса субъекта                         */
+/********************************************************************/
+PRIVATE MACRO InsertAddress( party, address:TRecHandler ):bool
+  var stat:bool = FALSE;
+  fadress.KeyNum = 0;
+  fadress.rec.PartyID = party.PartyID;
+  fadress.rec.Type    = address.rec.Type;
+  if( fadress.GetEQ() )
+    Copy( fadress, address );
+    fadress.rec.PartyID = party.PartyID;
+    stat = fadress.Update();
+    if( not stat )
+      ErrText = "Ошибка обновления адреса банка " + party.Name;
+    end;
+  else
+    Copy( fadress, address );
+    fadress.rec.PartyID = party.PartyID;
+    stat = fadress.Insert();
+    if( not stat )
+      ErrText = "Ошибка вставки адреса банка " + party.Name;
+    end;
+  end;
+  return stat;
+END;
+
+/********************************************************************/
+/* Вставка (или обновление) способа связи субъекта                         */
+/********************************************************************/
+PRIVATE MACRO InsertContact( party, contact:TRecHandler ):bool
+  var stat:bool = FALSE;
+  ContactKey.KeyNum = 0;
+  ContactKey.rec.RecID = contact.RecID;
+  if( ContactKey.GetEQ() )
+    Copy( ContactKey, contact );
+    ContactKey.rec.PartyID = party.PartyID;
+    stat = ContactKey.Update();
+    if( not stat )
+      ErrText = "Ошибка обновления способа связи банка " + party.Name;
+    end;
+  else
+    Copy( ContactKey, contact );
+    ContactKey.rec.PartyID = party.PartyID;
+    stat = ContactKey.Insert();
+    if( not stat )
+      ErrText = "Ошибка вставки способа связи банка " + party.Name;
+    end;
+  end;
+  return stat;
+END;
+/******************************************************************************
+   Определение наличия записи в файлах БД, позиционирование
+******************************************************************************/
+MACRO BrowseFiles( CodeKind, Code )
+
+   /* 1. Ищем запись с кодом BIC в файле PartCode. Если запись не найдена, то
+         придется вводить информацию во все 4 файла БД.
+   */
+   ObjCode.CodeKind = CodeKind;
+   ObjCode.Code = Code;
+   ObjCode.ObjectType = OBJTYPE_PARTY;
+
+   if ( not GetEQ( ObjCode ) )
+      PartCode_exist = 0;
+      PartyOwn_exist = 0;
+      Party_exist    = 0;
+      BankDprt_exist = 0;
+   else
+      PartCode_exist = 1;
+
+      /* Запись с данным БИК найдена. Внутренний код
+         контрагента - PartCode.PartyID.
+
+         Позиционируемся на записи в party.dbt
+      */
+
+      Party.PartyID = ObjCode.ObjectID;
+      if ( not GetEQ( Party ) )
+         Party_exist = 0;
+      else
+         Party_exist = 1;
+      end;
+
+      /*  Позиционируемся на записи в partyown.dbt  */
+
+      PartyOwn.PartyID = ObjCode.ObjectID;
+      PartyOwn.PartyKind = PTK_BANK;
+
+      if ( not GetEQ( PartyOwn ) )
+          PartyOwn_exist = 0;
+      else
+          PartyOwn_exist = 1;
+      end;
+
+      /*  Позиционируемся на записи в bankdprt.dbt  */
+      BankDprt.PartyID = ObjCode.ObjectID;
+      if ( not GetEQ( BankDprt ) )
+          BankDprt_exist = 0;
+      else
+          BankDprt_exist = 1;
+      end;
+   end;
+END;
+
+/******************************************************************************
+******************************************************************************/
+macro NameByID (ID)
+    party.partyID = ID;
+    if ( GetEQ (party))
+       return party.Name;
+    end;
+    return "";
+end;
+
+/******************************************************************************
+******************************************************************************/
+private macro GetCodeKindName(codekind:integer)
+  var rs:object = execSQLselect("SELECT t_name FROM dobjkcode_dbt WHERE t_objecttype="+OBJTYPE_PARTY+" and t_codekind="+codekind+";");
+  if( rs AND rs.moveNext() )
+    return "\"" + rs.value(0) + "\"";
+  end;
+  return string(codekind);
+end;
+
+/******************************************************************************
+******************************************************************************/
+MACRO BrowseFilesKO( CodeKind, Code )
+
+   /* 1. Ищем запись с кодом BIC в файле PartCode. Если запись не найдена, то
+         придется вводить информацию во все 4 файла БД.
+   */
+   ObjCode.CodeKind = CodeKind;
+   ObjCode.Code = Code;
+   ObjCode.ObjectType = OBJTYPE_PARTY;
+
+
+   if ( not GetEQ( ObjCode ) )
+      PartCode_exist = 0;
+      PartyOwn_exist = 0;
+      Party_exist    = 0;
+      BankDprt_exist = 0;
+   else
+      PartCode_exist = 1;
+
+      /* Запись с данным БИК найдена. Внутренний код
+         контрагента - PartCode.PartyID.
+
+         Позиционируемся на записи в party.dbt
+      */
+
+      if (false and ( Code == {MFO_BANK} ))
+         Party_exist = 1;
+         Party.PartyID = 0;
+      else
+         Party.PartyID = ObjCode.ObjectID;
+         if ( not GetEQ( Party ) )
+            Party_exist = 0;
+         else
+            Party_exist = 1;
+         end;
+      end;
+   end;
+
+end;
+
+
+/* получить следующее значение SettAcc.Order */
+macro GetSettAccOrder(PartyID)
+  var order;
+  fsettacc.Clear;
+  
+  fsettacc.keynum = 4;
+  fSettAcc.rec.PartyID           = PartyID;
+  fsettacc.rec.order             = 32767;
+  fsettacc.addfilter("t_partyid = "+partyid);
+
+  if(fsettacc.getle and (fSettAcc.rec.PartyID == PartyID))
+    order = fsettacc.rec.order + 1;
+  else
+    order = 1;
+  end;
+  fsettacc.dropfilter;
+  fsettacc.keynum = 3;
+  
+  return order;
+end;
+
+/******************************************************************************
+   Удаляем счета прямых корреспондентов на этого участника
+******************************************************************************/
+macro ClearAccKO(BankID,PartyID);
+var stat=true;
+
+  fsettacc.Clear;
+  
+  fsettacc.rec.PartyID = PartyID;
+  fsettacc.rec.FIKind = 1;
+  fsettacc.rec.FIID = 0;
+  fsettacc.rec.order = -32767;
+
+  fsettacc.addfilter("t_partyid = "+partyid+" and t_fikind = 1 and t_fiid = 0 and t_shortname <> chr(1)");
+
+  if(fsettacc.getge)
+/*println("BankID = "+ПолучитьКодСубъекта(BankID,14)+" "+BankID+" PartyID = "+ПолучитьКодСубъекта(PartyID,14)+" "+PartyID);
+println("BankID = "+settacc.BankID+" PartyID = "+settacc.PartyID);
+*/
+    while( stat  and 
+         (fsettacc.rec.PartyID == PartyID ) and
+           (fsettacc.rec.FIKind == 1) and
+           (fsettacc.rec.FIID == 0) )
+/*println("while BankID = "+settacc.BankID+" PartyID = "+settacc.PartyID);*/
+     if((fsettacc.rec.BankID == BankID) 
+        and (fsettacc.rec.ShortName == "Прямой участник")
+       ) 
+         
+  [| ##| ###########/######################### | ################################ | ##############################################################################]
+  ("УД",fSettAcc.rec.BankCode,fsettacc.rec.Account,fsettacc.rec.RecName,"Удален счет "+fSettAcc.rec.ShortName );         
+
+      ClearRecord(ptacc_ls);
+      ptacc_ls.SettAccID = fSettAcc.rec.SettAccID;
+      while(getge(ptacc_ls) and 
+            (ptacc_ls.SettAccID == fSettAcc.rec.SettAccID))
+        if ( not delete(ptacc_ls)) MsgBox ( "Ошибка удаления записи в ptacc_ls"); Exit(1); end;
+      end;
+      
+      if ( not fsettacc.delete ) MsgBox ( "Ошибка удаления записи в SettAcc"); Exit(1); end;
+
+      fsettacc.rec.PartyID = PartyID;
+      fsettacc.rec.FIKind = 1;
+      fsettacc.rec.FIID = 0;
+      fsettacc.rec.order = -32767;
+      stat = fsettacc.getge;
+     else
+       stat = fsettacc.next;
+     end; /* if*/
+    end;
+  end;
+  fsettacc.dropfilter;
+/*println("end BankID = "+settacc.BankID+" PartyID = "+settacc.PartyID);*/
+end;
+
+/******************************************************************************
+   Удаляем счета прямых корреспондентов на участников-несубъектов
+******************************************************************************/
+macro ClearAccKONonParty();
+var stat=true, i = 0;
+
+  fsettacc.Clear;
+  
+  fsettacc.rec.PartyID = -1;
+  fsettacc.rec.FIKind = 1;
+  fsettacc.rec.FIID = 0;
+  fsettacc.rec.order = -32767;
+
+  fsettacc.addfilter("t_partyid = -1 and t_fikind = 1 and t_fiid = 0 and t_shortname <> chr(1)");
+
+  if(fsettacc.getge)
+/*println("BankID = "+ПолучитьКодСубъекта(BankID,14)+" "+BankID+" PartyID = "+ПолучитьКодСубъекта(PartyID,14)+" "+PartyID);
+println("BankID = "+settacc.BankID+" PartyID = "+settacc.PartyID);
+*/
+    while( stat  and 
+         (fsettacc.rec.PartyID == -1 ) and
+           (fsettacc.rec.FIKind == 1) and
+           (fsettacc.rec.FIID == 0) )
+/*println("while BankID = "+settacc.BankID+" PartyID = "+settacc.PartyID);*/
+     if(fsettacc.rec.ShortName == "Прямой участник")
+         
+  [| ##| ###########/######################### | ################################ | ##############################################################################]
+  ("УД",fSettAcc.rec.BankCode,fsettacc.rec.Account,fsettacc.rec.RecName,"Удален счет (без субъекта) "+fSettAcc.rec.ShortName );         
+
+      ClearRecord(ptacc_ls);
+      ptacc_ls.SettAccID = fSettAcc.rec.SettAccID;
+      while(getge(ptacc_ls) and 
+            (ptacc_ls.SettAccID == fSettAcc.rec.SettAccID))
+        if ( not delete(ptacc_ls)) MsgBox ( "Ошибка удаления записи в ptacc_ls"); Exit(1); end;
+      end;
+      
+      if ( not fsettacc.delete ) MsgBox ( "Ошибка удаления записи в SettAcc"); Exit(1); end;
+
+      fsettacc.rec.PartyID = -1;
+      fsettacc.rec.FIKind = 1;
+      fsettacc.rec.FIID = 0;
+      fsettacc.rec.order = -32767;
+      stat = fsettacc.getge;
+      i = i + 1;
+      message("Удалено счетов прямых участников-несубъектов: "+i);
+     else
+       stat = fsettacc.next;
+     end; /* if*/
+    end;
+  end;
+  fsettacc.dropfilter;
+/*println("end BankID = "+settacc.BankID+" PartyID = "+settacc.PartyID);*/
+end;
+
+/* добавить СПИ прямого участника */
+/* PartyID может быть -1 */
+macro AddSettAccKO(BankID, PartyID)
+
+  var order;
+
+  if(PartyID != -1)
+    ClearAccKO( BankID, PartyID );
+  end;
+
+  order = GetSettAccOrder(PartyID);
+
+  ClearRecord ( SettAcc );
+
+  SettAcc.PartyID           = PartyID;
+  SettAcc.BankID            = BankID;
+  SettAcc.SettAccID         = 0;
+  SettAcc.FIKind            = 1;
+  SettAcc.FIID              = 0;
+  SettAcc.Chapter           = 1; /* VD был 0 */
+  SettAcc.Account           = Trim(Источник.LORO);
+  SettAcc.INN               = "";
+  SettAcc.CodeKind          = 3;
+  SettAcc.Code              = BIC;
+  SettAcc.RecName           = Trim(Источник.name1);
+  if(SettAcc.RecName=="")
+    SettAcc.RecName           = Trim(Источник.name2);
+  end;
+  SettAcc.BankCodeKind      = 3;
+  SettAcc.BankCode          = BIC_KO;
+  SettAcc.BankName          = NameByID(SettAcc.BankID);
+  SettAcc.Description       = "Запись создана автоматически "+{curdate};
+  SettAcc.Order             = order;
+  SettAcc.ShortName         = "Прямой участник";
+
+  if ( not GetEQ (SettAcc))
+     if ( not Insert( SettAcc ) ) AbortTrn(); end;
+     /* создаем привязку в список общих внешних счетов Бухгалтерии банка */
+     ClearRecord(ptacc_ls);
+
+     ptacc_ls.ServiceKind = 500;
+     ptacc_ls.Oper        = 0;
+     ptacc_ls.PartyID     = SettAcc.PartyID;
+     ptacc_ls.BankID      = SettAcc.BankID;
+     ptacc_ls.SettAccID   = SettAcc.SettAccID;
+     ptacc_ls.CodeKind    = SettAcc.BankCodeKind;
+
+     if( not getEQ(ptacc_ls) )
+       if ( not Insert( ptacc_ls ) )
+         ErrText = "Не вставилась привязка МФР прямого участника к операционистам Бухгалтерии банка";
+         AbortTrn();
+       end;
+     end;
+   end;
+
+  [| ##| ###########/######################### | ################################ | ##############################################################################]
+   ("",SettAcc.BankCode,SettAcc.Account,SettAcc.RecName,"Внесен корсчет в "+SettAcc.BankName );
+end;
+
+/******************************************************************************
+******************************************************************************/
+MACRO UpdateBankKO
+  var non_party = false;
+  var Address:TRecHandler = NULL;
+  var AddressExists:bool;
+  var Country:TRecHandler = NULL;
+  ErrText = "";
+  Superior = -1;
+  SelfBIC = 0; /* Признак того, что банк имеет собственный БИК */
+
+  Priznak = Trim(Источник.RR);
+  ClirCode = Trim(Источник.KODUH);
+  BIC = Trim(Источник.NEWNUM);     /* корреспондент, которому открыт счет */
+  BIC_KO = Trim(Источник.NEWNUM1); /* ОСБ, где открыт счет */
+
+/* VD !!! Убрал, потому что работает только для Северного банка СБ РФ
+  if (BIC_KO == {MFO_BANK} )                
+     ClirCode ="77"+SubStr(Источник.LORO,17,4);
+  end;
+*/
+
+  if (Priznak != "11") 
+    ErrText = "Банк не является участником расчетов";
+    return;
+  end;
+  if(ClirCode != "")
+    ClirCode = ClirCode+"0000";
+  end;
+                     
+  /* Считаем, что банк имеет собственный БИК, если выполнен любой из пунктов:
+     1. поле Источник.PRIZ = "1"
+     2. является террбанком(все цифры кроме первых двух в поле Источник.KODUH являются 0)
+  */
+  if (BIC != "") SelfBIC = 1;
+  end;
+
+  if((BIC == "") and (ClirCode == ""))
+    non_party = true;
+  end;
+
+  if(SelfBIC != 0) /* Есть собственный БИК */
+    BrowseFiles( PTCK_BIC, BIC );
+  elif( ClirCode != "" )
+    BrowseFiles( PTCK_CLIRING, ClirCode );
+  end;
+
+/* Меняем всегда */
+  if ( ОбновлятьВсегда )
+     UpdateParty = 1;
+  end;
+
+  if( not non_party ) /* вносим в party прямого участника, только если него есть какой-то код */
+    /* Новая запись или внесены изменения */
+    if( (Party_exist == 0) )
+      if( Party_exist == 0)
+         ClearRecord( Party );
+         Party.PartyID = 0;     /* Автоинкрементный ключ */
+         Party.LegalForm = 1;   /* Организация */
+      end;
+
+      Party.Change_DatePrev = Party.Change_Date;
+      Party.Change_Date     = {curdate};
+      Party.Name = trim (Источник.Name2);
+      Party.ShortName = Trim( Источник.name2 );   /* сокращенное название банка    */
+  /*    Party.Locked = UNSET_CHAR;*/
+
+      if ( Party_exist == 0 )
+         if ( not ВставитьСубъекта( Party ) )
+              ErrText = "Ошибка вставки субъекта";
+              AbortTrn();
+         end;
+      end;
+    else
+  /*    Party.Locked = UNSET_CHAR;*/
+      if ( not Update( Party ) ) AbortTrn(); end;
+    end;
+
+
+    /* Вставить или обновить адрес (в данном случае есть только страна) */
+    Address = TRecHandler( "adress.dbt" );
+    Country = TRecHandler( "country.dbt" );
+    AddressExists = FindAddress(Party, 1, Address);
+    FindCountryByNum( Источник.Code, Country );
+    if( (not AddressExists) OR 
+        (Country.rec.CodeLat3 AND (Address.rec.Country != Country.rec.CodeLat3)) )
+      Address.rec.Type    = 1;                    /* тип - юридический */
+      Address.rec.Country = Country.rec.CodeLat3; /* страна            */
+      if( not InsertAddress( Party, Address ) )
+        AbortTrn();
+      end;
+    end;
+
+    BankID_KO = Party.PartyID;
+    BankName_KO = Party.Name;
+
+    /* Заполняем partcode.dbt только в случае, если запись не найдена
+       или нет кода клиринга.
+    */
+
+    /* Вставляем БИК */
+
+    if(SelfBIC != 0) /* Есть собственный БИК */
+      if(PartCode_exist == 0) /* Нет БИКа */
+        ErrText = "Не найден БИК";
+        AbortTrn;
+      end;
+    end;
+
+    /* Вставляем код контрагента */
+    ObjCode_Kind.CodeKind = PTCK_CONTR;
+    ObjCode_Kind.ObjectID= Party.PartyID;
+    ObjCode_Kind.ObjectType = OBJTYPE_PARTY;
+    if ( not GetEQ( ObjCode_Kind ) )
+      ClearRecord( ObjCode );
+      ObjCode.ObjectID  = Party.PartyID;
+      ObjCode.CodeKind = PTCK_CONTR;
+      ObjCode.Code     = "КОРРСБ_" + ClirCode;
+      ObjCode.ObjectType = OBJTYPE_PARTY;
+      if ( not Insert( ObjCode ) ) AbortTrn(); end;
+    end;
+
+
+    /* Код клиринга вставляем, если есть собственный БИК или не найден код клиринга */
+    if( ((SelfBIC != 0) or ((PartCode_exist == 0))) and (ClirCode != "") )
+      if(SelfBIC != 0)
+        ObjCode_Kind.CodeKind = PTCK_CLIRING;     /* Ищем код клиринга */
+        ObjCode_Kind.ObjectID = Party.PartyID;
+        ObjCode_Kind.ObjectType = OBJTYPE_PARTY;
+        if( GetEQ( ObjCode_Kind ) ) PartCode_exist = 1;
+        else                         PartCode_exist = 0;
+        end;
+      end;
+
+      if(PartCode_exist == 0)
+        ClearRecord( ObjCode );
+        ObjCode.ObjectID   = Party.PartyID;
+        ObjCode.CodeKind = PTCK_CLIRING;
+        ObjCode.Code     = ClirCode  ;
+        ObjCode.ObjectType = OBJTYPE_PARTY;
+        if ( not Insert( ObjCode ) ) AbortTrn(); end;
+      else
+        ObjCode_Kind.Code = ClirCode;
+        if ( not Update( ObjCode_Kind ) ) AbortTrn(); end;
+      end;
+    end;
+
+  /*  Заполняем partyown.dbt только в случае, если запись не найдена  */
+
+    if ( PartyOwn_exist == 0 )
+       ClearRecord( PartyOwn );
+       PartyOwn.PartyID = Party.PartyID;
+       PartyOwn.PartyKind = PTK_BANK;  /*  Контрагент является банком  */
+       if ( not Insert ( PartyOwn ) ) AbortTrn; end;
+    end;
+
+  /*  Заполняем файл BankDprt.dbt  */
+  /* только если новая запись или внесены изменения */
+
+    if( BankDprt_exist == 0 )   /*  новая запись!  */
+      ClearRecord( BankDprt );
+      BankDprt.PartyID = Party.PartyID;
+      BankDprt.Blnc_Rcc = "  0";
+      BankDprt.CheckAlg  = 1;             /* По умолчанию проверка ключа */
+      BankDprt.Lock      = UNSET_CHAR;
+    end;
+    BankDprt.CorAcc = Trim( Источник.LORO ); /* Корсчет */
+    if ( BankDprt_exist == 0 )
+      if ( not Insert( BankDprt ) ) AbortTrn(); end;
+    else
+      BankDprt.Lock       = UNSET_CHAR;
+      if ( not update( BankDprt ) ) AbortTrn(); end;
+    end;
+  else /* if( not non_party ) */
+    BankID_KO = -1;
+  end; /* if( not non_party ) */
+
+  BrowseFilesKO( PTCK_BIC, BIC_KO ); /* становимся в party на ОСБ */
+
+  if(( PartCode_exist == 1) and ( Party_exist == 1 ))  /* Найден корреспондент */
+    AddSettAccKO(Party.PartyID, BankID_KO);
+  else
+    ErrText = "Не найден банк с БИК " + BIC_KO;
+    AbortTrn();
+  end;
+END;
+
+/******************************************************************************
+   Удаляем все рублевые МФР на этого участника
+******************************************************************************/
+macro ClearAcc(BankID,PartyID);
+var NameP, NameA;
+var stat=true;
+
+  fsettacc.Clear;
+  
+  fsettacc.rec.PartyID = PartyID;
+  fsettacc.rec.FIKind = 1;
+  fsettacc.rec.FIID = 0;
+  fsettacc.rec.order = -32767;
+
+  fsettacc.addfilter("t_partyid = "+partyid+" and t_fikind = 1 and t_fiid = 0");
+
+  if(fsettacc.getge)
+/*println("BankID = "+ПолучитьКодСубъекта(BankID,14)+" "+BankID+" PartyID = "+ПолучитьКодСубъекта(PartyID,14)+" "+PartyID);
+println("BankID = "+settacc.BankID+" PartyID = "+settacc.PartyID);
+*/
+    while( stat  and 
+         (fsettacc.rec.PartyID == PartyID ) and
+           (fsettacc.rec.FIKind == 1) and
+           (fsettacc.rec.FIID == 0) )
+/*println("while BankID = "+settacc.BankID+" PartyID = "+settacc.PartyID);*/
+     if((fsettacc.rec.BankID == BankID) 
+        and ((substr(fsettacc.rec.Account,1,5) == "30301")
+             or (substr(fsettacc.rec.Account,1,5) == "30302")
+            )
+       ) 
+/* чтобы не засорять лог 
+      if(substr(fsettacc.rec.Account,1,5) == "30301")
+        NameP = fsettacc.rec.Account;
+        NameA = "";
+      else /*if(substr(settacc.Account,1,5) == "30302")*/
+        NameA = fsettacc.rec.Account;
+        NameP = "";
+      end;
+         
+  [|###|   ####   |    ####   | #################### | #################### | ############################################################################## |]
+  ("УД",ПолучитьКодСубъекта(fSettAcc.rec.BankID,14),ПолучитьКодСубъекта(fSettAcc.rec.PartyID,14),NameA,NameP,"Удален счет "+fSettAcc.rec.ShortName );         
+*/
+
+      ClearRecord(ptacc_ls);
+      ptacc_ls.SettAccID = fSettAcc.rec.SettAccID;
+      while(getge(ptacc_ls) and 
+            (ptacc_ls.SettAccID == fSettAcc.rec.SettAccID))
+        if ( not delete(ptacc_ls)) MsgBox ( "Ошибка удаления записи в ptacc_ls"); Exit(1); end;
+      end;
+      
+      if ( not fsettacc.delete ) MsgBox ( "Ошибка удаления записи в SettAcc"); Exit(1); end;
+
+      fsettacc.rec.PartyID = PartyID;
+      fsettacc.rec.FIKind = 1;
+      fsettacc.rec.FIID = 0;
+      fsettacc.rec.order = -32767;
+      stat = fsettacc.getge;
+     else
+       stat = fsettacc.next;
+     end; /* if*/
+    end;
+  end;
+  fsettacc.dropfilter;
+/*println("end BankID = "+settacc.BankID+" PartyID = "+settacc.PartyID);*/
+end;
+
+
+/******************************************************************************
+******************************************************************************/
+MACRO UpdateBankSMFR
+var BankSMFR = Trim(Источник.IDENT_G), /* где открыт - головной ОСБ */
+  PartySMFR = Trim(Источник.IDENT_K), /* кому открыт - филиал */
+  AccountA = Trim(Источник.AMFR), /* активный МФР */
+  AccountP = Trim(Источник.PMFR), /* пассивный МФР - на него в голове зачисляются деньги для филиала */
+  PartyID, BankID, order;
+  
+  ErrText = "";
+  
+  ObjCode.CodeKind = PTCK_SMFR;
+  ObjCode.Code     = BankSMFR;
+  ObjCode.ObjectType = OBJTYPE_PARTY;
+
+  if ( not GetEQ( ObjCode ) )
+    ErrText = "Не найден банк с СМФР "+BankSMFR;
+    AbortTrn(); 
+  end;
+  
+  BankID = ObjCode.ObjectID;
+  
+  ObjCode.Code     = PartySMFR;
+
+  if ( not GetEQ( ObjCode ) )
+    ErrText = "Не найден банк с СМФР "+PartySMFR;
+    AbortTrn(); 
+  end;
+
+  PartyID           = ObjCode.ObjectID;
+
+  ClearAcc(BankID, PartyID); /* очистка settacc, ptacc_ls с ранее закаченными МФР */
+
+  order = GetSettAccOrder(PartyID);
+  
+  SettAcc.PartyID           = PartyID;
+  SettAcc.BankId            = BankID;
+  SettAcc.SettAccID         = 0;
+  SettAcc.FIKind            = 1;
+  SettAcc.FIID              = 0;
+  SettAcc.Chapter           = 1; /* VD был 0 */
+  SettAcc.Account           = AccountA;
+  SettAcc.INN               = "";
+  SettAcc.RecName           = NameByID(SettAcc.PartyID);
+  SettAcc.BankCodeKind      = 3;
+  SettAcc.BankCode          = ПолучитьКодСубъекта(SettAcc.BankID, SettAcc.BankCodeKind);
+  if(SettAcc.BankCode=="")
+    SettAcc.BankCodeKind      = PTCK_CLIRING;
+    SettAcc.BankCode          = ПолучитьКодСубъекта(SettAcc.BankID, SettAcc.BankCodeKind);
+  end;
+  SettAcc.BankName          = NameByID(SettAcc.BankID);
+  SettAcc.CodeKind          = PTCK_OSB;
+  SettAcc.Code              = ПолучитьКодСубъекта(SettAcc.PartyID, PTCK_OSB);
+  if(SettAcc.Code=="")
+    SettAcc.CodeKind      = PTCK_CLIRING;
+    SettAcc.Code          = ПолучитьКодСубъекта(SettAcc.PartyID, SettAcc.CodeKind);
+  end;
+  SettAcc.Description       = "Дата открытия (переключевания) счета МФР "+Trim(Источник.DT_ON)+
+                              ". Запись создана автоматически "+{curdate};
+  SettAcc.Order             = order /*abs(SettAcc.PartyID+SettAcc.BankID)*/;
+  SettAcc.ShortName         = "Активный МФР";
+
+  if ( not Insert( SettAcc ) ) 
+    ErrText = "Не вставился активный МФР "+SettAcc.Order+" "+btrerr+" "+status(btrerr);
+    AbortTrn(); 
+  end;
+  
+  /* создаем привязку в список общих внешних счетов Бухгалтерии банка */
+  
+  ClearRecord(ptacc_ls);
+
+  ptacc_ls.ServiceKind = 500; //PTSK_SETTACC_MEMORDER
+  ptacc_ls.Oper        = 0;
+  ptacc_ls.PartyID     = SettAcc.PartyID;
+  ptacc_ls.BankID      = SettAcc.BankID;
+  ptacc_ls.SettAccID   = SettAcc.SettAccID;
+  ptacc_ls.CodeKind    = SettAcc.BankCodeKind;
+
+  if ( not Insert( ptacc_ls ) )
+    ErrText = "Не вставилась привязка активного МФР к операционистам Бухгалтерии банка";
+    AbortTrn();
+  end;
+
+  ptacc_ls.ServiceKind = 3; //PTSK_PAY
+  if ( not Insert( ptacc_ls ) )
+    ErrText = "Не вставилась привязка активного МФР к операционистам РКО";
+    AbortTrn();
+  end;
+
+
+  SettAcc.SettAccID         = 0;
+  SettAcc.Account           = AccountP;
+  SettAcc.ShortName         = "Пассивный МФР";
+  SettAcc.Order             = SettAcc.Order + 1;
+
+  if ( not Insert( SettAcc ) )
+    ErrText = "Не вставился пассивный МФР "+SettAcc.Order+" "+btrerr+" "+status(btrerr);
+    AbortTrn();
+  end;
+  
+  /* создаем привязку в список общих внешних счетов Бухгалтерии банка */
+  
+  ptacc_ls.SettAccID = SettAcc.SettAccID;
+
+  if ( not Insert( ptacc_ls ) )
+    ErrText = "Не вставилась привязка пассивного МФР к операционистам Бухгалтерии банка";
+    AbortTrn();
+  end;
+
+END;
+
+/******************************************************************************
+******************************************************************************/
+MACRO UpdateBankPR
+  ErrText = "";
+  Superior = -1;
+  SelfBIC = 0; /* Признак того, что банк имеет собственный БИК */
+
+  ClirCode = Trim(Источник.KODUH_U)+"0000";
+  SMFR_Code = Trim(Источник.IDENT_U);
+
+  BrowseFiles( PTCK_CLIRING, ClirCode );
+
+  /* Новая запись или внесены изменения */
+  if( (Party_exist == 0) )
+    if( Party_exist == 0)
+       ClearRecord( Party );
+       Party.PartyID = 0;     /* Автоинкрементный ключ */
+       Party.LegalForm = 1;   /* Организация */
+    end;
+
+    Party.Change_DatePrev = Party.Change_Date;
+    Party.Change_Date     = {curdate};
+ /*   Party.Locked = SET_CHAR;*/
+
+    if ( Party_exist == 0 )
+       if ( not ВставитьСубъекта( Party ) )
+            ErrText = "Ошибка вставки субъекта";
+            AbortTrn();
+       end;
+    end;
+  end;
+
+
+  /* Заполняем partcode.dbt только в случае, если запись не найдена
+     или нет кода клиринга.
+  */
+
+  /* Вставляем код контрагента */
+  ObjCode_Kind.CodeKind = PTCK_CONTR;
+  ObjCode_Kind.ObjectID  = Party.PartyID;
+  ObjCode_Kind.ObjectType = OBJTYPE_PARTY;
+  if ( not GetEQ( ObjCode_Kind ) )
+    ClearRecord( ObjCode );
+    ObjCode.ObjectID  = Party.PartyID;
+    ObjCode.CodeKind = PTCK_CONTR;
+    ObjCode.Code     = "КЛИР_" + ClirCode;
+    ObjCode.ObjectType = OBJTYPE_PARTY;
+    if ( not Insert( ObjCode ) ) AbortTrn(); end;
+  end;
+
+  /* Вставляем код СМФР СБ */
+  if(SMFR_Code != "")
+    ObjCode_Kind.CodeKind = PTCK_SMFR;
+    ObjCode_Kind.ObjectID  = Party.PartyID;
+    ObjCode_Kind.ObjectType = OBJTYPE_PARTY;
+    if ( not GetEQ( ObjCode_Kind ) )
+      ClearRecord( ObjCode );
+      ObjCode.ObjectID  = Party.PartyID;
+      ObjCode.CodeKind = PTCK_SMFR;
+      ObjCode.Code     = SMFR_Code;
+      ObjCode.ObjectType = OBJTYPE_PARTY;
+      if ( not Insert( ObjCode ) ) AbortTrn(); end;
+    end;
+  end;
+
+  /* Код клиринга вставляем, если есть собственный БИК или не найден код клиринга */
+  if( PartCode_exist == 0 )
+    ObjCode_Kind.CodeKind = PTCK_CLIRING;     /* Ищем код клиринга */
+    ObjCode_Kind.ObjectID  = Party.PartyID;
+    ObjCode_Kind.ObjectType = OBJTYPE_PARTY;
+    if( GetEQ( ObjCode_Kind ) ) PartCode_exist = 1;
+    else                         PartCode_exist = 0;
+    end;
+
+    if(PartCode_exist == 0)
+      ClearRecord( ObjCode );
+      ObjCode.ObjectID   = Party.PartyID;
+      ObjCode.CodeKind = PTCK_CLIRING;
+      ObjCode.Code     = ClirCode  ;
+      ObjCode.ObjectType = OBJTYPE_PARTY;
+      if ( not Insert( ObjCode ) ) AbortTrn(); end;
+    end;
+  end;
+
+  /*  Заполняем partyown.dbt только в случае, если запись не найдена  */
+
+  if ( PartyOwn_exist == 0 )
+     ClearRecord( PartyOwn );
+     PartyOwn.PartyID = Party.PartyID;
+     PartyOwn.PartyKind = PTK_BANK;  /*  Контрагент является банком  */
+     if ( not Insert ( PartyOwn ) ) AbortTrn; end;
+  end;
+
+  /*  Заполняем файл BankDprt.dbt  */
+  /* только если новая запись или внесены изменения */
+
+  if( (BankDprt_exist == 0) )
+    if( BankDprt_exist == 0 )   /*  новая запись!  */
+      ClearRecord( BankDprt );
+      BankDprt.PartyID = Party.PartyID;
+      BankDprt.Blnc_Rcc = "  0";
+      BankDprt.CheckAlg  = 1;             /* По умолчанию проверка ключа */
+      BankDprt.Lock      = UNSET_CHAR;
+    end;
+    if ( BankDprt_exist == 0 )
+      if ( not Insert( BankDprt ) ) AbortTrn(); end;
+    else
+      BankDprt.Lock       = UNSET_CHAR;
+      if ( not update( BankDprt ) ) AbortTrn(); end;
+    end;
+  end;
+END;
+
+
+/******************************************************************************
+******************************************************************************/
+MACRO LockAllBankClir
+   VAR str, iii = 0, ok = true;
+   fobjcode.rec.CodeKind = PTCK_CLIRING;
+   fobjcode.rec.ObjectType = OBJTYPE_PARTY;
+   fobjcode.rec.Code = "";
+   fobjcode.addfilter("t_CodeKind = "+PTCK_CLIRING+" and t_ObjectType = "+OBJTYPE_PARTY);
+
+   InitProgress ( fobjcode.NRecords(), "Блокировка банков по кодам клиринга","Блокировка банков по кодам клиринга");
+
+   if(fobjcode.getge)
+     while ( ok and (fobjcode.rec.CodeKind == PTCK_CLIRING) and (fobjcode.rec.ObjectType == OBJTYPE_PARTY ) )
+         iii = iii + 1;
+         UseProgress (iii);
+         party.partyid    = fobjcode.rec.objectid;
+         BankDprt.PartyID = party.PartyID;
+         if(geteq(party) and GetEQ (BankDprt))
+
+           str = substr (fobjCode.rec.Code, 3, 4 ) ;
+           if (not (( str == "0000" ) or ( str == "0001" ) or ( str == "0002" )or ( str == "0003" ) ))
+              Party.Locked  = UNSET_CHAR;
+              BankDprt.Lock = SET_CHAR;
+              if ( not update (party))    MsgBox ( "Ошибка обновления записи в Party.dbt"); Exit(1); end;
+              if ( not update (BankDprt)) MsgBox ( "Ошибка обновления записи в BankDprt"); Exit(1); end;
+           end;
+
+         end;
+         ok = fobjcode.next;
+     end;
+   end;
+   RemProgress;
+   fobjcode.dropfilter;
+END;
+
+
+/******************************************************************************
+******************************************************************************/
+MACRO ClearPR
+   VAR str, iii = 0;
+    rewind ( ObjCode );
+    InitProgress ( NRecords (ObjCode), "Удаление правопреемников","Удаление правопреемников");
+    while ( next (ObjCode))
+        iii = iii + 1;
+        UseProgress (iii);
+        if ( (ObjCode.CodeKind == 102) and (ObjCode.ObjectType == OBJTYPE_PARTY))
+           if ( not delete (ObjCode)) MsgBox ("Не могу удалить запись в partcode.dbt"); Exit(1); end;
+        end;
+    end;
+    RemProgress;
+END;
+
+
+
+/******************************************************************************
+ Обработка по файлу sbik.dbf
+******************************************************************************/
+MACRO UpdateBank
+
+  var str;
+  var KindDepart;
+  var rs:object = sbik_rset;
+  var Address:TRecHandler = NULL;
+  
+  ErrText = "";
+  Superior = -1;
+  SelfBIC = 0; /* Признак того, что банк имеет собственный БИК */
+
+  Priznak = Trim(rs.value("t_PRIZ"));
+  ClirCode = Trim(rs.value("t_KODUH")) ;
+  BIC = Trim(rs.value("t_NEWNUM"));
+  SMFR_Code = Trim(rs.value("t_IDENT"));
+
+  if(ClirCode == "")
+      ErrText = "Не задан код клиринга";
+      AbortTrn;
+  end;
+
+  ClirCode = Trim(rs.value("t_KODUH")) + "0000";
+  
+  /* Считаем, что банк имеет собственный БИК, если выполнен любой из пунктов:
+     1. поле Источник.PRIZ = "1"
+     2. является террбанком(все цифры кроме первых двух в поле Источник.KODUH являются 0)
+  */
+  var pzn:string = Trim(rs.value("t_PZN"));
+  if(Priznak == "1") SelfBIC = 1;
+  elif ( (pzn != "32") and (pzn != "22") and (pzn != "37"))
+      if ( Trim(rs.value("t_NEWNUM")) != "" ) SelfBIC = 1; end;
+  elif(SubStr(ClirCode,3,4) == "0000") SelfBIC = 1;
+  end;
+
+  /* Отделение СБ */
+  if(pzn == "32")
+    if(Priznak == "0") /* нет собственного БИКа - задан БИК вышестоящего органа*/
+      ObjCode.CodeKind = PTCK_BIC;
+      ObjCode.Code = BIC;
+      ObjCode.ObjectType = OBJTYPE_PARTY;
+      if( not GetEQ( ObjCode )  )
+        ErrText = "Не найден территориальный банк по БИК";
+        AbortTrn;
+      else
+        Superior = ObjCode.ObjectID;
+      end;
+    else /* задан собственный БИК - ищем вышестоящую организацию по коду клиринга */
+      ObjCode.CodeKind = PTCK_CLIRING;
+      ObjCode.Code = SubStr(ClirCode,1,2) + "00000000";
+      ObjCode.ObjectType = OBJTYPE_PARTY;
+      if ( not GetEQ( ObjCode ) )
+        ErrText = "Не найден территориальный банк по коду клиринга";
+        AbortTrn;
+      else
+        Superior = ObjCode.ObjectID;
+      end;
+    end;
+  end;
+
+  if(SelfBIC != 0) /* Есть собственный БИК */
+    BrowseFiles( PTCK_BIC, BIC );
+  else
+    BrowseFiles( PTCK_CLIRING, ClirCode );
+  end;
+
+  if(Party.Change_Date <= sqldate2date(rs.value("t_DT_IZM"))) UpdateParty = 1;
+  else                                                        UpdateParty = 0;
+  end;
+
+/* Меняем всегда */
+  if ( ОбновлятьВсегда )
+     UpdateParty = 1;
+  end;
+
+  /* Новая запись или внесены изменения */
+  if( (Party_exist == 0) or (UpdateParty != 0) )
+    if( Party_exist == 0)
+       ClearRecord( Party );
+       Party.PartyID = 0;     /* Автоинкрементный ключ */
+       Party.LegalForm = 1;   /* Организация */
+    end;
+
+    Party.Change_DatePrev = Party.Change_Date;
+    Party.Change_Date     = {curdate};
+    Party.Name            = Trim( rs.value("t_namep") );
+    Party.UserField1      = Trim( rs.value("t_namep") );
+    Party.ShortName       = Trim( rs.value("t_namen") );   /* сокращенное название банка    */
+
+    
+    Party.OKPO            = Trim( rs.value("t_okpo" ) );   /* код ОКПО          */
+/*    Party.Locked = Lock_Bank;*/
+    /*art*//*if(Party.Superior == 0) Party.Superior = Superior;end;*/
+    Party.Superior = Superior;
+
+    if ( Party_exist == 0 )
+       if ( not ВставитьСубъекта( Party ) )
+            ErrText = "Ошибка вставки субъекта";
+            AbortTrn();
+       end;
+    else
+       if ( not Update( Party ) ) 
+            ErrText = "Ошибка обновления субъекта";
+            AbortTrn(); 
+       end;
+    end;
+
+    /* Вставить или обновить адрес */
+    Address = TRecHandler( "adress.dbt" );
+    FindAddress(Party, 1, Address);
+    Address.rec.Type        = 1;                             /* тип - юридический */
+    Address.rec.Country     = "RUS";                         /* страна - Россия   */
+    Address.rec.Adress      = Trim( rs.value("t_adr"  ) );   /* почтовый адрес    */
+    Address.rec.PostIndex   = Trim( rs.value("t_ind"  ) );   /* почтовый индекс   */
+    Address.rec.CodePlace   = DefineCodePlace( rs.value("t_tnp"  ) );  /* вид населенного пункта   */
+    Address.rec.Place       = Trim( rs.value("t_nnp"  ) );   /* населенный пункт  */
+    //Address.rec.Telegraph   = Trim( rs.value("t_at1"  ) );   /* телеграф          */
+    //Address.rec.TelexNumber = Trim( rs.value("t_at2"  ) );   /* телекс            */
+    //Address.rec.PhoneNumber = Trim( rs.value("t_telef") );*/   /* телефон           */
+    if( not InsertAddress( Party, Address ) )
+      AbortTrn();
+    end;
+    
+    var Contact = TRecHandler( "contact.dbt" );
+    FindContact(Party, Address.rec.Type, CNTADR_PHONENUMBER, Contact);
+    Contact.rec.Value = Trim( rs.value("t_telef") );
+    InsertContact();
+    
+    FindContact(Party, Address.rec.Type, CNTADR_TELEGRAPH, Contact);
+    Contact.rec.Value = Trim( rs.value("t_at1") );
+    InsertContact();
+    
+    FindContact(Party, Address.rec.Type, CNTADR_TELEXNUMBER, Contact);
+    Contact.rec.Value = Trim( rs.value("t_at1") );
+    InsertContact();
+  end;
+
+  /* Заполняем partcode.dbt только в случае, если запись не найдена
+     или нет кода клиринга.
+  */
+
+  /* Вставляем БИК */
+  if(SelfBIC != 0) /* Есть собственный БИК */
+    if(PartCode_exist == 0) /* Вставляем запись */
+      ClearRecord( ObjCode );
+      ObjCode.ObjectID  = Party.PartyID;
+      ObjCode.CodeKind = PTCK_BIC;
+      ObjCode.Code     = BIC;
+      ObjCode.ObjectType = OBJTYPE_PARTY;
+      if ( not Insert( ObjCode ) ) 
+            ErrText = "Ошибка вставки БИКа";
+            AbortTrn(); 
+      end;
+    end;
+  end;
+
+  /* Вставляем код контрагента */
+  ObjCode_Kind.CodeKind = PTCK_CONTR;
+  ObjCode_Kind.ObjectID  = Party.PartyID;
+  ObjCode_Kind.ObjectType = OBJTYPE_PARTY;
+  if ( not GetEQ( ObjCode_Kind ) )
+    ClearRecord( ObjCode );
+    ObjCode.ObjectID  = Party.PartyID;
+    ObjCode.CodeKind = PTCK_CONTR;
+    ObjCode.Code     = "КЛИР_" + ClirCode;
+    ObjCode.ObjectType = OBJTYPE_PARTY;
+    if ( not Insert( ObjCode ) ) 
+        ErrText = "Ошибка вставки кода вида " + GetCodeKindName(PTCK_CONTR) + " для банка " + Party.Name;
+        AbortTrn();
+    end;
+  end;
+
+  /* VD !!! Вставляем Номер ОСБ */
+  str = TrimZero(substr(ClirCode,3,4));
+  if( (substr(ClirCode,1,2)!="00") 
+      and ( str != "") 
+      and ( str != "0000" ) 
+      and ( str != "0001" ) 
+      and ( str != "0002" ) 
+      and ( str != "0003" ) 
+    )
+
+    ObjCode_Kind.CodeKind = PTCK_OSB;
+    ObjCode_Kind.ObjectID  = Party.PartyID;
+    ObjCode_Kind.ObjectType = OBJTYPE_PARTY;
+    if ( not GetEQ( ObjCode_Kind ) )
+      ClearRecord( ObjCode );
+      ObjCode.ObjectID  = Party.PartyID;
+      ObjCode.CodeKind = PTCK_OSB;
+      ObjCode.Code     = TrimZero(substr(ClirCode,3,4));
+      ObjCode.ObjectType = OBJTYPE_PARTY;
+      if ( not Insert( ObjCode ) ) 
+          ErrText = "Ошибка вставки кода вида " + GetCodeKindName(PTCK_OSB) + " для банка " + Party.Name;
+          AbortTrn();
+      end;
+    end;
+  end;
+
+  /* Вставляем код СМФР СБ */
+  if(SMFR_Code != "")
+    ObjCode_Kind.CodeKind = PTCK_SMFR;
+    ObjCode_Kind.ObjectID  = Party.PartyID;
+    ObjCode_Kind.ObjectType = OBJTYPE_PARTY;
+    if ( not GetEQ( ObjCode_Kind ) )
+      ClearRecord( ObjCode );
+      ObjCode.ObjectID = Party.PartyID;
+      ObjCode.CodeKind = PTCK_SMFR;
+      ObjCode.Code     = SMFR_Code;
+      ObjCode.ObjectType = OBJTYPE_PARTY;
+      if ( not Insert( ObjCode ) ) 
+         ErrText = "Ошибка вставки кода вида " + GetCodeKindName(PTCK_SMFR) + " для банка " +Party.Name;
+         AbortTrn(); 
+      end;
+    elif(ObjCode_Kind.Code != SMFR_Code)
+      if( not delete(ObjCode_Kind) )
+        msgbox("Ошибка удаления кода СМФР "+ObjCode_Kind.Code);
+        Exit(1); 
+      end;
+      ClearRecord( ObjCode );
+      ObjCode.ObjectID  = Party.PartyID;
+      ObjCode.CodeKind = PTCK_SMFR;
+      ObjCode.Code     = SMFR_Code;
+      ObjCode.ObjectType = OBJTYPE_PARTY;
+      if ( not Insert( ObjCode ) ) 
+         ErrText = "Ошибка обновления кода вида " + GetCodeKindName(PTCK_SMFR) + " для банка " + Party.Name;
+         AbortTrn(); 
+      end;
+    end;
+  end;
+
+  /* Код клиринга вставляем, если есть собственный БИК или не найден код клиринга */
+  if( (SelfBIC != 0) or ((PartCode_exist == 0)) )
+    if(SelfBIC != 0)
+      ObjCode_Kind.CodeKind = PTCK_CLIRING;     /* Ищем код клиринга */
+      ObjCode_Kind.ObjectID  = Party.PartyID;
+      ObjCode_Kind.ObjectType = OBJTYPE_PARTY;
+      if( GetEQ( ObjCode_Kind ) ) PartCode_exist = 1;
+      else                         PartCode_exist = 0;
+      end;
+    end;
+
+    if(PartCode_exist == 0)
+      ClearRecord( ObjCode );
+      ObjCode.ObjectID   = Party.PartyID;
+      ObjCode.CodeKind = PTCK_CLIRING;
+      ObjCode.Code     = ClirCode;
+      ObjCode.ObjectType = OBJTYPE_PARTY;
+      if ( not Insert( ObjCode ) ) 
+            ErrText = "Ошибка вставки кода вида " + GetCodeKindName(PTCK_CLIRING) + " для банка " + Party.Name;
+            AbortTrn(); 
+      end;
+    else
+      ObjCode_Kind.Code = ClirCode;
+      if ( not Update( ObjCode_Kind ) ) 
+            ErrText = "Ошибка обновления кода вида " + GetCodeKindName(PTCK_CLIRING) + " для банка " + Party.Name;
+            AbortTrn(); 
+      end;
+    end;
+  end;
+
+  /*  Заполняем partyown.dbt только в случае, если запись не найдена  */
+
+  if ( PartyOwn_exist == 0 )
+     ClearRecord( PartyOwn );
+     PartyOwn.PartyID = Party.PartyID;
+     PartyOwn.PartyKind = PTK_BANK;  /*  Контрагент является банком  */
+     if ( not Insert ( PartyOwn ) ) 
+        ErrText = "Ошибка вставки принадлежности к банку";
+        AbortTrn; 
+     end;
+  end;
+
+  /*  Заполняем файл BankDprt.dbt  */
+  /* только если новая запись или внесены изменения */
+
+  if( (BankDprt_exist == 0) or (UpdateParty != 0) )
+    if( BankDprt_exist == 0 )   /*  новая запись!  */
+      ClearRecord( BankDprt );
+      BankDprt.PartyID = Party.PartyID;
+      BankDprt.Blnc_Rcc = "  0";
+      BankDprt.CheckAlg  = 1;             /* По умолчанию проверка ключа */
+    end;
+
+    BankDprt.CorAcc = Trim( rs.value("t_ksnp") ); /* Корсчет */
+    BankDprt.CheckData = BIC;           /* проверка идет по БИК банка  */
+
+    BankDprt.BIC_RCC    = Trim(rs.value("t_rkc"));               /* БИК РКЦ */
+    BankDprt.Region     = Trim(rs.value("t_rgn"));               /* Регион */
+    
+    /* Задаем вид участника расчетов */
+    KindDepart = Trim( Тип_банка( Trim(rs.value("t_pzn")) ) );
+    BankDprt.UERType = GetBankTypeByKindDepart( KindDepart );
+    
+    BankDprt.Place      = Trim(Тип_населенного_пункта( Trim(rs.value("t_tnp")) )); /* */
+    BankDprt.Lock       = Lock_Bankdprt(rs.value("t_REAL"));
+
+    if ( BankDprt_exist == 0 )
+      if ( not Insert( BankDprt ) ) 
+            ErrText = "Ошибка вставки свойств банка";
+            AbortTrn(); 
+      end;
+    else
+      if ( not Update( BankDprt ) ) 
+            ErrText = "Ошибка обновления свойств банка";
+            AbortTrn(); 
+      end;
+    end;
+
+  end;
+  /*Вставляем счет контрагента*/
+END;
+
+
+
+/******************************************************************************
+*******************************************************************************  
+*******************************************************************************  
+  НАЧАЛО ПРОГРАММЫ 
+*******************************************************************************  
+*******************************************************************************  
+******************************************************************************/
+
+/* первый прогон */
+private var Nrec      :integer = 0;
+private var recCount  :integer = 0;
+private var count_rset:object  = NULL;
+private var err_text  :string  = "";
+private var btr_stat  :integer,
+            btr_text  :string;
+
+/* Зальем весь справочник в таблицу ORACLE для сортировки */
+if( not dbf2ora(DbfFileName, "dsbik_dbf", "Индексация справочника отделений Сбербанка России", err_text) )
+  MsgBox( err_text );
+  Exit(1);
+end;
+
+/* блокируем все банки, имеющие код клиринга */
+LockAllBankClir;
+
+/* Получаем записи справочника, отсортированные по KODUH и их количество */
+sbik_rset  = execSQLselect("SELECT * FROM dsbik_dbf WHERE trim(t_KODUH) IS NOT NULL ORDER BY t_KODUH;");
+count_rset = execSQLselect("SELECT count(1) FROM dsbik_dbf WHERE trim(t_KODUH) IS NOT NULL;");
+if( count_rset.moveNext() )
+  recCount = int(count_rset.value(0));
+end;
+
+[--------------------------------------------------------------------------------------------------------------------------------------];
+[|Усп|код клиринга|              Название            |               Ошибка                                                           |];
+[|---+------------+----------------------------------+--------------------------------------------------------------------------------|];
+
+InitProgress(recCount, "", "ЗАГРУЗКА СПРАВОЧНИКА ОТДЕЛЕНИЙ СБЕРБАНКА РОССИИ");
+while( sbik_rset.moveNext()  )
+    ErrText = "";
+    BtrErr  = "";
+    if ( ProcessTrn( 0, "UpdateBank" , Party, ObjCode, PartyOwn, BankDprt ) )
+        if(ErrText == "")
+            ProcessedOK = ProcessedOK + 1;
+            success = "ОК";
+        else
+            ProcessedNoWorking = ProcessedNoWorking + 1;
+            success = " ";
+        end;
+    else
+        btr_stat = Status( btr_text );
+        ErrText = String( ErrText, " ", btr_stat, " ", btr_text );
+        ProcessedWithErrors = ProcessedWithErrors + 1;
+        success = "!!";
+    end;
+    [|###|############|################################# |############################################################################### |]
+    ( success,
+      trim(sbik_rset.value("t_KODUH")),
+      trim(sbik_rset.value("t_namep")),
+      ErrText );    
+    Nrec = Nrec + 1;
+    UseProgress(Nrec);
+    message( "Успешно обработано записей:", ProcessedNoWorking + ProcessedOK, ".  Ошибок:", ProcessedWithErrors );
+end;
+[----+-------------------------------------+-----------------------------------------------];
+[ ];
+[ Успешно обработано записей        : ###### ] ( ProcessedOK );
+[ Не подлежит обработке             : ###### ] ( ProcessedNoWorking );
+[ Ошибки ввода/корректировки записи : ###### ] ( ProcessedWithErrors );
+RemProgress();
+
+
+[ ];
+[ Загрузка справочника счетов МФР ];
+[-----------------------------------------------------------------------------------------------------------------------------------------------------------];
+[|Усп|ГДЕ открыт|КОМУ открыт|    Активный счет     |    Пассивный счет    |               Результат                                                        |];
+[|---+----------+-----------+----------------------+----------------------+--------------------------------------------------------------------------------|];
+
+NRec = 0;
+ProcessedOK = 0;
+ProcessedNoWorking = 0;
+ProcessedWithErrors = 0;
+if ( not open(Источник,DbfFileNameSMFR)) 
+    MsgBox ("Не могу открыть файл ",DbfFileNameSMFR); 
+    Exit(1); 
+end;
+InitProgress(NRecords(Источник), "", "ЗАГРУЗКА СПРАВОЧНИКА СЧЕТОВ МФР СБЕРБАНКА РОССИИ");
+ReWind(Источник);
+while(  next( Источник )  )
+/*
+  if((Источник.IDENT_G=="4510")or(Источник.IDENT_G=="4517")or(Источник.IDENT_G=="4518")
+     or(Источник.IDENT_G=="4529")or(Источник.IDENT_G=="4530")or(Источник.IDENT_G=="4531")or(Источник.IDENT_G=="4536")
+     or(Источник.IDENT_G=="6730")
+     or(Источник.IDENT_G=="6745"))
+*/     
+    ErrText = "";
+    if ( ProcessTrn( 0, "UpdateBankSMFR" , SettAcc, PTAcc_LS ) )
+        if(ErrText == "")
+          ProcessedOK = ProcessedOK + 1;
+          success = "Ок";
+        else
+          ProcessedNoWorking = ProcessedNoWorking + 1;
+          success = " ";
+        end;
+    else
+        ProcessedWithErrors = ProcessedWithErrors + 1;
+        success = "!!";
+    end;
+
+[|###|   ####   |    ####   | #################### | #################### | ############################################################################## |]
+    ( success,
+      Источник.IDENT_G,
+      Источник.IDENT_K,
+      Источник.AMFR,
+      Источник.PMFR,
+      ErrText );    
+/*  end;*/
+
+    Nrec = Nrec + 1;
+    UseProgress(Nrec);
+    message( "Успешно обработано записей:", ProcessedNoWorking + ProcessedOK, ".  Ошибок:", ProcessedWithErrors );
+end;
+
+
+[----+----------+-----------+----------------------+----------------------+---------------------------------------------------------------------------------];
+[ ];
+[ Успешно обработано записей        : ###### ] ( ProcessedOK );
+[ Не подлежит обработке             : ###### ] ( ProcessedNoWorking );
+[ Ошибки ввода/корректировки записи : ###### ] ( ProcessedWithErrors );
+RemProgress();
+close(Источник);
+
+[ ];
+[ Загрузка справочника корреспондентов ];
+[----------------------------------------------------------------------------------------------------------------------------------------------------------------];
+[|Усп| БИК ОСБ    /корсчет                   |              Название            |               Результат                                                        ];
+[|---+---------------------------------------+----------------------------------+--------------------------------------------------------------------------------];
+
+NRec = 0;
+ProcessedOK = 0;
+ProcessedNoWorking = 0;
+ProcessedWithErrors = 0;
+if ( not open(Источник,DbfFileNameKO)) 
+    MsgBox ("Не могу открыть файл ",DbfFileNameKO); 
+    Exit(1); 
+end;
+InitProgress(NRecords(Источник), "", "ЗАГРУЗКА СПРАВОЧНИКА КОРРЕСПОНДЕНТОВ СБЕРБАНКА РОССИИ");
+ClearAccKONonParty();
+ReWind(Источник);
+while(  next( Источник )  )
+  ErrText = "";
+  if ( ProcessTrn( 0, "UpdateBankKO" , Party, ObjCode, PartyOwn, BankDprt ) )
+      if(ErrText == "")
+        ProcessedOK = ProcessedOK + 1;
+        success = "Ок";
+      else
+        ProcessedNoWorking = ProcessedNoWorking + 1;
+        success = "";
+      end;
+  else
+      ProcessedWithErrors = ProcessedWithErrors + 1;
+      success = "!!";
+  end;
+
+  if( success != "Ок")
+[| ##| ###########/######################### | ################################ | ############################################################################## ]
+  ( success,
+    Источник.NEWNUM1,
+    Источник.LORO,
+    Источник.name1,
+    ErrText );    
+  end;
+  Nrec = Nrec + 1;
+  UseProgress(Nrec);
+  message( "Успешно обработано записей:", ProcessedNoWorking + ProcessedOK, ".  Ошибок:", ProcessedWithErrors );
+end;
+
+[----+---------------------------------------+-----------------------------------------------];
+[ ];
+[ Успешно обработано записей        : ###### ] ( ProcessedOK );
+[ Не подлежит обработке             : ###### ] ( ProcessedNoWorking );
+[ Ошибки ввода/корректировки записи : ###### ] ( ProcessedWithErrors );
+RemProgress();
+close(Источник);
+
+/* VD !!! отключил, потому что справочник правопреемников плохо поддерживается в самом СБ РФ
+InitProgress(NRecords(pr), "", "Этап 4. ЗАГРУЗКА СПРАВОЧНИКА ПРАВОПРЕЕМНИКОВ");
+
+While ( next (pr))
+     
+   Nrec = Nrec + 1;
+   UseProgress(Nrec);
+
+   bank = pr.cl_code;
+   prav = pr.leg_succ;
+
+   if (( bank != "7700010000") and ( bank != "7700020000"))
+     
+     bank1 = ПолучитьКодСубъекта ( bank, 5, err);
+     
+     if ( not err )
+       ПолучитьСубъекта ( bank1, party_r);
+       prav1 = ПолучитьКодСубъекта ( prav, 5, err);
+       if ( not err )
+           ПолучитьСубъекта ( prav1, assignee_party);
+
+           if( SetLinkedObject( OBJROLE_PARTY_ASSIGNEE, OBJTYPE_PARTY, party_r, OBJTYPE_PARTY, assignee_party, true ) != 0 )
+              println ( "Не могу ввести код правопреемника ", prav);
+           else
+              println ( "Банк = ", bank," ",bank1, " Правопреемник = ",prav," ",prav1);
+           end;
+       end;
+     end;
+
+   end;
+
+end;
+
+RemProgress();
+*/
+
+/**/
+
+
+
+/* Выполняем привязку банка к схеме расчетов
+    0 810    РКЦ г.Костромы
+    1 810    Северный банк - списание
+    2 810    Северный банк - зачисление
+    3 810    Островское ОСБ №2497 - списание
+    4 810    Островское ОСБ №2497 - зачисле
+    5 810    Макарьевское ОСБ №2498 - списа
+    6 810    Макарьевское ОСБ №2498 - зачис
+    7 810    Чухломское ОСБ №2510 - списание
+    8 810    Чухломское ОСБ №2510 - зачисле
+    9 810    Нейское ОСБ №2511 - списание
+   10 810    Нейское ОСБ №2511 - зачисление
+   11 810    Шарьинское ОСБ №4366 - списание
+   12 810    Шарьинское ОСБ №4366 - зачисле
+   13 810    Мантуровское ОСБ №4372 - списа
+   14 810    Мантуровское ОСБ №4372 - зачис
+
+   7743720000               ОСБ СБ РФ N 4372 МАНТУРОВСКОЕ  Г. МАНТУРОВО
+   7743660000               ОСБ СБ РФ N 4366 ШАРЬИНСКОЕ  Г. ШАРЬЯ
+   7725110000               ОСБ СБ РФ N 2511 НЕЙСКОЕ  Г. НЕЯ
+   7725100000               ОСБ СБ РФ N 2510 ЧУХЛОМСКОЕ  Г. ЧУХЛОМА
+   7724980000               ОСБ СБ РФ N 2498 МАКАРЬЕВСКОЕ  Г. МАКАРЬЕВ
+   7724970000               ОСБ СБ РФ N 2497 ОСТРОВСКОЕ П. ОСТРОВСКОЕ
+   
+*/
+/*
+CodeBank[0] =  "7743720000";  Schem30301[0] = 13;  Schem30302[0] = 14;
+CodeBank[1] =  "7743660000";  Schem30301[1] = 11;  Schem30302[1] = 12;
+CodeBank[2] =  "7725110000";  Schem30301[2] = 9 ;  Schem30302[2] = 10 ;
+CodeBank[3] =  "7725100000";  Schem30301[3] = 7 ;  Schem30302[3] = 8 ;
+CodeBank[4] =  "7724980000";  Schem30301[4] = 5 ;  Schem30302[4] = 6 ;
+CodeBank[5] =  "7724970000";  Schem30301[5] = 3 ;  Schem30302[5] = 4 ;
+
+i = 0;
+while ( i < asize (CodeBank))
+
+    BankPartyID = ПолучитьКодСубъекта (CodeBank[i], 5);
+    if ( 0 > ПривязкаКСхемеРасчетовСуществует ( BankPartyID , 0, "X", "", "", "X"))
+        ПривязатьБанкКСхемеРасчетов ( BankPartyID, 
+                                      0, 
+                                      Schem30302[i], "X", "", "", "X" );
+    end;   
+
+    if ( 0 > ПривязкаКСхемеРасчетовСуществует ( BankPartyID , 0, "", "X", "X", ""))
+        ПривязатьБанкКСхемеРасчетов ( BankPartyID, 
+                                      0, 
+                                      Schem30301[i], "", "X", "X", "" );
+    end;   
+
+    i = i + 1;
+
+end;  
+
+  */

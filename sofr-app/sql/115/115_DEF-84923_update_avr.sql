@@ -1,0 +1,2 @@
+UPDATE DAVOIRISS_DBT SET t_NKDBase_Kind=4 WHERE t_NKDBase_Kind=10
+/

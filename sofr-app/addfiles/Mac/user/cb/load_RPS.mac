@@ -1,0 +1,462 @@
+/*
+load_RPS.mac
+Загрузка трасфертных (рыночных) процентных ставок из файла csv
+*/
+import oralib, likepy, globals, rsexts, or_rep_h;
+import "usr_open_files.mac";
+import "u_common_email_utils.mac";
+
+private const RATE_DATE = 0,
+              CURRENCY  = 1,
+              PERIOD    = 2,
+              DAYS      = 3,
+              RATE      = 4;
+
+private var RegDir = "РСХБ\\ДИРЕКТОРИИ\\TRANSF_RATE",
+            etl_path = "";
+
+private file doc() txt;
+
+//Массивы с ошибками и информацией о загрузке
+private var errors = TArray();
+private var logs = TArray();
+
+private macro AddErr (err:string)
+  errors[errors.size] = err;
+  return false;
+End;
+
+private macro AddLog (log:string)
+  logs[logs.size] = log;
+  return true;
+End;
+
+//Перемещает файл
+private macro copyFromTo (from, to)
+  return TDirList().copy(from, null, to, true, false);
+End;
+
+//класс для вывод протокола
+private class TReport_loadRPS ()
+  private var Rep = CMakeReport();
+
+  macro PrintHeader ()
+    Rep.AddPrintCell("Протокол загрузки трансфертных ставок", 100, 0, "c:ex_FS(b)", REP_ELEM_STR ); Rep.AddStr();
+    Rep.AddEmptyStr();
+    Rep.AddPrintCell("Дата запуска: "+string({curdate}:f)+"   Время запуска " + Time(), 100, 0, "l:ex_FS(b)", REP_ELEM_STR ); Rep.AddStr();
+    Rep.AddPrintCell("Опрационист: "+{Name_Oper}, 100, 0, "l:ex_FS(b)", REP_ELEM_STR ); Rep.AddStr();
+    Rep.AddEmptyStr();
+  End;
+
+  //ShowErr - признак показа ошибок
+  macro ShowInfo (ShowErr)
+    var i = 0;
+    var arr = ifThenElse(ShowErr, errors, logs);
+
+    if (arr.size > 0) 
+      Rep.AddEmptyStr();
+      Rep.AddPrintCell(ifThenElse(ShowErr, "Ошибки при выполнении", "Информация о выполнении"), 100, 0, "l:ex_FS(b)", REP_ELEM_STR );
+      Rep.AddStr();
+    end;
+
+    while (i < arr.size)
+      Rep.AddPrintCell(i+1, 3, 0, "l:ex_FS(b)", REP_ELEM_TABL);
+      Rep.AddPrintCell(arr[i], 100, 0, "l:ex_FS(b)", REP_ELEM_TABL);
+      Rep.AddStr();
+      i = i + 1;
+    end;
+  End;
+
+  macro ShowRep (IsHandler)
+    var usr_filename = string(date():f)+"_load_transf_rate";
+    usr_filename = strsubst(usr_filename, ".", "");
+
+    var log_file = GetTxtFileName(usr_filename+".txt");
+
+    Rep.SetFileNameTxt(usr_filename);
+
+    ShowInfo();
+    ShowInfo(true);
+    Rep.PrintRep();
+
+    if (not IsHandler) 
+      copyFromTo(log_file, "$"+etl_path+"logs\\");
+    else
+      ViewFile( log_file );
+    end;
+  End;
+END;
+//----------------------------------------------------------------------------------------------
+
+//Найти номер периодичности выплаты процентов
+//у банка есть срок "раз в пол года", который в нашем справочнике записан как "раз в полгода". Из-за этого приходится костылить
+private macro GetInterestFrequency (name):integer
+  var num = 0, sql;
+
+  name = StrSubSt(name, " ", "");
+
+  sql = ExecSqlSelect("select t_inumberalg from dnamealg_dbt where t_itypealg = 8230 and lower(REPLACE(t_sznamealg, ' ', '')) = :1", MakeArray(SqlParam("1", StrLwr(name))));
+  if (sql.MoveNext() )
+    num = sql.value(0);
+  end;
+  return num;
+End;
+//----------------------------------------------------------------------------------------------
+
+/*Класс для вставки нового значения РПС*/
+class InsertRPS ()       
+  var ContractYear = 0;
+  var ContractMonths = 0;
+  var ContractDays = 0;
+  var ContractSum = 0;
+  var FIID = 0;
+  var InterestFrequency = 0;
+  var MinValue = 0;
+  var MaxValue = 0;
+  var ValueDate;
+  var oper = {oper};
+
+  private var ServiseKind = 0;
+  private var ProductKindID = 0;
+  private var ProductID = 0;
+  private var ClientType = 0;
+  private var SourceDataLayer = 0;
+
+  private macro GetFIIDByCCY (ccy):integer
+    var sql = ExecSqlSelect("select t_fiid from dfininstr_dbt where t_fi_kind = 1 and t_ccy = :1", MakeArray(SqlParam("1", ccy)));
+    if (sql.MoveNext() )
+      return sql.value(0);
+    end;
+    return -1;
+  End;
+
+  //Сгенерировать имя записи РПС
+  private macro GenerateMarketName ()
+    var name:string = "";
+    var sql = ExecSqlSelect("select t_name from dservkind_dbt where t_servisekind = :servkind", MakeArray(SqlParam("servkind", ServiseKind)), false);
+    if (sql.MoveNext() )
+      name = sql.value(0);
+    end;
+
+    if (ContractDays > 0)
+      name = name + " " + ContractDays;
+    end;
+
+    sql = ExecSqlSelect("select t_ccy From dfininstr_Dbt where t_fi_kind = 1 and t_fiid = :fiid", MakeArray(SqlParam("fiid", FIID)), false);
+    if (sql.MoveNext() )
+      name = name + " " + sql.value(0);
+    end;
+    return name;
+  End;
+
+  //Вставить значение в таблицу со ставками
+  private macro InsertValIntMarketRate (MarketID)
+    var valinmarketid:integer = 0;
+    var sql = "select t_id from dvalintmarketrate_dbt "
+            + "where t_marketrateid = :marketid and t_begindate = :dt and t_deletedate = to_date('01.01.0001', 'dd.mm.yyyy') ";
+    sql = ExecSqlSelect(sql, MakeArray(SqlParam("marketid", MarketID), SqlParam("dt", ValueDate)), false);
+    if (sql.MoveNext() )
+      valinmarketid = sql.value(0);
+    end;
+
+    if (valinmarketid != 0) 
+      sql = "update dvalintmarketrate_dbt set t_minvalue = :minvalue, "
+          + "                                t_maxvalue = :maxvalue, "
+          + "                                t_oper = :oper, "
+          + "                                t_changedate = :changedate "
+          + "where t_id = :valinID ";
+      sql = ExecSql(sql, MakeArray(SqlParam("minvalue",   MinValue),
+                                   SqlParam("MaxValue",   MaxValue),
+                                   SqlParam("oper",       oper),
+                                   SqlParam("changedate", {curdate}),
+                                   SqlParam("valinID",    valinmarketid)), false);
+      AddLog("Обновлено значение ставки у записи ИД="+MarketID+" на дату="+ValueDate);
+    else
+      sql = "insert into dvalintmarketrate_dbt (t_id, t_marketrateid, t_begindate, t_minvalue, t_maxvalue, t_deletedate, "
+          + "                                   t_correctdate, t_changedate, t_changetime, t_oper) "
+          + "VALUES (0, " //t_id
+          + "        :marketid, "  //t_marketrateid
+          + "        :begindate, " //t_begindate
+          + "        :minvalue, " //t_minvalue
+          + "        :maxvalue, " //t_maxvalue
+          + "        to_date('01.01.0001', 'dd.mm.yyyy'), " //t_deletedate
+          + "        to_date('01.01.0001', 'dd.mm.yyyy'), " //t_correctdate
+          + "        to_date('01.01.0001', 'dd.mm.yyyy'), " //t_changedate
+          + "        to_date('01.01.0001 00:00:00', 'dd.mm.yyyy HH24:mi:ss'), " //t_changetime
+          + "        :oper); "; //t_oper
+      sql = ExecSql(sql, MakeArray(SqlParam("marketid",  MarketID),
+                                   SqlParam("begindate", ValueDate),
+                                   SqlParam("minvalue",  MinValue),
+                                   SqlParam("maxvalue",  MaxValue),
+                                   SqlParam("oper",      oper)), false);
+      AddLog("Добавлено новое значение ставки ИД="+MarketID+" на дату="+ValueDate);
+    end;
+  onerror()
+    AddErr("Ошибка при добавлении новой записи ставки ИД="+MarketID);
+    return false;
+  End;
+
+  //Вставить значение в таблицу со списком РПС
+  private macro InsertMarketRate ()
+    var NewMarketID:integer = 0;
+    var sql = ExecSqlSelect("select dmarketrate_dbt_seq.nextval from dual", null, false);
+    if (sql.MoveNext() )
+      NewMarketID = sql.value(0);
+    end;
+
+    sql = "INSERT INTO dmarketrate_dbt (T_ID,            T_SERVISEKIND, T_BRANCHID,     T_NAME,           T_FULLNAME, "
+        + "                             T_PRODUCTKINDID, T_PRODUCTID,   T_CONTRACTYEAR, T_CONTRACTMONTHS, T_CONTRACTDAYS, "
+        + "                             T_CONTRACTSUM,   T_FIID,        T_CLIENTTYPE,   T_INFO,           T_NOTUSE, "
+        + "                             T_OPER,          T_INPUTDATE,   T_CORRECTDATE,  T_CHANGEDATE,     T_SOURCEDATALAYER, T_INTERESTFREQUENCY) "
+        + "VALUES (:newid, " //T_ID
+        + "        :servisekind, " //T_SERVISEKIND
+        + "        :branch, " //T_BRANCHID
+        + "        :name1, " //T_NAME
+        + "        :fullname, " //T_FULLNAME
+        + "        :productkind, " //T_PRODUCTKINDID
+        + "        :productid, " //T_PRODUCTID
+        + "        :years, " //T_CONTRACTYEAR
+        + "        :months, " //T_CONTRACTMONTHS
+        + "        :days, " //T_CONTRACTDAYS
+        + "        :summa, " //T_CONTRACTSUM
+        + "        :fiid, " //T_FIID
+        + "        :clienttype, " //T_CLIENTTYPE
+        + "        chr(1), " //T_INFO
+        + "        chr(0), " //T_NOTUSE
+        + "        :oper, " //T_OPER
+        + "        :inputdate, " //T_INPUTDATE
+        + "        to_date('01.01.0001', 'dd.mm.yyyy'), " //T_CORRECTDATE
+        + "        to_date('01.01.0001', 'dd.mm.yyyy'), " //T_CHANGEDATE
+        + "        :sourcedatalayer, " //T_SOURCEDATALAYER
+        + "        :interest " //T_INTERESTFREQUENCY
+        + "       ) ";
+  sql = ExecSql(sql, MakeArray(SqlParam("newid",           NewMarketID),
+                               SqlParam("servisekind",     ServiseKind),
+                               SqlParam("branch",          {OperDprt}),
+                               SqlParam("name1",           GenerateMarketName()),
+                               SqlParam("fullname",        GenerateMarketName()),
+                               SqlParam("productkind",     ProductKindID),
+                               SqlParam("productid",       ProductID),
+                               SqlParam("years",           ContractYear),
+                               SqlParam("months",          ContractMonths),
+                               SqlParam("days",            ContractDays),
+                               SqlParam("summa",           ContractSum),
+                               SqlParam("fiid",            FIID),
+                               SqlParam("clienttype",      ClientType),
+                               SqlParam("oper",            oper),
+                               SqlParam("inputdate",       ValueDate),
+                               SqlParam("sourcedatalayer", SourceDataLayer),
+                               SqlParam("interest",        InterestFrequency)));
+    if (sql == null)
+      RunError("Ошибка при заполнении данных");
+    end;
+    AddLog("Добавлен новый вид трасфертной ставки");
+
+    if ( (MinValue != 0) or (MaxValue != 0) )
+      InsertValIntMarketRate(NewMarketID);
+    end;
+
+  onerror()
+    AddErr("Ошибка при добавлении нового вида трансфертной ставки"); //Стоит доработать, и выводить больше информации. Пока не понятно, что именно выводить
+  End;
+
+  private macro GetMarketID ():integer
+    var MarketID:integer = 0;
+    var sql = "SELECT t_id FROM dmarketrate_dbt "
+            + "WHERE     t_servisekind = :servkind "
+            + "      AND t_branchid = :branch "
+            + "      AND t_productkindid = :productkind "
+            + "      AND t_productid = :productid "
+            + "      AND t_contractyear = :years "
+            + "      AND t_contractmonths = :months "
+            + "      AND t_contractdays = :days "
+            + "      AND t_contractsum = :sum "
+            + "      AND t_fiid = :fiid "
+            + "      AND t_clienttype = :clienttype "
+            + "      AND t_sourcedatalayer = :sourcedata "
+            + "      AND t_interestfrequency = :interest ";
+    sql = ExecSqlSelect(sql, MakeArray(SqlParam("servkind",    ServiseKind),
+                                       SqlParam("branch",      {OperDprt}),
+                                       SqlParam("productkind", ProductKindID),
+                                       SqlParam("productid",   ProductID),
+                                       SqlParam("years",       ContractYear),
+                                       SqlParam("months",      ContractMonths),
+                                       SqlParam("days",        ContractDays),
+                                       SqlParam("sum",         ContractSum),
+                                       SqlParam("fiid",        FIID),
+                                       SqlParam("clienttype",  ClientType),
+                                       SqlParam("sourcedata",  SourceDataLayer),
+                                       SqlParam("interest",    InterestFrequency)), false);
+    if (sql.MoveNext() )
+      MarketID = sql.value(0);
+    end;
+    return MarketID;
+  End;
+
+  private macro AddNewRPSEx ()
+    var MarketID = GetMarketID();
+    if (MarketID == 0) 
+      InsertMarketRate();
+    else
+      InsertValIntMarketRate(MarketID);
+    end;
+  End;
+
+  //Ищет все записи РПС "По умолчанию" и только к таким добавляет новые значения ставок
+  macro AddNewRPS (_ContractYear,
+                   _ContractMonths,
+                   _ContractDays,
+                   _ContractSum,
+                   _FIID_CCY,
+                   _InterestFrequency,
+                   _MinValue,
+                   _MaxValue,
+                   _ValueDate)
+
+    ContractYear      = _ContractYear;
+    ContractMonths    = _ContractMonths;
+    ContractDays      = _ContractDays;
+    ContractSum       = _ContractSum;
+    FIID              = GetFIIDByCCY(_FIID_CCY);
+    InterestFrequency = _InterestFrequency;
+    MinValue          = _MinValue;
+    MaxValue          = _MaxValue;
+    ValueDate         = _ValueDate;
+
+    var sql = "select t_servisekind, "
+            + "       t_productkindid, "
+            + "       t_productid, "
+            + "       t_clienttype, "
+            + "       t_sourcedatalayer "
+            + "from dmarketrate_dbt "
+            + "where     t_contractyear = 0 "
+            + "      and t_contractmonths = 0 "
+            + "      and t_contractdays = 0 "
+            + "      and t_contractsum = 0 "
+            + "      and t_fiid = :fiid "
+            + "      and t_interestfrequency = :interest ";
+    sql = ExecSqlSelect(sql, MakeArray(SqlParam("fiid", FIID), SqlParam("interest", _InterestFrequency)), false);
+
+    while (sql.MoveNext() )
+      ServiseKind     = sql.Value("t_servisekind");
+      ProductKindID   = sql.Value("t_productkindid");
+      ProductID       = sql.Value("t_productid");
+      ClientType      = sql.Value("t_clienttype");
+      SourceDataLayer = sql.Value("t_sourcedatalayer");
+      AddNewRPSEx();
+    end;
+
+  End;
+END;
+
+//Автопоиск файла. Маска: 20191231*_TRANSF.csv
+private macro FindFile ()
+  var dd, mm, year, FileName="", mask = "*_TRANSF.csv";
+
+  datesplit({curdate}, dd, mm, year);
+  mask = string(year:o:4) + string(mm:o:2) + string(dd:o:2) + mask;
+
+  //GetRegistryValue(RegDir, V_STRING, etl_path);
+  FileName = TDirList ("$" + etl_path + mask, "F").name(0);
+  FileName = "$" + etl_path + FileName;
+  return FileName;
+onerror()
+  return "";
+End;
+
+PRIVATE MACRO RatesFromMAKS()
+    const RegPath = "РСХБ\\БРОКЕРСКОЕ ОБСЛУЖИВАНИЕ\\ТРАНСФЕРНЫЕ СТАВКИ МАКС\\ИМПОРТ ТР.СТАВОК ИСП. KAFKA";
+    var RegValue = -1, err;
+    GetRegistryValue( RegPath, V_INTEGER, RegValue, err );
+    
+    if ( err != 0 )
+        MsgBox( "Ошибка при получении значения настройки \"" + RegPath + "\"" );
+    else
+        if ( RegValue )
+            return 1;
+        else
+            return 0;
+        end;
+    end;
+end;
+
+PRIVATE MACRO GetEmail()
+    const RegPath = "РСХБ\\БРОКЕРСКОЕ ОБСЛУЖИВАНИЕ\\ТРАНСФЕРНЫЕ СТАВКИ МАКС\\EMAIL_ДЛЯ_ОШИБОК_ЗАГР_ТРАНСФ_СТ";
+    var RegValue = "", err;
+    GetRegistryValue( RegPath, V_STRING, RegValue, err );
+    
+    if ( err != 0 )
+        MsgBox( "Ошибка при получении значения настройки \"" + RegPath + "\"" );
+        return "";
+    end;
+
+	return RegValue;
+end;
+
+Private macro SendError()
+   var EmailFromReg = GetEmail();
+   if (EmailFromReg != "")
+	   var email = c_email_proc_env();
+	   var tittle = "Загрузка трасфертных (рыночных) процентных ставок из файла csv";
+	   var message = "Редактирование процентных ставок запрещено, импорт автоматически осуществляется из системы МАКС";
+	   email.m_set_msg_head(tittle);
+	   email.m_add_row_to_msg_text(message);
+	   email.m_add_email_to_list();
+
+	   email.m_submit_email_synch();
+	end;
+End;
+
+//IsHandler - признак ручной обработки
+macro StartLoadRPS (IsHandler)
+  var RPS_class = InsertRPS();
+  var c_file = c_txt_file();
+  var Rep = TReport_loadRPS();
+  var FullFileName, mask = "*_TRANSF.csv";
+  var stat;
+  
+  if (RatesFromMAKS())
+    if(IsHandler)
+       msgbox("Редактирование процентных ставок запрещено, импорт автоматически осуществляется из системы МАКС");
+       SendError();
+       return false;
+    end;
+    return AddErr("Редактирование процентных ставок запрещено, импорт автоматически осуществляется из системы МАКС");
+  end;
+
+  Rep.PrintHeader();
+
+  GetRegistryValue(RegDir, V_STRING, etl_path);
+  FullFileName = FindFile();
+  stat = c_file.openFile(doc, etl_path+""+mask, true, (not IsHandler), FullFileName, "rsansi");
+
+  if ( (valtype(stat) == V_UNDEF) or (stat == false) )
+    Rep().ShowRep(IsHandler);
+    return AddErr("Ошибка открытия файла");
+  end;
+
+  SetDelim(";");
+  Next(doc); //Первая строка - заголовочная
+
+  while(Next(doc))
+    RPS_class.AddNewRPS(0, //years
+                        0, //months
+                        doc(days), //days
+                        0, //sum
+                        doc(CURRENCY), //fiid_CCY
+                        //GetInterestFrequency(Trim(doc(PERIOD))), //InterestFrequency
+                        0, //InterestFrequency пока работает только так!!
+                        doc(RATE), //RateMin
+                        doc(RATE), //RateMax
+                        doc(RATE_DATE)); //valuedate
+  end;
+  c_file.closeFile(doc);
+
+  if (not IsHandler)
+    copyFromTo(FullFileName, "$" + etl_path+"old\\");
+  end;
+  Rep().ShowRep(IsHandler);
+
+onerror()
+  Rep().ShowRep(IsHandler);
+End;

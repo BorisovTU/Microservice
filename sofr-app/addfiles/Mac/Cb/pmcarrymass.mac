@@ -1,0 +1,549 @@
+/*
+$Name:           pmcarrymass.mac
+$Module:         РКО, ББ
+$Description:    Выполнение завершающей проводки по платежам в массовом режиме
+*/
+/*
+ Блок      : 29012 - "Зачисление"
+ Шаг       : 10    - "Зачисление"
+ Описание  : macro PM_MassMakeLastCarry
+*/
+
+import globals, oralib, likepy, PaymInter, PTInter, PSInter, OprInter, CTInter, pm_tools, 
+       BankInter, sfpmbtch, pm_const, "SetPaymTrnDef.mac";
+
+/* ------------------------------------------------------------------------------
+   Субъект - ЦБ? 
+------------------------------------------------------------------------------ */
+PRIVATE CLASS (PSRepMap) TIsCBCache
+
+  InitPSRepMap( V_INTEGER );
+
+  /* Субъект - ЦБ? */
+  MACRO IsPartyCB( PartyID:integer ):bool
+    if( _extObj.Exists( PartyID ) )
+      return _extObj.Value( PartyID );
+    else
+      var IsCB:bool;
+      IsCB = IsBankType( PartyID, PT_KIND_PAYM_CASH_CENTRE        )
+          or IsBankType( PartyID, PT_KIND_FIELDOFFICE_CENTRALBANK );
+      _extObj.Add( PartyID, IsCB );
+      return IsCB;
+    end;
+  END;
+
+END;
+
+private var IsCBCache:TIsCBCache = TIsCBCache();
+
+/* ------------------------------------------------------------------------------
+ Структура данных, необходимых для выполнения проводки
+   ------------------------------------------------------------------------------ */
+PRIVATE CLASS (TRsdRecordReader) TMassCarryData
+  var PaymentID:integer
+     ,ID_Operation:integer
+     ,ID_Step:integer
+     ,PmAddPIID:integer
+     ,FIID_FuturePayAcc:integer
+     ,FuturePayerAccount:string
+     ,FuturePayerAmount:money
+     ,FIID_FutureRecAcc:integer
+     ,FutureReceiverAccount:string
+     ,FutureReceiverAmount:money
+     ,Payer:integer
+     ,Receiver:integer
+     ,ValueDate:date
+     ,ShifrOper:string
+     ,Chapter:integer
+     ,Number:string
+     ,NumberPack:string
+     ,Ground:string
+     ,Department:integer
+     ,Type_Document:string
+     ,CashSymbolDebet:string
+     ,CashSymbolCredit:string
+     ,SymbNotBalDebet:string
+     ,SymbNotBalCredit:string
+     ,ToDPP:string
+     ,ClaimID:integer
+     ,ReserveID:integer
+     ,CarryStatus:integer
+     ,StartDepartment:integer
+     ,EndDepartment:integer
+     ,PaymDocKind:integer
+     ,InGroup:integer
+     ,InTransferDate:date
+     ,InPayFIID:integer
+     ,InCorrID:integer
+     ,OutGroup:integer
+     ,OutTransferDate:date
+     ,OutPayFIID:integer
+     ,OutCorrID:integer
+     ,AddPIDebetCredit:integer
+     ,PayType:integer
+     ,CoverAmount:money
+     ,OFRSymbol:string
+     ,PIOFRSymbol:string;
+END;
+
+/* ------------------------------------------------------------------------------
+   Класс первичного документа для КУ
+   ------------------------------------------------------------------------------ */
+CLASS TMassCarryPrimDoc( p_rec:TMassCarryData )
+
+  private var rec:TMassCarryData = p_rec;
+
+  /* Обязательные свойства/методы класса первичного документа */
+
+  /* Вид первичного документа */
+  MACRO Kind():integer
+    return rec.PaymDocKind;
+  END;
+  
+  /* ID сделки */
+  MACRO Id():integer
+    return rec.PaymentID;
+  END;
+
+  /* Номер текущей ошибки */
+  MACRO Error():integer
+    return 0;
+  END;
+
+  /* Получить роль ФИ */
+  MACRO GetBasisFIRole():integer
+     return FIROLE_UNDEF;
+  END;
+
+  /* Получить базис ролей ФИ */
+  MACRO GetFIRoleBArray():TArray
+     return makeArray( FIROLE_UNDEF );
+  END;
+
+  /* Параметры второго рода */
+  MACRO GetParametr( ParmKind:integer, OperDate:date, CatCode:string, FIRole:integer ):variant
+
+    /* Вид документа */
+    if(   ParmKind == MC_TYPE_PARAMETR_DOCKIND )
+      return rec.PaymDocKind;
+    /* ID сделки */
+    elif( ParmKind == MC_TYPE_PARAMETR_DOCID )
+      return rec.PaymentID;
+    /* Дата картотеки */
+    elif( ParmKind == MC_TYPE_PARAMETR_INDEXDATE )
+      if( rec.PaymDocKind != WL_INDOC )
+        return rec.OutTransferDate;
+      else
+        return rec.InTransferDate;
+      end;
+    /* Валюта */
+    elif( ( ParmKind == MC_TYPE_PARAMETR_FIID ) or
+          ( ParmKind == MC_TYPE_PARAMETR_PAYCURRENCY ) )
+      if( rec.PaymDocKind != WL_INDOC )
+        return rec.OutPayFIID;
+      else
+        return rec.InPayFIID;
+      end;
+    /* Филиал */
+    elif( ParmKind == MC_TYPE_PARAMETR_DEPARTMENT )
+      return rec.Department;
+    /* Контрагент */
+    elif( ( ParmKind == MC_TYPE_PARAMETR_PARTY ) or
+          ( ParmKind == MC_TYPE_PARAMETR_CONTRACTOR ) )
+      if( rec.PaymDocKind != WL_INDOC )
+        return rec.OutCorrID;
+      else
+        return rec.InCorrID;
+      end;
+    elif( ParmKind == MC_TYPE_PARAMETR_OWNER )
+      if( rec.PaymDocKind != WL_INDOC )
+        return rec.Payer;
+      else
+        return rec.Receiver;
+      end;
+    end;
+
+    return -1;
+
+  END;
+
+  /* Параметры первого рода */
+  MACRO GetParametrTemplate( ObjectID:integer, Classificator:integer, OperDate:date, FIRole:integer ):integer
+    var PayFIID:integer,
+        CorrID :integer;
+    /* Клиентский? */
+    if  ( ( ObjectID == OBJTYPE_UNCL_PAYMTYPE ) AND ( Classificator == LLCLASS_UNCS_PAYMTYPE ) )
+      return IfThenElse( ( rec.PaymDocKind == PS_PAYORDER ) or ( rec.PaymDocKind == PS_CPORDER ), 1, 0 );
+    /* Нацвалютный? */
+    elif( ( ObjectID == OBJTYPE_UNCL_FITYPE   ) AND ( Classificator == LLCLASS_UNCS_FITYPE   ) )
+      PayFIID = IfThenElse( rec.PaymDocKind != WL_INDOC, rec.OutPayFIID, rec.InPayFIID );
+      return IfThenElse( PayFIID == 0, 1, 0 );
+    /* Через ЦБ? */
+    elif( ( ObjectID == OBJTYPE_UNCL_ROUTE    ) AND ( Classificator == LLCLASS_UNCS_ROUTE    ) )
+      CorrID = IfThenElse( rec.PaymDocKind != WL_INDOC, rec.OutCorrID, rec.InCorrID );
+      return IfThenElse( IsCBCache.IsPartyCB( rec.OutCorrID ), 1, 0 );
+    end;
+
+    return -1;
+
+  END;
+
+  /* Найти или открыть счёт незавершённых расчётов */
+  MACRO FindAndOpenAccount():string
+    var CategoryName:string = IfThenElse( rec.PaymDocKind != WL_INDOC, "Незавершенные расчеты OUT", "Незавершенные расчеты IN" );
+    return MC_FindAndOpenAccount( CategoryName, this, date(), IsOprMultiExec(), MC_OPENACC_CREATE, null, null, null, null, null, null );
+  END;
+
+  MACRO CorrectAccount()
+     return true;
+  END;
+
+END;
+
+class (RsbBatchPaymTrn) RsbBatchPaymTrnForCarryStep
+
+  var batchSf:TSfPaymBatchCompletion;
+
+  InitRsbBatchPaymTrn();
+
+  macro AppRunFunction()
+
+    return batchSf.AppRunFunction();
+  end;
+  
+  
+  macro CommitFunction(iPackStartRec : integer, iCarry : integer, ID_Operation : integer, ID_Step : integer)
+    
+    return batchSf.CommitFunction( GetPaymentIDNewTrn(iCarry), iPackStartRec, iCarry, ID_Operation, ID_Step );
+  end;
+  
+  macro RollbackFunction(iPackStartRec : integer, iCarry : integer, ID_Operation : integer, ID_Step : integer)
+    
+    return batchSf.RollbackFunction( GetPaymentIDNewTrn(iCarry), iPackStartRec, iCarry, ID_Operation, ID_Step );
+  end;
+
+end;
+
+private macro AddPICarryGroundGetRegValue()
+  var Regval:integer;
+  var error = 0;
+
+  GetRegistryValue( "COMMON\\DOCGROUND\\ADDPICARRYGROUND", V_INTEGER, RegVal, error );
+    
+  if( error != 0)
+    RegVal = 0;
+  end;
+
+  return RegVal;
+end;
+
+macro PM_MassBilBookEntry():integer
+  var query: string =
+  "SELECT /*+ LEADING(t)*/"
+        " pm.t_ValueDate"
+        ",t.t_id_operation "
+        ",t.t_id_step "
+        ",pmbf.t_FacturaID"
+        ",pmbf.t_Amount"
+        ",pmbf.t_FIID"
+        ",pmbf.t_BBEDirection"
+        ",pm.t_PrimDocKind"
+        ",pm.t_PaymentID "
+   " FROM V_PMMASSOPFOREXE t, dpmpaym_dbt pm, dpmbflnk_dbt pmbf "
+  " WHERE t.t_OrderID = pm.t_PaymentID "
+    " AND t.t_OrderID = pmbf.t_PaymentID "
+    " AND pmbf.t_NotCreateBBE in (CHR(0), 'Z') ";
+
+  var rs:RsdRecordset = execSQLselect( query );
+  var bbe = BilBookEntryBatchCharger();
+  while (rs.MoveNext())
+    var bilfDocArray = TArray();
+    bilfDocArray[0] = TRecHandler("bilf_doc.rec");
+    bilfDocArray[0].Clear();
+
+    bilfDocArray[0].rec.DocKind = rs.value("t_PrimDocKind");    
+    bilfDocArray[0].rec.DocID  = rs.value("t_PaymentID");
+    bilfDocArray[0].rec.Amount = rs.value("t_Amount");
+    bilfDocArray[0].rec.FIID   = rs.value("t_FIID");
+    bbe.Add(rs.value("t_FacturaID"), bilfDocArray, date(rs.value("t_ValueDate")), rs.value("t_id_operation"), rs.value("t_id_step"), rs.value("t_BBEDirection"));
+  end;
+  var stat = bbe.run();
+  bbe = NULL;
+  return stat;
+end;
+/* ------------------------------------------------------------------------------
+   Выполнить проводки зачисления по платежам в массовом режиме 
+   ------------------------------------------------------------------------------ */
+MACRO PM_MassMakeLastCarry():integer
+
+  var query:string = 
+  "SELECT /*+ LEADING(t)*/ "
+        " pm.t_paymentid "
+        ",t.t_id_operation "
+        ",t.t_id_step "
+        ",nvl( picr.t_PmAddPIID, nvl( pidb.t_PmAddPIID, 0 ) ) as t_PmAddPIID "
+        ",nvl( pidb.t_FIID, pm.t_fiid_futurepayacc ) as t_fiid_futurepayacc "
+        ",nvl( pidb.t_Account, pm.t_futurepayeraccount ) as t_futurepayeraccount "
+        ",nvl( pidb.t_futurepayeramount, pm.t_futurepayeramount) as t_futurepayeramount "
+        ",nvl( picr.t_FIID, pm.t_fiid_futurerecacc ) as t_fiid_futurerecacc "
+        ",nvl( picr.t_Account, pm.t_futurereceiveraccount ) as t_futurereceiveraccount "
+        ",nvl( picr.t_FutureReceiverAmount, pm.t_futurereceiveramount ) as t_FutureReceiverAmount "
+        ",nvl( pidb.t_OFRSymbol, nvl( picr.t_OFRSymbol, CHR(0) ) ) as t_PIOFRSymbol "
+        ",pm.t_Payer "
+        ",pm.t_Receiver "
+        ",pm.t_valuedate "
+        ",rm.t_shifroper "
+        ",pm.t_chapter "
+        ",rm.t_number "
+        ",pm.t_numberpack ";
+
+  if ( AddPICarryGroundGetRegValue() == 0 )        
+    query = query +
+        ",CASE"
+        " WHEN"
+        "   nvl(rm.t_Ground, chr(1)) <> chr(1)"
+        "   THEN"
+        "     rm.t_Ground"
+        " ELSE"
+        "     chr(1)"
+        " END"
+        " as t_Ground";
+  else
+    query = query +
+        ",CASE"
+        " WHEN"
+        "   nvl(picr.t_Ground, chr(1)) <> chr(1)"
+        "   THEN"
+        "     picr.t_Ground"
+        " WHEN   "
+        "   nvl(pidb.t_Ground, chr(1)) <> chr(1)"
+        "   THEN"
+        "     pidb.t_Ground"
+        " WHEN"
+        "   nvl(rm.t_Ground, chr(1)) <> chr(1)"
+        "   THEN"
+        "     rm.t_Ground"
+        " ELSE"
+        "     chr(1)"
+        " END"
+        " as t_Ground";
+  end;  
+  
+  query = query +
+        ",pm.t_department "
+        ",DECODE (t.t_dockind, 15, (select md.t_type_document from dmultydoc_dbt md where md.t_autokey = t.t_orderid), "
+                             " 70, (select mo.t_typedocument from dcb_doc_dbt mo where mo.t_documentid = t.t_orderid), CHR(1) ) AS t_type_document "
+        ",nvl( picr.t_CashSymbol, rm.t_CashSymbolDebet )  as t_CashSymbolDebet "
+        ",nvl( pidb.t_CashSymbol, rm.t_CashSymbolCredit ) as t_CashSymbolCredit "
+        ",nvl( pidb.t_NotBalSymbol, rm.t_SymbNotBalDebet ) as t_SymbNotBalDebet "
+        ",nvl( picr.t_NotBalSymbol, rm.t_SymbNotBalCredit ) as t_SymbNotBalCredit " +
+        ",c.t_ToDPP "
+        ",pm.t_ClaimID "
+        ",res.t_ReserveID "
+        ",c.t_CarryStatus "
+        ",pm.t_StartDepartment "
+        ",pm.t_EndDepartment "
+        ",decode( pm.t_PrimDocKind, 0, pm.t_DocKind, pm.t_PrimDocKind ) as t_PaymDocKind "
+        ",inprop.t_Group as t_InGroup "
+        ",inprop.t_TransferDate as t_InTransferDate "
+        ",inprop.t_PayFIID as t_InPayFIID "
+        ",decode( inprop.t_OurCorrID, -1, nvl( incs.t_CorrID, -1 ), inprop.t_OurCorrID ) as t_InCorrID "
+        ",outprop.t_Group as t_OutGroup "
+        ",outprop.t_TransferDate as t_OutTransferDate "
+        ",outprop.t_PayFIID as t_OutPayFIID "
+        ",decode( outprop.t_OurCorrID, -1, nvl( outcs.t_CorrID, -1 ), outprop.t_OurCorrID ) as t_OutCorrID "
+        ",nvl( picr.t_DebetCredit, nvl( pidb.t_DebetCredit, -1 ) ) as t_AddPIDebetCredit " +
+        ",pm.t_PayType "
+        ",nvl( nvpi.t_CoverAmount, 0 ) as t_CoverAmount "
+        ",PM_COMMON.GetPaymNoteTextStr( pm.t_PaymentID, 67/*PM_COMMON.NOTEKIND_PM_OFRSYMBOL*/, pm.t_ValueDate ) as t_OFRSymbol "
+    "FROM V_PMMASSOPFOREXE t, "
+         "dpmcarrystep_tmp c, "
+         "dpmpaym_dbt pm, "
+         "dpmrmprop_dbt rm, "
+         "dpmprop_dbt inprop, "
+         "dpmprop_dbt outprop, "
+         "dcorschem_dbt incs, "
+         "dcorschem_dbt outcs, "
+         "dpmaddpi_dbt pidb, "
+         "dpmaddpi_dbt picr, "
+         "dpmnvpi_dbt nvpi, "
+         "dpmres_tmp res "
+   "WHERE c.t_PaymentID = t.t_orderid "
+     "AND pm.t_paymentid = t.t_orderid "
+     "AND rm.t_paymentid = t.t_orderid "
+     "AND inprop.t_paymentid = t.t_orderid "
+     "AND inprop.t_issender = 'X' "
+     "AND outprop.t_paymentid = t.t_orderid "
+     "AND outprop.t_issender = CHR(0) "
+     "AND incs.t_FI_Kind(+) = 1 "
+     "AND incs.t_FIID(+) = inprop.t_PayFIID "
+     "AND incs.t_Number(+) = inprop.t_Corschem "
+     "AND outcs.t_FI_Kind(+) = 1 "
+     "AND outcs.t_FIID(+) = outprop.t_PayFIID "
+     "AND outcs.t_Number(+) = outprop.t_Corschem "
+     "AND pidb.t_PaymentID(+) = t.t_orderid "
+     "AND pidb.t_DebetCredit(+) = 0 "
+     "AND picr.t_PaymentID(+) = t.t_orderid "
+     "AND picr.t_DebetCredit(+) = 1 "
+     "AND nvpi.t_PaymentID(+) = t.t_orderid "
+     "AND res.t_DocumentID = nvl(pidb.t_PmAddPIID, c.t_PaymentID) "
+     "AND res.t_DocKind = nvl2(pidb.t_PmAddPIID, 251, t.t_DocKind) ";
+
+  var ErrorStatus:integer = 0;
+  var ErrorMessage:string = "";
+  var rs:RsdRecordset = execSQLselect( query );
+  var CarryData:TMassCarryData = TMassCarryData();
+  var batchTrn:RsbBatchPaymTrn = RsbBatchPaymTrnForCarryStep();
+  batchTrn.batchSf = TSfPaymBatchCompletion( batchTrn );
+  var accTrnData:RsbAccTransactionData;
+  var ReceiverAccount:string;
+  var Status_After = ACCTRN_STATUS_DOCUMENT;
+  var prevPaymentID = 0;
+
+  while( rs.moveNext() )
+
+    CarryData.Read( rs );
+    
+    ErrorMessage = "";
+    ErrorStatus = 0;
+
+    /* Для внутренних межфилиальных и входящих сквитованных 
+       перед проводкой актуализируем все предыдущие проводки */
+    if( ( ( CarryData.StartDepartment != CarryData.EndDepartment ) and 
+          ( CarryData.InGroup     == PAYMENTS_GROUP_INTERNAL ) and 
+          ( CarryData.OutGroup    == PAYMENTS_GROUP_INTERNAL ) )
+        or
+        ( ( CarryData.InGroup     == PAYMENTS_GROUP_EXTERNAL ) and
+          ( CarryData.CarryStatus == ACCTRN_STATUS_DOCUMENT  ) ) )
+      
+      if(not batchTrn.AddTransactionActuate( CarryData.PaymentID, 0, ACCTRN_STATUS_DOCUMENT, CarryData.ID_Operation, CarryData.ID_Step ))
+        ErrorMessage = "Ошибка при актуализации проводок";
+        ErrorStatus = 1;
+      end;
+      
+    end;
+
+    if( not ErrorStatus )
+
+      accTrnData = RsbAccTransactionData();
+
+      accTrnData.Chapter         = CarryData.Chapter;
+      accTrnData.Date_Carry      = CarryData.ValueDate;
+      accTrnData.Number_Pack     = CarryData.NumberPack;
+      accTrnData.Numb_Document   = CarryData.Number;
+      accTrnData.ResultCarry     = 1;
+      accTrnData.Shifr_Oper      = CarryData.ShifrOper;
+      accTrnData.Ground          = CarryData.Ground;
+      accTrnData.Department      = CarryData.Department;
+      if( CarryData.FIID_FuturePayAcc == CarryData.FIID_FutureRecAcc )
+        if(CarryData.PmAddPIID > 0)
+          accTrnData.FIID = accTrnData.FIIDPayer = accTrnData.FIIDReceiver = CarryData.FIID_FuturePayAcc;
+          if(CarryData.AddPIDebetCredit == 0)
+            accTrnData.Sum = CarryData.FuturePayerAmount;
+          elif(CarryData.AddPIDebetCredit == 1)
+            accTrnData.Sum = CarryData.FutureReceiverAmount;
+          end;
+        else
+          accTrnData.FIID = accTrnData.FIIDPayer = accTrnData.FIIDReceiver = CarryData.FIID_FuturePayAcc;
+          accTrnData.Sum = accTrnData.SumPayer = accTrnData.SumReceiver = CarryData.FuturePayerAmount;
+        end;
+      else
+        accTrnData.FIIDPayer     = CarryData.FIID_FuturePayAcc;
+        accTrnData.FIIDReceiver  = CarryData.FIID_FutureRecAcc;
+        accTrnData.SumPayer      = CarryData.FuturePayerAmount;
+        accTrnData.SumReceiver   = CarryData.FutureReceiverAmount;
+      end;
+      accTrnData.AccountPayer    = CarryData.FuturePayerAccount;
+
+      if( CarryData.OutGroup == PAYMENTS_GROUP_EXTERNAL )
+        Status_After = ACCTRN_STATUS_PLAN;
+      end;
+
+      if( CarryData.ToDPP != "X" )
+        accTrnData.AccountReceiver = CarryData.FutureReceiverAccount;
+      else
+        accTrnData.AccountReceiver = TMassCarryPrimDoc( CarryData ).FindAndOpenAccount();
+        execSQL( "update dpmcarrystep_tmp set t_DPP_FIID = ?, t_DPP_Account = ? where t_PaymentID = ?",
+                 makeArray( SQLParam( "", accTrnData.FIIDReceiver ),
+                            SQLParam( "", accTrnData.AccountReceiver ),
+                            SQLParam( "", CarryData.PaymentID ) ) );
+        Status_After = ACCTRN_STATUS_PLAN;
+      end;
+      accTrnData.TypeDocument    = CarryData.Type_Document;
+      accTrnData.ClaimID         = IfThenElse( CarryData.ReserveID > 0, CarryData.ReserveID, CarryData.ClaimID );
+      accTrnData.BudgetPaymentType = CarryData.PayType;
+
+      if( ( CarryData.PmAddPIID <= 0 ) and ( CarryData.CoverAmount != $0 ) )
+        accTrnData.SumEquivalentCarry = CarryData.CoverAmount;
+      end;
+
+      if( not RmCopyInCarryCashSymbol(CarryData, accTrnData ) )
+        ErrorMessage = "Ошибка при копировании кассовых символов из платежа в проводку";
+        ErrorStatus = 1;
+      end;
+
+      ErrorStatus = SetPaymTransactionDef(accTrnData, CarryData.PaymentID, CarryData.PmAddPIID, CarryData );
+      if(ErrorStatus)
+        ErrorMessage = GetErrMsg();
+
+        if(not ErrorMessage)
+          ErrorMessage = "Ошибка при установке атрибутов проводки по платежу";
+        end;
+      end;
+
+      if( batchTrn.AddTransaction( CarryData.PaymentID, accTrnData, Status_After, PM_CARRY_REASON_EXECUTION, CarryData.PmAddPIID, CarryData.ID_Operation, CarryData.ID_Step ) < 0 )
+        ErrorMessage = "Ошибка при исполнении проводки";
+        ErrorStatus = 1;
+      end;
+      
+      // Если платеж с разноской, то AddTrnData должна зваться один раз
+      if( not ErrorStatus and (prevPaymentID != CarryData.PaymentID))
+        batchTrn.batchSf.AddTrnData( CarryData.PaymentID );
+      end;
+      
+      prevPaymentID = CarryData.PaymentID;
+
+    end;
+  
+    if( ErrorStatus )
+      SetErrorOprTemp( CarryData.PaymentID, ErrorStatus, ErrorMessage );
+    end;
+  end;
+
+  if( not batchTrn.Execute() )
+    batchTrn.batchSf = NULL;
+    batchTrn = NULL;
+    return 1;
+  end;
+
+  var errPaymentID:TArray;
+  var errCode:TArray;
+  var errMsg:TArray;
+
+  if(not batchTrn.GetErrors(errPaymentID, errCode, errMsg))
+    batchTrn.batchSf = NULL;
+    batchTrn = NULL;
+    return 1;
+  end;
+
+  batchTrn.batchSf = NULL;
+  batchTrn = NULL;
+
+  var i = 0;
+  if(errPaymentID.size() > 0)
+  
+    while( i < errPaymentID.size() )
+
+      if((errCode[i] > 0) or (errMsg[i] != ""))
+        SetErrorOprTemp( errPaymentID[i], errCode[i], errMsg[i] );
+      end;
+
+      i = i + 1;
+    end;
+
+  end;
+
+  return 0;
+
+END;
+

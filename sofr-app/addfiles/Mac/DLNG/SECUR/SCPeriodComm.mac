@@ -1,0 +1,1447 @@
+/*
+$Name:        SCPeriodComm.mac
+$Module:      Ценные бумаги
+$Description: Расчет периодической комиссии
+*/
+IMPORT rsd, rsbdataset, SfInter, DealsInter, "secinter.mac", "MoCommon.mac", "cb_sql.mac", "spserv.mac";
+
+/*моменты взимания/расчета комиссий*/
+CONST COMM_IN_PAYDATE  = "DPD", // В дату оплаты сделки
+      COMM_IN_DEALDATE     = "DSD", // В дату заключения сделки
+      COMM_IN_DELIVERYDATE = "DDD", // В дату поставки сделки
+      COMM_IN_COMPAYDATE   = "DPC"; // В дату оплаты комиссии
+
+CONST ВТБДепо   = "ВТБДепоПериод",
+      БрокерНов = "БрокерНовПериод";
+
+/*Метод пересчета сумм комиссии*/
+PRIVATE CONST CALCCOMISSSUMALG_CALC      = 1, // на день расчета
+              CALCCOMISSSUMALG_PAY       = 2, // На дату оплаты
+              CALCCOMISSSUMALG_BEFOREPAY = 3; // На дату оплаты минус 1 день
+
+/*константы T_INPUTMEDIUM в dlcomis_dbt*/
+CONST INPUTMEDIUM_USE    = 1, // пользовательский
+      INPUTMEDIUM_CALC   = 2, // Расчет
+      INPUTMEDIUM_IMPORT = 3; // Импорт
+
+
+PRIVATE VAR GlobalDealIDForCalc = 0;
+
+MACRO SetGlobalDealIDForCalc(DealID:integer)
+  GlobalDealIDForCalc = DealID;
+END;
+
+/*Получить код субъекта PartyID вида PTCK_CONTR*/
+PRIVATE VAR PartyCode  = TArray();
+PRIVATE MACRO GetPartyContrCode( PartyID:INTEGER ):STRING
+  if( PartyID > 0 )
+     if( PartyCode[PartyID] == null )
+        PartyCode[PartyID] = ПолучитьКодСубъекта( PartyID, PTCK_CONTR );
+     end;
+     return PartyCode[PartyID];
+  end;
+  return "";
+END;
+
+/*Получить все значения категории NumberGroup, заданные для комиссии rCom*/
+PRIVATE MACRO GetCommissionCategs( rCom:TRecHandler, NumberGroup:INTEGER, Categs:TArray )
+   VAR loop,
+       objattr = TRecHandler("objattr.dbt");
+ 
+   objattr.clear();
+   loop = ObjAttr_FindFirst( objattr, OBJTYPE_SFCOMISS, UniID( rCom, OBJTYPE_SFCOMISS), NumberGroup );
+   while( loop == 0 )          
+      Categs[Categs.Size] = objattr.rec.NameObject;
+      loop = ObjAttr_FindNext( objattr );
+   end;
+   ObjAttr_FindClose();   
+END;
+
+/*Добавить сумму по сделке для расчета механизмом ПЗО*/
+PRIVATE VAR bassum = TRecHandler("sfbassum.str");
+PRIVATE MACRO InsertBaseSum( DealType:INTEGER, DealID:INTEGER, Summa:MONEY, FIID:INTEGER ):BOOL
+  bassum.Clear();
+  bassum.rec.baseType        = 1/*SF_BASETYPE_SUM*/;
+  bassum.rec.baseType2       = bassum.rec.baseType;
+  bassum.rec.baseSum         = Summa;
+  bassum.rec.baseSum2        = bassum.rec.baseSum;
+  bassum.rec.FIID_baseSum    = FIID;
+  bassum.rec.FIID_baseSum2   = bassum.rec.FIID_baseSum;
+  bassum.rec.BaseObjectType  = DealType;
+  bassum.rec.BaseObjectID    = DealID;
+  if( InsertSumList( bassum ) )
+     MsgBox( "Ошибка при вставке базовой суммы по сделке.\n" + GetErrMsg() );
+     return false;
+  end;
+
+  return true;
+END;
+
+
+PRIVATE MACRO InsertBaseSumUsr( DealType:INTEGER, DealID:INTEGER, Summa:MONEY, FIID:INTEGER, PFIID:INTEGER):BOOL
+  bassum.Clear();
+  bassum.rec.baseType        = 1/*SF_BASETYPE_SUM*/;
+  bassum.rec.baseType2       = bassum.rec.baseType;
+  bassum.rec.baseSum         = Summa;
+  bassum.rec.baseSum2        = bassum.rec.baseSum;
+  bassum.rec.FIID_baseSum    = FIID;
+  bassum.rec.FIID_baseSum2   = bassum.rec.FIID_baseSum;
+  bassum.rec.BaseObjectType  = DealType;
+  bassum.rec.BaseObjectID    = DealID;
+  bassum.rec.DocFiid         = pFiid;
+
+  if( InsertSumList( bassum ) )
+     MsgBox( "Ошибка при вставке базовой суммы по сделке.\n" + GetErrMsg() );
+     return false;
+  end;
+
+  return true;
+END;
+
+/******************************************************************************
+ Комиссия
+  _CommNumber  - номер/буффер комиссии
+  _Type - тип комиссии
+*******************************************************************************/
+CLASS CCommission( _Comiss:VARIANT, _Type:INTEGER )
+  PRIVATE VAR v_IsBroker = NULL, v_CalcMom:TArray = NULL, v_PayMom:TArray = NULL;
+
+  PRIVATE VAR v_rComiss  = NULL,
+              Comiss     = _Comiss,
+              Type       = _Type;
+
+  MACRO rComiss():TRecHandler
+     if( v_rComiss == NULL )
+
+        if( ValType(Comiss) == V_GENOBJ ) /*TRecHandler/TBFile*/
+           v_rComiss = Comiss;
+        elif( (ValType(Comiss) == V_INTEGER) AND (Comiss > 0) ) /*CommNumber*/
+           v_rComiss  = TRecHandler( "sfcomiss.dbt" );
+
+           if( SfGetComiss( Type, Comiss, v_rComiss ) == false ) 
+              RunError( "Не найдена единовременная комиссия с номером <"+ Comiss +"> (класс CCommission)" );
+           end;   
+        else
+           RunError( "Неверный тип параметра <_Comiss> в конструкторе класса CCommission" );
+        end;
+     end;
+     return v_rComiss;
+  END;
+
+  /*Нпличие значения _Value в массиве Arr*/
+  PRIVATE MACRO Exists( Arr:TArray, _Value:VARIANT ):BOOL
+    VAR i = 0;
+
+    if( Arr )
+       while( i < Arr.Size )
+          if( Arr[i] == _Value )
+             return true;
+          end;
+          i = i + 1;
+       end;
+    end;
+    return false;
+  END;
+
+  MACRO ПроверитьМоментРасчета()
+    if( v_CalcMom == NULL )
+      v_CalcMom = TArray();
+      GetCommissionCategs( this.rComiss, 5 /*номер категории "Момент расчета комиссии"*/, v_CalcMom );
+    end;
+
+    if( (Exists( v_CalcMom, COMM_IN_PAYDATE )  == false) AND (Exists( v_CalcMom, COMM_IN_DEALDATE ) == false) )
+//       MsgBox( "В настройках комиссии " + rComiss.rec.Code + " не указано, в какую дату должен выполняться расчет (значение категории \"Момент расчета\")." );
+       return false;
+    end;              
+
+    if( Exists( v_CalcMom, COMM_IN_PAYDATE )  AND Exists( v_CalcMom, COMM_IN_DEALDATE ) )
+       MsgBox( "В настройках комиссии " + rComiss.rec.Code + "| указаны две даты расчета (значения категории \"Момент расчета\")." );
+       return false;
+    end;
+
+    return true;
+  END;
+
+  /*Проверить заданность значения _Value для категории комиссии МоментРасчета*/
+  MACRO МоментРасчета( _Value:STRING ):BOOL
+     if(this.ПроверитьМоментРасчета() == false)
+       return false;
+     end;
+     return Exists( v_CalcMom, _Value );
+  END;
+
+  /*Проверить заданность значения _Value для категории комиссии МоментРасчета*/
+  /*если не нашли - не ругаемся*/
+  MACRO МоментРасчета_2( _Value:STRING ):BOOL
+     if( v_CalcMom == NULL )
+        v_CalcMom = TArray();
+        GetCommissionCategs( this.rComiss, 5 /*номер категории "Момент расчета комиссии"*/, v_CalcMom );
+        if( Exists( v_CalcMom, COMM_IN_PAYDATE )  AND Exists( v_CalcMom, COMM_IN_DEALDATE ) AND Exists( v_CalcMom, COMM_IN_DELIVERYDATE ) AND Exists( v_CalcMom, COMM_IN_COMPAYDATE ) )
+           MsgBox( "В настройках комиссии " + rComiss.rec.Code + "| указан больше одной даты расчета (значения категории \"Момент расчета\")." );
+           return false;
+        end;   
+     end;
+     return Exists( v_CalcMom, _Value );
+  END;
+
+  /*Проверить заданность значения _Value для категории комиссии МоментВзимания*/
+  MACRO МоментВзимания( _Value:STRING ):BOOL
+     if( v_PayMom == NULL )
+        v_PayMom = TArray();
+        GetCommissionCategs( this.rComiss, 1/*номер категории "Момент взимания комиссии"*/, v_PayMom );
+
+        if( (Exists( v_PayMom, COMM_IN_PAYDATE )  == false) AND (Exists( v_PayMom, COMM_IN_DEALDATE ) == false) )
+           MsgBox( "В настройках комиссии " + rComiss.rec.Code + " не указано, в какую дату выполнять взимание комиссии (значение категории \"Момент взимания\")." );
+           return false;
+        end;              
+
+        if( Exists( v_PayMom, COMM_IN_PAYDATE )  AND Exists( v_PayMom, COMM_IN_DEALDATE ) )
+           MsgBox( "В настройках комиссии " + rComiss.rec.Code + "| указаны две даты взимания комиссии (значения категории \"Момент взимания\")." );
+           return false;
+        end;   
+     end;
+     return Exists( v_PayMom, _Value );
+  END;
+
+  /*Проверить заданность значения ВзиматьПоОтмененнымСделкам для категории комиссии МоментРасчета*/
+  MACRO ВзиматьПоОтмененнымСделкам():BOOL
+     return МоментРасчета( "DRD" );
+  END;
+
+  /*это комиссия посреднику*/
+  MACRO IsAgent():BOOL
+     return ( (this.rComiss.rec.ReceiverID > 0) AND (this.rComiss.rec.ReceiverID != {OurBank}) );
+  END;
+
+  /*это комиссия клиента банку*/
+  MACRO IsClient():BOOL
+     return ( (this.rComiss.rec.ReceiverID <= 0) OR (this.rComiss.rec.ReceiverID == {OurBank}) );
+  END;
+
+  /*это комиссия брокеру*/
+  MACRO IsBroker():BOOL
+     if( v_IsBroker == NULL )
+        v_IsBroker = ( this.IsAgent() AND (ВидСубъекта( this.rComiss.rec.ReceiverID, PTK_BROKER ) == true ) );
+     end;
+     return v_IsBroker;
+  END;
+
+  /*Сумма удержанной комиссии */
+  MACRO Сумма():MONEY
+     return $0;
+  END;
+
+  /*сумма НДС удержанной  комиссии */
+  MACRO НДС():MONEY
+     return $0;
+  END;
+
+  /*получатель комиссии*/
+  MACRO Получатель():INTEGER
+    return this.rComiss.rec.ReceiverID;
+  END;
+
+  /*Валюта расчета комиссии (валюта возвращаемой суммы)*/
+  MACRO Валюта():INTEGER
+    return this.rComiss.rec.FIID_Comm;
+  END;
+
+  /*валюта оплаты комиссии*/
+  MACRO ВалютаОплаты():INTEGER
+    if( this.rComiss.rec.FIID_PaySum < 0 ) /*Не задана валюта оплаты комиссии*/
+       return Валюта(); 
+    end;
+    return this.rComiss.rec.FIID_PaySum;
+  END;
+
+  /*сумма вкл. НДС, определяется в зависимости от настроек*/
+  MACRO СуммаВклНДС():MONEY
+     return Сумма() + НДС();
+  END;
+END; /*CCommission*/
+
+/******************************************************************************
+ Объект начисления по периодической комиссии (удерженная период. комиссия)
+*******************************************************************************/
+CLASS (CCommission) CPeriodCalcCom( _BasObj:OBJECT )
+  PRIVATE VAR BasObj = _BasObj;
+
+  initCCommission( BasObj.CommNumber, SF_FEE_TYPE_PERIOD );
+
+  /*Валюта расчета комиссии (валюта возвращаемой суммы)*/
+  MACRO Валюта():INTEGER
+     return BasObj.FIID;
+  END;
+
+  /*сумма комиссии по сделке */
+  MACRO Сумма():MONEY
+     return BasObj.COMMSUM;
+  END;
+
+  /*сумма НДС удержанной  комиссии */
+  MACRO НДС():MONEY
+     return BasObj.NDSSUM;
+  END;
+END; /*CPeriodCalcCom*/
+
+/******************************************************************************
+ Периодическая комиссия
+  _rContr - Договор обслуживания
+  _Comiss (TRecHandler/INTEGER) - буффер или CommNumber
+  _rDefCom - Удержанная комиссия
+*******************************************************************************/
+CLASS (CCommission) CPeriodCommission( _rContr:OBJECT, _Comiss:VARIANT, _DefCom:VARIANT )
+
+  PRIVATE VAR v_rDefCom = NULL,
+              DefCom  = _DefCom;
+
+  VAR rContr = _rContr;
+
+  initCCommission( _Comiss, SF_FEE_TYPE_PERIOD );
+
+  MACRO rDefCom():TRecHandler
+     if( v_rDefCom == NULL )
+
+        if( ValType(DefCom) == V_GENOBJ ) /*TRecHandler/TBFile*/
+           v_rDefCom = DefCom;
+        elif( ValType(DefCom) == V_INTEGER ) 
+           v_rDefCom  = TBFile( "sfdefcom.dbt", "R", 0 );
+
+           v_rDefCom.rec.ID = DefCom;
+           if( v_rDefCom.GetEQ() != true ) 
+              RunError( "Не найдена удерженная комиссия <"+ rComiss.rec.CommNumber +"> по договору "+ rContr.rec.Number+" (класс CPeriodCommission)" );
+           end;   
+        else
+           RunError( "Неверный тип параметра <_DefCom> в конструкторе класса CPeriodCommission" );
+        end;
+     end;
+     return v_rDefCom;
+  END;
+
+  /*Проверить релевантность сделки для расчета по ней период. комиссии*/
+  PRIVATE MACRO IsRelevantDeal( DealID:INTEGER, RejectDate:DATE, BeginDate:DATE, EndDate:DATE ):BOOL
+     var RetVal:bool = true;
+
+     if( (RejectDate != DATE(0,0,0)) AND (RejectDate <= EndDate ) )
+        /* был отказ от исполнения сделки за дату <= дате расчета */
+        if( ВзиматьПоОтмененнымСделкам() == false )
+           RetVal = false;
+        end;
+     end;
+
+     return RetVal;
+  END;
+
+  PRIVATE MACRO IsPervRazm(deal)
+     var AttrVal = "";
+     var CodeStr = "", err;
+     GetRegistryValue( "РСХБ\\БРОКЕРСКОЕ ОБСЛУЖИВАНИЕ\\ПЕРВИЧ_РАЗМЕЩ_РЕЖИМЫ_ТОРГОВ", V_STRING, CodeStr, err );
+     If( not GetMainObjAttr(null, OBJTYPE_SECDEAL, l_z(deal.rec.dealid, 34), 106, null, null, AttrVal))
+        return false;
+     end;
+
+  var TempStr = "", TempVal = "", i = 0;
+   var Rez = TArray();
+   while(Index(Codestr, ",") != 0)
+      TempVal = Trim(Substr(Codestr, 1, Index(Codestr, ",")-1));
+      Codestr = Trim(Substr(Codestr, Index(Codestr, ",")+1));
+      Rez[i] = TempVal;
+      i = i+1;
+   end;
+     Rez[i] = Codestr;
+    i = 0;
+         while(i < Rez.size)
+            If(AttrVal  == Rez[i])
+                return true;
+            end; 
+            i = i+1;
+         end;
+
+/*
+     If((AttrVal == "PSAU") OR (AttrVal == "PSSU") )
+         return true;
+     else 
+         return false;
+     end;
+*/
+
+     return false;
+
+  END;
+
+  PRIVATE MACRO IsOwnAvoir(deal)
+     record fin (fininstr); 
+     ПолучитьФинИН(deal.rec.pfi, fin);
+     If(fin.issuer == 1)
+        return true;
+     else
+        return false;
+     end;
+  END;
+
+  /**
+   @brief Проверка на то, что выпуск по сделке является СПЕЦ РЕПО
+   @param[in] deal   структура сделки 
+   @return true, если является, иначе false
+  */
+  PRIVATE MACRO IsSpecRepo(deal):bool
+     var IsSpecRepo:integer = 0;
+     var IsRisk:integer = 0;/*уровень риска клиента*/
+     var dboid:integer = 0;
+     var cmd, DataSet;
+      
+     GetMainObjAttr(null, OBJTYPE_SECDEAL, l_z(deal.rec.dealid, 34), 103, null, null, IsSpecRepo);
+
+     /*CHVA 516982 добавил проверку на наличие категории "Уровень риска " на договоре*/
+     /*Некоторые сделки репо закрываются не трейдерами , а системой квик и получают признак спецрепо, в этом случае необходимо смотреть на наличие категории по договору*/
+     if(IsSpecRepo == 1)
+        cmd = DL_RSDCommand(" SELECT contrmp.t_dlcontrid "
+                          + "   FROM ddlcontrmp_dbt contrmp "
+                          + "  WHERE contrmp.t_sfcontrid = ?");
+                     
+        cmd.addParam(deal.rec.clientcontrid);
+        DataSet = cmd.execute();
+     
+        while(DataSet.moveNext())
+           dboid = DataSet.t_dlcontrid;
+        end;
+        if(dboid != 0) 
+           GetMainObjAttr(null, 207, l_z(dboid, 34), 103, null, null, IsRisk);
+        end;
+        if((IsRisk == 0) and (IsSpecRepo == 1)) 
+           IsSpecRepo = 0;
+        else
+           return true;
+        end;
+     end;
+     /*CHVA 516982*/
+
+     return false;
+  END;
+
+  /**
+   @brief Проверка на то, что выпуск по сделке не является структурной нотой, выплаты по которой зависят от изменения величины процентных ставок
+   @param[in] deal   структура сделки 
+   @return true, если не является, иначе false
+  */
+  PRIVATE MACRO IsNotNoteWithPercRates(deal):bool
+     var IsNotPercRates:integer = 0;
+
+     GetMainObjAttr(null, OBJTYPE_AVOIRISS, l_z(deal.rec.PFI, 10), 132, null, null, IsNotPercRates);
+     if(IsNotPercRates == 1)
+        return true;
+     end;
+
+     return false;
+  END;
+
+  /**
+   @brief Поиск тарифного плана на дату комиссии
+   @param[in] SfContrID   идентификатор субдоговора
+   @param[in] ComissDate  дата комиссии 
+   @return идентификатор тарифного плана
+  */
+  PRIVATE MACRO GetContrSfPlanID(SfContrID:integer, ComissDate:date):integer
+     var cmdTP, DataSetTP;
+
+     cmdTP = DL_RSDCommand("select plan.T_SFPLANID "+
+                           "  from DSFCONTRPLAN_DBT plan "+
+                           " where plan.T_SFCONTRID  = ? "+
+                           "   and plan.T_BEGIN <= ? "+
+                           "   and (plan.T_END = to_date('01.01.0001','DD.MM.YYYY') or plan.T_END >= ?) "
+                          );
+     cmdTP.addParam(SfContrID);
+     cmdTP.addParam(ComissDate);
+     cmdTP.addParam(ComissDate);
+     DataSetTP = cmdTP.execute();
+     if(DataSetTP.MoveNext())
+        return DataSetTP.rec.SFPLANID;
+     end;
+        
+     return 0; //индивидуальный тарифный план
+  END;
+
+  /**
+   @brief Проверка на то, что сделка облагается в соответствии с отдельной тарификацией для заблокированных ЦБ
+   @param[in] deal   структура сделки 
+   @return true, если является, иначе false
+  */
+  PRIVATE MACRO IsBlocked(deal):bool
+     var IsBlockedDeal:integer = 0;
+     var IsNotSeparateBlocked:integer = 0; 
+ 
+     GetMainObjAttr(null, OBJTYPE_SECDEAL, l_z(deal.rec.DealID, 34), 119, null, null, IsBlockedDeal);
+     if(IsBlockedDeal == 1)
+        GetMainObjAttr(null, OBJTYPE_SFPLAN, l_z(GetContrSfPlanID(deal.rec.ClientContrID, deal.rec.DealDate), 10), 104, null, null, IsNotSeparateBlocked);
+        if(IsNotSeparateBlocked != 1)       
+           return true;
+        end;
+     end;
+ 
+     return false;
+   END;
+
+  /**
+   @brief Проверка на то, что сделка облагается в соответствии с отдельной тарификацией для сделок замещения ЦБ
+   @param[in] deal   структура сделки 
+   @return true, если является, иначе false
+  */
+  PRIVATE MACRO IsReplacement(deal):bool
+     var IsReplacementDeal:integer = 0;
+     var IsNotSeparateReplacement:integer = 0; 
+ 
+     GetMainObjAttr(null, OBJTYPE_SECDEAL, l_z(deal.rec.DealID, 34), 120, null, null, IsReplacementDeal);
+     if(IsReplacementDeal == 1)
+        GetMainObjAttr(null, OBJTYPE_SFPLAN, l_z(GetContrSfPlanID(deal.rec.ClientContrID, deal.rec.DealDate), 10), 105, null, null, IsNotSeparateReplacement);
+        if(IsNotSeparateReplacement != 1)       
+           return true;
+        end;
+     end;
+ 
+     return false;
+   END;
+ 
+   PRIVATE MACRO IsRelevantDeal_Usr( DealID:INTEGER, RejectDate:DATE, BeginDate:DATE, EndDate:DATE ):BOOL
+      private var Deal = TBFile( "dl_tick.dbt", "R", 0 );
+      var RetVal:bool = false;
+      var Group;
+
+     if( (RejectDate != DATE(0,0,0)) AND (RejectDate <= EndDate ) )
+        /* был отказ от исполнения сделки за дату <= дате расчета */
+        if( ВзиматьПоОтмененнымСделкам() == false )
+           RetVal = false;
+        end;
+     end;
+
+     Deal.Clear();
+     Deal.rec.DealID = DealID;
+     if( Deal.GetEQ() == false )
+        return false;
+     end;
+     
+     Group = SP_GetOperationGroup( Deal.rec ); 
+
+     if(   ( this.rComiss.rec.Code == "ПАОМскБирж_RUR" )       
+        or ( this.rComiss.rec.Code == "ПАОМскБирж_USD" )
+        or ( this.rComiss.rec.Code == "ПАОМскБирж_EUR" )
+        or ( this.rComiss.rec.Code == "ПАОМскБирж_CHF" )
+        or ( this.rComiss.rec.Code == "ПАОМскБирж_CNY" )
+       )
+        RetVal = ( IsClientDeal( Deal.rec ) AND
+                   IsEXCHANGE(Group, true) and (not isRepo(Group))
+                 );
+     elif(   ( this.rComiss.rec.Code == "БрокерКомпенсац_RUR" )       
+        or ( this.rComiss.rec.Code == "БрокерКомпенсац_USD" )
+        or ( this.rComiss.rec.Code == "БрокерКомпенсац_EUR" )
+        or ( this.rComiss.rec.Code == "БрокерКомпенсац_CHF" )
+       )
+        RetVal = ( IsClientDeal( Deal.rec ) AND
+                   IsEXCHANGE(Group, true) and (not IsPervRazm(deal)) and (not isRepo(Group))
+                 );
+     elif(   ( this.rComiss.rec.Code == "ПАОМскБиржПерв_RUR" )       
+        or ( this.rComiss.rec.Code == "ПАОМскБиржПерв_USD" )
+        or ( this.rComiss.rec.Code == "ПАОМскБиржПерв_EUR" )
+        or ( this.rComiss.rec.Code == "ПАОМскБиржПерв_CHF" )
+        or ( this.rComiss.rec.Code == "ПАОМскБиржПерв_CNY" )
+       )
+        RetVal = ( IsClientDeal( Deal.rec ) AND
+                   IsEXCHANGE(Group, true) and (not isRepo(Group)) and IsPervRazm(deal)
+                 );
+/*БИ 8786*/
+     elif(   ( this.rComiss.rec.Code == "ПАОМскБиржПервРСХБ_RUR" )       
+        or ( this.rComiss.rec.Code == "ПАОМскБиржПервРСХБ_USD" )
+        or ( this.rComiss.rec.Code == "ПАОМскБиржПервРСХБ_EUR" )
+        or ( this.rComiss.rec.Code == "ПАОМскБиржПервРСХБ_CHF" )
+        or ( this.rComiss.rec.Code == "ПАОМскБиржПервРСХБ_CNY" )
+         )
+        RetVal = ( IsClientDeal( Deal.rec ) AND
+                   IsEXCHANGE(Group, true) and (not isRepo(Group)) and IsPervRazm(deal) and IsOwnAvoir(deal)
+                 );
+     elif(   ( this.rComiss.rec.Code == "ПАОМскБиржПервСТОР_RUR" )
+        or ( this.rComiss.rec.Code == "ПАОМскБиржПервСТОР_USD" )
+        or ( this.rComiss.rec.Code == "ПАОМскБиржПервСТОР_EUR" )
+        or ( this.rComiss.rec.Code == "ПАОМскБиржПервСТОР_CHF" )
+        or ( this.rComiss.rec.Code == "ПАОМскБиржПервСТОР_CNY" )
+         )
+        RetVal = ( IsClientDeal( Deal.rec ) AND
+                   IsEXCHANGE(Group, true) and (not isRepo(Group)) and IsPervRazm(deal) and (not IsOwnAvoir(deal))
+                 );
+     elif(   ( this.rComiss.rec.Code == "ПАОМскБиржПервСТОРНОТЫПС_RUR" )
+        or ( this.rComiss.rec.Code == "ПАОМскБиржПервСТОРНОТЫПС_USD" )
+        or ( this.rComiss.rec.Code == "ПАОМскБиржПервСТОРНОТЫПС_EUR" )
+        or ( this.rComiss.rec.Code == "ПАОМскБиржПервСТОРНОТЫПС_CNY" )
+         )
+        RetVal = ( IsClientDeal( Deal.rec ) AND
+                   IsEXCHANGE(Group, true) and (not isRepo(Group)) and IsPervRazm(deal) and (not IsOwnAvoir(deal)) and 
+                   IsBUY(Group) and (not IsNotNoteWithPercRates(deal))
+                 );
+     elif(   ( this.rComiss.rec.Code == "ПАОМскБиржПервСТОРНОТЫНЕПС_RUR" )
+        or ( this.rComiss.rec.Code == "ПАОМскБиржПервСТОРНОТЫНЕПС_USD" )
+        or ( this.rComiss.rec.Code == "ПАОМскБиржПервСТОРНОТЫНЕПС_EUR" )
+        or ( this.rComiss.rec.Code == "ПАОМскБиржПервСТОРНОТЫНЕПС_CNY" )
+         )
+        RetVal = ( IsClientDeal( Deal.rec ) AND
+                   IsEXCHANGE(Group, true) and (not isRepo(Group)) and IsPervRazm(deal) and (not IsOwnAvoir(deal)) and 
+                   IsBUY(Group) and IsNotNoteWithPercRates(deal)
+                 );
+     elif(   ( this.rComiss.rec.Code == "ПАОМскБиржБаз_RUR" )       
+        or ( this.rComiss.rec.Code == "ПАОМскБиржБаз_USD" )
+        or ( this.rComiss.rec.Code == "ПАОМскБиржБаз_EUR" )
+        or ( this.rComiss.rec.Code == "ПАОМскБиржБаз_CHF" )
+        or ( this.rComiss.rec.Code == "ПАОМскБиржБаз_CNY" )
+       )
+        RetVal = ( IsClientDeal( Deal.rec ) AND
+                   IsEXCHANGE(Group, true) and (not isRepo(Group)) and (not IsPervRazm(deal))
+                 );
+     elif( ( this.rComiss.rec.Code == "НеБирж_RUR" )      
+        or ( this.rComiss.rec.Code == "НеБирж_USD" )
+        or ( this.rComiss.rec.Code == "НеБирж_GBP" )
+        or ( this.rComiss.rec.Code == "НеБирж_EUR" )
+        or ( this.rComiss.rec.Code == "НеБиржБезНот_RUR" )
+        or ( this.rComiss.rec.Code == "НеБиржБезНот_USD" )
+        or ( this.rComiss.rec.Code == "НеБиржБезНот_GBP" )
+        or ( this.rComiss.rec.Code == "НеБиржБезНот_EUR" )
+        or ( this.rComiss.rec.Code == "НеБиржБезНотНов_RUR" )
+        or ( this.rComiss.rec.Code == "НеБиржБезНотНов_USD" )
+        or ( this.rComiss.rec.Code == "НеБиржБезНотНов_GBP" )
+        or ( this.rComiss.rec.Code == "НеБиржБезНотНов_EUR" )
+        or ( this.rComiss.rec.Code == "НеБиржНоты_RUR" )
+        or ( this.rComiss.rec.Code == "НеБиржНоты_USD" )
+        or ( this.rComiss.rec.Code == "НеБиржНоты_GBP" )
+        or ( this.rComiss.rec.Code == "НеБиржНоты_EUR" )
+         )
+        RetVal = ( IsClientDeal( Deal.rec ) AND
+                   IsOutEXCHANGE(Group, true) and (not isRepo(Group)) and (not IsBlocked(deal)) and (not IsReplacement(deal))  
+                 );
+     elif( ( this.rComiss.rec.Code == "НеБиржБлокЦБ_RUR" )      
+        or ( this.rComiss.rec.Code == "НеБиржБлокЦБ_USD" )
+        or ( this.rComiss.rec.Code == "НеБиржБлокЦБ_EUR" )
+         )
+        RetVal = ( IsClientDeal( Deal.rec ) AND
+                   IsOutEXCHANGE(Group, true) and (not isRepo(Group)) and IsBlocked(deal) and (not IsReplacement(deal))  
+                 );
+     elif( ( this.rComiss.rec.Code == "НеБиржЗамещение_RUR" )      
+        or ( this.rComiss.rec.Code == "НеБиржЗамещение_USD" )
+        or ( this.rComiss.rec.Code == "НеБиржЗамещение_EUR" )
+         )
+        RetVal = ( IsClientDeal( Deal.rec ) AND
+                   IsOutEXCHANGE(Group, true) and (not isRepo(Group)) and IsReplacement(deal) and (not IsBUY(Group)) 
+                 );
+     elif( ( this.rComiss.rec.Code == "РЕПО_RUR" )      
+        or ( this.rComiss.rec.Code == "РЕПО_USD" )
+        or ( this.rComiss.rec.Code == "РЕПО_EUR" )      
+        or ( this.rComiss.rec.Code == "РЕПО_CHF" )      
+        or ( this.rComiss.rec.Code == "РЕПО_CNY" )         
+         )
+        RetVal = ( IsClientDeal( Deal.rec ) AND isRepo(Group) and (not IsSpecRepo(deal))
+                 );
+     elif( ( this.rComiss.rec.Code == "СПЕЦРЕПО_RUR" )      
+        or ( this.rComiss.rec.Code == "СПЕЦРЕПО_USD" )
+        or ( this.rComiss.rec.Code == "СПЕЦРЕПО_EUR" )      
+        or ( this.rComiss.rec.Code == "СПЕЦРЕПО_CNY" )      
+         )         
+        RetVal = ( IsClientDeal( Deal.rec ) AND isRepo(Group) and IsSpecRepo(deal)
+                 );
+     end;
+
+     return RetVal;
+  END;
+
+
+  /* Расчитать базовую сумму периодической комиссии по каждой подходящей сделке и вставить в список сумм для расчета ПЗО*/
+  /* расчет при закрытии тогорвого  дня*/
+  MACRO CalculateBaseSum_TDF( BeginDate:DATE, EndDate:DATE ):BOOL
+     VAR cmd, rs, ClientID, DateCond = "";
+
+     if( (EndDate == NULL) OR (EndDate == DATE(0,0,0)) )
+        EndDate = BeginDate;
+     end;
+
+     if( this.rContr.rec.PartyID == {OurBank} ) 
+        ClientID = -1;
+     else 
+        ClientID = this.rContr.rec.PartyID;
+     end;
+
+     if( this.IsAgent() )
+        DateCond = " AND Deal.t_DealDate  between ?/*8*/ AND ? /*9*/ ";
+     elif( this.IsClient() )
+        if( this.МоментРасчета( COMM_IN_DEALDATE ) )
+           DateCond = " AND Deal.t_DealDate  between ?/*8*/ AND ? /*9*/ ";
+        elif( this.МоментРасчета( COMM_IN_PAYDATE ) )
+           DateCond = " AND RQ.t_FactDate between ?/*8*/ AND ? /*9*/ ";
+        end;
+     else
+        return false;
+     end;
+     cmd = RSDCommand( "SELECT Deal.t_BofficeKind, Deal.t_DealID, Deal.t_ClientID, "+
+                       "       Leg.t_RejectDate, "
+                       "       RQ.t_Amount BaseSum, RQ.t_FIID BaseSumFIID"+
+                       "  FROM ddl_tick_dbt Deal, DDLRQ_DBT RQ, ddl_leg_dbt Leg"+
+                       " WHERE Deal.t_BofficeKind = ? /*0*/ " +
+                       "   AND Deal.t_DealStatus  = ? /*1*/ " +
+                       "   AND Deal.t_DealDate   >= ? /*2*/" +
+                       "   AND Leg.t_DealID  = Deal.t_DealID " +
+                       "   AND Leg.t_LegKind = " + LEG_KIND_DL_TICK +
+                       "   AND Leg.t_LegID   = 0 " +
+                       "   AND RQ.t_DocKind = Deal.t_BofficeKind " +
+                       "   AND RQ.t_DOCID = Deal.t_DealID " +
+                       "   AND RQ.t_DEALPART = 1 " + 
+                       "   AND RQ.t_Type = ? "+ 
+                       "   AND RQ.t_SUBKIND = ? " +
+                       "   AND ((Deal.t_ClientID   = ?/*4*/" +
+                       "        AND ( (     Deal.t_ClientID > 0 " +
+                       "                AND Deal.t_ClientContrID = ?/*5*/ " +  
+                       "              ) OR " +
+                       "              ( Deal.t_ClientID <= 0 ) "+
+                       "            ) " + 
+                       "        ) OR " +
+                       "        (Deal.t_PartyID = ? /*6*/ AND Deal.t_PartyContrID = ? /*7*/ ) " +
+                       "       )" +
+                       DateCond +
+                       "   AND ( (Deal.t_ClientID > 0) or " +
+                       "         (RSB_SECUR.RSI_GetSfContrID(Deal.t_DealID) = ? /*10*/ ) " +
+                       "       ) "
+                       "   AND ( ((?/*11*/ = 'КлиентМскБирж') and (Deal.t_ClientID > 0) and (RSB_SECUR.ISEXCHANGE(rsb_secur.get_OperationGroup(rsb_secur.get_OperSysTypes(Deal.t_DealType, Deal.t_BofficeKind)), 1) = 1)) or " +
+                       "         ((?/*12*/ = 'КлиентБрокер') and (Deal.t_ClientID > 0) and (RSI_RSBPARTY.PT_GetPartyCode(Deal.t_BrokerID, 1) = '" + BROKER_CODE + "')) or " +
+                       "         ((?/*13*/ = 'БрокерСчёт') and (RSI_RSBPARTY.PT_GetPartyCode(Deal.t_BrokerID, 1) = '" + BROKER_CODE + "')) or" +
+                  "         ((?/*14*/ = 'ПАОМскБирж' and Deal.t_dealtype in (2143, 2144, 2153, 2154))) or"+
+                  "         ((?/*15*/ = 'НеБирж' and Deal.t_dealtype in (2183,2193)))"+
+                       "       ) "
+                     );
+
+     cmd.NullConversion = true;
+     cmd.addParam( "", RSDBP_IN, DL_SECURITYDOC ); /*0*/
+     cmd.addParam( "", RSDBP_IN, DL_READIED );     /*1*/
+     cmd.addParam( "", RSDBP_IN, BeginDate );      /*2*/
+     cmd.addParam( "", RSDBP_IN, DLRQ_TYPE_PAYMENT ); 
+     cmd.addParam( "", RSDBP_IN, DLRQ_SUBKIND_CURRENCY ); 
+     cmd.addParam( "", RSDBP_IN, ClientID );       /*4*/
+     cmd.addParam( "", RSDBP_IN, this.rContr.rec.ID );  /*5*/
+     cmd.addParam( "", RSDBP_IN, ClientID );       /*6*/
+     cmd.addParam( "", RSDBP_IN, this.rContr.rec.ID );  /*7*/
+     cmd.addParam( "", RSDBP_IN, BeginDate );      /*8*/
+     cmd.addParam( "", RSDBP_IN, EndDate );        /*9*/
+     cmd.addParam( "", RSDBP_IN, this.rContr.rec.ID );  /*10*/
+     cmd.addParam( "", RSDBP_IN, this.rComiss.rec.Code );  /*11*/
+     cmd.addParam( "", RSDBP_IN, this.rComiss.rec.Code );  /*12*/
+     cmd.addParam( "", RSDBP_IN, this.rComiss.rec.Code );  /*13*/
+    cmd.addParam( "", RSDBP_IN, this.rComiss.rec.Code );  /*14*/
+    cmd.addParam( "", RSDBP_IN, this.rComiss.rec.Code );  /*15*/
+
+     cmd.execute();
+     rs = TRsbDataSet( cmd );
+     while( rs.MoveNext() )
+        if( IsRelevantDeal_USR( rs.DealID, SQL_ConvTypeDate(rs.RejectDate), BeginDate, EndDate ) )
+           if( InsertBaseSum( rs.BofficeKind, rs.DealID, rs.BaseSum, rs.BaseSumFIID ) != true )
+              return false;
+           end;
+        end;
+     end;
+
+     return true;
+  END;
+
+  /* Расчитать базовую сумму периодической комиссии по каждой подходящей сделке и вставить в список сумм для расчета ПЗО*/
+  /* в операции расчета комиссий в БОЦБ*/
+  MACRO CalculateBaseSum_DC( BeginDate:DATE, EndDate:DATE ):BOOL
+     VAR cmd, rs, ClientID, DateCond = "", query_com = "", query_total = "", ЗаданМоментРасчета = false;
+ 
+     var AllSumm = $0, BaseSum = $0, cmdall, rsall,query_comall = "", kind, id; // ААИ
+
+
+     if( (EndDate == NULL) OR (EndDate == DATE(0,0,0)) )
+        EndDate = BeginDate;
+     end;
+
+     if( this.МоментРасчета_2( COMM_IN_COMPAYDATE ) )
+        DateCond = " AND decode(tick.t_CommDate, to_date('01.01.0001','DD.MM.YYYY'), tick.t_DealDate, tick.t_CommDate) = ? ";
+        ЗаданМоментРасчета = true;
+     elif( this.МоментРасчета_2( COMM_IN_DELIVERYDATE ) )/*"дата поставки"*/
+        DateCond = " AND RQ_avr.t_PlanDate = ? ";
+        ЗаданМоментРасчета = true;
+     elif( this.МоментРасчета_2( COMM_IN_PAYDATE ) )/*"дата оплаты"*/
+        DateCond = " AND RQ_cur.t_PlanDate = ? ";
+        ЗаданМоментРасчета = true;
+     end;
+     /*общая часть для 1 и 2 часте сделок*/
+     query_com = "SELECT Leg1.t_ID  as legid, Leg1.t_LegKind as legkind,  Leg1.t_RejectDate as RejectDate,  "+
+                 "       leg1.t_payfiid as PayFIID, leg1.t_cfi as DealFIID, tick.t_dealid as dealid, "+
+                 "       (case when rsb_secur.IsRepo(rsb_secur.get_OperationGroup(rsb_secur.get_OperSysTypes(tick.t_DealType, tick.t_BofficeKind)))=1 "+
+                 "            then /*decode(( leg2.t_expiry - leg1.t_expiry ), 0, 1, ( leg2.t_expiry - leg1.t_expiry ))**/leg1.t_cost                      "+
+                 "            else leg1.t_cost "+
+                 "        end) as BaseSum, leg1.t_cost "+
+                 "  FROM ddl_tick_dbt tick, ddl_leg_dbt Leg1, ddl_leg_dbt Leg2 "+
+                 " WHERE     tick.t_BofficeKind  = ? " +/*пока только по сделкам (уточнила, что паи , погашения не нужны)*/
+                 "       AND tick.t_DealStatus  != ? " +
+                 "       AND decode(tick.t_CommDate, to_date('01.01.0001','DD.MM.YYYY'), tick.t_DealDate, tick.t_CommDate) = ? " +
+                 "       AND Leg1.t_DealID       = tick.t_DealID " +
+                 "       AND Leg1.t_LegKind      = ? "+
+                 "       AND Leg1.t_LegID        = 0 " +
+                 "       AND Leg2.t_DealID (+)   = tick.t_DealID " +
+                 "       AND Leg2.t_LegKind (+)  = ? "+
+                 "       and tick.t_ClientID     =  ?" +
+                 "       and tick.t_ClientContrID     =  ?" +
+                 "            " +DateCond;
+     
+     if(GlobalDealIDForCalc > 0)
+       query_com = query_com + " and tick.t_DealID = ? ";
+     end;
+
+query_com = query_com + " UNION ALL " +
+      " SELECT Leg1.t_ID  as legid, Leg1.t_LegKind as legkind,  Leg1.t_RejectDate as RejectDate,  "+
+                 "       leg1.t_payfiid as PayFIID, leg1.t_cfi as DealFIID, tick.t_dealid as dealid, "+
+                 "       (case when rsb_secur.IsRepo(rsb_secur.get_OperationGroup(rsb_secur.get_OperSysTypes(tick.t_DealType, tick.t_BofficeKind)))=1 "+
+                 "            then /*decode(( leg2.t_expiry - leg1.t_expiry ), 0, 1, ( leg2.t_expiry - leg1.t_expiry ))**/leg1.t_cost                      "+
+                 "            else leg1.t_cost "+
+                 "        end) as BaseSum, leg1.t_cost "+
+                 "  FROM ddl_tick_dbt tick, ddl_leg_dbt Leg1, ddl_leg_dbt Leg2, dsfcontr_dbt sf1, dsfcontr_dbt sf2, ddlcontrmp_dbt mp1, ddlcontrmp_dbt mp2 "+
+                 " WHERE     tick.t_BofficeKind  = ? " +/*пока только по сделкам (уточнила, что паи , погашения не нужны)*/
+                 "       AND tick.t_DealStatus  != ? " +
+                 "       AND decode(tick.t_CommDate, to_date('01.01.0001','DD.MM.YYYY'), tick.t_DealDate, tick.t_CommDate) = ? " +
+                 "       AND Leg1.t_DealID       = tick.t_DealID " +
+                 "       AND Leg1.t_LegKind      = ? "+
+                 "       AND Leg1.t_LegID        = 0 " +
+                 "       AND Leg2.t_DealID (+)   = tick.t_DealID " +
+                 "       AND Leg2.t_LegKind (+)  = ? "+
+                 "       and tick.t_ClientID     =  ?" +
+                 "        AND sf1.t_id = ? " +
+                 "        AND sf1.t_servkind = 1 " +
+                 "        AND SF1.T_SERVKINDSUB = 8 " +
+                 "        AND sf2.t_id != sf1.t_id " +
+                 "        AND sf2.t_servkind = 1 " +
+                 "        AND sf2.T_SERVKINDSUB = 8 " +
+                 "        AND mp1. t_sfcontrid = sf1.t_id " +
+                 "        AND mp2.t_dlcontrid = mp1.t_dlcontrid " +
+                 "        AND mp2.t_sfcontrid = sf2.t_id " +
+                 "        AND tick.t_ClientContrID = sf2.t_id " +
+//                 "       and tick.t_ClientContrID     =  ?" +
+                 "            " +DateCond;
+     
+     if(GlobalDealIDForCalc > 0)
+       query_com = query_com + " and tick.t_DealID = ? ";
+     end;
+
+     
+     cmd = DL_RSDCommand(query_com);   
+
+     cmd.addParam(DL_SECURITYDOC);
+     cmd.addParam(DL_CLOSED); 
+//     cmd.addParam(BeginDate);    
+     cmd.addParam(EndDate);    
+     cmd.addParam(LEG_KIND_DL_TICK);/*1ч*/
+     cmd.addParam(LEG_KIND_DL_TICK_BACK);/*2ч*/
+     cmd.addParam(this.rContr.rec.PartyId); 
+     cmd.addParam(this.rContr.rec.Id); 
+
+
+     if( ЗаданМоментРасчета )
+        cmd.addParam(EndDate );         
+     end;
+
+     //JIRA DEF-19808 исправление ошибки.
+     if(GlobalDealIDForCalc > 0)
+       cmd.addParam(GlobalDealIDForCalc);
+     end;
+
+     cmd.addParam(DL_SECURITYDOC);
+     cmd.addParam(DL_CLOSED); 
+//     cmd.addParam(BeginDate);    
+     cmd.addParam(EndDate);    
+     cmd.addParam(LEG_KIND_DL_TICK);/*1ч*/
+     cmd.addParam(LEG_KIND_DL_TICK_BACK);/*2ч*/
+     cmd.addParam(this.rContr.rec.PartyId); 
+     cmd.addParam(this.rContr.rec.Id); 
+
+
+     if( ЗаданМоментРасчета )
+        cmd.addParam(EndDate );         
+     end;
+
+
+
+     if(GlobalDealIDForCalc > 0)
+       cmd.addParam(GlobalDealIDForCalc);
+     end;
+
+     rs = cmd.execute(query_com);
+
+     while( rs.MoveNext() )
+        
+        if( IsRelevantDeal_Usr( rs.DealID, SQL_ConvTypeDate(rs.RejectDate), BeginDate, EndDate) )
+            BaseSum = 0;
+
+        if(   ( this.rComiss.rec.Code == "БрокерКомпенсац_RUR" )       
+           or ( this.rComiss.rec.Code == "БрокерКомпенсац_USD" )
+           or ( this.rComiss.rec.Code == "БрокерКомпенсац_EUR" )
+           or ( this.rComiss.rec.Code == "БрокерКомпенсац_CHF" )
+          )
+              SmartConvertSum(BaseSum, money( rs.cost ), EndDate, rs.DealFIID, NATCUR, false);
+        else
+              SmartConvertSum(BaseSum, money( rs.BaseSum ), EndDate, rs.DealFIID, NATCUR, false);
+        end;
+            if( InsertBaseSumUsr( rs.legKind, rs.legid, BaseSum , NATCUR, rs.DealFIID ) != true )
+                 return false;
+            end;
+       end;
+     end;
+
+     return true;
+  END;
+
+  /* Расчитать базовую сумму периодической комиссии по каждой подходящей сделке и вставить в список сумм для расчета ПЗО*/
+  /* в операции расчета комиссий в БОЦБ с учетом признака структурной облигации (ноты)*/
+  MACRO CalculateBaseSum_DC_NOTE( BeginDate:DATE, EndDate:DATE, is_Note:BOOL ):BOOL
+     VAR cmd, rs, ClientID, DateCond = "", query_com = "", query_total = "", ЗаданМоментРасчета = false;
+     var AllSumm = $0, BaseSum = $0, cmdall, rsall,query_comall = "", kind, id; // ААИ
+
+     if( (EndDate == NULL) OR (EndDate == DATE(0,0,0)) )
+        EndDate = BeginDate;
+     end;
+
+     if( this.МоментРасчета_2( COMM_IN_COMPAYDATE ) )
+        DateCond = " AND decode(tick.t_CommDate, to_date('01.01.0001','DD.MM.YYYY'), tick.t_DealDate, tick.t_CommDate) = ? ";
+        ЗаданМоментРасчета = true;
+     elif( this.МоментРасчета_2( COMM_IN_DELIVERYDATE ) )/*"дата поставки"*/
+        DateCond = " AND RQ_avr.t_PlanDate = ? ";
+        ЗаданМоментРасчета = true;
+     elif( this.МоментРасчета_2( COMM_IN_PAYDATE ) )/*"дата оплаты"*/
+        DateCond = " AND RQ_cur.t_PlanDate = ? ";
+        ЗаданМоментРасчета = true;
+     end;
+
+     /*общая часть для 1 и 2 часте сделок*/
+     query_com = "SELECT Leg1.t_ID  as legid, Leg1.t_LegKind as legkind,  Leg1.t_RejectDate as RejectDate,  "+
+                 "       leg1.t_payfiid as PayFIID, leg1.t_cfi as DealFIID, tick.t_dealid as dealid, "+
+                 "       (case when rsb_secur.IsRepo(rsb_secur.get_OperationGroup(rsb_secur.get_OperSysTypes(tick.t_DealType, tick.t_BofficeKind)))=1 "+
+                 "            then decode(( leg2.t_expiry - leg1.t_expiry ), 0, 1, ( leg2.t_expiry - leg1.t_expiry ))*leg1.t_cost                      "+
+                 "            else leg1.t_cost "+
+                 "        end) as BaseSum, leg1.t_cost, obj.t_code as cfi, "+
+                 "        RSB_SECUR.IsBUY(RSB_SECUR.get_OperationGroup(rsb_secur.get_OperSysTypes (tick.t_DealType, tick.t_BofficeKind))) IsDealBuy"+
+                 "  FROM ddl_tick_dbt tick, ddl_leg_dbt Leg1, ddl_leg_dbt Leg2, dobjcode_dbt obj  "+
+                 " WHERE     tick.t_BofficeKind  = ? " +/*пока только по сделкам (уточнила, что паи , погашения не нужны)*/
+                 "       AND tick.t_DealStatus  != ? " +
+                 "       AND decode(tick.t_CommDate, to_date('01.01.0001','DD.MM.YYYY'), tick.t_DealDate, tick.t_CommDate) = ? " +
+                 "       AND Leg1.t_DealID       = tick.t_DealID " +
+                 "       AND Leg1.t_LegKind      = ? "+
+                 "       AND Leg1.t_LegID        = 0 " +
+                 "       AND Leg2.t_DealID (+)   = tick.t_DealID " +
+                 "       AND Leg2.t_LegKind (+)  = ? "+
+                 "       and tick.t_ClientID     =  ?" +
+                 "       and tick.t_ClientContrID     =  ?" +
+                 "       and obj.t_objecttype(+) = 9" +
+                 "       and obj.t_codekind (+) = 18" +
+                 "       and obj.t_state(+) = 0" +
+                 "       and obj.t_objectid(+) = tick.t_pfi" +
+                 "            " +DateCond;
+     
+     if(GlobalDealIDForCalc > 0)
+       query_com = query_com + " and tick.t_DealID = ? ";
+     end;
+     
+     if(is_Note)//посчитаем только покупки
+       query_com = query_com + "and RSB_SECUR.IsBUY(RSB_SECUR.get_OperationGroup(rsb_secur.get_OperSysTypes (tick.t_DealType, tick.t_BofficeKind))) = 1";
+     end;
+     
+     cmd = DL_RSDCommand(query_com);   
+
+     cmd.addParam(DL_SECURITYDOC);
+     cmd.addParam(DL_CLOSED); 
+     cmd.addParam(EndDate);
+     cmd.addParam(LEG_KIND_DL_TICK);/*1ч*/
+     cmd.addParam(LEG_KIND_DL_TICK_BACK);/*2ч*/
+     cmd.addParam(this.rContr.rec.PartyId);
+     cmd.addParam(this.rContr.rec.Id);
+
+     if( ЗаданМоментРасчета )
+        cmd.addParam(EndDate );
+     end;
+
+     if(GlobalDealIDForCalc > 0)
+       cmd.addParam(GlobalDealIDForCalc);
+     end;
+     rs = cmd.execute(query_com);
+
+     while( rs.MoveNext() )
+       if( IsRelevantDeal_Usr( rs.DealID, SQL_ConvTypeDate(rs.RejectDate), BeginDate, EndDate) )
+         if(((not is_Note) and ((substr(rs.cfi, 1, 2) != "DE") and (substr(rs.cfi, 1, 2) != "DS"))) or (rs.IsDealBuy == 0))
+           BaseSum = 0;
+           SmartConvertSum(BaseSum, money( rs.BaseSum ), EndDate, rs.DealFIID, NATCUR, false);
+           if( InsertBaseSumUsr( rs.legKind, rs.legid, BaseSum , NATCUR, rs.DealFIID ) != true )
+             return false;
+           end;
+         elif((is_Note) and ((substr(rs.cfi, 1, 2) == "DE") or (substr(rs.cfi, 1, 2) == "DS")))//только покупка
+           BaseSum = 0;
+           SmartConvertSum(BaseSum, money( rs.BaseSum ), EndDate, rs.DealFIID, NATCUR, false);
+           if( InsertBaseSumUsr( rs.legKind, rs.legid, BaseSum , NATCUR, rs.DealFIID ) != true )
+             return false;
+           end;
+         end;
+       end
+     end;
+
+     return true;
+  END;
+
+  // расчет базовой суммы периодической комиссии по сделкам валютной брокерки за ед оборот
+  MACRO CalculateBaseSum_BrkCur_EDTURN( BeginDate:DATE, EndDate:DATE, is_Note:BOOL ):BOOL
+     var sqls, rsdc, rsds, BaseSum = 0.00;
+     if( (EndDate == NULL) OR (EndDate == DATE(0,0,0)) )
+        EndDate = BeginDate;
+     end;
+     sqls = String( 
+                    "SELECT Sfc.t_Id CntrId, Dli.t_Fiid, Dli.t_Amount, Dli.t_Pricefiid, Dli.t_Cost, Dl.t_DocKind DealKd, Dl.t_Id DealId   \n"
+                   ,"  FROM Ddvndeal_Dbt Dl   \n"
+                   ," INNER JOIN Ddvnfi_Dbt Dli   \n"
+                   ,"    ON (Dli.t_Dealid = Dl.t_Id)   \n"
+                   ," INNER JOIN Dsfcontr_Dbt Sfc   \n"
+                   ,"    ON (Sfc.t_Id = Dl.t_Clientcontr AND Sfc.t_Servkind = :p_srvk AND Sfc.t_Servkindsub = :p_srvksb)   \n"
+                   ," WHERE Dl.t_Date = :p_dat   \n"
+                   ,"   AND Dl.t_Clientcontr = :p_Sfc   \n"
+                   ,"   AND Dl.t_Client = :p_Prt   \n"
+          ,"   AND Dl.t_DvKind = :p_dvkd   \n"
+                   ,"   AND Dli.t_Type = :p_dlprt   \n"
+                  );
+     rsdc = rsdcommand(sqls);
+     rsdc.AddParam("p_srvk",   RSDBP_IN, 21);
+     rsdc.AddParam("p_srvksb", RSDBP_IN, 8);
+     rsdc.AddParam("p_dat", RSDBP_IN, EndDate);
+     rsdc.AddParam("p_sfc", RSDBP_IN, this.rContr.rec.Id);
+     rsdc.AddParam("p_prt", RSDBP_IN, this.rContr.rec.PartyId);
+     rsdc.AddParam("p_dvkd", RSDBP_IN, 7);
+     rsdc.AddParam("p_dlprt", RSDBP_IN, 0);
+     rsds = rsdrecordset(rsdc, RSDVAL_CLIENT_IF_NEEDED, RSDVAL_FORWARD_ONLY);
+     rsds.Open();
+     while (rsds.MoveNext())
+        BaseSum = 0.0;
+        // поскольку шкала тарифа в рублях - переводим все суммы сделок к рублям, иначе распределение сумм страдает
+        // сумма комиссии ПЗО переведёт к валюте комиссии, сохранить валюту суммы в ("sfbassum.str".DocFiid)
+        SmartConvertSum(BaseSum, money(rsds.Value("t_Cost")), EndDate, int(rsds.Value("t_Pricefiid")), NATCUR, false);
+        if (InsertBaseSumUsr(int(rsds.Value("DealKd")), int(rsds.value("DealId")), BaseSum , NATCUR, int(rsds.Value("t_Pricefiid"))) != true)
+          return false;
+        end;
+     end;    
+     rsds.Close;
+     rsds = null;
+     rsdc = null;
+     return true;
+  onerror(er)
+     rsds = null;
+     rsdc = null;
+     return true;
+  END;
+  
+  // расчет базовой суммы периодической комиссии по сделкам валютной брокерки за спецсвопы
+  MACRO CalculateBaseSum_BrkCur_SPSWAP( BeginDate:DATE, EndDate:DATE, is_Note:BOOL ):BOOL
+     var sqls, rsdc, rsds, BaseSum = 0.00;
+     if( (EndDate == NULL) OR (EndDate == DATE(0,0,0)) )
+        EndDate = BeginDate;
+     end;
+     sqls = String( 
+            "WITH Swp AS   \n"
+           ," (SELECT Sfc.t_Id Cntrid   \n"
+           ,"        ,Dl.t_Dockind Dealkd   \n"
+           ,"        ,Dl.t_Id Dealid   \n"
+           ,"        ,Dl.t_Code   \n"
+           ,"        ,(SELECT MIN(Dlp.t_Id) FROM Ddvnfi_Dbt Dlp WHERE Dlp.t_Dealid = Dl.t_Id) Dli1   \n"
+           ,"        ,(SELECT MAX(Dlp.t_Id) FROM Ddvnfi_Dbt Dlp WHERE Dlp.t_Dealid = Dl.t_Id) Dli2   \n"
+           ,"    FROM Ddvndeal_Dbt Dl   \n"
+           ,"   INNER JOIN Dsfcontr_Dbt Sfc   \n"
+           ,"      ON (Sfc.t_Id = Dl.t_Clientcontr AND Sfc.t_Servkind = :p_Srvk AND Sfc.t_Servkindsub = :p_Srvksb)   \n"
+           ,"   WHERE Dl.t_Date = :p_Dat   \n"
+           ,"     AND Dl.t_Clientcontr = :p_Sfc   \n"
+           ,"     AND Dl.t_Client = :p_Prt   \n"
+           ,"     AND Dl.t_State <= :p_Stt   \n"
+           ,"     AND Dl.t_Dvkind IN (:p_Swap, :p_Swap_Fx))   \n"
+           ,"SELECT Swp.*   \n"
+           ,"      ,Dlp1.t_Cost   \n"
+           ,"      ,Dlp1.t_Pricefiid   \n"
+           ,"      ,Dlp1.t_Execdate   \n"
+           ,"      ,Dlp2.t_Execdate   \n"
+           ,"      ,Dlp1.t_Cost /** (Dlp2.t_Execdate - Dlp1.t_Execdate)*/ BaseSum   \n"
+           ,"  FROM Swp   \n"
+           ," INNER JOIN Ddvnfi_Dbt Dlp1   \n"
+           ,"    ON (Dlp1.t_Id = Swp.Dli1)   \n"
+           ," INNER JOIN Ddvnfi_Dbt Dlp2   \n"
+           ,"    ON (Dlp2.t_Id = Swp.Dli2)   \n"
+          );
+     rsdc = rsdcommand(sqls);
+     rsdc.AddParam("p_srvk",   RSDBP_IN, 21);
+     rsdc.AddParam("p_srvksb", RSDBP_IN, 8);
+     rsdc.AddParam("p_dat", RSDBP_IN, EndDate);
+     rsdc.AddParam("p_sfc", RSDBP_IN, this.rContr.rec.Id);
+     rsdc.AddParam("p_prt", RSDBP_IN, this.rContr.rec.PartyId);
+     rsdc.AddParam("p_Stt", RSDBP_IN, 2);
+     rsdc.AddParam("p_Swap", RSDBP_IN, DV_CURSWAP);
+     rsdc.AddParam("p_Swap_Fx", RSDBP_IN, DV_CURSWAP_FX);
+     rsds = rsdrecordset(rsdc, RSDVAL_CLIENT_IF_NEEDED, RSDVAL_FORWARD_ONLY);
+     rsds.Open();
+     while (rsds.MoveNext())
+        BaseSum = money(rsds.Value("BaseSum"));
+
+        SmartConvertSum(BaseSum, BaseSum, EndDate, int(rsds.Value("t_Pricefiid")), NATCUR, false);
+        if (InsertBaseSum(int(rsds.Value("DealKd")), int(rsds.value("DealId")), BaseSum , NATCUR) != true)
+          return false;
+        end;
+     end;    
+     rsds.Close;
+     rsds = null;
+     rsdc = null;
+     return true;
+  onerror(er)
+     rsds = null;
+     rsdc = null;
+     return true;
+  END;
+
+  // расчет базовой суммы периодической комиссии по сделкам валютной брокерки за спецсвопы для расчета компенсационной комиссии
+  MACRO CalculateBaseSum_BrkCur_SPSWAP_Comp( BeginDate:DATE, EndDate:DATE, is_Note:BOOL ):BOOL
+     var sqls, rsdc, rsds, BaseSum = 0.00;
+     if( (EndDate == NULL) OR (EndDate == DATE(0,0,0)) )
+        EndDate = BeginDate;
+     end;
+     sqls = String( 
+            "WITH Swp AS   \n"
+           ," (SELECT Sfc.t_Id Cntrid   \n"
+           ,"        ,Dl.t_Dockind Dealkd   \n"
+           ,"        ,Dl.t_Id Dealid   \n"
+           ,"        ,Dl.t_Code   \n"
+           ,"        ,(SELECT MIN(Dlp.t_Id) FROM Ddvnfi_Dbt Dlp WHERE Dlp.t_Dealid = Dl.t_Id) Dli1   \n"
+           ,"        ,(SELECT MAX(Dlp.t_Id) FROM Ddvnfi_Dbt Dlp WHERE Dlp.t_Dealid = Dl.t_Id) Dli2   \n"
+           ,"    FROM Ddvndeal_Dbt Dl   \n"
+           ,"   INNER JOIN Dsfcontr_Dbt Sfc   \n"
+           ,"      ON (Sfc.t_Id = Dl.t_Clientcontr AND Sfc.t_Servkind = :p_Srvk AND Sfc.t_Servkindsub = :p_Srvksb)   \n"
+           ,"   WHERE Dl.t_Date = :p_Dat   \n"
+           ,"     AND Dl.t_Clientcontr = :p_Sfc   \n"
+           ,"     AND Dl.t_Client = :p_Prt   \n"
+           ,"     AND Dl.t_State <= :p_Stt   \n"
+           ,"     AND Dl.t_Dvkind IN (:p_Swap, :p_Swap_Fx))   \n"
+           ,"SELECT Swp.*   \n"
+           ,"      ,Dlp1.t_Cost   \n"
+           ,"      ,Dlp1.t_Pricefiid   \n"
+           ,"      ,Dlp1.t_Execdate   \n"
+           ,"      ,Dlp2.t_Execdate   \n"
+           ,"      ,Dlp1.t_Cost  BaseSum   \n"
+           ,"  FROM Swp   \n"
+           ," INNER JOIN Ddvnfi_Dbt Dlp1   \n"
+           ,"    ON (Dlp1.t_Id = Swp.Dli1)   \n"
+           ," INNER JOIN Ddvnfi_Dbt Dlp2   \n"
+           ,"    ON (Dlp2.t_Id = Swp.Dli2)   \n"
+          );
+     rsdc = rsdcommand(sqls);
+     rsdc.AddParam("p_srvk",   RSDBP_IN, 21);
+     rsdc.AddParam("p_srvksb", RSDBP_IN, 8);
+     rsdc.AddParam("p_dat", RSDBP_IN, EndDate);
+     rsdc.AddParam("p_sfc", RSDBP_IN, this.rContr.rec.Id);
+     rsdc.AddParam("p_prt", RSDBP_IN, this.rContr.rec.PartyId);
+     rsdc.AddParam("p_Stt", RSDBP_IN, 2);
+     rsdc.AddParam("p_Swap", RSDBP_IN, DV_CURSWAP);
+     rsdc.AddParam("p_Swap_Fx", RSDBP_IN, DV_CURSWAP_FX);
+     rsds = rsdrecordset(rsdc, RSDVAL_CLIENT_IF_NEEDED, RSDVAL_FORWARD_ONLY);
+     rsds.Open();
+     while (rsds.MoveNext())
+        BaseSum = money(rsds.Value("BaseSum"));
+        if (InsertBaseSum(int(rsds.Value("DealKd")), int(rsds.value("DealId")), BaseSum , int(rsds.Value("t_Pricefiid"))) != true)
+          return false;
+        end;
+     end;    
+     rsds.Close;
+     rsds = null;
+     rsdc = null;
+     return true;
+  onerror(er)
+     rsds = null;
+     rsdc = null;
+     return true;
+  END;
+  
+  MACRO CalculateBaseSum( BeginDate:DATE, EndDate:DATE ):BOOL
+     /*отбор сделок в зависимости от категории комиссии "Расчет суммы в БО ЦБ"*/
+     if ((this.rContr.rec.Servkind == 21) and (this.rContr.rec.Servkindsub = 8) and (index(rComiss.rec.Code, "МСКБ_ВБ_ДН") != 0))
+        return CalculateBaseSum_BrkCur_EDTURN( BeginDate, EndDate );
+     elif((this.rContr.rec.Servkind == 21) and (this.rContr.rec.Servkindsub = 8) and (index(rComiss.rec.Code, "МСКБ_ВБ_СПСВОП") != 0))
+        return CalculateBaseSum_BrkCur_SPSWAP( BeginDate, EndDate );
+     elif((this.rContr.rec.Servkind == 21) and (this.rContr.rec.Servkindsub = 8) and (index(rComiss.rec.Code, "БрокерКомпенсацВ") != 0))
+        var res;
+        res = CalculateBaseSum_BrkCur_EDTURN( BeginDate, EndDate );
+//        res = CalculateBaseSum_BrkCur_SPSWAP_Comp( BeginDate, EndDate );
+        return res;
+     elif(ПроверитьКатегориюКомиссии( rComiss(), "TDF", OBJGROUP_SFCOM_CALCBYBO ))/*при закрытии торгового дня*/
+        return CalculateBaseSum_TDF( BeginDate, EndDate );
+     elif(ПроверитьКатегориюКомиссии( rComiss(), "DC", OBJGROUP_SFCOM_CALCBYBO ))/*в операции расчета комиссий в БОЦБ*/
+       if(index(rComiss.rec.Code, "НеБиржБезНот") != 0)
+         CalculateBaseSum_DC_NOTE( BeginDate, EndDate, false );
+       elif(index(rComiss.rec.Code, "НеБиржНоты") != 0)
+         CalculateBaseSum_DC_NOTE( BeginDate, EndDate, true );
+       else
+         return CalculateBaseSum_DC( BeginDate, EndDate );
+       end;
+     end;
+
+     return true;
+  END;
+
+  /*дата взимания (расчета) комиссии*/
+  MACRO Дата():DATE
+    if( rDefCom != NULL )
+       return rDefCom.rec.DateFee;
+    end;
+    return DATE( 0,0,0 );
+  END;
+
+  /*Сумма удержанной комиссии */
+  MACRO Сумма():MONEY
+    if( rDefCom != NULL )
+       return rDefCom.rec.CommSum;
+    end;
+    return $0;
+  END;
+
+  /*сумма НДС удержанной  комиссии */
+  MACRO НДС():MONEY
+    if( rDefCom != NULL )
+       return rDefCom.rec.NDSSum;
+    end;
+    return $0;
+  END;
+
+  /*Вычисляет дату курса для удержанной периодической комиссии Ком */
+  MACRO ВычислитьДатуКурса( PayDate:DATE):DATE
+    if( this.rComiss.rec.CalcComissSumAlg == CALCCOMISSSUMALG_CALC ) 
+       return this.Дата();
+    elif( this.rComiss.rec.CalcComissSumAlg == CALCCOMISSSUMALG_PAY ) 
+       return PayDate;
+    elif( this.rComiss.rec.CalcComissSumAlg == CALCCOMISSSUMALG_BEFOREPAY ) 
+       return PayDate - 1;
+    end;
+    return DATE(0,0,0);
+  END;
+
+
+  PRIVATE VAR rSfSi_tmp = TrecHandler( "sfsi.dbt");
+  MACRO ПолучитьСчетПлательщика( ContrNumber:STRING, rSfSi:TRecHandler, Obligatory:BOOL ):BOOL
+    rSfSi.Clear();
+
+    SfGetSI( 663/*OBJTYPE_SFDEFCOM*/, rDefCom, rSfSi, rSfSi_tmp ); 
+    if( ( (rSfSi.rec.ID <= 0) OR (rSfSi.rec.Account == "") ) AND (Obligatory == true)) 
+       MsgBox( "Не найден счет клиента по удержанной комиссии <" + this.rComiss.rec.Number+"> для договора <" + ContrNumber+">. Возможно не заданы ПИ для договора.");
+       return false;
+    end;
+
+    if( (rSfSi.rec.ID > 0) AND (rSfSi.rec.Account != "") )
+       if( rSfSi.rec.FIID != this.ВалютаОплаты() )
+          MsgBox( "Валюта <"+GetFICode(rSfSi.rec.FIID)+"> счета клиента <"+rSfSi.rec.Account+"> комиссии <" + this.rComiss.rec.Number+">, удержанной по договору <" + ContrNumber+"> не совпадает с валютой оплаты комиссии <"+GetFICode(this.ВалютаОплаты())+">. Возможно неверно настроены ПИ для договора или комиссии.");
+          return false;
+       elif( rSfSi.rec.BankID != {OurBank} )
+          MsgBox( "Счет клиента <"+rSfSi.rec.Account+"> по удержанной комиссии <" + this.rComiss.rec.Number+"> для договора <" + ContrNumber+"> должен быть в нашем банке. Возможно неверно настроены ПИ для договора.");
+          return false;
+       end;
+    end;
+
+    return true;
+  END; /*ПолучитьСчетПлательщика*/
+
+  MACRO ПолучитьСчетПолучателя( ContrNumber:STRING, rSfSi:TRecHandler, Obligatory:BOOL, AccountNDS:TRecHandler ):BOOL
+    rSfSi.Clear();
+    AccountNDS.Clear();
+
+    SfGetSI( 663/*OBJTYPE_SFDEFCOM*/, rDefCom, rSfSi_tmp, rSfSi ); 
+    if( ( (rSfSi.rec.ID <= 0) OR (rSfSi.rec.Account == "") ) AND (Obligatory == true)) 
+       MsgBox( "Не найден счет получателя комиссии <" + this.rComiss.rec.Number+">, удержанной по договору <" + ContrNumber+">. Возможно не заданы ПИ для комиссии.");
+       return false;
+    end;
+
+    if( (rSfSi.rec.ID > 0) AND (rSfSi.rec.Account != "") )
+       if( rSfSi.rec.FIID != NATCUR )
+          MsgBox( "Валюта счета получателя комиссии <" + this.rComiss.rec.Number+">, удержанной по договору <" + ContrNumber+"> не равна <"+GetFICode(NATCUR)+">. Возможно неверно настроены ПИ для комиссии.");
+          return false;
+       elif( rSfSi.rec.BankID != {OurBank} )
+          MsgBox( "Счет <"+rSfSi.rec.Account+"> получателя комиссии <" + this.rComiss.rec.Number+">, удержанной по договору <" + ContrNumber+"> должен быть в нашем банке. Возможно неверно настроены ПИ комиссии.");
+          return false;
+       end;
+    end;
+
+    if( AccountNDS != NULL )
+       if( (SfGetCategoryAccount( rComiss, 2/*OBJROLE_SFCOMISS_TAX_ACC*/, AccountNDS ) != 0) OR (AccountNDS.rec.Account == "") )
+          /*Не задан счет НДС - это не ошибка*/
+          AccountNDS.rec.Account       = rSfSi.rec.Account;
+          AccountNDS.rec.Code_Currency = rSfSi.rec.FIID;
+          AccountNDS.rec.Chapter       = 1;
+       end;
+    end;
+
+    return true;
+  END; /*ПолучитьСчетПолучателя*/
+END;
+
+/* Расчитать базовую сумму для расчета периодической комиссии по каждой подходящей сделке и вставить в список сумм для расчета ПЗО (InsertSumList)*/
+MACRO SC_PeriodCom_CalculateBaseSum( Error:@INTEGER, sfcontr_addr:MEMADDR, BeginDate:DATE, EndDate:DATE, sfalg_adr:MEMADDR ):INTEGER
+
+   VAR rComiss  = TRecHandler( "sfcomiss.dbt" ), 
+       rContr   = TRecHandler( "sfcontr.dbt" ),
+       rAlgBase = TRecHandler( "sfcalcal.dbt" );       
+   VAR PeriodComm;
+
+   Error = 0;
+   rContr.SetRecordAddr( sfcontr_addr );
+   rAlgBase.SetRecordAddr( sfalg_adr );
+
+   rComiss.Clear();
+   if( SfGetComiss( rAlgBase.rec.FeeType, rAlgBase.rec.CommNumber, rComiss ) == false )
+      Error = 1;
+      MsgBox( "Ошибка при расчете базовой суммы периодической комиссии.\nНе найдена комиссия вида " + rAlgBase.rec.FeeType + " с номером " + rAlgBase.rec.CommNumber );
+   end;   
+
+   if( Error == 0 )
+      PeriodComm = CPeriodCommission( rContr, rComiss );
+      if( PeriodComm.CalculateBaseSum( BeginDate, EndDate ) != true ) 
+         Error = 1;
+      end;
+   end;
+
+   return Error;
+END;
+
+/*****************************************************************************
+    Печать подробного отчета о расчете периодической комиссии
+******************************************************************************/
+/* Шапка отчета подробного отчета о расчете периодической комиссии */
+MACRO SC_PeriodCom_ReportHeader( sfrepdet:VARIANT ):INTEGER
+[┌────────────────────────────────────────┬───────────┬────────────────────────────────────────┐
+ │             Сумма сделок               │   Ставка  │                Комиссия                │
+ │                                        │           │                                        │
+ ├────────────────────────────────────────┼───────────┼────────────────────────────────────────┤
+];                                    
+   return 0;
+END;
+
+/* Печать строчки отчета подробного отчета о расчете периодической комиссии */
+MACRO SC_PeriodCom_ReportLine( sfrepdet:VARIANT ):INTEGER
+[│######################## ###############│###########│####################### ################│
+]( sfrepdet.baseSum, GetFICode( sfrepdet.FIID_baseSum ), sfrepdet.tariff*100, sfrepdet.CalcSum, GetFICode( sfrepdet.FIID_CalcSum ) );
+
+  return 0;
+END;
+
+/* Печать окончания отчета подробного отчета о расчете периодической комиссии */
+MACRO SC_PeriodCom_ReportFooter( sfrepdet:VARIANT, TotalSum:MONEY ):INTEGER
+
+[└────────────────────────────────────────┴───────────┴────────────────────────────────────────┘
+];
+
+  return 0;
+END;
+
+PRIVATE MACRO GetDealCode( DealID:INTEGER ):STRING
+  VAR rs, cmd;
+
+  cmd = RSDCommand( "SELECT t_DealCode FROM ddl_tick_dbt WHERE t_DealID = ? ");
+  cmd.NullConversion = true;
+  cmd.addParam( "", RSDBP_IN, DealID ); 
+  cmd.execute();
+  rs = TRsbDataSet( cmd );
+  if( rs.MoveNext() )
+     return rs.DealCode;
+  end;
+  return "";
+END;
+
+CLASS CListByCalcObject( _GTTName:STRING )
+  PRIVATE VAR cmd, GTTName = _GTTName;
+  VAR Rec;
+
+  MACRO Очистить()
+     SQL_Truncate( GTTName );
+  END;
+
+  MACRO First( WhereCond:STRING ):BOOL
+     if( WhereCond == NULL )
+        WhereCond = "";
+     end;
+
+     cmd = RSDCommand( "SELECT * FROM " + GTTName + " " + WhereCond );
+     cmd.NullConversion = true;
+     cmd.execute();
+     Rec = TRsbDataSet( cmd );
+     return Rec.MoveNext();
+  END;
+
+  MACRO Next():BOOL
+     return Rec.MoveNext();
+  END;
+
+  Очистить();
+END;
+
+CLASS (CListByCalcObject)CSummByContr()
+  initCListByCalcObject( "DSCCommByContr_TMP" );
+
+  MACRO Добавить( CommNumber:INTEGER, ВО:INTEGER, Сумма:MONEY, НДС:MONEY):BOOL
+     VAR rs, cmd;
+
+     if( Сумма != 0 )
+        cmd = RSDCommand( "SELECT T_PayFIID "+
+                          "  FROM DSCCommByContr_TMP " +
+                          " WHERE T_CommNumber = ? "
+                        );
+        cmd.NullConversion = true;
+        cmd.addParam( "", RSDBP_IN, CommNumber ); 
+
+        cmd.execute();
+        rs= TRsbDataSet( cmd );
+        if( rs.MoveNext() )
+           if( rs.PayFIID != ВО )
+              MsgBox( "Валюта оплаты комиссий по договору должна быть одинаковой" );
+              return false;
+           end;
+
+           cmd = RSDCommand( "UPDATE DSCCommByContr_TMP "+
+                             "   SET T_Summa = T_Summa + ?, " +
+                             "       T_NDS   = T_NDS   + ?  " +
+                             " WHERE T_CommNumber = ? "
+                           );
+           cmd.NullConversion = true;
+           cmd.addParam( "", RSDBP_IN, Сумма ); 
+           cmd.addParam( "", RSDBP_IN, НДС ); 
+           cmd.addParam( "", RSDBP_IN, CommNumber ); 
+           cmd.execute();
+        else
+           cmd = RSDCommand( " INSERT INTO DSCCommByContr_TMP( T_CommNumber, T_PayFIID, T_Summa, T_NDS) " + 
+                             " VALUES( ?, ?, ?, ? ) "
+                           );
+           cmd.NullConversion = true;
+           cmd.addParam( "", RSDBP_IN, CommNumber ); 
+           cmd.addParam( "", RSDBP_IN, ВО ); 
+           cmd.addParam( "", RSDBP_IN, Сумма ); 
+           cmd.addParam( "", RSDBP_IN, НДС ); 
+           cmd.execute();
+        end;
+     end;
+     return true;
+  END;
+END;
+
+
+MACRO ДоговорКлиентский( rContr:OBJECT ):BOOL
+   return ( (rContr.rec.PartyID != {OurBank}) AND (rContr.rec.ContractorID == {OurBank}) );
+END;
+
+MACRO ДоговорСПосредником( rContr:OBJECT ):BOOL
+   return (rContr.rec.ContractorID != {OurBank});
+END;
+
+MACRO ДоговорСБрокером( rContr:OBJECT ):BOOL
+   return (ВидСубъекта( rContr.rec.ContractorID, PTK_BROKER ) == true );
+END;
+
+macro GetInputMedium(INPUTMEDIUM:integer)
+   if(INPUTMEDIUM == INPUTMEDIUM_USE)
+      return "П";
+   elif(INPUTMEDIUM == INPUTMEDIUM_CALC)
+      return "Р";
+   elif(INPUTMEDIUM == INPUTMEDIUM_IMPORT)
+      return "И";
+   end;
+
+   return "";
+end;

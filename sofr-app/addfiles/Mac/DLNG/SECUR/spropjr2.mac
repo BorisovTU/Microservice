@@ -1,0 +1,592 @@
+/*
+$Name: spropjr2.mac
+$Module: Ценные бумаги
+$Description: Отчет "Журнал операций"
+*/
+
+/*******************************************************************************
+ FILE         :   SPROPJR2.MAC
+ COPYRIGHT    :   R-Style, 2002
+ DESCRIPTION  :   RS-Bank, БО ЦБ, отчет "Журнал операций"
+ PROGRAMMED BY:   Леонов И.Е. 31.07.02
+******************************************************************************/
+IMPORT DealsInter, "secinter.mac", "dlntlib.mac", "spRepFun.mac", "DLReport_h.mac", "dlmisc.mac";
+
+PRIVATE CONST POI_MODE = TRUE;
+
+/*процедура корректирует даты из диапазона отчетности*/
+private MACRO SetReportDates( dateMin, dateMax )
+   PRIVATE File PmPaym("pmpaym") key 10;
+   if( dateMin == date(0,0,0) ) 
+      ClearRecord( PmPaym );
+      PmPaym.DocKind   = DL_SECURITYDOC;
+      if( GetGE(PmPaym) )
+         dateMin = PmPaym.ValueDate;
+      end;
+   end;
+   if( dateMax == date(0,0,0) )
+      dateMax = {curdate};
+   end;
+   if( dateMax < dateMin ) 
+      dateMax = dateMin;
+   end;
+   SetParm( 0, dateMin );
+   SetParm( 1, dateMax );
+END;
+
+
+/* Структура с исходными данными */
+class SourceData( _chapter:integer, _dateMin:date, _dateMax:date, _ClientID:integer,
+                  _ContrID:integer, _apostrSum:bool )
+   /*Заданные в панели отчета данные*/
+   var chapter   = _chapter,
+       dateMin   = _dateMin,
+       dateMax   = _dateMax,
+       ClientID  = _ClientID,
+       ContrID   = _ContrID,
+       ApostrSum = _ApostrSum;
+
+   /*Данные для выпуска отчета*/
+   var ReportRun = false;
+   var TotalSum = TArray();
+   var PrevDate = Date(0,0,0), PrevClient = -1, PrevContract = -1, PrevDeal = -1;
+
+   SetReportDates( dateMin, dateMax );
+end;
+
+class СTotalSumma( _Summa, _FIID )
+   var FIID  = _FIID,
+       Summa = _Summa;
+end;
+
+private const _SFDOC_DEF_PERIOD = 51;
+private const ItogsLineName = "Итого за день:";
+
+private var ReportData;
+private file FDealCarTmp( "repdlcar.tmp" ) key 0 WRITE;
+private file FOprDocs( "oprdocs.dbt" );
+private file FOprOper( "oproper.dbt" );
+private file FSfDef( "sfdef.dbt" );        //таблица
+private file FSfDefCom( "sfdefcom.dbt" );  //представление
+private file FDeal( "dl_tick.dbt" );
+private file FComm( "dl_comm.dbt" );
+private file FContr( "sfcontr.dbt" );
+private file FDealNett( "dl_nett.dbt" );
+private record RParty( "party.dbt" );
+private var DlRqr = TRecHandler("dlrq.dbt");
+
+private macro СформироватьСумму( sum )
+
+    if( ReportData.chapter == 5 ) sum = Floor_Money( sum ); end;
+
+    if( ReportData.ApostrSum == true )
+      return String(sum:a);
+    else  
+      return String(sum);   
+    end;  
+end; 
+
+/* Получить договор по коду. Если договора с указанным кодом не
+   существует, то возвращаем false. */
+private macro ПолучитьДоговорПоКоду( ContrID )
+   ClearRecord( FContr );
+   FContr.Id = ContrID;
+   return GetEQ(FContr);
+end;
+
+/* Возвращаем True, если договор подходит под параметры фильтра.
+      ContrID     - код договора
+      PartyID    - код клиента */
+private macro ДоговорПодходит( ContrID, PartyID )
+   return   ((ReportData.ContrID == 0) or (ReportData.ContrID == ContrID))
+            and ( (ReportData.ClientID == -1)
+                  or ((ReportData.ClientID > 0) and (ReportData.ClientID == PartyID))
+                  or ((ReportData.ClientID == 0) and (PartyID == {OurBank}))
+                  );
+end; 
+
+/* Возвращаем True, если клиент в сделке подходит под параметры фильтра.
+   Особенность хранения данных в сделке: для собственных сделок ClientID == -1*/
+private macro КлиентВСделкеПодходид( ClientID )
+   return   (ReportData.ClientID == {OurBank} )
+            or ((ReportData.ClientID != 0) AND (ReportData.ClientID != {OurBank}) AND (ReportData.ClientID == ClientID)) 
+            or ((ReportData.ClientID == 0) and (ClientID == -1));
+end;
+
+/*если в платежах сделки неттинга хотя бы 1 платеж БОЦБ, то проводку печатаем*/
+PRIVATE MACRO NtgLinkFilter( pml, IsOurDoc:@variant )
+   IsOurDoc = false;
+   if(ПолучитьТО(pml.InitialPayment, DlRqr))
+      if( (DlRqr.rec.DocKind == DL_SECURITYDOC) OR (DlRqr.rec.DocKind == DL_RETIREMENT))  
+         IsOurDoc = true;
+         return false; /*больше смотреть платежи не надо*/
+      end;
+   end;
+   return true;
+END;
+
+/* Определим параметры первичного документа.
+      DocKind     - вид первичного документа
+      DocumentID  - номер документа
+      ServDocKind - вид документа сервисной операции.
+   Возвращаемые параметры:
+      DealID      - код сделки
+      DealCode    - номер сделки
+      ContrID     - код договора
+      ClientID    - код клиента  */
+private macro ОпределитьПараметрыСделки(
+                  DocKind, DocumentID, ServDocKind,
+                  DealID:@integer, DealCode:@string,
+                  ContrID:@integer, ClientID:@integer
+                  )
+
+   var OK = false, FindContrID = 0, Group;
+
+   DealID   = 0;
+   DealCode = "";
+   ContrID  = 0;
+   ClientID = 0;
+
+   ClearRecord( FDeal );
+   ClearRecord( FComm );
+   ClearRecord( FDealNett );
+   ClearRecord( FContr);
+
+   if( (DocKind == DL_SECURITYDOC) OR (DocKind == DL_RETIREMENT) )
+      /*Покупка/продажа/погашение*/
+      if(   DealsRestoreDocumentID( FDeal, DocumentID, DocKind )
+            and GetEQ(FDeal) )
+         /*Займ отсекаем.*/
+         Group = SP_GetOperationGroup( FDeal ); 
+         if (not IsLOAN(Group))
+
+            if(   (  ПолучитьДоговорПоСделке( FDeal, FContr, true )
+                     or (ReportData.ContrID <= 0) )
+                  and ДоговорПодходит( FContr.Id, FContr.PartyID )
+                  and КлиентВСделкеПодходид( FDeal.ClientID ) )
+               OK       = true;
+               DealID   = FDeal.DealID;
+               DealCode = FDeal.DealCode;
+               ContrID  = FContr.Id;
+               ClientID = FContr.PartyID;
+            end;
+         end;
+      else
+         MsgBox( "Не найдена сделка по операции" );
+      end;
+
+   elif( (DocKind == DL_STOCKCONTR) AND (ServDocKind == BofficeKindCOMM) ) 
+      /*период. комиссии*/
+      if(   DealsRestoreDocumentID( FContr, DocumentID, DocKind )
+            and GetEQ(FContr) 
+            )
+         if( ДоговорПодходит( FContr.Id, FContr.PartyID ) )
+            OK       = true;
+            DealID   = 0;
+            DealCode = "";
+            ContrID  = FContr.Id;
+            ClientID = FContr.PartyID;
+         end;
+      else
+         MsgBox( "Не найден договор обслуживания по операции" );
+      end;
+
+   elif( DocKind == DL_SETTLEMENT  ) 
+      /*свертки - расчеты на ОРЦБ*/
+      if(   DealsRestoreDocumentID( FComm, DocumentID, DocKind )
+            and GetEQ(FComm)  
+            )                                            
+         SP_GetSfContrIDbyPartyID( FComm.CommDate, FComm.PartyID, FindContrID );
+         if( FindContrID > 0 )
+            if( ДоговорПодходит( FContr.Id, {OurBank} ) ) /*свертки всегда для нашего банка*/
+               OK       = true;
+               DealID   = FComm.DocumentID;  
+               DealCode = FComm.CommCode;
+               ContrID  = FindContrID;
+               ClientID = {OurBank};
+            end;
+         else
+            MsgBox( "Не найден договор обслуживания для биржи в операции свертки " + FComm.CommCode );
+         end;
+      end;
+
+   elif( DocKind == DL_NTGDOC )
+      /* Неттинг */
+      /* 10.07.03 у сделок неттинга нет договора обслуживания, и это наши сделки */
+      if( not ((ReportData.ContrID > 0) OR (ReportData.ClientID > 0)) ) 
+
+         /*нужны только сделки неттинга БОЦБ*/
+         FDealNett.NettingID = int(DocumentID);
+         if( GetEQ(FDealNett) )
+            ForEachPMLinkRQ( DL_NTGSEC, FDealNett.NettingID, @NtgLinkFilter, @OK);
+            if( OK )
+               DealID   = FDealNett.NettingID;
+               DealCode = FDealNett.DealNumber;
+               ContrID  = 0;
+               ClientID = 0;
+            end;
+         else
+            MsgBox( "Не найдена сделка неттинга по операции" );
+         end;
+      end;
+
+   elif( DocKind == _SFDOC_DEF_PERIOD )
+      /* Распределенные комисии */
+      if( DealsRestoreDocumentID( FSfDef, DocumentID, DocKind ) )
+        FSfDefCom.ID = FSfDef.ID;
+        if(GetEQ( FSfDefCom ))
+           if(   ПолучитьДоговорПоКоду( FSfDefCom.ConID )
+                 and ДоговорПодходит( FContr.Id, FContr.PartyID ) )
+              OK       = true;
+              DealID   = 0;
+              DealCode = "";
+              ContrID  = FContr.Id;
+              ClientID = FContr.PartyID;
+           end;
+        else
+           MsgBox( "Не найдена запись в sfdefcom (DocumentID = ", DocumentID );
+        end;
+      end;
+   end;
+
+   return OK;
+end;
+
+/* Сохраняем данные во временную базу.
+      FileDoc     - проводка
+      DealID      - код сделки
+      DealCode    - номер сделки
+      ContrID     - код договора
+      ClientID    - код клиента */
+private macro СохранитьДляОтчета(   FileDoc, DealID, DealCode, ContrID,
+                                    ClientID )
+
+   ClearRecord( FDealCarTmp );
+   FDealCarTmp.Date        = FileDoc.Date_Carry;
+   FDealCarTmp.DealCode    = DealCode;
+   FDealCarTmp.DealID      = DealID;
+   FDealCarTmp.ClientID    = ClientID;
+   FDealCarTmp.ContractID  = ContrID;
+   FDealCarTmp.AccDebet    = FileDoc.Account_Payer;
+   FDealCarTmp.FIID          = FileDoc.FIID_Payer;
+   FDealCarTmp.Summa         = FileDoc.Sum_Payer;
+   FDealCarTmp.AccCredit   = FileDoc.Account_Receiver;
+   FDealCarTmp.FIID_Receiver = FileDoc.FIID_Receiver;
+   FDealCarTmp.Sum_Receiver  = FileDoc.Sum_Receiver;
+   FDealCarTmp.Sum_NatCur    = FileDoc.Sum_NatCur;
+   FDealCarTmp.Ground      = FileDoc.Ground;   
+
+   if( not Insert( FDealCarTmp ) )
+      RunError( "Ошибка при вставке данных во временный файл отчета.");
+   end;
+   ReportData.ReportRun = true;
+end;
+
+macro ПеребратьПроводки()
+
+   var
+      PrevOprDocID = -1, DealOk = false, CurNum = 0,
+      DealID   = null,
+      DealCode = null,
+      ContrID  = null,
+      ClientID = null;
+
+
+   var queryTxt, selWhere;      
+
+   var cmd, FileDoc;
+
+   selWhere = 
+      "T_Chapter = ? " +        
+      "AND NOT T_Result_Carry = " + ARHCARRY + " " +  /*отражение проводки перенесенной в архив, нам не нужно*/
+      "AND acctrn.T_State = 1 "+/*фактическая проводка*/
+      "AND T_Date_Carry <= ? AND T_Date_Carry >= ? " + 
+      
+      "AND oprdocs.T_AccTrnID = acctrn.T_AccTrnID " +
+      "AND oprdocs.T_DocKind = " + DLDOC_CARRY + " "+
+      "AND oprdocs.T_Origin = 0 ";
+
+   cmd = RSDCommand(
+      "Select count(*) cnt " + 
+      "From dacctrn_dbt acctrn, DOPRDOCS_DBT oprdocs " + 
+      "Where " + selWhere  
+   );
+
+   cmd.addParam("", RSDBP_IN, ReportData.Chapter);
+   cmd.addParam("", RSDBP_IN, ReportData.dateMax);
+   cmd.addParam("", RSDBP_IN, ReportData.dateMin);
+
+   cmd.execute();
+
+   FileDoc = TRsbDataSet(cmd);
+   FileDoc.MoveNext();
+
+   InitProgress( int(FileDoc.cnt), "Отчет \"Журнал операций\"", 
+                 "Просмотр проводок: \"dacctrn_dbt\"" );
+
+   cmd = RSDCommand(
+      "Select " +          
+         "oprdocs.T_ID_Operation, " +
+         "acctrn.* " +
+      "From dacctrn_dbt acctrn, DOPRDOCS_DBT oprdocs " +   
+      "Where " + selWhere +         
+      "Order by acctrn.T_Date_Carry"   
+   );
+
+   cmd.addParam("", RSDBP_IN, ReportData.Chapter);
+   cmd.addParam("", RSDBP_IN, ReportData.dateMax);
+   cmd.addParam("", RSDBP_IN, ReportData.dateMin);
+
+   cmd.execute();
+
+   FileDoc = TRsbDataSet(cmd);   
+
+   while( FileDoc.MoveNext() )      
+      if( PrevOprDocID != FileDoc.ID_Operation )
+               ClearRecord( FOprOper );
+         FOprOper.ID_Operation = FileDoc.ID_Operation;
+               if( GetEQ(FOprOper) )
+                  DealOk = ОпределитьПараметрыСделки(
+                              FOprOper.DocKind, FOprOper.DocumentID,
+                              FOprDocs.ServDocKind,
+                              @DealID, @DealCode, @ContrID, @ClientID
+                              );
+               else
+                  msgbox("Не найдена операция по ссылке в \"oprdocs.dbt\"");
+                  DealOk = false;
+               end;
+         PrevOprDocID = FileDoc.ID_Operation;
+      end;
+
+      if( DealOk == true )
+         СохранитьДляОтчета( FileDoc, DealID, DealCode, ContrID, ClientID );
+      end;
+
+      UseProgress( CurNum = CurNum + 1 );
+   end;       
+   RemProgress;
+end;
+
+private macro СоздатьОтчет()
+   if( ReportData.dateMin <= {Curdate} ) 
+      ПеребратьПроводки();
+   end;
+end;
+
+private macro КодВалюты( FIID )
+  var TypeCode;
+  /*У бумаг нет FICK_ISOSTRING*/
+  if( ReportData.chapter == 5 )
+     TypeCode = FICK_USERCODE;
+  else
+     TypeCode = FICK_ISOSTRING;
+  end;
+  return GetFICode( FIID, null, TypeCode );
+end; 
+
+private macro ДобавитьСумму( Summa, FIID )
+   var i = 0;
+   while( i < ReportData.TotalSum.Size )
+      if( ReportData.TotalSum[i].FIID == FIID )
+         ReportData.TotalSum[i].Summa = ReportData.TotalSum[i].Summa + Summa;
+         return;
+      end;
+      i = i + 1;
+   end;
+   ReportData.TotalSum[i] = СTotalSumma( Summa, FIID );
+end;
+
+
+PRIVATE VAR Cap =
+"Журнал операций за период с ########## по ##########\n"+
+" Глава ### #\n\n";
+                                                                             
+PRIVATE VAR Investor =
+"Инвестор ####################   Договор № ##############   от #\n";
+
+PRIVATE VAR Dat =
+"Дата операций: ##########\n\n";
+
+PRIVATE VAR ReportRunFalse =
+"#";
+
+PRIVATE VAR TableHeader =
+"┌───────────────────────┬──────────────────────────┬──────────────────────────┬────────────────┬─────────────────────────┬──────────────────────────┬────────────────┬──────────────────────────┬───────────────────────────────────────────────────┐\n" +
+"│         №             │    Счет дебета           │      Сумма дебета        │     Валюта     │     Счет кредита        │      Сумма кредита       │     Валюта     │           Сумма          │                     Основание                     │\n" +
+"│       сделки          │                          │                          │     дебета     │                         │                          │     кредита    │эквивалента в нац. валюте │                                                   │\n" +
+"├───────────────────────┼──────────────────────────┼──────────────────────────┼────────────────┼─────────────────────────┼──────────────────────────┼────────────────┼──────────────────────────┼───────────────────────────────────────────────────┤\n" +
+"│          1            │             2            │             3            │        4       │             5           │             6            │        7       │             8            │                          9                        │\n" +
+"├───────────────────────┼──────────────────────────┼──────────────────────────┼────────────────┼─────────────────────────┼──────────────────────────┼────────────────┼──────────────────────────┼───────────────────────────────────────────────────┤";
+
+PRIVATE VAR Excel;
+
+PRIVATE CLASS (DL_CReportTemplate) SP_Spropjr2_Report
+
+  PRIVATE MACRO PrintMode():INTEGER
+     if(Excel)
+        return DL_OUTREPORT_EXCEL;
+   else
+        return DL_OUTREPORT_STD;
+     end;
+  END;                                                                                                                                                                         
+  
+  PRIVATE MACRO BeginReport()
+
+     Dl_CallInsertStat( PrintMode() );
+
+     CreateTotalBook();     
+     
+     var obchaptr = TBfile( "obchaptr.dbt" );
+     obchaptr.Clear();
+     obchaptr.rec.Chapter = ReportData.chapter;
+     obchaptr.GetEQ();
+
+     SetActiveSheet( "0101" );
+     PrintFormatString( Cap,
+                        "N1_H0_D", ReportData.dateMin, 
+                        "N1_H0_F", ReportData.dateMax,  
+                        "N1_H0_B", ReportData.chapter,  
+                        "N1_H0_C", obchaptr.rec.Name
+                      );
+
+     CopyAllSheetInTotalBook( NULL, false, "N1_Cap", 0 );
+
+  END;
+
+  PRIVATE MACRO EndReport()
+     SaveTotalBook();
+  END;
+
+  PRIVATE MACRO PrintTotalDay() //печать итого за день
+     var i = 0;
+     while( i < ReportData.TotalSum.Size )
+        PrintTableLine( "N1_A1", ItogsLineName, null,
+                        "N1_A3", СформироватьСумму( ReportData.TotalSum[i].Summa ), null,
+                        "N1_A4", КодВалюты( ReportData.TotalSum[i].FIID ) , null );
+      i = i + 1;
+   end;
+     EndTable();
+     CopyAllSheetInTotalBook( NULL, false, GetTableRange(), 0 );
+  ReportData.TotalSum.Size = 0;
+  END;
+
+  PRIVATE MACRO PrintCapContract( PrintItog ) //печать шапки для договора
+
+   ПолучитьДоговорПоКоду( FDealCarTmp.ContractID );
+
+   if( ReportData.PrevContract != FDealCarTmp.ContractID )
+      ReportData.PrevContract = FDealCarTmp.ContractID;
+   end;
+
+   if( PrintItog )
+        PrintTotalDay();
+   end;
+
+     PrintFormatString( Investor,
+                        "N1_H0_2", RParty.ShortName,
+                        "N1_H0_3", FContr.Number,
+                        "N1_H0_4", FContr.dateBegin );
+     CopyAllSheetInTotalBook( NULL, false, "N1_TableHeader", 1 );
+
+     RegisterTable( "N1_MainTable", TableHeader,
+                    "N1_A1",        // № счёта       
+                    "N1_A2",        // Счёт дебета        
+                    "N1_A3",        // Сумма д        
+                    "N1_A4",        // Валюта д
+                    "N1_A5",        // Счёт кредита
+                    "N1_A6",        // Сумма к
+                    "N1_A7",        // Валюта к
+                    "N1_A8",        // Валюта экв в нац валюте
+                    "N1_A9"         // Основание
+                  );
+
+  END;
+
+  PRIVATE MACRO PrintCapClient( PrintItog ) //печать шапки для клиента
+   if( ReportData.PrevClient != FDealCarTmp.ClientID )
+      if( ПолучитьСубъекта( FDealCarTmp.ClientID, RParty ) )
+         msgBox( "Ошибка при определении клиента в сделке ", FDealCarTmp.DealCode );
+      end;
+      ReportData.PrevClient = FDealCarTmp.ClientID;
+   end;
+
+     PrintCapContract( PrintItog );
+  END;
+
+  PRIVATE MACRO PrintCapDate( PrintItog ) //печать шапки для даты
+     if( PrintItog )  PrintTotalDay();  end;
+     PrintFormatString( Dat, "N1_H0_1", FDealCarTmp.Date );
+     CopyAllSheetInTotalBook( NULL, false, "N1_Date", 1 );
+     PrintCapClient( false );
+   ReportData.PrevDate = FDealCarTmp.Date;
+  END;
+
+  PRIVATE MACRO PrintConductings() //печать проводки
+     PrintTableLine( "N1_A1",  FDealCarTmp.DealCode,                      null,
+                     "N1_A2",  FDealCarTmp.AccDebet,                      null,
+                     "N1_A3",  СформироватьСумму(FDealCarTmp.Summa),       null,
+                     "N1_A4",  КодВалюты( FDealCarTmp.FIID ),              null,
+                     "N1_A5",  FDealCarTmp.AccCredit,                      null,
+                     "N1_A6",  СформироватьСумму(FDealCarTmp.Sum_Receiver),null,
+                     "N1_A7",  КодВалюты( FDealCarTmp.FIID_Receiver ),     null,
+                     "N1_A8",  СформироватьСумму( FDealCarTmp.Sum_NatCur ),null,
+                     "N1_A9",  FDealCarTmp.Ground,                         null
+              );
+
+     if( ReportData.chapter == 5 )
+        ДобавитьСумму( FDealCarTmp.Summa, FDealCarTmp.FIID );
+     else
+        ДобавитьСумму( FDealCarTmp.Sum_NatCur, NATCUR );
+     end;
+  END;
+
+  PRIVATE MACRO PrintReport()
+   var CurNum = 0;
+   InitProgress( NRecords(FDealCarTmp), "Отчет \"Журнал операций\"", "Печать отчета" );
+
+   Rewind( FDealCarTmp );
+   while( next(FDealCarTmp) )
+
+      if( ReportData.PrevDate != FDealCarTmp.Date )
+           PrintCapDate( ReportData.PrevDate != Date(0,0,0) );
+      elif( ReportData.PrevClient != FDealCarTmp.ClientID )
+           PrintCapClient( true );
+      elif( ReportData.PrevContract != FDealCarTmp.ContractID )
+           PrintCapContract( true );
+      end;
+
+        PrintConductings();
+      UseProgress( CurNum = CurNum + 1 );
+   end;
+
+     PrintTotalDay();
+   RemProgress;
+     AddStandardFooter( "N1_" );
+     CopyAllSheetInTotalBook( NULL, false, "N1_Footer", 1 );
+  END;
+
+  PRIVATE MACRO Create()
+   var TmpFName = GetWorkFileName("repdlcar");
+   ClearGlobalTmp( "drepdlcar_tmp" );
+   Message( "Выполнение отчета \"Журнал операций\"" );
+   СоздатьОтчет();
+   if( ReportData.ReportRun == false )
+        PrintFormatString( ReportRunFalse, "N1_ReportRunFalse", "Нет данных, удовлетворяющих параметрам отчета" );
+        CopyAllSheetInTotalBook( NULL, false, "N1_ReportRunFalse", 1 );
+   else
+        PrintReport();
+   end;
+  END;
+
+  initDL_CReportTemplate( NULL, "Report_TxSpropjr2.xls", null, null, null, POI_MODE );
+END;
+
+macro operjour( chapter:integer, dateMin:date, dateMax:date, ClientID:integer,
+                ContrID:integer, apostrSum:bool, IsExcel:bool)
+
+   Excel = IsExcel;
+   ReportData = SourceData( chapter, dateMin, dateMax, ClientID, ContrID, apostrSum );
+   SP_Spropjr2_Report().Run();
+
+exit(1); 
+end;

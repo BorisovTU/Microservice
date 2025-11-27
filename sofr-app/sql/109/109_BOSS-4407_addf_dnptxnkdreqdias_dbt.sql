@@ -1,0 +1,13 @@
+-- Добавить поле в таблицу "DNPTXNKDREQDIAS_DBT"
+DECLARE
+   e_exist_field EXCEPTION;
+
+   PRAGMA EXCEPTION_INIT( e_exist_field, -1430);
+
+BEGIN
+   EXECUTE IMMEDIATE 'ALTER TABLE DNPTXNKDREQDIAS_DBT ADD T_FACTSUM NUMBER(32,12) DEFAULT 0';
+   EXECUTE IMMEDIATE 'COMMENT ON COLUMN DNPTXNKDREQDIAS_DBT.T_FACTSUM IS ''Сумма фактически переданного УНКД в Диасофт и учтенная в НОБ в СОФРе''';
+   EXCEPTION WHEN e_exist_field THEN NULL;
+END;
+/
+

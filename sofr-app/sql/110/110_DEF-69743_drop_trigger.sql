@@ -1,0 +1,3 @@
+/*Удаление триггера*/
+DROP TRIGGER DNPTXNKDREQDIAS_DBT_FOBJ
+/

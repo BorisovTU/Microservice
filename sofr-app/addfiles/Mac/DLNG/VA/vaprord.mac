@@ -1,0 +1,2170 @@
+/*──────────────────────────────────────────────────────────────────────────┐
+  RS-Bank 5.1                                          R-Style Software Lab
+
+  File Name   : vaprord.mac
+  Programmer  : Панкратов А.В.
+  Comment     : Печать договоров и актов в УВ
+  04.07.2018 Изменён под шаблоны РСХБ. Симанов А
+└───────────────────────────────────────────────────────────────────────────*/
+
+IMPORT RsbDataSet, globals, PaymInter, OprInter, DealsInter, PTInter;
+IMPORT FIInter, CTInter, VSInter, valib, dlwreps, vaconv, "cb_sql.mac", vslib;
+import vsrplib, dlprxytg;
+
+//наиманования шаблонов
+private const ПОКУПКА = "DKV_RSHB.dotx",
+              ПРОДАЖА = "DPV_RSHB.dotx";
+
+//номера таблиц в шаблоне
+private var FirstTableNum = 0,
+            ActTableNum = 0;
+
+/*****************************************************************************/
+/* Вспомогательные функции                                                   */
+/*****************************************************************************/
+
+/* Генерация имени файла */
+MACRO GenFileName()
+VAR str;
+    str = "Doc_" + string(time(true):m);
+    str = StrSubst(str, ":", "-");
+    str = StrSubst(str, ".", "-");
+
+    return string(str + ".rtf");
+END;
+
+MACRO FormatDate(OldDate)
+VAR str;
+
+     str = string((date(OldDate)):m);
+
+     return SubStr(str, 3);
+
+END;
+
+/* Сравнивает две даты и возвращает TRUE, если date1+1год == date2 */
+PRIVATE MACRO CompDate(date1, date2)
+VAR y1,y2,m1,m2,d1,d2;
+    DateSplit(date1, d1, m1, y1);
+    DateSplit(date2, d2, m2, y2);
+    if ((d1 == d2) AND (m1 == m2) AND ((y1 + 1) == y2))
+       return TRUE;
+    end;
+    return FALSE;
+END;
+
+/*
+Возвращает название города по номеру филиала
+*/
+private macro GetDprtCity (NumDprt)
+   var partyid = 0;
+   var Party, PartyAddress;
+   var sql = ExecSqlSelect("select t_partyid from ddp_dep_dbt where t_code = :num", MakeArray(SqlParam("num", NumDprt)), false);
+   if (sql.MoveNext() )
+      partyid = int(sql.value("t_partyid"));
+   end;
+   if (partyid == 0)
+      return "";
+   end;
+
+   Party = RsbParty(partyid);
+   PartyAddress = Party.Address(PTADDR_LEGAL);
+   return PartyAddress.District;
+End;
+
+/* Печать суммы прописью */
+PRIVATE MACRO CurWr(sum, fiid)
+VAR r, k, str = "", fi_code,
+    fininstr = Tbfile("fininstr.dbt", "R", 0);
+
+    fininstr.Clear();
+    fininstr.rec.FIID = fiid;
+
+    if(fininstr.GetEQ())
+       fi_code = fininstr.rec.FI_Code;
+       // Формат вывода суммы прописью для рублей, долларов и евро
+       // явно указан в ТЗ "Отчеты_Договоры.doc"
+       // Для других валют используем стандартный вывод CurToStrAlt
+       str = CurToStrAlt(sum, r, k, int(fi_code));
+       if((fi_code == "810") OR (fi_code == "643"))
+          str = string("(", r, " руб. ", k," коп.) руб.");
+       elif (fi_code == "840")
+          str = string("(", r, " ", k, "/100) долларов США");
+       elif(fi_code == "978")
+          str = string("(", r, " ", k, "/100) евро");
+       end;
+    end;
+    return str;
+END;
+
+/****************************************************************************/
+/* Получить вид документа по сделке                                         */
+/* Возвращает код вида документа, иначе -1                                  */
+/****************************************************************************/
+MACRO ПолучитьВидДокумента(BofficeKind, DealType)/* из dl_tick */
+VAR Kind = -1;
+    if(BofficeKind == DL_VAREPAY)
+        Kind = 102;/* Заявление на погашение */
+    elif(BofficeKind == DL_VAPAWN)
+        Kind = 107;/* Договор залога */
+/*    elif(BofficeKind == DL_VAENWR)
+        Kind = 107;/* Списание и зачисление */*/
+    elif(BofficeKind == DL_VEKSELACCOUNTED)
+        if(VA_IsSale(DealType) OR VA_IsBuy(DealType))
+            Kind = 26;/* Договор купли-продажи */
+        elif(VA_IsExchange(DealType))
+            Kind = 108;/* Мена */
+        end;
+    end;
+    return Kind;
+END;
+
+/* Найти код субъекта */
+MACRO КодСубъекта(PartyID, CodeKind)
+VAR PartCode = Tbfile ("partcode.dbt", "R", 0);
+
+    PartCode.Clear();
+    PartCode.rec.PartyID = PartyID;
+    PartCode.rec.CodeKind = CodeKind;
+    if (PartCode.getEQ()) return string(PartCode.rec.Code);
+    end;
+    return "";
+END;
+
+/*****************************************************************************/
+PRIVATE MACRO РеквизитыСубъекта(dl_tick, PartyID)
+VAR str = "", val, purp = Cai, Pmpaym,
+    Pmprop = Tbfile("pmprop.dbt", "R", 0),
+    Corschem = Tbfile("corschem.dbt", "R", 1),
+    Party = Tbfile("party.dbt", "R", 0);
+
+    if(dl_tick.BofficeKind == DL_VAREPAY) // если операция погашения, то Purpose - PM_PURP_PRINC_RET == 10
+        purp = PM_PURP_PRINC_RET;
+    end;
+
+    Pmpaym = TRsbDataSet("SELECT pmpaym.t_PaymentID, "
+                               " pmpaym.t_Payer, pmpaym.t_PayFIID, pmpaym.t_PayerBankID, pmpaym.t_PayerAccount, "
+                               " pmpaym.t_Receiver, pmpaym.t_ReceiverBankID, pmpaym.t_ReceiverAccount  "
+                        " FROM dpmpaym_dbt pmpaym "
+                        " WHERE pmpaym.t_DocKind = " + dl_tick.BofficeKind +
+                              " AND  pmpaym.t_DocumentID = " + dl_tick.DealID +
+                              " AND  pmpaym.t_Purpose = " + purp +
+                        " ORDER BY pmpaym.t_DocKind, pmpaym.t_DocumentID, pmpaym.t_Purpose, "
+                                 " pmpaym.t_SubPurpose, pmpaym.t_PaymentID");
+
+
+    while(Pmpaym.MoveNext())
+     if(Pmpaym.rec.Payer == PartyID)
+        if (Pmpaym.rec.Payer == {OurBank})
+        Pmprop.Clear();
+        Pmprop.rec.PaymentID = Pmpaym.rec.PaymentID;
+        Pmprop.rec.DebetCredit = 1;
+            if (Pmprop.GetEQ())
+            Corschem.Clear();
+            Corschem.rec.Number = Pmprop.rec.Corschem;
+            Corschem.rec.FI_Kind = FIKIND_CURRENCY;
+            Corschem.rec.FIID = Pmpaym.rec.PayFIID;
+            Corschem.GetEQ();
+            else
+            ;// Оставлено для дальнейшего использования
+            end;
+        Party.Clear();
+        Party.rec.PartyID = Corschem.rec.CorrID;
+        Party.GetEQ();
+
+            if(Party.rec.NotResident == "")
+            str = ",\nБИК ";
+            val = PTCK_BIC;
+            else
+            str = ",\nSWIFT ";
+            val = PTCK_SWIFT;
+            end;
+
+        return string("к/сч. "+Corschem.rec.CorAccount+" в "+Party.rec.AddName+str+КодСубъекта(PartyID,val));
+
+        else
+        Party.Clear();
+        Party.rec.PartyID = Pmpaym.rec.PayerBankID;
+        Party.GetEQ();
+
+        Pmprop.Clear();
+        Pmprop.rec.PaymentID = Pmpaym.rec.PaymentID;
+        Pmprop.rec.DebetCredit = 0;
+        Pmprop.GetEQ();
+
+            if(Pmprop.rec.CodeKind == PTCK_BIC)
+            str = ", БИК ";
+            elif(Pmprop.rec.CodeKind == PTCK_SWIFT)
+            str = ", SWIFT ";
+            end;
+
+        return string("р/сч. "+Pmpaym.rec.PayerAccount+"\nв банке "+Party.rec.ShortName+"\nк/сч "+Pmprop.rec.CorrAcc+str+Pmprop.rec.BankCode);
+
+        end;
+    elif(Pmpaym.rec.Receiver == PartyID)
+        if(PartyID == {OurBank})
+        Pmprop.Clear();
+        Pmprop.rec.PaymentID = Pmpaym.rec.PaymentID;
+        Pmprop.rec.DebetCredit = 0;
+            if(Pmprop.GetEQ())
+            Corschem.Clear();
+            Corschem.rec.Number = Pmprop.rec.Corschem;
+            Corschem.rec.FI_Kind = FIKIND_CURRENCY;
+            Corschem.rec.FIID = Pmpaym.rec.PayFIID;
+            Corschem.GetEQ();
+            else
+            ;// Оставлено для дальнейшего использования
+            end;
+        Party.Clear();
+        Party.rec.PartyID = Corschem.rec.CorrID;
+        Party.GetEQ();
+
+            if(Party.rec.NotResident == "")
+            str = ", БИК ";
+            val = PTCK_BIC;
+            else
+            str = ", SWIFT ";
+            val = PTCK_SWIFT;
+            end;
+
+        return string("к/сч. "+corschem.rec.CorAccount+" в "+Party.rec.AddName+str+КодСубъекта(PartyID,val));
+
+        else
+        Party.Clear();
+        Party.rec.PartyID = Pmpaym.rec.ReceiverBankID;
+        Party.GetEQ();
+
+        Pmprop.Clear();
+        Pmprop.rec.PaymentID = Pmpaym.rec.PaymentID;
+        Pmprop.rec.DebetCredit = 1;
+        Pmprop.GetEQ();
+
+        if(Pmprop.rec.CodeKind == PTCK_BIC)
+            str = ", БИК ";
+        elif(Pmprop.rec.CodeKind == PTCK_SWIFT)
+            str = ", SWIFT ";
+        end;
+
+        return string("р/сч. "+Pmpaym.rec.ReceiverAccount+" в банке "+Party.rec.ShortName+" к/сч. "+Pmprop.rec.CorrAcc+str+Pmprop.rec.BankCode);
+
+        end;
+/*    else
+    return FALSE;*/
+    end;
+    end;
+
+    return("");
+END;
+
+/*****************************************************************************/
+
+MACRO ПолучитьСрокПлатежаПоВекселю(bnr_BCTermFormula, leg_Maturity:date, leg_Start:date, leg_Expiry:date, leg_diff)
+    if((bnr_BCTermFormula == VS_TERMF_FIXEDDAY) OR (bnr_BCTermFormula == VS_TERMF_INATIME))
+        return string(leg_Maturity)+"г.";
+    elif(bnr_BCTermFormula == VS_TERMF_ATSIGHT)
+        if((leg_Maturity <= leg_Start) AND (leg_Expiry <= leg_Start))
+            return "по предъявлении";
+        else
+            if(leg_Expiry <= leg_Start)
+                return "по предъявлении, но не ранее "+string(leg_Maturity)+"г.";
+            elif(leg_Maturity <= leg_Start)
+                return "по предъявлении, но не позднее "+string(leg_Expiry)+"г.";
+            else
+                return "по предъявлении, но не ранее "+string(leg_Maturity)+"г. и не позднее "+string(leg_Expiry)+"г.";
+            end;
+        end;
+    elif(bnr_BCTermFormula == VS_TERMF_DURING)
+        return "Погашение через "+string(leg_diff)+" дней от предъявления";
+    end;
+
+    return "";
+END;
+
+/*****************************************************************************/
+/* Получить, затем напечатать шаблон документа и параметры документа         */
+/*****************************************************************************/
+
+PRIVATE MACRO GetTemplAndDocPrm(BofficeKind, DealID, Kind, CDate:@Date)
+VAR templ = "", D,
+    SpGround = TRsbDataSet("SELECT spground.t_AltXld, spground.t_SignedDate, grtmpl.t_File_Name "
+                           "FROM dspgrdoc_dbt spgrdoc, dspground_dbt spground, ddlgrtemp_dbt grtmpl "
+                           "WHERE spgrdoc.t_SourceDocKind = " + BofficeKind +
+                                 " AND  spgrdoc.t_SourceDocID = " + DealID +
+                                 " AND spground.t_SPGroundID = spgrdoc.t_SPGroundID "
+                                 " AND spground.t_Kind = " + Kind +
+                                 " AND grtmpl.t_DocLog = " + LLCLASS_KINDDOC_VAORDER +
+                                 " AND grtmpl.t_Num = spground.t_DocTemplate "
+                           "ORDER BY spground.t_AltXld");
+
+    while(SpGround.MoveNext())
+
+         templ = string(SpGround.rec.File_Name);
+
+         println(templ);
+
+         if (templ == ПОКУПКА) 
+           FirstTableNum = 2;
+           ActTableNum = 5;
+         elif (templ == ПРОДАЖА)
+           FirstTableNum = 1;
+           ActTableNum = 3;
+         end;
+
+         println(GenFileName());
+
+         [~CNumber];
+
+         if(SpGround.rec.AltXld != "")
+            println(string(SpGround.rec.AltXld));
+         else
+            println("__________________");
+         end;
+
+         [~City];
+         println(GetDprtCity({OperDprtNode}));
+
+         CDate = SQL_ConvTypeDate(SpGround.rec.SignedDate);
+         if(CDate != date(0,0,0))
+            DateSplit(CDate, D);
+
+            [~CDay];
+            println(string(D:o:2:t));
+
+            [~CDate];
+            println(FormatDate(CDate));
+         else
+            [~CDay];
+            println("__________________");
+         end;
+
+    end;
+
+    return templ;
+END;
+
+/*****************************************************************************/
+/* Параметры сторон по договору                                              */
+/*****************************************************************************/
+PRIVATE MACRO ПараметрыНашБанка(dl_tick)
+VAR Party,
+    Adress,
+    Dl_proxy,
+    SpGround;
+
+    Party = Tbfile("party.dbt", "R", 0);
+    Party.Clear();
+    Party.rec.PartyID = {OurBank};
+    Party.GetEQ();
+
+    [~OurGeneralName];
+    if(Party.rec.Name != "")
+       println(string(Party.rec.Name));
+    else
+       println("__________________");
+    end;
+
+    [~OurShortName];
+    if(Party.rec.ShortName != "")
+       println(string(Party.rec.ShortName));
+    else
+       println("__________________");
+    end;
+
+    Adress = Tbfile("adress.dbt", "R", 0);
+    Adress.Clear();
+
+    Adress.rec.PartyID = {OurBank};
+    Adress.rec.Type = 1;
+    Adress.GetEQ();
+
+    [~OurAddress];
+    if(Adress.rec.Adress != "")
+       println(string(Adress.rec.Adress));
+    else
+       println("__________________");
+    end;
+
+    [~OurINN];
+    println(КодСубъекта({OurBank}, PTCK_INN));
+    [~OurSPI];
+    println(РеквизитыСубъекта(dl_tick, {OurBank}));
+
+
+    Dl_proxy = Tbfile("dl_proxy.dbt", "R", 0);
+    Dl_proxy.Clear();
+    Dl_proxy.rec.DocKind = dl_tick.BofficeKind;
+    Dl_proxy.rec.ContractID = dl_tick.DealID;
+    Dl_proxy.rec.ContractParty = DLPROXY_OURBANK;
+    Dl_proxy.rec.ProxyRole = DL_PROXY_BOSS;
+    Dl_proxy.GetEQ();
+
+    [~OurRepresPosition];
+    if(Dl_proxy.rec.AgentPost != "")
+       println(string(Dl_proxy.rec.AgentPost));
+    else
+       println("__________________");
+    end;
+
+    [~OurRepresShortName];
+    if(Dl_proxy.rec.AgentName != "")
+       println(string(Dl_proxy.rec.AgentName));
+    else
+       println("__________________");
+    end;
+
+    SpGround = Tbfile("spground.dbt", "R", 0);
+    SpGround.Clear();
+    SpGround.rec.SPGroundID = Dl_proxy.rec.ProxyID;
+    SpGround.GetEQ();
+
+    [~OurRepresDoc];
+    if(SpGround.rec.Kind == 4)
+        println("Устава ");
+    elif(SpGround.rec.Kind == 3)
+        println("Доверенности № ", string(SpGround.rec.AltXld), " от ", SpGround.rec.SignedDate, " г.");
+    else
+        println("__________________");
+    end;
+
+    Dl_proxy.Clear();
+    Dl_proxy.rec.DocKind = Dl_tick.BofficeKind;
+    Dl_proxy.rec.ContractID = Dl_tick.DealID;
+    Dl_proxy.rec.ContractParty = DLPROXY_OURBANK;
+    Dl_proxy.rec.ProxyRole = DL_PROXY_BOOK;
+    Dl_proxy.GetEQ();
+
+    [~OurChiefAccShortName];
+    if(Dl_proxy.rec.AgentName != "")
+       println(string(Dl_proxy.rec.AgentName));
+    else
+       println("__________________");
+    end;
+END;
+
+PRIVATE MACRO ПараметрыПокупателя(dl_tick)/* dl_tick.DealType */
+VAR BuyerID,
+    PartyFile,
+    AdressFile,
+    Dl_proxyFile,
+    SpGroundFile;
+/* Определяем покупателя */
+    if (VA_IsBuy(dl_tick.DealType))
+        BuyerID = {OurBank};
+    elif(VA_IsSALE(dl_tick.DealType))
+        BuyerID = dl_tick.PartyID;
+    end;
+
+    PartyFile = Tbfile("party.dbt", "R", 0);
+    PartyFile.Clear();
+    PartyFile.rec.PartyID = BuyerID;
+    PartyFile.GetEQ();
+
+    [~BGeneralName];
+    if(PartyFile.rec.Name != "")
+    println(string(PartyFile.rec.Name));
+    else
+    println("__________________");
+    end;
+
+    [~BShortName];
+    if(PartyFile.rec.ShortName != "")
+    println(string(PartyFile.rec.ShortName));
+    else
+    println("__________________");
+    end;
+
+    AdressFile = Tbfile("adress.dbt", "R", 0);
+    AdressFile.Clear();
+    AdressFile.rec.PartyID = BuyerID;
+    AdressFile.rec.Type = 1;
+    AdressFile.GetEQ();
+
+    [~BAddress];
+    if(AdressFile.rec.Adress != "")
+    println(string(AdressFile.rec.Adress));
+    else
+    println("__________________");
+    end;
+
+    AdressFile.rec.Type = 2;
+    AdressFile.GetEQ();
+
+    [~BPostAddress];
+    if (AdressFile.rec.Adress != "")
+       println(string(AdressFile.rec.Adress));
+    else
+       println("__________________");
+    end;
+
+    [~BINN];
+    println(КодСубъекта(BuyerID, PTCK_INN));
+    [~BSPI];
+    println(РеквизитыСубъекта(dl_tick, BuyerID));
+
+
+    Dl_proxyFile = Tbfile("dl_proxy.dbt", "R", 0);
+    Dl_proxyFile.Clear();
+    Dl_proxyFile.rec.DocKind = dl_tick.BofficeKind;
+    Dl_proxyFile.rec.ContractID = dl_tick.DealID;
+    if (BuyerID == {OurBank})
+        Dl_proxyFile.rec.ContractParty = DLPROXY_OURBANK;
+    else
+        Dl_proxyFile.rec.ContractParty = DLPROXY_CONTRACTOR;
+    end;
+    Dl_proxyFile.rec.ProxyRole = DL_PROXY_BOSS;
+    Dl_proxyFile.GetEQ();
+
+    [~BRepresPosition];
+    if(Dl_proxyFile.rec.AgentPost != "")
+    println(string(Dl_proxyFile.rec.AgentPost));
+    else
+    println("__________________");
+    end;
+
+    [~BRepresShortName];
+    if(Dl_proxyFile.rec.AgentName != "")
+    println(string(Dl_proxyFile.rec.AgentName));
+    else
+    println("__________________");
+    end;
+
+    SpGroundFile = Tbfile("spground.dbt", "R", 0);
+    SpGroundFile.Clear();
+    SpGroundFile.rec.SPGroundID = Dl_proxyFile.rec.ProxyID;
+    SpGroundFile.GetEQ();
+
+    [~BRepresDoc];
+    if(SpGroundFile.rec.Kind == 4)
+        println("Устава ");
+    elif(SpGroundFile.rec.Kind == 3)
+        println("Доверенности № ", string(SpGroundFile.rec.AltXld), " от ", SpGroundFile.rec.SignedDate, " г.");
+    else
+        println("__________________");
+    end;
+
+    Dl_proxyFile.Clear();
+    Dl_proxyFile.rec.DocKind = Dl_tick.BofficeKind;
+    Dl_proxyFile.rec.ContractID = Dl_tick.DealID;
+    if (BuyerID == {OurBank})
+        Dl_proxyFile.rec.ContractParty = DLPROXY_OURBANK;
+    else
+        Dl_proxyFile.rec.ContractParty = DLPROXY_CONTRACTOR;
+    end;
+    Dl_proxyFile.rec.ProxyRole = DL_PROXY_BOOK;
+    Dl_proxyFile.GetEQ();
+
+    [~BChiefAccShortName];
+    if(Dl_proxyFile.rec.AgentName != "")
+    println(string(Dl_proxyFile.rec.AgentName));
+    else
+    println("__________________");
+    end;
+
+END;
+
+
+PRIVATE MACRO ПараметрыПродавца(dl_tick)/* dl_tick.DealType */
+VAR SellerID,
+    PartyFile,
+    AdressFile,
+    Dl_proxyFile,
+    SpGroundFile;
+/* Определяем продавца */
+    if (VA_IsBuy(dl_tick.DealType))
+        SellerID = dl_tick.PartyID;
+    elif(VA_IsSALE(dl_tick.DealType))
+        SellerID = {OurBank};
+    end;
+
+    PartyFile = Tbfile("party.dbt", "R", 0);
+    PartyFile.Clear();
+    PartyFile.rec.PartyID = SellerID;
+    PartyFile.GetEQ();
+
+    [~SGeneralName];
+    if(PartyFile.rec.Name != "")
+    println(string(PartyFile.rec.Name));
+    else
+    println("__________________");
+    end;
+
+    [~SShortName];
+    if(PartyFile.rec.ShortName != "")
+    println(string(PartyFile.rec.ShortName));
+    else
+    println("__________________");
+    end;
+
+    AdressFile = Tbfile("adress.dbt", "R", 0);
+    AdressFile.Clear();
+    AdressFile.rec.PartyID = SellerID;
+    AdressFile.rec.Type = 1;
+    AdressFile.GetEQ();
+
+    [~SAddress];
+    if(AdressFile.rec.Adress != "")
+    println(string(AdressFile.rec.Adress));
+    else
+    println("__________________");
+    end;
+
+    AdressFile.rec.Type = 2;
+    AdressFile.GetEQ();
+
+    [~SPostAddress];
+    if (AdressFile.rec.Adress != "")
+       println(string(AdressFile.rec.Adress));
+    else
+       println("__________________");
+    end;
+
+    [~SINN];
+    println(КодСубъекта(SellerID, PTCK_INN));
+
+    [~SSPI];
+    println(РеквизитыСубъекта(dl_tick, SellerID));
+
+    Dl_proxyFile = Tbfile("dl_proxy.dbt", "R", 0);
+    Dl_proxyFile.Clear();
+    Dl_proxyFile.rec.DocKind = dl_tick.BofficeKind;
+    Dl_proxyFile.rec.ContractID = dl_tick.DealID;
+    if (SellerID == {OurBank})
+        Dl_proxyFile.rec.ContractParty = DLPROXY_OURBANK;
+    else
+        Dl_proxyFile.rec.ContractParty = DLPROXY_CONTRACTOR;
+    end;
+    Dl_proxyFile.rec.ProxyRole = DL_PROXY_BOSS;
+    Dl_proxyFile.GetEQ();
+
+    [~SRepresPosition];
+    if(Dl_proxyFile.rec.AgentPost != "")
+    println(string(Dl_proxyFile.rec.AgentPost));
+    else
+    println("__________________");
+    end;
+
+    [~SRepresShortName];
+    if(Dl_proxyFile.rec.AgentName != "")
+    println(string(Dl_proxyFile.rec.AgentName));
+    else
+    println("__________________");
+    end;
+
+    SpGroundFile = Tbfile("spground.dbt", "R", 0);
+    SpGroundFile.Clear();
+    SpGroundFile.rec.SPGroundID = Dl_proxyFile.rec.ProxyID;
+    SpGroundFile.GetEQ();
+
+    [~SRepresDoc];
+    if(SpGroundFile.rec.Kind == 4)
+        println("Устава ");
+    elif(SpGroundFile.rec.Kind == 3)
+        println("Доверенности № ", string(SpGroundFile.rec.AltXld), " от ", SpGroundFile.rec.SignedDate, " г.");
+    else
+        println("__________________");
+    end;
+
+    Dl_proxyFile.Clear();
+    Dl_proxyFile.rec.DocKind = dl_tick.BofficeKind;
+    Dl_proxyFile.rec.ContractID = dl_tick.DealID;
+    if (SellerID = {OurBank})
+        Dl_proxyFile.rec.ContractParty = DLPROXY_OURBANK;
+    else
+        Dl_proxyFile.rec.ContractParty = DLPROXY_CONTRACTOR;
+    end;
+    Dl_proxyFile.rec.ProxyRole = DL_PROXY_BOOK;
+    Dl_proxyFile.GetEQ();
+
+    [~SChiefAccShortName];
+    if(Dl_proxyFile.rec.AgentName != "")
+    println(string(Dl_proxyFile.rec.AgentName));
+    else
+    println("__________________");
+    end;
+
+END;
+
+PRIVATE MACRO КонтрАгент(dl_tick)
+    var partcode = TBfile("partcode.dbt");
+    var Party = RsbParty(dl_tick.PartyID);
+    var PartyAddress;
+
+    PartyAddress = Party.Address(PTADDR_LEGAL);
+
+    [~KGeneralName];
+    if(Party.FullName != "")
+      println(string(Party.FullName));
+    else
+      println("__________________");
+    end;
+
+    [~KShortName];
+    if(Party.ShortName != "")
+      println(string(Party.ShortName));
+    else
+      println("__________________");
+    end;
+
+    [~KAddress];
+    PartyAddress = Party.Address(PTADDR_LEGAL);
+    if (PartyAddress.Address != "")
+      println(string(PartyAddress.Address));
+    else
+      println("__________________");
+    end;
+
+   partcode.KeyNum = 0;
+   partcode.rec.PartyID = dl_tick.PartyID;
+   partcode.rec.CodeKind = PTCK_INN;
+   if(partcode.GetEQ)
+      [~KINN];
+      println(partcode.rec.Code);
+   end;
+
+   [~KSPI];
+   println(РеквизитыСубъекта(dl_tick, dl_tick.PartyID));
+
+END;
+
+PRIVATE MACRO ПараметрыЗалогодателя(dl_tick)
+VAR DepID,
+    Party,
+    Adress,
+    Dl_proxy,
+    SpGround;
+/* Определяем залогодателя. Для определения Залога-приема и Залога-передачи используем VA_IsBuy */
+    if (VA_IsBuy(dl_tick.DealType))
+        DepID = dl_tick.PartyID;
+    else
+        DepID = {OurBank};
+    end;
+
+    Party = Tbfile("party.dbt", "R", 0);
+    Party.Clear();
+    Party.rec.PartyID = DepID;
+    Party.GetEQ();
+
+    [~DGeneralName];
+    if(Party.rec.Name != "")
+    println(string(Party.rec.Name));
+    else
+    println("__________________");
+    end;
+
+    [~DShortName];
+    if(Party.rec.ShortName != "")
+    println(string(Party.rec.ShortName));
+    else
+    println("__________________");
+    end;
+
+    Adress = Tbfile("adress.dbt", "R", 0);
+    Adress.Clear();
+    Adress.rec.PartyID = DepID;
+    Adress.rec.Type = 1;
+    Adress.GetEQ();
+
+    [~DAddress];
+    if(Adress.rec.Adress != "")
+    println(string(Adress.rec.Adress));
+    else
+    println("__________________");
+    end;
+
+    [~DINN];
+    println(КодСубъекта(DepID, PTCK_INN));
+
+    [~DSPI];
+    println(РеквизитыСубъекта(dl_tick, DepID));
+
+    Dl_proxy = Tbfile("dl_proxy.dbt", "R", 0);
+    Dl_proxy.Clear();
+    Dl_proxy.rec.DocKind = dl_tick.BofficeKind;
+    Dl_proxy.rec.ContractID = dl_tick.DealID;
+    if (DepID == {OurBank})
+        Dl_proxy.rec.ContractParty = DLPROXY_OURBANK;
+    else
+        Dl_proxy.rec.ContractParty = DLPROXY_CONTRACTOR;
+    end;
+    Dl_proxy.rec.ProxyRole = DL_PROXY_BOSS;
+    Dl_proxy.GetEQ();
+
+    [~DRepresPosition];
+    if(Dl_proxy.rec.AgentPost != "")
+    println(string(Dl_proxy.rec.AgentPost));
+    else
+    println("__________________");
+    end;
+
+    [~DRepresShortName];
+    if(Dl_proxy.rec.AgentName != "")
+    println(string(Dl_proxy.rec.AgentName));
+    else
+    println("__________________");
+    end;
+
+    SpGround = Tbfile("spground.dbt", "R", 0);
+    SpGround.Clear();
+    SpGround.rec.SPGroundID = Dl_proxy.rec.ProxyID;
+    SpGround.GetEQ();
+
+    [~DRepresDoc];
+    if(SpGround.rec.Kind == 4)
+        println("Устава ");
+    elif(SpGround.rec.Kind == 3)
+        println("Доверенности № ", string(SpGround.rec.AltXld), " от ", SpGround.rec.SignedDate, " г.");
+    else
+        println("________________");
+    end;
+
+    Dl_proxy.Clear();
+    Dl_proxy.rec.DocKind = dl_tick.BofficeKind;
+    Dl_proxy.rec.ContractID = dl_tick.DealID;
+    if (DepID = {OurBank})
+        Dl_proxy.rec.ContractParty = DLPROXY_OURBANK;
+    else
+        Dl_proxy.rec.ContractParty = DLPROXY_CONTRACTOR;
+    end;
+    Dl_proxy.rec.ProxyRole = DL_PROXY_BOOK;
+    Dl_proxy.GetEQ();
+
+    [~DChiefAccShortName];
+    if(Dl_proxy.rec.AgentName != "")
+    println(string(Dl_proxy.rec.AgentName));
+    else
+    println("__________________");
+    end;
+END;
+
+PRIVATE MACRO ПараметрыЗалогодержателя(dl_tick)
+VAR PawnID,
+    Party,
+    Adress,
+    Dl_proxy,
+    SpGround;
+/* Определяем залогодержателя. Для определения Залога-приема и Залога-передачи используем VA_IsSale */
+    if (VA_IsSALE(int(dl_tick.DealType)))
+        PawnID = dl_tick.PartyID;
+    else
+        PawnID = {OurBank};
+    end;
+
+    Party = Tbfile("party.dbt", "R", 0);
+    Party.Clear();
+    Party.rec.PartyID = PawnID;
+    Party.GetEQ();
+
+    [~OurGeneralName];
+    if(Party.rec.Name != "")
+       println(string(Party.rec.Name));
+    else
+       println("__________________");
+    end;
+
+    [~OurShortName];
+    if(Party.rec.ShortName != "")
+       println(string(Party.rec.ShortName));
+    else
+       println("__________________");
+    end;
+
+    Adress = Tbfile("adress.dbt", "R", 0);
+    Adress.Clear();
+
+    Adress.rec.PartyID = PawnID;
+
+    Adress.rec.Type = 1;
+    Adress.GetEQ();
+
+    [~OurAddress];
+    if(Adress.rec.Adress != "")
+       println(string(Adress.rec.Adress));
+    else
+       println("__________________");
+    end;
+
+    [~OurINN];
+    println(КодСубъекта(PawnID, PTCK_INN));
+    [~OurSPI];
+    println(РеквизитыСубъекта(dl_tick, PawnID));
+
+
+    Dl_proxy = Tbfile("dl_proxy.dbt", "R", 0);
+    Dl_proxy.Clear();
+    Dl_proxy.rec.DocKind = dl_tick.BofficeKind;
+    Dl_proxy.rec.ContractID = dl_tick.DealID;
+    if (PawnID == {OurBank})
+        Dl_proxy.rec.ContractParty = DLPROXY_OURBANK;
+    else
+        Dl_proxy.rec.ContractParty = DLPROXY_CONTRACTOR;
+    end;
+    Dl_proxy.rec.ProxyRole = DL_PROXY_BOSS;
+    Dl_proxy.GetEQ();
+
+    [~OurRepresPosition];
+    if(Dl_proxy.rec.AgentPost != "")
+    println(string(Dl_proxy.rec.AgentPost));
+    else
+    println("__________________");
+    end;
+
+    [~OurRepresShortName];
+    if(Dl_proxy.rec.AgentName != "")
+    println(string(Dl_proxy.rec.AgentName));
+    else
+    println("__________________");
+    end;
+
+    SpGround = Tbfile("spground.dbt", "R", 0);
+    SpGround.Clear();
+    SpGround.rec.SPGroundID = Dl_proxy.rec.ProxyID;
+    SpGround.GetEQ();
+
+    [~OurRepresDoc];
+    if(SpGround.rec.Kind == 4)
+        println("Устава ");
+    elif(SpGround.rec.Kind == 3)
+        println("Доверенности № ", string(SpGround.rec.AltXld), " от ", SpGround.rec.SignedDate, " г.");
+    else
+        println("__________________");
+    end;
+
+    Dl_proxy.Clear();
+    Dl_proxy.rec.DocKind = Dl_tick.BofficeKind;
+    Dl_proxy.rec.ContractID = Dl_tick.DealID;
+    if (PawnID == {OurBank})
+        Dl_proxy.rec.ContractParty = DLPROXY_OURBANK;
+    else
+        Dl_proxy.rec.ContractParty = DLPROXY_CONTRACTOR;
+    end;
+    Dl_proxy.rec.ProxyRole = DL_PROXY_BOOK;
+    Dl_proxy.GetEQ();
+
+    [~OurChiefAccShortName];
+    if(Dl_proxy.rec.AgentName != "")
+    println(string(Dl_proxy.rec.AgentName));
+    else
+    println("__________________");
+    end;
+END;
+
+PRIVATE MACRO ПараметрыГенСогл(BofficeKind, DealID)
+var isPrint = false;
+VAR SpGround = TRsbDataSet("SELECT spground.t_Xld, spground.t_RegistrDate "
+                          "FROM dspgrdoc_dbt spgrdoc, dspground_dbt spground "
+                          "WHERE spgrdoc.t_SourceDocKind = " + BofficeKind + " AND  spgrdoc.t_SourceDocID = " + DealID +
+                                 " AND spground.t_SPGroundID = spgrdoc.t_SPGroundID AND spground.t_Kind = 112 "
+                          "ORDER BY spground.t_Xld");
+
+    while(SpGround.MoveNext())
+          isPrint = true;
+          [~GeneralAgreementName];
+          println("Генерального соглашения");
+          [~GeneralAgreementNumber];
+          println(string(SpGround.rec.XLD));
+          [~GeneralAgreementDate];
+          println(string(SpGround.rec.RegistrDate));
+    end;
+
+    if(isPrint == false)
+      [~GeneralAgreementName];
+      println("");
+      [~GeneralAgreementNumber];
+      println("");
+      [~GeneralAgreementDate];
+      println("");
+    end;
+END;
+
+/*****************************************************************************/
+/* Параметры векселя по договору                                             */
+/*****************************************************************************/
+PRIVATE MACRO GetDDate(dl_tick, Purpose)
+VAR PmpaymSet = TRsbDataSet("SELECT pmpaym.t_IsPlanPaym, pmpaym.t_ValueDate "
+                            "FROM dpmpaym_dbt pmpaym "
+                            "WHERE pmpaym.t_DocKind = " + dl_tick.BofficeKind +
+                                " AND pmpaym.t_DocumentID = " +dl_tick.DealID +
+                                 " AND pmpaym.t_Purpose = " + Purpose +
+                                 " AND pmpaym.t_IsPlanPaym = 'X'");
+
+    if(PmpaymSet.MoveNext())
+       return PmpaymSet.rec.ValueDate;
+    end;
+
+    return "";
+END;
+
+PRIVATE MACRO ПолучВалРасчетов(dl_tick, PayCur:@Integer)
+  VAR SQLQueryStr = "";
+  VAR TickPrm;
+
+  SQLQueryStr =
+    " SELECT "
+      + " leg.t_PayFIID "
+  + " FROM "
+      + " ddl_leg_dbt leg "
+  + " WHERE "
+      + " leg.t_DealID = " + dl_tick.DealID
+  + " AND leg.t_LegKind = " + LEG_KIND_DL_TICK
+  + " AND leg.t_LegID = " + 0;
+  TickPrm = TRsbDataSet(SQLQueryStr);
+
+  if(TickPrm.MoveNext())
+    if(ValType(PayCur) != V_UNDEF)
+      PayCur = Int(TickPrm.rec.PayFIID);
+    end;
+  end;
+END;
+
+/*
+link - направление движения векселя
+0 - передаётся из банка
+2 - принимаетс банком
+*/
+private macro ПолучВалРасчетовМены (dl_tick, PayCur:@Integer, link)
+  var sql = "select t_cfi cfi from ddl_leg_dbt where t_legid = 0 and t_legkind = :link and t_dealid = : dealid";
+  sql = ExecSqlSelect(sql, MakeArray(SqlParam("link", link), SqlParam("dealid", dl_tick.DealID)), false);
+  if (sql.MoveNext() )
+    if(ValType(PayCur) != V_UNDEF)
+      PayCur = int(sql.value("cfi"));
+    end;
+  end;
+End;
+
+PRIVATE MACRO ПараметрыВекселей(dl_tick, isRepay, Kind, CDate)
+
+    VAR SQLQueryStr = "";
+    VAR CountingBills;
+    VAR BillsPrm;
+    VAR BillKind = VS_IN_UNKNOWN;
+    VAR BillType = -1;
+    VAR CountBills1Nom = 0;
+    VAR CountBills = 0;
+    VAR CountNom = 0;
+    VAR NumBills1Nom = TArray;
+    VAR NumBills = 0;
+    VAR NumNom = 0;
+    VAR CountBmNom = 1;
+    VAR SumCurrency = -1;
+    VAR Sum : MONEY;
+    VAR TotalFaceValuei : MONEY;
+    VAR TotalFaceValue : MONEY;
+    VAR TotalSumi : MONEY;
+    VAR AllTotali = "";
+    VAR TotalSum : MONEY;
+    VAR DDate;
+    VAR D;
+
+    SQLQueryStr =
+      " SELECT "
+        + " leg.t_PFI, "
+        + " COUNT (leg.t_PFI) NumBills "
+    + " FROM "
+        + " dvsordlnk_dbt ordlnk, "
+        + " ddl_leg_dbt leg "
+    + " WHERE "
+        + " ordlnk.t_DocKind = " + dl_tick.BofficeKind
+    + " AND ordlnk.t_ContractID = " + dl_tick.DealID
+    + " AND leg.t_DealID = ordlnk.t_BCID "
+    + " AND leg.t_LegKind = " + LEG_KIND_VSBANNER
+    + " AND leg.t_LegID = " + 0
+    + " GROUP BY "
+        + " leg.t_PFI "
+    + " ORDER BY "
+        + " leg.t_PFI ";
+
+    CountingBills = TRsbDataSet(SQLQueryStr);
+
+    while(CountingBills.MoveNext())
+      NumBills1Nom(NumNom) = Int(CountingBills.rec.NumBills);
+      NumBills = NumBills + Int(CountingBills.rec.NumBills);
+
+      if(NumNom > 0)
+        // Множим таблицу пункта 1.1
+        println("~CopyTableAfter");
+        // В шаблоне она под номером NumNom
+        println(NumNom);
+        // Смещаем закладки на число векселей одного номинала NumBills1Nom(NumNom - 1)
+        println(NumBills1Nom(NumNom - 1));
+
+        if(Kind != 102) // В погашении одна таблица
+          // Множим первую таблицу акта.
+          println("~CopyTableAfter");
+          // В шаблоне она теперь под номером 3 + (NumNom - 1) + NumNom
+          println(3 + (NumNom - 1) + NumNom);
+          // Смещаем закладки на число векселей одного номинала NumBills1Nom(NumNom - 1)
+          println(NumBills1Nom(NumNom - 1));
+        end;
+      end;
+
+      NumNom = NumNom + 1;
+    end;
+
+    while(CountNom < NumNom)
+      // Множим строки в таблицах пункта 1.1
+      println("~MultipleRow");
+      // Номер таблицы теперь совпадает с (1 + CountNom)
+      //println(1 + CountNom);
+      println(FirstTableNum);
+      // Добавляем (NumBills1Nom(CountNom) - 1) строк
+      println(NumBills1Nom(CountNom) - 1);
+      println("#");
+      // Множим строку 2
+      println(2);
+
+      if(Kind != 102) // В погашении одна таблица
+        // Множим строки первой таблицы акта
+        println("~MultipleRow");
+        // В шаблоне она теперь (3 + (NumNom - 1) + CountNom)
+        //println(3 + (NumNom - 1) + CountNom);
+        println(ActTableNum);
+        // Добавляем (NumBills1Nom(CountNom) - 1) строк
+        println(NumBills1Nom(CountNom) - 1);
+        println("#");
+        // Множим строку 2
+        println(2);
+      end;
+
+      CountNom = CountNom + 1;
+    end;
+
+    ПолучВалРасчетов(dl_tick, @SumCurrency);
+
+    SQLQueryStr =
+      " SELECT "
+        + " ordlnk.t_BCID, "
+        + " ordlnk.t_BCCost, "
+        + " ordlnk.t_BCCFI, "
+        + " vsbnr.t_IssueKind, "
+        + " vsbnr.t_IssuerName, "
+        + " vsbnr.t_BCSeries, "
+        + " vsbnr.t_BCNumber, "
+        + " vsbnr.t_IssuePlace, "
+        + " vsbnr.t_BCTermFormula, "
+        + " leg.t_Formula, "
+        + " leg.t_Price, "
+        + " leg.t_Start, "
+        + " leg.t_Maturity, "
+        + " leg.t_Expiry, "
+        + " leg.t_Diff, "
+        + " leg.t_Principal, "
+        + " leg.t_price/power(10, leg.t_point) Rate, "
+        + " vsbnr.t_holdername Holder, "
+        + " leg.t_PFI "
+    + " FROM "
+        + " dvsordlnk_dbt ordlnk, "
+        + " dvsbanner_dbt vsbnr, "
+        + " ddl_leg_dbt leg "
+    + " WHERE "
+        + " ordlnk.t_DocKind = " + dl_tick.BofficeKind
+    + " AND ordlnk.t_ContractID = " + dl_tick.DealID
+    + " AND vsbnr.t_BCID = ordlnk.t_BCID "
+    + " AND leg.t_DealID = ordlnk.t_BCID "
+    + " AND leg.t_LegKind = " + LEG_KIND_VSBANNER
+    + " AND leg.t_LegID = " + 0
+    + " ORDER BY "
+        + " leg.t_PFI ";
+
+    BillsPrm = TRsbDataSet(SQLQueryStr);
+
+    CountBills1Nom = 0;
+    CountBills = 0;
+    CountNom = 0;
+    Sum = $0;
+    TotalFaceValuei = $0;
+    TotalFaceValue = $0;
+    TotalSumi = $0;
+    TotalSum = $0;
+
+    while(BillsPrm.MoveNext())
+      CountBills1Nom = CountBills1Nom + 1;
+      CountBills = CountBills + 1;
+
+      if(CountBills == 1)
+        if(ВексельПроцентный(BillsPrm.rec.Formula, BillsPrm.rec.Price))
+          BillKind = VS_IN_S_PC;
+        else
+          BillKind = VS_IN_DISCONT; // Как бы беспроцентный
+        end;
+
+        BillType = BillsPrm.rec.IssueKind;
+      else
+        if((BillKind == VS_IN_S_PC) and (not ВексельПроцентный(BillsPrm.rec.Formula, BillsPrm.rec.Price)))
+          BillKind = VS_IN_UNKNOWN;
+        elif((BillKind == VS_IN_DISCONT) and (ВексельПроцентный(BillsPrm.rec.Formula, BillsPrm.rec.Price)))
+          BillKind = VS_IN_UNKNOWN;
+        end;
+
+        if(BillType != BillsPrm.rec.IssueKind)
+          BillType = -1;
+        end;
+      end;
+
+      println("~N" + string(CountBills));
+      println(CountBills1Nom);
+
+      println("~Issuer" + string(CountBills));
+      println(BillsPrm.rec.IssuerName);
+
+      println("~BillSeries" + string(CountBills));
+      if (BillsPrm.rec.BCSeries != "")
+        println(BillsPrm.rec.BCSeries);
+      else
+        println("\n");
+      end;
+
+      println("~BillNumber" + string(CountBills));
+      println(trim(BillsPrm.rec.BCNumber));
+
+      println("~IssueLocation" + string(CountBills));
+      if(BillsPrm.rec.IssuePlace != "")
+        println(BillsPrm.rec.IssuePlace);
+      else
+        println("_________");
+      end;
+
+      println("~IssueDate" + string(CountBills));
+      println(SQL_ConvTypeDate(BillsPrm.rec.Start));
+
+      println("~RepaymentDate" + string(CountBills));
+      println(SQL_ConvTypeDate(BillsPrm.rec.Maturity) + "\n");
+
+      println("~BillTerm" + string(CountBills));
+      println(ПолучитьСрокПлатежаПоВекселю(BillsPrm.rec.BCTermFormula, BillsPrm.rec.Maturity, BillsPrm.rec.Start, BillsPrm.rec.Expiry, BillsPrm.rec.Diff));
+
+      println("~Amount" + string(CountBills));
+      println("1");
+
+      println("~Rate" + string(CountBills));
+      println(BillsPrm.rec.Rate);
+
+      println("~Holder" + string(CountBills));
+      println(BillsPrm.rec.Holder);
+
+      println("~FaceValue" + string(CountBills));
+      println(BillsPrm.rec.Principal);
+      TotalFaceValuei = TotalFaceValuei + BillsPrm.rec.Principal;
+      TotalFaceValue = TotalFaceValue + BillsPrm.rec.Principal;
+
+      println("~Sum" + string(CountBills));
+      Sum = money(VA_Convert(BillsPrm.rec.BCCost, CDate, BillsPrm.rec.BCCFI, SumCurrency));
+      println(Sum);
+      TotalSumi = TotalSumi + Sum;
+      TotalSum = TotalSum + Sum;
+
+      // Одинарные метки одного номинала
+      if(CountBills1Nom == NumBills1Nom(CountNom))
+        if(CountNom > 0)
+          CountBmNom = CountBmNom + NumBills1Nom(CountNom - 1);
+        end;
+
+        println("~FaceCurrency" + string(CountBmNom));
+        println(VA_GetFI_ISO_Code(BillsPrm.rec.PFI));
+
+        println("~SumCurrency"  + string(CountBmNom));
+        println(VA_GetFI_ISO_Code(SumCurrency));
+
+        println("~TotalAmounti" + string(CountBmNom));
+        println(CountBills1Nom);
+
+        println("~TotalSumi" + string(CountBmNom));
+        println(TotalSumi);
+
+        println("~TotalFaceValuei" + string(CountBmNom));
+        println(TotalFaceValuei);
+
+        if(AllTotali != "")
+          AllTotali = AllTotali + ", ";
+        end;
+
+        AllTotali =
+          AllTotali
+        + string(CountBills1Nom)
+        + " (" + NumToStr(CountBills1Nom, "", "", "", TRUE, 0) + ") ";
+
+        if(dl_tick.AvoirKind == AVOIRISSKIND_BILL)
+          if(CountBills1Nom == 1)
+            AllTotali = AllTotali + "вексель";
+          else
+            AllTotali = AllTotali + "векселей общей";
+          end;
+        elif(dl_tick.AvoirKind == AVOIRISSKIND_DEPOSIT_CERTIFICATE)
+          if(CountBills1Nom == 1)
+            AllTotali = AllTotali + "депозитный сертификат";
+          else
+            AllTotali = AllTotali + "депозитных сертификатов общей";
+          end;
+        end;
+
+        AllTotali =
+          AllTotali
+        + " номинальной стоимостью "
+        + string(TotalFaceValuei)
+        + " " + CurWr(TotalFaceValuei, BillsPrm.rec.PFI);
+
+        CountBills1Nom = 0;
+        CountNom = CountNom + 1;
+
+        TotalFaceValuei = $0;
+        TotalSumi = $0;
+      end;
+
+    end; // while(BillsPrm.MoveNext())
+
+    if(NumBills > 0)
+      println("~TotalAmount");
+      println(NumBills);
+
+      println("~TotalAmountWr");
+      println("(" + NumToStr(NumBills, "", "", "", TRUE, 0) + ")");
+
+      println("~TotalFaceValue");
+      println(TotalFaceValue);
+
+      println("~TotalFaceValueWr");
+      println(CurWr(TotalFaceValue, BillsPrm.rec.PFI));
+
+      println("~AllTotali");
+      println(AllTotali);
+
+      println("~TotalSum");
+      println(TotalSum);
+
+      println("~TotalSumWr");
+      println(CurWr(TotalSum, SumCurrency));
+
+      DDate = GetDDate(dl_tick, Bai);
+
+      println("~DDate");
+      DateSplit(date(DDate), D);
+      println(string(D:o:2:t));
+
+      println("~DelieveryDate");
+      println(FormatDate(DDate));
+
+      println("~PaymentDate");
+      println(SQL_ConvTypeDate(GetDDate(dl_tick, Cai)));
+
+      println("~BillType");
+      if(BillType == 0)
+        if(isRepay == true)
+          println("простых");
+        elif(NumBills > 1)
+          println("простые");
+        else
+          println("простой");
+        end;
+      elif(BillType == 1)
+        if(isRepay == true)
+          println("переводных");
+        elif(NumBills > 1)
+          println("переводные");
+        else
+          println("переводной");
+        end;
+      else
+        println(" ");
+      end;
+
+      println("~BillKind");
+      if(BillKind == VS_IN_DISCONT)
+        if(NumBills > 1)
+          println("беспроцентные");
+        else
+          println("беспроцентный");
+        end;
+      elif(BillKind == VS_IN_S_PC)
+        if(NumBills > 1)
+          println("процентные");
+        else
+          println("процентный");
+        end;
+      else
+        println(" ");
+      end;
+    end; // if(NumBills > 0)
+
+END;
+
+PRIVATE MACRO ПолучОценСтоимость(dl_tick, EstimatedValueCur:@Integer, EstimatedValue:@Money)
+  VAR SQLQueryStr = "";
+  VAR TickPrm;
+
+  SQLQueryStr =
+    " SELECT "
+      + " leg.t_CFI, "
+      + " leg.t_Cost "
+  + " FROM "
+      + " ddl_leg_dbt leg "
+  + " WHERE "
+      + " leg.t_DealID = " + dl_tick.DealID
+  + " AND leg.t_LegKind = " + LEG_KIND_DL_TICK
+  + " AND leg.t_LegID = " + 0;
+
+  TickPrm = TRsbDataSet(SQLQueryStr);
+
+  if(TickPrm.MoveNext())
+    if(ValType(EstimatedValueCur) != V_UNDEF)
+      EstimatedValueCur = Int(TickPrm.rec.CFI);
+    end;
+    if(ValType(EstimatedValue) != V_UNDEF)
+      EstimatedValue = Money(TickPrm.rec.Cost);
+    end;
+  end;
+END;
+
+PRIVATE MACRO ПараметрыВекселейЗалога(dl_tick, CDate)
+
+    VAR SQLQueryStr = "";
+    VAR CountingBills;
+    VAR BillsPrm;
+    VAR BillKind = VS_IN_UNKNOWN;
+    VAR BillType = -1;
+    VAR CountBills1Nom = 0;
+    VAR CountBills = 0;
+    VAR CountNom = 0;
+    VAR NumBills1Nom = TArray;
+    VAR NumBills = 0;
+    VAR NumNom = 0;
+    VAR CountBmNom = 1;
+    VAR EstimatedValueCurrency = -1;
+    VAR EstimatedValue : MONEY;
+    VAR TotalFaceValuei : MONEY;
+    VAR TotalEstimatedValuei : MONEY;
+    VAR AllTotali = "";
+    VAR TotalEstimatedValue : MONEY;
+    VAR TotalEstimatedValueTick : MONEY;
+    VAR DDate;
+    VAR D;
+
+    SQLQueryStr =
+      " SELECT "
+        + " leg.t_PFI, "
+        + " COUNT (leg.t_PFI) NumBills "
+    + " FROM "
+        + " dvsordlnk_dbt ordlnk, "
+        + " ddl_leg_dbt leg "
+    + " WHERE "
+        + " ordlnk.t_DocKind = " + dl_tick.BofficeKind
+    + " AND ordlnk.t_ContractID = " + dl_tick.DealID
+    + " AND leg.t_DealID = ordlnk.t_BCID "
+    + " AND leg.t_LegKind = " + LEG_KIND_VSBANNER
+    + " AND leg.t_LegID = " + 0
+    + " GROUP BY "
+        + " leg.t_PFI "
+    + " ORDER BY "
+        + " leg.t_PFI ";
+
+    CountingBills = TRsbDataSet(SQLQueryStr);
+
+    while(CountingBills.MoveNext())
+      NumBills1Nom(NumNom) = Int(CountingBills.rec.NumBills);
+      NumBills = NumBills + Int(CountingBills.rec.NumBills);
+
+      if(NumNom > 0)
+        // Множим таблицу пункта 1.1
+        println("~CopyTableAfter");
+        // В шаблоне она под номером NumNom
+        println(NumNom);
+        // Смещаем закладки на число векселей одного номинала NumBills1Nom(NumNom - 1)
+        println(NumBills1Nom(NumNom - 1));
+
+        // Множим первую таблицу акта.
+        println("~CopyTableAfter");
+        // В шаблоне она теперь под номером 3 + (NumNom - 1) + NumNom
+        println(3 + (NumNom - 1) + NumNom);
+        // Смещаем закладки на число векселей одного номинала NumBills1Nom(NumNom - 1)
+        println(NumBills1Nom(NumNom - 1));
+      end;
+
+      NumNom = NumNom + 1;
+    end;
+
+    while(CountNom < NumNom)
+      // Множим строки в таблицах пункта 1.1
+      println("~MultipleRow");
+      // Номер таблицы теперь совпадает с (1 + CountNom)
+      println(1 + CountNom);
+      // Добавляем (NumBills1Nom(CountNom) - 1) строк
+      println(NumBills1Nom(CountNom) - 1);
+      println("#");
+      // Множим строку 2
+      println(2);
+
+      // Множим строки первой таблицы акта
+      println("~MultipleRow");
+      // В шаблоне она теперь (3 + (NumNom - 1) + CountNom)
+      println(3 + (NumNom - 1) + CountNom);
+      // Добавляем (NumBills1Nom(CountNom) - 1) строк
+      println(NumBills1Nom(CountNom) - 1);
+      println("#");
+      // Множим строку 2
+      println(2);
+
+      CountNom = CountNom + 1;
+    end;
+
+    TotalEstimatedValueTick = $0;
+    ПолучОценСтоимость(dl_tick, @EstimatedValueCurrency, @TotalEstimatedValueTick);
+
+    SQLQueryStr =
+      " SELECT "
+        + " ordlnk.t_BCID, "
+        + " ordlnk.t_BCCost, "
+        + " ordlnk.t_BCCFI, "
+        + " vsbnr.t_IssueKind, "
+        + " vsbnr.t_IssuerName, "
+        + " vsbnr.t_BCSeries, "
+        + " vsbnr.t_BCNumber, "
+        + " vsbnr.t_BCTermFormula, "
+        + " leg.t_Start, "
+        + " leg.t_Maturity, "
+        + " leg.t_Expiry, "
+        + " leg.t_Diff, "
+        + " leg.t_Principal, "
+        + " leg.t_PFI "
+    + " FROM "
+        + " dvsordlnk_dbt ordlnk, "
+        + " dvsbanner_dbt vsbnr, "
+        + " ddl_leg_dbt leg "
+    + " WHERE "
+        + " ordlnk.t_DocKind = " + dl_tick.BofficeKind
+    + " AND ordlnk.t_ContractID = " + dl_tick.DealID
+    + " AND vsbnr.t_BCID = ordlnk.t_BCID "
+    + " AND leg.t_DealID = ordlnk.t_BCID "
+    + " AND leg.t_LegKind = " + LEG_KIND_VSBANNER
+    + " AND leg.t_LegID = " + 0
+    + " ORDER BY "
+        + " leg.t_PFI ";
+
+    BillsPrm = TRsbDataSet(SQLQueryStr);
+
+    CountBills1Nom = 0;
+    CountBills = 0;
+    CountNom = 0;
+    EstimatedValue = $0;
+    TotalFaceValuei = $0;
+    TotalEstimatedValuei = $0;
+    TotalEstimatedValue = $0;
+
+    while(BillsPrm.MoveNext())
+      CountBills1Nom = CountBills1Nom + 1;
+      CountBills = CountBills + 1;
+
+      if(CountBills == 1)
+        BillType = BillsPrm.rec.IssueKind;
+      else
+        if(BillType != BillsPrm.rec.IssueKind)
+          BillType = -1;
+        end;
+      end;
+
+      println("~N" + string(CountBills));
+      println(CountBills1Nom);
+
+      println("~Issuer" + string(CountBills));
+      println(BillsPrm.rec.IssuerName);
+
+      println("~BillSeries" + string(CountBills));
+      if (BillsPrm.rec.BCSeries != "")
+        println(BillsPrm.rec.BCSeries);
+      else
+        println("\n");
+      end;
+
+      println("~BillNumber" + string(CountBills));
+      println(trim(BillsPrm.rec.BCNumber));
+
+      println("~IssueDate" + string(CountBills));
+      println(SQL_ConvTypeDate(BillsPrm.rec.Start));
+
+      println("~BillTerm" + string(CountBills));
+      println(ПолучитьСрокПлатежаПоВекселю(BillsPrm.rec.BCTermFormula, BillsPrm.rec.Maturity, BillsPrm.rec.Start, BillsPrm.rec.Expiry, BillsPrm.rec.Diff));
+
+      println("~FaceValue" + string(CountBills));
+      println(BillsPrm.rec.Principal);
+      TotalFaceValuei = TotalFaceValuei + BillsPrm.rec.Principal;
+
+      println("~EstimatedValue" + string(CountBills));
+      EstimatedValue = money(VA_Convert(BillsPrm.rec.BCCost, CDate, BillsPrm.rec.BCCFI, EstimatedValueCurrency));
+      println(EstimatedValue);
+      TotalEstimatedValuei = TotalEstimatedValuei + EstimatedValue;
+      TotalEstimatedValue = TotalEstimatedValue + EstimatedValue;
+
+      // Одинарные метки одного номинала
+      if(CountBills1Nom == NumBills1Nom(CountNom))
+        if(CountNom > 0)
+          CountBmNom = CountBmNom + NumBills1Nom(CountNom - 1);
+        end;
+
+        println("~FaceCurrency" + string(CountBmNom));
+        println(VA_GetFI_ISO_Code(BillsPrm.rec.PFI));
+
+        println("~EstimatedValueCurrency"  + string(CountBmNom));
+        println(VA_GetFI_ISO_Code(EstimatedValueCurrency));
+
+        println("~TotalEstimatedValuei" + string(CountBmNom));
+        println(TotalEstimatedValuei);
+
+        println("~TotalFaceValuei" + string(CountBmNom));
+        println(TotalFaceValuei);
+
+        if(AllTotali != "")
+          AllTotali = AllTotali + ", ";
+        end;
+
+        AllTotali =
+          AllTotali
+        + string(CountBills1Nom)
+        + " (" + NumToStr(CountBills1Nom, "", "", "", TRUE, 0) + ") ";
+
+        if(dl_tick.AvoirKind == AVOIRISSKIND_BILL)
+          if(CountBills1Nom == 1)
+            AllTotali = AllTotali + "вексель на";
+          else
+            AllTotali = AllTotali + "векселей на общую";
+          end;
+        elif(dl_tick.AvoirKind == AVOIRISSKIND_DEPOSIT_CERTIFICATE)
+          if(CountBills1Nom == 1)
+            AllTotali = AllTotali + "депозитный сертификат на";
+          else
+            AllTotali = AllTotali + "депозитных сертификатов на общую";
+          end;
+        end;
+
+        AllTotali =
+          AllTotali
+        + " сумму по номиналу "
+        + string(TotalFaceValuei)
+        + " " + CurWr(TotalFaceValuei, BillsPrm.rec.PFI);
+
+        CountBills1Nom = 0;
+        CountNom = CountNom + 1;
+
+        TotalFaceValuei = $0;
+        TotalEstimatedValuei = $0;
+      end;
+
+    end; // while(BillsPrm.MoveNext())
+
+    if(NumBills > 0)
+      println("~TotalAmount");
+      println(NumBills);
+
+      println("~TotalAmountWr");
+      println("(" + NumToStr(NumBills, "", "", "", TRUE, 0) + ")");
+
+      println("~AllTotali");
+      println(AllTotali);
+
+      println("~TotalEstimatedValue");
+      if((TotalEstimatedValueTick != $0) and (TotalEstimatedValueTick != TotalEstimatedValue))
+        println(TotalEstimatedValueTick);
+      else
+        println(TotalEstimatedValue);
+      end;
+
+      println("~TotalEstimatedValueWr");
+      println(CurWr(TotalEstimatedValue, EstimatedValueCurrency));
+
+      println("~BillType");
+      if(BillType == 0)
+        if(NumBills > 1)
+          println("простые");
+        else
+          println("простой");
+        end;
+      elif(BillType == 1)
+        if(NumBills > 1)
+          println("переводные");
+        else
+          println("переводной");
+        end;
+      else
+        println(" ");
+      end;
+
+    end; // if(NumBills > 0)
+
+END;
+
+private macro ПараметрыОднойЧасти (dl_tick, CDate, LinkKind)
+  VAR prefix;
+  VAR SQLQueryStr = "";
+  VAR CountingBills;
+  VAR BillsPrm;
+  VAR BillKind = VS_IN_UNKNOWN;
+  VAR BillType = -1;
+  VAR CountBills1Nom = 0;
+  VAR CountBills = 0;
+  VAR CountNom = 0;
+  VAR NumBills1Nom = TArray;
+  VAR NumBills = 0;
+  VAR NumNom = 0;
+  VAR CountBmNom = 1;
+  VAR SumCurrency = -1;
+  VAR Sum : MONEY;
+  VAR TotalFaceValuei : MONEY;
+  VAR TotalFaceValue : MONEY;
+  VAR TotalSumi : MONEY;
+  VAR AllTotali = "";
+  VAR TotalSum : MONEY;
+  VAR DDate;
+  VAR D;
+  VAR LegKind;
+  VAR TableNum;
+
+  if (LinkKind == 0)
+    LegKind = 0;
+  elif (LinkKind == 1)
+    LegKind = 2;
+  end;
+
+//Сначала принимаемые банком векселя
+
+  SQLQueryStr =
+    " SELECT "
+      + " leg.t_PFI, "
+      + " COUNT (leg.t_PFI) NumBills "
+  + " FROM "
+      + " dvsordlnk_dbt ordlnk, "
+      + " ddl_leg_dbt leg "
+  + " WHERE "
+      + " ordlnk.t_DocKind = " + dl_tick.BofficeKind
+  + " AND ordlnk.t_ContractID = " + dl_tick.DealID
+  + " AND ordlnk.t_LinkKind = " + LinkKind
+  + " AND leg.t_DealID = ordlnk.t_BCID "
+  + " AND leg.t_LegKind = " + LEG_KIND_VSBANNER
+  + " AND leg.t_LegID = " + 0
+  + " GROUP BY "
+      + " leg.t_PFI "
+  + " ORDER BY "
+      + " leg.t_PFI ";
+
+  CountingBills = TRsbDataSet(SQLQueryStr);
+
+  while(CountingBills.MoveNext())
+    NumBills1Nom(NumNom) = Int(CountingBills.rec.NumBills);
+    NumBills = NumBills + Int(CountingBills.rec.NumBills);
+
+    NumNom = NumNom + 1;
+  end;
+
+  while(CountNom < NumNom)
+    if (LinkKind == 1)
+      TableNum = 1;
+    else
+      TableNum = 2;
+    end;
+
+    // Множим строки в таблицах пункта 1.1
+    println("~MultipleRow");
+    println(TableNum); //номер таблицы
+    println(NumBills1Nom(CountNom) - 1); //количество добавляемых строк
+    println("#");
+    println(2); //номер размножаемой строки
+
+    if (LinkKind == 1)
+      TableNum = 4;
+    else
+      TableNum = 6;
+    end;
+
+    // Множим строки первой таблицы акта
+    println("~MultipleRow");
+    println(TableNum); //номер таблицы
+    println(NumBills1Nom(CountNom) - 1); //количество добавляемых строк
+    println("#");
+    println(2); //номер размножаемой строки
+
+    CountNom = CountNom + 1;
+  end;
+
+  SQLQueryStr =
+    " SELECT "
+      + " ordlnk.t_BCID, "
+      + " ordlnk.t_BCCost, "
+      + " ordlnk.t_BCCFI, "
+      + " vsbnr.t_IssueKind, "
+      + " vsbnr.t_IssuerName, "
+      + " vsbnr.t_BCSeries, "
+      + " vsbnr.t_BCNumber, "
+      + " vsbnr.t_IssuePlace, "
+      + " vsbnr.t_BCTermFormula, "
+      + " leg.t_Formula, "
+      + " leg.t_Price, "
+      + " leg.t_Start, "
+      + " leg.t_Maturity, "
+      + " leg.t_Expiry, "
+      + " leg.t_Diff, "
+      + " leg.t_Principal, "
+      + " leg.t_price/power(10, leg.t_point) Rate, "
+      + " vsbnr.t_holdername Holder, "
+      + " leg.t_PFI "
+  + " FROM "
+      + " dvsordlnk_dbt ordlnk, "
+      + " dvsbanner_dbt vsbnr, "
+      + " ddl_leg_dbt leg "
+  + " WHERE "
+      + " ordlnk.t_DocKind = " + dl_tick.BofficeKind
+  + " AND ordlnk.t_ContractID = " + dl_tick.DealID
+  + " AND ordlnk.t_LinkKind = " + LinkKind
+  + " AND vsbnr.t_BCID = ordlnk.t_BCID "
+  + " AND leg.t_DealID = ordlnk.t_BCID "
+  + " AND leg.t_LegKind = " + LEG_KIND_VSBANNER
+  + " AND leg.t_LegID = " + 0
+  + " ORDER BY "
+      + " leg.t_PFI ";
+
+  BillsPrm = TRsbDataSet(SQLQueryStr);
+
+  CountBills1Nom = 0;
+  CountBills = 0;
+  CountNom = 0;
+  Sum = $0;
+  TotalFaceValuei = $0;
+  TotalFaceValue = $0;
+  TotalSumi = $0;
+  TotalSum = $0;
+
+  if (LinkKind == 0)
+    prefix = "";
+  else
+    prefix = "New";
+  end;
+
+  ПолучВалРасчетовМены(dl_tick, @SumCurrency, LegKind);
+
+  while(BillsPrm.MoveNext())
+    CountBills1Nom = CountBills1Nom + 1;
+    CountBills = CountBills + 1;
+
+    if(CountBills == 1)
+      if(ВексельПроцентный(BillsPrm.rec.Formula, BillsPrm.rec.Price))
+        BillKind = VS_IN_S_PC;
+      else
+        BillKind = VS_IN_DISCONT; // Как бы беспроцентный
+      end;
+
+      BillType = BillsPrm.rec.IssueKind;
+    else
+      if((BillKind == VS_IN_S_PC) and (not ВексельПроцентный(BillsPrm.rec.Formula, BillsPrm.rec.Price)))
+        BillKind = VS_IN_UNKNOWN;
+      elif((BillKind == VS_IN_DISCONT) and (ВексельПроцентный(BillsPrm.rec.Formula, BillsPrm.rec.Price)))
+        BillKind = VS_IN_UNKNOWN;
+      end;
+
+      if(BillType != BillsPrm.rec.IssueKind)
+        BillType = -1;
+      end;
+    end;
+
+    println("~" + prefix + "N" + string(CountBills));
+    println(CountBills1Nom);
+
+    println("~" + prefix + "Issuer" + string(CountBills));
+    println(BillsPrm.rec.IssuerName);
+
+    println("~" + prefix + "BillSeries" + string(CountBills));
+    if (BillsPrm.rec.BCSeries != "")
+      println(BillsPrm.rec.BCSeries);
+    else
+      println("\n");
+    end;
+
+    println("~" + prefix + "BillNumber" + string(CountBills));
+    println(trim(BillsPrm.rec.BCNumber));
+
+    println("~" + prefix + "IssueLocation" + string(CountBills));
+    if(BillsPrm.rec.IssuePlace != "")
+      println(BillsPrm.rec.IssuePlace);
+    else
+      println("_________");
+    end;
+
+    println("~" + prefix + "IssueDate" + string(CountBills));
+    println(SQL_ConvTypeDate(BillsPrm.rec.Start));
+
+    println("~" + prefix + "RepaymentDate" + string(CountBills));
+    println(SQL_ConvTypeDate(BillsPrm.rec.Maturity) + "\n");
+
+    println("~" + prefix + "BillTerm" + string(CountBills));
+    println(ПолучитьСрокПлатежаПоВекселю(BillsPrm.rec.BCTermFormula, BillsPrm.rec.Maturity, BillsPrm.rec.Start, BillsPrm.rec.Expiry, BillsPrm.rec.Diff));
+
+    println("~" + prefix + "Amount" + string(CountBills));
+    println("1");
+
+    println("~" + prefix + "Rate" + string(CountBills));
+    println(BillsPrm.rec.Rate);
+
+    println("~" + prefix + "Holder" + string(CountBills));
+    println(BillsPrm.rec.Holder);
+
+    println("~" + prefix + "FaceValue" + string(CountBills));
+    println(BillsPrm.rec.Principal);
+    TotalFaceValuei = TotalFaceValuei + BillsPrm.rec.Principal;
+    TotalFaceValue = TotalFaceValue + BillsPrm.rec.Principal;
+
+    println("~" + prefix + "Sum" + string(CountBills));
+    Sum = money(VA_Convert(BillsPrm.rec.BCCost, CDate, BillsPrm.rec.BCCFI, SumCurrency));
+    println(Sum);
+    TotalSumi = TotalSumi + Sum;
+    TotalSum = TotalSum + Sum;
+
+    // Одинарные метки одного номинала
+    if(CountBills1Nom == NumBills1Nom(CountNom))
+      if(CountNom > 0)
+        CountBmNom = CountBmNom + NumBills1Nom(CountNom - 1);
+      end;
+
+      println("~" + prefix + "FaceCurrency" + string(CountBmNom));
+      println(VA_GetFI_ISO_Code(BillsPrm.rec.PFI));
+
+      println("~" + prefix + "SumCurrency"  + string(CountBmNom));
+      println(VA_GetFI_ISO_Code(SumCurrency));
+
+      println("~" + prefix + "TotalAmounti" + string(CountBmNom));
+      println(CountBills1Nom);
+
+      println("~" + prefix + "TotalSumi" + string(CountBmNom));
+      println(TotalSumi);
+
+      println("~" + prefix + "TotalFaceValuei" + string(CountBmNom));
+      println(TotalFaceValuei);
+
+      CountBills1Nom = 0;
+      CountNom = CountNom + 1;
+
+      TotalFaceValuei = $0;
+      TotalSumi = $0;
+    end;
+
+  end; // while(BillsPrm.MoveNext())
+
+  if(NumBills > 0)
+    println("~" + prefix + "TotalAmount");
+    println(NumBills);
+
+    println("~" + prefix + "TotalAmountWr");
+    println("(" + NumToStr(NumBills, "", "", "", TRUE, 0) + ")");
+
+    println("~" + prefix + "TotalFaceValue");
+    println(TotalFaceValue);
+
+    println("~" + prefix + "TotalFaceValueWr");
+    println(CurWr(TotalFaceValue, BillsPrm.rec.PFI));
+
+    println("~" + prefix + "AllTotali");
+    println(AllTotali);
+
+    println("~" + prefix + "TotalSum");
+    println(TotalSum);
+
+    println("~" + prefix + "TotalSumWr");
+    println(CurWr(TotalSum, SumCurrency));
+
+    DDate = GetDDate(dl_tick, Bai);
+
+    println("~" + prefix + "DDate");
+    DateSplit(date(DDate), D);
+    println(string(D:o:2:t));
+
+    println("~" + prefix + "DelieveryDate");
+    println(FormatDate(DDate));
+
+    println("~" + prefix + "PaymentDate");
+    println(SQL_ConvTypeDate(GetDDate(dl_tick, Cai)));
+
+
+  end; // if(NumBills > 0)
+
+End;
+
+private macro ПараметрыВекселейМены (dl_tick, CDate)
+  var SendPremium = $0, ReceivePremium = $0, SendCost = $0, ReceiveCost = $0;
+  var SendPremiumCurr = -1, ReceivePremiumCurr = -1, SendCostCurr = -1, ReceiveCostCurr = -1;
+  var sql;
+
+  ПараметрыОднойЧасти(dl_tick, CDate, 1);//принимаемые векселя
+  ПараметрыОднойЧасти(dl_tick, CDate, 0);//передаваемые векселя векселя
+
+  sql = "select t_returnincome sum, "
+      + "       t_deliveringfiid fiid, "
+      + "       t_legkind legkind, "
+      + "       t_cost cost, "
+      + "       t_cfi cfi "
+      + "from ddl_leg_dbt where t_dealid = :dealid and t_legkind <> 1 order by t_legkind ";
+  sql = ExecSqlSelect(sql, MakeArray(SqlParam("dealid", dl_tick.DealID)), false);
+  while (sql.MoveNext() )
+    if (int(sql.value("legkind")) == 0) //передача векселя
+      SendPremium     = money(sql.value("sum"));
+      SendCost        = money(sql.value("cost"));
+      SendPremiumCurr = int(sql.value("fiid"));
+      SendCostCurr    = int(sql.value("cfi"));
+
+    elif (int(sql.value("legkind")) == 2) //прием векселя
+      ReceivePremium     = money(sql.value("sum"));
+      ReceiveCost        = money(sql.value("cost"));
+      ReceivePremiumCurr = int(sql.value("fiid"));
+      ReceiveCostCurr    = int(sql.value("cfi"));
+    end;
+  end;
+
+  if (SendPremium == ReceivePremium) //векселя стоят одинаково
+    [~item1p2];
+    println("Стороны договорились установить стоимость векселей, передаваемых каждой из Сторон, равноценной и равной " + SendCost + " " + CurWr(SendCost, SendCostCurr));
+    [~item2p1];
+    println("Клиент обязуется в течение 1 (одного) рабочего дня с момента подписания Сторонами настоящего Договора передать Банку в собственность векселя, "+
+            "указанные в п. 1.1.1. настоящего Договора.");
+    [~item2p2];
+    println("Банк обязуется в течение 1 (одного) рабочего дня после выполнения Клиентом п. 2.1. настоящего Договора, передать в собственность Клиенту векселя, указанные в п. 1.1.2. " +
+            "настоящего Договора. Векселя передаются Клиенту. Обязательство Банка является встречным.");
+  elif (SendPremium > 0) //передаваемые векселя дороже
+    [~item1p2];
+    println("Стороны признают обмениваемые векселя неравноценными. Сумма в размере разницы между согласованной стоимостью векселей, указанных в п. 1.1.1. настоящего Договора, " +
+            "и согласованной стоимостью векселей, указанных в п. 1.1.2. настоящего Договора, составляет " + SendPremium + " " + CurWr(SendPremium, SendPremiumCurr));
+    [~item2p1];
+    println("Клиент обязуется в течение 1 (одного) рабочего дня с момента подписания Сторонами настоящего Договора передать Банку в собственность векселя, указанные в " +
+            "п. 1.1.1. настоящего Договора, и перечислить на счет Банка денежные средства в размере, указанном в п. 1.2. настоящего Договора.");
+    [~item2p2];
+    println("Банк обязуется в течение 1 (одного) рабочего дня после исполнения Клиентом п. 2.1. настоящего Договора, передать в собственность Клиенту векселя, указанные в п. 1.1.2. " +
+            "настоящего Договора.");
+  else //принимаемые векселя дороже
+    [~item1p2];
+    println("Стороны признают обмениваемые векселя неравноценными. Сумма в размере разницы между согласованной стоимостью векселей, указанных в п. 1.1.1. настоящего Договора, " +
+            "и согласованной стоимостью векселей, указанных в п. 1.1.2. настоящего Договора, составляет " + ReceivePremium + " " + CurWr(ReceivePremium, ReceivePremiumCurr));
+    [~item2p1];
+    println("Клиент обязуется в течение 1 (одного) рабочего дня с момента подписания Сторонами настоящего Договора передать Банку в собственность векселя, "+
+            "указанные в п. 1.1.1. настоящего Договора.");
+    [~item2p2];
+    println("Банк обязуется в течение 1 (одного) рабочего дня после исполнения Клиентом п. 2.1. настоящего Договора, передать в собственность Клиенту векселя, указанные в п. 1.1.2. " +
+            "настоящего Договора, и перечислить на счет Клиента денежные средства в размере, указанном в п. 1.2. настоящего Договора.");
+  end;
+
+
+End;
+
+/*****************************************************************************/
+/* Макросы печати                                                            */
+/*****************************************************************************/
+
+/* Основной макрос печати
+
+ВХОДНЫЕ ПАРАМЕТРЫ :
+dl_tick - структура record (dl_tick)
+templ - строка, содержащая имя шаблона
+*/
+
+MACRO УВ_Печать(dl_tick)
+VAR templ = "", Kind = 0, TempFile, CDate = Date(0,0,0);
+var d;
+
+/* Attributs begin */
+    Kind = ПолучитьВидДокумента(dl_tick.BofficeKind, dl_tick.DealType);
+
+    if (Kind == 108) //мена
+      templ = "DMV_RSHB.dotx";
+      println(templ);
+
+      CDate = dl_tick.DealDate;
+
+      [~City];
+      println(GetDprtCity({OperDprtNode}));
+
+      [~CNumber];
+      println(dl_tick.DealCode);
+
+      DateSplit(CDate, D);
+
+      [~CDay];
+      println(string(D:o:2:t));
+
+      [~CDate];
+      println(FormatDate(CDate));
+
+    else
+      templ = GetTemplAndDocPrm(dl_tick.BofficeKind, dl_tick.DealID, Kind, @CDate);
+    end;
+
+    if (templ == "")
+//    MsgBox("Не определен файл шаблона");
+       return TRUE;
+    end;
+
+    if((Kind == 102) OR (Kind == 26))
+      if(Kind == 102)
+          ПараметрыНашБанка(dl_tick);
+          ПараметрыВекселей(dl_tick, true, Kind, CDate);
+      elif((Kind == 26) OR (Kind == 24))
+          ПараметрыПокупателя(dl_tick);
+          ПараметрыПродавца(dl_tick);
+
+          //в дистрибутивной реализации не находит представителей, т.к. не хватает параметра proxybegindate
+          ProxyTag(dl_tick.BofficeKind, dl_tick.DealID, dl_tick.PartyID);
+
+          if(Kind == 26)
+            ПараметрыВекселей(dl_tick, false, Kind, CDate);
+          end;
+      end;
+
+      КонтрАгент(dl_tick);
+
+    elif(Kind == 107)
+      ПараметрыЗалогодателя(dl_tick);
+      ПараметрыЗалогодержателя(dl_tick);
+      ПараметрыГенСогл(dl_tick.BofficeKind, dl_tick.DealID);
+      ПараметрыВекселейЗалога(dl_tick, CDate);
+
+    elif (kind == 108) //мена
+      ПараметрыНашБанка(dl_tick);
+      ПараметрыВекселейМены(dl_tick, CDate);
+      КонтрАгент(dl_tick);
+
+      ProxyTag(dl_tick.BofficeKind, dl_tick.DealID, dl_tick.PartyID);
+    end;
+
+/* Attributs end */
+
+    TempFile = SetOutPut(GetTxtFileName("tmpout"), FALSE);
+    DLWREPS_PrintReportFromTagFile (TempFile);
+
+    SetOutput(NULL, false);
+
+    return TRUE;
+END;
+
+/* Макрос автоматической печати
+(для вызов из функции ExecuteStep(Buffer, dl_tick))
+Отличается от макроса Печать(dl_tick, templ) входными параметрами !
+
+ВХОДНЫЕ ПАРАМЕТРЫ :
+dl_tick - адрес, передаваемый из кода С
+templ - строка, содержащая имя шаблона
+*/
+
+MACRO АвтоПечать(dl_tick, templ)
+VAR TempFile;
+
+    record Dl_tickRec ("dl_tick");
+    SetBuff(Dl_tickRec, dl_tick);
+
+var spgrdoc = tbfile ("spgrdoc");
+    spgrdoc.Clear();
+    spgrdoc.KeyNum = 1;
+    spgrdoc.rec.SourceDocKind = Dl_tickRec.BOfficeKind;
+    spgrdoc.rec.SourceDocId = Dl_tickRec.DealID;
+    spgrdoc.AddFilter("t_SourceDocKind = " + Dl_tickRec.BOfficeKind + " AND t_SourceDocId = " + Dl_tickRec.DealID);
+
+    if (spgrdoc.GetGE() == false)
+        msgbox("Не найдены документы по сделке");
+        return false;
+    end;
+
+    spgrdoc.DropFilter();
+
+    if (NOT УВ_Печать(Dl_tickRec))
+    return FALSE;
+    end;
+
+    return TRUE;
+END;

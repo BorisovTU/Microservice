@@ -1,0 +1,1653 @@
+/*
+$Name:        dbo_qi_func.mac
+$Module:      Интеграция с внешними системами
+$Description: Уведомление квал.инвесторов
+*/
+
+/* BIQ-9185 Уведомление квал.инвесторов
+   Гераськина Т.В.
+   На основе dbo_message_main.mac
+*/
+import rsexts, rsd, PTInter;
+import "u_common_email_utils.mac", "CBForms_h.mac", "Bnk_Common.mac", "Bnk_PtLib.mac", "ContactUtil.mac", "StringUtils.mac", "StorageInfo.mac", "WordDocProcessor.mac", "sud_utils.mac";
+import or_rep_h;
+import file_archive;
+
+const RECOGNITION_QI   = 501;
+const TEST_QI          = 503;
+const EXCLUSIONRIGHT_QI= 504;
+const INCLUSION_QI     = 506;
+const REJECTION_QI     = 509;
+const OVERDUE_QI       = 512;
+const CLAIM_QI         = 511;
+const EXCLUSION_QI     = 513;
+const PROLONG_QI       = 514;
+
+const NOTEKIND_TEMPLATE_QI = 108;
+const NOTEKIND_DATE_EXCLUSION_QI = 201;
+
+const CATEGORY_USE_IN_APPLICATION = 140;
+
+const QI_REGISTRY_DIRECTORY        = "РСХБ\\БРОКЕРСКОЕ ОБСЛУЖИВАНИЕ\\КВАЛИФИКАЦИЯ\\ДИРЕКТОРИЯ";
+const QI_REGISTRY_HIDDENRECIPIENTS_UL = "РСХБ\\БРОКЕРСКОЕ ОБСЛУЖИВАНИЕ\\КВАЛИФИКАЦИЯ\\НАПРАВЛЯТЬ СКРЫТУЮ КОПИЮ ПО ЮЛ";
+const QI_REGISTRY_HIDDENRECIPIENTS_FL = "РСХБ\\БРОКЕРСКОЕ ОБСЛУЖИВАНИЕ\\КВАЛИФИКАЦИЯ\\НАПРАВЛЯТЬ СКРЫТУЮ КОПИЮ ПО ФЛ";
+const QI_REGISTRY_DEFAULTSIGNER    = "РСХБ\\БРОКЕРСКОЕ ОБСЛУЖИВАНИЕ\\КВАЛИФИКАЦИЯ\\ПОДПИСАНТ ПО УМОЛЧАНИЮ";
+const QI_REGISTRY_NOTIFICATIONDEALINE = "РСХБ\\БРОКЕРСКОЕ ОБСЛУЖИВАНИЕ\\КВАЛИФИКАЦИЯ\\СРОК ОТПРАВКИ УВЕДОМЛЕНИЯ ПО КИ";
+const QI_REGISTRY_TIMEOUT_SEND_MESSAGE = "РСХБ\\БРОКЕРСКОЕ ОБСЛУЖИВАНИЕ\\КВАЛИФИКАЦИЯ\\ТАЙМАУТ ОТПР УВЕДОМЛЕНИЙ ПО КИ";
+
+const PDFTAG = "PDF";    ///< Метка для файла PDF
+const SIGNTAG = "SIGN";  ///< Метка для файла подписи
+const LOGTAG = "LOG";    ///< Метка для файла лога
+
+/// Запрос для поиска подписанта (должен быть добавлен в dAcsGroupOper)
+const SIGNER_SELECT = "SELECT p.t_oper, p.t_name, o.t_post, o.t_personID FROM dPerson_dbt p, dOfficer_dbt o " +
+                                "WHERE p.t_oper IN (SELECT ago.t_oper FROM dAcsGroupOper_dbt ago " +
+                                     "WHERE ago.t_groupID = (SELECT ag.t_groupID FROM dAcsGroup_dbt ag WHERE ag.t_name = 'Подписанты отчетности по КИ')) " +
+                                  "AND o.t_personid(+) = p.t_partyid";
+
+/**
+@brief Класс с данными подписанта
+*/
+class CSigner(pOper: Integer, pName: String,  pPost: String)
+  var oper: Integer = pOper;    ///< Номер пользователя
+  var name: String = pName;     ///< ФИО пользователя
+  var post: String = pPost;     ///< Должность
+  var signImageID: Integer = 0; ///< ID в таблице dImage_dbt для файла подписи сотрудника
+  var signStampImageID: Integer = 0; ///< ID в таблице dImage_dbt для файла подписи сотрудника с печатью банка
+end;
+
+/**
+@brief Класс с данными клиента
+*/
+class CClient(pPartyId: Integer, pShortName: String, pFullName: String)
+  var partyId: Integer = pPartyId;    ///< Номер в таблице dParty_dbt
+  var shortName: String = pShortName; ///< Краткое наименование клиента
+  var fullName: String = pFullName;   ///< Полное наименование клиента
+  var legalForm: Integer = 0;         ///< Форма субъекта
+  var contractNumber: String = "";    ///< Номер ДБО
+  var emails: TArray = TArray();      ///< Массив E-mail клиента для отправки
+end;
+
+/**
+@brief Функция поиска подписанта по номеру пользователя в списке текущих подписантов
+@param[in] operId Номер пользователя
+@return Экземпляр класса CSigner
+@note В случае если пользователь с указанным номером не найден в списке подписантов, в возвращаемом значении будет установлено oper=0, name="", post=""
+*/
+macro GetSigner(operId: Integer): CSigner
+  var result: CSigner = CSigner(0, "", "");
+  var rs = ExecSQLSelect(SIGNER_SELECT + " and p.t_oper = " + operId);
+
+  if (rs.movenext())
+    result = CSigner(rs.value("t_oper"), rs.value("t_name"), rs.value("t_post"));
+    result.signImageID = Bnk_GetImageID(OBJTYPE_PARTY, String(rs.value("t_personid"):o:10), 3 /*Подпись сотрудника*/);
+    result.signStampImageID = Bnk_GetImageID(OBJTYPE_PARTY, String(rs.value("t_personid"):o:10), 4 /*Подпись с печатью банка*/);
+  end;
+  
+  return result;
+end;
+
+/*
+@brief Получить значение из параметра по пути. РУБИЛЬНИК.BOSS-5689
+@return Значение параметра
+*/
+macro GetRegValueSwitchQI()
+   var VALUE_BOSS_5689 = False,  stat;
+    GetRegistryValue("РСХБ\\БРОКЕРСКОЕ ОБСЛУЖИВАНИЕ\\РУБИЛЬНИК.BOSS-5689", V_BOOL, VALUE_BOSS_5689, stat);
+   
+    if(stat)
+       VALUE_BOSS_5689 = False;
+    end;
+    return VALUE_BOSS_5689;
+end;
+
+
+/**
+@brief Функция получения подписанта по умолчанию из настроек банка
+@return Экземпляр класса CSigner
+@note В случае если настройка банка не задана, в возвращаемом значении будет установлено oper=0, name="", post=""
+*/
+macro GetQIDefaultSigner(): CSigner
+  var errCode: Integer;
+  var operId: Integer;
+    
+  GetRegistryValue(QI_REGISTRY_DEFAULTSIGNER, V_INTEGER, operId, errCode);
+  if (errCode == 0)
+    return GetSigner(operId);
+  end;
+  
+  return CSigner(0, "", "");
+end;
+
+/**
+@brief Функция пользовательского интерфейса для выбора подписанта
+@return Экземпляр класса CSigner (Подписант)
+@return null если пользователь отказался от выбора
+*/
+macro GetSignerUI(): CSigner
+  var choise;
+  var signer: CSigner;
+  
+  choise = DL_Scroll(SIGNER_SELECT, " Выбор подписанта ", 35, 15, "t_name", "Подписант");
+  if (choise != null)
+    return GetSigner(choise.value("t_oper"));
+  end;
+  
+  return null;
+end;
+
+/**
+@brief Функция поиска информации по клиенту
+@param[in] dlContrId ID договора ДБО
+@return Экземпляр класса CClient
+@note В случае если клиент с указанным номером не найден, в возвращаемом значении будет установлено partyId=0, shortName=""
+*/
+macro GetClient(dlContrId: Integer): CClient
+  var rs = ExecSQLSelect("SELECT pt.t_partyID, pt.t_name, pt.t_shortName, pt.t_legalForm, dl.t_email, sf.t_number FROM dDlContr_dbt dl, dSfContr_dbt sf, dParty_dbt pt WHERE t_dlContrID = " + dlContrId + " AND dl.t_SfContrID = sf.t_ID AND sf.t_partyID = pt.t_partyID");
+  var client: CClient;
+  var email: String;
+  
+  if (rs.movenext())
+    client = CClient(rs.value("t_partyID"), rs.value("t_shortName"), rs.value("t_name"));
+    client.legalForm = rs.value("t_legalForm");
+    client.contractNumber = rs.value("t_number");
+    email = Trim(String(rs.value("t_email")));
+
+    if (StrLen(email) > 0) // e-mail установлен на ДБО
+      client.emails.value(0) = email;
+    else
+      var contacts = GetPartyContacts(client.partyID, CNTK_EMAIL); // массив объектов CPartyContact
+      var filteredContacts = FilterPartyContacts(contacts, CNTK_EMAIL, 8); // для отчетов
+      
+      if (filteredContacts.size == 0)
+        filteredContacts = FilterPartyContacts(contacts, CNTK_EMAIL, 1001); // рабочий
+      end;
+      
+      if (filteredContacts.size == 0)
+        filteredContacts = contacts; // может быть пустым
+      end;
+      
+      var i: Integer = 0;
+      while (i < filteredContacts.size)
+        client.emails.value(client.emails.size) = filteredContacts(i).value;
+        i = i + 1;
+      end;
+    end;
+    
+    return client;
+  end;
+  
+  return CClient(0, "", "");
+end;
+
+/**
+@brief Класс с параметрами уведомлений по КИ
+*/
+class CQINotificationParams()
+  var dlContrID: Integer;  ///< ID договора брокерского обслуживания
+  var notificationDate: Date; ///< Дата уведомления
+  var signer;              ///< Данные подписанта - объект класса CSigner
+  var client;              ///< Данные клиента - объект класса CClient
+  
+  /**
+  @brief Процедура начальной инициализации класса
+  */
+  private macro InitNotification()
+    dlContrID = 0;
+    notificationDate = {curdate};
+    signer = null;
+    client = null;
+  end;
+  //--- конструктор ---
+  InitNotification();
+end; // CQINotificationParams
+
+/**
+@brief Функция проверки включения текущего пользователя в группу имеющую права доступа к функционалу КИ
+@return true Если функционал КИ доступен для пользователя
+*/
+macro CheckQIUserRights(): Bool
+  return CheckUserRoles({oper}, РОЛЬ_12, РОЛЬ_14);
+end;
+
+/**
+@brief Функция отправки данных в IPS Фабрику документов по уведомлениям КИ
+@param[in] clientID ID субъекта
+@param[in] notificationType Тип уведомления (константы RECOGNITION_QI и т.д.)
+@param[in] notificationDate Дата уведомления (необяз.)
+@param[in] signerID Номер операциониста (напр. 1557) (необяз.)
+@param[in] reason Причина для уведомления об отказе (необяз.)
+@param[in] clientNameModified Полное наименование клиента в предложном падеже (необяз.)
+@param[out] error Текст ошибки
+@return Код ошибки (0 в случае успеха)
+*/
+macro QINotifyIPS(clientID: Integer, notificationType: Integer, notificationDate: Date, signerID: Integer, reason: String, clientNameModified: String, error: @String): Integer
+  var errorCode: Integer = 0;
+  var cmd = RSDCommand("{call IT_IPS_DFactory.SendInvestorStatus(?, ?, ?, ?, ?, ?, ?, ?)}");
+
+  cmd.AddParam("", RSDBP_IN, clientID);
+  cmd.AddParam("", RSDBP_IN, notificationType);
+  cmd.AddParam("", RSDBP_IN, notificationDate);
+  cmd.AddParam("", RSDBP_IN, signerID);
+  cmd.AddParam("", RSDBP_IN, reason);
+  cmd.AddParam("", RSDBP_IN, clientNameModified);
+
+  cmd.AddParam("errorCode", RSDBP_OUT, V_INTEGER);
+  cmd.AddParam("errorMessage", RSDBP_OUT, V_STRING, 2000);
+
+  cmd.Execute();
+  
+  error = SQL_ConvTypeStr(cmd.Value("errorMessage"));
+  errorCode = cmd.Value("errorCode");
+
+  return errorCode;
+  
+OnError(err)
+  error = err.Message;
+  errorCode = err.Code;
+  
+  return errorCode;
+end;
+
+/**
+@brief Класс с параметрами ответа для уведомлений по КИ
+*/
+class CQINotificationResultParams()
+  var Path: String;  ///< Путь к сформированному файлу
+  var Messageid: integer; ///< ID сформированного сообщения dlcontrmsg_dbt
+  var Error_code: integer; ///< Код ошибки для системы мониторинга: 10 - ошибка бизнес-логики, 20 - критическая ошибка 
+  
+  /**
+  @brief Процедура начальной инициализации класса
+  */
+  private macro InitNotificationResult()
+    Path = "";
+    Messageid = 0;
+    Error_code = 20;
+  end;
+  //--- конструктор ---
+  InitNotificationResult();
+end; // CQINotificationResultParams
+
+class dboMessage_qi(_dlcontrid, _messagekind)
+   var ddl_id = _dlcontrid, isLast = true, mess_kind = _messagekind; 
+   
+   var PartyId = 0, Prt_Lfrm = 0, Prt_FNam = "", Prt_Nnam = ""; 
+   var Cnt_Eml = "", Cnt_Iis = "", Cnt_Dbeg, Cnt_Stat = 0, Cnt_Emsg = 0;
+
+   const wdFormatPDF = 17;
+
+   private var oWrd, oDoc, IsNtr = isStandalone();
+
+   private var PATH_OUT;
+   private var FileDirForm;
+   var Mess = "";
+
+   var TemplName = "";
+   var Templ_Dir = "";
+
+   var place, doname, donnam, doeml;
+
+   var statMes = "";
+   var statsend = 0;
+   
+   var statfix = 0;
+   var fixmes = "";
+   var attempts = 0;
+   var uqiaccredid = 0;
+
+   var GODBO = "";
+   var partyForm = "";
+   var NameDP   = "";
+   var NumberDBO = "";
+   var NumberBO = "";
+   var NameBO   = "";
+   var FolderName = "";
+   var FormFilename = "";
+   var FormFilename_clear = "";
+   var CurrentFileName = "";
+   var TempFileName = "";
+   var w_ext = ".docx";
+
+   var pdfSaveStat = false;
+   var TestQIName, test_num;
+   
+   var msgid = 0, id_uqi = 0;
+   var g_error = "";
+
+   private macro IIF(val, retval, retval2)
+      if (Val)
+         return retval;
+      else
+         return retval2;
+      end;
+   end;
+
+   statMes = "Сообщение уже было сформировано";
+
+   // пустая SQL строка
+   macro emp_str(p_par)
+      if ((p_par == null) or (p_par == nullval) or (p_par == strfor(1)) or (p_par == strfor(0)) or (p_par == "01.01.0001"))
+         return "";
+      end;
+      return p_Par;
+   end;
+
+   // клиент - ГО
+   macro isGOClient(p_par)
+      return ((p_Par == "") or (p_par == "00"));
+   end;
+
+   // наличие сообщения по договору
+   macro isExistsMessage() 
+      return Cnt_Emsg > 0;
+      // реализация с обращением к базе
+      var sqls, rsdc;
+      sqls = String( 
+                     "DECLARE   \n"
+                    ,"   v_Ret INTEGER;   \n"
+                    ,"BEGIN   \n"
+                    ,"   SELECT COUNT(1)   \n"
+                    ,"     INTO v_Ret   \n"
+                    ,"     FROM Ddlcontrmsg_Dbt Msg, Dimgdata_Dbt Dim, Dimage_Dbt Dig   \n"
+                    ,"    WHERE Dim.t_Objectid = Lpad(Msg.t_Id, 34, '0')   \n"
+                    ,"      AND Dig.t_Imageid = Dim.t_Imageid   \n"
+                    ,"      AND Msg.t_Kind = :p_kind   \n"
+                    ,"      AND Msg.t_Dlcontrid = :p_dlId   \n"
+                    ,"      AND Dim.t_ObjectType = 208;   \n" //shev def-29032
+                    ,"   :p_Ret := v_Ret;   \n"
+                    ,"END;   \n"
+                   );
+      rsdc = rsdcommand(sqls);
+      rsdc.AddParam("p_kind", RSDBP_IN, mess_kind);
+      rsdc.AddParam("p_dlId", RSDBP_IN, ddl_id);
+      rsdc.AddParam("p_Ret", RSDBP_OUT, v_integer);
+      rsdc.execute;
+      sqls = int(rsdc.Value("p_Ret"));
+      rsdc = null;
+      return sqls > 0;  
+   onerror(e);
+      return false;   
+   end;
+   
+
+   // собрать данные по договору
+   macro constructor()
+      var sqls, rsdc, rsds, StrErr;
+      statMes = "";
+      statsend = 0;
+      isLast = true;
+      sqls = String( 
+                     "DECLARE   \n"
+                    ,"   v_dlId   Ddlcontr_Dbt.t_Dlcontrid%TYPE := :p_dlId;   \n"
+                    ,"   v_kind   Ddlcontrmsg_Dbt.t_Kind%TYPE := :p_kind;   \n"
+                    ,"   v_objecttype Dimgdata_Dbt.t_objecttype%TYPE := :p_objecttype;   \n"
+                    ,"   v_Partyid  Dparty_Dbt.t_Partyid%TYPE;   \n"
+                    ,"   v_Prt_Lfrm Dparty_Dbt.t_Legalform%TYPE;   \n"
+                    ,"   v_Prt_Fnam Dparty_Dbt.t_Name%TYPE;   \n"
+                    ,"   v_Prt_Nnam Dparty_Dbt.t_Name%TYPE;   \n"
+                    ,"   v_Prt_Empl NUMBER(5);   \n"
+                    ,"   v_Cnt_Numb Dsfcontr_Dbt.t_Number%TYPE;   \n"
+                    ,"   v_Cnt_Name Dsfcontr_Dbt.t_Name%TYPE;   \n"
+                    ,"   v_Cnt_Dbeg DATE;   \n"
+                    ,"   v_Cnt_Emsg NUMBER(5);   \n"
+                    ,"   v_Cnt_Iis  Ddlcontr_Dbt.t_Iis%TYPE;   \n"
+                    ,"   v_Godbo    VARCHAR2(50);   \n"
+                    ,"   v_Cnt_Eml  Ddlcontr_Dbt.t_Email%TYPE;   \n"
+                    ,"   v_Do_Name  Dparty_Dbt.t_Name%TYPE;   \n"
+                    ,"   v_Do_Plac  Dadress_Dbt.t_Place%TYPE;   \n"
+                    ,"   v_Do_Nnam  Dparty_Dbt.t_Normalizedname%TYPE;   \n"
+                    ,"   v_Do_Eml   Dcontact_Dbt.t_Value%TYPE;   \n"
+                    ,"   v_Err      VARCHAR2(2000);   \n"
+                    ,"BEGIN   \n"
+                    ,"   BEGIN   \n"
+                    ,"      SELECT Dp.t_Partyid   \n"
+                    ,"            ,Dp.t_Name Prt_Name   \n"
+                    ,"            ,Dp.t_Normalizedname Nrm_Name   \n"
+                    ,"            ,Dp.t_Legalform Prt_Lf   \n"
+                    ,"            ,Dsf.t_Name Dsf_Name   \n"
+                    ,"            ,Dsf.t_Number Dsf_Numb   \n"
+                    ,"            ,Dsf.t_Datebegin Dsf_Datb   \n"
+                    ,"            ,Dl.t_Iis   \n"
+                    ,"            ,Dl.t_Email   \n"
+                    ,"        INTO v_Partyid   \n"
+                    ,"            ,v_Prt_Fnam   \n"
+                    ,"            ,v_Prt_Nnam   \n"
+                    ,"            ,v_Prt_Lfrm   \n"
+                    ,"            ,v_Cnt_Name   \n"
+                    ,"            ,v_Cnt_Numb   \n"
+                    ,"            ,v_Cnt_Dbeg   \n"
+                    ,"            ,v_Cnt_Iis   \n"
+                    ,"            ,v_Cnt_Eml   \n"
+                    ,"        FROM Ddlcontr_Dbt Dl   \n"
+                    ,"       INNER JOIN Dsfcontr_Dbt Dsf ON (Dsf.t_Id = Dl.t_Sfcontrid)   \n"
+                    ,"       INNER JOIN Dparty_Dbt Dp    ON (Dp.t_Partyid = Dsf.t_Partyid)   \n"
+                    ,"       WHERE Dl.t_Dlcontrid = v_dlId;   \n"
+                    ,"      -- наличие сообщений по договору   \n"
+                    ,"      SELECT Decode(COUNT(1), 0, 0, 1)   \n"
+                    ,"        INTO v_Cnt_Emsg   \n"
+                    ,"        FROM Ddlcontrmsg_Dbt Msg, Dimgdata_Dbt Dim, Dimage_Dbt Dig   \n"
+                    ,"       WHERE Dim.t_Objectid = Lpad(Msg.t_Id, 34, '0')   \n"
+                    ,"         AND Dig.t_Imageid = Dim.t_Imageid   \n"
+                    ,"         AND Msg.t_Kind = v_kind   \n"
+//shev def-29032
+                    ,"         AND dim.t_objecttype = v_objecttype   \n"
+                    ,"         AND Msg.t_Dlcontrid = v_dlId;   \n"
+                    ,"      -- наименование филиала, очень похоже на рег.номер КО   \n"
+                    ,"      IF TRIM(v_Godbo) IS NOT NULL THEN   \n"
+                    ,"         v_Do_Name := '3349/' || v_Godbo;   \n"
+                    ,"         BEGIN   \n"
+                    ,"            SELECT Decode(Adr.t_Place, Chr(1), Adr.t_District, Adr.t_Place), Prt.t_Normalizedname   \n"
+                    ,"              INTO v_Do_Plac, v_Do_Nnam   \n"
+                    ,"              FROM Ddp_Dep_Dbt Dpt   \n"
+                    ,"             INNER JOIN Dparty_Dbt Prt   \n"
+                    ,"                ON (Prt.t_Partyid = Dpt.t_Partyid)   \n"
+                    ,"             INNER JOIN Dadress_Dbt Adr   \n"
+                    ,"                ON (Adr.t_Partyid = Dpt.t_Partyid AND Adr.t_Type = 1)   \n"
+                    ,"             WHERE Dpt.t_Name = v_Godbo || '00';   \n"
+                    ,"         EXCEPTION   \n"
+                    ,"            WHEN OTHERS THEN   \n"
+                    ,"               v_Do_Name := 'АО РОССЕЛЬХОЗБАНК';   \n"
+                    ,"               v_Do_Plac := 'Москва';   \n"
+                    ,"         END;   \n"
+                    ,"         BEGIN   \n"
+                    ,"            SELECT '<' || Cnt.t_Value || '>'   \n"
+                    ,"              INTO v_Do_Eml   \n"
+                    ,"              FROM Ddp_Dep_Dbt Dpt   \n"
+                    ,"             INNER JOIN Dcontact_Dbt Cnt   \n"
+                    ,"                ON (Cnt.t_Partyid = Dpt.t_Partyid AND Cnt.t_Contactkind = 5 AND Cnt.t_Contacttype = 8)   \n"
+                    ,"             WHERE Dpt.t_Name = v_Godbo || '00';   \n"
+                    ,"         EXCEPTION   \n"
+                    ,"            WHEN OTHERS THEN   \n"
+                    ,"               v_Do_Eml := '';   \n"
+                    ,"         END;   \n"
+                    ,"      ELSE   \n"
+                    ,"         v_Do_Name := 'АО Россельхозбанк';   \n"
+                    ,"         v_Do_Plac := 'Москва';   \n"
+                    ,"      END IF;   \n"
+                    ,"      v_Do_Plac := Nvl(TRIM(TRIM(Chr(1) FROM v_Do_Plac)), 'Москва');   \n"
+                    ,"   EXCEPTION   \n"
+                    ,"      WHEN No_Data_Found THEN   \n"
+                    ,"         v_Err := 'Данные для договора не найдены: '||v_dlId;   \n"
+                    ,"      WHEN OTHERS THEN   \n"
+                    ,"         v_Err := 'Ошибка поиска данных для договора: '||v_dlId||' '|| SQLERRM;   \n"
+                    ,"   END;   \n"
+                    ,"   :p_Partyid  := v_Partyid;   \n"
+                    ,"   :p_Prt_Lfrm := v_Prt_Lfrm;   \n"
+                    ,"   :p_Prt_Fnam := v_Prt_Fnam;   \n"
+                    ,"   :p_Prt_Nnam := v_Prt_Nnam;   \n"
+                    ,"   :p_Cnt_Numb := v_Cnt_Numb;   \n"
+                    ,"   :p_Cnt_Name := v_Cnt_Name;   \n"
+                    ,"   :p_Cnt_Dbeg := v_Cnt_Dbeg;   \n"
+                    ,"   :p_Cnt_Emsg := v_Cnt_Emsg;   \n"
+                    ,"   :p_Cnt_Iis  := v_Cnt_Iis;   \n"
+                    ,"   :p_Cnt_Eml  := v_Cnt_Eml;   \n"
+                    ,"   :p_Godbo    := v_Godbo;   \n"
+                    ,"   :p_Do_Name  := v_Do_Name;   \n"
+                    ,"   :p_Do_Plac  := v_Do_Plac;   \n"
+                    ,"   :p_Do_Nnam  := v_Do_Nnam;   \n"
+                    ,"   :p_Do_Eml   := v_Do_Eml;   \n"
+                    ,"   :p_Err      := v_Err;   \n"
+                    ,"END;   \n"
+                   );
+      rsdc = rsdcommand(sqls);
+      rsdc.AddParam("p_dlid", RSDBP_IN, ddl_id);
+      rsdc.AddParam("p_kind", RSDBP_IN, mess_kind);
+      rsdc.AddParam("p_objecttype", RSDBP_IN, 208);
+      rsdc.AddParam("p_Partyid", RSDBP_OUT, v_integer);
+      rsdc.AddParam("p_Prt_Lfrm", RSDBP_OUT, v_integer);
+      rsdc.AddParam("p_Prt_Fnam", RSDBP_OUT, v_string, 500);
+      rsdc.AddParam("p_Prt_Nnam", RSDBP_OUT, v_string, 500);
+      rsdc.AddParam("p_Cnt_Numb", RSDBP_OUT, v_string, 500);
+      rsdc.AddParam("p_Cnt_Name", RSDBP_OUT, v_string, 500);
+      rsdc.AddParam("p_Cnt_Dbeg", RSDBP_OUT, v_date);
+      rsdc.AddParam("p_Cnt_Emsg", RSDBP_OUT, v_integer);
+      rsdc.AddParam("p_Cnt_Iis", RSDBP_OUT, v_string);
+      rsdc.AddParam("p_Cnt_Eml", RSDBP_OUT, v_string, 500);
+      rsdc.AddParam("p_Godbo", RSDBP_OUT, v_string);
+      rsdc.AddParam("p_Do_Name", RSDBP_OUT, v_string, 500);
+      rsdc.AddParam("p_Do_Plac", RSDBP_OUT, v_string, 500);
+      rsdc.AddParam("p_Do_Nnam", RSDBP_OUT, v_string, 500);
+      rsdc.AddParam("p_Do_Eml", RSDBP_OUT, v_string, 500);
+      rsdc.AddParam("p_Err", RSDBP_OUT, v_string, 2000);
+      rsdc.execute;   
+      if ((rsdc.Value("p_Err") != null) and (rsdc.Value("p_Err") != nullval))
+         runerror("Ошибка получения данных по договору", rsdc.Value("p_Err"));
+      end;
+      PartyId   = int(rsdc.value("p_Partyid"));
+      Prt_Lfrm  = int(rsdc.value("p_Prt_Lfrm"));
+      if (Prt_Lfrm == 1)
+         PartyForm = "Юридическое лицо";
+      elif (Prt_Lfrm == 2)
+         PartyForm = "Физическое лицо";
+      end;
+      Prt_Fnam  = emp_str(rsdc.value("p_Prt_Fnam"));
+      Prt_Nnam  = emp_str(rsdc.value("p_Prt_Nnam"));
+      if ((Prt_Nnam == null) or (Prt_Nnam == nullval))
+         Prt_Nnam = strsubst(strupr(Prt_Fnam), "-", " ");
+         Prt_Nnam = strsubst(strupr(Prt_Nnam), "Ё", "Е ");
+         Prt_Nnam = strsubst(strupr(Prt_Nnam), "ё", "е");
+         while (index(Prt_Nnam, "  ") > 0)
+            Prt_Nnam = strsubst(Prt_Nnam, "  ", " ");
+         end;
+      end;
+      NumberDBO = emp_str(rsdc.value("p_Cnt_Numb"));
+      NumberDBO = emp_str(NumberDBO);
+      NameBO    = rsdc.value("p_Cnt_Name");
+      if (strlen(trim(NameBO)) == 0)
+         NameBO = Prt_Fnam;
+      end;
+      Cnt_Dbeg = rsdc.value("p_Cnt_Dbeg"); 
+      Cnt_Emsg = int(rsdc.value("p_Cnt_Emsg")); 
+      NumberBO  = NumberDBO; 
+      Cnt_Iis   = emp_str(rsdc.Value("p_Cnt_Iis"));
+      Cnt_Eml = emp_str(rsdc.Value("p_Cnt_Eml"));
+
+      GODBO  = rsdc.value("p_Godbo");
+      GODBO  = emp_str(GODBO); ;
+      place  = rsdc.value("p_Do_Plac");
+      place  = emp_str(place);
+      doname = rsdc.value("p_Do_Name");
+      doname = emp_str(doname); 
+      donnam = rsdc.value("p_Do_Nnam");
+      donnam = emp_str(donnam); 
+      doeml  = rsdc.value("p_Do_Eml");
+      doeml  = emp_str(doeml); 
+
+      if (PartyId == 114800) 
+         NameDP = NameBO;
+      else   
+         NameDP = Prt_Fnam;
+      end;
+
+      PATH_OUT = "";
+     
+      if (isGOClient(GODBO))
+         GetRegistryValue("РСХБ\\ДИРЕКТОРИИ\\OUT\\ГО", V_STRING, PATH_OUT, StrErr);
+         FolderName = "";
+      else 
+         GetRegistryValue("РСХБ\\ДИРЕКТОРИИ\\OUT\\ФИЛИАЛ", V_STRING, PATH_OUT, StrErr);
+         FolderName = GODBO + "00 " + strSubst(substr(donnam,1,41),"\"","") + "\\";
+      end;
+      GetRegistryValue("BANK_INI\\ОБЩИЕ ПАРАМЕТРЫ\\ДИРЕКТОРИИ\\TEMPLSDIR", V_STRING, Templ_Dir, StrErr);
+      FileDirForm = "..\\txtFile\\";
+
+      FormFilename_clear = NumberDBO + "_QI";
+      FormFilename_clear = strSubst(FormFilename_clear,"\"","");
+      FormFilename_clear = strSubst(FormFilename_clear,"\\","-");
+      FormFilename_clear = strSubst(FormFilename_clear,"/","-");
+
+   onerror(e);
+      if ((e.Err != null) or (e.Err != nullval))
+         statMes = e.Err;
+      else 
+         statMes = e.Message;
+      end;
+      statsend = -1;
+   end;
+   
+   // полное имя файла из относительного
+   macro abs_path(p)
+      var i = 0, l = 0, pth = "";
+      if (substr(p, 1, 1) != ".")
+         return p;
+      end;        
+      if (IsNtr)
+         pth = GetCurDir(false);
+         while (true)
+            i = index(pth, "\\", l + 1);
+            if (i == 0)
+               break;
+            else
+               l = i;
+            end;
+         end;       
+         if (l > 0)
+            pth = substr(pth, 1, l - 1);
+         end;
+      else
+         pth = GetCurDir(true);
+      end;
+      p = strsubst(p, "..", "");
+      return string(pth, p); 
+   end;
+
+   macro WordError(e)
+      var count, i, str="";
+      if (e.Err)
+         if (IsEqClass ("TRsComErr", e.err))
+            count = e.err.Count;
+            i = 0;
+            while (i < count)
+               str = string(str, e.err.Message(i), " (Code = ",e.err.Code(i), ", Level = ",e.err.Level(i), ")", strfor(10));
+               i = i + 1
+            end;
+            str = str + " " + e.Module + " " + e.Line + " " + e.Message;
+         elif (valtype(e.err) == v_string)
+            str = e.err;
+         else
+            str = e.Module + " " + e.Line + " " + e.Message;
+         end;  
+      else
+         str = e.Module + " " + e.Line + " " + e.Message;
+      end;    
+      return str;
+   end;
+   
+   // закрыть Word
+   macro cls_word()
+      if (oDoc)
+         // закрыть без сохранения, так как сохранение уже могло не выполниться
+         // после этого Word в скрытом режиме держит обращение к пользователю
+         oDoc.Close(false);
+      end;   
+      oDoc = null;
+      if (isLast)
+         if (oWrd)
+            oWrd.Quit;
+         end;   
+         oWrd = null;
+      end;  
+   onerror(e)
+      if (oWrd)
+         oWrd.Quit;
+      end;   
+      oDoc = oWrd = null;
+   end;  
+   
+   // коррекция терминального имени для копирования
+   macro fnam4copy(p)
+   if (not isNtr)
+      if (substr(p, 1, 1) == "$")
+         return p;
+      end;
+      return string("$", p);
+   end;
+   return p;
+   end;
+   
+   // открыть Word
+   macro opn_word(fnam)
+      if (oWrd == null)
+         if (IsNtr)
+            oWrd = ActiveX("Word.Application", NULL, false);
+         else
+            oWrd = CreateObject("rsax", "TRsAxServer", "RsAxServer", false).CreateComObject("Word.Application", false);
+         end;
+      end;   
+      oWrd.DisplayAlerts = 0;
+      oWrd.Visible = false;
+      oDoc = oWrd.Documents.Open(fnam);
+      return true;
+   onerror (e);
+      g_error = WordError(e);
+      return false;
+   end;
+   
+   // значение из Word - пустое
+   macro nrm_wstr(p_val)
+      p_val = emp_str(p_val);
+      p_val = strsubst(p_val, strfor(0), "");
+      p_val = strsubst(p_val, strfor(1), "");
+      p_val = strsubst(p_val, strfor(7), "");
+      p_val = strsubst(p_val, strfor(9), "");
+      p_val = strsubst(p_val, strfor(10), "");
+      p_val = strsubst(p_val, strfor(13), "");
+      p_val = strsubst(p_val, " ", "");
+      p_val = trim(p_val);
+      return p_val;
+   end;
+   
+   // закладки 
+   macro fill_bmk
+      var bmks, bmkc, nam_b = "", val_b = "";     
+      bmks = oDoc.Bookmarks;
+      bmkc = bmks.Count;
+      while (bmkc > 0)
+         nam_b = Strupr(bmks.item(1).Name); 
+         if (index(nam_b, "FULLNAME") > 0)  
+            val_b = TestQIName; 
+          else
+            bmks.item(1).delete;
+         end;
+         bmks.item(1).Range.Text = val_b;
+         if (bmkc == bmks.Count)
+            bmks.item(1).delete;
+         else   
+         end;
+         bmkc = bmks.Count;
+      end;
+   end;
+
+   /**
+   @brief Логирование шага обработки 
+   @param[in] _accredid Значение uqiaccreditation_dbt.t_id
+   @param[in] _status Статус обработки 0 - ОК, -1 - ошибка
+   @param[in] _comment Комментарий
+   */
+   macro FixStep(_status, _comment)
+      var sqls, cmd;
+      sqls = String( 
+                     "   INSERT INTO UQIACCREDITATION_STEP_DBT (T_STEPID, T_ACCREDID, T_TIMESTAMP, T_STATUS, T_COMMENT) \n"
+                    ,"   VALUES (0, :pid, sysdate, :pstat, :pcomment); \n"
+                    );
+      cmd = RsdCommand(sqls);
+      cmd.addParam("pid" ,RSDBP_IN, uqiaccredid);
+      cmd.addParam("pstat" ,RSDBP_IN, _status);
+      cmd.addParam("pcomment" ,RSDBP_IN, Substr(_comment,1,2000));
+      cmd.execute();
+      cmd.close();
+      cmd = null;
+   end;
+   
+   // формирование текста уведомления
+   macro Head_Form(p_Templ)
+      var fil_nam = "";
+      var tpl_nam = "";
+      var erStr = "";
+      private var DlArchivator;
+      
+      //доставить шаблон в место формирования
+      tpl_nam = FindPath(toANSI(p_Templ), Templ_Dir);
+      if (strlen(trim(tpl_nam)) == 0)
+         runerror("Ошибка поиска шаблона", "Ошибка поиска шаблона " + p_Templ);
+      end;
+      fil_nam = abs_path(toAnsi(MESS));
+      MESS = fil_nam;
+      if (NOT CopyFile(tpl_nam, fnam4copy(fil_nam), false, "Копирование шаблона"))
+         runerror("Ошибка получения шаблона", "Ошибка получения шаблона " + toOem(tpl_nam));
+      end;
+      FixStep(0, "Шаблон скопирован");
+
+      var extractPath = abs_path(toAnsi(CurrentFileName));
+      DlArchivator = c_unarch_kit(fil_nam,extractPath);
+      var extractState = DlArchivator.extract_files("zip7");
+      if(extractState)
+         var doc = extractPath+"\\word\\document.xml";
+
+         var xml = ActiveX("Microsoft.XMLDOM");
+         var t1;
+
+         XML.load( doc);
+         if (xml.url !="")
+            var t_body = xml.SelectSingleNode("//w:body");
+            var t_p = t_body.SelectNodes(".//w:p");
+            var ai = 0;
+            while (ai < t_p.length)
+               var t_r = t_p.item(ai).SelectNodes(".//w:r");
+               var aj = 0;
+               while (aj < t_r.length)
+                  var t_t = t_r.item(aj).selectSingleNode(".//w:t");
+                  if (t_t.text == "Расшифровка_теста")
+                    t_t.text = TestQIName;
+                  end;
+                  aj = aj+1;
+               end;
+               ai = ai+1;
+            end;
+         else 
+            runerror("Ошибка преобразования шаблона", "Ошибка преобразования шаблона " + doc); 
+         end;
+         
+         xml.save(doc);
+
+         DlArchivator = c_inarch_kit(extractPath, "");
+         var zipState = DlArchivator.Add_to_Archive_Word("zip7");
+         if (not zipState)
+            erStr = DlArchivator.get_state_message();
+            runerror("Ошибка упаковки файла", "Ошибка упаковки файла " +erStr);
+         end;
+         // файлы удаляются архиватором, папка остается
+         RecursiveRemoveInDir(extractPath);
+         RemoveDir(extractPath);  
+      else 
+         erStr = DlArchivator.get_state_message();
+         runerror("Ошибка распаковки шаблона", "Ошибка распаковки шаблона " +erStr);
+      end;
+      
+      return "";
+   onerror(e)
+      erStr = WordError(e);
+      FixStep(-1, "Ошибка обработки файла "+erStr);
+      isLast = true;
+      return erStr;
+   end;
+   
+   // создать уведомление
+   macro CreateNotification()
+      var DT = Trim(string(Date:f));
+      var TM = Trim(string(Time:f));
+      CurrentFileName = FormFilename_clear + test_num + "_" + StrSubst(DT, ".", "") + "_" + StrSubst(TM, ":", "");
+      FormFilename    = CurrentFileName + w_ext;
+
+      Mess = string(FileDirForm, FormFilename);
+      CurrentFileName = string(FileDirForm, CurrentFileName);
+
+      return Head_Form(TemplName);
+   end;
+
+   // выгрузка сообщения в файл
+   macro downLoadMessage()
+      var sqls, rsdc, rsds;
+      sqls = String( 
+                     "SELECT Dbms_Lob.Getlength(Dig.t_Fmtblobdata_Xxxx) Siz Dig.t_Fmtblobdata_Xxxx Val   \n"
+                    ,"  FROM Ddlcontrmsg_Dbt Msg, Dimgdata_Dbt Dim, Dimage_Dbt Dig   \n"
+                    ," WHERE Lpad(Msg.t_Id, 34, '0') = Dim.t_Objectid   \n"
+                    ,"   AND Msg.t_Kind = :p_kind   \n"
+                    ,"   AND Dim.t_Imageid = Dig.t_Imageid   \n"
+                    ,"   AND Msg.t_Dlcontrid = :p_dlId   \n"
+                   );
+      rsdc = RsdCommand(sqls);
+      rsdc.addParam("p_kind" ,RSDBP_IN, mess_kind);
+      rsdc.addParam("p_dlId" ,RSDBP_IN, ddl_id);
+      rsds = rsdrecordset(rsdc,RSDVAL_CLIENT_IF_NEEDED,RSDVAL_FORWARD_ONLY);
+      if (rsds.MoveNext)
+         rsds.Fld("val").Read(sqls, Int(rsds.Value("siz")));
+      end;
+      rsds = null;
+      rsdc = TStream(FileDirForm + FormFilename, "WA");
+      rsdc.write2(sqls);
+      rsdc = null;
+   onerror(err);
+   end;
+   
+   // имя файла - сообщения
+   macro getMessageNameInDB()
+      var sqls, rsdc;
+      sqls = String( 
+                     "DECLARE   \n"
+                    ,"   v_Ret Dimgdata_Dbt.t_Filename%TYPE;   \n"
+                    ,"   v_msgid Ddlcontrmsg_Dbt.t_id%TYPE;   \n"
+                    ,"BEGIN   \n"
+                    ,"   BEGIN   \n"
+                    ,"      SELECT replace(t_Filename,'GO',''), t_id    \n"
+                    ,"        INTO v_Ret, v_msgid   \n"
+                    ,"        FROM (SELECT Dim.t_Filename, Msg.t_id   \n"
+                    ,"                FROM Ddlcontrmsg_Dbt Msg, Dimgdata_Dbt Dim, Dimage_Dbt Dig   \n"
+                    ,"               WHERE Dim.t_Objectid = Lpad(Msg.t_Id, 34, '0')   \n"
+                    ,"                 AND Dig.t_Imageid = Dim.t_Imageid   \n"
+                    ,"                 AND Msg.t_Kind = :p_kind   \n"
+                    ,"                 AND Msg.t_Dlcontrid = :p_dlId   \n"
+                    ,"                 AND Dim.t_ObjectType = 208   \n" 
+                    ,"               ORDER BY Msg.t_Createdate DESC, Msg.t_Createtime DESC)   \n"
+                    ,"       WHERE Rownum = 1;   \n"
+                    ,"   EXCEPTION   \n"
+                    ,"      WHEN OTHERS THEN   \n"
+                    ,"         v_Ret := NULL;   \n"
+                    ,"   END;   \n"
+                    ,"   :p_Ret := v_Ret;   \n"
+                    ,"   :p_msgid := v_msgid;   \n"
+                    ,"END;   \n"
+                   );
+      rsdc = rsdcommand(sqls);
+      rsdc.AddParam("p_kind", RSDBP_IN, mess_kind);
+      rsdc.AddParam("p_dlId", RSDBP_IN, ddl_id);
+      rsdc.AddParam("p_Ret", RSDBP_OUT, v_string, 200);
+      rsdc.AddParam("p_msgid", RSDBP_OUT, v_integer);
+      rsdc.execute;
+      sqls = rsdc.Value("p_Ret");
+      msgid = rsdc.Value("p_msgid");
+      rsdc = null;
+      if ((sqls != null) and (sqls != nullval))
+         FormFilename = sqls;
+      end;
+   end;
+   
+   // отправка уведомления
+   macro SendNotification()  
+      private macro GetFullPath( Path )
+          var fullpath;
+          if( substr( Path, 1, 2 ) == ".." ) /* ссылка на вышестоящий каталог */
+            Path = substr(Path, 3 );
+          end;
+          if( substr( Path, 1, 1 ) == "\\" ) /* ссылка на вышестоящий каталог */
+            Path = substr(Path, 2 );
+          end;
+          fullpath =   strsubst( GetCurDir(false) , "\\Obj","")  + "\\" + Path ; 
+        // получить полный путь
+        return fullpath;
+      end;
+      
+      var Eml, emailText, Subject, v_email_processor;
+      var templ_dir;
+      var Attachement_name_file = "899-ОД-1-4-заявление об отказе от статуса квал инвестора.docx";
+      var Attachement_name_src, Attachement_name;
+      var strerr;
+      
+      if (mess_kind == TEST_QI)
+         Attachement_name = "";
+      else 
+         GetRegistryValue("BANK_INI\\ОБЩИЕ ПАРАМЕТРЫ\\ДИРЕКТОРИИ\\TEMPLSDIR", V_STRING, Templ_Dir, StrErr);
+         //def-29032 заявление не вкладывается
+         Attachement_name_src = FindPath(toANSI(Attachement_name_file), Templ_Dir);
+         Attachement_name = string(PATH_OUT, FolderName, Attachement_name_file);
+
+         if (NOT CopyFile(Attachement_name_src, Attachement_name, false, "Копирование шаблона"))
+            runerror("Ошибка получения шаблона", "Ошибка получения шаблона " + toOem(Attachement_name_src));
+         end;
+      end;
+
+      Eml = Cnt_Eml;
+
+      if ((ValType(Eml) == V_UNDEF) or (ValType(Eml) == 26) or (trim(eml) == StrFor(1)))
+         statMes = "Сообщение сформировано, но не отправлено. Не задан email";
+         statsend = 2;
+         return;
+      end;
+      
+      if (mess_kind == TEST_QI)
+         Subject = "Уведомление о результатах тестирования НКИ. " + Numberdbo + "_" + NameBO;
+         Emailtext = String("Добрый день!",
+                            "\n",
+                            "\nВ соответствии с условиями Регламента оказания брокерских услуг АО \x22Россельхозбанк\x22 направляем Вам уведомление о результатах тестирования в целях совершения (заключения) сделок (договоров) со сложными финансовыми инструментами, требующими проведения тестирования физического лица, не признанного квалифицированным инвестором. ",
+                            "\n",
+                            "\nТелефоны поддержки клиентов 8 (800) 100-40-40; +7 (495) 651-60-91",
+                            "\n",
+                            "\nДанное письмо было отправлено автоматически.\n\n ");
+         Attachement_name = "";
+      elif (mess_kind == EXCLUSIONRIGHT_QI)
+         Subject = "Уведомление о праве подачи заявления на исключение из реестра квалифицированных инвесторов. " + Numberdbo + "_" + NameBO;
+         Emailtext = String("Добрый день!",
+                            "\n",
+                            "\nВ соответствии с условиями Регламента оказания брокерских услуг АО \x22Россельхозбанк\x22, Регламента принятия решения о признании лица квалифицированным инвестором в АО \x22Россельхозбанк\x22 направляем Вам уведомление о праве подачи заявления на исключение из реестра квалифицированных инвесторов.",
+                            "\n",
+                            "\nТелефоны поддержки клиентов 8 (800) 100-40-40; +7 (495) 651-60-91",
+                            "\n",
+                            "\nДанное письмо было отправлено автоматически.\n\n ");
+      elif (mess_kind == INCLUSION_QI)
+         Subject = "Уведомление о последствиях признания квалифицированным инвестором. " + Numberdbo + "_" + NameBO;
+         Emailtext = String("Добрый день!",
+                            "\n",
+                            "\nВ соответствии с условиями Регламента оказания брокерских услуг АО \x22Россельхозбанк\x22, Регламента принятия решения о признании лица квалифицированным инвестором в АО \x22Россельхозбанк\x22 направляем Вам уведомление о последствиях признания физического лица квалифицированным инвестором.",
+                            "\n",
+                            "\nТелефоны поддержки клиентов 8 (800) 100-40-40; +7 (495) 651-60-91",   
+                            "\n",
+                            "\nДанное письмо было отправлено автоматически.\n\n ");
+      else
+         // лишнее дожно фильтроваться раньше, но проверку добавим
+         runerror("Неизвестный тип сообщения по квал.инвестору: "+mess_kind);
+      end;
+
+      v_email_processor = c_email_proc_env();
+      v_email_processor.m_add_email_to_list(Eml);
+      v_email_processor.m_set_msg_head(Subject);
+      v_email_processor.m_add_attach_to_list(mess);
+      if (strlen(trim(Attachement_name)) != 0)
+         v_email_processor.m_add_attach_to_list(Attachement_name);
+      end;
+      v_email_processor.m_add_row_to_msg_text(emailText);
+      // Сохраняем текст письма для отправки плановой процедурой 
+      v_email_processor.m_save_to_submit_synch();
+      if (mess_kind == TEST_QI)
+         FixStep(0, "Сообщение электронной почты сохранено");
+      end;
+      
+      // Отправляем все не отправленные письма
+      v_email_processor.m_submit_email_synch();
+      if (mess_kind == TEST_QI)
+         FixStep(0, "Сообщение электронной почты отправлено");
+      end;
+
+      if(v_email_processor.m_get_error_status())
+         statMes = "Сообщение сформировано, но не отправлено: " + v_email_processor.get_service_msg();
+         statsend = 2;
+      else
+         statMes = "Сообщение отправлено";
+         statsend = 1;
+      end;
+   end;
+   
+   // сохранить сообщение в образах
+   macro ReForm()
+      var v_msg = "", sqls, rsdc;
+      var v_err;
+      sqls = String( 
+                     "DECLARE   \n"
+                    ,"   v_dlId Ddlcontr_Dbt.t_Dlcontrid%TYPE := :p_dlId;   \n"
+                    ,"   v_Snd_St NUMBER(5) := :p_Snd_St;   \n"
+                    ,"   v_kind NUMBER(5) := :p_kind;   \n"
+                    ,"   v_Err    VARCHAR2(2000);   \n"
+                    ,"   v_Msg    Ddlcontrmsg_Dbt.t_Id%TYPE;   \n"
+                    ,"   Ex_Er EXCEPTION;   \n"
+                    ,"BEGIN   \n"
+                    ,"   BEGIN   \n"
+                    ,"      IF v_dlId IS NOT NULL THEN   \n"
+                    ,"         INSERT INTO Ddlcontrmsg_Dbt   \n"
+                    ,"            (t_Dlcontrid, t_Kind, t_Createdate, t_Createtime, t_Senddate, t_Sendtime)   \n"
+                    ,"         VALUES   \n"
+                    ,"            (v_dlId   \n"
+                    ,"            ,v_kind   \n"
+                    ,"            ,Trunc(SYSDATE)   \n"
+                    ,"            ,To_Date('01010001 ' || To_Char(SYSDATE, 'HH24MISS'), 'DDMMYYYY HH24MISS')   \n"
+                    ,"            ,CASE v_Snd_St   \n"
+                    ,"                WHEN 1 THEN   \n"
+                    ,"                 Trunc(SYSDATE)   \n"
+                    ,"                ELSE   \n"
+                    ,"                 NULL   \n"
+                    ,"             END   \n"
+                    ,"            ,CASE v_Snd_St   \n"
+                    ,"                WHEN 1 THEN   \n"
+                    ,"                 To_Date('01010001 ' || To_Char(SYSDATE, 'HH24MISS'), 'DDMMYYYY HH24MISS')   \n"
+                    ,"                ELSE   \n"
+                    ,"                 NULL   \n"
+                    ,"             END)   \n"
+                    ,"         RETURNING t_Id INTO v_Msg;   \n"
+                    ,"      END IF;   \n"
+                    ,"   EXCEPTION   \n"
+                    ,"      WHEN OTHERS THEN   \n"
+                    ,"         v_Err := Nvl(v_Err, Dbms_Utility.Format_Error_Stack || ' ' || Dbms_Utility.Format_Error_Backtrace);   \n"
+                    ,"         v_Msg := NULL;   \n"
+                    ,"   END;   \n"
+                    ,"   :p_Msg := v_Msg;   \n"
+                    ,"   :p_Err := v_Err;   \n"
+                    ,"END;   \n"
+                   );
+      rsdc = rsdcommand(sqls);
+      rsdc.AddParam("p_dlid", RSDBP_IN, ddl_id);
+      rsdc.AddParam("p_snd_st", RSDBP_IN, statsend);
+      rsdc.AddParam("p_kind", RSDBP_IN, mess_kind);
+      rsdc.AddParam("p_Msg", RSDBP_OUT, v_integer, 50);
+      rsdc.AddParam("p_Err", RSDBP_OUT, v_string, 2000);
+      rsdc.execute;
+      v_msg = rsdc.Value("p_Msg");
+      v_err = rsdc.Value("p_err");
+      if ((v_err != null) and (v_err != nullval))
+         runerror(v_Err);
+      end;
+      msgid = v_msg;
+      rsdc = null;
+      FixStep(0, "Сообщение ddlcontrmsg_dbt сохранено");
+      
+      if (not LoadImageObj(Mess, 208, String(v_Msg:o:34), 1))
+         v_err = "К записи о сообщении не удалось прикрепить файл сообщения";
+         runerror(v_Err);
+      end;
+      FixStep(0, "Прикреплен объект к сообщению ddlcontrmsg_dbt");
+
+   onError(e)
+      rsdc = null;
+      statsend = 3;
+      if ((e.Err != null) and (e.Err != nullval))
+         statMes = e.Err;
+      else
+         statMes = e.Message;
+      end;
+      FixStep(-1, "Ошибка ddlcontrmsg_dbt "+statMes);
+   end;
+   
+   // создать сообщение
+   macro CreateMessage(reformMessage, sendEmail, isgood, text_mess)
+      var FileFrom, FileFromPDF, FileFromDOC; 
+
+      macro remove_tmp()
+         RemoveFile(FileFromDOC);
+         if (pdfSaveStat) // удаление pdf
+            RemoveFile(FileFromPDF);
+         end;
+      end;
+      
+      if (not reformMessage) 
+         reformMessage = false;
+      end;
+      if (not sendEmail) 
+         sendEmail = false;
+      end;
+      
+      if (not isgood)
+         isgood = false;
+      end;
+
+      if (text_mess)
+         TestQIName = text_mess.groupname;
+         test_num = text_mess.Code;
+      end;
+
+      if (not test_num)
+         test_num = "0";
+      end;
+      
+      if (mess_kind == TEST_QI)
+         if (isgood)
+            TemplName = "QITestResult_good" + w_ext;
+         else
+            TemplName = "QITestResult_bad" + w_ext;
+         end;
+      elif (mess_kind == EXCLUSIONRIGHT_QI)
+         TemplName = "QIExclusion" + w_ext;
+      elif (mess_kind == INCLUSION_QI)
+         TemplName = "QIInclusion" + w_ext;
+      else 
+         runerror("Неизвестный тип сообщения по квал.инвестору: "+mess_kind);
+      end;
+
+      if (not isExistsMessage or reformMessage)
+         FixStep(0, "Начало обработки");
+         statMes = CreateNotification();
+
+         // локальный путь для трехзвенки
+         FileFromDOC = fnam4copy(Mess);
+         
+         if (strlen(trim(statMes)) > 0)
+            runerror("Ошибка формирования уведомления", "Ошибка формирования сообщения " + FormFilename + " " + statMes);
+         end;
+         MakeDir(string(PATH_OUT, FolderName));
+
+         FileFrom = FileFromDOC;
+         Mess = string(PATH_OUT, FolderName, FormFilename);
+         
+         // перенос файла
+         if (not CopyFile(FileFrom, Mess))
+            runerror("Ошибка формирования уведомления", "Не удалось скопировать файл " + FormFilename + " в директорию " + string(PATH_OUT, FolderName));
+         end;
+         FixStep(0, "Файл перенесен");
+
+         // удаление временных
+         remove_tmp();
+         FixStep(0, "Удалены временные файлы");
+
+         // отправка уведомления
+         if (sendEmail)
+            SendNotification(); 
+         else
+            statsend = 2;
+         end;
+         ReForm();
+
+      else
+         if (sendEmail)
+            getMessageNameInDB();
+            Mess = string(PATH_OUT, FolderName, FormFilename);
+            SendNotification();
+         end;
+      end;
+      
+      return this;
+   onerror(e)   
+      if ((e.Err != null) and (e.Err != nullval))
+         statMes = e.Err;
+      else   
+         statMes = e.Message;
+      end;   
+      statsend = -1;
+      FixStep(-1, statMes);
+      // удаление временных
+      remove_tmp();
+      return this;
+   end;
+
+   macro FixUQIAccreditation(p_Accreditation, p_transparent_id)
+      var sqls, rsdc;
+      var v_err;
+//def-65477
+      if (ValTYpe(p_Accreditation) == V_GENOBJ)
+         if (p_Accreditation.expired) //не актуальные данные, есть более свежая запись по accred_date
+            statsend = 2;
+            statmes = "Неактуальные данные, есть запись с более поздней accred_date для этой группы";
+         end;
+      end;
+
+      sqls = String( 
+                     "DECLARE   \n"
+                    ,"   v_partyid number(10) := :p_partyid;   \n"
+                    ,"   v_kind number(10) := :p_kind;   \n"
+                    ,"   v_send_date date;   \n"
+                    ,"   v_send_result VARCHAR2(200);   \n"
+                    ,"   v_dlcontrid number(10) := :p_dlcontrid;   \n"
+                    ,"   v_msgid number(10) := :p_msgid;   \n"
+                    ,"   v_statsend number(10) := :p_statsend;   \n"
+                    ,"   v_statmes varchar2(200) := :p_statmes;   \n"
+                    ,"   v_accred_date date := :p_accred_date;   \n"
+                    ,"   v_accred_code VARCHAR2(200) := :p_accred_code;   \n"
+                    ,"   v_accred_result VARCHAR2(200) := :p_accred_result;   \n"
+                    ,"   v_jmsmessageid varchar2(200) := :p_jmsmessageid;   \n"
+                    ,"   v_ekk varchar2(64);   \n"
+                    ,"   v_id number(10);   \n"
+                    ,"   v_Err    VARCHAR2(2000);   \n"
+                    ,"BEGIN   \n"
+                    ,"   BEGIN   \n"
+                    ,"      IF v_dlcontrid IS NOT NULL THEN   \n"
+                    ,"        BEGIN \n"
+                    ,"           select t_code into v_ekk \n"
+                    ,"             from ddlobjcode_dbt  \n"
+                    ,"            where t_objecttype = 207 and t_codekind = 1 and t_objectid = v_dlcontrid \n"
+                    ,"              and t_bankclosedate = to_date('01010001','ddmmyyyy'); \n"
+                    ,"        EXCEPTION \n"
+                    ,"           WHEN no_data_found then v_ekk := chr(1); \n"
+                    ,"        END; \n"
+                    ,"        IF v_statsend = 1 then  \n"
+                    ,"          BEGIN \n"
+                    ,"             select nvl(m.t_senddate,to_date('01010001','ddmmyyyy')) into v_send_date \n"
+                    ,"               from ddlcontrmsg_dbt m \n"
+                    ,"              where m.t_id = v_msgid; \n"
+                    ,"             if v_send_date > to_date('01010001','ddmmyyyy') then \n"
+                    ,"                 v_send_result := 'Отправлено'; \n"
+                    ,"             else \n"
+                    ,"                 v_send_result := 'Не отправлено'; \n"
+                    ,"             end if; \n"
+                    ,"          EXCEPTION \n"
+                    ,"             WHEN no_data_found then v_send_date := null; \n"
+                    ,"                                     v_send_result := Nvl(v_Err, Dbms_Utility.Format_Error_Stack || ' ' || Dbms_Utility.Format_Error_Backtrace); \n"
+                    ,"          END; \n"
+                    ,"        ELSE \n"
+                    ,"          v_send_date := null; \n"
+                    ,"          v_send_result := v_statmes; \n"
+                    ,"        END IF; \n"   
+                    ,"        INSERT INTO uqiaccreditation_dbt   \n"
+                    ,"            ( t_id, t_partyid, t_kind, t_ekk, t_accred_date, t_accred_code, \n"
+                    ,"              t_accred_result, t_send_date, t_send_status, t_send_result, t_dlcontrid, t_msgid, t_jmsmessageid) \n"
+                    ,"         VALUES   \n"
+                    ,"            (0 \n"
+                    ,"            ,v_partyid   \n"
+                    ,"            ,v_kind   \n"
+                    ,"            ,v_ekk   \n"
+                    ,"            ,v_accred_date   \n"
+                    ,"            ,v_accred_code   \n"
+                    ,"            ,v_accred_result   \n"
+                    ,"            ,v_send_date   \n"
+                    ,"            ,v_statsend   \n"
+                    ,"            ,v_send_result   \n"
+                    ,"            ,v_dlcontrid \n"
+                    ,"            ,v_msgid \n"
+                    ,"            ,v_jmsmessageid)   \n"
+                    ,"         RETURNING t_Id INTO v_id;   \n"
+                    ,"      END IF;   \n"
+                    ,"   EXCEPTION   \n"
+                    ,"      WHEN OTHERS THEN   \n"
+                    ,"         v_Err := Nvl(v_Err, Dbms_Utility.Format_Error_Stack || ' ' || Dbms_Utility.Format_Error_Backtrace);   \n"
+                    ,"         v_id := NULL;   \n"
+                    ,"   END;   \n"
+                    ,"   :p_id := v_id;   \n"
+                    ,"   :p_Err := v_Err;   \n"
+                    ,"END;   \n"
+                   );
+      rsdc = rsdcommand(sqls);
+      rsdc.AddParam("p_partyid", RSDBP_IN, PartyId);
+      rsdc.AddParam("p_kind", RSDBP_IN, mess_kind);
+      rsdc.AddParam("p_dlcontrid", RSDBP_IN, ddl_id);
+      rsdc.AddParam("p_msgid", RSDBP_IN, msgid);
+      rsdc.AddParam("p_statsend", RSDBP_IN, statsend);
+      rsdc.AddParam("p_statmes", RSDBP_IN, statMes);
+      
+      if (ValTYpe(p_Accreditation) == V_GENOBJ)
+         rsdc.AddParam("p_accred_date", RSDBP_IN, p_Accreditation.Date_acc);
+         rsdc.AddParam("p_accred_code", RSDBP_IN, p_Accreditation.Code);
+         if (p_Accreditation.IsSuccess)
+            rsdc.AddParam("p_accred_result", RSDBP_IN, "Успешно");
+         else
+            rsdc.AddParam("p_accred_result", RSDBP_IN, "Не успешно");
+         end;
+      else
+         rsdc.AddParam("p_accred_date", RSDBP_IN, null);
+         rsdc.AddParam("p_accred_code", RSDBP_IN, null);
+         rsdc.AddParam("p_accred_result", RSDBP_IN, null);
+      end;
+      
+      if (p_transparent_id)
+         rsdc.AddParam("p_jmsmessageid", RSDBP_IN, p_transparent_id);
+      else 
+         rsdc.AddParam("p_jmsmessageid", RSDBP_IN, null);
+      end;
+      
+      rsdc.AddParam("p_id", RSDBP_OUT, v_string, 50);
+      rsdc.AddParam("p_Err", RSDBP_OUT, v_string, 2000);
+      rsdc.execute;
+      v_err = rsdc.Value("p_Err");
+      if ((v_err != null) and (v_err != nullval))
+         runerror(v_err, v_err);
+      end;
+      id_uqi = rsdc.Value("p_id");   
+      rsdc = null;
+      statfix = 0;
+      fixmes = "OK";
+
+      return this;
+   onerror(e)
+      statfix = e.code;
+      fixmes = e.message + getFullCmdErrorText(rsdc);
+      return this;
+   end;
+
+   macro UpdateUQIAccreditation(p_id)
+      var sqls, rsdc;
+      var v_err;
+      sqls = String( 
+                     "DECLARE   \n"
+                    ,"   v_send_date date;   \n"
+                    ,"   v_send_result VARCHAR2(2000);   \n"
+                    ,"   v_statsend number(10) := :p_statsend;   \n"
+                    ,"   v_statmes varchar2(2000) := :p_statmes;   \n"
+                    ,"   v_msgid number(10) := :p_msgid;   \n"
+                    ,"   v_id number(10) := :p_id;   \n"
+                    ,"   v_Err    VARCHAR2(2000);   \n"
+                    ,"   v_cnt number(10);  \n"
+                    ,"BEGIN   \n"
+                    ,"   BEGIN   \n"
+                    ,"      IF v_statsend = 1 then  \n"
+                    ,"        BEGIN \n"
+                    ,"           select nvl(m.t_senddate,to_date('01010001','ddmmyyyy')) into v_send_date \n"
+                    ,"             from ddlcontrmsg_dbt m \n"
+                    ,"            where m.t_id = v_msgid; \n"
+                    ,"           if v_send_date > to_date('01010001','ddmmyyyy') then \n"
+                    ,"               v_send_result := 'Отправлено'; \n"
+                    ,"           else \n"
+                    ,"               v_send_result := 'Не отправлено'; \n"
+                    ,"           end if; \n"
+                    ,"        EXCEPTION \n"
+                    ,"           WHEN no_data_found then v_send_date := null; \n"
+                    ,"                                   v_send_result := Nvl(v_Err, Dbms_Utility.Format_Error_Stack || ' ' || Dbms_Utility.Format_Error_Backtrace); \n"
+                    ,"        END; \n"
+                    ,"      ELSE \n"
+                    ,"        v_send_date := null; \n"
+                    ,"        v_send_result := v_statmes; \n"
+                    ,"      END IF; \n"   
+                    ,"      INSERT INTO UQIACCREDITATION_STEP_DBT (T_STEPID, T_ACCREDID, T_TIMESTAMP, T_STATUS, T_COMMENT) \n"
+                    ,"      VALUES (0, v_id, sysdate, v_statsend, v_send_result); \n"
+                    ,"      SELECT COUNT(*) into v_cnt FROM UQIACCREDITATION_STEP_DBT WHERE t_accredid = v_id; \n"
+                    ,"      UPDATE uqiaccreditation_dbt   \n"
+                    ,"         SET t_send_date = v_send_date, t_send_status = v_statsend, t_send_result = substr(v_send_result,1,200)  \n"
+                    ,"       WHERE t_id = v_id; \n"
+                    ,"   EXCEPTION   \n"
+                    ,"      WHEN OTHERS THEN   \n"
+                    ,"         v_Err := Nvl(v_Err, Dbms_Utility.Format_Error_Stack || ' ' || Dbms_Utility.Format_Error_Backtrace);   \n"
+                    ,"   END;   \n"
+                    ,"   :p_Err := v_Err;   \n"
+                    ,"   :p_Cnt_attempts := v_cnt; \n"
+                    ,"END;   \n"
+                   );
+      rsdc = rsdcommand(sqls);
+      rsdc.AddParam("p_statsend", RSDBP_IN, statsend);
+      rsdc.AddParam("p_statmes", RSDBP_IN, Substr(statMes,1,2000));
+      rsdc.AddParam("p_msgid", RSDBP_IN, msgid);
+      rsdc.AddParam("p_id", RSDBP_IN, p_id);
+      rsdc.AddParam("p_Err", RSDBP_OUT, v_string, 2000);
+      rsdc.AddParam("p_Cnt_attempts", RSDBP_OUT, v_integer);
+      rsdc.execute;
+      v_err = rsdc.Value("p_Err");
+      attempts = rsdc.Value("p_Cnt_attempts");
+      if ((v_err != null) and (v_err != nullval))
+         runerror(v_err, v_err);
+      end;
+      rsdc = null;
+      statfix = 0;
+      fixmes = "OK";
+
+      return this;
+   onerror(e)
+      statfix = e.code;
+      fixmes = e.message + getFullCmdErrorText(rsdc);
+      return this;
+   end;
+
+
+   constructor();
+end;
+
+// действующий ДБО клиента с наименьшим значением поля "Дата открытия"
+// если 2 договора открыты в один день, то с меньшим ddlcontr_dbt.t_dlcontrid (в скроллинге ДБО порядок такой)
+macro FindFirstContract(_partyid, _repdate)
+   var res = -1;
+   var sql_str, cmd, rs;
+
+   sql_str = " select dl.t_dlcontrid, sf.* "+ 
+             "   from ddlcontr_dbt dl, "+
+             "        dsfcontr_dbt sf "+
+             "  where dl.t_sfcontrid = sf.t_id "+
+             "    and sf.t_partyid = :p "+
+             "    and (sf.t_dateclose > :dt1 or sf.t_dateclose = to_date('01.01.0001','dd.mm.yyyy') ) "+
+             "    and sf.t_datebegin = (select min(t_datebegin) from dsfcontr_dbt sf1 "+
+             "                           where sf1.t_partyid = sf.t_partyid "+
+             "                             and (sf1.t_dateclose > :dt2 or sf1.t_dateclose = to_date('01.01.0001','dd.mm.yyyy') ) "+
+             "                          ) "+
+             "  order by dl.t_dlcontrid ";
+   cmd = RSDCommand(sql_str);
+   cmd.AddParam("p", RSDBP_IN, _partyid);
+   cmd.AddParam("dt1", RSDBP_IN, _repdate);
+   cmd.AddParam("dt2", RSDBP_IN, _repdate);
+   rs = RSdRecordSet(cmd);
+   if (rs.movenext)
+      res = rs.value("t_dlcontrid");
+   end;
+
+   return res;
+end;
+
+macro FindQIInclusionMessage(_partyid, _repdate)
+   var sql_str, rs, cmd;
+   var res = -1;
+   sql_str = "select 1 from dscqinv_dbt qi "+
+             " where qi.t_partyid = :partyid "+
+             "   and qi.t_state = 1 "+
+             "   and qi.t_regdate = :repdate "+
+             "   and not exists (select 1 "+
+             "                     from ddlcontrmsg_dbt m, "+
+             "                          ddlcontr_dbt d, "+
+             "                          dsfcontr_dbt s "+
+             "                    where m.t_dlcontrid = d.t_dlcontrid "+
+             "                    and d.t_sfcontrid = s.t_id  "+
+             "                    and s.t_partyid = qi.t_partyid  "+
+             "                    and t_kind = :inclusion) ";
+   cmd = RSDCommand(sql_str);
+   cmd.AddParam("partyid", RSDBP_IN, _partyid);
+   cmd.AddParam("repdate", RSDBP_IN, _repdate);
+   cmd.AddParam("inclusion", RSDBP_IN, INCLUSION_QI);
+   rs = RSDRecordSet(cmd);
+   if (rs.movenext)
+      res = rs.value(0);
+   end;
+   return res;
+end;
+
+macro InsEvent_QI(_partyid, _typeaction)
+   const CV_TYPE = 5070; /* Тип Отправка уведомления о включении в реестр КИ */
+
+   var v_sql :string = "",
+       v_cmd;
+
+   v_sql =         "INSERT INTO uTableProcessEvent_dbt( t_objecttype, t_objectid, t_type, t_status, t_timestamp ) ";
+   v_sql = v_sql + " ( SELECT :p_objecttype1,:p_objectid1, :p_typeaction, 1, SYSDATE FROM DUAL ";
+   v_sql = v_sql + "   WHERE NOT EXISTS(SELECT t_recid FROM utableprocessevent_dbt ";
+   v_sql = v_sql + "                     WHERE t_objecttype = :p_objecttype2 ";
+   v_sql = v_sql + "                       AND t_objectid = :p_objectid2 ";
+   v_sql = v_sql + "                       AND t_type = :p_typeaction ";
+   v_sql = v_sql + "                       AND TRUNC(t_timestamp) = TRUNC(SYSDATE) ";
+   v_sql = v_sql + "                       AND t_status IN (1, 2)) ";  /* статус 4 исключаем, так как обновлений может быть несколько. Наверное. */
+   v_sql = v_sql + "     AND ROWNUM = 1 ) "; /* На всякий случай */
+
+   v_cmd = RSDCommand(v_sql);
+   v_cmd.addParam("p_objecttype1", RSDBP_IN, CV_TYPE);
+   v_cmd.addParam("p_objectid1", RSDBP_IN, _partyid);
+   v_cmd.addParam("p_typeaction1", RSDBP_IN, _typeaction);
+   v_cmd.addParam("p_objecttype2", RSDBP_IN, CV_TYPE);
+   v_cmd.addParam("p_objectid2", RSDBP_IN, _partyid);
+   v_cmd.addParam("p_typeaction2", RSDBP_IN, _typeaction);
+   v_cmd.execute();
+
+   v_cmd.close(); v_cmd = null; v_sql = null;
+
+onError(err)
+
+end;
+
+/**
+@brief Функция получения пути реестра настройки адресов скрытой копии в зависимости от типа субъекта
+@param[in] isLegalPerson Признак - получение настройки для ЮЛ (если false - для ФЛ)
+@return Путь в реестре к настройке
+*/
+macro GetHiddenRecipientsRegistryPath(isLegalPerson: Bool): String
+  if (isLegalPerson)
+    return QI_REGISTRY_HIDDENRECIPIENTS_UL;
+  end;
+  
+  return QI_REGISTRY_HIDDENRECIPIENTS_FL;
+end;
+
+/**
+@brief Функция получения адресов e-mail из настроек банка для установки в скрытой копии
+@return Массив строк с адресами
+*/
+macro GetHiddenRecipients(registryPath: String): TArray
+  var result: TArray = TArray();
+  var errCode: Integer;
+  var hiddenRecipients: String;
+    
+  GetRegistryValue(registryPath, V_STRING, hiddenRecipients, errCode);
+  if ((errCode == 0) and (ValType(hiddenRecipients) == V_STRING))
+    hiddenRecipients = Trim(hiddenRecipients);
+
+    if (StrLen(hiddenRecipients) > 0)
+      hiddenRecipients = StrSubst(hiddenRecipients, ",", ";");
+      var emails: TArray = StringSplit(hiddenRecipients, ";");
+      var i = 0;
+      var email: String;
+      
+      while (i < emails.size)
+        email = Trim(emails(i));
+        if (StrLen(email) > 0)
+          result(result.size) = email;
+        end;
+        i = i + 1;
+      end;
+      
+    end;
+  end;
+  
+  return result;
+end;
+
+/**
+@brief Процедура многократного вызова процедуры с адресом procPtr с предачей параметров из paramArray
+@param[in] procPtr Адрес процедуры
+@param[in] paramArray Массив передаваемых параметров
+
+Процедура будет вызвана paramArray.size раз
+*/
+macro RunProcByParamArray(procPtr: Variant, paramArray: TArray)
+  var i: Integer = 0;
+  
+  while (i < paramArray.size)
+    CallR2M(procPtr, paramArray(i));
+    i = i + 1;
+  end;
+end;
+
+/**
+@brief Процедура печати нескольких строк в таблицу посредством класса-обработчика CWorddocProcessor
+@param[in] wordProcessor Объект класса CWordDocProcessor 
+@param[in] tableNumber Номер таблицы в шаблоне Word
+@param[in] tableRow Номер строки, содержащей закладку, которая будет размножена начиная с указанной строки в таблице
+@param[in] startBookmarkName Имя закладки в строке вида имя_номер
+@param[in] textLines Массив TArray со строками, которые будут добавлены в таблицу.
+@return Количество добавленных строк (textLines.size)
+
+Пример закладки в размножаемой строке: Example_1_9 - будет размножена на Example_1_10, Example_1_11 и т.д.
+*/
+macro PrintTableRows(wordProcessor: CWordDocProcessor, tableNumber: Integer, tableRowIndex: Integer, startBookmarkName: String, textLines: TArray): Integer
+  if (textLines.size > 1)
+    /// Размножить указанную строку в таблице
+    wordProcessor.DublicateTableRow(tableNumber, tableRowIndex, tableRowIndex, textLines.size - 1);
+  end;
+  
+  var pos: Integer = IndexLast(startBookmarkName, "_");
+  var bookmarkIndex: Integer = 0;
+  var nameRightPart: String = SubStr(startBookmarkName, pos + 1);
+  
+  if (StrIsNumber(nameRightPart))
+    bookmarkIndex = Int(nameRightPart);
+    startBookmarkName = SubStr(startBookmarkName, 1, pos);
+  else
+    bookmarkIndex = 0;
+    startBookmarkName = startBookmarkName + "_";
+  end;
+  
+  var i = 0;
+  while (i < textLines.size)
+    wordProcessor.ReplaceBookmark(startBookmarkName + bookmarkIndex , textLines(i));
+    
+    bookmarkIndex = bookmarkIndex + 1;
+    i = i + 1;
+  end;
+  
+  return textLines.size;
+end;
+
+/**
+@brief Процедура формирования комад для обработки шаблона с данными Word - удаление строк в таблице
+@param[in] tableNumber Номер таблицы в шаблоне Word
+@param[in] tableRowIndexFrom Номер строки, с которой производится удаление
+@param[in] tableRowIndexTo Номер строки, до которой производится удаление
+*/
+macro DeleteTableRows(tableNumber: Integer, tableRowIndexFrom: Integer, tableRowIndexTo: Integer)
+  println("~DeleteRows");
+  println(tableNumber);
+  println("%");
+  println(tableRowIndexFrom);
+  println(tableRowIndexTo);
+end;
+
+/**
+@brief Функция сохранения файла из таблицы dImage_dbt
+@param[in] storage Данные об используемых директориях/файлах
+@param[in] imageId ID файла из таблицы dImage_dbt
+@return true В случае успешной загрузки изображения
+@return false В случае ошибки
+*/
+macro ImageUpload(storage: CStorageInfo, imageId: Integer, error: @String): Bool
+  var uploadedFilePath: String;
+  var fname: String;
+  var fext: String;
+  
+  if (not WEB_ShowImageByID(imageId, uploadedFilePath))
+    error = "Ошибка загрузки изображения с ID = " + imageId;
+    return false
+  end;
+  
+  SplitFile(uploadedFilePath, fname, fext);
+  storage.AddFile(WORKTAG, SIGNTAG, fname + "_" + String(Random(999):3), fext, true);
+  if (not CopyFile(uploadedFilePath, storage.FilePath(WORKTAG, SIGNTAG)))
+    error = "Ошибка копирования из " + uploadedFilePath + " в " + storage.FilePath(WORKTAG, SIGNTAG);
+    return false;
+  end;
+  
+  RemoveFile(uploadedFilePath);
+  return true;
+end;
+
+/**
+@brief Удаление для объекта всех прикрепленных документов из таблицы dImage_dbt
+@param[in] objectType Тип объекта
+@param[in] objectID ID объекта
+@param[in] imageType Тип документа (необяз., если не указан удаляются документы всех типов)
+@return true В случае успешного удаления и в случае если документы не найдены
+*/
+macro DeleteObjectImages(objectType: Integer, objectID: String, imageType: Integer): Bool
+  var query = "SELECT t_imageID " +
+                         "FROM dImgData_dbt " +
+                        "WHERE t_objectType = :objectType " +
+                          "AND t_objectID   = :objectID ";
+  if (ValType(imageType) == V_INTEGER)
+    query = query + "AND t_imageType  = :imageType";
+  end;
+  
+  var cmd = RsdCommand(query);
+  cmd.AddParam("objectType", RSDBP_IN, objectType);
+  cmd.AddParam("objectID", RSDBP_IN, objectID);
+  
+  if (ValType(imageType) == V_INTEGER)
+    cmd.AddParam("imageType", RSDBP_IN, imageType);
+  end;
+  
+  cmd.Execute();
+  
+  var rs = RSDRecordSet(cmd);
+  
+  while (rs.MoveNext())
+    if(not WEB_DeleteImage(rs.Value("t_imageID")))
+      return false;
+    end;
+  end;
+  
+  return true;
+  
+OnError(err)
+  return false;
+end;

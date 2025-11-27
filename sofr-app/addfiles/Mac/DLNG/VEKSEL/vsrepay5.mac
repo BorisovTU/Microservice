@@ -1,0 +1,2671 @@
+/**
+ @file vsrepay5.mac
+ @brief Общая часть по погашению векселей, выполняемая в операциях погашения и Выкупа
+
+ # changelog
+ |date       |autor          |tasks                                           |note
+ |-----------|---------------|------------------------------------------------|-------------------------------------------------------------
+ |09.01.2024 |Велигжанин А.В.|DEF-59007                                       |Убрал формирование платежа по налогу (Дт 60301, Кт 301), закомментировано.
+ |28.12.2023 |Велигжанин А.В.|DEF-56486                                       |Оптимизация. Выражение GetGE() неэффективно без addFilter()
+ |22.12.2023 |Велигжанин А.В.|DEF-57381                                       |Во избежании межфилиальной проводки с счетом по категории
+ |           |               |                                                |'НДФЛ к перечислению 15%' используется первичный документ
+ |           |               |                                                |ВЕКСЕЛЯ (а не договора). Только для режима РАЗБИВКА ИСХ.ПЛАТЕЖЕЙ ПРИ ПОГАШ
+ |           |               |                                                |В другом режиме, оба счета в проводке открываются по ПД -- договору.
+ |           |               |                                                |Это нормально.
+*/
+ 
+IMPORT
+       PTInter, VSInter, Проценты, globals,
+       vs4each, vscateg, vscount, vslib, vsrcvacc, vscarry, vspmfutu,
+       vsreplib, vscngst, vsmisc, vsconv, vsnptxcalcfun;
+import oralib, likepy, role_model;
+import "usr_connect_attr.mac"; //Simanov
+import "pmlib.mac";
+import "nptxstbfun.mac";
+private var Sum2_all = 0, S_Tax15 = 0, S_Tax13 = 0;
+private var ОтключениеПереоценки = true;
+//Simanov. i-support 507260
+//По валютным платежам с филиалами, должен документ формироваться с кодом 06.
+private macro SetCodeDocument (dealid, dockind)
+  var query = "select t_paymentid from dpmpaym_dbt pmpaym "
+            + "where     t_dockind = :dockind "
+            + "      and t_documentid = :dealid "
+            + "      and exists (select 1 from dpmprop_dbt where t_paymentid = pmpaym.t_paymentid and t_debetcredit = 1 and t_corschem > -1) " //Есть исходящая корсхема
+            + "      and t_receiverbankid in (select t_partyid from ddp_dep_dbt) "
+            + "      and t_receiverbankid <> 1 ";
+  var sql = execSqlSelect(query, makeArray(sqlParam("dockind", dockind), sqlParam("dealid", dealid)));
+
+  while (sql.moveNext( ))
+    Connect_attr_to_paym (sql.value("t_paymentid"), ATTR_GROUP_DOCUMENT_BIS, "06");
+  end;
+
+End;
+
+PRIVATE var
+            ВексПД,                     /* первичный документ векселя */
+            ДогПД,                      /* первичный документ договора */
+            Вексель,                    /* текщий вексель */
+            ДогПогашения,
+            ДатаПогашения,              /* дата погашения */
+
+            Сп = 0.0,                   /* сумма к оплате */
+            ЧерезТранзит = false,       /* признак проводки оплаты*/
+            ИнтегрРежимРаботы = false,
+            Кол_воВекселей = 0,
+            Счет_Векселя = "";          /* начальная */
+
+PRIVATE var PlanPaymsOrd; /* Платежи Договора (класс) */
+PRIVATE var УдержатьНалог = false,
+            pt_cntr  = TRecHandler ("party");
+PRIVATE var СозданPlusG_2800 = false, СозданBaseBill = false;
+private var NumberOfNeededOrdPaym = 0;
+
+private var IncrRatesArr = makeArray(15,18,20,22);
+private var IncrKBKArr = TArray();
+/* Возвращает массив платежей по договору
+*/
+PRIVATE MACRO VS_GetOrderPayms()
+  return PlanPaymsOrd;
+END;
+
+PRIVATE MACRO VS_SettingForNumbering()
+  var ret = 0;
+  if(not VS_GetRegistryValue("ВЕКСЕЛЯ БАНКА\\РЕЖИМ РАБОТЫ\\ВИД НУМЕРАЦИИ ПЛ.ПОГАШЕНИЯ", V_INTEGER, @ret))
+    return 0;
+  end;
+  return ret;
+END;
+
+/* Возвращает платеж требуемого назначения
+*/
+MACRO VS_FindOrderPaym(purp, acc, Number)
+var ordPayms = VS_GetOrderPayms();
+
+  //и вот здесь один кастыль:
+  //поскольку Find вернёт только первый, добавляем доп параметр
+  if (Number == NULL)
+    Number = 0;
+  end;
+  return ordPayms.Find(purp, acc, Number);
+END;
+
+/* Установка основания в платеже
+*/
+PRIVATE MACRO SetGroundInPay(Paym, основание:@string)
+var
+    stat = 0, ground;
+
+    if(Кол_воВекселей == 1)
+      if (Сп == Paym.PayerAmount)
+         ground = String("Погашение векселя",
+                         " сер. ", Вексель.rec.BCSeries,
+                         " № ", trim(Вексель.rec.BCNumber));
+      else
+         ground = String("Перечисление части суммы от погашения векселя",
+                        " сер. ", Вексель.rec.BCSeries,
+                        " № ", trim(Вексель.rec.BCNumber));
+      end;
+    else
+      if (Сп == Paym.PayerAmount)
+         ground = String("Погашение векселей");
+      else
+         ground = String("Перечисление части суммы от погашения векселей");
+      end;
+    end;
+
+    Paym.Ground = ground;
+
+    if((основание != null) and (VALTYPE(основание) == V_STRING))
+      основание = Ground;
+    end;
+
+    return (stat == 0);
+END;
+
+PRIVATE MACRO ПолучитьСчетМФР(
+    fd,            // первичный документ
+    FindAccount,   // здесь вернется номер счета
+    AccCreate,     // признак верификации\открытия лицевого счета
+    Currency,      // код валюты
+    ActionDate    // дата действия
+)
+
+var stat = 0,
+    BackOutAccount = false, ChangeOpenDate  = false;
+    MC_GetAccountOpenParms( "Счет МФР", @BackOutAccount, @ChangeOpenDate );
+
+    FindAccount = MC_FindAndOpenCommonAccByFD (
+                                 "Счет МФР",       // код категории
+                                 fd,               // первичный документ
+                                 ActionDate,       // дата действия
+                                 0,                // признак "тихой" работы
+                                 AccCreate,        // режим поиска/создания счёта
+                                 null,             // буфер для найденного/открытого счёта (account.dbt)
+                                 Currency,         // ФИ создаваемого счёта
+                                 null,             // схема переоценки
+                                 null,             // режим определения парного счёта
+                                 null,             // Номер счета, который необходимо подставить в создаваемый
+                                 0,                // роль финансового инструмента
+                                 null,             // фактический режим открытия
+                                 null,             // Найденный/открытый счет. Структура MCACCDOC.
+                                 null,             // номер узла ТС
+                                 null,             // владелец счета
+                                 null,             // дата начала действия счёта
+                                 BackOutAccount,
+                                 ChangeOpenDate);
+    if(FindAccount == "")
+        Ошибка("Ошибка в получении счета:|категория: Счет МФР");
+        stat = 1;
+    else
+        SetParm( 1, FindAccount );
+    end;
+
+    return (stat == 0);
+END;
+
+/* Получает счет учета номинала для первого векселя по договору
+*/
+PRIVATE MACRO GetFstAccount(bnr, leg, emi, order, numOrd, lnk, acc:@variant)
+var
+   fd = VSBannerFD(bnr, leg);
+
+   ПолучитьСчетУчетаНоминала(bnr, fd, ДатаПогашения, @acc);
+   return 1; /* достаточно одной итерации */
+END;
+
+/*  Разбираемся со счетами в платеже
+Simanov. Внесены изменения для операции погашения векселя другого филиала. Абсолютно весь бух. учет в ГО
+*/
+PRIVATE MACRO LookAccountsInDrawPaym(order)
+var
+     Paym, ContrDepartment, Flag1, splinter = false,  otype = ValType(order), i,
+     acc = "", OrderDepartment,
+     fd = VSOrderFD(order);
+
+    if(otype == V_GENOBJ)
+      ContrDepartment = order.rec.ContrDepartment;
+      OrderDepartment = order.rec.Department;
+      Flag1 = order.rec.Flag1;
+    else
+      ContrDepartment = order.ContrDepartment;
+      OrderDepartment = order.Department;
+      Flag1 = order.Flag1;
+    end;
+
+    if(not VS_GetRegistryValue("ВЕКСЕЛЯ БАНКА\\РЕЖИМ РАБОТЫ\\РАЗБИВКА ИСХ.ПЛАТЕЖЕЙ ПРИ ПОГАШ", V_BOOL, @splinter))
+       return false;
+    elif(not splinter) //Simanov
+       Paym = VS_FindOrderPaym(PM_PURP_VEKSELDRAW);
+       if(not Paym)
+          msgbox("Не найден платеж",
+                 "|назначение ", PM_PURP_VEKSELDRAW,
+                 "|договор ", order.ContractID,
+                 "|DocKind ", order.DocKind);
+          return false;
+       end;
+
+       //Simanov
+       if(ЧерезТранзит == false)
+          ДляКаждогоВекселя(order, @GetFstAccount, VSORDLNK_K_DRAW, @Счет_Векселя, "BL");
+          if(Счет_Векселя == "")
+             return false;
+          end;
+          acc = Счет_Векселя;
+//Simanov       elif(not ПолучитьСчетВекселя("-Расчеты", ДогПД, acc, MC_OPENACC_CREATE, paym.PayerFIID, null, ДатаПогашения))
+          return false;
+       end;
+
+       VS_CngPayerAccount(acc, paym, true);
+
+       if(not SetGroundInPay(Paym))
+         return false;
+       end;
+    end;
+
+     Paym = VS_FindOrderPaym(PM_PURP_VEKSELDRAW);
+     if(not splinter)
+        paym.MyActuate(true);
+     end;
+     if(Paym.ReceiverBankID != {OurBank})
+//Simanov         paym.FutureReceiverAccount = paym.GetCorAccount("К");
+     end;
+
+    return true;
+END;
+
+/* Заполняет массив плановых платежей договора.
+   Следует учитывать, что обрабатываться будут только платежи
+   с известным назначением.
+*/
+PRIVATE MACRO ЗаполнитьСписокПланПлатежей(order)
+   PlanPaymsOrd = OrderPayms (order);
+   return true;
+END;
+
+/* Определяет сумму налога
+*/
+PRIVATE MACRO GetTax(bnr, leg, emi, order, numOrd, lnk, S:@variant)
+var
+  R = 0.0;
+  var Sum1 = 0.0, Sum2 = 0.0, Sum3 = 0.0, Sum4 = 0.0, Sum5 = 0.0, Sum6 = 0,Sum7 = 0;
+  var Rg = 0.13;
+  var Rp = 0.15;
+  var Max15 = 5000000;//предельное значение НОБ для расчета по основной ставке
+  var EndDate = lnk.rec.InterestChargeDate;
+  var Year;
+  DateSplit(EndDate, NULL, NULL, Year);
+  var BegDate = date(1, 1, Year);
+  var refund = true;
+  S = RepAmountAndTax();
+
+  if(S.Cur == -1)
+     S.Cur = lnk.rec.BCCFI;
+  end;
+
+  if(not VS_GetRegistryValue("ВЕКСЕЛЯ БАНКА\\РЕЖИМ РАБОТЫ\\ВОЗВРАТ ПЕРЕПЛАТЫ В ТЕЧЕНИЕ ГОД", V_BOOL, @refund))
+    refund = true;
+  end;
+
+  S.Amount = S.Amount + VS_Convert(lnk.rec.BCCost, lnk.rec.InterestChargeDate, lnk.rec.BCCFI, S.Cur);
+
+  if ((pt_cntr.rec.LegalForm == PTLEGF_PERSN) and (IsUseProgressScale(EndDate)))
+    S.Tax13_Raw = lnk.rec.taxamount_natcur;
+    S.Tax15_Raw = lnk.rec.taxamount15_natcur;
+    S.Tax18_Raw = lnk.rec.taxamount18_natcur;
+    S.Tax20_Raw = lnk.rec.taxamount20_natcur;
+    S.Tax22_Raw = lnk.rec.taxamount22_natcur;
+    S.Tax13_NatCur = Round(S.Tax13_Raw, 0);
+    S.Tax15_NatCur = Round(S.Tax15_Raw, 0);
+    S.Tax18_NatCur = Round(S.Tax18_Raw, 0);
+    S.Tax20_NatCur = Round(S.Tax20_Raw, 0);
+    S.Tax22_NatCur = Round(S.Tax22_Raw, 0);
+
+    var roundTo = IIF(S.Cur != NATCUR, 2, 0);
+    S.Tax13 = Round(lnk.rec.taxamount,roundTo);
+    S.Tax15 = Round(lnk.rec.taxamount15,roundTo);
+    S.Tax18 = Round(lnk.rec.taxamount18,roundTo);
+    S.Tax20 = Round(lnk.rec.taxamount20,roundTo);
+    S.Tax22 = Round(lnk.rec.taxamount22,roundTo);
+    S.TaxIncr = S.Tax15 + S.Tax18 + S.Tax20 + S.Tax22;
+    S.Tax = S.Tax13 + S.Tax15 + S.Tax18 + S.Tax20 + S.Tax22;
+    S.TaxIncr_Raw = S.Tax15_Raw + S.Tax18_Raw + S.Tax20_Raw + S.Tax22_Raw;
+    S.Tax_Raw = S.Tax13_Raw + S.TaxIncr_Raw;
+    return 0;
+  end;
+
+  /*BIQ 7294*/
+  if ((pt_cntr.rec.LegalForm == PTLEGF_PERSN) and (EndDate >= GetStartSTBDate()))
+    S.Tax13_NatCur = Round(lnk.rec.taxamount_natcur, 0);
+    S.Tax15_NatCur = Round(lnk.rec.taxamount15_natcur, 0);
+    S.Tax13_Raw = lnk.rec.taxamount_natcur;
+    S.Tax15_Raw = lnk.rec.taxamount15_natcur;
+    S.Tax_Raw = S.Tax13_Raw + S.Tax15_Raw;
+    if (S.Cur != NATCUR)
+      S.Tax13 = Round(lnk.rec.taxamount,2);
+      S.Tax15 = Round(lnk.rec.taxamount15,2);
+    else
+      S.Tax13 = Round(lnk.rec.taxamount,0);
+      S.Tax15 = Round(lnk.rec.taxamount15,0);
+    end;
+    S.Tax = S.Tax13 + S.Tax15;
+    S.TaxIncr = S.Tax15;
+    return 0;
+  end;
+
+  R = ПолучитьСтавкуПоКонтргенту(pt_cntr,order);
+
+  if((pt_cntr.rec.LegalForm == PTLEGF_PERSN) and (pt_cntr.rec.NotResident != "X") and (EndDate >= date(1,1,2021)) )
+        Sum2 = VS_Convert(lnk.rec.TaxBaseAmount, lnk.rec.InterestChargeDate, lnk.rec.BCCFI, NATCUR);
+        var SumQuery = "select " +
+                       "   (" +
+                       "      select nvl(sum(nptxobjSum1.t_Sum0), 0) " +
+                       "      from dnptxobj_dbt nptxobjSum1 " +
+                       "      where nptxobjSum1.t_Kind = " + string(TXOBJ_PLUSG_2800) +
+                       "        and nptxobjSum1.t_Client = party.t_PartyID" +
+                       "        and nptxobjSum1.t_Date between ? and ?" +
+                       "        and EXISTS (select ordlnk.* from dvsordlnk_dbt ordlnk where ORDLNK.T_CONTRACTID = NPTXOBJSUM1.T_ANALITIC1 and ORDLNK.T_LINKKIND = 1)" +
+                       "   ) as t_Sum1," +
+                       "   (" +
+                       "      SELECT nvl(sum(nptxobjSum4.t_Sum0), 0)" +
+                       "  FROM dnptxobj_dbt nptxobjSum4" +
+                       " WHERE     nptxobjSum4.t_Kind = " + string(TXOBJ_PAIDBILL) +
+                       "       AND nptxobjSum4.t_Client = party.t_PartyID" +
+                       "       AND nptxobjSum4.t_Date BETWEEN ? " +
+                       "                                  AND ? " +
+                       "       AND (   EXISTS" +
+                       "                  (SELECT ordlnk.*" +
+                       "                     FROM dvsordlnk_dbt ordlnk" +
+                       "                    WHERE     ORDLNK.T_CONTRACTID = nptxobjSum4.T_ANALITIC1" +
+                       "                          AND ORDLNK.T_LINKKIND = 1)" +
+                       "            OR (    nptxobjSum4.T_ANALITIC1 = -1" +
+                       "                AND EXISTS" +
+                       "                       (SELECT *" +
+                       "                          FROM dnptxobdc_dbt obdc, DNPTXOP_DBT op" +
+                       "                         WHERE     obdc.t_ObjID = nptxobjSum4.t_ObjID" +
+                       "                               AND op.t_ID = obdc.t_DocID" +
+                       "                               AND (   op.t_Kind_Operation = 2035" +       // расчет ноб
+                       "                                    OR op.t_Kind_Operation = 2038" +    // удержание ндфл
+                       "                                    OR op.t_Kind_Operation = 2044" +
+                       "                                    OR op.t_Kind_Operation = 2046 ))))" +
+                       "   ) as t_Sum4, " +
+                       "   (" +
+                       "      SELECT nvl(sum(nptxobjSum5.t_Sum0), 0)" +
+                       "  FROM dnptxobj_dbt nptxobjSum5" +
+                       " WHERE     nptxobjSum5.t_Kind = " + string(TXOBJ_PAIDGENERAL_15_9) + // PaidGeneral_15_9
+                       "       AND nptxobjSum5.t_Client = party.t_PartyID" +
+                       "       AND nptxobjSum5.t_Date BETWEEN ? " +
+                       "                                  AND ? " +
+                       "       AND (   EXISTS" +
+                       "                  (SELECT ordlnk.*" +
+                       "                     FROM dvsordlnk_dbt ordlnk" +
+                       "                    WHERE     ORDLNK.T_CONTRACTID = nptxobjSum5.T_ANALITIC1" +
+                       "                          AND ORDLNK.T_LINKKIND = 1)" +
+                       "            OR (    nptxobjSum5.T_ANALITIC1 = -1" +
+                       "                AND EXISTS" +
+                       "                       (SELECT *" +
+                       "                          FROM dnptxobdc_dbt obdc, DNPTXOP_DBT op" +
+                       "                         WHERE     obdc.t_ObjID = nptxobjSum5.t_ObjID" +
+                       "                               AND op.t_ID = obdc.t_DocID" +
+                       "                               AND (   op.t_Kind_Operation = 2035" +       // расчет ноб
+                       "                                    OR op.t_Kind_Operation = 2038" +    // удержание ндфл
+                       "                                    OR op.t_Kind_Operation = 2044" +
+                       "                                    OR op.t_Kind_Operation = 2046 ))))" +
+                       "   ) as t_Sum5 " +
+                       "from dparty_dbt party " +
+                       "where party.t_PartyID = ?";
+
+        var SumSelect = DL_RSDCommand(SumQuery);
+        SumSelect.AddParam(BegDate);
+        SumSelect.AddParam(EndDate);
+        SumSelect.AddParam(BegDate);
+        SumSelect.AddParam(EndDate);
+        SumSelect.AddParam(BegDate);
+        SumSelect.AddParam(EndDate);
+        SumSelect.AddParam(pt_cntr.rec.PartyID);
+
+        var SumDS = SumSelect.Execute();
+        if(SumDS.MoveNext())
+           Sum1 = SumDS.Sum1;
+           Sum4 = SumDS.Sum4 + S_Tax13;
+           Sum5 = SumDS.Sum5 + S_Tax15;
+        end;
+
+        Sum2_all  = Sum2_all + Sum2;
+        Sum3 = Sum1 + Sum2_all;
+
+        Sum6 = (Rg * min(Sum3, Max15)) - Sum4;
+        Sum7 = (Rp * max(Sum3 - Max15, 0)) - Sum5;
+
+        if ((not refund) AND (Sum6 < 0))
+          Sum6 = 0;
+        end;
+        if ((not refund) AND (Sum7 < 0))
+          Sum7 = 0;
+        end;
+
+          if ((Sum6 < 0) and (Sum7 > 0))
+            Sum6 = Sum6 + min (abs(Sum6), abs(Sum7));
+            Sum7 = Sum7 - min (abs(Sum6), abs(Sum7));
+          elif ((Sum7 < 0) and (Sum6 > 0))
+            Sum6 = Sum6 - min (abs(Sum6), abs(Sum7));
+            Sum7 = Sum7 + min (abs(Sum6), abs(Sum7));
+          end;
+
+          if (Sum6 < 0)
+            S.IsReverse = true;
+          end;
+
+          if (Sum7 < 0)
+            S.IsReverse15 = true;
+          end;
+        S.Tax13_NatCur = S.Tax13_NatCur + Round(Sum6,0);
+        S.Tax15_NatCur = S.Tax15_NatCur + Round(Sum7,0);
+        S.Tax13_Raw = Sum6;
+        S.Tax15_Raw = Sum7;
+        S.Tax_Raw = S.Tax13_Raw + S.Tax15_Raw;
+        if (S.Cur != NATCUR)
+          S.Tax13 = S.Tax13 + Round(VS_Convert(Sum6, lnk.rec.InterestChargeDate, NATCUR, S.Cur),2);
+          S.Tax15 = S.Tax15 + Round(VS_Convert(Sum7, lnk.rec.InterestChargeDate, NATCUR, S.Cur),2);
+        else
+          S.Tax13 = S.Tax13_NatCur;
+          S.Tax15 = S.Tax15_NatCur;
+        end;
+        S.Tax = S.Tax13 + S.Tax15;
+  elif (lnk.rec.TaxBaseAmount > 0.0)
+     /* Округляем налог до рублей:
+        Согласно Налоговому кодексу, ст. 225. Порядок исчисления налога.
+        п.4. Сумма налога  определяется в полных рублях.
+        Сумма налога менее 50 копеек отбрасывается, а 50 копеек и более округляется до полного рубля.
+     */
+
+    S.Tax13_Raw = double((VS_Convert(lnk.rec.TaxBaseAmount, lnk.rec.InterestChargeDate, lnk.rec.BCCFI, NATCUR) * R) / 100);
+    S.Tax13_NatCur = MoneyL(Round(S.Tax13_Raw, 0));
+    S.Tax13 = S.Tax13 + Round(VS_Convert(S.Tax13_NatCur, lnk.rec.InterestChargeDate, NATCUR, S.Cur), 2);
+    S.Tax = S.Tax13;
+
+  S.Tax_Raw = S.Tax13_Raw;
+  end;
+  S_Tax13 = S_Tax13 + S.Tax13;
+  S_Tax15 = S_Tax15 + S.Tax15;
+  return 0;
+END;
+
+/* Возвращает сумму налога для договора погашения (одновременно, и валюту, и сумму погашения)
+*/
+MACRO VS_GetTax(order, S:@variant)
+  return ДляКаждогоВекселя(order, @GetTax, VSORDLNK_K_DRAW, @S, null) == 0;
+END;
+
+PRIVATE MACRO GetTaxLnk(bnr, leg, emi, order, numOrd, lnk, S:@variant)
+
+  S.Tax13_NatCur   = S.Tax13_NatCur + lnk.rec.taxamount_natcur;
+  S.Tax15_NatCur   = S.Tax15_NatCur + lnk.rec.taxamount15_natcur;
+  S.Tax18_NatCur   = S.Tax18_NatCur + lnk.rec.taxamount18_natcur;
+  S.Tax20_NatCur   = S.Tax20_NatCur + lnk.rec.taxamount20_natcur;
+  S.Tax22_NatCur   = S.Tax22_NatCur + lnk.rec.taxamount22_natcur;
+  S.TaxIncr_NatCur = S.Tax15_NatCur + S.Tax18_NatCur + S.Tax20_NatCur + S.Tax22_NatCur;
+  S.Tax13          = S.Tax13        + lnk.rec.taxamount;
+  S.Tax15          = S.Tax15        + lnk.rec.taxamount15;
+  S.Tax18          = S.Tax18        + lnk.rec.taxamount18;
+  S.Tax20          = S.Tax20        + lnk.rec.taxamount20;
+  S.Tax22          = S.Tax22        + lnk.rec.taxamount22;
+  S.Tax            = S.Tax13 + S.Tax15 + S.Tax18 + S.Tax20 + S.Tax22;
+  S.TaxIncr        = S.Tax15 + S.Tax18 + S.Tax20 + S.Tax22;
+
+  return 0;
+END;
+
+/* Возвращает сумму налога для договора погашения (одновременно, и валюту, и сумму погашения)
+*/
+PRIVATE MACRO GetVSTax(order, S:@variant)
+  S = RepAmountAndTax();
+  return ДляКаждогоВекселя(order, @GetTaxLnk, VSORDLNK_K_DRAW, @S, null) == 0;
+END;
+
+/* Возвращает TRUE, если необходимо удержать налог хотя бы по одному векселю,
+   и FALSE в противном случае
+*/
+PRIVATE MACRO TestTaxAtion(СуммаНалога:@variant)
+  VAR S = RepAmountAndTax();
+
+
+  if(IsNoNDLFOpr(ДогПогашения.CONTRACTID)) return false; end;
+  VS_GetTax(ДогПогашения, @S);
+  СуммаНалога = S.Tax;
+  return (СуммаНалога != 0.0 );
+END;
+
+// Получить налоговый орган нашего банка. Для физиков один, для юриков другой
+PRIVATE MACRO ПолучитьНалогОрган(pt_self, LegalForm)
+  var found = false, regValue = 0;
+  var PathKeyVal = IIF(LegalForm==PTLEGF_PERSN, "ВЕКСЕЛЯ БАНКА\\РСХБ\\НАЛОГОВЫЙ_АГЕНТ_ФИЗ_ЛИЦ", "ВЕКСЕЛЯ БАНКА\\РСХБ\\НАЛОГОВЫЙ_АГЕНТ_ЮР_ЛИЦ");
+
+  if (not GetRegistryValue( PathKeyVal, 0, regValue) )
+    regValue = 0;
+  end;
+
+  pt_self.KeyNum = 0;
+  pt_self.rec.PartyID = regValue;
+  found = pt_self.GetEQ;
+
+ return found;
+END;
+
+PRIVATE MACRO ПолучитьБанкНалоговой( ID, settacc, LegalForm:integer )
+var found, Ok, Ok2;
+
+  found = false;
+  var pmautoac   = TBfile("pmautoac.dbt");
+
+  pmautoac.clear();
+
+  pmautoac.KeyNum = 0;
+
+  pmautoac.rec.SettAccId = settacc.rec.SettAccId;
+
+  var sql = " select SettAcc.t_SettAccId, SettAcc.t_Account, pmAuto.t_KindOper " +
+            "    from dsettacc_dbt SettAcc,  dpmautoac_dbt pmAuto " +
+            "    where "+
+            "          SettAcc.t_SettAccId = pmAuto.t_SettAccId "+
+            "      and SettAcc.t_PartyID = "+ID +
+            "      and pmAuto.t_purpose = " + 38 +//назначение платежа - "Налог с дохода" (справочник - таблица *dpmpurp_dbt*)
+            "      and SettAcc.t_FIID = "+NATCUR;
+
+
+
+  var cmd_settacc;
+  var cmd_pmautoac;
+  var cmd;
+
+  cmd = RSDCommand(sql);
+  cmd.execute();
+  var dataset = TRsbDataSet( cmd );
+  /*
+  while(  (not found) and dataset.MoveNext() )
+
+       if (LegalForm == PTLEGF_PERSN )
+         //проверка на нужную операцию
+         found =  (dataset.KindOper == 2038 );// Операция удержания НДФЛ
+
+         //проверка на категорию
+         found = (found and ПолучитьКатегорию(0,0,dataset.account,1,NATCUR) == "НДФЛ к перечислению СВ");
+
+       elif(LegalForm == PTLEGF_INST )
+         // пожалуй, это лишнее //  found = (Ok and (dataset.KindOper != 2038)); // НЕ Операция удержания НДФЛ
+
+        found = (found and ПолучитьКатегорию(0,0,dataset.account,1,NATCUR) == "-Бюджет, ф.налоги");
+       end;
+  end;*/
+
+  if (dataset.MoveNext())
+    settacc.KeyNum = 0;
+    settacc.rec.SettAccId = dataset.SettAccId;
+    settacc.GetEQ;
+    found = true;
+  end;
+
+ return found;
+END;
+
+PRIVATE MACRO ОснПлатежаПоНалогу(Конверсия, pt_cntr, bnr, leg, Повышенный)
+var s="";
+
+   if ( ( pt_cntr.rec.LegalForm == PTLEGF_PERSN ) and  /* Если физ лицо и резидент */
+     ( pt_cntr.rec.NotResident != "X") )
+      if (not Конверсия)
+       s = "Подоходный налог с ";
+       if(Повышенный)
+         s = "Налог 15% с ";
+       end;
+      else
+       s = "Конверсия суммы подоходного налога с ";
+       if(Повышенный)
+         s = "Конверсия суммы налога 15% с ";
+       end;
+      end;
+   else
+      if (not Конверсия)
+       s = "Налог с ";
+      else
+       s = "Конверсия суммы налога с ";
+      end;
+   end;
+
+   if  ( leg.rec.Formula == VS_IN_DISC_PC ) s = String(s, "процентно-дисконтного векселя");
+   elif( ВексельДисконтный(leg) )   s = String(s, "дисконтного векселя");
+   elif( ВексельПроцентный(leg) )   s = String(s, "процентного векселя");
+   end;
+
+/*Simanov
+   s = String(s, " сер. ", bnr.rec.BCSeries, " № ", trim(bnr.rec.BCNumber),
+              " , предъявитель векселя ", ДогПогашения.ContractorName + ", вексель АО \"Россельхозбанк\"");//CHVA  496503
+*/
+   s = String(s + " вексель " + bnr.rec.IssuerName + " сер. ", bnr.rec.BCSeries, " № ", trim(bnr.rec.BCNumber),
+              " , предъявитель векселя ", ДогПогашения.ContractorName);
+
+   return s;
+END;
+
+
+private macro ShortFio(fullName)
+  var name = "";
+ 
+  var fio = SplitString(fullName, " ");
+  if (fio.size > 0)
+    name = fio[0];
+  end;
+  if (fio.size > 1)
+    name = name + " " + substr(fio[1], 1, 1) + ".";
+  end;
+  if (fio.size > 2)
+    name = name + substr(fio[2], 1, 1) + ".";
+  end;
+  return name;
+end;
+
+PRIVATE MACRO ОснованиеОкругление(Тип, pt_cntr, bnr, leg, Сумма, Дата, ВидДок, НомерДок, Валюта)
+  var cmd = RsdCommand("select t_isocode from disocur_dbt where t_numbercode = '" + Валюта + "';");
+  cmd.execute();
+  var dataset = TRsbDataSet(cmd);
+  if (dataset.MoveNext())
+    Валюта = dataset.isocode;
+  end;
+  var s = Тип + " от округл. по погаш. ";
+
+  if (leg.rec.Formula == VS_IN_DISC_PC)
+    s = String(s, "проц.-диск. векселя ");
+  elif (ВексельДисконтный(leg))
+    s = String(s, "диск. векселя ");
+  elif (ВексельПроцентный(leg))
+    s = String(s, "проц. векселя ");
+  end;
+
+  s = String(s, bnr.rec.IssuerName, " сер. ", bnr.rec.BCSeries, " № ", trim(bnr.rec.BCNumber),
+             ", предъявитель векселя ",ShortFio(pt_cntr.rec.Name));
+
+  s = String(s, " Исх.док. ", ВидДок, " N '", НомерДок, "' от ", Дата,
+             ", валюта ", Валюта, ", сумма ", string(abs(round(Сумма, 2))), " ", Валюта, ".");
+
+  return s;
+END;
+
+
+PRIVATE MACRO ОснПлатежаПоНалогуPRGS(Конверсия, pt_cntr, bnr, leg, Rate)
+  var s="";
+  if (ValType(Rate) == V_UNDEF)
+    Rate = 0;
+  end;
+
+   if ( ( pt_cntr.rec.LegalForm == PTLEGF_PERSN ) and  /* Если физ лицо и резидент */
+     ( pt_cntr.rec.NotResident != "X") )
+      if (not Конверсия)
+       s = "Подоходный налог с ";
+       if(Rate)
+         s = "Налог "+string(Rate)+"% с ";
+       end;
+      else
+       s = "Конверсия суммы подоходного налога с ";
+       if(Rate)
+         s = "Конверсия суммы налога "+string(Rate)+"% с ";
+       end;
+      end;
+   else
+      if (not Конверсия)
+       s = "Налог с ";
+      else
+       s = "Конверсия суммы налога с ";
+      end;
+   end;
+
+   if  ( leg.rec.Formula == VS_IN_DISC_PC ) s = String(s, "процентно-дисконтного векселя");
+   elif( ВексельДисконтный(leg) )   s = String(s, "дисконтного векселя");
+   elif( ВексельПроцентный(leg) )   s = String(s, "процентного векселя");
+   end;
+   s = String(s + " вексель " + bnr.rec.IssuerName + " сер. ", bnr.rec.BCSeries, " № ", trim(bnr.rec.BCNumber),
+              " , предъявитель векселя ", ДогПогашения.ContractorName);
+
+   return s;
+END;
+
+
+MACRO ПроводкаОкругления(СуммаОкругления, СуммаНалогаДляОсн, pt_cntr, bnr, leg, ДатаОперации, КодВалютыНоминала, НомерДокумента)
+
+  var Тип   = IIF(СуммаОкругления > 0, "Доход", "Расход");
+  var CatDt = IIF(СуммаОкругления > 0, "СВексель к исполнению", "Расходы Окргл");
+  var CatCt = IIF(СуммаОкругления > 0, "ОкруглДоход",          "СВексель к исполнению");
+
+  var AccDt = "", AccCt = "";
+  var fd = VSBannerFD(bnr, leg);
+  var CurDt = IIF(CatDt == "СВексель к исполнению", leg.rec.PFI, NATCUR);
+  var CurCt = IIF(CatCt == "СВексель к исполнению", leg.rec.PFI, NATCUR);
+
+  ПолучитьСчетВекселя(CatDt, fd, @AccDt, MC_OPENACC_CREATE, CurDt, null, ДатаОперации);
+  ПолучитьСчетВекселя(CatCt, fd, @AccCt, MC_OPENACC_CREATE, CurCt, null, ДатаОперации);
+
+  if (SubStr(AccDt, 1, 5) == "52406")
+    CurDt = leg.rec.PFI;
+    ПолучитьСчетВекселя(CatDt, fd, @AccDt, MC_OPENACC_CREATE, CurDt, null, ДатаОперации);
+  end;
+  if (SubStr(AccCt, 1, 5) == "52406")
+    CurCt = leg.rec.PFI;
+    ПолучитьСчетВекселя(CatCt, fd, @AccCt, MC_OPENACC_CREATE, CurCt, null, ДатаОперации);
+  end;
+
+  var ОснОкругл = ОснованиеОкругление(Тип, pt_cntr, bnr, leg,
+                                      СуммаНалогаДляОсн, ДатаОперации,
+                                      "М.о.", НомерДокумента, КодВалютыНоминала);
+
+  var КодВалютыПроводки = 0;
+  var РежимПроводки = 0;
+  var СуммаДляПроводки = abs(СуммаОкругления);
+
+  if (CurDt == CurCt)
+    if (CurDt != NATCUR)
+      КодВалютыПроводки = CurDt;
+    end;
+  else
+    if ((CurDt == NATCUR) and (CurCt != NATCUR))
+      КодВалютыПроводки = CurCt;
+      РежимПроводки = 1; // дебет в рублях, кредит в валюте
+    elif ((CurDt != NATCUR) and (CurCt == NATCUR))
+      КодВалютыПроводки = CurDt;
+      РежимПроводки = 2; // дебет в валюте, кредит в рублях
+    end;
+  end;
+                  
+  Проводка(AccDt, AccCt, СуммаДляПроводки, ОснОкругл,
+           null, null,
+           КодВалютыПроводки, null, null, ДатаОперации, null,
+           РежимПроводки, null, null, null, IIF(КодВалютыПроводки != 0, 0, 2), ОтключениеПереоценки, НомерДокумента,true);
+END;
+
+
+/* Окончательная проводка по платежу
+*/
+PRIVATE MACRO ЗавершитьФормированиеПлатежа( Paym, Основание, method )
+var
+    pm_trans: RsbPaymTransaction,
+    stat = 0,
+    sql = "",
+    regValue = null;
+
+  if ( Paym.ReceiverAmount == 0.0 )
+    if(not VS_ChangeStat(paym, PM_FINISHED, null, ДатаПогашения)) /* Статус платежа Завершен */
+      stat = Ошибка("Ошибка изменения статуса платежа");
+    end;
+    return (stat == 0);
+  end;
+
+  if (not GetRegistryValue( "ВЕКСЕЛЯ БАНКА\\РСХБ\\PARTYNOSWIFT", 0, regValue) )
+    regValue = null;
+  end;
+
+  regValue = StrSubst(regValue, " ", "");
+  regValue = split(regValue, ","); //Сделать из строки массив
+
+  if((ДогПогашения.DocKind == DL_VEKSELDRAWORDER) AND (Paym.Purpose == PM_PURP_VEKSELDRAW))
+    if(not VS_SettingForNumbering())
+      Paym.Number = ДогПогашения.ContractID;
+    else
+      Paym.Number = ПолучитьНомерПроводкиДляПогашенияПоОперДню({curdate});
+    end;
+  end;
+SetCodeDocument(ДогПогашения.ContractID, ДогПогашения.DocKind);
+
+  if((ИнтегрРежимРаботы == false) // Проводку делаем, если неинтегрированный режим
+     or VS_IsBkpByOut() // или включена настройка "Проводка по исходящим платежам"
+     or (Paym.ReceiverBankID == {OurBank}) //  или внутренний платеж
+     or ((ДогПогашения.Flag1 == "") AND (ДогПогашения.ContrDepartment != ДогПогашения.Department)) // или погашение векселя в другом филиале
+    )
+    Paym.MyActuate();
+    //Paym.ActuateFutureAmounts(TBA_AMOUNT); //Без комментов FutureAmounts обнуляется
+
+    //Simanov. Проводки с пачкой 155 уходят в бис в любом случае, не зависимо от счетов и т.д.
+    if ( (paym.BaseFIID != NATCUR) and (find(regValue, string(paym.ReceiverBankID)) != -1))
+      Paym.NumberPack = 155;
+    else
+      Paym.NumberPack = 55;
+    end;
+    Paym.FuturePayerAccount = Paym.PayerAccount;
+    Paym.Number = ДогПогашения.ContractID;
+    Paym.Oper = GetMainOperInGroup(Paym.DocKind);
+    Paym.priority = 5;/*CHVA 502316*/
+    if((pm_trans = Paym.MakeTransaction()) != NULL)
+       pm_trans.Oper = GetMainOperInGroup(Paym.DocKind);
+       if (Paym.NumberPack == 155)
+         pm_trans.userfield3 = 1;
+       end;
+       if (not ПроводкаСПроверкойСчетов(pm_trans))
+           stat = Ошибка("Ошибка при создании проводки по платежу");
+       end;
+    else
+       stat = Ошибка("Ошибка при создании объекта класса RsbPaymTransaction");
+    end;
+  end;
+
+  if(not stat)
+    if((not ИнтегрРежимРаботы) or (paym.ReceiverBankID == {OurBank}) /* получатель - наш клиент или неинтегрированный режим */
+        or ( (paym.BaseFIID != NATCUR) and (find(regValue, string(paym.ReceiverBankID)) != -1)))  /*Simanov По указаниям от Медведевой Л.В. не нужно формировать исходящий платеж при погашении собственных валютных векселей, когда у клиента рассчетный счет в НРД.
+                                                                                                    partyid НРД лежит в настройке ВЕКСЕЛЯ БАНКА\\РСХБ\\PARTYNOSWIFT.*/
+       if(not VS_ChangeStat(paym, PM_FINISHED, method, ДатаПогашения)) /* завершен */
+          stat = Ошибка("Ошибка изменения статуса платежа");
+          return (stat == 0);
+       end;
+    else
+       if(not VS_ChangeStat(paym, PM_READY_TO_SEND, method, ДатаПогашения)) /* Готов к отправке */
+         stat = Ошибка("Ошибка изменения статуса платежа");
+         return (stat == 0);
+       end;
+    end;
+  end;
+
+  return (stat == 0);
+END;
+
+PRIVATE MACRO СоздатьПлатежПоРазбивкеСумм(bnr, leg, pmobj:@variant, pmparent, categ)
+var
+    FactID,
+    ordPayms  = VS_GetOrderPayms(),
+/*    settacc   = TBfile("settacc.dbt"),
+    ratedef   = TBfile("ratedef.dbt"),
+    pt_self   = TBFile  ("party.dbt"),
+    paym      = TBfile("pmpaym.dbt"),
+    pmrmprop1 = TBfile("pmrmprop.dbt"),*/
+    pmprop    = TBfile("pmprop.dbt"),
+    Name = "",
+    INN = "",
+    BankName = "",
+    CorrAccNostro = "",
+    СчетПолучателя = "",
+    stat = 0,
+    PayerAcc = "",
+    ВалУч,
+    S = $0.0,
+    fd = VSBannerFD(bnr, leg);
+
+    ВалУч = ОпределитьВалютуУчетаВекселя(bnr.rec.PayFIID, leg.rec.PFI);
+
+    if ( not ПолучитьСчетВекселя(categ, fd, PayerAcc,  MC_OPENACC_CREATE, null, null, ДатаПогашения) )
+      return false;
+    elif (not ПолучитьОстаток(S, PayerAcc, ВалУч, ДатаПогашения) )
+      return false;
+    end;
+
+//    ClearRecord (Paym);
+//    ClearRecord (pmrmprop1);
+    InitPM_PAYMPROP (pmprop);
+    var found=false;
+
+    Pmobj.DocKind      = ДогПогашения.DocKind;
+    Pmobj.DocumentID   = ДогПогашения.ContractID;
+    Pmobj.Purpose      = PM_PURP_VEKSELDRAW;       /* Погашение векселя */
+    Pmobj.BaseAmount   = S;                         /* Сумма актива   */
+    Pmobj.BaseFIID     = ВалУч;                /* Валюта актива  */
+    Pmobj.ReceiverFIID = NATCUR;                /* Валюта платежа */
+    Pmobj.PayerFIID    = pmparent.PayerFIID;         /* Валюта актива  */
+    Pmobj.IsPlanPaym   = "X";
+    Pmobj.IsFixPayerAmount = "X";
+
+    Pmobj.SetPayerPI(
+                     PAYMENTS_GROUP_UNDEF, // Group
+                     {OurBank},      // BankID                   /* Банк плательщика */
+                     0,             // BankCodeKind
+                     "",            // BankCode
+                     "",            // BankName
+                     "",            // CorrAcc
+                     pmparent.FuturePayerFIID,// AccountFI
+                     1,             // AccountChapter
+                     PayerAcc,  // Account   /* Счет плательщика */
+                     pmparent.Payer,      // ClientID  /* Плательщик */
+                     "", // ClientName,
+                     "", // ClientINN,
+                     0,  // ClientCodeKind,
+                     ""  // ClientCode
+                    );
+
+    Pmobj.SetReceiverPI(
+                     PAYMENTS_GROUP_UNDEF, // Group
+                     pmparent.ReceiverBankID,                      /* Банк получателя */
+                     pmparent.ReceiverBankCodeKind,               // BankCodeKind
+                     pmparent.ReceiverBankCode,                   // BankCode
+                     pmparent.ReceiverBankName,                   // BankName
+                     "",          // CorrAcc
+                     pmparent.ReceiverFIID,                         // AccountFI
+                     1,           // AccountChapter
+                     pmparent.ReceiverAccount,                     /* счет получателя */
+                     pmparent.Receiver,                            /* Получатель */
+                     pmparent.ReceiverName,                        // ClientName,
+                     pmparent.ReceiverINN,                         // ClientINN,
+                     0,           // ClientCodeKind,
+                     ""           // ClientCode
+                       );
+
+
+
+    Pmobj.ValueDate   = ДатаПогашения;             /* Дата валютирования */
+    Pmobj.PaymStatus  = PM_READIED;                /* Статус платежа */
+
+    pmobj.Ground = "Платеж по разбивке сумм "+categ;
+
+    VS_FillPaymProp(ДогПогашения.Contractor, Pmobj.PayerBankID,
+                    Name, INN, BankName, CorrAccNostro);
+    pmobj.PayerName = Name;
+    pmobj.PayerINN = INN;
+    pmobj.PayerBankName = BankName;
+    pmobj.PayerBankCorrAcc = CorrAccNostro;
+
+    VS_FillPaymProp(Pmobj.Receiver, Pmobj.ReceiverBankID,
+                    Name, INN, BankName, CorrAccNostro);
+    pmobj.ReceiverName = Name;
+    pmobj.ReceiverINN = INN;
+    pmobj.ReceiverBankName = BankName;
+    pmobj.ReceiverBankCorrAcc = CorrAccNostro;
+
+   if(ДогПогашения.DocKind == DL_VEKSELDRAWORDER)
+      if(not VS_SettingForNumbering())
+        pmobj.Number = ДогПогашения.ContractID;
+      else
+        pmobj.Number = ПолучитьНомерПроводкиДляПогашенияПоОперДню({curdate});
+      end;
+    end;
+
+    pmobj.BaseRate.Actuate(ДатаПогашения, false);
+    pmobj.FactRate.Actuate(ДатаПогашения, false);
+    pmobj.Actuate();
+
+    return (stat == 0);
+
+END;
+
+/* Создаем платеж для налога
+*/
+PRIVATE MACRO СоздатьПлатежДляНалога(bnr, leg, СуммаНалога, pmobj:@variant, pmparent, LegalForm:integer, NotResident:string, PayerAccount:string, BttTICode)
+var
+    FactID,
+    ordPayms  = VS_GetOrderPayms(),
+    settacc   = TBfile("settacc.dbt"),
+    ratedef   = TBfile("ratedef.dbt"),
+    pt_self   = TBFile  ("party.dbt"),
+    paym      = TBfile("pmpaym.dbt"),
+    pmrmprop1 = TBfile("pmrmprop.dbt"),
+    pmprop    = TBfile("pmprop.dbt"),
+    Name = "",
+    INN = "",
+    BankName = "",
+    CorrAccNostro = "",
+    СчетПолучателя = "",
+    fd = VSBannerFD(bnr, leg),
+    stat = 0,
+    splinter = false,
+    СчетОтправителя = "",
+    bnr_fd = VSBannerFD(bnr, leg);
+    var m, y;
+
+    ClearRecord (Paym);
+    ClearRecord (pmrmprop1);
+    InitPM_PAYMPROP (pmprop);
+    var found=false;
+
+    Pmobj.DocKind      = ДогПогашения.DocKind;
+    Pmobj.DocumentID   = ДогПогашения.ContractID;
+    Pmobj.Purpose      = PM_PURP_TAXINCOME_NJ;       /* Налог с дохода */
+    Pmobj.BaseAmount   = СуммаНалога;                /* Сумма актива   */
+    //Pmobj.BaseFIID     = ОпределитьВалютуУчетаВекселя(bnr.rec.PayFIID, leg.rec.PFI) /*leg.rec.PFI*/; /* Валюта актива  */
+    Pmobj.BaseFIID     = NATCUR; /* Валюта актива  */
+    Pmobj.ReceiverFIID = NATCUR;                /* Валюта платежа */
+    Pmobj.PayerFIID    = NATCUR;         /* Валюта актива  */
+    Pmobj.IsPlanPaym   = "X";
+    Pmobj.IsFixPayerAmount = "X";
+
+    //Dorohov Заполнение ValueDate. Оно нам нужно ниже при формировании налогового платежа
+    if(Pmobj.ValueDate == date(0,0,0))
+     Pmobj.ValueDate   = ДатаПогашения;                /* Дата валютирования */
+    end;
+
+    if(ПереключениРеквизитовЕНП() == 1)
+      PmObj.PaymentKind  = "";
+      Pmobj.Ground       = "0";/*Purpose;*/
+      pmobj.Priority     = PM_DefaultMaxPriority();
+      pmObj.TaxPmGround  = "0";
+      pmObj.OKATOCode    = "0";
+      pmObj.TaxPmPeriod  = "0";
+      pmObj.TaxPmNumber  = "0";
+      pmObj.TaxPmDate    = date(0,0,0);
+    else
+      Pmobj.Ground       = ОснПлатежаПоНалогу(0, pt_cntr, bnr, leg,0);
+      pmobj.Priority     = 3; //Simanov. Тут должно быть 3 - налоговый платёж. 5 /*3*/;/* CHVA 496503*/
+      pmObj.TaxPmGround = "ТП"; //платежи текущего года
+
+      //Simanov. Данные для налогового платежа
+      DateSplit(pmObj.ValueDate, null, m, y);
+
+      if(m <= 9)
+        m = "0"+m;
+      end;
+
+      pmObj.OKATOCode   = ПолучитьКодСубъекта({OurBank}, 74/*Код ОКТМО*/);
+      pmObj.TaxPmPeriod = "МС."+m+"."+y;
+      pmObj.TaxPmNumber = "0";
+      pmObj.TaxPmDate   = string(pmObj.ValueDate:f);
+    end;
+
+
+    pmObj.BttTICode = КБКдляЕНП();
+    pmObj.PaymentByOtherPerson = PM_OTHRPRSN_PRSN;
+
+    pmObj.TaxPmType   = "0";
+    pmObj.PayType     = BPT_TAX;
+
+    pmObj.PayerBankEnterDate = pmObj.ValueDate;
+    pmObj.PayerChargeOffDate = pmObj.ValueDate;
+
+    /******************************************************************/
+         /*находится или открывается счёт с категорией "-Расчеты"          */
+         /* Про разбивке исх.платежей при погашении производим списания    */
+         /* со счета "Свексель к исполнению" или "Обяз%, Свексель к исп."  */
+         /******************************************************************/
+    if(not VS_GetRegistryValue("ВЕКСЕЛЯ БАНКА\\РЕЖИМ РАБОТЫ\\РАЗБИВКА ИСХ.ПЛАТЕЖЕЙ ПРИ ПОГАШ", V_BOOL, @splinter))
+      stat = 1;
+    end;
+    /*if (stat == 0)
+      if (splinter == true)
+        if(ВексельДисконтный(leg)) stat = IIF ( ПолучитьСчетУчетаДисконта(bnr, bnr_fd, ДатаПогашения, @СчетОтправителя) , 0 , 1 );
+        elif(ВексельПроцентный(leg)) stat = IIF ( ПолучитьСчетУчетаПроцентов(bnr, bnr_fd, ДатаПогашения, @СчетОтправителя) , 0 , 1 ); end;
+      else
+        stat = IIF ( ПолучитьСчетВекселя("-Расчеты", ДогПД, СчетОтправителя, MC_OPENACC_CREATE, ОпределитьВалютуУчетаВекселя(bnr.rec.PayFIID, leg.rec.PFI), null, ДатаПогашения), 0 , 1 );
+      end;
+    end;*/
+    СчетОтправителя = PayerAccount;
+
+    Pmobj.SetPayerPI(
+                PAYMENTS_GROUP_UNDEF, // Group
+                {OurBank},            // BankID  /* Банк плательщика */
+                3,                    // BankCodeKind
+                НашБик(),             // BankCode
+                "",                   // BankName
+                "",                   // CorrAcc
+                NATCUR,               // AccountFI
+                1,                    // AccountChapter
+                СчетОтправителя,         // Account   /* Счет плательщика */
+                IIF(ПереключениРеквизитовЕНП() == 1, -1, {OurBank}),            // ClientID  /* Плательщик */
+                "",                   // ClientName,
+                {INN_Bank},           // ClientINN,
+                IIF(ПереключениРеквизитовЕНП() == 1, 0, 3),                    // ClientCodeKind,
+                IIF(ПереключениРеквизитовЕНП() == 1, "",НашБик())              // ClientCode
+               );
+
+    if (stat == 0)
+      if (not ПолучитьНалогОрган(pt_self, LegalForm))
+        stat = Ошибка("Не найден налоговый орган нашего банка");
+      end;
+    end;
+    if (stat == 0)
+      //и так:
+      // 1. ищем СПИ для налоговой, с назначением: 38 - налог с дохода
+      // 2. в каждом из найденной спи смотрим счёт. у него должна быть категория учёта:
+      // либо:
+      //   а. - Бюджет, ф.налоги (НацВ)
+      //   б. - НДФЛ к перечислению СВ (НацВ)
+      // 3. если не найдена такая СПИ, просто открываем счёт.
+      //Simanov. Убрал проверку на категорию счета и открытие счета. Счёт, который открыт в другом банке не может быть привязан к нашей КУ
+      if ( not ПолучитьБанкНалоговой( pt_self.rec.PartyID, settacc, LegalForm ))
+        found = false;
+        //Simanov. если не нашли необходимую СПИ, то сообщаем об ошибке
+        stat = Ошибка("Не найден Банк налогового органа. Проверьте платежные инструкции");
+      else
+        found = true;
+      end;
+    end;
+
+    if ( stat == 0 )
+      if (found == false) //Simanov. Сюда не должны попасть. Т.к. если не нашли СПИ, то делаем ошибку
+        Pmobj.SetReceiverPI(
+          PAYMENTS_GROUP_UNDEF, // Group
+          {OurBank},   // BankID          /* Банк налогового органа */
+          0,           // BankCodeKind
+          "",          // BankCode
+          "",          // BankName
+          "",          // CorrAcc
+          0,           // AccountFI
+          1,           // AccountChapter
+          СчетПолучателя,   // Account        /* счет в Банке налогового органа */
+          IIF(ПереключениРеквизитовЕНП() == 1, -1, pt_self.rec.TaxInstitution), // ClientID  /* Налоговый орган */
+          "",          // ClientName,
+          "",          // ClientINN,
+          0,           // ClientCodeKind,
+          ""           // ClientCode
+         );
+
+      elif( settacc.rec.BankID == {OurBank} )
+        Pmobj.SetReceiverPI(
+                  PAYMENTS_GROUP_UNDEF,                // Group
+                  settacc.rec.BankID,                  // BankID         /* Банк налогового органа */
+                  0,                                   // BankCodeKind
+                  "",                                  // BankCode
+                  "",                                  // BankName
+                  "",                                  // CorrAcc
+                  settacc.rec.FIID,                    // AccountFI
+                  1,                                   // AccountChapter
+                  settacc.rec.Account,                 // Account        /* счет в Банке налогового органа */
+                  IIF(ПереключениРеквизитовЕНП() == 1, -1, pt_self.rec.PartyID),                 // ClientID       /* Налоговый орган */
+                  IIF(ПереключениРеквизитовЕНП() == 1, "", pt_self.rec.name),                    // ClientName,
+                  "",                                  // ClientINN,
+                  IIF(ПереключениРеквизитовЕНП() == 1, 0, 1),                                   // ClientCodeKind,
+                  IIF(ПереключениРеквизитовЕНП() == 1, "",ПолучитьКодСубъекта(pt_self.rec.PartyID, 1)) // ClientCode
+                 );
+      else
+        Pmobj.SetReceiverPI(
+                  PAYMENTS_GROUP_UNDEF,                // Group
+                  settacc.rec.BankID,                  // BankID         /* Банк налогового органа */
+                  settacc.rec.BankCodeKind,            // BankCodeKind
+                  settacc.rec.BankCode,                // BankCode
+                  settacc.rec.BankName,                // BankName
+                  settacc.rec.CorrAcc,                 // CorrAcc
+                  settacc.rec.FIID,                    // AccountFI
+                  1,                                   // AccountChapter
+                  settacc.rec.Account,                 // Account        /* счет в Банке налогового органа */
+                  IIF(ПереключениРеквизитовЕНП() == 1, -1, pt_self.rec.PartyID),                 // ClientID       /* Налоговый орган */
+                  IIF(ПереключениРеквизитовЕНП() == 1, "", pt_self.rec.name),                    // ClientName,
+                  "",                                  // ClientINN,
+                  IIF(ПереключениРеквизитовЕНП() == 1, 0, 1),                                   // ClientCodeKind,
+                  IIF(ПереключениРеквизитовЕНП() == 1, "",ПолучитьКодСубъекта(pt_self.rec.PartyID, 1)) // ClientCode
+                 );
+      end;
+    end;
+
+    //Simanov
+    pmObj.TaxAuthorState = IIF(ПереключениРеквизитовЕНП() == 1, "04", "02"); //статус составителя - налоговый агент //Это должно задаваться после Set***PI(), иначе "Не найдена схема расчетов по умолчанию"
+
+    Pmobj.ValueDate   = ДатаПогашения;                /* Дата валютирования */
+    Pmobj.PaymStatus  = PM_READIED;                /* Статус платежа */
+
+    if(ПереключениРеквизитовЕНП() == 0)
+      VS_FillPaymProp(ДогПогашения.Contractor, Pmobj.PayerBankID,
+                      Name, INN, BankName, CorrAccNostro);
+      pmobj.PayerName        = Name;
+      pmobj.PayerINN         = INN;
+      pmobj.PayerBankName    = BankName;
+      pmobj.PayerBankCorrAcc = CorrAccNostro;
+
+      VS_FillPaymProp(Pmobj.Receiver, Pmobj.ReceiverBankID,
+                      Name, INN, BankName, CorrAccNostro);
+      pmobj.ReceiverName        = Name;
+      pmobj.ReceiverINN         = INN;
+      pmobj.ReceiverBankName    = BankName;
+      pmobj.ReceiverBankCorrAcc = CorrAccNostro;
+    end;
+
+   if(ДогПогашения.DocKind == DL_VEKSELDRAWORDER)
+      if(not VS_SettingForNumbering())
+        pmobj.Number = ДогПогашения.ContractID;
+      else
+        pmobj.Number = ПолучитьНомерПроводкиДляПогашенияПоОперДню({curdate});
+      end;
+    end;
+
+
+
+    pmobj.Number              = ДогПогашения.ContractID;
+
+    if ( settacc.rec.BankID != {OurBank} )
+      pmobj.OutTransferDate = Pmobj.ValueDate;
+    end;
+
+    pmobj.BaseRate.Actuate(ДатаПогашения, false);
+    pmobj.FactRate.Actuate(ДатаПогашения, false);
+    pmobj.Actuate();
+
+    return (stat == 0);
+END;
+
+MACRO ВыполнитьПроводкиЗачетаНДФЛ_Векс(FD, OpCode, ClientID, dat, TaxRateX, TaxRateY, SCorr, NettAccTrnArr:@TArray, ErrStr:@string)
+  var accX  = TRecHandler("account.dbt");
+  var accY  = TRecHandler("account.dbt");
+  var accRetY  = TRecHandler("account.dbt");
+  var RESTrate_Y = $0;
+  var ClientShortName = ПолучитьКороткоеИмяСубъекта(ClientID);
+  var err = 0;
+  var CatCodeX = GetCatTransfByRate(TaxRateX);
+  var CatCodeY = GetCatTransfByRate(TaxRateY);
+  var CatRetY = "";
+  var Sum = 0;
+
+  NettAccTrnArr.size = 0;
+  ErrStr = "";
+
+  if(CatCodeX == "")
+    ErrStr = "Не найдена категория НДФЛ к перечислению для ставки " + TaxRateX + "%";
+    return 1;
+  end;
+
+  if(CatCodeY == "")
+    ErrStr = "Не найдена категория НДФЛ к перечислению для ставки " + TaxRateY + "%";
+    return 1;
+  end;
+
+
+  if( not ПолучитьСчетВекселя(CatCodeX, FD, NULL, MC_OPENACC_CREATE, NATCUR, accX, dat) )
+    ErrStr = "Ошибка при определении счета по категории <"+CatCodeX+">.";
+    return 1;
+  end;
+
+
+  if( not ПолучитьСчетВекселя(CatCodeY, FD, NULL, MC_OPENACC_CREATE, NATCUR, accY, dat) )
+    ErrStr = "Ошибка при определении счета по категории <"+CatCodeY+">.";
+    return 1;
+  end;
+
+  if(accX.rec.Account == accY.rec.Account)
+    return 0;
+  end;
+
+  RESTrate_Y = DL_GetRestAccount(accY.rec, dat);
+
+  if(SCorr <= RESTrate_Y)
+    Sum = SCorr;    
+    if( Проводка(accY.rec.Account, accX.rec.Account, Sum,
+                 "Урегулирование НДФЛ между КБК, "+ClientShortName,
+                 null, null,
+                 NATCUR, null, null,
+                 dat, null,
+                 2, null, null, null, null, true)
+      )
+       ErrStr = "Ошибка при выполнении проводки";
+       return 1;
+    end;
+
+    NettAccTrnArr[NettAccTrnArr.size] = NPTXNettAccTrnData(accY.rec.Account, accX.rec.Account, Sum);
+  else
+    Sum = RESTrate_Y;
+    if( Проводка(accY.rec.Account, accX.rec.Account, Sum,
+                 "Урегулирование НДФЛ между КБК, "+ClientShortName,
+                 null, null,
+                 NATCUR, null, null,
+                 dat, null,
+                 2, null, null, null, null, true)
+      )
+       ErrStr = "Ошибка при выполнении проводки";
+       return 1;
+    end;
+
+    NettAccTrnArr[NettAccTrnArr.size] = NPTXNettAccTrnData(accY.rec.Account, accX.rec.Account, Sum);
+
+    CatRetY = GetCatRetByRate(TaxRateY);
+
+    if(CatRetY == "")
+      ErrStr = "Не найдена категория НДФЛ к возврату для ставки " + TaxRateY + "%";
+      return 1;
+    end;
+
+
+    if( not ПолучитьСчетВекселя(CatRetY, FD, NULL, MC_OPENACC_CREATE, NATCUR, accRetY, dat))
+      ErrStr = "Ошибка при определении счета по категории <"+CatRetY+">.";
+      return 1;
+    end;
+
+    Sum = SCorr-RESTrate_Y;
+
+    if( Проводка(accRetY.rec.Account, accY.rec.Account, Sum,
+                 "Урегулирование НДФЛ между КБК, "+ClientShortName,
+                 null, null,
+                 NATCUR, null, null,
+                 dat, null,
+                 2, null, null, null, null, true)
+      )
+       ErrStr = "Ошибка при выполнении проводки";
+       return 1;
+    end;
+
+    NettAccTrnArr[NettAccTrnArr.size] = NPTXNettAccTrnData(accRetY.rec.Account, accY.rec.Account, Sum);
+  end;
+
+  return err;
+END;
+
+MACRO УчестьКоррБалНДФЛ_ПРГС_Векс(FD, OperCode, DocKind, DocID, ClientID, OperDate, AddTaxeArr:@TArray, ErrStr:@string)
+  var SumCorrBalArr = TArray();
+  var NettAccTrnArr = TArray();
+  var err = 0;
+  var i = 0;
+
+  AddTaxeArr.size = 0;
+
+  if(ВЫПОЛНЯТЬ_КОРРЕКТИРОВКУ_НДФЛ() == false)
+    return 0;
+  end;
+
+  GetSumCorrBalInOpForVSAll(DocKind, DocID, ClientID, false, OperDate, @SumCorrBalArr);
+
+  while(i < SumCorrBalArr.size)
+    if(SumCorrBalArr[i].Налог > 0)
+      AddTaxeArr[AddTaxeArr.size] = STB_TaxRateParm(SumCorrBalArr[i].Ставка,
+                                                    $0, 
+                                                    SumCorrBalArr[i].Налог,
+                                                    SumCorrBalArr[i].КБК
+                                                   );
+    end;
+
+    i = i + 1;
+  end;
+
+  if(SumCorrBalArr.size != AddTaxeArr.size) //Если помимо положительных корректировок есть отрицательные
+    i = 0;
+    while((i < SumCorrBalArr.size) and (not err))
+      if(SumCorrBalArr[i].Налог < 0)
+        var SCorr = $0;
+        var j = 0;
+
+        while((j < AddTaxeArr.size) and (not err))
+
+          if(AddTaxeArr[j].Налог > 0)
+            SCorr = min(abs(SumCorrBalArr[i].Налог), AddTaxeArr[j].Налог);
+
+            err = ВыполнитьПроводкиЗачетаНДФЛ_Векс(FD, OperCode, ClientID, OperDate, AddTaxeArr[j].Ставка, SumCorrBalArr[i].Ставка, SCorr, @NettAccTrnArr, @ErrStr);
+
+            AddTaxeArr[j].Налог = AddTaxeArr[j].Налог - SCorr;
+          end;
+
+          j = j + 1;
+        end;
+
+      end;
+
+      i = i + 1;
+    end;
+
+    AddTaxeArr.size = 0;
+  end;
+ 
+  return err;
+END;
+
+PRIVATE MACRO ВыполнитьПроводкуЗачетаНДФЛ(ClientID, dat, WrtMainToIncr, WrtIncrToMain)
+  var accMain = TRecHandler("account.dbt");
+  var acc15   = TRecHandler("account.dbt");
+  var CtAcc = TRecHandler("account.dbt");
+  var DtAcc = TRecHandler("account.dbt");
+  var RestAcc = $0;
+  var CatCode = "";
+  var SCorr = $0;
+  var IsClientResident = STB_IsResidentStatus(STB_GetClientTaxPayerStatus(ClientID));
+  var ClientShortName = ПолучитьКороткоеИмяСубъекта(ClientID);
+  var needAccTrn = true;
+  var err = 0;
+
+  CatCode = "НДФЛ к перечислению, FLR";
+  if(IsClientResident == false)
+    CatCode = "НДФЛ к перечислению, FLN";
+  end;
+  err = IIF ( ПолучитьСчетВекселя(CatCode, ДогПД, NULL, MC_OPENACC_CREATE, NATCUR, accMain, dat), 0, 1);
+
+  if(not err)
+    CatCode = "НДФЛ к перечислению 15%";
+    err = IIF ( ПолучитьСчетВекселя(CatCode, ДогПД, NULL, MC_OPENACC_CREATE, NATCUR, acc15, dat), 0, 1);
+  end;
+
+  if(not err)
+    if(accMain.rec.Account == acc15.rec.Account)
+      return 0;
+    end;
+
+    //Вообще одновременно WrtMainToIncr и WrtIncrToMain не должны быть отличный от 0. Иначе в этом нет никакого смысла. Тогда это ошибка в предыдущих расчетах
+    if(WrtIncrToMain != 0) //Уменьшение НДФЛ по 15%
+      SCorr = abs(WrtIncrToMain);
+
+      copy(CtAcc, accMain);
+
+      RestAcc = DL_GetRestAccount(acc15.rec, dat);
+      if(SCorr > RestAcc)
+        DtAcc = "НДФЛ к возврату_15%";
+      else
+        copy(DtAcc, acc15);
+      end;
+    elif(WrtMainToIncr != 0) //Увеличение НДФЛ по 15%
+      SCorr = abs(WrtMainToIncr);
+
+      copy(CtAcc, acc15);
+
+      RestAcc = DL_GetRestAccount(accMain.rec, dat);
+      if(SCorr > RestAcc)
+        DtAcc = "НДФЛ к возврату";
+      else
+        copy(DtAcc, accMain);
+      end;
+    end;
+
+    if(ValType(DtAcc) == V_STRING)
+      CatCode = DtAcc;
+      err = IIF ( ПолучитьСчетВекселя(CatCode, ДогПД, NULL, MC_OPENACC_CREATE, NATCUR, DtAcc, dat), 0, 1);
+    end;
+
+    if(not err)
+      err = IIF (Проводка(DtAcc.rec.Account, CtAcc.rec.Account, SCorr,
+                           "Урегулирование НДФЛ между КБК, "+ClientShortName,
+                           null, null,
+                           NATCUR, null, null,
+                           dat, null,
+                          2, null, null, null, null, ОтключениеПереоценки),
+                 1,
+                 0
+                 );
+    end;
+  end;
+
+  return err;
+END;
+
+/* Взятие налога.
+   Выполняется путем выполнения неосновной проводки к платежу.
+*/
+
+private var RestCorrTaxBalMain = $0;
+private var RestCorrTaxBalIncr   = $0;
+private var Total_S         = NULL;
+private var Total_TaxHoldArrObj = NULL;
+private var TotalDecrTaxMain = $0;
+private var TotalDecrTaxIncr   = $0;
+private var RestDecrTaxMain = $0;
+private var RestDecrTaxIncr   = $0;
+private var WrtMainToIncr       = $0;
+private var WrtIncrToMain       = $0;
+private var AddDecrTaxMain  = $0;
+private var AddDecrTaxIncr    = $0;
+
+
+
+PRIVATE MACRO ВыполнитьУдержаниеНалога(bnr, leg, emi, order, numOrd, lnk, ПолнаяСуммаНалога:@variant)
+var
+    Paym = VS_FindOrderPaym(PM_PURP_VEKSELDRAW, NULL, NumberOfNeededOrdPaym),
+    СуммаНалога = MoneyL(0), СуммаНалогаДляПлатежа = $0, СуммаНалогаДляПроводки = $0,
+    СчетПолучателя = "",
+    СчетОтправителя = "",
+    KreditCat = "",
+    S = RepAmountAndTax(),
+    ВалУч = ОпределитьВалютуУчетаВекселя(bnr.rec.PayFIID, leg.rec.PFI),
+    bnr_fd,
+    splinter,
+    LegalForm = pt_cntr.rec.LegalForm,
+    ndrKind,
+    stat = 0,
+    fd = VSBannerFD(bnr, leg),
+    СуммаНалогаIncr = MoneyL(0), СуммаНалогаДляПлатежа15 = $0,
+    СчетПолучателя15 = "", СчетПолучателя18 = "", СчетПолучателя20 = "", СчетПолучателя22 = "",
+    CorrTaxBalMain = $0, AddCorrTaxBalMain = $0,
+    CorrTaxBalINCR = $0, AddCorrTaxBalIncr = $0;
+
+  if(not VS_GetRegistryValue("ВЕКСЕЛЯ БАНКА\\РЕЖИМ РАБОТЫ\\РАЗБИВКА ИСХ.ПЛАТЕЖЕЙ ПРИ ПОГАШ", V_BOOL, @splinter))
+    stat = 1;
+  end;
+  if (splinter)
+    NumberOfNeededOrdPaym = NumberOfNeededOrdPaym  + 1;
+  end;
+  if ((ВалУч !=  leg.rec.PFI) and (ВалУч == NATCUR))
+    S.Cur = NATCUR;
+  end;
+
+  if(Total_S == NULL)
+    GetVSTax(order, @Total_S);
+  end;
+
+  CorrTaxBalMain = GetSumCorrBalInOp(order.DocKind, order.ContractID, order.Contractor, NPTXKBK_MAIN, false, IIF(Total_S.Tax13 != 0, true, false));
+  CorrTaxBalMain = VS_Convert(CorrTaxBalMain, ДатаПогашения, NATCUR, S.Cur);
+  CorrTaxBalINCR = GetSumCorrBalInOp(order.DocKind, order.ContractID, order.Contractor, NPTXKBK_INCR, false, IIF(Total_S.TaxIncr != 0, true, false));
+  CorrTaxBalINCR = VS_Convert(CorrTaxBalINCR, ДатаПогашения, NATCUR, S.Cur);
+
+  if(numOrd == 0)
+    RestCorrTaxBalMain = CorrTaxBalMain;
+    RestCorrTaxBalIncr = CorrTaxBalINCR;
+  end;
+
+  GetTax(bnr, leg, emi, order, numOrd, lnk, @S, 1);
+  СуммаНалога = S.Tax13;
+  СуммаНалогаIncr = S.TaxIncr;
+
+  if (ВалУч != NATCUR)
+    СуммаНалога = VS_Convert(S.Tax13_NatCur, ДатаПогашения, NATCUR, S.Cur);
+    СуммаНалогаIncr = VS_Convert(S.Tax15_NatCur, ДатаПогашения, NATCUR, S.Cur);
+    ПолнаяСуммаНалога = ПолнаяСуммаНалога + S.Tax13_NatCur + S.Tax15_NatCur;
+  else
+    ПолнаяСуммаНалога = ПолнаяСуммаНалога + VS_Convert(S.Tax, ДатаПогашения, S.Cur, NATCUR);
+  end;
+
+  var SumSeparate = VS_IsSumSeparation();
+
+  //Знак у корректировок всегда одинаковый, либо они (все или некоторые) равны 0
+  if((CorrTaxBalMain < 0) or (CorrTaxBalINCR < 0))
+    //Значит только отрицательные корректировки
+
+    if(numOrd == 0)
+      if((CorrTaxBalMain != 0) and (CorrTaxBalINCR == 0))
+        var RestMainToIncr = CorrTaxBalMain;
+        if(Total_S.Tax13 > 0)
+          TotalDecrTaxMain = -min(Total_S.Tax13, abs(RestMainToIncr));
+          RestMainToIncr = RestMainToIncr - TotalDecrTaxMain;
+        end;
+
+        if((Total_S.TaxIncr > 0) and (RestMainToIncr != 0))
+          TotalDecrTaxIncr = -min(Total_S.TaxIncr, abs(RestMainToIncr));
+          WrtMainToIncr = TotalDecrTaxIncr;
+        end;
+
+      elif((CorrTaxBalMain == 0) and (CorrTaxBalINCR != 0))
+        var Rest15ToMain = CorrTaxBalINCR;
+        if(Total_S.TaxIncr > 0)
+          TotalDecrTaxIncr = -min(Total_S.TaxIncr, abs(Rest15ToMain));
+          Rest15ToMain = Rest15ToMain - TotalDecrTaxIncr;
+        end;
+
+        if((Total_S.Tax13 > 0) and (Rest15ToMain != 0))
+          TotalDecrTaxMain = -min(Total_S.Tax13, abs(Rest15ToMain));
+          WrtIncrToMain = TotalDecrTaxMain;
+        end;
+      elif((CorrTaxBalMain != 0) and (CorrTaxBalINCR != 0))
+
+        if((Total_S.Tax13 > 0) and (Total_S.TaxIncr == 0))
+          TotalDecrTaxMain = -min(Total_S.Tax13, abs(CorrTaxBalMain));
+
+          WrtIncrToMain = -min((Total_S.Tax13+TotalDecrTaxMain), abs(CorrTaxBalINCR));
+          TotalDecrTaxMain = TotalDecrTaxMain + WrtIncrToMain;
+        elif((Total_S.Tax13 == 0) and (Total_S.TaxIncr > 0))
+          TotalDecrTaxIncr = -min(Total_S.TaxIncr, abs(CorrTaxBalINCR));
+
+          WrtMainToIncr = -min((Total_S.TaxIncr+TotalDecrTaxIncr), abs(CorrTaxBalMain));
+          TotalDecrTaxIncr = TotalDecrTaxIncr + WrtMainToIncr;
+        elif((Total_S.Tax13 > 0) and (Total_S.TaxIncr > 0))
+          TotalDecrTaxMain = -min(Total_S.Tax13, abs(CorrTaxBalMain));
+          TotalDecrTaxIncr = -min(Total_S.TaxIncr, abs(CorrTaxBalINCR));
+
+          if(TotalDecrTaxMain != CorrTaxBalMain)
+            WrtMainToIncr = CorrTaxBalMain - TotalDecrTaxMain;
+            TotalDecrTaxIncr = TotalDecrTaxIncr + WrtMainToIncr;
+          elif(TotalDecrTaxIncr != CorrTaxBalINCR)
+            WrtIncrToMain = CorrTaxBalINCR - TotalDecrTaxIncr;
+            TotalDecrTaxMain = TotalDecrTaxMain + WrtIncrToMain;
+          end;
+        end;
+      end;
+
+      RestDecrTaxMain = TotalDecrTaxMain;
+      RestDecrTaxIncr   = TotalDecrTaxIncr;
+    end;
+
+    if(RestDecrTaxMain != 0)
+      AddDecrTaxMain = $0;
+      if(Кол_воВекселей == (numOrd+1))
+        AddDecrTaxMain = RestDecrTaxMain;
+      else
+        if(Total_S.Tax13 != 0)
+          AddDecrTaxMain = money(round(TotalDecrTaxMain * (S.Tax13 / Total_S.Tax13), 0));
+        end;
+      end;
+
+      if((RestDecrTaxMain - AddDecrTaxMain) > 0)
+        AddDecrTaxMain = RestDecrTaxMain;
+      end;
+
+      RestDecrTaxMain = RestDecrTaxMain - AddDecrTaxMain;
+    end;
+
+    if(RestDecrTaxIncr != 0)
+      AddDecrTaxIncr = $0;
+      if(Кол_воВекселей == (numOrd+1))
+        AddDecrTaxIncr = RestDecrTaxIncr;
+      else
+        if(Total_S.TaxIncr != 0)
+          AddDecrTaxIncr = money(round(TotalDecrTaxIncr * (S.TaxIncr / Total_S.TaxIncr), 0));
+        end;
+      end;
+
+      if((RestDecrTaxIncr - AddDecrTaxIncr) < 0)
+        AddDecrTaxIncr = RestDecrTaxIncr;
+      end;
+
+      RestDecrTaxIncr = RestDecrTaxIncr - AddDecrTaxIncr;
+    end;
+  end;
+
+  if ( stat == 0 )
+    if ( (СуммаНалога != 0.0 ) or (CorrTaxBalMain > 0))
+      СуммаНалогаДляПлатежа  = СуммаНалога + AddDecrTaxMain;
+      СуммаНалогаДляПроводки = СуммаНалога + AddDecrTaxMain;
+      ПолнаяСуммаНалога      = ПолнаяСуммаНалога + AddDecrTaxMain;
+
+      //Simanov Первым делом формируется проводка со счета векселя на 60301
+      if ( (pt_cntr.rec.LegalForm == PTLEGF_PERSN) and ( pt_cntr.rec.NotResident != "X"  ) ) //физ. лицо - резидент
+        KreditCat = "НДФЛ к перечислению СВ";
+      elif ( (pt_cntr.rec.LegalForm == PTLEGF_PERSN) and ( pt_cntr.rec.NotResident == "X"  ) ) //физ. лицо - не резидент
+        KreditCat = "НДФЛ к перечислению СВ2";
+      else // должныы остаться юрики нерезы
+        KreditCat = "-Бюджет, ф.налоги, ULN";
+      end;
+
+      stat = IIF ( ПолучитьСчетВекселя(KreditCat, fd, СчетПолучателя, MC_OPENACC_CREATE, NATCUR, null, ДатаПогашения) , 0 , 1); //Simanov. Новая КУ, чтобы счёт всегда открывался в ГО
+
+      if (not ПолучитьСчетУчетаНоминала(bnr, fd, ДатаПогашения, @СчетОтправителя))
+        stat = 1;
+      end;
+
+      if ((stat == 0) and (СуммаНалогаДляПроводки != 0.0))
+      var НомерДокумента;
+        stat = IIF (
+                       Проводка(IIF(S.IsReverse, СчетПолучателя, СчетОтправителя), IIF(S.IsReverse, СчетОтправителя, СчетПолучателя), VS_Convert(abs(СуммаНалогаДляПроводки), ДатаПогашения, S.Cur, ВалУч),
+                                ОснПлатежаПоНалогу(0, pt_cntr, bnr, leg, 0),
+                            null, null,
+                            ВалУч, null, null,
+                            ДатаПогашения, null,
+                                IIF(S.IsReverse, 1, 2)/*дебет в ВУ*/, null, null, null, IIF(ВалУч != NATCUR, 0, 2), ОтключениеПереоценки, @НомерДокумента),
+                   1,
+                   0
+                   );
+            var СуммаОкругления = S.Tax - S.Tax_Raw;
+            ПроводкаОкругления(СуммаОкругления, S.Tax,pt_cntr, bnr, leg, ДатаПогашения, S.Cur, НомерДокумента);
+
+      end;
+
+      if((stat == 0) and (RestCorrTaxBalMain > 0))
+        AddCorrTaxBalMain = $0;
+        if(Кол_воВекселей == (numOrd+1))
+          AddCorrTaxBalMain = RestCorrTaxBalMain;
+        else
+          if(Сп != 0)
+            AddCorrTaxBalMain = money(round(CorrTaxBalMain * (lnk.rec.BCCost / Сп), 0));
+          end;
+        end;
+
+        if((RestCorrTaxBalMain - AddCorrTaxBalMain) > 0)
+          AddCorrTaxBalMain = RestCorrTaxBalMain;
+        end;
+
+        RestCorrTaxBalMain = RestCorrTaxBalMain - AddCorrTaxBalMain;
+
+        СуммаНалогаДляПлатежа = СуммаНалогаДляПлатежа + AddCorrTaxBalMain;
+        ПолнаяСуммаНалога = ПолнаяСуммаНалога + AddCorrTaxBalMain;
+
+        if(AddCorrTaxBalMain != 0)
+          stat = IIF (
+                         Проводка(СчетОтправителя, СчетПолучателя, VS_Convert(AddCorrTaxBalMain, ДатаПогашения, NATCUR, ВалУч),
+                                  "Доудержание НДФЛ КБК = *02010* по " + pt_cntr.rec.Name,
+                              null, null,
+                              ВалУч, null, null,
+                              ДатаПогашения, null,
+                                  2, null, null, null, null, ОтключениеПереоценки),
+                     1,
+                     0
+                     );
+        end;
+      end;
+
+      if((stat == 0) and (СуммаНалогаДляПлатежа != 0.0 ))
+        if(not ИзменитьВексель(bnr.rec.BCID, ДатаПогашения, "taxamount", VS_Convert(СуммаНалогаДляПлатежа, ДатаПогашения, S.Cur, lnk.rec.BCCFI) ));
+          stat = 1;
+        end;
+        if(not ИзменитьВексель(bnr.rec.BCID, ДатаПогашения, "taxamount_natcur", VS_Convert(СуммаНалогаДляПлатежа, ДатаПогашения, S.Cur, NATCUR)));
+          stat = 1;
+        end;
+
+        if (stat == 0)
+          stat = СоздатьНДР_PaidBill(ДатаПогашения, pt_cntr, VS_Convert(СуммаНалогаДляПроводки, ДатаПогашения, S.Cur, NATCUR), order, VS_CurrIDOperation, VS_CurrIDStep, NATCUR  );
+        end;
+      end;
+    end;
+  end;
+
+  if ( stat == 0 )
+    if ( ((СуммаНалогаIncr != 0.0) or (RestCorrTaxBalIncr > 0)) and (ДатаПогашения >= date(1,1,2021)))
+      //РЕЗИДЕНТ
+      if ( (pt_cntr.rec.NotResident != "X")  and (pt_cntr.rec.LegalForm == PTLEGF_PERSN))
+        СуммаНалогаДляПлатежа  = СуммаНалогаIncr + AddDecrTaxIncr;
+        СуммаНалогаДляПроводки = СуммаНалогаIncr + AddDecrTaxIncr;
+        ПолнаяСуммаНалога      = ПолнаяСуммаНалога + AddDecrTaxIncr;
+
+        bnr_fd = VSBannerFD(bnr, leg);
+
+         if (splinter == true)
+           // DEF-57381, счет нужно получить по первичному документу -- векселю, потому что счет должен корреспондировать со счетом,
+           //            полученным по векселю (если же открывать счет по первичному документу -- договору,
+           //            то проводка может оказаться межфилиальной)
+           stat = IIF ( ПолучитьСчетВекселя("НДФЛ к перечислению 15%", bnr_fd, СчетПолучателя15, MC_OPENACC_CREATE, NATCUR, null, ДатаПогашения) , 0 , 1);
+         else
+           stat = IIF ( ПолучитьСчетВекселя("НДФЛ к перечислению 15%", ДогПД, СчетПолучателя15, MC_OPENACC_CREATE, NATCUR, null, ДатаПогашения) , 0 , 1);
+         end;
+
+
+        /******************************************************************/
+        /*находится или открывается счёт с категорией "-Расчеты"          */
+        /* Про разбивке исх.платежей при погашении производим списания    */
+        /* со счета "Свексель к исполнению" или "Обяз%, Свексель к исп."  */
+        /******************************************************************/
+        if (stat == 0)
+          if (splinter == true)
+           if(ВексельДисконтный(leg)) stat = IIF ( ПолучитьСчетУчетаДисконта(bnr, bnr_fd, ДатаПогашения, @СчетОтправителя) , 0 , 1 );
+           elif(ВексельПроцентный(leg)) stat = IIF ( ПолучитьСчетУчетаПроцентов(bnr, bnr_fd, ДатаПогашения, @СчетОтправителя) , 0 , 1 ); end;
+          else
+           stat = IIF ( ПолучитьСчетВекселя("-Расчеты", ДогПД, СчетОтправителя, MC_OPENACC_CREATE, ВалУч, null, ДатаПогашения), 0 , 1 );
+          end;
+        end;
+
+        /******************************************************************/
+        /*выполняется проводка по найденным счетам                        */
+        /******************************************************************/
+        if ((stat == 0) and (СуммаНалогаДляПроводки != 0))
+            stat = IIF (
+                      Проводка(IIF(S.IsReverse15, СчетПолучателя15, СчетОтправителя), IIF(S.IsReverse15, СчетОтправителя, СчетПолучателя15), VS_Convert(abs(СуммаНалогаДляПроводки), ДатаПогашения, S.Cur, ВалУч),
+                               ОснПлатежаПоНалогу(0, pt_cntr, bnr, leg, 1),
+                               null, null,
+                               ВалУч, null, null,
+                               ДатаПогашения, null,
+                               IIF(S.IsReverse15, 1, 2) /*дебет в ВУ*/, null, null, null, IIF(ВалУч != NATCUR, 0, 2), ОтключениеПереоценки),
+                      1,
+                      0
+                      );
+        end;
+
+        if((stat == 0) and (RestCorrTaxBalIncr > 0))
+          AddCorrTaxBalIncr = $0;
+          if(Кол_воВекселей == (numOrd+1))
+            AddCorrTaxBalIncr = RestCorrTaxBalIncr;
+          else
+            if(Сп != 0)
+              AddCorrTaxBalIncr = money(round(CorrTaxBalIncr * (lnk.rec.BCCost / Сп), 0));
+            end;
+          end;
+
+          if((RestCorrTaxBalIncr - AddCorrTaxBalIncr) < 0)
+            AddCorrTaxBalIncr = RestCorrTaxBalIncr;
+          end;
+
+          RestCorrTaxBalIncr = RestCorrTaxBalIncr - AddCorrTaxBalIncr;
+
+          СуммаНалогаДляПлатежа = СуммаНалогаДляПлатежа + AddCorrTaxBalIncr;
+          ПолнаяСуммаНалога = ПолнаяСуммаНалога + AddCorrTaxBalIncr;
+
+          if(AddCorrTaxBalIncr != 0)
+            stat = IIF (
+                           Проводка(СчетОтправителя, СчетПолучателя15, VS_Convert(AddCorrTaxBalIncr, ДатаПогашения, NATCUR, ВалУч),
+                                    "Доудержание НДФЛ КБК = *02080* по " + pt_cntr.rec.Name,
+                                null, null,
+                                ВалУч, null, null,
+                                ДатаПогашения, null,
+                                    2, null, null, null, null, ОтключениеПереоценки),
+                       1,
+                       0
+                       );
+          end;
+        end;
+
+        if((stat == 0) and (СуммаНалогаДляПлатежа != 0))
+          if(not ИзменитьВексель(bnr.rec.BCID, ДатаПогашения, "taxamount15", VS_Convert(СуммаНалогаДляПлатежа, ДатаПогашения, S.Cur, lnk.rec.BCCFI) ));
+            stat = 1;
+          end;
+          if(not ИзменитьВексель(bnr.rec.BCID, ДатаПогашения, "taxamount15_natcur", VS_Convert(СуммаНалогаДляПлатежа, ДатаПогашения, S.Cur, NATCUR)));
+            stat = 1;
+          end;
+
+          if (stat == 0)
+            stat = СоздатьНДР_PaidGeneral_15_9(ДатаПогашения, pt_cntr, VS_Convert(СуммаНалогаДляПроводки, ДатаПогашения, S.Cur, NATCUR), order, VS_CurrIDOperation, VS_CurrIDStep, NATCUR );
+          end;
+
+          if (stat == 0)
+            stat = СоздатьНДР_PaidGeneral_15(ДатаПогашения, pt_cntr, VS_Convert(СуммаНалогаДляПроводки, ДатаПогашения, S.Cur, NATCUR), order, VS_CurrIDOperation, VS_CurrIDStep, NATCUR  );
+          end;
+        end;
+      end;
+    end;
+  end;
+
+  if(not stat)
+    if((Кол_воВекселей == (numOrd+1)) and ((WrtMainToIncr != 0) or (WrtIncrToMain != 0)))
+      stat = ВыполнитьПроводкуЗачетаНДФЛ(order.Contractor, ДатаПогашения, WrtMainToIncr, WrtIncrToMain);
+    end;
+  end;
+
+  return stat;
+END;
+
+private class ByIdxSumStore()
+  var sumArr = TArray();
+
+  macro PlusSum(Idx, Sum)
+    var id = DL_FindKeyPairInArr(sumArr,Idx);
+    if (id >= 0)
+      sumArr[id].Value = sumArr[id].Value + Sum;
+    else
+      sumArr[sumArr.size] = DL_KeyPair(Idx,Sum);
+    end;
+  end;
+
+  macro MinusSum(Idx, Sum)
+    var id = DL_FindKeyPairInArr(sumArr,Idx);
+    if (id >= 0)
+      sumArr[id].Value = sumArr[id].Value - Sum;
+    else
+      sumArr[sumArr.size] = DL_KeyPair(Idx,Sum);
+    end;
+  end;
+
+  macro SetSum(Idx,Sum)
+    var id = DL_FindKeyPairInArr(sumArr,Idx);
+    if (id >= 0)
+      sumArr[id].Value = Sum;
+    else
+      sumArr[sumArr.size] = DL_KeyPair(Idx,Sum);
+    end;
+  end;
+
+  macro GetSum(Idx)
+    var id = DL_FindKeyPairInArr(sumArr,Idx);
+    if (id >= 0)
+      return sumArr[id].Value;
+    end;
+    return $0;
+  end;
+
+  macro AnyValBelowZero()
+    for (var vall, sumArr)
+      if (vall < 0)
+        return true;
+      end;
+    end;
+    return false;
+  end;
+end;
+
+private var RestCorrTaxBalIncrByIdx = ByIdxSumStore();
+private var GlobalAddTaxeArr = TArray();
+
+PRIVATE MACRO ВыполнитьУдержаниеНалогаPRGS(bnr, leg, emi, order, numOrd, lnk, ПолнаяСуммаНалога:@variant)
+var
+    Paym = VS_FindOrderPaym(PM_PURP_VEKSELDRAW, NULL, NumberOfNeededOrdPaym),
+    СуммаНалога = MoneyL(0), СуммаНалогаДляПлатежа = $0, СуммаНалогаДляПроводки = $0,
+    СчетПолучателя = "",
+    СчетОтправителя = "",
+    KreditCat = "",
+    S = RepAmountAndTax(),
+    ВалУч = ОпределитьВалютуУчетаВекселя(bnr.rec.PayFIID, leg.rec.PFI),
+    bnr_fd,
+    splinter,
+    LegalForm = pt_cntr.rec.LegalForm,
+    ndrKind,
+    stat = 0,
+    cRate = 0,
+    cKBK = "",
+    cAddTax = null,
+    fd = VSBannerFD(bnr, leg),
+    СуммаНалогаIncrByIdx = ByIdxSumStore(),
+    CorrTaxBalMain = $0, AddCorrTaxBalMain = $0,
+    CorrTaxBalIncrByIdx = ByIdxSumStore(), AddCorrTaxBalIncr = $0,
+    cntrIsResident = (IsResidentStatusPONSK(pt_cntr.rec.PartyID, ДатаПогашения) == 1);
+
+  if(not VS_GetRegistryValue("ВЕКСЕЛЯ БАНКА\\РЕЖИМ РАБОТЫ\\РАЗБИВКА ИСХ.ПЛАТЕЖЕЙ ПРИ ПОГАШ", V_BOOL, @splinter))
+    stat = 1;
+  end;
+  if ((ВалУч !=  leg.rec.PFI) and (ВалУч == NATCUR))
+    S.Cur = NATCUR;
+  end;
+
+  if (IncrKBKArr.size == 0)
+    IncrKBKArr = GetIncrKBKListForVeksel(cntrIsResident, ДатаПогашения);
+  end;
+
+  GetTax(bnr, leg, emi, order, numOrd, lnk, @S, 1);
+
+  if (ВалУч != NATCUR)
+    СуммаНалога = VS_Convert(S.Tax13_NatCur, ДатаПогашения, NATCUR, S.Cur);
+    ПолнаяСуммаНалога = ПолнаяСуммаНалога + S.Tax13_NatCur;
+    for (cRate, IncrRatesArr)
+      СуммаНалогаIncrByIdx.SetSum(cRate,VS_Convert(GenGetProp(S, "Tax"+string(cRate)+"_NatCur"), ДатаПогашения, NATCUR, S.Cur));
+      ПолнаяСуммаНалога = ПолнаяСуммаНалога + GenGetProp(S, "Tax"+string(cRate)+"_NatCur");
+    end;
+  else
+    СуммаНалога = S.Tax13;
+    for (cRate, IncrRatesArr)
+      СуммаНалогаIncrByIdx.SetSum(cRate,GenGetProp(S, "Tax"+string(cRate)));
+    end;
+    ПолнаяСуммаНалога = ПолнаяСуммаНалога + VS_Convert(S.Tax, ДатаПогашения, S.Cur, NATCUR);
+  end;
+
+  if(Total_S == NULL)
+    GetVSTax(order, @Total_S);
+  end;
+
+  if (Total_TaxHoldArrObj == NULL)
+    Total_TaxHoldArrObj = CalcTaxSTB_VekselPRGS_AndGetTaxHold(order);
+  end;
+
+  for (cAddTax, GlobalAddTaxeArr)
+    if (cAddTax.Налог > 0)
+      if (cAddTax.КБК == NPTXKBK_MAIN)
+        CorrTaxBalMain = CorrTaxBalMain + cAddTax.Налог;
+      else
+        CorrTaxBalIncrByIdx.PlusSum(cAddTax.КБК, cAddTax.Налог);
+        if (DL_FindKeyPairInArr(IncrKBKArr, cAddTax.КБК) == -1)
+          IncrKBKArr[IncrKBKArr.size] = DL_KeyPair(cAddTax.КБК, cAddTax.Ставка);
+        end;
+      end;
+    end;
+  end;
+
+  if(numOrd == 0)
+    RestCorrTaxBalMain = CorrTaxBalMain;
+    for (cKBK, IncrKBKArr)
+      RestCorrTaxBalIncrByIdx.SetSum(cKBK.Key,CorrTaxBalIncrByIdx.GetSum(cKBK.Key));
+    end;
+  end;
+
+  if ( stat == 0 )
+    if ((СуммаНалога != 0.0 ) or (RestCorrTaxBalMain != 0.0))
+      if ( (pt_cntr.rec.LegalForm == PTLEGF_PERSN) and ( pt_cntr.rec.NotResident != "X"  ) ) //физ. лицо - резидент
+        KreditCat = "НДФЛ к перечислению СВ";
+      elif ( (pt_cntr.rec.LegalForm == PTLEGF_PERSN) and ( pt_cntr.rec.NotResident == "X"  ) ) //физ. лицо - не резидент
+        KreditCat = "НДФЛ к перечислению СВ2";
+      else // должныы остаться юрики нерезы
+        KreditCat = "-Бюджет, ф.налоги, ULN";
+      end;
+
+      stat = IIF ( ПолучитьСчетВекселя(KreditCat, fd, СчетПолучателя, MC_OPENACC_CREATE, NATCUR, null, ДатаПогашения) , 0 , 1);
+
+      if (not ПолучитьСчетУчетаНоминала(bnr, fd, ДатаПогашения, @СчетОтправителя))
+        stat = 1;
+      end;
+
+      if ((stat == 0) and (СуммаНалога != 0.0))
+      var НомерДокумента2;
+        stat = IIF (
+                       Проводка(IIF(S.IsReverse, СчетПолучателя, СчетОтправителя), IIF(S.IsReverse, СчетОтправителя, СчетПолучателя), VS_Convert(abs(СуммаНалога), ДатаПогашения, S.Cur, ВалУч),
+                                ОснПлатежаПоНалогуPRGS(0, pt_cntr, bnr, leg, 0),
+                            null, null,
+                            ВалУч, null, null,
+                            ДатаПогашения, null,
+                                IIF(S.IsReverse, 1, 2)/*дебет в ВУ*/, null, null, null, IIF(ВалУч != NATCUR, 0, 2), ОтключениеПереоценки, @НомерДокумента2),
+                   1,
+                   0
+                   );
+
+      var СуммаОкругления = VS_Convert(S.Tax13, ДатаПогашения, S.Cur, NATCUR) - S.Tax13_NatCur;
+      if (abs(СуммаОкругления) > 0)
+        ПроводкаОкругления(СуммаОкругления, S.Tax13, pt_cntr, bnr, leg, ДатаПогашения, ПолучитьКодФинИн(leg.rec.PFI, null), НомерДокумента2);
+      end;
+    end;
+
+      if((stat == 0) and (RestCorrTaxBalMain > 0))
+        AddCorrTaxBalMain = $0;
+        if(Кол_воВекселей == (numOrd+1))
+          AddCorrTaxBalMain = RestCorrTaxBalMain;
+        else
+          if(Сп != 0)
+            AddCorrTaxBalMain = money(round(CorrTaxBalMain * (lnk.rec.BCCost / Сп), 0));
+          end;
+        end;
+
+        AddCorrTaxBalMain = min(AddCorrTaxBalMain,RestCorrTaxBalMain);
+
+        RestCorrTaxBalMain = RestCorrTaxBalMain - AddCorrTaxBalMain;
+
+        СуммаНалогаДляПлатежа = СуммаНалогаДляПлатежа + AddCorrTaxBalMain;
+        ПолнаяСуммаНалога = ПолнаяСуммаНалога + AddCorrTaxBalMain;
+
+        if(AddCorrTaxBalMain != 0)
+          stat = IIF (
+                         Проводка(СчетОтправителя, СчетПолучателя, VS_Convert(AddCorrTaxBalMain, ДатаПогашения, NATCUR, ВалУч),
+                                  "Доудержание НДФЛ КБК = *02010* по " + pt_cntr.rec.Name,
+                              null, null,
+                              ВалУч, null, null,
+                              ДатаПогашения, null,
+                                  2, null, null, null, null, ОтключениеПереоценки),
+                     1,
+                     0
+                     );
+        end;
+      end;
+
+      if((stat == 0) and (СуммаНалога != 0.0 ))
+        if (stat == 0)
+          stat = СоздатьНДР_PaidBill(ДатаПогашения, pt_cntr, S.Tax13_NatCur, order, VS_CurrIDOperation, VS_CurrIDStep, NATCUR  );
+        end;
+      end;
+    end;
+  end;
+
+macro СуммаНалогаДоОкругления(RateVal)
+  if(RateVal == 15)
+     return  S.Tax15_NatCur
+   elif (RateVal == 18)   
+  return  S.Tax18_NatCur
+     elif (RateVal == 20)   
+  return  S.Tax20_NatCur
+     elif (RateVal == 22)   
+  return  S.Tax22_NatCur
+  end;
+end;
+
+  macro MakeIncrCarryAndNDR(TaxSum, TaxCur, IncrIsReverse, Idx, RateVal)
+    var isResident = (IsResidentStatusPONSK(pt_cntr.rec.PartyID, {curdate}) == 1);
+
+    if (( stat == 0 ) and ((TaxSum != 0) or (RestCorrTaxBalIncrByIdx.GetSum(Idx) != 0)))
+      var accountReceiver = "";
+      var accountSender = "";
+      //РЕЗИДЕНТ
+      if ( isResident )
+        bnr_fd = VSBannerFD(bnr, leg);
+
+        if (splinter == true)
+          stat = IIF ( ПолучитьСчетВекселя("НДФЛ к перечислению "+string(RateVal)+"%", bnr_fd, accountReceiver, MC_OPENACC_CREATE, NATCUR, null, ДатаПогашения) , 0 , 1);
+        else
+          stat = IIF ( ПолучитьСчетВекселя("НДФЛ к перечислению "+string(RateVal)+"%", ДогПД, accountReceiver, MC_OPENACC_CREATE, NATCUR, null, ДатаПогашения) , 0 , 1);
+        end;
+
+        /******************************************************************/
+        /*находится или открывается счёт с категорией "-Расчеты"          */
+        /* Про разбивке исх.платежей при погашении производим списания    */
+        /* со счета "Свексель к исполнению" или "Обяз%, Свексель к исп."  */
+        /******************************************************************/
+        if (stat == 0)
+          if (splinter == true)
+            if(ВексельДисконтный(leg)) stat = IIF ( ПолучитьСчетУчетаДисконта(bnr, bnr_fd, ДатаПогашения, @accountSender) , 0 , 1 );
+            elif(ВексельПроцентный(leg)) stat = IIF ( ПолучитьСчетУчетаПроцентов(bnr, bnr_fd, ДатаПогашения, @accountSender) , 0 , 1 );
+            end;
+          else
+            stat = IIF ( ПолучитьСчетВекселя("-Расчеты", ДогПД, accountSender, MC_OPENACC_CREATE, ВалУч, null, ДатаПогашения), 0 , 1 );
+          end;
+        end;
+
+        /******************************************************************/
+        /*выполняется проводка по найденным счетам                        */
+        /******************************************************************/
+        //тут все проценты остальные
+        if ((stat == 0) and (TaxSum != 0))
+          var НомерДокумента2;
+              stat = IIF (
+                        Проводка(IIF(IncrIsReverse, accountReceiver, accountSender),
+                                 IIF(IncrIsReverse, accountSender, accountReceiver),
+                                 VS_Convert(abs(TaxSum), ДатаПогашения, TaxCur, ВалУч),
+                                 ОснПлатежаПоНалогуPRGS(0, pt_cntr, bnr, leg, RateVal),
+                                 null, null,
+                                 ВалУч, null, null,
+                                 ДатаПогашения, null,
+                                 IIF(IncrIsReverse, 1, 2) /*дебет в ВУ*/, null, null, null, IIF(ВалУч != NATCUR, 0, 2), ОтключениеПереоценки, @НомерДокумента2),1,0
+                        );
+          var СуммаОкругления2 = VS_Convert(TaxSum, ДатаПогашения, S.Cur, NATCUR) -  СуммаНалогаДоОкругления(RateVal);
+          if (abs(СуммаОкругления2) > 0)
+            ПроводкаОкругления(СуммаОкругления2, TaxSum, pt_cntr, bnr, leg, ДатаПогашения, ПолучитьКодФинИн(leg.rec.PFI, null), НомерДокумента2);
+          end;         
+        end;
+
+        if((stat == 0) and (RestCorrTaxBalIncrByIdx.GetSum(Idx) > 0))
+          AddCorrTaxBalIncr = $0;
+          if(Кол_воВекселей == (numOrd+1))
+            AddCorrTaxBalIncr = RestCorrTaxBalIncrByIdx.GetSum(Idx);
+          else
+            if(Сп != 0)
+              AddCorrTaxBalIncr = money(round(CorrTaxBalIncrByIdx.GetSum(Idx) * (lnk.rec.BCCost / Сп), 0));
+            end;
+          end;
+
+          AddCorrTaxBalIncr = min(RestCorrTaxBalIncrByIdx.GetSum(Idx),AddCorrTaxBalIncr);
+
+          RestCorrTaxBalIncrByIdx.MinusSum(Idx, AddCorrTaxBalIncr);
+
+          ПолнаяСуммаНалога = ПолнаяСуммаНалога + AddCorrTaxBalIncr;
+
+          if(AddCorrTaxBalIncr > 0)
+            stat = IIF (
+                           Проводка(accountSender, accountReceiver, VS_Convert(AddCorrTaxBalIncr, ДатаПогашения, NATCUR, ВалУч),
+                                    "Доудержание НДФЛ КБК = *"+substr(Idx, 7, 5)+"* по " + pt_cntr.rec.Name,
+                                null, null,
+                                ВалУч, null, null,
+                                ДатаПогашения, null,
+                                    2, null, null, null, null, ОтключениеПереоценки),
+                       1,
+                       0
+                       );
+          end;
+        end;
+
+        if((stat == 0) and (TaxSum != 0))
+          if (stat == 0)
+            stat = СоздатьНДР_PaidGeneral_ByRate(ДатаПогашения, RateVal, pt_cntr, СуммаНалогаДоОкругления(RateVal), order, VS_CurrIDOperation, VS_CurrIDStep  )
+          end;
+          if ((RateVal == 15) and (stat == 0))
+            stat = СоздатьНДР_PaidGeneral_15(ДатаПогашения, pt_cntr, СуммаНалогаДоОкругления(RateVal), order, VS_CurrIDOperation, VS_CurrIDStep, NATCUR  );
+          end;
+        end;
+      end;
+    end;
+  end;
+
+  var prevRate = 0;
+  for (cKBK, IncrKBKArr)
+    var curSum = СуммаНалогаIncrByIdx.GetSum(cKBK.Value);
+    if (prevRate == cKBK.Value)
+      //если мы опять идём по этой же ставке, то сумму налога зануляем, т.к. всё сумму обрабатываем на первом шаге
+      curSum = $0;
+    end;
+    MakeIncrCarryAndNDR(curSum,S.Cur,S.IsReverse,cKBK.Key,cKBK.Value);
+    prevRate = cKBK.Value;
+  end;
+
+  return stat;
+END;
+
+PRIVATE MACRO ИницВекс(bnr, leg, emi, order, numOrd, lnk)
+var stat = 0;
+   Кол_воВекселей = Кол_воВекселей + 1;
+   if (Кол_воВекселей == 1)
+     Вексель = bnr;
+   end;
+   Сп = Сп + lnk.rec.BCCost;
+   return stat;
+END;
+
+PRIVATE MACRO КолвоВекс()
+  var stat = 0;
+  Сп = 0.0 ; /*Сумма погашения */
+  Кол_воВекселей =0;
+  stat = ДляКаждогоВекселя(ДогПогашения, @ИницВекс,VSORDLNK_K_DRAW, null, "B");
+  return stat;
+END;
+
+/* Налог всегда берется с транзита
+*/
+PRIVATE MACRO NeedTaxAtion(СуммаНалога:@MoneyL)
+    if(TestTaxAtion(@СуммаНалога))
+       УдержатьНалог = true;
+       if(not VS_IsSplinter())
+          ЧерезТранзит =  true;
+       end;
+    end;
+    return true;
+END;
+
+/* Конверсия всегда проводится через транзит
+*/
+PRIVATE MACRO TestMultyCurrency()
+var
+    paym;
+
+    if(not VS_IsSplinter())
+       Paym = VS_FindOrderPaym(PM_PURP_VEKSELDRAW);
+       if (Paym.PayerFIID != Paym.ReceiverFIID)
+         ЧерезТранзит = true;
+       end;
+    end;
+
+    return true;
+END;
+
+/* Обработать Платеж По Задолженности
+*/
+PRIVATE MACRO LookAccountsInDebtPaym()
+var
+    Paym = VS_FindOrderPaym(PM_PURP_PAY_DEBT),
+    stat = 0,
+    acc;
+
+   if (not Paym)
+    return true; /* этот платеж может отсутствовать */
+   end;
+
+   ЧерезТранзит = true;
+   if(Paym.PayerAccount == "")
+      if(not ПолучитьСчетВекселя("-Расчеты", ДогПД, acc, MC_OPENACC_CREATE, Paym.ReceiverFIID, null, ДатаПогашения))
+         stat = 1;
+         return false;
+      elif(acc == "")
+         stat = Ошибка("Не задан счет плательщика",
+                       "|для оплаты задолженности ", ДогПогашения.ContractID);
+      else
+         Paym.SetPayerAccount( Paym.PayerFIID, 1, acc );
+      end;
+   end;
+
+   if(Paym.ReceiverAccount == "")
+      if(not ПолучитьСчетВекселя("-Расчеты внутренние", ДогПД, acc, MC_OPENACC_CREATE, Paym.ReceiverFIID, null, ДатаПогашения))
+         stat = 1;
+         return false;
+      elif(acc == "")
+         stat = Ошибка("Не задан счет получателя",
+                       "|для оплаты задолженности", ДогПогашения.ContractID);
+      else
+         Paym.SetReceiverAccount( Paym.ReceiverFIID, 1, acc );
+      end;
+   end;
+
+   Paym.MyActuate(true);
+
+   if(not SetGroundInPay(Paym))
+       stat = 1;
+   end;
+
+   if(stat != 0)
+      msgbox("Ошибка при выполненнии|инициализации шага");
+   end;
+
+   return (stat == 0);
+END;
+
+/* Определяет: через транзит пойдут проводки или нет.
+   Выполняется, если погашаются векселя нашего филиала.
+*/
+PRIVATE MACRO TestTransitFlagForOurBanners(order)
+var
+   otype = ValType(order), ContrDepartment, OrderDepartment, Flag1;
+
+   if(otype == V_GENOBJ)
+      ContrDepartment = order.rec.ContrDepartment;
+      OrderDepartment = order.rec.Department;
+      Flag1 = order.rec.Flag1;
+   else
+      ContrDepartment = order.ContrDepartment;
+      OrderDepartment = order.Department;
+      Flag1 = order.Flag1;
+   end;
+
+    if((not VS_IsSplinter()) AND ((ContrDepartment == OrderDepartment) OR (Flag1 == "")))
+        ЧерезТранзит = true;
+    end;
+    return true;
+END;
+
+/* Инициализация первичного документа векселя
+*/
+PRIVATE MACRO doInitBnrFD(bnr, leg, emi, order, numOrd, lnk, fd:@variant)
+   fd = VSBannerFD(bnr, leg);
+   return 1; /* достаточно одной итерации */
+END;
+
+/* Инициализация первичного документа векселя
+*/
+PRIVATE MACRO InitBnrFD(order, fd:@variant)
+    ДляКаждогоВекселя(order, @doInitBnrFD, VSORDLNK_K_DRAW, @fd, "BL");
+    return true;
+END;
+
+/*  1. Инициализация
+*/
+MACRO Инициализация(order, ЧТ:@bool, СВ:@string, Дата)
+var
+    СуммаНалога = MoneyL(0),
+    stat = 0;
+
+   Кол_воВекселей = 0;
+   ЧерезТранзит = false;
+   Счет_Векселя = "";            /* начальная инициализация */
+   УдержатьНалог = false;
+   ДогПогашения = order;
+   ЧерезТранзит = ЧТ;
+   Счет_Векселя = СВ;
+   ПоУмолчанию(Дата, {curdate});
+   ДатаПогашения = Дата;
+
+   ДогПД = VSOrderFD(ДогПогашения);
+
+   if(not VS_CheckWorkMode_INTEGRATED(@ИнтегрРежимРаботы))
+      return false;
+   end;
+
+   if(КолвоВекс())
+       stat = Ошибка("По договору нет|ни одного векселя|для оплаты");
+   elif(not InitBnrFD(order, @ВексПД))
+       stat = Ошибка("Ошибка инициализации первичного документа векселя");
+   elif(ПолучитьСубъекта(order.Contractor, pt_cntr))
+       stat = Ошибка("Не найден контрагент по договору");
+   elif(not ЗаполнитьСписокПланПлатежей(order))
+       stat = Ошибка("Ошибка при заполнении списка платежей");
+   end;
+
+   if(stat != 0)
+       /* уже ошибка */
+   elif(not NeedTaxAtion(@СуммаНалога))          /* Необходимость удержания налога ? */
+       stat = 1;
+   elif(not TestMultyCurrency())                 /* Конверсия всегда проводится через транзит */
+       stat = 1;
+   elif(not LookAccountsInDebtPaym())            /* Обработать платеж по задолженности */
+       stat = 1;
+   elif(not TestTransitFlagForOurBanners(order)) /* Если погашаем векселя нашего филиала */
+       stat = 1;
+   elif(not LookAccountsInDrawPaym(order))       /* Обработать платёж по погашению (счета плательщика-получателя) */
+       stat = 1;
+   end;
+
+   ЧТ = ЧерезТранзит;
+   СВ = Счет_Векселя;
+
+   return (stat == 0);
+END;
+
+/* 2.1.5. Выплата %%
+/
+PRIVATE MACRO ВыплатаПроцентов(Сумма)
+var stat=0;
+   if(not isPc)
+     ;// ничего не делаем - вексель не процентный
+   elif(Сумма==0)
+     ;// ничего не делаем - сумма нулевая
+   elif(Сумма<0)
+     ;//ничего не делаем - сумма отрицательная
+   elif (not InsertPcPay( СчетПроц.rec.AutoKey,
+                          ЦУ.rec.Maturity, ДатаПодписания, Сумма))
+      stat=Ошибка("Ошибка при выполнении проводки",
+                  "|по отнесению %% на расходы");
+   end;
+
+   return (stat==0);
+END;*/
+
+CLASS TaxClass (_sum, _cur)
+VAR sum = _sum, cur = _cur;
+END;
+
+PRIVATE MACRO УменьшитьСуммуПлатежа(Paym, Tax)
+var
+    s = "",
+    old = Paym.BaseAmount,
+    new = 0.0,
+    ПолнаяСуммаНалога = Tax.Sum,
+    stat = 0,
+    ПолнаяСуммаНалогаВВалПлат = VS_Convert(ПолнаяСуммаНалога, ДатаПогашения, Tax.Cur, Paym.BaseFIID);
+
+    if(ПолнаяСуммаНалогаВВалПлат == 0.0)
+      return true;
+    end;
+
+    if (ПолнаяСуммаНалогаВВалПлат > old )
+       ПолнаяСуммаНалогаВВалПлат = ПолнаяСуммаНалогаВВалПлат - old;
+       new = 0.0;
+    else
+       new = old - ПолнаяСуммаНалогаВВалПлат;
+       ПолнаяСуммаНалогаВВалПлат = 0.0;
+    end;
+
+    if (Paym.Purpose == PM_PURP_PAY_DEBT)
+      s = String("В результате удержания налогов сумма платежа КЭО уменьшена",
+                 "|с ", old ,"до ", new,
+                 "|Продолжить выполнение операции?");
+      if( not GetTrue(true, s))
+        return false;
+      end;
+    end;
+
+    Tax.Sum = VS_Convert(ПолнаяСуммаНалога, ДатаПогашения, Paym.BaseFIID, Tax.Cur);
+
+    Paym.BaseAmount = new;
+    Paym.PayerAmount = VS_Convert(new, ДатаПогашения, Paym.BaseFIID, Paym.PayerFIID);
+    Paym.ReceiverAmount = VS_Convert(new, ДатаПогашения, Paym.BaseFIID, Paym.ReceiverFIID);
+    Paym.FutureBaseAmount = new; //Simanov. Без этой строки не всегда обновляются суммы future* в платеже
+
+    Paym.Actuate();
+    Paym.ActuateFutureAmounts(TBA_AMOUNT);
+
+    return (stat == 0)
+END;
+
+/* Окончательная обработка платежа
+*/
+PRIVATE MACRO СформироватьПлатеж(Paym, Tax)
+var
+     stat = 0;
+
+     if (Paym.ReceiverAmount == 0)  /* платеж нулевой */
+       ;
+     elif((Paym.Purpose != PM_PURP_VEKSELDRAW) AND (Paym.Purpose != PM_PURP_PAY_DEBT))
+       ;/* неизвестные нам платежи - не обрабатываем */
+     elif(not УменьшитьСуммуПлатежа(Paym, Tax))
+       stat = 1;
+     elif(not ЗавершитьФормированиеПлатежа(Paym, String("Конвертация валют")))
+       stat = 1;
+     end;
+
+     return stat;
+END;
+
+/* Выполняется удержание налога с дохода по всем векселям договора.
+   Возвращает совокупную сумму налога с дохода,
+   выплачиваемого по всем векселям договора
+*/
+MACRO УдержатьНалоги(ПолнаяСуммаНалога:@money, ВалНалога:@variant, order)
+var stat = 0;
+
+  if (not УдержатьНалог)
+    return true;
+  end;
+
+  if(ValType(ВалНалога) == V_UNDEF)
+    ВалНалога = NATCUR;
+  end;
+
+  var signDate;
+
+  if(ValType(order) == V_GENOBJ)
+    signDate = order.rec.Signdate;
+  else
+    signDate = order.Signdate;
+  end;
+
+  if (IsUseProgressScale(order.Signdate))
+    stat = ДляКаждогоВекселя(ДогПогашения, @ВыполнитьУдержаниеНалогаPRGS, VSORDLNK_K_DRAW, @ПолнаяСуммаНалога,"BL");
+  else
+    stat = ДляКаждогоВекселя(ДогПогашения, @ВыполнитьУдержаниеНалога, VSORDLNK_K_DRAW, @ПолнаяСуммаНалога,"BL");
+  end;
+
+  if (IsUseNewNOB(order.Signdate) and (stat == 0))
+    stat = CalcAndInsertNDR_VekselPRGS(order);
+  end;
+
+//  ВалНалога = ВалютаНоминала;
+
+  return (stat == 0);
+END;
+
+/*  6-7. Производит изменение планового платежа на фактический
+         Если получатель платежа является клиентом нашего банка,
+         то также производит и проводку.
+*/
+PRIVATE MACRO СформироватьПлатежи(ПолнаяСуммаНалога:@money, ВалНалога)
+var
+     ordPayms = VS_GetOrderPayms(),
+     Tax = TaxClass(ПолнаяСуммаНалога, ВалНалога),
+     stat = 0;
+
+     stat = ordPayms.ForEach(@СформироватьПлатеж, Tax);
+
+     return (stat == 0);
+END;
+
+/* Взимает налог и выполняет формирование платежа
+     при включенной настройке "разбивка исходящих платежей при выкупе/погашении".
+*/
+PRIVATE MACRO SplinterPmBkps(bnr, leg, emi, order, numOrd, lnk, ПолнаяСуммаНалога:@money)
+var
+    Paym, Tax, fd,
+    СуммаНалога = MoneyL(0), ВалНалога = NATCUR,
+    Счет = "", stat = 0, SumSeparate = false;
+    var pnpc, pndc, isperc_ground = "";
+
+    SumSeparate = VS_IsSumSeparation();
+
+    if (УдержатьНалог)
+       var signDate;
+       if(ValType(order) == V_GENOBJ)
+         signDate = order.rec.Signdate;
+       else
+         signDate = order.Signdate;
+       end;
+       if (IsUseProgressScale(order.Signdate))
+         stat = ВыполнитьУдержаниеНалогаPRGS(bnr, leg, emi, order, numOrd, lnk, @СуммаНалога);
+       else
+         stat = ВыполнитьУдержаниеНалога(bnr, leg, emi, order, numOrd, lnk, @СуммаНалога);
+       end;
+
+       if(stat != 0)
+          return stat;
+       end;
+    end;
+
+    ПолнаяСуммаНалога = ПолнаяСуммаНалога + СуммаНалога;
+
+    if((fd = VSBannerFD(bnr, leg)) == null)
+       stat = 1;
+       return stat;
+    elif (not ПолучитьСчетВекселя("СВексель к исполнению", fd, Счет, MC_OPENACC_CREATE, null, null, ДатаПогашения))
+       stat = 1;
+       return stat;
+    else
+       // при разбивке исх.платежей нужный платеж по векселю приходится искать через счет к исполнению
+       Paym = VS_FindOrderPaym(PM_PURP_VEKSELDRAW, Счет );
+
+       if (ВексельПроцентный(fd.GetLeg()))
+         isperc_ground = "и процентов ";
+       end;
+
+       Paym.Ground = "Погашение векселя " + isperc_ground + Trim(bnr.rec.IssuerName) + " серия " + Trim(bnr.rec.BCSeries) + " номер " + Trim(bnr.rec.BCNumber) + ".";
+
+       if (СуммаНалога != 0)
+         Paym.Ground = Paym.Ground + " Удержан подоходный налог в сумме " + СуммаНалога + " руб.";
+       end;
+       Paym.Ground = Paym.Ground + " НДС не облагается.";
+
+      /*создаём платежи "пристёгнутые" к основному с суммами равными тому,
+        что набралось на счетах учета в результате всяких проводок по переносу
+        на счет "к исполнению" */
+      if ( SumSeparate == true )
+        pnpc = MyRsbPayment();
+        pndc = MyRsbPayment();
+
+        СоздатьПлатежПоРазбивкеСумм(bnr, leg, pnpc, Paym, "Обяз%, СВексель к исп.");
+        СоздатьПлатежПоРазбивкеСумм(bnr, leg, pndc, Paym, "Дисконт, СВексель к исп.");
+
+        Paym.LinkPayment(pnpc, PMLINK_KIND_RECALL);
+        pnpc.PaymStatus = PM_FINISHED;
+        Paym.LinkPayment(pndc, PMLINK_KIND_RECALL);
+        pndc.PaymStatus = PM_FINISHED;
+      end;
+
+    end;
+
+    if (not Paym)
+       msgbox("Не найден платеж",
+              "|назначение ", PM_PURP_VEKSELDRAW,
+              "|договор ", ДогПогашения.ContractID,
+              "|DocKind ", ДогПогашения.DocKind);
+       stat = 1;
+       return stat;
+    end;
+
+    Tax = TaxClass(СуммаНалога, ВалНалога);
+    stat = СформироватьПлатеж(Paym, Tax);
+
+    if ( SumSeparate == true )
+      if ( pnpc )
+      УменьшитьСуммуПлатежа(pnpc, Tax);
+        ЗавершитьФормированиеПлатежа(pnpc, String("Конвертация валют"));
+      end;
+      if ( pndc )
+        ЗавершитьФормированиеПлатежа(pndc, String("Конвертация валют"));
+      end;
+      ЗавершитьФормированиеПлатежа(Paym, String("Конвертация валют"));
+    else
+      //stat = СформироватьПлатеж(Paym, Tax); //Simanov. Задваивается платёж. Платеж формируются в СформироватьПлатежи()
+    end;
+
+    return stat;
+END;
+
+/*  Удержать налоги и выполнить проводку по платежу
+*/
+MACRO DoTaxAndPmBkps(order)
+var
+    splinter = false, ПолнаяСуммаНалога = 0.0, ВалНалога = NATCUR, stat = 0,
+    ContrDepartment, otype = ValType(order), OrderDepartment, Сумма_ProcBill = 0, Contractor,
+    CalcDueTax = RepAmountAndTax(), AmountIncome = RepAmountAndTax();
+    Sum2_all = 0;
+    S_Tax15 = 0;
+    S_Tax13 = 0;
+
+    var ДогПД = VSOrderFD(order);
+    var ВалНалогаНДР = ДогПД.GetParametr(MC_TYPE_PARAMETR_PAYCURRENCY);
+
+    if(otype == V_GENOBJ)
+      ContrDepartment = order.rec.ContrDepartment;
+      OrderDepartment = order.rec.Department;
+    else
+      ContrDepartment = order.ContrDepartment;
+      OrderDepartment = order.Department;
+    end;
+
+    ClearGTT_DNPTXOBJ_TMP();
+
+    if (IsUseProgressScale(order.Signdate))
+      stat = СоздатьНДРКоррБал_ПРГС(order.DocKind, order.ContractID, order.Contractor, VS_CurrIDOperation, VS_CurrIDStep);
+      if (not stat)
+        var errStr;
+        stat = УчестьКоррБалНДФЛ_ПРГС_Векс(ДогПД, order.ordernumber, order.DocKind, order.ContractID, order.Contractor, order.Signdate, @GlobalAddTaxeArr, @errStr);
+      end;
+    end;
+
+    if(not VS_GetRegistryValue("ВЕКСЕЛЯ БАНКА\\РЕЖИМ РАБОТЫ\\РАЗБИВКА ИСХ.ПЛАТЕЖЕЙ ПРИ ПОГАШ", V_BOOL, @splinter))
+       stat = 1;
+    elif((not splinter) /*OR (ContrDepartment != OrderDepartment)*/) //Simanov. Проверка не нужна, т.к. все проводки формируются через ГО
+       if(not УдержатьНалоги(@ПолнаяСуммаНалога, @ВалНалога, order))
+          stat = 1;
+       elif(not СформироватьПлатежи(@ПолнаяСуммаНалога, ВалНалога))
+          stat = 1;
+       end;
+    else
+       stat = ДляКаждогоВекселя(ДогПогашения, @SplinterPmBkps, VSORDLNK_K_DRAW, @ПолнаяСуммаНалога);
+       if (IsUseNewNOB(order.Signdate) and (stat == 0))
+         stat = CalcAndInsertNDR_VekselPRGS(order);
+       end;
+    end;
+
+    if(IsNoNDLFOpr(ДогПогашения.CONTRACTID)) return (stat == 0); end;
+
+    var налогВВалютеНДР = VS_Convert(ПолнаяСуммаНалога, ДатаПогашения, NATCUR, ВалНалогаНДР);
+
+    var ndrKind = FilterMakeNDRObj(pt_cntr);
+
+    if ((stat == 0) and (ndrKind == OBJ_JUR_KND))
+      if (VS_GetCalcTax(order, @CalcDueTax))
+        stat = СоздатьНДР_DueTax(ДатаПогашения, pt_cntr, CalcDueTax.Amount, order, VS_CurrIDOperation, VS_CurrIDStep, CalcDueTax.Cur );
+      end;
+      if (VS_GetIncome(order, @AmountIncome))
+        stat = СоздатьНДР_Plus_11(ДатаПогашения, pt_cntr, AmountIncome.Amount, order, VS_CurrIDOperation, VS_CurrIDStep, AmountIncome.Cur );
+      end;
+    end;
+
+    if (stat == 0)
+      stat = СоздатьНДР_PaidTax(ДатаПогашения, pt_cntr, налогВВалютеНДР, order, VS_CurrIDOperation, VS_CurrIDStep, ВалНалогаНДР );
+    end;
+
+    /*для ProcBill проводки не нужны. выполняем "наверху"*/
+    var paramsArr = TArray();
+    paramsArr[0] = Сумма_ProcBill;
+    paramsArr[1] = ДатаПогашения;
+    paramsArr[2] = VS_CurrIDOperation;
+    paramsArr[3] = VS_CurrIDStep;
+
+    if (stat == 0)
+      stat = ДляКаждогоВекселя(ДогПогашения, @CreateНДР_ProcBill, VSORDLNK_K_DRAW, paramsArr );
+      Сумма_ProcBill = paramsArr[0];
+    end;
+
+    if (stat == 0)
+      stat = СоздатьНДР_PlusG_2800(ДатаПогашения, pt_cntr, Сумма_ProcBill, order, VS_CurrIDOperation, VS_CurrIDStep );
+    end;
+    if (stat == 0)
+      stat = СоздатьНДР_BaseBill(ДатаПогашения, pt_cntr, Сумма_ProcBill, order, VS_CurrIDOperation, VS_CurrIDStep );
+    end;
+    if (stat == 0)
+      stat = СоздатьНДР_BaseG2_NewNob(ДатаПогашения, pt_cntr, Сумма_ProcBill, order, VS_CurrIDOperation, VS_CurrIDStep );
+    end;
+    if (stat == 0)
+      stat = СоздатьНДР_BaseGeneral_NewNob(ДатаПогашения, pt_cntr, Сумма_ProcBill, order, VS_CurrIDOperation, VS_CurrIDStep );
+    end;
+    if((stat == 0) and (not IsUseProgressScale(order.Signdate)))
+      stat = СоздатьНДРКоррБал(order.DocKind, order.ContractID, order.Contractor, VS_CurrIDOperation, VS_CurrIDStep);
+    end;
+
+    return (stat == 0);
+end;
+
+MACRO ПроводкиПоНалогам(order, Дата)
+var
+    СуммаНалога = MoneyL(0),
+    stat = 0;
+
+   Кол_воВекселей = 0;
+   ЧерезТранзит = false;
+   Счет_Векселя = "";            /* начальная инициализация */
+   УдержатьНалог = false;
+   ДогПогашения = order;
+   ПоУмолчанию(Дата, {curdate});
+   ДатаПогашения = Дата;
+
+   ДогПД = VSOrderFD(ДогПогашения);
+
+   if(not VS_CheckWorkMode_INTEGRATED(@ИнтегрРежимРаботы))
+      return false;
+   end;
+
+   if(КолвоВекс())
+       stat = Ошибка("По договору нет|ни одного векселя|для оплаты");
+   elif(not InitBnrFD(order, @ВексПД))
+       stat = Ошибка("Ошибка инициализации первичного документа векселя");
+   elif(ПолучитьСубъекта(order.Contractor, pt_cntr))
+       stat = Ошибка("Не найден контрагент по договору");
+   elif(not ЗаполнитьСписокПланПлатежей(order))
+       stat = Ошибка("Ошибка при заполнении списка платежей");
+   end;
+
+   if(stat != 0)
+       /* уже ошибка */
+   elif(not NeedTaxAtion(@СуммаНалога))          /* Необходимость удержания налога ? */
+       stat = 1;
+   elif(not DoTaxAndPmBkps(order))                 /* Конверсия всегда проводится через транзит */
+       stat = 1;
+   end;
+
+
+   return (stat == 0);
+END;
+
+

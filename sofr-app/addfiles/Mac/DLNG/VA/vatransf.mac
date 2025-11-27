@@ -1,0 +1,318 @@
+/*
+$Name:         vatransf.mac
+$Module:       Учтенные векселя
+$Description:  Переносить по срокам? (#71019)
+*/
+
+/*──────────────────────────────────────────────────────────────────────────┐
+  RS-Bank 6.0                                          R-Style Software Lab
+
+  File Name   : vatransf.mac
+
+  Comment     : Переносить по срокам? (#71019)
+└───────────────────────────────────────────────────────────────────────────*/
+IMPORT InsCarryDoc, CTInter, dltransf, 
+       vaacc, vabart, vabuy, vaopr, vapaym, vaxutils, vatickfd;
+
+private const _MaxDate = Date(31,12,9999);
+
+
+/* Группирует векселя по валютам номинала.
+*/
+PRIVATE MACRO GetAnyPFI(bnr, leg, tick, numOrd, lnk, pfi:@variant)
+   pfi = leg.rec.PFI;
+   return 1;
+END;
+
+// Определяет валюту срочного счета
+private macro GetCurrAccFIID(tick, FIRole)
+var ВалРасчетов = -1, BAiFI = -1, CAiFI = -1, IsDiffPayExists, tickfd,
+    buy       = VA_IsBuy(tick.DealType), 
+    sale      = VA_IsSale(tick.DealType), 
+    barter    = VA_IsExchange(tick.DealType); 
+
+   if(((buy) and (FIRole == FIROLE_FICOM)) or
+        ((sale) and (FIRole == FIROLE_FIREQ)))
+      if(VA_GetPayFIID(tick, CAi, @ВалРасчетов)) // вернуть валюту расчетов
+         return ВалРасчетов;
+      end;
+   elif(((buy) and (FIRole == FIROLE_FICOM)) or
+        ((sale) and (FIRole == FIROLE_FIREQ)))
+      VA_ForEachBanner(tick, @GetAnyPFI, null, @BAiFI, "L"); // вернуть валюту номинала любого векселя 
+      // т.к. здесь валюта нам нужна не для открытия счетов, 
+      // а для определеня даты след. переноса по срокам, 
+      // то нет необходимости получать валюты номинала всех векселей
+      return BAiFI;
+   elif(barter)
+      tickfd = VATickFD(tick);
+      if(FIRole == FIROLE_FIREQ)
+         return ПолучитьВУПолучаемыхЦБВМене(tick);
+      elif(FIRole == FIROLE_FICOM)
+         return ПолучитьВУПередаваемыхЦБВМене(tick);
+      elif((FIRole == FIROLE_FIBARTERDIFF) and (tickFd.GetBartDiffSum()))
+         return tickfd.GetDealPayFI();
+      end;
+   end;
+   
+   return -1;
+end;
+
+/* Возвращает:
+    - текущий период для счета по категории (в Period).
+    - очередной период для счета по категории (в PrevPeriod).
+    - верхнюю границу очередного периода срочности (в PrevDate).
+*/
+PRIVATE MACRO VA_GetPeriod(tick, Categ, FIRole, ActionDate, Period, StepDate, PrevDate:@variant, PrevPeriod)
+var
+   stat = 0, /*acnt,*/ fd, FIID;
+//   record AccBuf(account);
+
+   if((fd = VATickFD(tick)) == null);
+      stat = VA_Err("Ошибка при определении первичного документа сделки");
+//   elif(not VA_GetAccount(Categ, fd, acnt, MC_OPENACC_CREATE, null, FIRole, AccBuf, ActionDate))
+//     stat = 1;
+   else
+      FIID = GetCurrAccFIID(tick, FIRole);
+      stat = MC_GetPeriodForCurrAcc(Categ, 
+                                    tick.BofficeKind, tick.DealID, 
+                                    FIRole, FIID,//AccBuf.Code_Currency, 
+                                    MC_PERIOD_PREV, false, PrevPeriod,
+                                    fd.GetParametr(MC_TYPE_PARAMETR_DEPARTMENT));
+      PrevDate = MC_CalcPeriodBound(StepDate, PrevPeriod, false);
+      stat = MC_GetPeriodForCurrAcc(Categ, 
+                                    tick.BofficeKind, tick.DealID, 
+                                    FIRole, FIID,//AccBuf.Code_Currency, 
+                                    MC_PERIOD_CURR, false, Period,
+                                    fd.GetParametr(MC_TYPE_PARAMETR_DEPARTMENT));
+   end;
+
+   return (stat == 0);
+END;  
+
+
+//-------------------------------------------------------------------------
+// Определить, кто является плательщиком платежа по оплате разницы 
+//   в мене - наш банк или контрагент.
+private macro CheckDiffPayer(DocKind, DocID, Purpose, IsDiffPayerOurBank:@bool)
+var DataSet = TRsbDataSet("SELECT t_Payer FROM dpmpaym_dbt " +
+        " WHERE t_DocKind = " + DocKind + " and t_DocumentID = " + DocID +
+            " and t_Purpose = " + Purpose + " and t_IsPlanPaym = 'X'");
+    if(DataSet.MoveNext())  // нашли свой платеж
+       IsDiffPayerOurBank = (DataSet.Payer == {OurBank});
+       return true;
+    end;
+
+    VA_Err("Не найден платеж по оплате разницы");
+    return false;
+END;
+
+//--------------------------------------------------------------------------
+// Алгоритм поиска ActionDate для покупки, продажи и мены
+private macro FindActionDate(tick, StepDate, PrevPeriod, ActionDate, NeedTransf, RegDate)
+var Endp1Date, Endp2Date, Endp3Date,
+    DealDate, DiffDate,
+    D_MoveReq, D_MoveCom, D_MoveDiff,
+    SupplyDate, PayDate;
+
+var IsDiffPayExists = false,
+    IsDiffPayerOurBank = false;
+
+   record Period("mcperiod");
+   record ComPrevPeriod("mcperiod"); // очередной период срочности обязательств
+   record ReqPrevPeriod("mcperiod"); // .......................... требований
+   record DiffPrevPeriod("mcperiod"); // .......................... доплаты в мене
+
+   DiffDate = date(0,0,0);
+   D_MoveDiff = date(0,0,0);
+
+   ActionDate = Date(0,0,0);
+   NeedTransf = true;
+
+   DealDate = tick.DealDate;
+
+   if(not VA_GetPeriod(tick, "+Форвард, дрейф", FIROLE_FIREQ, DealDate, Period, StepDate, @Endp1Date, ReqPrevPeriod))
+      return 1; /* ошибка */
+   elif(Period.Number == 1)
+      /* Нет */
+      NeedTransf = false;
+      return 0;   /* снятие сделки с внебалансового учета */
+   elif(not VA_GetPeriod(tick, "-Форвард, дрейф", FIROLE_FICOM, DealDate, Period, StepDate, @Endp2Date, ComPrevPeriod))
+      return 1; /* ошибка */
+   elif(Period.Number == 1)
+      /* Нет */
+      NeedTransf = false;
+      return 0;   /* снятие сделки с внебалансового учета */
+   end;
+
+   if(VA_IsExchange(tick.DealType)) // мена
+      GetOprDate( DATE_BART_NEW, SupplyDate );
+      GetOprDate( DATE_BART_OLD, PayDate );
+      GetOprDate( DATE_BART_REG, RegDate ); /* Дата учета */
+      if(VA_GetPM_ValueDate(tick.BofficeKind, tick.DealID, PM_PURP_VSBARTERDIFF, @DiffDate))
+         IsDiffPayExists = true;
+         if(not CheckDiffPayer(tick.BofficeKind, tick.DealID, PM_PURP_VSBARTERDIFF, @IsDiffPayerOurBank))
+            return 1;
+         end;
+      end;
+   elif(VA_IsSale(tick.DealType))
+      GetOprDate( DATE_SALE_REG, RegDate ); /* Дата учета */
+      GetOprDate( DATE_SALE_PAY, PayDate );
+      GetOprDate( DATE_SALE_SUPPLY, SupplyDate );
+   else
+      GetOprDate( DATE_BUY_REG, RegDate ); /* Дата учета */
+      GetOprDate( DATE_BUY_PAY, PayDate );
+      GetOprDate( DATE_BUY_SUPPLY, SupplyDate );
+   end;
+
+   if(VA_IsSale(tick.DealType))
+     D_MoveReq = StepDate + (PayDate - Endp1Date);
+     D_MoveCom = StepDate + (SupplyDate - Endp2Date);
+   else
+     D_MoveReq = StepDate + (SupplyDate - Endp1Date);
+     D_MoveCom = StepDate + (PayDate - Endp2Date);
+   end;
+
+//---------------- Для мены ----------------
+   /* Доплата */
+   if(IsDiffPayExists)
+      if(IsDiffPayerOurBank)
+         if(not VA_GetPeriod(tick, "-Форвард, дрейф", FIROLE_FIBARTERDIFF, DealDate, Period, StepDate, @Endp3Date, DiffPrevPeriod))
+            return 1; /* ошибка */
+         elif(Period.Number == 1)
+            /* Нет */
+            NeedTransf = false;
+            return 0;   /* снятие сделки с внебалансового учета */
+         end;
+      else
+         if(not VA_GetPeriod(tick, "+Форвард, дрейф", FIROLE_FIBARTERDIFF, DealDate, Period, StepDate, @Endp3Date, DiffPrevPeriod))
+            return 1; /* ошибка */
+         elif(Period.Number == 1)
+            /* Нет */
+            NeedTransf = false;
+            return 0;   /* снятие сделки с внебалансового учета */
+         end;
+      end;
+
+      D_MoveDiff = (StepDate + (DiffDate - Endp3Date));
+//      D_MoveReq = VA_MinDate(D_MoveReq, D_MoveDiff);
+      if(D_MoveDiff < D_MoveReq)
+         D_MoveReq = D_MoveDiff;
+         Copy(ReqPrevPeriod, DiffPrevPeriod);
+      end;
+   end;
+//------------------------------------------
+
+//   ActionDate = VA_MinDate(D_MoveReq, D_MoveCom);
+   if(D_MoveReq < D_MoveCom)
+      ActionDate = D_MoveReq;
+      Copy(PrevPeriod, ReqPrevPeriod);
+   else
+      ActionDate = D_MoveCom;
+      Copy(PrevPeriod, ComPrevPeriod);
+   end;
+
+   SetParm( 3, ActionDate );
+   SetParm( 4, NeedTransf );
+   SetParm( 5, RegDate );
+
+   return 0;
+end;
+
+//*****************************************************************
+// Получить дату определения срочности для переноса по срокам
+// Обобщенная ф-я GetTransferActionDate из dltransf.mac
+//    не подходит
+MACRO VA_GetTransferActionDate(tick, StepDate, ActivateDate, ActionDate, NeedTransf)
+var stat = 0, RegDate;
+
+   ActivateDate = ActionDate = Date(0,0,0);
+   NeedTransf = false;
+
+   record Period("mcperiod");
+
+   // Найдем ActionDate
+   stat = FindActionDate(tick, StepDate, Period, ActionDate, NeedTransf, RegDate);
+
+   if(stat != 0)
+      return stat;
+   elif(NeedTransf == true)
+
+      if( (GetTransferMode() == TRANSFERMODE_NO) and ((RegDate - ActionDate) < 1) )
+
+         NeedTransf = false;   // снятие сделки с внебалансового учета (#57483)
+
+      else
+
+         ActivateDate = GetTransferActivateDate( Period, ActionDate );
+
+         if( ActivateDate == Date( 0, 0, 0 ) ) /*Перенос по срокам не нужен*/ 
+            NeedTransf = false;
+         else
+            NeedTransf = true;
+         end;
+      end;
+
+   end;
+
+   SetParm( 2, ActivateDate );
+   SetParm( 3, ActionDate );
+   SetParm( 4, NeedTransf );
+
+   return 0;
+END;
+
+
+/* Действия шага выбора (В пункты 2 и 3 добавлена доплата)
+   Алгоритм:
+   1.  Если Дуч - Дс < 3 рабочих дней,  то: Выход по "Нет".
+   2.  ТекущийДиапазонСрочности = min (диапазон срочности текущего счета 
+       категории "+Форвард, дрейф" (роль "требование"); 
+       диапазон срочности текущего счета категории "-Форвард, дрейф" 
+       (роль "обязательство").
+       Если ТекущийДиапазонСрочности = 1 
+       // т.е. это самый нижний диапазон срочности,
+       то: Выход по "Нет"
+   3.  Dок_п = max (Дата окончания предыдущего периода срочности для 
+       текущего счета категории "+Форвард, дрейф" (роль "требование"), 
+       вычисленная относительно текущей даты; 
+       Дата окончания предыдущего периода срочности для текущего счета 
+       категории "-Форвард, дрейф"(роль "обязательство"), 
+       вычисленная относительно текущей даты).
+
+       Проинициализировать дату Dпер =  (Текущая дата + (Dуч - Dок_п)). 
+       Выводим ActivateDate - дату, на которую будут планироваться шаги, 
+       открываться счета и проводиться проводки - VA_GetTransferActionDate(#71019).
+
+       Выход по "Да"
+*/
+// Нужно переносить по срокам?
+// Логика шагов выбора 60 и 80 операций покупки, продажи и мены
+MACRO VA_NeedMoveByUrgency( tick, NoStep, YesStep, StepDate )
+var NeedTransf = false, ActivateDate, objVal = 2;
+
+   /* 1. */
+   if(VA_IsSale(tick.DealType)) // условие для продажи
+      GetMainObjAttr(null, OBJTYPE_VEKSELACCOUNTED, UniID(tick, OBJTYPE_VEKSELACCOUNTED), 23, null, null, @objVal);
+      if (objVal == 2)
+         return NoStep;
+      end;
+   elif(VATickFD(tick).GetUrgencyType() != СделкаНеРанееТретьегоДня)
+     /* Нет */
+     return NoStep;   // снятие сделки с внебалансового учета
+   end;
+
+   if(0 != VA_GetTransferActionDate(tick, StepDate, ActivateDate, null, NeedTransf))
+      return 1;
+   elif(not NeedTransf)
+      return NoStep;   // снятие сделки с внебалансового учета
+   end;
+
+   if(VA_IsExchange(tick.DealType)) // мена
+      DefineOprDate( DATE_BART_MOVE, ActivateDate );  // Дата переноса 
+   elif(VA_IsSale(tick.DealType)) // мена
+      DefineOprDate( DATE_SALE_MOVE,  ActivateDate );  /* Дата переноса */
+   else
+      DefineOprDate( DATE_BUY_MOVE,  ActivateDate );  /* Дата переноса */
+   end;
+   return YesStep; /*  да - перенос по срокам */
+END;  

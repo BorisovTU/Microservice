@@ -1,0 +1,695 @@
+/*
+$Name:               pmsf1.mac
+$Module:            РКО, ББ
+$Description:      Шаг      : "Единовременная комиссия - исполнение"
+*/
+
+//-----------------------------------------------------------------------------
+// Блок     : 29016  - "Предобработка клиентского платежа"
+//            29017  - "Предобработка кассового документа"
+//            
+// Шаг      : "Единовременная комиссия - исполнение"
+//-----------------------------------------------------------------------------
+
+import PaymInter, OprInter, FIInter, SFInter, oralib, likepy, cbctuncs, "pmbencom.mac", "sfbatch_lib.mac";
+
+var PaymentObj:RsbPayment;
+
+//Возможные исходы событий
+PRIVATE CONST PMSF_ACTION_OK    :integer = 0, //Ok
+              PMSF_ACTION_ERROR :integer = 1, //Возникла ошибка
+              SET_CHAR = "X";
+
+PRIVATE MACRO CheckSiCredit( sicredit:TRecHandler ):integer
+
+  var PayerDepartment:integer = -1;
+  var ReceiverDepartment:integer = -1;
+  
+  // Проверить наличие валюты в sicredit
+  if( sicredit.rec.FIID < 0 )
+    msgbox("Не задана валюта в ПИ ПЗО");
+    return PMSF_ACTION_ERROR;
+  end;
+  
+  if( (sicredit.rec.Account == "") OR
+      (NOT AccountExistOpen( sicredit.rec.FIID, sicredit.rec.Account, 1/*CHAPT1*/, ReceiverDepartment )) )
+    msgbox("Не задан получатель в ПИ ПЗО");
+    return PMSF_ACTION_ERROR;
+  end;
+  
+  // проверить, чтобы получатель ПЗО находился в нашем банке (в том же банке, что и плательщик);
+  if( (NOT AccountExistOpen( PaymentObj.ComissFIID, PaymentObj.ComissAccount, 1/*CHAPT1*/, PayerDepartment )) OR
+      (PayerDepartment != ReceiverDepartment) )
+    msgbox("При оплате комиссий проводками счет получателя комиссий должен быть в нашем банке");
+    return PMSF_ACTION_ERROR;
+  end;
+
+  return PMSF_ACTION_OK;
+END;
+
+//-----------------------------------------------------------------------------
+// Является ли субъект резидентом
+//-----------------------------------------------------------------------------
+PRIVATE MACRO IsResident( BankID )
+  private FILE fparty ( "party.dbt" );
+
+  var OldKey, result = true;
+
+  OldKey = KeyNum( fparty, 0 );
+
+  fparty.PartyId = BankID;
+
+  if( getEQ( fparty ) )
+    if( fparty.NotResident == "X" )
+      result = false;
+    end;
+  end;
+
+  keyNum( fparty, OldKey );
+
+  return result;
+END;
+
+
+PRIVATE MACRO CheckFee( action:integer, oprcom_trec ):integer
+
+  RECORD oprcom( oprsfcom );
+  Copy(oprcom, oprcom_trec);
+
+  if( action != PMSF_ACTION_OK )
+    return action;
+  end;
+
+  record contr(sfcontr);
+  if( not SfGetContr(oprcom.SfcontrID, contr ) )
+    msgbox( "Не найден договор обслуживания" );
+    return PMSF_ACTION_ERROR;
+  end;
+
+  var sfcomiss:TBFile = TBFile( "sfcomiss.dbt", "R", 0 );
+  
+  sfcomiss.rec.FeeType = oprcom.FeeType;
+  sfcomiss.rec.Number  = oprcom.CommNumber;
+  if( not sfcomiss.GetEQ() )
+    msgbox( "Не найдена комиссия" );
+    return PMSF_ACTION_ERROR;
+  end;
+
+  var siNDS   :TRecHandler = TRecHandler("sfsi.dbt");
+  var sicredit:TRecHandler = TRecHandler("sfsi.dbt");
+  
+    // Вид создаваемых платежных инструкций ПЗО
+  var kindSfSiCredit = IfThenElse( oprcom.IsIncluded == "X", CALC_SFSI_KIND   , COMISS_SFSI_KIND ); 
+  var kindSfSiNDS    = IfThenElse( oprcom.IsIncluded == "X", CALCNDS_SFSI_KIND, NDS_SFSI_KIND    );
+
+  // Получить платежные инструкции
+  if( ( not GetDefComSfSi( oprcom.feeType, oprcom.ID, kindSfSiCredit, "", NULL, NULL, NULL, sicredit ) ) or
+      ( oprcom.SumNDS != 0 and 
+        not GetDefComSfSi( oprcom.feeType, oprcom.ID, kindSfSiNDS   , "", NULL, NULL, NULL, siNDS    ) ) )
+    MsgBox("Ошибка при взятии платежных инструкций");
+    return PMSF_ACTION_ERROR;
+  end;
+  
+  var Status:integer = CheckSiCredit(sicredit);
+  if( Status != PMSF_ACTION_OK )
+    return PMSF_ACTION_ERROR;
+  end;
+
+  var NewTaxSum = oprcom.Sum, 
+      NewNDSSum = oprcom.SumNDS,
+      СуммаДебета,
+      deltaBaseAmount, deltaBaseAmountNDS;
+
+  if( oprcom.FIID_Sum != sicredit.rec.FIID )
+    if( ConvSum(NewTaxSum, oprcom.Sum, PaymentObj.ValueDate, oprcom.FIID_Sum, sicredit.rec.FIID) )
+      msgbox("Невозможно конвертировать сумму комиссии");
+      return PMSF_ACTION_ERROR;
+    end;
+    if( oprcom.SumNDS > 0 )
+      if( ConvSum(NewNDSSum, oprcom.SumNDS, PaymentObj.ValueDate, oprcom.FIID_Sum, siNDS.FIID) )
+        msgbox("Невозможно конвертировать сумму НДС");
+        return PMSF_ACTION_ERROR;
+      end;
+    end;
+  end;
+
+  var accTrn:object = NULL, accNDSTrn:object = NULL;
+
+  if( PaymentObj.ComissCharges == PM_CHRG_BEN )
+    accTrn = PaymentObj.MakeTransaction();
+    accTrn.Reason = PM_CARRY_REASON_COMISSION;
+    accTrn.Status_After    = GetPaymentCarryKind( PaymentObj );    
+  else
+    accTrn = RsbAccTransaction;
+    accTrn.Status_After    = ACCTRN_STATUS_DOCUMENT;
+  end;
+  
+  if( accTrn == NULL )
+    msgbox("Ошибка при создании проводки оплаты комиссии");
+    return PMSF_ACTION_ERROR;
+  end;
+
+  // Комиссия за перевод
+  accTrn.Chapter         = PaymentObj.Chapter;
+  accTrn.Date_Carry      = PaymentObj.ValueDate;
+  accTrn.Number_Pack     = PaymentObj.NumberPack;
+  accTrn.Numb_Document   = PaymentObj.Number;
+  accTrn.ResultCarry     = SFPAY_CARRY;
+  accTrn.Kind_Oper       = " 1";
+
+  if (PaymentObj.ShifrOper != "")
+    accTrn.Shifr_Oper      = PaymentObj.ShifrOper;
+  else
+  accTrn.Shifr_Oper      = "09";
+  end;
+
+  accTrn.Department   = PaymentObj.Department;
+  accTrn.FIIDPayer    = PaymentObj.ComissFIID;
+  accTrn.AccountPayer = PaymentObj.ComissAccount;
+
+  if( ConvSum(СуммаДебета, oprcom.Sum, PaymentObj.ValueDate, oprcom.FIID_Sum, accTrn.FIIDPayer) )
+    msgbox("Невозможно конвертировать сумму комиссии");
+    return PMSF_ACTION_ERROR;
+  end;
+  accTrn.SumPayer        = СуммаДебета;
+  accTrn.FIIDReceiver    = sicredit.rec.FIID;
+  accTrn.SumReceiver     = NewTaxSum;
+  accTrn.AccountReceiver = sicredit.rec.Account;
+  accTrn.Ground          = "Комиссия за перевод платежного поручения №" + PaymentObj.Number + " от " + PaymentObj.Date + ".";
+  if( (IsResident(PaymentObj.Payer) AND (PaymentObj.ComissFIID == 0)) OR (not IsResident(PaymentObj.Payer)) )
+    accTrn.Ground = accTrn.Ground + "{VO99020}";
+  end;
+
+  if( not accTrn.Carry )
+    msgbox("Ошибка при актуализации проводки|оплаты комиссии за перевод");
+    return PMSF_ACTION_ERROR;
+  end;
+
+  if( NewNDSSum == 0 )
+    return PMSF_ACTION_OK;
+  end;
+
+  if( PaymentObj.ComissCharges == PM_CHRG_BEN )
+    accNDSTrn = PaymentObj.MakeTransaction();
+    accNDSTrn.Reason = PM_CARRY_REASON_COMISSION;
+    accNDSTrn.Status_After    = GetPaymentCarryKind( PaymentObj );    
+  else
+    accNDSTrn = RsbAccTransaction;
+    accNDSTrn.Status_After    = ACCTRN_STATUS_DOCUMENT;
+  end;
+
+  if( accNDSTrn == NULL )
+    msgbox("Ошибка при создании проводки по переводу НДС");
+    return PMSF_ACTION_ERROR;
+  end;
+
+  // НДС по комиссии за перевод 
+  accNDSTrn.Chapter         = PaymentObj.Chapter;
+  accNDSTrn.Date_Carry      = PaymentObj.ValueDate;
+  accNDSTrn.Number_Pack     = PaymentObj.NumberPack;
+  accNDSTrn.Numb_Document   = PaymentObj.Number;
+  accNDSTrn.ResultCarry     = SFPAY_CARRY;
+  accNDSTrn.Kind_Oper       = " 1";
+
+  if (PaymentObj.ShifrOper != "")
+    accNDSTrn.Shifr_Oper      = PaymentObj.ShifrOper;
+  else
+  accNDSTrn.Shifr_Oper      = "09";
+  end;
+
+  accNDSTrn.Department      = PaymentObj.Department;
+  accNDSTrn.FIIDPayer     = PaymentObj.ComissFIID;
+  accNDSTrn.AccountPayer  = PaymentObj.ComissAccount;
+  if( ConvSum(СуммаДебета, oprcom.SumNDS, PaymentObj.ValueDate, oprcom.FIID_Sum, accNDSTrn.FIIDPayer) )
+    msgbox("Невозможно конвертировать сумму комиссии");
+    return PMSF_ACTION_ERROR;
+  end;
+  accNDSTrn.SumPayer        = СуммаДебета;
+  accNDSTrn.FIIDReceiver    = siNDS.FIID;
+  accNDSTrn.SumReceiver     = NewNDSSum;
+  accNDSTrn.AccountReceiver = siNDS.Account;
+  accNDSTrn.Ground          = "НДС по комиссии за перевод платежного поручения №" + PaymentObj.Number + " от " + PaymentObj.Date + ".";
+  if( (IsResident(PaymentObj.Payer) AND (PaymentObj.ComissFIID == 0)) OR (not IsResident(PaymentObj.Payer)) )
+    accNDSTrn.Ground = accNDSTrn.Ground + "{VO99020}";
+  end;
+
+  if( not accNDSTrn.Carry )
+    msgbox("Ошибка при актуализации проводки НДС по комиссии за перевод");
+    return PMSF_ACTION_ERROR;
+  end;
+
+  if( SfComSetState( oprcom, OPRSFCOM_STATUS_PAY ) )
+    msgbox("Ошибка при смене статуса комиссии");
+    return PMSF_ACTION_ERROR;
+  end;
+
+  return PMSF_ACTION_OK;
+END;
+
+//------------------------------------------------------------------------------
+// Макрос шага
+//------------------------------------------------------------------------------
+MACRO ExecuteStep( doc, paymDoc, DocKind:integer, ID_Operation:integer, ID_Step:integer )
+
+  var stat:bool = true;
+  var Action:integer;
+  var i:integer;
+
+  var paymtr:RsbAccTransaction;
+  var OprComList:TArray = TArray();
+  RECORD oprcom( oprsfcom );
+
+  if( (PaymentObj.ComissCharges == PM_CHRG_BEN) )
+
+    while( SfGetOperCommission(ID_Operation, ID_Step, oprcom) and (oprcom.Department == PaymentObj.Department) )
+        i = OprComList.size;
+        OprComList[i] = TRecHandler("oprsfcom.dbt");
+        Copy(OprComList[i], oprcom);
+    end;
+
+    if(PayBenFromCorr == false)
+      return PayCommisArrayBEN( OprComList, PaymentObj, PaymentObj.FuturePayerAccount, PaymentObj.FuturePayerFIID );
+    else
+      return MarkPaidCommisArrayBEN( OprComList );
+    end;
+
+  elif( PaymentObj.ComissCharges != PM_CHRG_BEN )
+
+    if( (PaymentObj.DocKind == PS_CPORDER) or (PaymentObj.DocKind == BBANK_CPORDER) )
+      // Оплата  комиссии производится штатным механизмом ПЗО
+    end;
+
+  end;
+  
+  if( stat )
+    return 0;
+  else
+    return 1;
+  end;
+
+END;
+
+/* Предтранзакционные действия */
+macro PrepMassExecuteStep() 
+  return execStoredFunc( "PM_SFSTEP.MassSFStepPrepare", V_INTEGER );
+
+onerror(x)
+  msgbox( x.Message );
+  return 1;
+end;
+
+MACRO MassExecuteStep()
+
+  var i:integer, err;
+  var PayBen:bool, PayerChargeOffSum:moneyl = 0;
+  var batchTrn:RsbBatchPaymTrn = RsbBatchPaymTrn();
+  var accTrn:object = NULL, accNDSTrn:object = NULL;
+  var NewTaxSum, NewNDSSum, СуммаДебета, deltaBaseAmount;
+  var ClaimID = 0, ClaimAmount, ClaimStatus;
+  var needNDS = false, needTRN = false;
+  var Status_After, Reason = 0;
+  var ErrorStatus = 0, ErrorMessage = "";
+  var SfDefArray:TArray = TArray();
+  var sfdef = Tbfile ("sfdef.dbt");
+
+  GetRegistryValue("PS\\CPORDER\\ORDER\\PAYBENFROMCORR", V_BOOL, PayBen, err);
+
+  var select = "select sfdef.t_FeeType/*0*/, sfdef.t_ID/*1*/, pm.t_ValueDate/*2*/, rm.t_ComissCharges/*3*/, sf_cr.t_FIID/*4*/, sf_nds.t_FIID/*5*/, " +
+               "       pm.t_Chapter/*6*/, pm.t_NumberPack/*7*/, rm.t_Number/*8*/, rm.t_ShifrOper/*9*/, pm.t_Department/*10*/, pm.t_ComissFIID/*11*/, " +
+               "       pm.t_ComissAccount/*12*/, sf_cr.t_Account/*13*/, sf_nds.t_Account/*14*/, debet.t_Group/*15*/, credit.t_Group/*16*/, " +
+               "       rm.t_Date/*17*/, pm.t_Payer/*18*/, oprtemp.t_OrderID/*19*/, oprtemp.t_ID_Operation/*20*/, oprtemp.t_ID_Step/*21*/ " +
+               "  from dsfdef_dbt sfdef, doprtemp_tmp oprtemp, dsfsi_dbt sf_cr, dsfsi_dbt sf_nds, dpmpaym_dbt pm, dpmprop_dbt debet, " +
+               "       dpmprop_dbt credit, dpmrmprop_dbt rm " +
+               "    where sfdef.t_ID_Step = oprtemp.t_ID_Step           " +
+               "      and sfdef.t_ID_Operation = oprtemp.t_ID_Operation " +
+               "      and oprtemp.t_DocKind in ( 202, 27 )              " + //:PS_CPORDER, :BBANK_CPORDER
+               "      and oprtemp.t_ErrorStatus = 0                     " +
+               "      and sf_cr.t_ObjectType = 665                        " + //:OBJTYPE_OPRSFCOM 
+               "      and sf_cr.t_ObjectID =  lpad( sfdef.t_ID, 10, '0' ) " +
+               "      and sf_cr.t_DebetCredit = decode( sfdef.t_IsIncluded, 'X', 2, 1 ) " + //CALC_SFSI_KIND, COMISS_SFSI_KIND
+               "      and sf_nds.t_ObjectType = 665 " + //:OBJTYPE_OPRSFCOM 
+               "      and sf_nds.t_ObjectID = lpad( sfdef.t_ID, 10, '0' ) " +
+               "      and sf_nds.t_DebetCredit = decode( sfdef.t_SumNDS, 0, sf_cr.t_DebetCredit, decode( sfdef.t_IsIncluded, 'X', 3, 5 ) ) " + //CALCNDS_SFSI_KIND, NDS_SFSI_KIND
+               "      and oprtemp.t_OrderID = pm.t_PaymentID  " +
+               "      and debet.t_PaymentID = pm.t_PaymentID  " +
+               "      and debet.t_DebetCredit = 0             " +
+               "      and credit.t_PaymentID = pm.t_PaymentID " +
+               "      and credit.t_DebetCredit = 1            " +
+               "      and rm.t_PaymentID = pm.t_PaymentID     ";
+
+  VAR rs:RsdRecordset = execSQLselect( select, NULL, false );
+  while( rs.MoveNext() )
+    needTRN = true; //будет необходимо исполнение проводок
+
+    i = sfdefArray.size; // для смены статуса sfdef
+    sfdefArray[i] = SfDefOpr();
+
+    ClearRecord( sfdef.rec );
+    sfdef.rec.FeeType = rs.Value(0);
+    sfdef.rec.ID = rs.Value(1);
+    sfdef.getEQ ();
+
+    Copy( sfdefArray[i].SfDef, sfdef ); // заполнение класса для смены статуса sfdef
+    sfdefArray[i].OldStatus = sfdef.rec.Status;
+    sfdefArray[i].OldIsIncluded = sfdef.rec.IsIncluded;
+    sfdefArray[i].oprID_Operation = rs.Value(20);
+    sfdefArray[i].oprID_Step = rs.Value(21);
+
+    NewTaxSum = sfdef.rec.Sum; 
+    if( sfdef.rec.SumNDS > 0 )
+      NewNDSSum = sfdef.rec.SumNDS;
+      needNDS = true;
+    end;
+
+    if( sfdef.rec.FIID_Sum != rs.Value(11) )
+      if( ConvSum(NewTaxSum, sfdef.rec.Sum, date(rs.Value(2)), sfdef.rec.FIID_Sum, rs.Value(4) ) )
+        ErrorMessage = "Невозможно конвертировать сумму комиссии";
+        ErrorStatus = 1;
+      end;
+      if( not ErrorStatus and needNDS )
+        if( ConvSum(NewNDSSum, sfdef.rec.SumNDS, date(rs.Value(2)), sfdef.rec.FIID_Sum, rs.Value(5) ) )
+          ErrorMessage = "Невозможно конвертировать сумму НДС";
+          ErrorStatus = 1;
+        end;
+      end;
+    end;
+
+    /* если внешний и несквитованный, то планируемая */
+    if( ( rs.Value(3) == PM_CHRG_BEN ) and ( 
+        ( ( rs.Value(15) == PAYMENTS_GROUP_EXTERNAL ) and ( GetOprStatus(OPR_PAYM_IN_KVIT ) == OPR_PM_ST_UNKVIT ) ) or    
+        ( ( rs.Value(16) == PAYMENTS_GROUP_EXTERNAL ) and ( GetOprStatus(OPR_PAYM_OUT_KVIT) == OPR_PM_ST_UNKVIT ) ) ) )
+      Status_After = ACCTRN_STATUS_PLAN;
+    else
+      Status_After = ACCTRN_STATUS_DOCUMENT;
+    end;
+
+    if( not ErrorStatus and PayBen )  // PS\\CPORDER\\ORDER\\PAYBENFROMCORR = true
+      if( rs.Value(3) == PM_CHRG_BEN )
+        accTrn = RsbAccTransactionData();
+        Reason = PM_CARRY_REASON_COMISSION;
+        if( needNDS )
+          accNDSTrn = RsbAccTransactionData();
+          Reason = PM_CARRY_REASON_COMISSION;
+        end;
+      else
+        accTrn = RsbAccTransaction;
+        Reason = PM_CARRY_REASON_UNKNOWN;
+        if( needNDS )
+          accNDSTrn = RsbAccTransaction;
+          Reason = PM_CARRY_REASON_UNKNOWN;
+        end;
+      end;
+
+      if( accTrn == NULL or ( needNDS and ( accNDSTrn == NULL ) ) )
+        ErrorMessage = "Ошибка при создании проводки оплаты комиссии";
+        ErrorStatus = 1;
+      end;
+
+      if( not ErrorStatus )
+        // Комиссия за перевод
+        accTrn.Chapter         = rs.Value(6);
+        accTrn.Date_Carry      = rs.Value(2);
+        accTrn.Number_Pack     = rs.Value(7);
+        accTrn.Numb_Document   = rs.Value(8);
+        accTrn.ResultCarry     = SFPAY_CARRY;
+        accTrn.Kind_Oper       = " 1";
+
+        if( needNDS )
+          accNDSTrn.Chapter       = rs.Value(6);
+          accNDSTrn.Date_Carry    = date(rs.Value(2));
+          accNDSTrn.Number_Pack   = rs.Value(7);
+          accNDSTrn.Numb_Document = rs.Value(8);
+          accNDSTrn.ResultCarry   = SFPAY_CARRY;
+          accNDSTrn.Kind_Oper     = " 1";
+        end;
+  
+        if( rs.Value(9) != "" )
+          accTrn.Shifr_Oper = rs.Value(9); 
+          if( needNDS )
+            accNDSTrn.Shifr_Oper = rs.Value(9);
+          end;
+        else
+          accTrn.Shifr_Oper = "09";
+          if( needNDS )
+            accNDSTrn.Shifr_Oper = "09";
+          end;
+        end;
+
+        accTrn.Department   = rs.Value(10);
+        accTrn.FIIDPayer    = rs.Value(11);
+        accTrn.AccountPayer = rs.Value(12);
+
+        if( needNDS )
+          accNDSTrn.Department   = rs.Value(10);
+          accNDSTrn.FIIDPayer    = rs.Value(11);
+          accNDSTrn.AccountPayer = rs.Value(12);
+        end;
+
+        if( ConvSum(СуммаДебета, sfdef.rec.Sum, date(rs.Value(2)), sfdef.rec.FIID_Sum, accTrn.FIIDPayer) )
+          ErrorMessage = "Невозможно конвертировать сумму комиссии";
+          ErrorStatus = 1;
+        end;
+        if( not ErrorStatus )
+          accTrn.SumPayer        = СуммаДебета;
+          accTrn.SumReceiver     = NewTaxSum;
+          accTrn.FIIDReceiver    = rs.Value(4);
+          accTrn.AccountReceiver = rs.Value(13);
+        end;
+
+        if( not ErrorStatus and needNDS )
+          if( ConvSum(СуммаДебета, sfdef.rec.SumNDS, date(rs.Value(2)), sfdef.rec.FIID_Sum, accNDSTrn.FIIDPayer) )
+            ErrorMessage = "Невозможно конвертировать сумму комиссии";
+            return 1;
+          end;
+        end;
+        if( not ErrorStatus and needNDS )
+          accNDSTrn.SumPayer        = СуммаДебета;
+          accNDSTrn.SumReceiver     = NewNDSSum;
+          accNDSTrn.FIIDReceiver    = rs.Value(5);
+          accNDSTrn.AccountReceiver = rs.Value(14);
+        end;
+  
+        accTrn.Ground = "Комиссия за перевод платежного поручения №" + rs.Value(8) + " от " + date(rs.Value(17)) + ".";
+        if( needNDS )
+          accNDSTrn.Ground = "НДС по комиссии за перевод платежного поручения №" + rs.Value(8) + " от " + date(rs.Value(17)) + ".";
+        end;
+
+        if( (IsResident(rs.Value(18)) AND (rs.Value(11) == 0)) OR (not IsResident(rs.Value(18))) )
+          accTrn.Ground  = accTrn.Ground + "{VO99020}";
+          if( needNDS )
+            accNDSTrn.Ground = accNDSTrn.Ground + "{VO99020}";
+          end;
+        end;
+
+        if( not batchTrn.AddTransaction( rs.Value(19), accTrn, Status_After, Reason, 0, rs.Value(20), rs.Value(21) ) )
+          ErrorMessage = "Ошибка при исполнении проводки";
+          ErrorStatus = 1;
+        end;
+      end;
+      if( not ErrorStatus )
+        sfdefArray[i].sfdef.rec.Status = 40; //PRSFCOM_STATUS_PAY
+        accTrn = NULL;
+        if( needNDS )
+          if( not batchTrn.AddTransaction( rs.Value(19), accNDSTrn, Status_After, Reason, 0, rs.Value(20), rs.Value(21) ) )
+            ErrorMessage = "Ошибка при исполнении проводки";
+            ErrorStatus = 1;
+          end;
+          accNDSTrn = NULL;
+        end;
+      end;
+    elif( not ErrorStatus and ( rs.Value(3) == PM_CHRG_BEN ) ) // PS\\CPORDER\\ORDER\\PAYBENFROMCORR = false
+      
+      // Сформировать проводку (возможно, мультивалютную) оплаты комиссии
+      accTrn = RsbAccTransactionData();
+
+      var pmpaym = Tbfile ("pmpaym.dbt");
+      ClearRecord( pmpaym.rec );
+      pmpaym.rec.PaymentID = rs.Value(19);
+      pmpaym.getEQ ();
+
+      if( accTrn == NULL )
+        ErrorMessage = "Ошибка при создании проводки оплаты комиссии";
+        ErrorStatus = 1;
+      end;
+
+      if( not ErrorStatus )
+        accTrn.Chapter       = rs.Value(6);
+        accTrn.Ground        = "Комиссия за перевод платежного поручения №" + rs.Value(8) + " от " + date(rs.Value(17)) + ".";
+        accTrn.Date_Carry    = rs.Value(2);
+        accTrn.Department    = pmpaym.rec.Department;
+        accTrn.ResultCarry   = SFPAY_CARRY;
+
+        accTrn.FIIDPayer     = rs.Value(11);
+        accTrn.AccountPayer  = rs.Value(12);
+
+        if( ConvSum(СуммаДебета, sfdef.rec.Sum, date(rs.Value(2)), sfdef.rec.FIID_Sum, accTrn.FIIDPayer) )
+          ErrorMessage = "Невозможно конвертировать сумму комиссии";
+          ErrorStatus = 1;
+        end;
+      end;
+      if( not ErrorStatus )
+        accTrn.SumPayer         = СуммаДебета;
+        accTrn.AccountReceiver  = rs.Value(13);
+        accTrn.FIIDReceiver     = rs.Value(4);
+        accTrn.SumReceiver      = NewTaxSum;
+
+        GetReserveInfo( pmpaym.rec.DocKind, rs.Value(19), date(rs.Value(2)), @ClaimID, @ClaimAmount, @ClaimStatus, accTrn.AccountPayer, 
+                        accTrn.Chapter, accTrn.FIIDPayer );
+        accTrn.ClaimID = ClaimID;
+
+        PayerChargeOffSum = PayerChargeOffSum + accTrn.SumPayer;
+      
+        // Уменьшить сумму платежа на сумму комиссии
+        if( sfdef.rec.FIID_Sum != pmpaym.rec.BaseFIID )
+          if( ConvSum( deltaBaseAmount, sfdef.rec.Sum, date(rs.Value(2)), sfdef.rec.FIID_Sum, pmpaym.rec.BaseFIID ) )
+            ErrorMessage = "Невозможно конвертировать сумму комиссии";
+            ErrorStatus = 1;
+          end;
+          pmpaym.rec.FutureBaseAmount = pmpaym.rec.FutureBaseAmount - deltaBaseAmount;
+        else
+          pmpaym.rec.FutureBaseAmount = pmpaym.rec.FutureBaseAmount - sfdef.rec.Sum;
+          deltaBaseAmount = sfdef.rec.Sum;
+        end;
+      end;
+      if( not ErrorStatus )
+        if( not batchTrn.AddTransaction( rs.Value(19), accTrn, Status_After, PM_CARRY_REASON_UNKNOWN, 0, rs.Value(20), rs.Value(21) ) )
+          ErrorMessage = "Ошибка при исполнении проводки";
+          ErrorStatus = 1;
+        end;
+      end;
+      if( not ErrorStatus )
+        sfdefArray[i].sfdef.rec.Status = 40; //PRSFCOM_STATUS_PAY
+        accTrn = NULL;
+        ErrorStatus = execStoredFunc( "PM_ACTUATE.ReDefFutureAmountByNewAmounts", V_INTEGER, 
+                           makeArray( SQLParam( "FutureBaseAmount"        , pmpaym.rec.FutureBaseAmount ),
+                                      SQLParam( "FuturePayerAmount"       , -1               ),
+                                      SQLParam( "FutureReceiverAmount"    , -1               ),
+                                      SQLParam( "Department"              , rs.Value(10)      ),
+                                      SQLParam( "Chapter"                 , rs.Value(6)      ),
+                                      SQLParam( "ValueDate"               , date(rs.Value(2))      ),
+                                      SQLParam( "BaseFIID"                , pmpaym.rec.BaseFIID     ),
+                                      SQLParam( "FuturePayerAccount"      , pmpaym.rec.FuturePayerAccount    ),
+                                      SQLParam( "FIID_FuturePayAcc"       , pmpaym.rec.FIID_FuturePayAcc     ),
+                                      SQLParam( "FutureDRate"             , pmpaym.rec.FutureDRate           ),
+                                      SQLParam( "FutureDRatePoint"        , pmpaym.rec.FutureDRatePoint      ),
+                                      SQLParam( "FutureDRateScale"        , pmpaym.rec.FutureDRateScale      ),
+                                      SQLParam( "inFutureDRateIsInverse"  , pmpaym.rec.FutureDRateIsInverse  ),
+                                      SQLParam( "outFutureDRateIsInverse" , pmpaym.rec.FutureDRateIsInverse  ),
+                                      SQLParam( "FutureDRateType"         , pmpaym.rec.FutureDRateType       ),
+                                      SQLParam( "FutureDRateDate"         , pmpaym.rec.FutureDRateDate       ),
+                                      SQLParam( "FutureReceiverAccount"   , pmpaym.rec.FutureReceiverAccount ),
+                                      SQLParam( "FIID_FutureRecAcc"       , pmpaym.rec.FIID_FutureRecAcc     ),
+                                      SQLParam( "FutureCRate"             , pmpaym.rec.FutureCRate           ),
+                                      SQLParam( "FutureCRatePoint"        , pmpaym.rec.FutureCRatePoint      ),
+                                      SQLParam( "FutureCRateScale"        , pmpaym.rec.FutureCRateScale      ),
+                                      SQLParam( "inFutureCRateIsInverse"  , pmpaym.rec.FutureCRateIsInverse  ),
+                                      SQLParam( "outFutureCRateIsInverse" , pmpaym.rec.FutureCRateIsInverse  ),
+                                      SQLParam( "FutureCRateType"         , pmpaym.rec.FutureCRateType       ),
+                                      SQLParam( "FutureCRateDate"         , pmpaym.rec.FutureCRateDate   ) ) );
+
+        if( Status_After == ACCTRN_STATUS_DOCUMENT )
+          ChangeReserve( ClaimID, PayerChargeOffSum );
+        end;
+      end;
+      //НДС
+      if( not ErrorStatus and needNDS )
+        accNDSTrn = RsbAccTransactionData();
+
+        if( accNDSTrn == NULL )
+          ErrorMessage = "Ошибка при создании проводки по переводу НДС";
+          return 1;
+        end;
+        if( not ErrorStatus )
+          // НДС по комиссии за перевод 
+          accNDSTrn.Chapter       = rs.Value(6);
+          accNDSTrn.Ground        = "НДС по комиссии за перевод платежного поручения №" + rs.Value(8) + " от " + rs.Value(19) + ".";
+          accNDSTrn.Date_Carry    = rs.Value(2);
+          accNDSTrn.Department    = pmpaym.rec.Department;
+          accNDSTrn.ResultCarry   = SFPAY_CARRY;
+
+          accNDSTrn.FIIDPayer     = rs.Value(11);
+          accNDSTrn.AccountPayer  = rs.Value(12);
+      
+          if( ConvSum(СуммаДебета, sfdef.rec.SumNDS, date(rs.Value(2)), sfdef.rec.FIID_Sum, accNDSTrn.FIIDPayer) )
+            ErrorMessage = "Невозможно конвертировать сумму комиссии";
+            return 1;
+          end;
+        end;
+        if( not ErrorStatus )
+          accNDSTrn.SumPayer        = СуммаДебета;
+          accNDSTrn.FIIDReceiver    = rs.Value(5);
+          accNDSTrn.SumReceiver     = NewNDSSum;
+          accNDSTrn.AccountReceiver = rs.Value(14);
+
+          GetReserveInfo( pmpaym.rec.DocKind, rs.Value(19), rs.Value(2), @ClaimID, @ClaimAmount, @ClaimStatus, accTrn.AccountPayer, 
+                          accTrn.Chapter, accTrn.FIIDPayer );
+          accNDSTrn.ClaimID = ClaimID;
+
+          PayerChargeOffSum = PayerChargeOffSum + accNDSTrn.SumPayer;
+      
+          // Уменьшить сумму платежа на сумму NDS:
+          if( rs.Value(3) != pmpaym.rec.BaseFIID )
+            if( ConvSum(deltaBaseAmount, sfdef.rec.SumNDS, rs.Value(4), sfdef.rec.FIID_Sum, pmpaym.rec.BaseFIID ) )
+              ErrorMessage = "Невозможно конвертировать сумму комиссии";
+              ErrorStatus = 1;
+            end;
+            pmpaym.rec.FutureBaseAmount = pmpaym.rec.FutureBaseAmount - deltaBaseAmount;
+          else
+            pmpaym.rec.FutureBaseAmount = pmpaym.rec.FutureBaseAmount - sfdef.rec.SumNDS;
+            deltaBaseAmount = sfdef.rec.SumNDS;
+          end;
+        end;
+        if( not ErrorStatus )
+          if( not batchTrn.AddTransaction( rs.Value(19), accNDSTrn, Status_After, PM_CARRY_REASON_EXECUTION, 0, rs.Value(20), rs.Value(21) ) )
+            ErrorStatus = 1;
+          end;
+        end;
+        if( not ErrorStatus )
+          accNDSTrn = NULL;
+          ErrorStatus = execStoredFunc( "PM_ACTUATE.ReDefFutureAmountByNewAmounts", V_INTEGER, 
+                           makeArray( SQLParam( "FutureBaseAmount"        , pmpaym.rec.FutureBaseAmount ),
+                                      SQLParam( "FuturePayerAmount"       , -1               ),
+                                      SQLParam( "FutureReceiverAmount"    , -1               ),
+                                      SQLParam( "Department"              , rs.Value(8)      ),
+                                      SQLParam( "Chapter"                 , rs.Value(3)      ),
+                                      SQLParam( "ValueDate"               , rs.Value(4)      ),
+                                      SQLParam( "BaseFIID"                , rs.Value(21)     ),
+                                      SQLParam( "FuturePayerAccount"      , pmpaym.rec.FuturePayerAccount    ),
+                                      SQLParam( "FIID_FuturePayAcc"       , pmpaym.rec.FIID_FuturePayAcc     ),
+                                      SQLParam( "FutureDRate"             , pmpaym.rec.FutureDRate           ),
+                                      SQLParam( "FutureDRatePoint"        , pmpaym.rec.FutureDRatePoint      ),
+                                      SQLParam( "FutureDRateScale"        , pmpaym.rec.FutureDRateScale      ),
+                                      SQLParam( "inFutureDRateIsInverse"  , pmpaym.rec.FutureDRateIsInverse  ),
+                                      SQLParam( "outFutureDRateIsInverse" , pmpaym.rec.FutureDRateIsInverse  ),
+                                      SQLParam( "FutureDRateType"         , pmpaym.rec.FutureDRateType       ),
+                                      SQLParam( "FutureDRateDate"         , pmpaym.rec.FutureDRateDate       ),
+                                      SQLParam( "FutureReceiverAccount"   , pmpaym.rec.FutureReceiverAccount ),
+                                      SQLParam( "FIID_FutureRecAcc"       , pmpaym.rec.FIID_FutureRecAcc     ),
+                                      SQLParam( "FutureCRate"             , pmpaym.rec.FutureCRate           ),
+                                      SQLParam( "FutureCRatePoint"        , pmpaym.rec.FutureCRatePoint      ),
+                                      SQLParam( "FutureCRateScale"        , pmpaym.rec.FutureCRateScale      ),
+                                      SQLParam( "inFutureCRateIsInverse"  , pmpaym.rec.FutureCRateIsInverse  ),
+                                      SQLParam( "outFutureCRateIsInverse" , pmpaym.rec.FutureCRateIsInverse  ),
+                                      SQLParam( "FutureCRateType"         , pmpaym.rec.FutureCRateType       ),
+                                      SQLParam( "FutureCRateDate"         , pmpaym.rec.FutureCRateDate   ) ) );
+
+          if( Status_After == ACCTRN_STATUS_DOCUMENT )
+            ChangeReserve( ClaimID, PayerChargeOffSum );
+          end;
+        end; // not errorstatus
+      end; // needNDS ( payben = false )
+    end; // payben = false
+    if( ErrorStatus )
+      SetErrorOprTemp( rs.Value(19), ErrorStatus, ErrorMessage );
+    end;
+  end; // while movenext
+  // массовая проводка
+  if( needTRN )
+    if( not batchTrn.Execute() )
+      return 1;
+    end;
+  END;
+ 
+  ErrorStatus = UpdateSfDefStatusSfOpr( sfdefArray );
+  return ErrorStatus;
+END;

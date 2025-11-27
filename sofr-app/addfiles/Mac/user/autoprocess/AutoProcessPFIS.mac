@@ -1,0 +1,1260 @@
+/*
+$Name:        AutoProcessPFIS.mac
+$Module:      ФИСС и КО
+$Description: Биржевой автомат для сделок СПФИ
+*/
+
+import globals;
+import captureoutput, rsd, dlquery, cb_sql, oralib, likepy;
+import CbReport_h;
+import gtLibU;
+
+import "u_common_email_utils.mac";
+import "dldlngfun.mac", "gtconst.inc";
+
+/** Вставка записи в протокол */
+private macro insertLog(_message)
+   var exexlog = RSDCommand("begin rshb_brkrep.InsertLog(?); end;");
+   exexlog.addParam("", RSDBP_IN, "shed " + date() + " " + time() + " " + _message);
+   exexlog.execute();
+end;
+
+Private macro getCurrentDateTime()
+  var cdate = date();
+  var ctime = time();
+
+  var day, mon, year;
+  var hour, min, sec;
+
+  DateSplit(date(), day, mon, year);
+  TimeSplit(time(), hour, min, sec);
+  var str = string( day:2:o, ".", mon:2:o, ".", year, " ", hour:2:o, ":", min:2:o, ":", sec:2:o);
+
+  return str;
+end;
+
+private macro GetProcessRecordSet(OpDate, Type, SubType)
+  var query = 
+    "   SELECT ROWID, T_TYPE, t_operdate, t_subtype, t_num, t_status, t_wrnmsg, t_isfinish, t_name, "
+   +"          t_statusname, t_count, t_countrecs, t_counterrors, t_countwarning,  "
+   +"          TO_CHAR (t_starttime, 'dd.mm.yyyy hh24:mi:ss') t_starttime, "
+   +"          TO_CHAR (t_Endtime, 'dd.mm.yyyy hh24:mi:ss') t_Endtime, "
+   +"          t_errmsg "
+   +"     FROM dprocess_u_dbt "
+   +"    WHERE 1=1 "
+   +  IIF(ValType(OpDate) == V_DATE, " AND t_operdate = " + GetSQLDate(OpDate), "" )
+   +  IIF(ValType(Type) == V_INTEGER, " AND T_TYPE = " + String(Type), "" )
+   +  IIF(ValType(SubType) == V_INTEGER, " AND t_subtype = " + String(SubType), "" )
+   +" ORDER BY t_num, t_name ";
+  return RSDRecordset(RsdCommand(query), RSDVAL_CLIENT, RSDVAL_STATIC);
+end;
+
+/** Загрузка сделок СПФИ в шлюз (gtImPFIS) */
+macro ReceivePFIS(executor, currentTask)
+   var parms = "-beg_date:" + executor.operDate + "-end_date:" + executor.operDate;
+   currentTask.recs = 0;
+   currentTask.errrecs = 0;
+   currentTask.wrnrecs = 0;
+   currentTask.executeErrorMessage = "";
+
+   /** Создаем сеанс */
+   currentTask.seanceid = CreateSeance(executor.operNum,
+                                       1,   /** Из файлов в шлюз */
+                                       125, /** ММВБ_Рынок СПФИ, xml-формат */
+                                       11,  /** TGT-1 RS-Bank V.6 release 20 */
+                                       0,   /** Новые */
+                                       0, 
+                                       @currentTask.executeErrorMessage);
+   if(currentTask.seanceid < 0)
+     /** Транслируем ошибку */
+     currentTask.executeErrorMessage = currentTask.executeErrorMessage + " (" + currentTask.seanceid + ")";
+     return false;
+   elif(currentTask.seanceid == 0)
+     /** Нет объектов для обработки */
+     return true;
+   end;
+
+   /** Запускаем обработку сеанса */
+   ExecMacroFile("gtImPFIS", "Receive", currentTask.seanceid, parms, true);
+
+   /** Завершаем сеанс */
+   FinishSeance(currentTask.seanceid, @currentTask.recs, @currentTask.errrecs, @currentTask.executeErrorMessage, @currentTask.wrnrecs);
+
+   /** Возвращаем результат */
+   return true;
+onError(erru)  
+   currentTask.executeErrorMessage = "onError: " + erru.message + " (модуль " + erru.module + ", строка " + erru.line + ")";
+   return false;
+end;
+
+/** Загрудка сделок СПФИ из шлюза в ФИССиКО */
+macro ProcessBoPfisDeals(executor, currentTask)
+   return ProcessBO(125/*ММВБ_Рынок СПФИ*/, executor.operNum, 53/*Внебиржевая сделка с ПИ*/, @currentTask.seanceid, @currentTask.recs, @currentTask.errrecs, @currentTask.executeErrorMessage, @currentTask.wrnrecs);
+end;
+
+/** Загрузка расчетов по сделкам СПФИ */
+macro ProcessBoPfisCalculations(executor, currentTask)
+   return ProcessBO(125/*ММВБ_Рынок СПФИ*/, executor.operNum, 93/*Расчеты по ПФИ для внебирж. сделки*/, @currentTask.seanceid, @currentTask.recs, @currentTask.errrecs, @currentTask.executeErrorMessage, @currentTask.wrnrecs);
+end;
+
+/** Загрузка справедливой стоимости по сделкам СПФИ */
+macro ProcessBoPfisSS(executor, currentTask)
+   return ProcessBO(125/*ММВБ_Рынок СПФИ*/, executor.operNum, 98/*Справедливая стоимость для внебирж. с ЦК*/, @currentTask.seanceid, @currentTask.recs, @currentTask.errrecs, @currentTask.executeErrorMessage, @currentTask.wrnrecs);
+end;
+
+/** Загрузка фиксинга по процентным свопам СПФИ */
+macro ProcessBoPfisFix(executor, currentTask)
+   return ProcessBO(GT_SPFI, executor.operNum, RG_FIXPMGR_PRCNTSWAP, @currentTask.seanceid, @currentTask.recs, @currentTask.errrecs, @currentTask.executeErrorMessage, @currentTask.wrnrecs);
+end;
+
+/** Загрузка платежей по сделкам СПФИ */
+macro ProcessBoPfisPayments(executor, currentTask)
+   return ProcessBO(125/*ММВБ_Рынок СПФИ*/, executor.operNum, 57/*Строка графика платежей процентного свопа*/, @currentTask.seanceid, @currentTask.recs, @currentTask.errrecs, @currentTask.executeErrorMessage, @currentTask.wrnrecs);
+end;
+
+/** Толкнуть отложенные сделки СПФИ */
+macro ExecDeferredPFIS(executor, currentTask)
+   currentTask.recs = 0; currentTask.errrecs = 0; currentTask.executeErrorMessage = ""; currentTask.wrnrecs = 0;
+
+   var sql, cmd, rs, count_ALL, count_FAL, result;
+  
+   count_ALL = 0;
+   count_FAL = 0;
+   
+   /** Отложенные сделки банка с рынком СПФИ */
+   sql = " SELECT *                                                                   " +
+         "   FROM ddvndeal_Dbt t                                                      " +
+         "  WHERE t.t_State IN (0/*, 1*/) AND t.t_Client = -1 AND t.T_MARKETSCHEMEID = 19 ";
+
+   cmd = RSDCommand(sql);
+   cmd.NullConversion = true;
+
+   rs = TRsbDataSet( cmd );
+   if(rs != null)
+      while(rs.movenext)
+         count_ALL = count_ALL + 1;
+         result = DV_ExecDeal(int(rs.value("t_id")), false, -1, executor.operDate);
+         
+         if(result == 1336/** Преждевременное выполнение шага */)
+            currentTask.result_protocol.AddString("Успешно обработана сделка с кодом "+rs.value("t_code")+"( идентификатор ID="+rs.value(0)+").");
+         
+         elif(result != 0)/** выполнилось без ошибки PAN после исправления разработки код успешного исполнения должен стать = 0 */
+            count_FAL = count_FAL + 1;
+            currentTask.result_protocol.AddString("Не удалось обработать сделку с кодом "+rs.value("t_code")+"( идентификатор ID="+rs.value(0)+"). Код ошибки " + result +". " + geterrmsg());
+         
+         else
+            currentTask.result_protocol.AddString("Успешно обработана сделка с кодом "+rs.value("t_code")+"( идентификатор ID="+rs.value(0)+").");
+         end;
+      end;
+      
+      currentTask.recs = count_ALL;
+      currentTask.errrecs = Count_FAL;
+      
+      if(currentTask.recs == 0)
+         currentTask.result_protocol.AddString("Не найдены не обработанные сделки ");
+      end;
+
+      return true;
+   else
+      currentTask.result_protocol.AddString("Не найдены не обработанные сделки ");
+      return true;
+   end;
+onError(erru)  
+   currentTask.executeErrorMessage = "onError: " + erru.message + " (модуль " + erru.module + ", строка " + erru.line + ")";
+   return false;
+end;
+
+/** Толкнуть отложенные операции фиксинга */
+macro ExecFixingPFIS(executor, currentTask)
+   currentTask.recs = 0; currentTask.errrecs = 0; currentTask.executeErrorMessage = ""; currentTask.wrnrecs = 0;
+
+   var sql, cmd, rs, count_ALL, count_FAL, result;
+  
+   count_ALL = 0;
+   count_FAL = 0;
+   
+   /** Отложенные операции фиксинга */
+   sql = " SELECT t.t_ID, t_Code " +
+         "   FROM ddvoper_dbt t " +
+         "  WHERE t.t_State = 0 AND t.t_DocKind = "+DL_DVOPER_FIXING+" AND t.T_DATE = "+GetSQLDate(executor.operDate);
+
+   cmd = RSDCommand(sql);
+   cmd.NullConversion = true;
+
+   rs = TRsbDataSet( cmd );
+   if(rs != null)
+      while(rs.movenext)
+         count_ALL = count_ALL + 1;
+         result = DV_RunFixing(int(rs.value("t_id")), false);        
+         
+         if(result != 0)/** выполнилось без ошибки PAN после исправления разработки код успешного исполнения должен стать = 0 */
+            count_FAL = count_FAL + 1;
+            currentTask.result_protocol.AddString("Не удалось обработать операцию фиксинга с кодом "+rs.value("t_code")+"( идентификатор ID="+rs.value("t_id")+"). Код ошибки " + result +". " + geterrmsg());         
+         else
+            currentTask.result_protocol.AddString("Успешно обработана операция фиксинга с кодом "+rs.value("t_code")+"( идентификатор ID="+rs.value("t_id")+").");
+         end;
+      end;
+      
+      currentTask.recs = count_ALL;
+      currentTask.errrecs = Count_FAL;
+      
+      if(currentTask.recs == 0)
+         currentTask.result_protocol.AddString("Не найдены не обработанные операции фиксинга ");
+      end;
+
+      return true;
+   else
+      currentTask.result_protocol.AddString("Не найдены не обработанные операции фиксинга ");
+      return true;
+   end;
+onError(erru)  
+   currentTask.executeErrorMessage = "onError: " + erru.message + " (модуль " + erru.module + ", строка " + erru.line + ")";
+   return false;
+end;
+
+/** Запустить массовую переоценку процентных платежей */
+macro RunOvervalPFIS(executor, currentTask)
+  currentTask.recs = 0; currentTask.errrecs = 0; currentTask.executeErrorMessage = ""; currentTask.wrnrecs = 0;
+
+  var sql, cmd, rs, count_ALL, count_FAL, result;
+
+  count_ALL = 0;
+  count_FAL = 0;
+   
+  /** Получить коды сделок для переоценки процентных платежей */
+  sql = " SELECT distinct gt.t_DealCode " +
+        "   FROM ddvnpmgrgt_dbt gt " +
+        "  WHERE gt.t_Imported = chr(0) AND gt.t_ImpDate = "+GetSQLDate(executor.operDate);
+   
+  sql = "SELECT dv.t_id, dv.t_ExtCode as DealCode from DDVNDEAL_DBT dv where dv.t_ExtCode IN ( "+sql+" )";
+
+  cmd = RSDCommand(sql);
+  cmd.NullConversion = true;
+
+  rs = TRsbDataSet( cmd );
+  while(rs.movenext)        
+    result = DV_RunOvervalExt(executor.operDate, rs.Id);
+    if(result > 0)
+      count_FAL = count_FAL + 1;
+      currentTask.result_protocol.AddString("Не удалось обновить график платежей по сделке с кодом \""+rs.DealCode+"\". Код ошибки " + result +". " + geterrmsg());         
+    else
+      if(result != -1)
+        count_ALL = count_ALL + 1; 
+        currentTask.result_protocol.AddString("Успешно обновлён график платежей по сделке с кодом \""+rs.DealCode+"\".");
+      end;
+    end;
+  end;
+      
+  currentTask.recs = count_ALL;
+  currentTask.errrecs = Count_FAL;
+      
+  if(currentTask.recs == 0)
+    currentTask.result_protocol.AddString("Не найдена информации для переоценки процентных платежей за дату обработки ");
+  end;
+
+  return true;
+
+onError(erru)  
+   currentTask.executeErrorMessage = "onError: " + erru.message + " (модуль " + erru.module + ", строка " + erru.line + ")";
+   return false;
+end;
+
+/** Создание операции "Обработка сделок рынка СПФИ по итогам торгов" */
+macro CreatePFISMarketOp(executor, currentTask)
+   var OperID, OperCode;
+
+   currentTask.recs = 0; currentTask.errrecs = 0; currentTask.executeErrorMessage = ""; currentTask.wrnrecs = 0;   
+/* Пока не работает
+   if(DV_CreateCurMarketOp(2603, executor.operDate, ALG_SP_MONEY_SOURCE_OWN /** Собственные */, 19 /** MarketID */, true, OperID, OperCode) != 0 )
+
+      currentTask.errrecs = 1;
+      currentTask.executeErrorMessage = "Не удалось создать операцию Обработка сделок рынка СПФИ по итогам торгов " + " за дату " + executor.operDate + "!\n" + GetErrMsg();
+      return false;
+   end;
+*/
+   return true;
+end;
+
+class task(_executor, _subType, _state, _name, _module, _procedure, _singlSend)
+   var executor = _executor;
+   var subType = _subType;
+   var state = _state;
+   var name = _name;
+   var num = -1;
+   var module = _module;
+   var procedure = _procedure;
+
+   var singlSend = _singlSend;
+   if(not singlSend)
+      singlSend = false;
+   end;
+
+   var executeErrorMessage = "";
+   var recs = 0, errrecs = 0, errmsg, wrnrecs = 0;
+
+   /** Выполнить задачу */
+   macro execute()
+      executeErrorMessage = "";
+      var resultProc = ExecMacroFile(module, procedure, executor, this);
+
+      return resultProc;
+   end;
+
+   /** Сохранить результат */
+   macro saveResult()
+   end;
+
+   /** Показать протокол */
+   macro showProtocol()
+      file ReportOutFile() txt write;
+      var ReportFileName;
+
+      ReportFileName = GetTxtFileName("protocol");
+      if(not Open(ReportOutFile, ReportFileName))
+         msgboxex("Ошибка при открытии файла отчета|"+ReportFileName);
+      end;
+
+      insert(ReportOutFile, iif(trim(executeErrorMessage) == "", "Нет данных", executeErrorMessage));
+
+      close(ReportOutFile);
+      viewfile(ReportFileName);      
+   end;
+
+   /** Процедура обработки скроллинга результата обработки */
+   macro eInfoDialog(rs, cmd, id, key)
+      /** Обработка нажатия кнопок */
+      if(cmd == DLG_KEY)
+         /** Esc */
+         if(key == 27)
+            return CM_CANCEL;
+         /** Enter */
+         elif(key == 13)
+            if(rs.RecCount > 0)
+               showProtocol(rs);
+            end;
+         end;
+      end;
+   end;
+
+   /** Пустой скроллинг с результатом - заглушка */
+   macro getResultQuery()
+      return " select '0' t_oprcode,                " +
+             "        'Без названия' t_oprname,     " +
+             "        'Нет результата' t_oprstatus, " +
+             "        0 t_type,                     " +
+             "        trunc(sysdate) t_operdate,    " +
+             "        0 t_subtype,                  " +
+             "        0 t_operid                    " +
+             " from dual;                           ";
+   end;
+
+   /** Показать результат выполнения задачи */
+   macro showResult()
+      var cmdInfo = RsdCommand(getResultQuery());
+          cmdInfo.AddParam("processtype", RSDBP_IN, executor.processtype);
+          cmdInfo.AddParam("operdate", RSDBP_IN, executor.operDate);
+          cmdInfo.AddParam("processsubtype", RSDBP_IN, subType);
+
+      var rsInfo = RSDRecordset(cmdInfo, RSDVAL_CLIENT, RSDVAL_STATIC);
+
+      RunScroll(rsInfo, 3, MakeArray("t_oprcode",   "Код",          25, 2, -1, 0,
+                                     "t_oprname",   "Наименование", 30, 2, -1, 0,  
+                                     "t_oprstatus", "Состояние",    20, 2, -1, 0), 
+                "_eInfoDialog", R2M(this, "eInfoDialog"), name, "~Enter~ Информация ~Esc~ Выход", true);    
+   end;
+
+   /** Отправка уведомлений */
+   macro SendNotification()
+      var err_reg = 0,
+          v_email_processor,
+          email_group, 
+          msg_text = "При выполнении операции \"" + name + "\" зафиксировано ";
+
+      if(not singlSend)
+         return;
+      end;
+
+      GetRegistryValue("РСХБ\\ИНТЕГРАЦИЯ\\SEND_NOTIFY_BO", V_INTEGER, email_group, err_reg);
+      if(err_reg)
+         MsgBox("Ошибка получение значений настроек \"РСХБ\\ИНТЕГРАЦИЯ\\SEND_NOTIFY_BO\"");
+      end;
+
+      if(email_group)
+         v_email_processor = c_email_proc_env();
+         v_email_processor.m_get_email_group(email_group);
+         v_email_processor.m_set_msg_head("СОФР - Обработка дня:" + executor.name);
+
+         if(strlen(executeErrorMessage) > 0)
+            v_email_processor.m_add_row_to_msg_text(executeErrorMessage);
+         end;
+
+         if(errrecs > 0)
+            msg_text = msg_text + "ошибок: " + errrecs;
+            if(wrnrecs > 0)
+               msg_text = msg_text + ", ";
+            else
+               msg_text = msg_text + ". ";
+            end;
+         end;
+
+         if(wrnrecs > 0)
+            msg_text = msg_text + " предупреждений:" + wrnrecs + ".";     
+         end;
+
+         v_email_processor.m_add_row_to_msg_text(msg_text);
+         v_email_processor.m_save_to_submit_grp(email_group, true);
+         v_email_processor.m_submit_email_synch();
+      end;
+
+   onerror(err)
+      return;
+   end; 
+end;
+
+class (TArray) TStrCollectorPFIS
+   /** Очистить массив. */
+   macro ClearArray
+      this.Size = 0;
+   end;
+   
+   /** Добавить строку в массив. */
+   macro AddString( Str )
+      this.(this.Size) = Str;
+   end;
+end;
+
+/** Для исполнения сделок/операций */
+class (task) DealsTask(_executor, _subType, _state, _name, _module, _procedure, _singlSend)
+   initTask(_executor, _subType, _state, _name, _module, _procedure, _singlSend);
+   var result_protocol = TStrCollectorPFIS;
+
+   macro execute()
+      result_protocol = TStrCollectorPFIS;
+      var resultProc = ExecMacroFile(module, procedure, executor, this);
+      
+      return resultProc;
+   end;
+
+   macro saveResult()
+      /** Протокол работы */
+      var i = 0;
+      while(i < result_protocol.size)
+         StartCaptureOutput();
+         [
+           declare
+             processtype number := ?;
+             operdate date := ?;
+             processsubtype number := ?;
+             str varchar2(4000) := ?;
+             cl clob := null;
+           begin
+             -- Читаем текущее значение
+             begin
+               select t_protocol
+               into cl
+               from dprocess_oper_u_dbt 
+               where t_type = processtype and
+                     t_operdate = operdate and
+                     t_subtype = processsubtype and
+                     t_operid = 0
+               for update nowait;
+             exception when no_data_found then
+               insert into dprocess_oper_u_dbt values(processtype, operdate, processsubtype, 0, null);
+             end;
+             -- Создаем CLOB при необходимости
+             if(cl is null)then
+               dbms_lob.createtemporary(cl, true);
+             end if;
+             -- Дописываем строку в CLOB
+             dbms_lob.writeappend(cl, length(str), str);
+             -- Сохраняем результат
+             update dprocess_oper_u_dbt
+             set t_protocol = cl
+               where t_type = processtype and
+                     t_operdate = operdate and
+                     t_subtype = processsubtype and
+                     t_operid = 0;
+           end;
+         ];
+         var exec = RsdCommand(EndCaptureOutput());
+         exec.AddParam("processtype",    RSDBP_IN, executor.processtype);
+         exec.AddParam("operdate",       RSDBP_IN, executor.operDate);
+         exec.AddParam("processsubtype", RSDBP_IN, subType);
+         exec.AddParam("str",            RSDBP_IN, result_protocol.(i) + "\n");
+         exec.Execute();
+         i = i + 1;
+      end;
+   end;
+
+   macro showProtocol(rs)
+      file ReportOutFile() txt write;
+      var ReportFileName;
+
+      var cmdLog, rsLog, strLog;
+      var ind = 1, deltaind = 1024, idec;
+
+      ReportFileName = GetTxtFileName("protocol");
+      if(not Open(ReportOutFile, ReportFileName))
+         msgboxex("Ошибка при открытии файла отчета|"+ReportFileName);
+      end;
+      
+      strLog = "";
+      while(ind > 0)
+         StartCaptureOutput();
+         [
+           select nvl(dbms_lob.substr(process_oper_u.t_protocol, ?, ?),' ') t_log
+           from dprocess_oper_u_dbt process_oper_u
+           where process_oper_u.t_type = ? and
+                 process_oper_u.t_operdate = ? and
+                 process_oper_u.t_subtype = ? and
+                 process_oper_u.t_operid = ?
+         ];
+         cmdLog = DL_RsdCommand(EndCaptureOutput());
+         cmdLog.AddParam(deltaind);
+         cmdLog.AddParam(1 + deltaind * (ind - 1));
+         cmdLog.AddParam(rs.value("t_type"));
+         cmdLog.AddParam(date(rs.value("t_operdate")));
+         cmdLog.AddParam(rs.value("t_subtype"));
+         cmdLog.AddParam(rs.value("t_operid"));
+
+         rsLog = cmdLog.Execute();
+         if((rsLog.moveNext()) and (rsLog.value("t_log") != " "))
+            strLog = strLog + rsLog.value("t_log");
+            while(index(strLog, "\n") > 0)
+               idec = index(strLog, "\n");
+               insert(ReportOutFile, substr(strLog, 1, idec-1));
+               strLog = substr(strLog, idec+1);
+            end;
+            ind = ind + 1;
+         else
+            if(strlen(strLog) > 0)
+               insert(ReportOutFile, strLog);
+            end;
+            ind = 0;
+         end;
+      end;
+
+      close(ReportOutFile);
+      viewfile(ReportFileName);
+   end;
+
+   macro getResultQuery()
+      return " select chr(1) t_oprcode,                       " +
+             "        'Протокол работы процедуры' t_oprname,  " +
+             "        chr(1) t_oprstatus,                     " +
+             "        process_oper_u.t_type,                  " +
+             "        process_oper_u.t_operdate,              " +
+             "        process_oper_u.t_subtype,               " +
+             "        process_oper_u.t_operid                 " +
+             " from dprocess_oper_u_dbt process_oper_u        " +
+             " where process_oper_u.t_type = ? and            " +
+             "       process_oper_u.t_operdate = ? and        " +
+             "       process_oper_u.t_subtype = ? and         " +
+             "       process_oper_u.t_operid = 0              " +
+             " order by t_operid                              ";
+   end;
+
+end;
+
+/** Загрузка в шлюз/выгрузка в БО из шлюза */
+class (task) gateTask(_executor, _subType, _state, _name, _module, _procedure, _singlSend)
+   initTask(_executor, _subType, _state, _name, _module, _procedure, _singlSend);
+
+   var seanceid = 0;
+
+   macro execute()
+      executeErrorMessage = "";
+      var resultProc = ExecMacroFile(module, procedure, executor, this);
+      
+      if((seanceid == 0) and (executeErrorMessage == ""))
+         executeErrorMessage = "Нет объектов для обработки";
+      end;
+      
+      return resultProc;
+   end;
+
+   macro saveResult()
+      if(seanceid > 0)
+         StartCaptureOutput();
+         [
+           insert into dprocess_oper_u_dbt values(?, ?, ?, ?, null)
+         ];
+         var exec = RsdCommand(EndCaptureOutput());
+         exec.AddParam("processtype", RSDBP_IN, executor.processtype);
+         exec.AddParam("operdate", RSDBP_IN, executor.operDate);
+         exec.AddParam("processsubtype", RSDBP_IN, subType);
+         exec.AddParam("operationid", RSDBP_IN, seanceid);
+         exec.Execute();
+      end;
+   end;
+
+   macro showProtocol(rs)
+      file ReportOutFile() txt write;
+      var ReportFileName;
+
+      var cmdLog, rsLog, strLog;
+      var cmdLogs, rsLogs;
+      var ind = 1, deltaind = 1024, idec;
+
+      ReportFileName = GetTxtFileName("protocol");
+      if(not Open(ReportOutFile, ReportFileName))
+         msgboxex("Ошибка при открытии файла отчета|"+ReportFileName);
+      end;
+
+      strLog = "";
+      while(ind > 0)
+         StartCaptureOutput();
+         [
+           select nvl(dbms_lob.substr(gtseance.t_log, ?, ?),' ') t_log
+           from dgtseance_dbt gtseance
+           where gtseance.t_seanceid = ?
+         ];
+         
+         cmdLog = DL_RsdCommand(EndCaptureOutput());
+         cmdLog.AddParam(deltaind);
+         cmdLog.AddParam(1 + deltaind * (ind - 1));
+         cmdLog.AddParam(rs.value("t_operid"));
+
+         rsLog = cmdLog.Execute();
+         
+         if((rsLog.moveNext()) and (rsLog.value("t_log") != " "))
+            strLog = strLog + rsLog.value("t_log");
+            while(index(strLog, "\n") > 0)
+               idec = index(strLog, "\n");
+               insert(ReportOutFile, substr(strLog, 1, idec-1));
+               strLog = substr(strLog, idec+1);
+            end;
+            ind = ind + 1;
+         else
+            if(strlen(strLog) > 0)
+               insert(ReportOutFile, strLog);
+            end;
+            ind = 0;
+         end;
+      end;
+
+      close(ReportOutFile);
+      viewfile(ReportFileName);
+   end;
+
+   macro getResultQuery()
+      return " select to_char(gtseance.t_sysdate,'dd.mm.yyyy')||' '||to_char(gtseance.t_systime,'hh24:mi:ss')||' ('||gtseance.t_seanceid||')' t_oprcode,                                                 " +
+             "        case when gtseance.t_kind is null then chr(1) when gtseance.t_kind = 1 then 'Сеанс загрузки в шлюз' when gtseance.t_kind = 2 then 'Сеанс отправки в БО' else chr(1) end t_oprname, " +
+             "        case when gtseance.t_errorcount is null then chr(1) when gtseance.t_errorcount > 0 then 'Загружено с ошибками' else 'Загружено без ошибок' end t_oprstatus,                        " +
+             "        process_oper_u.t_type,                                                                                                                                                             " +
+             "        process_oper_u.t_operdate,                                                                                                                                                         " +
+             "        process_oper_u.t_subtype,                                                                                                                                                          " +
+             "        process_oper_u.t_operid                                                                                                                                                            " +
+             " from dprocess_oper_u_dbt process_oper_u                                                                                                                                                   " +
+             " left join dgtseance_dbt gtseance on gtseance.t_seanceid = process_oper_u.t_operid                                                                                                         " +
+             " where process_oper_u.t_type = ? and                                                                                                                                                       " +
+             "       process_oper_u.t_operdate = ? and                                                                                                                                                   " +
+             "       process_oper_u.t_subtype = ?                                                                                                                                                        " +
+             " order by t_operid                                                                                                                                                                         ";
+   end;
+end;
+
+class autoProcessTasks(_name, _processType, _operDate, _operNum)
+   var processType = _processtype;
+   var operDate = _operDate;
+   var tasks = TArray();
+   var Procedure = TArray();
+
+   var massSend = false;
+   
+   var operNum = _operNum;
+   if(not operNum)
+      operNum = {oper};
+   end;
+
+   var name = _name;
+   if(not name)
+      name = "";
+   end;
+
+   macro addTask(_newTask, CustomNum)
+      if ((ValType(CustomNum) != V_UNDEF) and (CustomNum > 0))
+        _newTask.num = CustomNum;
+      else
+        _newTask.num = tasks.size + 1;
+      end;
+
+      tasks[tasks.size] = _newTask;
+      Procedure[_newTask.subType] = _newTask;
+   end;
+
+   macro executeTask(_subType, process:@rsdrecordset, errmsg:@string)
+      var resultproc;
+      var exec;
+
+      /** Создаем экземпляр процесса */
+      StartCaptureOutput();
+      [
+        declare
+          processtype integer := ?;
+          operdate date := ?;
+          processsubtype integer := ?;
+          process_u dprocess_u_dbt%rowtype;
+          res integer := 0;
+        begin
+          begin
+            -- Захватываем запись
+            select *
+            into process_u
+            from dprocess_u_dbt
+            where t_type = processtype and
+                  t_operdate = operdate and
+                  t_subtype = processsubtype and
+                  (t_isfinish = chr(0) or t_isfinish = 'S')
+            for update nowait;
+            -- Результат
+            res := process_u.t_count + 1;
+          exception when others then
+            null;
+          end;
+          ? := res;
+        end;
+      ];
+
+      exec = RsdCommand(EndCaptureOutput());
+      exec.AddParam("processtype", RSDBP_IN, process.value("t_type"));
+      exec.AddParam("operdate", RSDBP_IN, date(process.value("t_operdate")));
+      exec.AddParam("processsubtype", RSDBP_IN, process.value("t_subtype"));
+      exec.AddParam("res", RSDBP_OUT, V_INTEGER);
+      exec.Execute();
+
+      if((valtype(exec.value("res")) != V_INTEGER) or (exec.value("res") <= 0))
+         //SetDialogFlag(1);
+         errmsg = "Процесс уже запущен/выполнен";
+         return false;
+      end;
+
+      process.edit();
+      process.value("t_isfinish") = "Z";
+      process.value("t_status") = 1;
+      process.value("t_statusname") = "Обрабатывается";
+      process.value("t_starttime") = getCurrentDateTime();
+      process.value("t_count") = exec.value("res");
+      process.update();
+
+      errmsg = "";
+
+      /** Выполнение задачи */
+      var oldDialogFlag = setDialogFlag(0);
+      resultProc = Procedure[_subType].execute();
+      setDialogFlag(oldDialogFlag);
+
+      /** Сохранение результата */
+      Procedure[_subType].saveResult();
+      
+      errmsg = Procedure[_subType].executeErrorMessage;
+      if( not resultproc or (Procedure[_subType].errrecs > 0) or (Procedure[_subType].wrnrecs > 0) )
+         Procedure[_subType].SendNotification();
+      end;
+
+      if(not resultproc)
+          if(strlen(Procedure[_subType].executeErrorMessage) <= 0)
+            Procedure[_subType].executeErrorMessage = "Неизвестная ошибка при обработке процесса";
+          end;
+          process.edit();
+          process.value("t_isfinish") = "E";
+          process.value("t_status") = 2;
+          process.value("t_statusname") = "Ошибка обработки";
+          process.value("t_errmsg") = substr(Procedure[_subType].executeErrorMessage, 1, 200);
+          process.value("t_endtime") = getCurrentDateTime();
+          process.update();
+
+          return false;
+      elif(Procedure[_subType].errrecs > 0)
+         process.edit();
+         process.value("t_isfinish") = "E";
+         process.value("t_status") = 3;
+         process.value("t_statusname") = "Обработан с ошибками";
+         process.value("t_countrecs") = Procedure[_subType].recs;
+         process.value("t_counterrors") = Procedure[_subType].errrecs;
+         process.value("t_countwarning") = Procedure[_subType].wrnrecs;
+         process.value("t_errmsg") = substr(Procedure[_subType].executeErrorMessage, 1, 200);
+         process.value("t_endtime") = getCurrentDateTime();
+         process.update();
+      else
+         process.edit();
+         process.value("t_isfinish") = "X";
+         process.value("t_status") = 10;
+         if(Procedure[_subType].wrnrecs > 0)
+            process.value("t_statusname") = "Обработан с предупреждениями";
+         else
+            process.value("t_statusname") = "Обработан успешно";
+         end;         
+         process.value("t_countrecs") = Procedure[_subType].recs;
+         process.value("t_counterrors") = Procedure[_subType].errrecs;
+         process.value("t_countwarning") = Procedure[_subType].wrnrecs;
+         process.value("t_errmsg") = substr(Procedure[_subType].executeErrorMessage, 1, 200);
+         process.value("t_endtime") = getCurrentDateTime();
+         process.update();
+
+         return true;
+      end;
+   end;
+
+   macro showTaskResult(_subType, process:@rsdrecordset)
+      Procedure[_subType].showResult();
+   end;
+
+   private macro deleteTaskResult(process:@rsdrecordset, errmsg:@string)
+      var exec;
+      StartCaptureOutput();
+      [
+        delete from dprocess_oper_u_dbt
+        where t_type = ? and
+              t_operdate = ? and
+              t_subtype = ?
+      ];
+      exec = RsdCommand(EndCaptureOutput());
+      exec.AddParam("processtype", RSDBP_IN, process.value("t_type"));
+      exec.AddParam("operdate", RSDBP_IN, date(process.value("t_operdate")));
+      exec.AddParam("processsubtype", RSDBP_IN, process.value("t_subtype"));
+      exec.Execute();
+      
+      process.edit();
+      process.value("t_isfinish") = "";
+      process.value("t_status") = 0;
+      process.value("t_statusname") = "Не обработан";
+      process.value("t_countrecs") = 0;
+      process.value("t_counterrors") = 0;
+      process.value("t_countwarning") = 0;
+      process.value("t_errmsg") = "";
+      process.value("t_starttime") = nullval;
+      process.value("t_Endtime") = nullval;
+      process.update();
+
+      return true;
+   onError(erru)  
+      errmsg = "onError: " + erru.message + " (модуль " + erru.module + ", строка " + erru.line + ")";
+      SetDialogFlag(1);
+      return false;
+   end;
+
+
+
+   macro createProcessList()
+      var query = "     declare                                          " +
+                  "       operdate date := ?;                            " +
+                  "       processtype integer := ?;                      " +
+                  "     begin                                            " +
+                  "         merge into dprocess_u_dbt p                  " +
+                  "         using                                        " +
+                  "         (select t_subtype, t_num, t_isfinish, t_name " +
+                  "          from (                                      ";
+
+      var i = 1;
+      for(var oneTask, tasks)
+         query = query + "select "+oneTask.subType+" t_subtype,  "+oneTask.num+" t_num, "+iif(oneTask.state == strFor(0),"chr(0)","'"+oneTask.state+"'")+" t_isfinish, '"+oneTask.name+"' t_name from dual";
+
+         if(i != tasks.size)
+            query = query + " union all ";
+            i = i + 1;
+         end;
+      end;
+      
+      query = query + " )) p_new                                                                                                                                                     " +
+                      "         on (p.t_type = processtype and                                                                                                                       " +
+                      "             p.t_operdate = operdate and                                                                                                                      " +
+                      "             p.t_subtype = p_new.t_subtype)                                                                                                                   " +
+                      "         when not matched then                                                                                                                                " +
+                      "           insert values(processtype, operdate, p_new.t_subtype, p_new.t_num, p_new.t_name, 0, 'Не обработан', p_new.t_isfinish, 0, 0, 0, chr(1), 0, chr(1), null, null); " +
+                      " end;                                                                                                                                                         ";
+
+      var exec = RsdCommand(query);
+      exec.AddParam("operdate", RSDBP_IN, operDate);
+      exec.AddParam("processtype", RSDBP_IN, processtype);
+      exec.Execute();
+   end;
+
+   var SaveNum = 0;
+   var inprocess = false;
+   var inprocessprogress;
+   macro eRunProcessDialog(rs, cmd, id, key)
+      var errmsg;
+
+      if(cmd == DLG_INIT)
+         /** Позиционируемся */
+         if(SaveNum > 0)
+            while(rs.movenext)
+               if(SaveNum == rs.value("t_num"))
+                  GoToScroll(rs);
+                  break;
+               end;
+            end;
+         end;
+
+         /** Регистрируем групповую обработку */
+         AddMultiAction(rs, 316/*F2*/);
+         AddMultiAction(rs, 322/*F8*/);
+
+      elif(cmd == DLG_KEY)
+         /** Esc */
+         if(key == 27)
+            return CM_CANCEL;
+         
+         /** F2 */
+         elif(key == 316)
+            if(msgboxex("Выполнить обработку процесса '" + rs.value("t_name") + "'?", MB_YES + MB_NO, IND_YES) == IND_YES)
+              executeTask(rs.value("t_subtype"), @rs);
+              updatescroll(rs, 5);
+            end;
+            return CM_IGNORE;
+         
+         /** Enter */
+         elif(key == 13)
+            showTaskResult(rs.value("t_subtype"), @rs); 
+            return CM_IGNORE;
+
+         /** F5 */
+         elif(key == 319)
+            if(rs.value("t_isfinish") == "")
+               rs.edit();
+               rs.value("t_isfinish") = "S";
+               rs.update();
+
+               updatescroll(rs, 5);
+            elif(rs.value("t_isfinish") == "S")
+               rs.edit();
+               rs.value("t_isfinish") = "";
+               rs.update();
+
+               updatescroll(rs, 5);
+            else
+               msgboxex("Пропустить можно только не обработанный процесс|Необходимо удалить обработку процесса");
+            end;
+         
+         /** F8 */
+         elif(key == 322)
+            if(rs.value("t_isfinish") == "")
+               msgboxex("Процесс '" + rs.value("t_name") + "' не обработан");
+            elif(msgboxex("Удалить обработку процесса '" + rs.value("t_name") + "'?", MB_YES + MB_NO, IND_YES) == IND_YES)
+               if(not deleteTaskResult(@rs, @errmsg))
+                  updatescroll(rs, 5);
+                  msgboxex("Ошибка при удалении обработки процесса '" + rs.value("t_name") + "'|" + errmsg);
+               else
+                  updatescroll(rs, 5);
+               end;
+            end;
+
+            return CM_IGNORE;
+         elif((key == 18/*Ctrl+R*/) or (key == 0))
+            SaveNum = rs.value("t_num");
+            return CM_SELECT;
+         end;
+
+      /** Старт обработки выделенных записей */
+      elif(cmd == DLG_MSELSTART)
+         /** F2 */
+         if(key == 316)
+            if(msgboxex("Выполнить обработку выделеных процессов?", MB_YES + MB_NO, IND_YES) == IND_YES)
+               inprocess = true;
+               inprocessprogress = 0;
+               InitProgress(int(GetMultiCount()), "Ждите...", "Выполнение процессов");
+            end;
+
+         /** F8 */
+         elif(key == 322)
+            if(msgboxex("Удалить обработку выделеных процессов?", MB_YES + MB_NO, IND_YES) == IND_YES)
+               inprocess = true;
+               inprocessprogress = 0;
+               InitProgress(int(GetMultiCount()), "Ждите...", "Удаление обработки процессов процессов");
+            end;
+
+
+
+         /** Ctrl+R */
+         elif(key == 18)
+            SaveNum = rs.value("t_num");
+            return CM_SELECT;
+         end;
+
+      /** Завершение обработки выделенных записей */
+      elif(cmd == DLG_MSELEND)
+         /** F2 */
+         if(key == 316)
+            if(inprocess)
+               inprocess = false;
+               RemProgress();
+               //SendNotification(SendWithManual);
+               msgboxex("Выполнение процессов завершено");
+            end;
+         
+         /** F8 */
+         elif(key == 322)
+            if(inprocess)
+               inprocess = false;
+               RemProgress();
+               msgboxex("Удаление обработки процессов завершено");
+            end;
+         end;
+
+      /** Обработка очередной выделенной записи */
+      elif(cmd == DLG_MSEL)
+         if(inprocess)
+            /** F2 */
+            if(key == 316)
+               if(rs.value("t_isfinish") == "")
+                  if(not executeTask(rs.value("t_subtype"), @rs, @errmsg))
+                     updatescroll(rs, 5);
+                     RemProgress();
+                     msgboxex("Ошибка при обработке процесса '" + rs.value("t_name") + "'|"+errmsg);
+                     //SendNotification(SendWithManual);
+
+                     return CM_MSEL_STOP_CLEAR;
+                  else
+                     updatescroll(rs, 5);
+                     inprocessprogress = inprocessprogress + 1;
+                     UseProgress(inprocessprogress);
+                  
+                     return CM_MSEL_CONT_CLEAR;               
+                  end;
+               elif(rs.value("t_isfinish") == "S")
+                  inprocessprogress = inprocessprogress + 1;
+                  UseProgress(inprocessprogress);
+                  return CM_MSEL_CONT_CLEAR;
+               else
+                  RemProgress();
+                  //SendNotification(SendWithManual);
+                  msgboxex("Ошибка при обработке процесса '" + rs.value("t_name") + "'|Процесс обрабатывался ранее");
+                  return CM_MSEL_STOP_CLEAR;
+               end;
+            
+            /** F8 */
+            elif(key == 322)
+              if(not deleteTaskResult(@rs, @errmsg))
+                updatescroll(rs, 5);
+                RemProgress();
+                msgboxex("Ошибка при удалении обработки процесса '" + rs.value("t_name") + "'|"+errmsg);
+                return CM_MSEL_STOP_CLEAR;
+              else
+                updatescroll(rs, 5);
+                inprocessprogress = inprocessprogress + 1;
+                UseProgress(inprocessprogress);
+                return CM_MSEL_CONT_CLEAR;
+              end;
+            end;
+
+         end;
+      end;
+   end;
+
+   macro show()
+      var rsScroll;
+      rsScroll = GetProcessRecordSet(operdate, processtype);
+
+      while(RunScroll(rsScroll, 11, MakeArray("t_num",          "№",                 2, 2,  -1, 0,
+                                             "t_isfinish",     "P",                 2, 2,  -1, 0,  
+                                             "t_name",         "Процесс",           40, 2,  2, 0, 
+                                             "t_statusname",   "Состояние",         17, 2, -1, 0, 
+                                             "t_count",        "Число обработок",   10, 2, -1, 0, 
+                                             "t_countrecs",    "Обработано",        10, 2, -1, 0, 
+                                             "t_counterrors",  "С ошибкой",         10, 2, -1, 0, 
+                                             "t_countwarning", "С предупреждением", 10, 2, -1, 0,
+                                             "t_starttime", "Начало",               20, 2, -1, 0,
+                                             "t_Endtime", "Окончание",              20, 2, -1, 0, 
+                                             "t_errmsg",       "",                  20, 2, -1, 0), 
+                      "eRunProcessDialog", R2M(this, "eRunProcessDialog"), iif(this.name == "", "Обработка операционного дня", this.name) + " " + operdate, "~F2~ Обработать ~F5~ Пропустить ~F8~ Очистить обработку ~CTRL-R~ Обновить ~Enter~ Информация ~Esc~ Выход", true))
+
+         rsScroll = GetProcessRecordSet(operdate, processtype);
+      end;
+   end;
+
+   macro execute(subtypes)
+      var cmdProcess, rsProcess, iProcess = 0;
+      var errmsg = "";
+
+      /** Все не завершенные и без признака "Пропустить" */
+      var sql = 
+      "  select *                                 "+
+      "  from dprocess_u_dbt                      "+
+      "  where t_operdate = ? and                 "+
+      "        t_type = ? and                     "+
+      "        ((t_isfinish not in ('X', 'S')) or ((t_isfinish = 'S') and ('-1' <> '"+subtypes+"'))) and   "+
+      "        (('-1' = '"+subtypes+"') or (t_subtype in ("+subtypes+")))   "+
+      "  order by t_num, t_name                   ";
+      
+      cmdProcess = RsdCommand(sql);
+      cmdProcess.AddParam("operdate", RSDBP_IN, operdate);
+      cmdProcess.AddParam("processtype", RSDBP_IN, processtype);
+      rsProcess = RSDRecordset(cmdProcess, RSDVAL_CLIENT, RSDVAL_STATIC);
+      while(rsProcess.movenext)
+         if(iProcess == 0)
+            InitProgress(int(rsProcess.RecCount), "Ждите...", "Выполнение процессов");
+         end;
+
+         if ( (rsProcess.value("t_isfinish") == "") or
+             ((rsProcess.value("t_isfinish") == "S") and (subtypes != "-1") and (ValType(subtypes) != V_UNDEF))
+            )
+           
+           if(not executeTask(rsProcess.value("t_subtype"), @rsProcess, @errmsg))
+             InsertLog("parm_break1=" + errmsg);
+             break;
+           end;
+         else
+            InsertLog("parm_break2=" + errmsg);
+            break;
+         end;
+         iProcess = iProcess + 1;
+         UseProgress(iProcess);
+      end;
+      if(iProcess > 0)
+        RemProgress();
+      end;
+
+      InsertLog("exit=" + iProcess + "=" + errmsg);
+   end;
+
+end;
+
+macro SendNotification(executor)
+   var err_reg = 0,
+       v_email_processor,
+       email_group, 
+       msg_text = "", i = 0;
+
+   if(not executor.MassSend)
+      return 0;
+   end;
+
+   GetRegistryValue("РСХБ\\ИНТЕГРАЦИЯ\\SEND_NOTIFY_BO", V_INTEGER, email_group, err_reg);
+   if(err_reg)
+      msgbox("Ошибка получение значений настроек \"РСХБ\\ИНТЕГРАЦИЯ\\SEND_NOTIFY_BO\"");
+   end;
+
+   if((not err_reg) and (email_group))
+      v_email_processor = c_email_proc_env();
+      v_email_processor.m_get_email_group(email_group);
+      v_email_processor.m_set_msg_head("СОФР - Обработка дня." + executor.name);
+                 
+      for(var oneTask, executor.tasks)
+         msg_text = "";
+
+         if(strlen(oneTask.executeErrorMessage) > 0)
+            msg_text = oneTask.executeErrorMessage + ".";
+         end;
+
+         if((oneTask.errRecs > 0) or (oneTask.wrnRecs > 0))
+            msg_text = msg_text + " В ходе выполнения операции " + oneTask.name + " Зафиксировано: ";
+            
+            if(oneTask.errRecs > 0)
+               msg_text = msg_text + oneTask.errRecs + " ошибок";
+              
+               if(oneTask.wrnRecs > 0)
+                  msg_text = msg_text + ", " + oneTask.wrnRecs + " предупреждений.";
+               else
+                  msg_text = msg_text + ".";
+               end;
+            else
+               msg_text = msg_text + oneTask.wrnRecs + " предупреждений."; 
+            end; 
+         end;
+         
+         v_email_processor.m_add_row_to_msg_text(msg_text);  
+         msg_text = ""; 
+      end;
+
+      v_email_processor.m_save_to_submit_grp(email_group, true);
+      v_email_processor.m_submit_email_synch();
+   end;
+
+onerror(err)
+   return 0;
+end;
+
+macro runAutoProcessPFIS()
+   var OnDateStr, OnDate, ProcessType = 5, dialogFlag, opernum, subtypes = "-1";
+
+   if(not GetCmdLineParm("subtypes", subtypes, V_STRING))
+      subtypes = "-1";
+   end;
+
+   if(IsShedulerRunning())
+
+      if(not GetCmdLineParm("date", OnDateStr, V_STRING))
+         OnDate = {curdate};
+      else
+         if(OnDateStr == "{operday}")
+            OnDate = {curdate};
+         else
+            OnDate = date(OnDateStr);
+         end;
+      end;
+
+      /** Переопределение dt */
+      if(GetDateAfterWorkDays(OnDate, 0) != date()) //выходной
+         exit(1);
+      else 
+         OnDate = GetDateAfterWorkDays(date()/*OnDate*/, -1);
+      end;
+      
+      if(not GetCmdLineParm("dialogFlag", dialogFlag, V_INTEGER))
+         dialogFlag = 0;
+      end;
+
+      if(not GetCmdLineParm("subtypes", subtypes, V_STRING))
+         subtypes = "-1";
+      end;
+
+      if(not GetCmdLineParm("opernum", opernum, V_STRING))
+         operNum = {oper};
+      end;
+   else
+      dialogFlag = 1;
+      operNum = {oper};
+
+      OnDate = {curdate};
+      if(not getDate(OnDate, "Дата процедуры"))
+         msgboxex("Отказ от обработки");
+         return;
+      end;
+
+      if({curdate} != OnDate)
+         if(not getTrue(false, "Дата опер дня пользователя не совпадает с датой обработки, продолжить?"))
+            msgboxex("Отказ от обработки");
+            return;
+         end;
+      end;
+
+      if({curdate} != GetDateAfterWorkDays(Date(), -1))
+         if(not getTrue(false, "Предположительно обрабатываемый день должен быть " + GetDateAfterWorkDays(Date(), -1) + ", а опер день пользователя другой, продолжить?"))
+            msgboxex("Отказ от обработки");
+            return;
+         end;
+      end;      
+   end;
+
+   var PfisTasks = autoProcessTasks("Обработка сделок СПФИ", ProcessType, OnDate, operNum, dialogFlag);
+   PfisTasks.addTask( gateTask( PfisTasks, 1, strFor(0), "Загрузка сделок СПФИ в Шлюз",               ModuleName(), "ReceivePFIS"));
+   PfisTasks.addTask( gateTask( PfisTasks, 2, strFor(0), "Загрузка сделок с ПИ в БО",                 ModuleName(), "ProcessBoPfisDeals"));
+   PfisTasks.addTask( gateTask( PfisTasks, 3, strFor(0), "Строка графика платежей процентного свопа", ModuleName(), "ProcessBoPfisPayments"));
+   PfisTasks.addTask(dealsTask( PfisTasks, 4, strFor(0), "Старт сделок СПФИ",                         ModuleName(), "ExecDeferredPFIS"));
+   //DEF-70676 требуется поменять порядок процессов, чтобы не лезть с изменениями в subtype, просто задам кастомный номер в порядке t_num + обновлю номер в таблице
+   PfisTasks.addTask( gateTask( PfisTasks, 5, strFor(0), "Расчеты по ПФИ для внебирж. сделки",        ModuleName(), "ProcessBoPfisCalculations"), 6);
+   PfisTasks.addTask( gateTask( PfisTasks, 6, strFor(0), "Справедливая стоимость для внебирж. с ЦК",  ModuleName(), "ProcessBoPfisSS"), 5);
+   PfisTasks.addTask( gateTask( PfisTasks, 7, strFor(0), "Загрузка фиксинга процентных свопов в БО",  ModuleName(), "ProcessBoPfisFix"));
+   PfisTasks.addTask(dealsTask( PfisTasks, 8, strFor(0), "Запуск операций фиксинга",                  ModuleName(), "ExecFixingPFIS"));
+   PfisTasks.addTask(dealsTask( PfisTasks, 9, strFor(0), "Переоценка платежей по IRS/CIRS",           ModuleName(), "RunOvervalPFIS"));
+   //PfisTasks.addTask(     Task( PfisTasks, 9, "S",       "Создание операции Обработка Итогов",        ModuleName(), "CreatePFISMarketOp"));
+   //PfisTasks.addTask(dealsTask( PfisTasks, 10, strFor(0), "Исполнение сделок СПФИ",                    ModuleName(), "ExecPFIS"));
+
+   PfisTasks.createProcessList();
+   PfisTasks.massSend = false;
+
+   if(IsShedulerRunning())
+      InsertLog("parm1=" + GetShedulerCommandLine());
+      InsertLog("parm2=" + OnDate + "=" + operNum + "=" + string(dialogflag) + "=" + processtype);
+      PfisTasks.execute(subtypes);
+
+      SendNotification(PfisTasks);
+   else
+      PfisTasks.show();
+   end;
+end;
+
+// -dialogflag:1 -processtype:4 -date:19.08.2021 -subtypes:1,2
+runAutoProcessPFIS();
+exit(1);

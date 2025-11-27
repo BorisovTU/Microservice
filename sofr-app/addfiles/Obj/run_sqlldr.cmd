@@ -1,0 +1,14 @@
+@echo off
+ 
+set SQLLDR_ORACLE_HOME_TMP=%ORACLE_HOME%
+set SQLLDR_TNS_ADMIN_TMP=%TNS_ADMIN%
+ 
+set ORACLE_HOME=c:\oracle
+set TNS_ADMIN=z:\opt\sofr\odbc
+ 
+%ORACLE_HOME%\sqlldr %*
+ 
+set ORACLE_HOME=%SQLLDR_ORACLE_HOME_TMP%
+set TNS_ADMIN=%SQLLDR_TNS_ADMIN_TMP%
+ 
+exit

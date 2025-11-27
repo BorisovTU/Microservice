@@ -1,0 +1,4197 @@
+/**
+ @file loadRuData.mac
+ @brief Загрузка ценных бумаг из RuDATA
+ 
+ # menu
+ - БО ЦБ\Справочники\Ценные бумаги\Импорт ЦБ из RUDATA
+
+RU-data
+RSHB
+Комментарии:
+1. SOFR_INFO_FINTOOLREFERENCEDATA.FaceFTName - должна быть валюта номинала текстом. по факту везде "0"
+2. Эмитент ищется только по ИНН
+3. Если эмитент(субъект) не найден - проставляется "Технический эмитент"
+4. Если субъект найден, но не имеет принадлежности к эмитентам - проставляется "Технический эмитент"
+5. Валюта определяется по полю SOFR_INFO_FINTOOLREFERENCEDATA.FaceFTName_NRD. Если оно пустое, то валюта указывается "RUB"
+6. Если валюта не найдена в справочнике - работа прерывается
+7. Если не удалось определить вид ценной бумаги - предлагается выбрать из списка вручную. При отказе работа прерывается
+8. Каким значением заполнять dfininstr_dbt.t_fi_code? Сейчас туда падает ИД из рудаты
+9. Никак не обрабатывается, если бумага в буфере уже "погашена" (загружает в список открытых, как и остальные)
+  
+ # tag
+ - functional_block:Интеграция_RUdata
+ - code_type:API
+  
+ # changeLog
+ |date       |author         |tasks               |note                                                        
+ |-----------|---------------|--------------------|-------------------------------------------------------------
+ |2024.03.06 |Дылгеров Ц.В.  |DEF-62713           | Обновление "текущего" купона при несовпадении точности incomepoint
+ |2023.12.11 |Гераськина Т.В.|DEF-58098           | При добавлении/изменении кодов эмитента создается новое событие для CDI
+ |2023.11.27 |Велигжанин А.В.|DEF-56847           | Добавил логирование загрузки по каждой бумаге (иначе трудно понять, где ошибка)
+ |           |               |                    | Добавил логгирование ошибки загрузки цб (см. LoadOne)
+ |2023.11.20 |Гераськина Т.В.|CCBO-7406           | При создании эмитента ценной бумаги, если включена работа с CDI, создается 
+ |           |               |                    | событие поиска организации в CDI
+ |2023.10.04 |Велигжанин А.В.|CCBO-7605           | Насыщение кода комментариями
+ |2023.01.09 |Гераськина Т.В |                    | реорганизация загрузки эмитентов - грузятся не по каждой 
+ |           |               |                    | бумаге, а отдельно, так как список эмитентов меньше списка 
+ |           |               |                    | бумаг
+ |           |               |DEF-31994 SD8599560 | Загрузка из Рудаты после релиза сентября 
+ |           |               |DEF-35669 SD8839115 | Ручная загрузка информации из РуДата 
+ |2021.06.08 |Cherednichenko |                    | Поиск и удаление лишних рейтингов эмитентов 
+ |           |               |                    | см. DeleteBadEmitentsRatings()
+ |2021.01.28 |shev           |                    | см. UpdateGeneralRating()
+ |2019.09.16 |BPV            |                    | Научили работать с плавающим купоном, Обновлять ГНУ, 
+ |           |               |                    | Возвращать ошибку 
+ |2018.12.07 |А.Киселев      |                    | безынтерфейсная загрузка RUData Общая информация по ценным 
+ |           |               |                    | бумагам, купоны и частичные погашения облигаций, рейтинги 
+ |           |               |                    | S&P, Fitch, Moody
+
+*/
+import oralib, likepy, FIInter, globals, PTInter, CTInter, cb_sql;
+import "u_common_email_utils.mac";
+import "func_lib.mac";
+import "dlquery.mac", "bnk_common.mac";
+
+private const CV_EMAIL_GRP_RUDATA = 18; //группа загрузки RUDATA
+private var isOkatoNewFunctional = Bnk_GetRegistryValue("РСХБ\\ИНТЕГРАЦИЯ\\ДОП ФУНКЦИОНАЛ ОКАТО", V_BOOL, false);
+
+
+record fininstr ("fininstr");
+record avoiriss ("avoiriss");
+record fiwarnts ("fiwarnts");
+
+const REFERENCE_PARTY_CODE = 110,
+      CODE_KIND_MMVBCODE    = 11,
+      CODE_KIND_NRDCODE     = 14,
+      CODE_KIND_CFI         = 18,
+      CODE_KIND_FIID_RUDATA = 104;
+
+
+const REZULT_COUPON_NOTETEXT = "НЕТ",
+      OBJECTTYPE_COUPON = 101,
+      OBJECT_COUPON  = 17 ,
+      OBJECT_SECURITY = 12,
+      OBJECTTYPE_SECURITY = 107;
+
+var avrinvst;
+
+//DEF-89152
+CONST RUDATA_SECURITIES_ALL_FIELDS = 
+  String("r.T_FACEVALUEFI, ",
+      "r.T_CCY, ",
+      "r.T_ISSUER, ",
+      "r.T_AVOIRKIND, ",
+      "r.T_FI_CODE, ",
+      "r.T_FI_KIND, ",
+      "r.T_NAME, ",
+      "r.T_DEFINITION, ",
+      "r.T_SETTLEMENT_CODE, ",
+      "CAST(r.T_FACEVALUE AS NUMERIC(19)) T_FACEVALUE, ",//rsd "падает" на больших значениях в поле
+      "r.T_DRAWINGDATE, ",
+      "r.ISINCODE, ",
+      "r.REGCODE, ",
+      "r.T_QTY, ",
+      "r.T_NKDROUND_KIND, ",
+      "r.T_INCOMETYPE, ",
+      "r.T_NKDBASE_KIND, ",
+      "r.T_INCIRCULATIONDATE, ",
+      "r.T_TYPE, ",
+      "r.ISSUERINN, ",
+      "r.ISSUERUID, ",
+      "r.T_ISSUED, ",
+      "r.T_ENDPLACEMENTDATE, ",
+      "r.T_FIID, ",
+      "r.FINTOOLID, ",
+      "r.T_LSIN, ",
+      "r.T_ISSUERID, ",
+      "r.NOTRESIDENT, ",
+      "r.CFI, ",
+      "r.T_ATTR_CODE, ",
+      "r.OGRN, ",
+      "r.T_ISDRAWING, ",
+      "r.NRDCODE, ",
+      "r.TIN, ",
+      "r.ISSUER_NRD, ",
+      "r.SWIFT, ",
+      "r.LEI_CODE, ",
+      "r.T_BEGPLACEMENTDATE, ",
+      "r.FINTOOLTYPE, ",
+      "r.SECURITYTYPE, ",
+      "r.ISSUER_INTERFAX, ",
+      "r.COUPONTYPE, ",
+      "r.COUPON_TYPE, ",
+      "r.STATE_REG_NUMBER, ",
+      "r.IS_SUBORDINATED, ",
+      "r.BASE_DR_FI, ",
+      "r.INDEXNOM, ",
+      "r.HAVEDEFAULT, ",
+      "r.KPP, ",
+      "r.SECURITYKIND, ",
+      "r.DRQTY, ",
+      "r.SHQTY, ",
+      "r.SESSION_GUID, ",
+      "r.NUMBER_PACK, ",
+      "r.STATUS, ",
+      "r.DRAWINGDATE_FM, ",
+      "r.FUNCOBJID, ",
+      "r.T_ID"
+  );
+
+/**
+@brief 		Возвращает идентификатор финансового инструмента для ц\б
+@param[in] 	BaseID isin ценной бумаги
+@return 	идентификатор ФИ
+*/
+macro GetBaseFiid(BaseID)
+  var rs = ExecSQLSelect("SELECT C.T_FIID FROM davoiriss_dbt C WHERE C.T_ISIN = ? AND C.T_SPISCLOSED <> CHR (88)",
+                         MakeArray(SQLParam("isin", BaseID)),
+                         false);
+   if(rs.MoveNext())
+    return SQL_ConvTypeInteger(rs.value("T_FIID"));
+  end;
+  return 0;
+end;
+
+/**
+@brief временные таблицы для загрузки рейтинга эмитентов
+*/
+private macro CheckCreateTable()
+   var sql = "declare " +
+        " retval number := 0; " +
+        " sql_cur varchar2(4000); " +
+        "begin " +
+        " sql_cur := 'CREATE GLOBAL TEMPORARY TABLE USR_RUDATA_EMITENT ( "+
+        "   LAST           VARCHAR2(255 CHAR), "+
+        "   DT             DATE, "+
+        "   RATING_ID      VARCHAR2(32 BYTE), "+
+        "   INN            VARCHAR2(100 CHAR), "+
+        "   T_PARTYID      NUMBER(10)    NOT NULL, "+
+        "   LEI            VARCHAR2(255 CHAR), "+
+        "   T_ATTRID       NUMBER, "+
+        "   T_PARENTID     NUMBER(10), "+
+        "   RATING_AGENCY  VARCHAR2(255 CHAR), "+
+        "   PREV           VARCHAR2(255 CHAR), "+
+        "   RATING_CODE    VARCHAR2(255 CHAR) "+
+        "  ) "+
+        "  ON COMMIT PRESERVE ROWS'; "+
+        " select count(1) into retval from user_tables where upper (table_name) = upper('USR_RUDATA_EMITENT'); " +
+        " if retval = 0 then " +
+        "  execute immediate (sql_cur); " +
+        " end if;  " +
+        " sql_cur := 'CREATE GLOBAL TEMPORARY TABLE USR_RUDATA_LIST_EMITENT ( "+
+        "  PARTYID    NUMBER(10)    NOT NULL, "+
+        "  ISSUERUID  NUMBER(19) "+
+        "  ) "+
+        "  ON COMMIT PRESERVE ROWS'; "+
+        " select count(1) into retval from user_tables where upper (table_name) = upper('USR_RUDATA_LIST_EMITENT'); " +
+        " if retval = 0 then " +
+        "  execute immediate (sql_cur); " +
+        "  execute immediate 'CREATE INDEX USR_RUDATA_LIST_EMITENT_IDX1 ON USR_RUDATA_LIST_EMITENT(PARTYID)'; "+
+        " end if;  " +
+        "end; " ;
+   var cmd = RSDCommand(sql);
+   cmd.execute;
+   cmd.close;
+onError(err)
+   var ErrText = err.message + getFullCmdErrorText(cmd);
+   RunError(ErrText);
+end;
+
+/**
+@brief 			Логгирование сообщения
+@param[in] p_text       Сообщение для записи в лог
+*/
+macro AddLog_it(p_text)
+   var cmd;
+   cmd = RSDCommand("begin it_log.log_handle('loadRuData.mac',:p_text,it_log.C_MSG_TYPE__DEBUG); end;");
+   cmd.AddParam("p_text", RSDBP_IN, p_text);
+   cmd.execute;
+   cmd.close;
+end;
+
+macro AddEventError_it(p_text,p_ServiceName)
+   var cmd;
+   cmd = RSDCommand("begin it_event.RegisterError(p_SystemId => 'RUDATA',"+
+                        " p_ServiceName => :p_ServiceName,"+
+                        " p_ErrorCode => 100,"+
+                        " p_ErrorDesc => :p_text,"+
+                        " p_LevelInfo => 3); end;");
+   cmd.AddParam("p_ServiceName", RSDBP_IN, p_ServiceName);
+   cmd.AddParam("p_text", RSDBP_IN, p_text);
+   cmd.execute;
+   cmd.close;
+end;
+
+/**
+@brief 		Поиск и удаление лишних рейтингов эмитентов
+*/
+macro DeleteBadEmitentsRatings()
+
+  var Params :TArray,
+      DataSet :RsdRecordset,
+      Query :string = "";
+
+  var Params1 :TArray,
+      Query1 :string = "";
+
+// DEF-35669, DEF-31994
+
+   Query="SELECT distinct  t_partyid, t_objecttype, t_codekind, t_code FROM (                         "+
+         " WITH true_code as                                                                          "+
+         "          ( select c.t_codekind,:ObjTypeRating as t_ObjTypeRating, :ListId as t_ListId,     "+
+         "                      SUBSTR(C.T_CODE, 1, CASE WHEN INSTR(C.T_CODE, '/') > 0 THEN           "+
+         "                   INSTR(C.T_CODE, '/') - 1 ELSE LENGTH(C.T_CODE) END ) t_code,             "+
+         "                      c.t_objectid t_partyid, c.t_objecttype                                "+
+         "            from  dobjcode_dbt C, dpartyown_dbt partyown                                    "+
+         "           where c.t_objecttype = 3 and c.t_state = 0 and c.t_codekind in (16,106,107)      "+
+         "              AND partyown.T_PARTYKIND = :PartyOwn AND c.T_OBJECTID = partyown.T_PARTYID    "+
+         "           )                                                                                "+
+         " SELECT true_code.t_partyid, true_code.t_objecttype, true_code.t_codekind, true_code.t_code "+
+         "   FROM sofr_rating_ratingshistory A, true_code, dllvalues_dbt rating                       "+
+         "  WHERE A.RATING_OBJECT_TYPE = true_code.t_ObjTypeRating                                    "+
+         "    AND to_char(rating.T_ELEMENT) = A.RATING_ID AND rating.T_LIST = true_code.t_ListId      "+
+         "    AND true_code.T_CODEKIND = 16 and true_code.T_CODE = A.INN                              "+
+         "     UNION                                                                                  "+
+         " SELECT true_code.t_partyid, true_code.t_objecttype, true_code.t_codekind, true_code.t_code "+
+         "   FROM sofr_rating_ratingshistory A, true_code, dllvalues_dbt rating                       "+
+         "  WHERE A.RATING_OBJECT_TYPE = true_code.t_ObjTypeRating                                    "+
+         "    AND to_char(rating.T_ELEMENT) = A.RATING_ID AND rating.T_LIST = true_code.t_ListId      "+
+         "    AND true_code.T_CODEKIND = 107 and true_code.T_CODE = A.INN                             "+
+         "     UNION                                                                                  "+
+         " SELECT true_code.t_partyid, true_code.t_objecttype, true_code.t_codekind, true_code.t_code "+
+         "   FROM sofr_rating_ratingshistory A, true_code, dllvalues_dbt rating                       "+
+         "  WHERE A.RATING_OBJECT_TYPE = true_code.t_ObjTypeRating                                    "+
+         "    AND to_char(rating.T_ELEMENT) = A.RATING_ID AND rating.T_LIST = true_code.t_ListId      "+
+         "    AND true_code.T_CODEKIND = 106 and true_code.T_CODE = A.FININSTID                       "+
+         "  ) a                                                                                       "+
+         " WHERE EXISTS (select 1 from dobjatcor_dbt obj where obj.t_objecttype = a.t_objecttype      "+
+         "                 and obj.t_object = lpad(a.t_partyid, 10,'0') and obj.t_groupid = :groupid) ";
+   Params = Null;
+   DataSet = Null;
+
+   Params = makeArray(  SQLParam("ObjTypeRating", "Компания"),
+                        SQLParam("ListId", 5004),
+                        SQLParam("PartyOwn", 5),
+                        SQLParam("groupid", 19) );
+
+   DataSet = execSQLselect( Query, Params );
+
+   Query1 = " DECLARE                                                                                       "+
+            "   v_ObjectType  number(10) := :p_ObjectType;                                                  "+
+            "   v_GroupId  number(10) := :p_GroupId;                                                        "+
+            "   v_PartyId   number(10) := :p_PartyId;                                                       "+
+            "   v_List   number(10) := :p_List;                                                             "+
+            "   v_CodeKind  number(10) := :p_CodeKind;                                                      "+
+            "   v_code   varchar2(35 byte) := :p_code;                                                      "+
+            "   TYPE del_atcor_rec IS RECORD (                                                              "+
+            "      t_deldate        DATE,                                                                   "+
+            "      t_partyid        NUMBER(10),                                                             "+
+            "      t_raiting        VARCHAR2(60 BYTE),                                                      "+
+            "      t_validfromdate  DATE,                                                                   "+
+            "      t_note           VARCHAR2(2000 BYTE),                                                    "+
+            "      t_id             NUMBER(10) );                                                           "+
+            "   TYPE del_atcor_t IS TABLE OF del_atcor_rec                                                  "+
+            "   INDEX BY PLS_INTEGER;                                                                       "+
+            "   v_del_atcor del_atcor_t;                                                                    "+
+            "BEGIN                                                                                          "+
+            "   SELECT SYSDATE, a1.t_object, b1.t_name, a1.t_validfromdate, '', a1.t_id                     "+
+            "     BULK COLLECT INTO v_del_atcor                                                             "+
+            "     FROM dobjatcor_dbt a1, dobjattr_dbt b1                                                    "+
+            "    WHERE a1.t_objecttype = v_ObjectType                                                       "+
+            "      AND a1.t_objecttype = b1.t_objecttype                                                    "+
+            "      AND a1.t_groupid = v_GroupId                                                             "+
+            "      AND a1.t_groupid = b1.t_groupid                                                          "+
+            "      AND a1.t_attrid = b1.t_attrid                                                            "+
+            "      AND a1.t_object = LPAD (TO_CHAR (v_PartyId), 10, '0')                                    "+
+            "      AND a1.t_id NOT IN (                                                                     "+
+            "         SELECT a.t_id                                                                         "+
+            "           FROM dobjatcor_dbt a,                                                               "+
+            "                dobjattr_dbt b,                                                                "+
+            "                sofr_rating_ratingshistory c                                                   "+
+            "          WHERE a.t_objecttype = a1.t_objecttype                                               "+
+            "            AND a.t_objecttype = b.t_objecttype                                                "+
+            "            AND a.t_groupid = a1.t_groupid                                                     "+
+            "            AND a.t_groupid = b.t_groupid                                                      "+
+            "            AND a.t_attrid = b.t_attrid                                                        "+
+            "            AND a.t_object = a1.t_object                                                       "+
+            "            AND c.rating_id IN (SELECT to_char(t_element) FROM dllvalues_dbt                   "+
+            "                                 WHERE t_list = v_List)                                        "+
+            "            AND b.t_name = c.LAST AND a.t_validfromdate = c.dt                                 "+
+            "            AND decode(v_CodeKind, 16, c.inn, 106, c.fininstid, 107, c.inn, c.inn) = v_code);  "+
+            "   if v_del_atcor.count > 0 then                                                               "+
+            "      FORALL i IN v_del_atcor.FIRST .. v_del_atcor.LAST                                        "+
+            "         INSERT INTO udelrat_dbt (t_deldate, t_partyid, t_raiting, t_validfromdate, t_note)    "+
+            "         VALUES (v_del_atcor(i).t_deldate, v_del_atcor(i).t_partyid, v_del_atcor(i).t_raiting, "+
+            "                 v_del_atcor(i).t_validfromdate, v_del_atcor(i).t_note);                       "+
+            "      FORALL i IN v_del_atcor.FIRST .. v_del_atcor.LAST                                        "+
+            "         DELETE FROM dobjatcor_dbt                                                             "+
+            "          WHERE t_id = v_del_atcor(i).t_id;                                                    "+
+            "   end if;                                                                                     "+
+            "end;                                                                                           ";
+
+   while ( DataSet.MoveNext )
+      Params1 = Null;
+      Params1 = makeArray( SQLParam("p_ObjectType", 3),
+                           SQLParam("p_GroupId", 19),
+                           SQLParam("p_PartyId", DataSet.value("t_partyid")),
+                           SQLParam("p_List", 5004),
+                           SQLParam("p_CodeKind", DataSet.value("t_codekind")),
+                           SQLParam("p_Code", DataSet.value("t_code")));
+
+      execSQL( Query1, Params1 );
+      Params1 = Null;
+  end;
+
+onError(err)
+
+ Params = Null;
+ Params1 = Null;
+
+end;
+
+/**
+@brief 			Возвращает группу налогового учета
+@param[in] fininstr     Буфер финансового инструмента
+@param[in] avoiriss     Буфер ценной бумаги
+@param[in] avrinvst     Буфер инвестиционного пая
+@return 		группа налогового учета
+*/
+MACRO ОпределитьГНУ_2( fininstr, avoiriss, avrinvst ):INTEGER
+  VAR ГНУ = 0;
+  var AvrKind, IncomeType, NominalFIID, IndexNom, BegDate = Date(0,0,0);
+  
+  AvrKind    = fininstr.AvoirKind;
+  IncomeType = avoiriss.IncomeType;
+  IndexNom   = avoiriss.IndexNom;
+
+  // ------------------------------------------------------------------------------------------------
+  //  SGS  11.07.2019. Сурен. 
+   if (IncomeType == 0)   // Если не проставлен вид дохода, считаем его дисконтным.
+      IncomeType=1;
+   end;
+  // ------------------------------------------------------------------------------------------------
+
+
+  NominalFIID = fininstr.FaceValueFI;
+  if(FI_IsISU(fininstr))
+    NominalFIID = avrinvst.FormValueFIID;
+  end;
+
+  //минимальная из дат выпуска,  ввода в обращение и начала размещения
+  if ((fininstr.Issued != null) AND (fininstr.Issued != Date(0,0,0)))
+     BegDate = fininstr.Issued;
+  end;
+  if ((avoiriss.InCirculationDate != null) AND (avoiriss.InCirculationDate != Date(0,0,0)))
+     if (avoiriss.InCirculationDate < BegDate)
+        BegDate = avoiriss.InCirculationDate;
+     end;
+  end;
+  if ((avoiriss.BegPlacementDate != null) AND (avoiriss.BegPlacementDate != Date(0,0,0)))
+     if (avoiriss.BegPlacementDate < BegDate)
+        BegDate = avoiriss.BegPlacementDate;
+     end;
+  end;
+
+  if( (IndexNom == "") AND FI_AvrKindsEQ( FIKIND_AVOIRISS, AVOIRISSKIND_BOND_OFZ, AvrKind ) )
+     ГНУ = 1  ;/*ОФП   */ 
+  elif( FI_AvrKindsEQ( FIKIND_AVOIRISS, AVOIRISSKIND_BOND_GKO, AvrKind ) )
+     ГНУ = 2  ;/*ОФД   */ 
+  elif( (IncomeType == FI_INCOME_TYPE_PERCENT) AND FI_AvrKindsEQ( FIKIND_AVOIRISS, AVOIRISSKIND_BOND_PARTY_BOND, AvrKind ) )
+     ГНУ = 3  ;/*ОСФП  */ 
+  elif( (IncomeType ==  FI_INCOME_TYPE_DISCOUNT) AND FI_AvrKindsEQ( FIKIND_AVOIRISS, AVOIRISSKIND_BOND_PARTY_BOND, AvrKind ) )
+     ГНУ = 4  ;/*ОСФД  */ 
+  elif( (IncomeType == FI_INCOME_TYPE_PERCENT) AND FI_AvrKindsEQ( FIKIND_AVOIRISS, AVOIRISSKIND_BOND_MUNICIPAL_BOND, AvrKind ) )
+     ГНУ = 5  ;/*ОМП15 */ 
+  elif( (IncomeType ==  FI_INCOME_TYPE_DISCOUNT) AND FI_AvrKindsEQ( FIKIND_AVOIRISS, AVOIRISSKIND_BOND_MUNICIPAL_BOND, AvrKind ) )
+     ГНУ = 6  ;/*ОМД15 */ 
+  elif( (IndexNom == "X") AND (IncomeType == FI_INCOME_TYPE_PERCENT) AND
+        ( FI_AvrKindsEQ( FIKIND_AVOIRISS, AVOIRISSKIND_BOND_CORPORATE_BOND, AvrKind ) OR
+          FI_AvrKindsEQ( FIKIND_AVOIRISS, AVOIRISSKIND_BOND_OBR, AvrKind )
+        )
+      )
+     ГНУ = 25  ;/*ОИН */  
+  elif( (NominalFIID == NATCUR) AND 
+        (IncomeType == FI_INCOME_TYPE_PERCENT) AND 
+        ( FI_AvrKindsEQ( FIKIND_AVOIRISS, AVOIRISSKIND_BOND_CORPORATE_BOND, AvrKind ) OR
+          FI_AvrKindsEQ( FIKIND_AVOIRISS, AVOIRISSKIND_BOND_OBR, AvrKind )
+        ) AND ((avoiriss.BegPlacementDate >= date(1, 1, 2017)) and (avoiriss.BegPlacementDate <= date(31, 12, 2021)))
+      )
+     ГНУ = 17  ;/*ОКЛПД */
+  elif( (IncomeType == FI_INCOME_TYPE_PERCENT) AND
+        ( FI_AvrKindsEQ( FIKIND_AVOIRISS, AVOIRISSKIND_BOND_CORPORATE_BOND, AvrKind ) OR
+          FI_AvrKindsEQ( FIKIND_AVOIRISS, AVOIRISSKIND_BOND_OBR, AvrKind )
+        )
+      )
+     ГНУ = 9  ;/*ОИН */ 
+  elif( (IncomeType ==  FI_INCOME_TYPE_DISCOUNT) AND FI_AvrKindsEQ( FIKIND_AVOIRISS, AVOIRISSKIND_BOND_CORPORATE_BOND, AvrKind ) )
+     ГНУ = 10 ;/*ОКД24 */ 
+  elif( (NominalFIID == NATCUR) AND FI_AvrKindsEQ( FIKIND_AVOIRISS, AVOIRISSKIND_SHARE, AvrKind ) )
+     ГНУ = 12 ;/*АР    */ 
+  elif( (NominalFIID == NATCUR) AND FI_AvrKindsEQ( FIKIND_AVOIRISS, AVOIRISSKIND_INVESTMENT_SHARE, AvrKind ) )
+     ГНУ = 13 ;/*ИПР   */ 
+  elif((IndexNom == "X") AND FI_AvrKindsEQ( FIKIND_AVOIRISS, AVOIRISSKIND_BOND_OFZ, AvrKind ))
+     ГНУ = 15 ;/*ОФЗИН */
+  elif( (NominalFIID == NATCUR) AND FI_IsDeposReceipt(fininstr) )
+     ГНУ = 22 ;/*АРИ   */
+  elif( (IncomeType ==  FI_INCOME_TYPE_PERCENT) AND
+        (NominalFIID == NATCUR) AND
+        ( FI_AvrKindsEQ( FIKIND_AVOIRISS, AVOIRISSKIND_BOND_EVRO, AvrKind ) OR
+          FI_AvrKindsEQ( FIKIND_AVOIRISS, AVOIRISSKIND_BOND_PARTY_EVRO, AvrKind ) OR
+          FI_AvrKindsEQ( FIKIND_AVOIRISS, AVOIRISSKIND_BOND_MUNICIPAL_EVRO, AvrKind ) OR
+          FI_AvrKindsEQ( FIKIND_AVOIRISS, AVOIRISSKIND_BOND_CORPORATE_EVRO, AvrKind ) OR
+          FI_AvrKindsEQ( FIKIND_AVOIRISS, AVOIRISSKIND_BOND_FOREIGN_FED, AvrKind )
+        )
+      )
+     ГНУ = 29 ;/*ОКП29   */
+  elif( FI_AvrKindsEQ( FIKIND_AVOIRISS, AVOIRISSKIND_BOND_OVVZ, AvrKind ) )
+     ГНУ = 31 ;/*ОВВЗ  */ 
+  elif( FI_AvrKindsEQ( FIKIND_AVOIRISS, AVOIRISSKIND_BOND_OGVZ, AvrKind ) )
+     ГНУ = 32 ;/*ОГВЗ  */
+  elif( (IncomeType ==  FI_INCOME_TYPE_PERCENT) AND
+        (NominalFIID != NATCUR) AND (NominalFIID != ALLFININSTR) AND
+        ( FI_AvrKindsEQ( FIKIND_AVOIRISS, AVOIRISSKIND_BOND_EVRO, AvrKind ) OR
+          FI_AvrKindsEQ( FIKIND_AVOIRISS, AVOIRISSKIND_BOND_PARTY_EVRO, AvrKind ) OR
+          FI_AvrKindsEQ( FIKIND_AVOIRISS, AVOIRISSKIND_BOND_MUNICIPAL_EVRO, AvrKind ) OR
+          FI_AvrKindsEQ( FIKIND_AVOIRISS, AVOIRISSKIND_BOND_CORPORATE_EVRO, AvrKind ) OR
+          FI_AvrKindsEQ( FIKIND_AVOIRISS, AVOIRISSKIND_BOND_FOREIGN_FED, AvrKind )
+        )
+      )
+     ГНУ = 33 ;/*ОПП */ 
+  elif( (IncomeType ==  FI_INCOME_TYPE_DISCOUNT) AND
+        (NominalFIID != NATCUR) AND (NominalFIID != ALLFININSTR) AND
+        ( FI_AvrKindsEQ( FIKIND_AVOIRISS, AVOIRISSKIND_BOND_EVRO, AvrKind ) OR
+          FI_AvrKindsEQ( FIKIND_AVOIRISS, AVOIRISSKIND_BOND_PARTY_EVRO, AvrKind ) OR
+          FI_AvrKindsEQ( FIKIND_AVOIRISS, AVOIRISSKIND_BOND_MUNICIPAL_EVRO, AvrKind ) OR
+          FI_AvrKindsEQ( FIKIND_AVOIRISS, AVOIRISSKIND_BOND_CORPORATE_EVRO, AvrKind ) OR
+          FI_AvrKindsEQ( FIKIND_AVOIRISS, AVOIRISSKIND_BOND_FOREIGN_FED, AvrKind )
+        )
+      )
+     ГНУ = 34 ;/*ОПД */
+  elif( (NominalFIID != NATCUR) AND (NominalFIID != ALLFININSTR) AND FI_AvrKindsEQ( FIKIND_AVOIRISS, AVOIRISSKIND_INVESTMENT_SHARE, AvrKind ) )                               
+     ГНУ = 35 ;/*ИПВ   */ 
+  elif( (NominalFIID != NATCUR) AND (NominalFIID != ALLFININSTR) AND FI_IsDeposReceipt(fininstr) )
+     ГНУ = 36 ;/*ДР    */ 
+  elif( (NominalFIID != NATCUR) AND (NominalFIID != ALLFININSTR) AND FI_AvrKindsEQ( FIKIND_AVOIRISS, AVOIRISSKIND_SHARE, AvrKind ) )                               
+     ГНУ = 37 ;/*АВ    */ 
+  elif(FI_IsKSU(fininstr))
+     ГНУ = 888 ;/*КСУ   */
+  elif(FI_AvrKindsEQ( FIKIND_AVOIRISS, AVOIRISSKIND_BASKET, AvrKind ))
+     ГНУ = 999;/*Корзина ц/б   */
+  end;
+
+  return ГНУ;
+END;
+
+/**
+@brief 				Добавление записи в журнал uloadRUDATAerr_log
+@param[in] Fiid     		ID финансового инструмента
+@param[in] NumCoupRUDATA     	Наименование купона ц/б
+@param[in] DrawingDateRUDATA    Дата погашения
+@param[in] FI_Code    		Код финансового инструмента
+@param[in] Mode    		Признак
+@param[in] Message    		Сообщение
+*/
+private macro AddLog( Fiid :integer, NumCoupRUDATA :string, DrawingDateRUDATA :date, FI_Code :string, Mode :string, Message ) 
+var Params :TArray,
+    DataSet :RsdRecordset,
+    Query :string = "";
+
+  Query = " DECLARE " +
+          "  p_Fiid                  dfininstr_dbt.T_FIID%TYPE := :p_Fiid; " +
+          "  p_FI_Code               sofr_bond_coupons.ID_FINTOOL%TYPE := :p_FI_Code; " +
+          "  p_NumCoupRUDATA         sofr_bond_coupons.ID_COUPON%TYPE := :p_NumCoupRUDATA; " +
+          "  p_DrawingDateRUDATA     sofr_bond_coupons.END_PERIOD%TYPE := :p_DrawingDateRUDATA; " +
+          "  p_Mode                  VARCHAR2(5) := :p_Mode; " +
+          "  p_Message               VARCHAR2(500) := :p_Message; " +
+
+          " BEGIN " +
+          
+          "  INSERT INTO uloadRUDATAerr_log " +
+          "   (SELECT p_Fiid, " +
+          "   ( SELECT T_NUMBER FROM dfiwarnts_dbt " +
+          "     WHERE T_FIID = p_Fiid " +
+          "      AND T_NUMBER = p_NumCoupRUDATA " +
+          "      AND T_ISPARTIAL = CHR (0) ) AS T_NUMBER, " +
+          "   ( SELECT T_DRAWINGDATE FROM dfiwarnts_dbt " +
+          "     WHERE T_FIID = p_Fiid " +
+          "        AND T_NUMBER = p_NumCoupRUDATA " +
+          "        AND T_ISPARTIAL = CHR (0) ) AS T_DRAWINGDATE, " +
+          "    p_FI_Code, p_NumCoupRUDATA, p_DrawingDateRUDATA, " +
+          "   ( SELECT T_ISIN FROM davoiriss_dbt " +
+          "     WHERE T_FIID = p_Fiid ) AS T_ISIN, " +
+          "   p_Mode, p_Message, sysdate " +
+          "   FROM DUAL ); " +
+          
+          " END; ";
+ 
+  Params = Null;
+  Params = makeArray( SQLParam("p_Fiid", Fiid),
+                      SQLParam("p_DrawingDateRUDATA", FI_Code),
+                      SQLParam("p_FI_Code", NumCoupRUDATA),
+                      SQLParam("p_NumCoupRUDATA", DrawingDateRUDATA),
+                      SQLParam("p_Mode", Mode),
+                      SQLParam("p_Message", Message)
+                    );
+
+  execSQL( Query, Params );
+  Params = Null;
+
+
+onError(err)
+
+ Params = Null;
+
+end;
+
+/**
+@brief 				Добавление записи в журнал uloadRUDATAerr_log
+@param[in] Fiid     		ID финансового инструмента
+@param[in] StrRating     	Строка рейтинга
+@param[in] ObjType    		Тип объекта
+@param[in] AttrId    		Идентификатор атрибута
+@param[in] ParentID    		Идентификатор предка
+*/
+private macro AddLogAttr( Fiid :integer, StrRating :string, ObjType :integer, AttrId :integer, ParentId :integer );
+var Params :TArray,
+    DataSet :RsdRecordset,
+    Query :string = "";
+
+
+  Query = " DECLARE " +
+          "  p_Fiid                  dfininstr_dbt.T_FIID%TYPE := :p_Fiid; " +
+          "  p_StrRating             uloadRUDATAerrAttr_log.T_STRRATING%TYPE := :p_StrRating; " +
+          "  p_ObjType               dobjatcor_dbt.T_OBJECTTYPE%TYPE := :p_ObjType; " +
+          "  p_AttrId                dobjatcor_dbt.T_ATTRID%TYPE := :p_AttrId; " +
+          "  p_ParentId              dobjattr_dbt.T_PARENTID%TYPE := :p_ParentId; " +
+          
+          " BEGIN " +
+          
+          "  INSERT INTO uloadRUDATAerrAttr_log " +
+          "  VALUES ( p_Fiid, p_StrRating, p_ObjType, p_AttrId, p_ParentId, null, sysdate ); " +
+          
+          " END; ";
+ 
+  Params = Null;
+  Params = makeArray( SQLParam("p_Fiid", Fiid),
+                      SQLParam("p_StrRating", StrRating),
+                      SQLParam("p_ObjType", ObjType),
+                      SQLParam("p_AttrId", AttrId),
+                      SQLParam("p_ParentId", ParentId) );
+
+  execSQL( Query, Params );
+  Params = Null;
+
+
+onError(err)
+
+ Params = Null;
+
+end;
+
+/**
+@brief 			загрузка оферт эмитента-Нашего банка
+@param[in] Fiid     		ID финансового инструмента
+@param[in] SOFR_FintoolId     	Идентификатор фин.инструмента СОФР
+@return 			Результат, если true -- успешно.
+*/
+private macro LoadOffers( Fiid :integer, SOFR_FintoolId :string ) :bool;
+var Params :TArray,
+    state :integer = 0;
+
+ Params = Null;
+ Params = makeArray( SQLParam("p_SOFR_FintoolId", SOFR_FintoolId ),
+                     SQLParam("p_Fiid", Fiid) );
+ state = execStoredFunc( "USR_PKG_IMPORT_SOFR.AddOffer", V_INTEGER, Params );
+ if( state == 0 )
+  return true;
+ else
+  return false;
+ end;
+
+onError(err)
+
+ Params = Null;
+ return false;
+
+
+end;
+
+/**
+@brief установить дату ограничения действия категории, добавить категорию, если имеются с более поздней датой действия 0 - успешно (ограничили или не нашли)
+@param[in] ObjType     		Тип объекта
+@param[in] GroupId     		Идентификатор группы
+@param[in] PartyId     		Идентификатор субъекта
+@param[in] AttrId     		Идентификатор атрибута
+@param[in] ParentAttrId		Идентификатор атрибута-родителя
+@param[in] DateRating		Дата ограничения
+@return 			1 - успешно ( добавили категорию с ограничениями дат )
+@return 			2 - ошибка
+*/
+private macro IsAttrIdDisconnectedSmart( ObjType :integer, GroupId :integer, PartyId :integer, AttrId :integer, ParentAttrId :integer, DateRating :date ) :bool
+var Params :TArray,
+    state :integer = 0;
+
+
+ Params = Null;
+ Params = makeArray( SQLParam("p_ObjType", ObjType),
+                     SQLParam("p_GroupId", GroupId ),
+                     SQLParam("p_PartyId", PartyId ),
+                     SQLParam("p_AttrId", AttrId ),
+                     SQLParam("p_ParentAttrId", ParentAttrId ),
+                     SQLParam("p_DateRating", DateRating ) );
+ state = execStoredFunc( "USR_PKG_IMPORT_SOFR.IsAttrIdDisconnectedSmart", V_INTEGER, Params );
+ if( state == 0 )
+  return true;
+ else
+  return false;
+ end;
+
+onError(err)
+
+ Params = Null;
+ return false;
+
+end;
+
+/**
+@brief установить дату ограничения действия категории, добавить категорию, если имеются с более поздней датой действия 0 - успешно (ограничили или не нашли)
+@param[in] ObjType     		Тип объекта
+@param[in] GroupId     		Идентификатор группы
+@param[in] PartyId     		Идентификатор субъекта
+@param[in] AttrId     		Идентификатор атрибута
+@param[in] ParentAttrId		Идентификатор атрибута-родителя
+@param[in] DateRating		Дата ограничения
+@return 			1 - успешно ( добавили категорию с ограничениями дат )
+@return 			2 - ошибка
+*/
+private macro IsAttrIdDisconnectedSmart2( ObjType :integer, GroupId :integer, PartyId :string, AttrId :integer, ParentAttrId :integer, DateRating :date ) :bool
+var Params :TArray,
+    state :integer = 0;
+
+ Params = Null;
+ Params = makeArray( SQLParam("p_ObjType", ObjType),
+                     SQLParam("p_GroupId", GroupId ),
+                     SQLParam("p_PartyId", PartyId ),
+                     SQLParam("p_AttrId", AttrId ),
+                     SQLParam("p_ParentAttrId", ParentAttrId ),
+                     SQLParam("p_DateRating", DateRating ) );
+ state = execStoredFunc( "USR_PKG_IMPORT_SOFR.IsAttrIdDisconnectedSmart2", V_INTEGER, Params );
+ if( state == 0 )
+  return true;
+ else
+  return false;
+ end;
+
+onError(err)
+
+ Params = Null;
+ return false;
+
+end;
+
+/**
+@brief добавляем код фин.инструмента
+@param[in] ObjType     		Тип объекта
+@param[in] CodeKind    		Вид кода
+@param[in] ObjId     		Идентификатор объекта
+@param[in] Code     		Код финансового инструмента
+@param[in] Mode			Режим добавления
+@return 			0 - статус успешного добавления
+@return 			1 - ошибка
+*/
+private macro AddFIIDCode( ObjType :integer, CodeKind :integer, ObjId :integer, Code :string, Mode :integer ) :integer
+var Params :TArray,
+    state :integer = 0;
+
+
+ if( (ValType(Mode) == V_UNDEF) or (ValType(Mode) == 26) )
+  Mode = 0;
+ end;
+
+ if ( (ObjType == 9) and (ObjId == 0) ) // DEF-44729 для фин.инструментов 0 - это ошибка инициализации, не следует устанавливать коды нац.валюте
+   return 1;
+ end;
+
+ Params = Null;
+ Params = makeArray( SQLParam("p_ObjType", ObjType), 
+                     SQLParam("p_CodeKind", CodeKind ),
+                     SQLParam("p_ObjId", ObjId),
+                     SQLParam("p_Code", Code),
+                     SQLParam("p_Mode", Mode) );
+ state = execStoredFunc( "USR_PKG_IMPORT_SOFR.AddCodeFIID", V_INTEGER, Params );
+ Params = Null;
+ return state;
+
+onError(err)
+
+ Params = Null;
+ return 1;
+
+end;
+
+/**
+@brief существование аттрибута категории с датой действия
+@param[in] ObjType     		Тип объекта
+@param[in] GroupId     		Идентификатор группы
+@param[in] PartyId     		Идентификатор субъекта
+@param[in] AttrId     		Идентификатор атрибута
+@param[in] ValidFromDt     	Дата валидации атрибута
+@return 			true - атрибут существует
+@return 			false - атрибута нет
+*/
+private macro IsAttrIdExists( ObjType :integer, GroupId :integer, PartyId :integer, AttrId :integer, ValidFromDt :date ) :bool
+var Params :TArray,
+    DataSet :RsdRecordset,
+    Query :string = "";
+
+ Query = " SELECT T_VALIDFROMDATE, T_VALIDTODATE " +
+         " FROM dobjatcor_dbt " +
+         " WHERE T_OBJECTTYPE = :ObjType " +
+         "  AND T_GROUPID = :GroupId " +
+         "  AND  T_OBJECT =  LPAD(TO_CHAR(:PartyId), 10, '0') " +
+         "  AND T_ATTRID = :AttrId " +
+         "  AND T_VALIDFROMDATE = :ValidFromDt ";
+
+ Params = Null;
+ DataSet = Null;
+
+ Params = makeArray( SQLParam("ObjType", ObjType),
+                     SQLParam("GroupId", GroupId),
+                     SQLParam("PartyId", PartyId),
+                     SQLParam("AttrId", AttrId),
+                     SQLParam("ValidFromDt", ValidFromDt) );
+
+ DataSet = execSQLselect( Query, Params );
+ if( DataSet.MoveNext )
+  return true;
+ else
+  return false;
+ end;
+
+onError(err)
+
+ Params = Null;
+ DataSet = Null;
+ return false;
+
+end;
+
+/**
+@brief существование аттрибута категории с датой действия
+@param[in] ObjType     		Тип объекта
+@param[in] GroupId     		Идентификатор группы
+@param[in] PartyId     		Идентификатор субъекта
+@param[in] AttrId     		Идентификатор атрибута
+@param[in] ValidFromDt     	Дата валидации атрибута
+@return 			true - атрибут существует
+@return 			false - атрибута нет
+*/
+private macro IsAttrIdExists2( ObjType :integer, GroupId :integer, PartyId :string, AttrId :integer, ValidFromDt :date ) :bool
+var Params :TArray,
+    DataSet :RsdRecordset,
+    Query :string = "";
+
+ Query = " SELECT T_VALIDFROMDATE, T_VALIDTODATE " +
+         " FROM dobjatcor_dbt " +
+         " WHERE T_OBJECTTYPE = :ObjType " +
+         "  AND T_GROUPID = :GroupId " +
+         "  AND  T_OBJECT =  TO_CHAR(:PartyId) " +
+         "  AND T_ATTRID = :AttrId " +
+         "  AND T_VALIDFROMDATE = :ValidFromDt ";
+
+ Params = Null;
+ DataSet = Null;
+
+ Params = makeArray( SQLParam("ObjType", ObjType),
+                     SQLParam("GroupId", GroupId),
+                     SQLParam("PartyId", PartyId),
+                     SQLParam("AttrId", AttrId),
+                     SQLParam("ValidFromDt", ValidFromDt) );
+
+ DataSet = execSQLselect( Query, Params );
+ if( DataSet.MoveNext )
+  return true;
+ else
+  return false;
+ end;
+
+onError(err)
+
+ Params = Null;
+ DataSet = Null;
+ return false;
+
+end;
+
+/**
+@brief существование атрибута к объекту простое
+@param[in] ObjType     		Тип объекта
+@param[in] GroupId     		Идентификатор группы
+@param[in] PartyId     		Идентификатор субъекта
+@return 			true - атрибут существует
+@return 			false - атрибута нет
+*/
+macro IsAttrIdExistsSimple( ObjType :integer, GroupId :integer, PartyId :integer ) :bool
+var Params :TArray,
+    DataSet :RsdRecordset,
+    Query :string = "";
+
+ Query = " SELECT A.T_ATTRID FROM dobjatcor_dbt A " +
+         " WHERE A.T_OBJECTTYPE = :ObjType " +
+         "  AND A.T_GROUPID = :GroupId " +
+         "  AND A.T_OBJECT = LPAD(TO_CHAR(:PartyId), 10, '0') " +
+         "  AND A.T_VALIDTODATE = TO_DATE('31129999','ddmmyyyy')";
+
+ Params = Null;
+ DataSet = Null;
+
+ Params = makeArray( SQLParam("ObjType", ObjType),
+                     SQLParam("GroupId", GroupId),
+                     SQLParam("PartyId", PartyId) );
+
+ DataSet = execSQLselect( Query, Params );
+ if( DataSet.MoveNext )
+  return true;
+ else
+  return false;
+ end;
+
+onError(err)
+
+ Params = Null;
+ DataSet = Null;
+ return false;
+
+end;
+
+/**
+@brief Получение AttrID кода ОКАТО
+@param[in] OKATOCode Код ОКАТО
+@return V_INTEGER AttrID найденного кода или -1
+*/
+private macro GetOKATOAttrId(OKATOCode: String): Integer
+  var sql = DL_RSDCommand("SELECT t_AttrID FROM dObjAttr_dbt WHERE t_objectType = ? AND t_groupID = ? AND t_numInList = ?");
+  sql.AddParam(OBJTYPE_PARTY);
+  sql.AddParam(PARTY_ATTR_GROUP_OKATO);
+  sql.AddParam(OKATOCode);
+  var rs = sql.Execute();
+  
+  if (rs.MoveNext())
+    return rs.attrID;
+  end;
+  
+  return -1;
+end;
+
+/**
+@brief 				Изменение основного рейтинга
+@param[in] PartyId     		Идентификатор субъекта
+*/
+private macro UpdateGeneralRating(Partyid)
+
+  var Params :TArray,
+      DataSet :RsdRecordset,
+      Query :string = "",
+      id, cmd, count;
+
+  Query = " select * from dobjatcor_dbt d " +
+          " where d.t_objecttype = 3 and d.t_groupid = 19 and d.t_object = LPAD(TO_CHAR(:PartyId), 10, '0') " +
+          " and t_general = chr(88) ";
+
+  Params = makeArray( SQLParam( "PartyId", PartyId ));  
+
+  DataSet = execSQLselect( Query, Params );
+  if( DataSet.MoveNext )
+     count = 1;
+  else
+     count = 0;
+  end;
+
+  Params = Null;  DataSet = Null;  Query = Null;
+
+  if(count == 0)
+
+    Query = " select  d.t_id from dobjatcor_dbt d " +
+            " where d.t_objecttype = 3 and d.t_groupid = 19 and d.t_object = LPAD(TO_CHAR(:PartyId), 10, '0') " +
+            " order by d.t_validfromdate desc ";
+  
+    Params = makeArray( SQLParam( "PartyId", PartyId ));  
+  
+    DataSet = execSQLselect( Query, Params );
+    if( DataSet.MoveNext )
+       id = DataSet.value("t_id");
+    end;
+  
+    Params = Null;  DataSet = Null;  Query = Null; 
+  
+    cmd = RSDCommand("update dobjatcor_dbt set t_general = chr(88) where t_id = :1");
+    cmd.AddParam(":1", RSDBP_IN, id);
+    cmd.execute();
+
+  end;
+
+end;
+
+/**
+@brief 				Проверка даты действия атрибута
+@param[in] Parentid   		Идентификатор предка
+@param[in] PartyId     		Идентификатор субъекта
+@return 			дата действия атрибута
+*/
+private macro CheckDateRating(Parentid,Partyid)
+
+var Params :TArray,
+    DataSet :RsdRecordset,
+    Query :string = "";
+
+   Query = " select  a.t_name, d.t_validfromdate from dobjatcor_dbt d " +
+           " left join dobjattr_dbt a on (a.t_attrid = d.t_attrid and a.t_objecttype = d.t_objecttype and a.t_groupid =  d.t_groupid ) " +
+           " where d.t_objecttype = 3 and d.t_groupid = 19 and d.t_object = LPAD(TO_CHAR(:PartyId), 10, '0')                           " +
+           "   and a.t_parentid = :Parentid order by d.t_validfromdate desc                                                              ";
+
+   Params = Null;
+   DataSet = Null;
+
+   Params = makeArray( SQLParam( "PartyId", PartyId ),SQLParam( "Parentid", Parentid ));  
+
+   DataSet = execSQLselect( Query, Params );
+   if( DataSet.MoveNext )
+      if(StrUpr(DataSet.value("t_name")) == "СНЯТ")
+         return date("01.01.0001");
+      else
+         return DataSet.value("t_validfromdate");
+      end;
+   else
+      return date("01.01.0002");
+   end;
+end;
+
+/**
+@brief 				Проверка рейтинга
+@param[in] PartyId     		Идентификатор субъекта
+@param[in] Rating_Agency	Рейтинговое агентство
+@param[in] Rating_Code		Рейтинговый код
+@return 			Идентификатор атрибута
+@return 			0 - атрибута нет
+*/
+private macro CheckRating( Partyid,Rating_Agency :string, Rating_Code :string ) :bool
+var Params :TArray,
+    DataSet :RsdRecordset,
+    Query :string = "",
+    Attrid : integer,
+    Rating_code_tmp:string = "";
+
+//  DEF-35669, DEF-31994 Данные уже отобраны в таблице USR_RUDATA_EMITENT
+
+   Query = "SELECT LAST, DT, RATING_ID, INN, T_PARTYID, T_ATTRID, T_PARENTID, Rating_Agency, Prev, RATING_CODE "+
+           "  FROM USR_RUDATA_EMITENT "+
+           " WHERE T_PARTYID = :partyid "+
+           "   AND RATING_AGENCY = :RATING_AGENCY "+
+           "   AND RATING_CODE != :RATING_CODE "+
+           " ORDER BY rating_agency, dt DESC ";
+
+   Params = Null;
+   DataSet = Null;
+
+   Params = makeArray( SQLParam( "PartyId", PartyId ),
+                       SQLParam( "RATING_AGENCY", Rating_Agency ),
+                       SQLParam( "RATING_CODE", Rating_Code ) );
+
+   DataSet = execSQLselect( Query, Params );
+   while( DataSet.MoveNext )
+      if(StrUpr(DataSet.value("Last")) == "СНЯТ")
+         Rating_code_tmp = DataSet.value("Rating_Code");
+      elif(Rating_code_tmp == "")
+         Attrid = DataSet.value("t_attrid");
+         return Attrid;
+      elif((Rating_code_tmp != DataSet.value("Rating_Code")) and (Rating_code_tmp != ""))
+         Attrid = DataSet.value("t_attrid");
+         return Attrid;
+      end;
+  end;
+
+  return 0;
+
+end;
+
+/**
+@brief 				Загрузка рейтинга страны
+@param[in] CountryId     	Идентификатор страны
+@param[in] PartyId     		Идентификатор субъекта
+@param[in] CatNum               Категория
+@param[in] ListNum		Классификатор
+@return 			true - загрузка успешная
+@return 			false - ошибка загрузки
+*/
+Private macro LoadRatingCountry( CountryId, PartyId , CatNum, ListNum) :bool
+var Params :TArray,
+    DataSet :RsdRecordset,
+    Query = "",
+    PartyCateg,
+    Rating_agency,
+    Rating_agency_tmp,
+    Dt,
+    FlAll :integer = 0;
+
+
+  Query = "  SELECT /*+ leading(d)*/ A.LAST, A.DT, A.RATING_ID,    " +
+          "   (SELECT E.T_ATTRID FROM dobjattr_dbt E  " +
+          "    WHERE E.T_OBJECTTYPE = 5  " +
+          "     AND E.T_GROUPID  = :GroupId  " +
+          "     AND E.T_PARENTID = D.T_FLAG  " +
+          "     AND E.T_NAME = A.LAST) AS T_ATTRID,  " +
+          "   D.T_FLAG AS T_PARENTID , A.Rating_Agency, A.Prev " +
+          "  FROM sofr_rating_ratingshistory A, dllvalues_dbt D  " +
+          "  WHERE ( A.RATING_OBJECT_TYPE = :ObjTypeRating  " +
+          "   AND A.FININSTID = :Partyid " +
+          "   AND to_char(D.T_ELEMENT) = A.RATING_ID  " +
+          "   AND D.T_LIST = :ListId  " +
+          "            )  ";
+
+  Query = Query + " order by a.rating_agency , a.dt desc  ";   
+
+
+  Params = Null;
+  DataSet = Null;
+
+  Params = makeArray( SQLParam( "GroupId", CatNum ),
+                      SQLParam( "ObjTypeRating", "Компания" ),
+                      SQLParam( "PartyId", PartyId ),
+                      SQLParam( "ListId", ListNum )
+                     ); 
+
+  DataSet = execSQLselect( Query, Params );
+  while( DataSet.MoveNext )
+  
+    dt =  DataSet.value(1, Null, V_DATE);
+
+    if( ( ValType( DataSet.value(3, Null, V_INTEGER) ) != V_UNDEF ) and
+       ( ValType( DataSet.value(3, Null, V_INTEGER) ) != 26 ) and
+       ( not IsAttrIdExists( 5, CatNum, CountryId, DataSet.value(3, Null, V_INTEGER), dt ) ) and
+       ( IsAttrIdDisconnectedSmart( 5, CatNum, CountryId, DataSet.value(3, Null, V_INTEGER), DataSet.value(4, Null, V_INTEGER),
+           dt ) ) )
+     
+     PartyCateg = Null;
+     PartyCateg = RsbObjCategories( 5, mkStr("0", 10-StrLen(string(CountryId))) + string(CountryId) );
+     PartyCateg.ConnectAttr( CatNum, DataSet.value(3, Null, V_INTEGER), null, null, dt);
+     PartyCateg.Save(mkStr("0", 10-StrLen(string(CountryId))) + string(CountryId));
+     PartyCateg = Null;
+
+     AddLogAttr( CountryId, DataSet.value("LAST", Null, V_STRING), 3, DataSet.value("T_ATTRID", Null, V_INTEGER), DataSet.value("T_PARENTID", Null, V_INTEGER) );
+
+    end;
+
+  end;
+
+  return true;
+
+onError(err)
+
+ Params = Null;
+ DataSet = Null;
+ return false;
+
+End;
+
+/**
+@brief 				Загрузка рейтинга страны по оценке Moodys
+@param[in] CountryId     	Идентификатор страны
+@param[in] PartyId     		Идентификатор субъекта
+@param[in] CatNum               Категория
+@param[in] ListNumNotKo		
+@param[in] ListNumKo
+@return 			true - загрузка успешная
+@return 			false - ошибка загрузки
+*/
+Private macro LoadRatingCountryMoodys( CountryId, PartyId , CatNum, ListNumNotKo, ListNumKo) :bool
+var Params :TArray,
+    DataSet :RsdRecordset,
+    Query = "",
+    PartyCateg,
+    Rating_agency,
+    Rating_agency_tmp,
+    Dt,
+    FlAll :integer = 0, FirstStr = true, Proir;;
+
+
+  Query = "  SELECT /*+ leading(d)*/ A.LAST, A.DT, A.RATING_ID,    " +
+          "   (SELECT E.T_ATTRID FROM dobjattr_dbt E  " +
+          "    WHERE E.T_OBJECTTYPE = 5  " +
+          "     AND E.T_GROUPID  = :GroupId  " +
+          "     AND E.T_PARENTID = D.T_FLAG  " +
+          "     AND E.T_NAME = A.LAST) AS T_ATTRID,  " +
+          "   D.T_FLAG AS T_PARENTID , A.Rating_Agency, A.Prev, d.t_reserve " +
+          "  FROM sofr_rating_ratingshistory A, dllvalues_dbt D, sofr_info_emitents emi  " +
+          "  WHERE ( A.RATING_OBJECT_TYPE = :ObjTypeRating  " +
+          "   AND A.FININSTID = :Partyid " +
+          "   AND to_char(D.T_ELEMENT) = A.RATING_ID  " +
+          "   and emi.fininstid = A.FININSTID " +
+          "   AND D.T_LIST = decode( EMI.BIK , null,   :ListNumNotKo, :ListNumKo)  " +
+          "            )  ";
+
+  Query = Query + " order by d.t_reserve asc, a.rating_agency , a.dt desc  ";   
+
+
+  Params = Null;
+  DataSet = Null;
+
+  Params = makeArray( SQLParam( "GroupId", CatNum ),
+                      SQLParam( "ObjTypeRating", "Компания" ),
+                      SQLParam( "PartyId", PartyId ),
+                      SQLParam( "ListNumNotKo", ListNumNotKo ),
+                      SQLParam( "ListNumKo", ListNumKo )
+                     ); 
+
+  DataSet = execSQLselect( Query, Params );
+  FirstStr = true;
+  while( DataSet.MoveNext )
+
+    If(FirstStr)
+       Proir = DataSet.value("T_reserve");
+    end;
+       FirstStr = false;
+    If(DataSet.value("T_reserve") !=Proir)
+        continue;
+    end;
+  
+    dt =  DataSet.value(1, Null, V_DATE);
+
+    if( ( ValType( DataSet.value(3, Null, V_INTEGER) ) != V_UNDEF ) and
+       ( ValType( DataSet.value(3, Null, V_INTEGER) ) != 26 ) and
+       ( not IsAttrIdExists( 5, CatNum, CountryId, DataSet.value(3, Null, V_INTEGER), dt ) ) and
+       ( IsAttrIdDisconnectedSmart( 5, CatNum, CountryId, DataSet.value(3, Null, V_INTEGER), DataSet.value(4, Null, V_INTEGER),
+           dt ) ) )
+     
+     PartyCateg = Null;
+     PartyCateg = RsbObjCategories( 5, mkStr("0", 10-StrLen(string(CountryId))) + string(CountryId) );
+     PartyCateg.ConnectAttr( CatNum, DataSet.value(3, Null, V_INTEGER), null, null, dt);
+     PartyCateg.Save(mkStr("0", 10-StrLen(string(CountryId))) + string(CountryId));
+     PartyCateg = Null;
+
+     AddLogAttr( CountryId, DataSet.value("LAST", Null, V_STRING), 3, DataSet.value("T_ATTRID", Null, V_INTEGER), DataSet.value("T_PARENTID", Null, V_INTEGER) );
+
+    end;
+
+  end;
+
+  return true;
+
+onError(err)
+
+ Params = Null;
+ DataSet = Null;
+ return false;
+
+End;
+
+
+/**
+@brief 				Загрузка рейтингов по всем странам
+*/
+macro LoadRatingAllCountrys()
+
+var Query :string = "", cmd, DataSet; 
+    Query = " select c.t_countryid, c.t_codelat3, c.t_codenum3, c.t_name, rsb_struct.getstring(n.t_text) as MainPartyId from dcountry_dbt c, dnotetext_dbt n " +
+            " where n.t_objecttype = 5 and n.t_notekind = 101 and c.t_countryid = n.t_documentid/* and c.t_countryid = 1*/";
+    cmd = RSDCommand(query);
+
+    DataSet = TRsbDataSet( cmd );
+
+    while(DataSet.moveNext())
+      LoadRatingCountry( dataset.countryid, DataSet.MainPartyId , 101, 5037);
+      LoadRatingCountry( dataset.countryid, DataSet.MainPartyId , 102, 5038);
+
+
+      LoadRatingCountryMoodys( dataset.countryid, DataSet.MainPartyId , 101, 5046, 5045);
+      LoadRatingCountryMoodys( dataset.countryid, DataSet.MainPartyId , 102, 5048, 5047);
+    end;
+
+end;
+
+/**
+@brief загрузка рейтингов эмитента
+@param[in] PartyId     		Идентификатор субъекта
+@param[in] Inn     		ИНН субъекта
+@param[in] Mass     		признак массовых действий
+@return 			true - загрузка успешная
+@return 			false - ошибка загрузки
+*/
+macro LoadRating( PartyId :integer, Inn :string, Mass :bool ) :bool
+var Params :TArray,
+    DataSet :RsdRecordset,
+    Query :string = "", Query_part1 = "", Query_part2 = "", Query_part2_0 = "", Query_part3 = "",
+    PartyCateg,
+    Rating_agency,
+    Check_Rating,
+    Rating_Code = 0,
+    Dt,
+    FlAll :integer = 0,
+    party_cur = 0, attrid_cur = 0, parentid_cur = 0, objectid_cur = "",
+    date_rating;
+
+   FlAll = 0;
+   if( (ValType(Inn) == V_UNDEF) or (ValType(Inn) == 26) )
+      Inn = "";
+   end;
+
+   if( ( ValType( PartyId ) == V_UNDEF ) or ( ValType( PartyId ) == 26 ) )
+      FlAll = 0;
+      PartyId = -1;
+   else
+      FlAll = 1;
+   end;
+
+   if( ( Inn != "" ) and ( PartyId == -1 ) );
+      FlAll = 1;
+   end;
+   
+   var cmd ;
+    
+   cmd = RSDCommand("truncate table USR_RUDATA_EMITENT");
+   cmd.execute;
+   cmd.close;
+   
+   Params = NULL;
+   Query = NULL;
+   DataSet = NULL;
+
+   Query_part1  = "  insert into USR_RUDATA_EMITENT ( last, dt, rating_id, inn, lei, rating_agency, prev, rating_code, t_partyid, t_parentid, t_attrid)  "+
+                  "  select last, dt, rating_id, inn, lei, rating_agency, prev, rating_code, t_objectid, t_parentid,                                     "+
+                  "         (SELECT E.T_ATTRID FROM dobjattr_dbt E                                                                                       "+
+                  "           WHERE E.T_OBJECTTYPE = x.T_OBJECTTYPE                                                                                      "+
+                  "             AND E.T_GROUPID  = :GroupId                                                                                              "+
+                  "             AND E.T_PARENTID = x.t_parentid                                                                                          "+
+                  "             AND E.T_NAME = x.last) AS T_ATTRID                                                                                       "+
+                  "   from (                                                                                                                             "+
+                  "     WITH true_code as                                                                                                                "+
+                  "      ( SELECT c.t_codekind, c.t_objectid, c.t_objecttype, :ObjTypeRating as t_ObjTypeRating, :ListId as t_ListId,                    "+
+                  "               SUBSTR(C.T_CODE, 1, CASE WHEN INSTR(C.T_CODE, '/') > 0 THEN INSTR(C.T_CODE, '/') - 1 ELSE LENGTH(C.T_CODE) END ) t_code"+
+                  "          FROM  dobjcode_dbt C, dpartyown_dbt partyown                                                                                "+
+                  "         WHERE c.t_objecttype = 3 and c.t_state = 0 and c.t_codekind in (16,106,107) ";
+   Query_part2 =  "           AND ( C.T_OBJECTID = :PartyId                                                                                              "+
+                  "                 OR 1 = ( CASE WHEN c.t_code = :Inn AND length(:Inn_1) > 0 THEN 1  ELSE 0  END )                                      "+
+                  "                 ) ";
+   Query_part2_0= "           AND C.T_OBJECTID in (select PartyId from USR_RUDATA_LIST_EMITENT) ";
+   Query_part3 =  "           AND partyown.T_PARTYKIND = :PartyOwn AND c.T_OBJECTID = partyown.T_PARTYID                                                 "+
+                  "       )                                                                                                                              "+
+                  "     SELECT a.last, a.dt, a.rating_id, a.inn, a.lei, a.rating_agency, a.prev, a.rating_code, true_code.t_objectid,                    "+
+                  "            rating.t_flag as t_parentid, true_code.t_objecttype                                                                       "+
+                  "       FROM sofr_rating_ratingshistory A, true_code, dllvalues_dbt rating                                                             "+
+                  "      WHERE  A.RATING_OBJECT_TYPE = true_code.t_ObjTypeRating                                                                         "+
+                  "        AND true_code.T_CODEKIND = 16 AND                                                                                             "+
+                  "              (CASE WHEN (SELECT COUNT(*) FROM dllvalues_dbt D WHERE D.T_CODE = true_code.T_CODE  AND T_LIST =5027)= 1                "+
+                  "                    THEN (SELECT to_char(D.T_name) FROM dllvalues_dbt D WHERE D.T_CODE = true_code.T_CODE AND T_LIST = 5027)          "+
+                  "                    ELSE true_code.T_CODE                                                                                             "+
+                  "                END) = A.INN                                                                                                          "+
+                  "        AND to_char(rating.T_ELEMENT) = A.RATING_ID AND rating.T_LIST = true_code.t_ListId                                            "+
+                  "            UNION                                                                                                                     "+
+                  "     SELECT a.last, a.dt, a.rating_id, a.inn, a.lei, a.rating_agency, a.prev, a.rating_code, true_code.t_objectid,                    "+
+                  "            rating.t_flag as t_parentid, true_code.t_objecttype                                                                       "+
+                  "       FROM sofr_rating_ratingshistory A, true_code, dllvalues_dbt rating                                                             "+
+                  "      WHERE  A.RATING_OBJECT_TYPE = true_code.t_ObjTypeRating                                                                         "+
+                  "        AND true_code.T_CODEKIND = 107 and true_code.T_CODE = A.INN                                                                   "+
+                  "        AND to_char(rating.T_ELEMENT) = A.RATING_ID AND rating.T_LIST = true_code.t_ListId                                            "+
+                  "            UNION                                                                                                                     "+
+                  "     SELECT a.last, a.dt, a.rating_id, a.inn, a.lei, a.rating_agency, a.prev, a.rating_code, true_code.t_objectid,                    "+
+                  "            rating.t_flag as t_parentid, true_code.t_objecttype                                                                       "+
+                  "       FROM sofr_rating_ratingshistory A, true_code, dllvalues_dbt rating                                                             "+
+                  "      WHERE  A.RATING_OBJECT_TYPE = true_code.t_ObjTypeRating                                                                         "+
+                  "        AND true_code.T_CODEKIND = 106 and true_code.T_CODE = A.FININSTID                                                             "+
+                  "        AND to_char(rating.T_ELEMENT) = A.RATING_ID AND rating.T_LIST = true_code.t_ListId                                            "+
+                  "     ) x";
+
+   if (FlAll == 1)   // по одному
+      Query = Query_part1 + Query_part2 + Query_part3;
+      Params = makeArray( SQLParam( "GroupId", 19 ),
+                          SQLParam( "ObjTypeRating", "Компания" ),
+                          SQLParam( "ListId", 5004 ),
+                          SQLParam( "PartyId", PartyId ),
+                          SQLParam( "Inn", Inn ),
+                          SQLParam( "Inn_1", Inn ),
+                          SQLParam( "PartyOwn", 5 ) );
+   else // по всем
+      if (Mass)
+         Query = Query_part1 + Query_part2_0 + Query_part3;
+         Params = makeArray( SQLParam( "GroupId", 19 ),
+                             SQLParam( "ObjTypeRating", "Компания" ),
+                             SQLParam( "ListId", 5004 ),
+                             SQLParam( "PartyOwn", 5 ) );
+      
+      else 
+         Query = Query_part1 + Query_part3; 
+         Params = makeArray( SQLParam( "GroupId", 19 ),
+                             SQLParam( "ObjTypeRating", "Компания" ),
+                             SQLParam( "ListId", 5004 ),
+                             SQLParam( "PartyOwn", 7 ) );
+      end;
+   end;
+   execSQL( Query, Params );
+
+   Params = NULL;
+   Query = NULL;
+   DataSet = NULL;
+
+   Query = " SELECT LAST, DT, RATING_ID, INN, T_PARTYID, T_ATTRID, T_PARENTID, Rating_Agency, Prev, RATING_CODE "+
+           "   FROM USR_RUDATA_EMITENT "+
+           " ORDER BY rating_agency, dt desc";
+   DataSet = RSDRecordSet(Query);
+   while( DataSet.MoveNext )
+
+      if(StrUpr(DataSet.value("Last")) == "СНЯТ")
+         Rating_Code = CheckRating(Partyid,DataSet.value("Rating_Agency"),DataSet.value("Rating_Code"));
+      end;
+      
+      if ((Rating_Code != 0))
+         Rating_Code = 0;
+      else
+
+         if(StrUpr(DataSet.value("Last")) == "СНЯТ") 
+            date_rating = CheckDateRating(DataSet.value("t_Parentid"),Partyid);
+            if  ( ( date_rating != date("01.01.0001"))
+                  and (date_rating > DataSet.value("Dt")))
+               dt = {curdate};
+            else 
+               dt =  DataSet.value(1, Null, V_DATE);
+            end;
+         else
+            dt =  DataSet.value(1, Null, V_DATE);
+         end;
+
+         if( PartyId != -1 )
+            party_cur = PartyId;
+         else 
+            party_cur =  DataSet.value(4, Null, V_INTEGER);
+         end;
+         objectid_cur = String(party_cur:o:10);
+         attrid_cur = DataSet.value(5, Null, V_INTEGER);
+         parentid_cur = DataSet.value(6, Null, V_INTEGER);
+         
+         if(   ( ValType( attrid_cur ) != V_UNDEF ) and
+               ( ValType( attrid_cur ) != 26 ) and
+               ( not IsAttrIdExists( 3, 19, party_cur, attrid_cur, dt ) ) and
+               ( IsAttrIdDisconnectedSmart( 3, 19, party_cur, attrid_cur, parentid_cur, dt ) ) )
+            PartyCateg = Null;
+            PartyCateg = RsbObjCategories( 3, objectid_cur );
+            PartyCateg.ConnectAttr( 19, attrid_cur, null, null, dt);
+            PartyCateg.Save(objectid_cur);
+            PartyCateg = Null;
+     
+         end;
+
+      end;
+
+   end;
+
+  UpdateGeneralRating(partyid);
+
+  return true;
+
+onError(err)
+
+   Params = Null;
+   DataSet = Null;
+   return false;
+
+end;
+
+/**
+@brief 			загрузка рейтингов эмитента для отчетности
+@param[in] PartyId     		Идентификатор субъекта
+@param[in] fininstid   		Идентификатор финансового инструмента
+@param[in] CatNum   		Категория
+@param[in] ListNum   		Классификатор
+@param[in] isarh   		Признак архивных данных
+@return 			true - загрузка успешная
+@return 			false - ошибка загрузки
+*/
+macro LoadRatingRepNat( PartyId :integer, fininstid :string, CatNum, ListNum, isarh ) :bool
+var Params :TArray,
+    DataSet :RsdRecordset,
+    Query :string = "", Query1 = "",
+    PartyCateg,
+    Rating_agency,
+    Rating_agency_tmp,
+    Dt,
+    party_cur = 0, attrid_cur = 0, parentid_cur = 0, objectid_cur = "";
+
+   IF (fininstid != "")
+      Query =  " SELECT  /*+ leading(d)*/ A.LAST, A.DT, A.RATING_ID, A.INN, B.T_PARTYID, " +
+               "  (SELECT E.T_ATTRID FROM dobjattr_dbt E " +
+               "    WHERE E.T_OBJECTTYPE = 3 " +
+               "      AND E.T_GROUPID  = :GroupId " +
+               "      AND E.T_PARENTID = D.T_FLAG " +
+               "      AND E.T_NAME = A.LAST) AS T_ATTRID, " +
+               "  D.T_FLAG AS T_PARENTID, A.Rating_Agency, A.Prev, pown.t_partykind pown " +
+               "  FROM sofr_rating_ratingshistory A, dparty_dbt B  left join dpartyown_dbt pown on ( b.t_partyid = pown.t_partyid and pown.t_partykind = 2 ), dllvalues_dbt D " +
+               " WHERE A.RATING_OBJECT_TYPE = :ObjTypeRating " +
+               "   AND to_char(D.T_ELEMENT) = A.RATING_ID " +
+               "   AND A.FININSTID = :fininstid " +
+   //             "  AND C.T_CODEKIND = :CodeKind_2  " +
+   //             "  AND C.T_OBJECTID = B.T_PARTYID " +
+               "   AND  B.T_PARTYID = :PartyId " +
+   //             "  AND C.T_OBJECTTYPE = :ObjType " +
+   //             "  AND C.T_STATE = 0 " +
+               "   AND D.T_LIST = :ListId ";
+   ELSE
+      Query =  " SELECT  /*+ leading(d)*/ A.LAST, A.DT, A.RATING_ID, A.INN, B.T_PARTYID, " +
+               "  (SELECT E.T_ATTRID FROM dobjattr_dbt E " +
+               "   WHERE E.T_OBJECTTYPE = C.T_OBJECTTYPE " +
+               "     AND E.T_GROUPID  = :GroupId " +
+               "     AND E.T_PARENTID = D.T_FLAG " +
+               "     AND E.T_NAME = A.LAST) AS T_ATTRID, " +
+               "  D.T_FLAG AS T_PARENTID, A.Rating_Agency, A.Prev, pown.t_partykind pown " +
+               "   FROM sofr_rating_ratingshistory A, dparty_dbt B  left join dpartyown_dbt pown on ( b.t_partyid = pown.t_partyid and pown.t_partykind = 2 ), dobjcode_dbt C, dllvalues_dbt D " +
+               "  WHERE A.RATING_OBJECT_TYPE = :ObjTypeRating " +
+               "    AND to_char(D.T_ELEMENT) = A.RATING_ID " +
+               "    AND C.T_CODE = A.FININSTID " +
+               "    AND C.T_CODEKIND = :CodeKind_2  " +
+               "    AND C.T_OBJECTID = B.T_PARTYID " +
+               "    AND  B.T_PARTYID = :PartyId " +
+               "    AND C.T_OBJECTTYPE = :ObjType " +
+               "    AND C.T_STATE = 0 " +
+               "    AND D.T_LIST = :ListId ";
+   END;
+
+/*Если архивные рейтинги, то ищем на дату 01.02.2022*/
+   If (isarh)
+      Query = "select * from ( " + Query + " ) t    WHERE t.DT <= TO_DATE ('01.02.2022', 'dd.mm.yyyy') ";
+   end;
+
+   If (isarh)
+      Query = Query + " order by t.rating_agency , t.dt desc  ";
+   else
+      Query = Query + " order by a.rating_agency , a.dt desc  ";
+   end;
+
+   Params = Null;
+   DataSet = Null;
+
+   IF (fininstid != "")
+      Params = makeArray(  SQLParam( "GroupId", CatNum ),
+                           SQLParam( "ObjTypeRating", "Компания" ),
+//                         SQLParam( "CodeKind_2", 106 ),
+                           SQLParam( "fininstid", fininstid ),
+                           SQLParam( "PartyId", PartyId ),
+//                         SQLParam( "ObjType", 3 ),
+                           SQLParam( "ListId", ListNum ));  //!!!!!!!!!!!!!  реестр
+   ELSE
+      Params = makeArray(  SQLParam( "GroupId", CatNum ),
+                           SQLParam( "ObjTypeRating", "Компания" ),
+                           SQLParam( "CodeKind_2", 106 ),
+                           SQLParam( "PartyId", PartyId ),
+                           SQLParam( "ObjType", 3 ),
+                           SQLParam( "ListId", ListNum ));  //!!!!!!!!!!!!!  реестр
+   END;
+
+   DataSet = execSQLselect( Query, Params );
+   while( DataSet.MoveNext )
+
+      dt = DataSet.value(1, Null, V_DATE);
+      if( PartyId != -1 )
+         party_cur = PartyId;
+      else 
+         party_cur = DataSet.value(4, Null, V_INTEGER);
+      end;
+
+      objectid_cur = String(party_cur:o:10);
+      attrid_cur = DataSet.value(5, Null, V_INTEGER);
+      parentid_cur = DataSet.value(6, Null, V_INTEGER);
+
+      if(   ( ValType( attrid_cur ) != V_UNDEF ) and
+            ( ValType( attrid_cur ) != 26 ) and
+            ( not IsAttrIdExists( 3, CatNum, party_cur, attrid_cur, dt ) ) and
+            ( IsAttrIdDisconnectedSmart( 3, CatNum, party_cur, attrid_cur, parentid_cur, dt ) ) )
+
+         PartyCateg = Null;
+         PartyCateg = RsbObjCategories( 3, objectid_cur );
+         PartyCateg.ConnectAttr( CatNum, attrid_cur, null, null, dt);
+         PartyCateg.Save(objectid_cur);
+         PartyCateg = Null;
+
+         AddLogAttr( party_cur, DataSet.value("LAST", Null, V_STRING), 3, attrid_cur, parentid_cur );
+      end;
+   end;
+
+   return true;
+
+onError(err)
+
+   Params = Null;
+   DataSet = Null;
+   return false;
+
+end;
+
+/**
+@brief 			загрузка отчета рейтингов по данным Moodys
+@param[in] PartyId     		Идентификатор субъекта
+@param[in] fininstid   		Идентификатор финансового инструмента
+@param[in] CatNum   		Категория
+@param[in] isarh   		Признак архивных данных
+@return 			true - загрузка успешная
+@return 			false - ошибка загрузки
+*/
+macro LoadRatingRepMoodys( PartyId :integer, fininstid: string, CatNum, isarh ) :bool
+var Params :TArray,
+    DataSet :RsdRecordset,
+    Query :string = "", Query1 = "",
+    PartyCateg,
+    Rating_agency,
+    Rating_agency_tmp,
+    Dt,
+    FlAll :integer = 0, IsBank, ListNum, FirstStr = true, Proir,
+    party_cur = 0, attrid_cur = 0, parentid_cur = 0, objectid_cur = "";
+
+   if(PartyID == 618) 
+     //При изменении логики загрузки рейтинга в справочник предусмотреть исключение для эмитента ВЭБ.РФ (Корпорация ВЭБ.РФ) Код='CC0001000027' и Id=618, который в СОФР является КО. 
+     //В целях определения рейтингов "ВЭБ.РФ" анализировать как не КО
+     IsBank = false; 
+   else
+     If(ВидСубъекта(PartyId, PTK_BANK)) 
+        IsBank = true;
+     end;
+   end;
+
+   If(CatNum == 122)
+      If(IsBank)
+         If(isarh)
+            ListNum = 5049;
+         else
+            ListNum = 5045;
+         end;
+      else
+         If(isarh)
+            ListNum = 5050;
+         else
+            ListNum = 5046;
+         end;
+      end;
+   else
+      If(IsBank)
+         If(isarh)
+            ListNum = 5051;
+         else
+            ListNum = 5047;
+         end;
+      else
+         If(isarh)
+            ListNum = 5052;
+         else
+            ListNum = 5048;
+         end;
+      end;
+   end;
+   IF(fininstid != "")
+      Query = " SELECT  /*+ leading(d)*/  A.LAST, A.DT, A.RATING_ID, A.INN, B.T_PARTYID, " +
+             "  (SELECT E.T_ATTRID FROM dobjattr_dbt E " +
+             "    WHERE E.T_OBJECTTYPE = 3 " +
+             "      AND E.T_GROUPID  = :GroupId " +
+             "      AND E.T_PARENTID = D.T_FLAG " +
+             "      AND E.T_NAME = A.LAST) AS T_ATTRID, " +
+             "   D.T_FLAG AS T_PARENTID , A.Rating_Agency, A.Prev, pown.t_partykind pown, d.t_reserve " +
+             "   FROM sofr_rating_ratingshistory A, dparty_dbt B  left join dpartyown_dbt pown on ( b.t_partyid = pown.t_partyid and pown.t_partykind = 2 ), dllvalues_dbt D " +
+             "  WHERE A.RATING_OBJECT_TYPE = :ObjTypeRating " +
+             "    AND to_char(D.T_ELEMENT) = A.RATING_ID " +
+             "    AND A.FININSTID = :fininstid " +
+//             "  AND C.T_CODEKIND = :CodeKind_2  " +
+//             "  AND C.T_OBJECTID = B.T_PARTYID " +
+             "    AND B.T_PARTYID = :PartyId " +
+//             "  AND C.T_OBJECTTYPE = :ObjType " +
+//             "  AND C.T_STATE = 0 " +
+             "    AND D.T_LIST = :ListId ";
+   ELSE
+     Query = " SELECT  /*+ leading(d)*/  A.LAST, A.DT, A.RATING_ID, A.INN, B.T_PARTYID, " +
+             "  (SELECT E.T_ATTRID FROM dobjattr_dbt E " +
+             "    WHERE E.T_OBJECTTYPE = C.T_OBJECTTYPE " +
+             "      AND E.T_GROUPID  = :GroupId " +
+             "      AND E.T_PARENTID = D.T_FLAG " +
+             "      AND E.T_NAME = A.LAST) AS T_ATTRID, " +
+             "  D.T_FLAG AS T_PARENTID , A.Rating_Agency, A.Prev, pown.t_partykind pown, d.t_reserve " +
+             "   FROM sofr_rating_ratingshistory A, dparty_dbt B  left join dpartyown_dbt pown on ( b.t_partyid = pown.t_partyid and pown.t_partykind = 2 ), dobjcode_dbt C, dllvalues_dbt D " +
+             "  WHERE A.RATING_OBJECT_TYPE = :ObjTypeRating " +
+             "    AND to_char(D.T_ELEMENT) = A.RATING_ID " +
+             "    AND C.T_CODE = A.FININSTID " +
+             "    AND C.T_CODEKIND = :CodeKind_2  " +
+             "    AND C.T_OBJECTID = B.T_PARTYID " +
+             "    AND B.T_PARTYID = :PartyId " +
+             "    AND C.T_OBJECTTYPE = :ObjType " +
+             "    AND C.T_STATE = 0 " +
+             "    AND D.T_LIST = :ListId ";
+   END;
+
+/*Если архивные рейтинги, то ищем на дату 01.02.2022*/
+   If (isarh)
+      Query = "select * from ( " + Query + " ) t    WHERE t.DT <= TO_DATE ('01.02.2022', 'dd.mm.yyyy') ";
+   end;
+
+   If (isarh)
+      Query = Query + " order by (case when UPPER(t.LAST) <> 'СНЯТ' then 1 else 0 end) desc, t.t_reserve asc, t.rating_agency, t.dt desc ";   
+   else
+      Query = Query + " order by (case when UPPER(a.LAST) <> 'СНЯТ' then 1 else 0 end) desc, d.t_reserve asc, a.rating_agency, a.dt desc ";   
+   end;
+
+   Params = Null;
+   DataSet = Null;
+
+   IF(fininstid != "")
+      Params = makeArray( SQLParam( "GroupId", CatNum ),
+                          SQLParam( "ObjTypeRating", "Компания" ),
+                          SQLParam( "fininstid", fininstid ),
+                          SQLParam( "PartyId", PartyId ),
+                          SQLParam( "ListId", ListNum ));  //!!!!!!!!!!!!!  реестр
+   ELSE
+      Params = makeArray( SQLParam( "GroupId", CatNum ),
+                          SQLParam( "ObjTypeRating", "Компания" ),
+                          SQLParam( "CodeKind_2", 106 ),
+                          SQLParam( "PartyId", PartyId ),
+                          SQLParam( "ObjType", 3 ),
+                          SQLParam( "ListId", ListNum ));  //!!!!!!!!!!!!!  реестр
+   END;
+
+   DataSet = execSQLselect( Query, Params );
+   FirstStr = true;
+   while( DataSet.MoveNext )
+      If(FirstStr)
+         Proir = DataSet.value("T_reserve");
+      end;
+      FirstStr = false;
+      If(DataSet.value("T_reserve") !=Proir)
+         continue;
+      end;
+      dt = DataSet.value(1, Null, V_DATE);
+
+      if( PartyId != -1 )
+         party_cur = PartyId;
+      else 
+         party_cur = DataSet.value(4, Null, V_INTEGER);
+      end;
+
+      objectid_cur = String(party_cur:o:10);
+      attrid_cur = DataSet.value(5, Null, V_INTEGER);
+      parentid_cur = DataSet.value(6, Null, V_INTEGER);
+
+      if( ( ValType( attrid_cur ) != V_UNDEF ) and
+          ( ValType( attrid_cur ) != 26 ) and
+          ( not IsAttrIdExists( 3, CatNum, party_cur, attrid_cur, dt ) ) and
+          ( IsAttrIdDisconnectedSmart( 3, CatNum, party_cur, attrid_cur, parentid_cur, dt ) ) )
+
+         PartyCateg = Null;
+         PartyCateg = RsbObjCategories( 3, objectid_cur );
+         PartyCateg.ConnectAttr( CatNum, attrid_cur, null, null, dt);
+         PartyCateg.Save(objectid_cur);
+         PartyCateg = Null;
+
+         AddLogAttr( party_cur, DataSet.value("LAST", Null, V_STRING), 3, attrid_cur, parentid_cur );
+      end;
+
+   end;
+
+   return true;
+
+onError(err)
+
+   Params = Null;
+   DataSet = Null;
+   return false;
+
+end;
+
+/**
+@brief 			загрузка рейтингов по субъектам РУ
+@return 			true - загрузка успешная
+@return 			false - ошибка загрузки
+*/
+macro LoadRatingRepNatAll()
+var Params :TArray,
+    DataSet :RsdRecordset,
+    Query :string = "", Query1 = "",
+    PartyCateg,
+    Rating_agency,
+    Rating_agency_tmp,
+    Dt,
+    FlAll :integer = 0;
+ var Party :RsbParty;
+
+
+/* Отбор контрагентов по которым есть нужные рейтинги в РУДАТА*/
+   Query = 
+" begin "+
+"    delete from USR_RUDATA_EMITENT; "+
+
+"    /* записи могут дублироваться, distinct применим потом */ "+
+
+"    /* По ИНН */ "+
+"    insert into USR_RUDATA_EMITENT (t_partyid, lei) "+
+"    SELECT partyown.t_partyid, hist.fininstid "+
+"      FROM sofr_rating_ratingshistory hist, "+
+"           dpartyown_dbt partyown, "+
+"           dobjcode_dbt objcode, "+
+"           dllvalues_dbt lv "+
+"     WHERE hist.rating_object_type = 'Компания' "+
+"       AND lv.t_element = hist.rating_id "+
+"       AND lv.t_list in (5037, 5038, 5041, 5042, 5045, 5046, 5047, 5048, 5049, 5050, 5051, 5052) "+
+"       AND partyown.t_partykind = 7 "+
+"       AND partyown.t_partyid = objcode.t_objectid "+
+"       AND SUBSTR ( objcode.t_code, "+
+"                                  1, "+
+"                               CASE  "+
+"                                  WHEN INSTR (objcode.t_code, '/') > 0 THEN INSTR (objcode.t_code, '/') - 1  "+
+"                               ELSE LENGTH (objcode.t_code)  "+
+"                               END ) = hist.inn "+
+"       AND objcode.t_codekind = 16 "+
+"       AND objcode.t_objecttype = 3 "+
+"       AND objcode.t_state = 0; "+
+
+"    /* По LIE */ "+
+"    insert into USR_RUDATA_EMITENT (t_partyid, lei) "+
+"    SELECT partyown.t_partyid, hist.fininstid "+
+"      FROM sofr_rating_ratingshistory hist, "+
+"           dpartyown_dbt partyown, "+
+"           dobjcode_dbt objcode, "+
+"           dllvalues_dbt lv "+
+"     WHERE hist.rating_object_type = 'Компания' "+
+"       AND lv.t_element = hist.rating_id "+
+"       AND lv.t_list in (5037, 5038, 5041, 5042, 5045, 5046, 5047, 5048, 5049, 5050, 5051, 5052) "+
+"       AND partyown.t_partykind = 7 "+
+"       AND partyown.t_partyid = objcode.t_objectid "+
+"       AND objcode.t_code = hist.lei  "+
+"       AND objcode.t_codekind = 69 "+
+"       AND objcode.t_objecttype = 3 "+
+"       AND objcode.t_state = 0; "+
+
+"    /* По Коду Интерфакс */ "+
+"    insert into USR_RUDATA_EMITENT (t_partyid, lei) "+
+"    SELECT partyown.t_partyid, hist.fininstid "+
+"      FROM sofr_rating_ratingshistory hist, "+
+"           dpartyown_dbt partyown, "+
+"           dobjcode_dbt objcode, "+
+"           dllvalues_dbt lv "+
+"     WHERE hist.rating_object_type = 'Компания' "+
+"       AND lv.t_element = hist.rating_id "+
+"       AND lv.t_list in (5037, 5038, 5041, 5042, 5045, 5046, 5047, 5048, 5049, 5050, 5051, 5052) "+
+"       AND partyown.t_partykind = 7 "+
+"       AND partyown.t_partyid = objcode.t_objectid "+
+"       AND objcode.t_code = hist.fininstid  "+
+"       AND objcode.t_codekind = 106 "+
+"       AND objcode.t_objecttype = 3 "+
+"       AND objcode.t_state = 0; "+
+
+"    /* По БИН */ "+
+"    insert into USR_RUDATA_EMITENT (t_partyid, lei) "+
+"    SELECT partyown.t_partyid, hist.fininstid "+
+"      FROM sofr_rating_ratingshistory hist, "+
+"           dpartyown_dbt partyown, "+
+"           dobjcode_dbt objcode, "+
+"           dllvalues_dbt lv "+
+"     WHERE hist.rating_object_type = 'Компания' "+
+"       AND lv.t_element = hist.rating_id "+
+"       AND lv.t_list in (5037, 5038, 5041, 5042, 5045, 5046, 5047, 5048, 5049, 5050, 5051, 5052) "+
+"       AND partyown.t_partykind = 7 "+
+"       AND partyown.t_partyid = objcode.t_objectid "+
+"       AND SUBSTR (objcode.t_code, "+
+"                                1, "+
+"                             CASE  "+
+"                               WHEN INSTR (objcode.t_code, '/') > 0 THEN INSTR (objcode.t_code, '/') - 1  "+
+"                             ELSE LENGTH (objcode.t_code)  "+
+"                             END) = hist.inn "+
+"       AND objcode.T_CODEKIND = 107 "+
+"       AND objcode.t_objecttype = 3 "+
+"       AND objcode.t_state = 0; "+
+" end;  ";
+   Params = null;
+   execSQL( Query, Params );
+
+   Query = "select distinct lei, t_partyid "+
+           "  from USR_RUDATA_EMITENT ";
+
+   Params = Null;
+   DataSet = Null;
+
+   DataSet = execSQLselect( Query, Params );
+   while( DataSet.MoveNext )
+
+      LoadRatingRepNat( DataSet.value(1, Null, V_INTEGER), DataSet.value(0, Null, V_STRING), 122, 5037, false ); //рейтинг эмитента в нац валюте для отчетов
+      LoadRatingRepNat( DataSet.value(1, Null, V_INTEGER), DataSet.value(0, Null, V_STRING), 123, 5038, false ); //рейтинг эмитента в ин валюте для отчетов
+     
+      LoadRatingRepMoodys( DataSet.value(1, Null, V_INTEGER), DataSet.value(0, Null, V_STRING), 122, false );
+      LoadRatingRepMoodys( DataSet.value(1, Null, V_INTEGER), DataSet.value(0, Null, V_STRING), 123, false );
+
+      LoadRatingRepNat( DataSet.value(1, Null, V_INTEGER), DataSet.value(0, Null, V_STRING), 122, 5041, true ); //рейтинг эмитента в нац валюте для отчетов по 3485
+      LoadRatingRepNat( DataSet.value(1, Null, V_INTEGER), DataSet.value(0, Null, V_STRING), 123, 5042, true ); //рейтинг эмитента в ин валюте для отчетов по 3485
+
+      LoadRatingRepMoodys( DataSet.value(1, Null, V_INTEGER), DataSet.value(0, Null, V_STRING), 122, true );
+      LoadRatingRepMoodys( DataSet.value(1, Null, V_INTEGER), DataSet.value(0, Null, V_STRING), 123, true );
+
+   end;
+
+   return true;
+
+onError(err)
+
+ Params = Null;
+ DataSet = Null;
+ return false;
+
+end;
+
+/**
+@brief 			загрузка рейтингов ценной бумаги
+@param[in] Fiid   		Идентификатор финансового инструмента
+@param[in] FI_Code   		Код финансового инструмента
+@return 			true - загрузка успешная
+@return 			false - ошибка загрузки
+*/
+private macro LoadRatingAvoiriss( Fiid :integer, FI_Code :integer )
+var Params :TArray,
+    DataSet :RsdRecordset,
+    Query :string = "",
+    PartyCateg,
+    FlAll :integer = 0;
+
+
+  if( ( ValType( Fiid ) == V_UNDEF ) or ( ValType( Fiid ) == 26 ) )
+   FlAll = 0;
+   Fiid = -1;
+  else
+   FlAll = 1;
+  end;
+
+  Query = " SELECT /*+ leading(d,a) */ A.LAST, A.DT, A.RATING_ID, B.T_ISIN, B.T_FIID, " +
+          "  (SELECT E.T_ATTRID FROM dobjattr_dbt E " +
+          "   WHERE E.T_OBJECTTYPE = :p_ObjType " +
+          "    AND E.T_GROUPID  = :p_GroupId " +
+          "    AND E.T_PARENTID = D.T_FLAG " +
+          "    AND E.T_NAME = A.LAST) AS T_ATTRID, " +
+          "  D.T_FLAG AS T_PARENTID " +
+          " FROM sofr_rating_ratingshistory A, davoiriss_dbt B, dllvalues_dbt D " +
+          " WHERE A.RATING_OBJECT_TYPE = :p_ObjTypeRating " +
+          "  AND to_char(D.T_ELEMENT) = A.RATING_ID " +
+          "  AND A.FINTOOLID =  :p_FI_Code " +
+          "  AND ( SELECT E.T_ISCLOSED FROM dfininstr_dbt E " +
+          "        WHERE E.T_FIID = :p_Fiid ) <> CHR(88) " +
+          "  AND D.T_LIST = :ListId " ;
+
+  Params = Null;
+  DataSet = Null;
+
+   if (FlAll = 1)
+      Query = Query + "  AND  B.T_FIID = :p_Fiid_1 " ;
+
+      Params = makeArray( SQLParam( "p_ObjType", 12 ),
+                      SQLParam( "GroupId", 53 ),
+                      SQLParam( "ObjTypeRating", "Инструмент" ),
+                      SQLParam( "p_FI_Code", Fi_Code ),
+                      SQLParam( "p_Fiid", Fiid ),
+                      SQLParam( "ListId", 5006 ),  //!!!!!!!!!!!!!  реестр
+                      SQLParam( "p_Fiid_1", Fiid )); 
+
+   else
+      Params = makeArray( SQLParam( "p_ObjType", 12 ),
+                      SQLParam( "GroupId", 53 ),
+                      SQLParam( "ObjTypeRating", "Инструмент" ),
+                      SQLParam( "p_FI_Code", Fi_Code ),
+                      SQLParam( "p_Fiid", Fiid ),
+                      SQLParam( "ListId", 5006 )  //!!!!!!!!!!!!!  реестр
+                     ); 
+
+   end ;
+
+
+
+
+  DataSet = execSQLselect( Query, Params );
+  while( DataSet.MoveNext )
+
+   if( ( ValType( DataSet.value(5, Null, V_INTEGER) ) != V_UNDEF ) and  //!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!11
+      ( ValType( DataSet.value(5, Null, V_INTEGER) ) != 26 ) and
+      ( not IsAttrIdExists( 12, 53, Fiid, DataSet.value(5, Null, V_INTEGER), DataSet.value(1, Null, V_DATE) ) ) and
+      ( IsAttrIdDisconnectedSmart( 12, 53, Fiid, DataSet.value(5, Null, V_INTEGER), DataSet.value(6, Null, V_INTEGER),
+          DataSet.value(1, Null, V_DATE) ) ) )
+
+    PartyCateg = Null;
+    PartyCateg = RsbObjCategories( 12, mkStr("0", 10-StrLen(string(Fiid))) + string(Fiid) );
+    PartyCateg.ConnectAttr( 53, DataSet.value(5, Null, V_INTEGER), null, null, DataSet.value(1, Null, V_DATE));
+    PartyCateg.Save(mkStr("0", 10-StrLen(string(Fiid))) + string(Fiid));
+    PartyCateg = Null;
+
+    AddLogAttr( DataSet.value("T_FIID", Null, V_INTEGER), DataSet.value("LAST", Null, V_STRING), 12, DataSet.value("T_ATTRID", Null, V_INTEGER), DataSet.value("T_PARENTID", Null, V_INTEGER) );
+
+   end;
+
+  end;
+
+
+onError(err)
+
+ Params = Null;
+ DataSet = Null;
+
+end;
+
+/*KD*/
+
+/**
+@brief 			загрузка рейтингов ценной бумаги
+@param[in] Fiid   		Идентификатор финансового инструмента
+@param[in] FI_Code   		Код финансового инструмента
+@param[in] CatNum   		Категория
+@param[in] ListNum   		Классификатор
+@param[in] isarh   		Признак архивных данных
+@return 			true - загрузка успешная
+@return 			false - ошибка загрузки
+*/
+private macro LoadRatingAvoirissRep( Fiid :integer, FI_Code :integer, CatNum, ListNum, isarh )
+var Params :TArray,
+    DataSet :RsdRecordset,
+    Query :string = "",
+    PartyCateg,
+    FlAll :integer = 0;
+
+
+  if( ( ValType( Fiid ) == V_UNDEF ) or ( ValType( Fiid ) == 26 ) )
+   FlAll = 0;
+   Fiid = -1;
+  else
+   FlAll = 1;
+  end;
+
+  Query = " SELECT /*+ leading(d,a)*/ A.LAST, A.DT, A.RATING_ID, B.T_ISIN, B.T_FIID, " +
+          "  (SELECT E.T_ATTRID FROM dobjattr_dbt E " +
+          "   WHERE E.T_OBJECTTYPE = :p_ObjType " +
+          "    AND E.T_GROUPID  = :p_GroupId " +
+          "    AND E.T_PARENTID = D.T_FLAG " +
+          "    AND E.T_NAME = A.LAST) AS T_ATTRID, " +
+          "  D.T_FLAG AS T_PARENTID " +
+          " FROM sofr_rating_ratingshistory A, davoiriss_dbt B, dllvalues_dbt D, dfininstr_dbt F " +
+          " WHERE A.RATING_OBJECT_TYPE = :p_ObjTypeRating " +
+          "  AND to_char(D.T_ELEMENT) = A.RATING_ID " +
+          "  AND A.FINTOOLID =  :p_FI_Code " +
+          "  AND ( SELECT E.T_ISCLOSED FROM dfininstr_dbt E " +
+          "        WHERE E.T_FIID = :p_Fiid ) <> CHR(88) " +
+          "  AND D.T_LIST = :ListId " ;
+   if (FlAll=1)
+      Query = Query + "  AND  B.T_FIID = :p_Fiid_1 " ;
+   end;        
+   Query = Query + " and F.t_fiid = B.t_fiid and ( ( B.t_subordinated = 'X' and D.T_ELEMENT not in( 7, 15)) or (B.t_subordinated != 'X' and D.T_ELEMENT not in (152, 153)) )";
+
+   If(isarh)
+      Query = Query + "AND A.DT <= to_date('01.02.2022','dd.mm.yyyy') ";
+   end;
+
+  Params = Null;
+  DataSet = Null;
+
+   if (FlAll=1)
+      Params = makeArray( SQLParam( "p_ObjType", 12 ),
+                          SQLParam( "GroupId", CatNum ),
+                          SQLParam( "ObjTypeRating", "Инструмент" ),
+                          SQLParam( "p_FI_Code", Fi_Code ),
+                          SQLParam( "p_Fiid", Fiid ),
+                          SQLParam( "ListId", ListNum ),  //!!!!!!!!!!!!!  реестр
+                          SQLParam( "p_Fiid_1", Fiid )); 
+    else
+      Params = makeArray( SQLParam( "p_ObjType", 12 ),
+                          SQLParam( "GroupId", CatNum ),
+                          SQLParam( "ObjTypeRating", "Инструмент" ),
+                          SQLParam( "p_FI_Code", Fi_Code ),
+                          SQLParam( "p_Fiid", Fiid ),
+                          SQLParam( "ListId", ListNum )  //!!!!!!!!!!!!!  реестр
+                           ); 
+    end;
+  DataSet = execSQLselect( Query, Params );
+  while( DataSet.MoveNext )
+
+   if( ( ValType( DataSet.value(5, Null, V_INTEGER) ) != V_UNDEF ) and  //!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!11
+      ( ValType( DataSet.value(5, Null, V_INTEGER) ) != 26 ) and
+      ( not IsAttrIdExists( 12, CatNum, Fiid, DataSet.value(5, Null, V_INTEGER), DataSet.value(1, Null, V_DATE) ) ) and
+      ( IsAttrIdDisconnectedSmart( 12, CatNum, Fiid, DataSet.value(5, Null, V_INTEGER), DataSet.value(6, Null, V_INTEGER),
+          DataSet.value(1, Null, V_DATE) ) ) )
+
+    PartyCateg = Null;
+    PartyCateg = RsbObjCategories( 12, mkStr("0", 10-StrLen(string(Fiid))) + string(Fiid) );
+    PartyCateg.ConnectAttr( CatNum, DataSet.value(5, Null, V_INTEGER), null, null, DataSet.value(1, Null, V_DATE));
+    PartyCateg.Save(mkStr("0", 10-StrLen(string(Fiid))) + string(Fiid));
+    PartyCateg = Null;
+
+    AddLogAttr( DataSet.value("T_FIID", Null, V_INTEGER), DataSet.value("LAST", Null, V_STRING), 12, DataSet.value("T_ATTRID", Null, V_INTEGER), DataSet.value("T_PARENTID", Null, V_INTEGER) );
+
+   end;
+
+  end;
+
+
+onError(err)
+
+ Params = Null;
+ DataSet = Null;
+
+end;
+
+/**
+@brief 			загрузка рейтингов эмитента 2014
+@param[in] PartyId   		Идентификатор субъекта
+@return 			true - загрузка успешная
+@return 			false - ошибка загрузки
+*/
+macro LoadRating2014( PartyId :integer )
+var Params :TArray,
+    DataSet :RsdRecordset,
+    Query :string = "",
+    PartyCateg,
+    FlAll :integer = 0;
+
+
+  if( ( ValType( PartyId ) == V_UNDEF ) or ( ValType( PartyId ) == 26 ) )
+   FlAll = 0;
+   PartyId = -1;
+  else
+   FlAll = 1;
+  end;
+
+
+  Query = " SELECT A.RAT AS LAST, A.DATRAT AS DT, " +
+          "  TO_CHAR( D.T_ELEMENT) AS RATING_ID, " +
+          "  SUBSTR(C.T_CODE, 1, CASE WHEN INSTR(C.T_CODE, '/') > 0 THEN INSTR(C.T_CODE, '/') - 1 " +
+          "                           ELSE LENGTH(C.T_CODE) END ) AS INN, " +
+          "  B.T_PARTYID, " +
+          "  (SELECT E.T_ATTRID FROM dobjattr_dbt E " +
+          "   WHERE E.T_OBJECTTYPE = C.T_OBJECTTYPE " +
+          "    AND E.T_GROUPID  = :GroupId_1 " +
+          "    AND E.T_PARENTID = D.T_FLAG " +
+//          "    AND UPPER(E.T_NAME) = UPPER(A.RAT)) AS T_ATTRID, " +
+          "    AND E.T_NAME = A.RAT) AS T_ATTRID, " +
+          "  D.T_FLAG AS T_PARENTID " +
+
+          " FROM sofr_rating_ratingshist2014 A, dpartyown_dbt B, dobjcode_dbt C, dllvalues_dbt D " +
+          " WHERE A.OBJECTTYPE = :ObjTypeRating_1 " +
+          "  AND D.T_NAME = A.AGENCY " +
+          "  AND A.INSTID = ( SELECT E.T_CODE FROM dobjcode_dbt E " +
+          "                   WHERE E.T_OBJECTTYPE = C.T_OBJECTTYPE " +
+          "                    AND E.T_OBJECTID = C.T_OBJECTID " +
+          "                    AND E.T_CODEKIND =  :CodeKind102 " +
+          "                    AND E.T_STATE = 0 ) " +
+          "  AND A.DATRAT = ( CASE WHEN A.OBJECTTYPE = 'Компания' THEN :NotBankPartyDate ELSE :BankPartyDate END ) " +
+          "  AND B.T_PARTYKIND = :PartyOwn_1 " +
+          "  AND C.T_OBJECTID = B.T_PARTYID " +
+          "  AND C.T_OBJECTTYPE = :ObjType_1 " +
+          "  AND (C.T_CODEKIND = :CodeKind_1 OR C.T_CODEKIND = 106)" +    //shev Добавил код интерфакса
+          "  AND C.T_STATE = 0 " +
+          "  AND D.T_LIST = :ListId_1 ";
+
+  Params = Null;
+  DataSet = Null;
+
+   if (FlAll=1)
+       Query = Query +   "  AND  B.T_PARTYID = :PartyId_1 ";
+
+      Params = makeArray( SQLParam( "GroupId_1", 19 ),
+                      SQLParam( "ObjTypeRating_1", "Компания" ),
+                      SQLParam( "CodeKind102", 102 ),
+                      SQLParam( "NotBankPartyDate", date("01.12.2014") ), //субъекты-не КО
+                      SQLParam( "BankPartyDate", date("01.03.2014") ), //субъекты КО
+                      SQLParam( "PartyOwn_1", 5 ),
+                      SQLParam( "ObjType_1", 3),
+                      SQLParam( "CodeKind_1", 16),
+                      SQLParam( "ListId_1", 5004),  //!!!!!!!!!!!!!  реестр
+                      SQLParam( "PartyId_1", PartyId)); 
+
+   else
+      Params = makeArray( SQLParam( "GroupId_1", 19 ),
+                          SQLParam( "ObjTypeRating_1", "Компания" ),
+                          SQLParam( "CodeKind102", 102 ),
+                          SQLParam( "NotBankPartyDate", date("01.12.2014") ), //субъекты-не КО
+                          SQLParam( "BankPartyDate", date("01.03.2014") ), //субъекты КО
+                          SQLParam( "PartyOwn_1", 5 ),
+                          SQLParam( "ObjType_1", 3),
+                          SQLParam( "CodeKind_1", 16),
+                          SQLParam( "ListId_1", 5004)  //!!!!!!!!!!!!!  реестр
+                          ); 
+
+  end;
+  DataSet = execSQLselect( Query, Params );
+  while( DataSet.MoveNext )
+
+   if( ( ValType( DataSet.value(5, Null, V_INTEGER) ) != V_UNDEF ) and
+      ( ValType( DataSet.value(5, Null, V_INTEGER) ) != 26 ) and
+      ( not IsAttrIdExists( 3, 19, PartyId, DataSet.value(5, Null, V_INTEGER), DataSet.value(1, Null, V_DATE) ) ) and
+      ( IsAttrIdDisconnectedSmart( 3, 19, PartyId, DataSet.value(5, Null, V_INTEGER), DataSet.value(6, Null, V_INTEGER),
+          DataSet.value(1, Null, V_DATE) ) ) )
+
+    PartyCateg = Null;
+    PartyCateg = RsbObjCategories( 3, mkStr("0", 10-StrLen(string(PartyId))) + string(PartyId) );
+    PartyCateg.ConnectAttr( 19, DataSet.value(5, Null, V_INTEGER), null, null, DataSet.value(1, Null, V_DATE));
+    PartyCateg.Save(mkStr("0", 10-StrLen(string(PartyId))) + string(PartyId));
+    PartyCateg = Null;
+
+    AddLogAttr( DataSet.value("T_PARTYID", Null, V_INTEGER), DataSet.value("LAST", Null, V_STRING), 3, DataSet.value("T_ATTRID", Null, V_INTEGER), DataSet.value("T_PARENTID", Null, V_INTEGER) );
+
+   end;
+
+  end;
+
+
+onError(err)
+
+ Params = Null;
+ DataSet = Null;
+
+end;
+
+/**
+@brief 			загрузка рейтингов ценных бумаг 2014
+@param[in] Fiid   		Идентификатор финансового инструмента
+@param[in] Isin   		Код ц/б
+@return 			true - загрузка успешная
+@return 			false - ошибка загрузки
+*/
+private macro LoadRatingAvoiriss2014( Fiid :integer, Isin :string )
+var Params :TArray,
+    DataSet :RsdRecordset,
+    Query :string = "",
+    AvoirissCateg,
+    FlAll :integer = 0;
+
+
+  if( ( ValType( Fiid ) == V_UNDEF ) or ( ValType( Fiid ) == 26 ) )
+   FlAll = 0;
+   Fiid = -1;
+  else
+   FlAll = 1;
+  end;
+
+
+  Query = " SELECT A.RAT AS LAST, A.DATRAT AS DT, " +
+          "  TO_CHAR( D.T_ELEMENT) AS RATING_ID, B.T_ISIN, " +
+          "  (SELECT E.T_ATTRID FROM dobjattr_dbt E " +
+          "   WHERE E.T_OBJECTTYPE = :p_ObjType " +
+          "    AND E.T_GROUPID  = :GroupId_1 " +
+          "    AND E.T_PARENTID = D.T_FLAG " +
+//          "    AND UPPER(E.T_NAME) = UPPER(A.RAT)) AS T_ATTRID, " +
+          "    AND E.T_NAME = A.RAT) AS T_ATTRID, " +
+          "  D.T_FLAG AS T_PARENTID " +
+          " FROM sofr_rating_ratingshist2014 A, davoiriss_dbt B, dllvalues_dbt D " +
+          " WHERE A.OBJECTTYPE = :ObjTypeRating_1 " +
+          "  AND A.ISIN = :p_Isin " +
+          "  AND D.T_NAME = A.AGENCY " +
+          "  AND A.FINTOOLID = ( SELECT E.T_CODE FROM dobjcode_dbt E " +
+          "                      WHERE E.T_OBJECTTYPE = :p_ObjType_1 " +
+          "                       AND E.T_OBJECTID = :p_Fiid " +
+          "                       AND E.T_CODEKIND =  :CodeKind101 " +
+          "                       AND E.T_STATE = 0 ) " +
+          "  AND A.DATRAT = ( CASE WHEN ( SELECT COUNT(1) FROM dpartyown_dbt F " +
+          "                               WHERE F.T_PARTYID = ( SELECT G.T_ISSUER FROM dfininstr_dbt G " +
+          "                                                     WHERE G.T_FIID = :p_Fiid_1 ) " +
+          "                                AND F.T_PARTYKIND = :p_PartyKind ) = 0 " +
+          "                        THEN :NotBankPartyDate ELSE :BankPartyDate END ) " +
+
+          "  AND ( SELECT E.T_ISCLOSED FROM dfininstr_dbt E " +
+          "        WHERE E.T_FIID = :p_Fiid_2 ) <> CHR(88) " +
+          "  AND D.T_LIST = :ListId_1 " ;
+
+  Params = Null;
+  DataSet = Null;
+
+  if (FlAll = 1)
+     Query = Query +   "  AND  B.T_FIID = :p_Fiid_3 ";
+     Params = makeArray( SQLParam( "p_ObjType", 12 ),
+                      SQLParam( "GroupId_1", 53 ),
+                      SQLParam( "ObjTypeRating_1", "Инструмент" ),
+                      SQLParam( "p_Isin", Isin ),
+                      SQLParam( "p_ObjType_1", 9 ),
+                      SQLParam( "p_Fiid", Fiid ),
+                      SQLParam( "CodeKind101", 101 ),
+
+                      SQLParam( "p_Fiid_1", Fiid ),
+                      SQLParam( "p_PartyKind", 2 ),
+
+                      SQLParam( "NotBankPartyDate", date("01.12.2014") ), //субъекты-не КО
+                      SQLParam( "BankPartyDate", date("01.03.2014") ), //субъекты КО
+                      SQLParam( "p_Fiid_2", Fiid ),
+                      SQLParam( "ListId_1", 5006 ),  //!!!!!!!!!!!!!  реестр
+                      SQLParam( "p_Fiid_3", Fiid )); 
+
+  else
+    Params = makeArray( SQLParam( "p_ObjType", 12 ),
+                      SQLParam( "GroupId_1", 53 ),
+                      SQLParam( "ObjTypeRating_1", "Инструмент" ),
+                      SQLParam( "p_Isin", Isin ),
+                      SQLParam( "p_ObjType_1", 9 ),
+                      SQLParam( "p_Fiid", Fiid ),
+                      SQLParam( "CodeKind101", 101 ),
+
+                      SQLParam( "p_Fiid_1", Fiid ),
+                      SQLParam( "p_PartyKind", 2 ),
+
+                      SQLParam( "NotBankPartyDate", date("01.12.2014") ), //субъекты-не КО
+                      SQLParam( "BankPartyDate", date("01.03.2014") ), //субъекты КО
+                      SQLParam( "p_Fiid_2", Fiid ),
+                      SQLParam( "ListId_1", 5006 )  //!!!!!!!!!!!!!  реестр
+                       ); 
+
+  end;  
+
+
+
+  DataSet = execSQLselect( Query, Params );
+  while( DataSet.MoveNext )  //!!!!!!!!!!!!!!!!!!!!!
+
+   if( ( ValType( DataSet.value(3, Null, V_STRING) ) != V_UNDEF ) and
+      ( ValType( DataSet.value(3, Null, V_STRING) ) != 26 ) and
+      ( ValType( DataSet.value(4, Null, V_INTEGER) ) != V_UNDEF ) and
+      ( ValType( DataSet.value(4, Null, V_INTEGER) ) != 26 ) and
+      ( not IsAttrIdExists( 12, 53, Fiid, DataSet.value(4, Null, V_INTEGER), DataSet.value(1, Null, V_DATE) ) ) and
+      ( IsAttrIdDisconnectedSmart( 12, 53, Fiid, DataSet.value(4, Null, V_INTEGER), DataSet.value(5, Null, V_INTEGER),
+          DataSet.value(1, Null, V_DATE) ) ) )
+
+    AvoirissCateg = Null;
+    AvoirissCateg = RsbObjCategories( 12, mkStr("0", 10-StrLen(string(Fiid))) + string(Fiid) );
+    AvoirissCateg.ConnectAttr( 53, DataSet.value(4, Null, V_INTEGER), null, null, DataSet.value(1, Null, V_DATE));
+    AvoirissCateg.Save(mkStr("0", 10-StrLen(string(Fiid))) + string(Fiid));
+    AvoirissCateg = Null;
+
+    AddLogAttr( Fiid, DataSet.value("LAST", Null, V_STRING), 12, DataSet.value("T_ATTRID", Null, V_INTEGER), DataSet.value("T_PARENTID", Null, V_INTEGER) );
+
+   end;
+
+  end;
+
+
+onError(err)
+
+ Params = Null;
+ DataSet = Null;
+
+end;
+
+/**
+@brief 			проверка эмитента ц/б
+@param[in] PartyId   		Идентификатор субъекта
+@param[in] PartyKind   		Не используется
+@return 			true - успешная проверка
+@return 			false - неуспешная проверка
+*/
+private macro CheckEmitentPartyOwn( PartyId :integer, PartyKind ) :bool
+var Party :RsbParty;
+
+ Party = Null;
+ Party = RsbParty(PartyId);
+
+ if( not Party.Isowned( PTK_ISSUER ) )
+  Party.AddOwn( PTK_ISSUER );
+  Party.Update();
+ end;
+ Party = Null;
+
+ return true;
+
+onError(err)
+
+ return false;
+
+end;
+
+/**
+@brief 				поиск эмитента ц/б
+@param[in] ISSUER_INTERFAX	Код субъекта Интерфакс
+@param[in] ISSUERINN   		ИНН
+@param[in] TIN   		Код субъекта ТИН
+@param[in] ISSUER_NRD 		Код субъекта НРД
+@param[in] SWIFT 		Код субъекта Swift
+@param[in] LEI_CODE 		Код субъекта LEI
+@param[in] KPP 			КПП
+@param[out] IssuerId		ID субъекта
+@return 			1 - субъект найден
+@return 			0 - субъект не найден
+*/
+private macro FindIssuer( ISSUER_INTERFAX, ISSUERINN, TIN, ISSUER_NRD, SWIFT, LEI_CODE, KPP, IssuerId:@integer)
+var err;
+
+   if(StrLen(trim(SWIFT)) == 8)
+      SWIFT = SWIFT + "XXX";
+   end;
+
+   IssuerId = ПолучитьКодСубъекта(string(ISSUER_INTERFAX), 106/*INTERFAX*/, err);
+   if(err)
+    if (ValType(KPP) != V_UNDEF)
+      IssuerId = ПолучитьКодСубъекта(string(ISSUERINN)+"/"+string(KPP), 16/*ИНН*/, err);
+    else
+      IssuerId = ПолучитьКодСубъекта(string(ISSUERINN), 16/*ИНН*/, err);
+    end;
+    if(err)
+       IssuerId = ПолучитьКодСубъекта(string(TIN), 62/*TIN*/, err);
+       if(err)
+          IssuerId = ПолучитьКодСубъекта(string(ISSUER_NRD), 8/*MICEX_CODE*/, err);
+          if(err)
+             IssuerId = ПолучитьКодСубъекта(string(LEI_CODE), 69/*LEI_CODE*/, err);
+             if(err)
+                IssuerId = ПолучитьКодСубъекта(string(SWIFT), 6/*SWIFT*/, err);/*свифт обязательно в последнюю очередь, бывают дубли*/
+                if(err)
+                   return 0;
+                end;
+             end;
+          end;
+       end;
+    end;
+   end;
+   return 1;
+end;
+
+/**
+@brief 				создание субъекта-эмитентам
+@param[in] IssuerUID		Код субъекта в sofr_info_emitents
+@param[in] Inn   		ИНН
+@return 			ID субъекта СОФР
+@return 			-1 - при ошибке
+*/
+private macro AddEmitentParty( IssuerUID :integer, Inn, TIN, errorText: @String) :integer //создание субъекта-эмитентам
+var Party :RsbParty,
+    Params :TArray,
+    DataSet :RsdRecordset,
+    Query :string = "",
+    PartyId :integer = -1,
+    RefValue :string = "",
+    PartyCateg,
+    PartyAddress :RSBPartyAddress,
+    PartyContacts : RsbPartyContact;
+
+   private macro Party_AddOwn(p_PTK)
+     Party.AddOwn( p_PTK );
+     return true;
+   onError(err)  
+     errorText = "Ошибка регистрации эмитента: " + err.message + " (модуль " + err.module + ", строка " + err.line + ")";
+     return false;
+   end;
+
+/* 
+не актуальн, т.к. етперь ищем и проверяем эмитентов не только по ИНН, 
+ if( ( ValType( Inn ) == V_UNDEF ) or ( ValType( Inn ) == 26 ) )
+   return -1;
+  end;       */
+
+  errorText = "";
+  
+  Query = " SELECT E.FULLNAME_RUS, E.FULLNAME_RUS_NRD, E.OKPO, E.SHORTNAME_RUS, E.INN, E.LEI_CODE, E.OGRN, E.FULLNAME_ENG_NRD, E.SHORTNAME_ENG, E.COUNTRY, E.OKVED, E.OKATO, E.OKOPF, E.KPP, " +
+          "  E.LEGAL_ADDRESS, E.POST_ADDRESS, E.PHONE, E.E_MAIL, E.IS_GOV_OR_CB, E.ISREGION, E.IS_SUBJECTRF, E.IS_BANK_4_NON_RESIDENT, /*E.IS_FINORG*/ E.CREDIT_CMP, E.TIN, " +
+          "  (SELECT D.T_ATTRID FROM dobjattr_dbt D " +
+          "   WHERE D.T_OBJECTTYPE = :ObjType_1 " +
+          "    AND D.T_GROUPID = :GroupId_64 " +
+          "    AND UPPER(D.T_NAMEOBJECT) = UPPER(E.OKVED)) AS T_ATTRID_OKVED, " +
+          "  (SELECT D.T_ATTRID FROM dobjattr_dbt D " +
+          "   WHERE D.T_OBJECTTYPE = :ObjType_2 " +
+          "    AND D.T_GROUPID  = :GroupId_53 " +
+          "    AND UPPER( REPLACE( D.T_NAMEOBJECT, ' ' ) ) = UPPER( E.OKOPF ) ) AS T_ATTRID_OKOPF, " +
+          "  E.FININSTID AS ISSUER_INTERFAX " +
+          " FROM sofr_info_emitents E " +
+          " WHERE E.FININSTID = :IssuerUID ";
+
+
+  Params = Null;
+  DataSet = Null;
+  PartyId = 0;
+
+  Params = makeArray( SQLParam("ObjType_1", 3),
+                      SQLParam("GroupId_64", 64),
+                      SQLParam("ObjType_2", 3),
+                      SQLParam("GroupId_53", 53),
+                      SQLParam("IssuerUID", string(IssuerUID)) );
+
+  DataSet = execSQLselect( Query, Params );
+
+  if( DataSet.MoveNext )
+
+   Party = Null;
+   Party = RsbParty(0);
+
+   Party.LegalForm = 1;/*Юрик*/
+
+   if( (ValType( DataSet.value("fullname_rus_nrd", "", V_STRING) ) != V_UNDEF) and 
+     (ValType( DataSet.value("fullname_rus_nrd", "", V_STRING) ) != 26)
+	  and (StrLen( DataSet.value("fullname_rus_nrd", "", V_STRING) ) > 0) )
+      Party.FullName  = DataSet.value("fullname_rus_nrd", "", V_STRING);
+   elif( (ValType( DataSet.value("fullname_rus", "", V_STRING) ) != V_UNDEF) and 
+     (ValType( DataSet.value("fullname_rus", "", V_STRING) ) != 26)
+	  and (StrLen( DataSet.value("fullname_rus", "", V_STRING) ) > 0) )
+      Party.FullName  = DataSet.value("fullname_rus", "", V_STRING);  
+   else
+     errorText = string("IssuerUID ",IssuerUID," не удалось определить полное наименование эмитента  ",DataSet.value("SHORTNAME_RUS", "", V_STRING),
+        " не заполнены атрибуты fullname_rus_nrd и fullname_rus таблицы sofr_info_emitents ");
+      
+     PartyId = -1;
+     Party = Null;
+     return PartyId;   
+   end;
+
+
+
+   Party.ShortName = DataSet.value("shortname_rus", "", V_STRING);
+
+   if( (ValType( DataSet.value("okpo", "", V_STRING) ) != V_UNDEF) and 
+     (ValType( DataSet.value("okpo", "", V_STRING) ) != 26) )
+    Party.OKPO      = DataSet.value("okpo", "", V_STRING);
+   end;
+
+   RefValue = "";
+
+   if( ( ValType( DataSet.value("COUNTRY", Null, V_STRING) ) != V_UNDEF ) and 
+       ( ValType( DataSet.value("COUNTRY", Null, V_STRING) ) != 26 ) )
+
+//    Party.Country = DataSet.value("COUNTRY", "", V_STRING);
+    Party.NRCountry = DataSet.value("COUNTRY", Null, V_STRING);
+
+   end;
+
+   
+   if ( not Party_AddOwn( PTK_ISSUER )) 
+		 PartyId = -1;
+		 Party = Null;
+		 return PartyId;
+   end;
+   if( ( ValType( DataSet.value("IS_GOV_OR_CB", Null, V_STRING)) != V_UNDEF ) and
+    ( ValType( DataSet.value("IS_GOV_OR_CB", Null, V_STRING)) != 26 ) and
+    ( DataSet.value("IS_GOV_OR_CB", Null, V_STRING) != "0" ) )
+
+    Party.AddOwn( PTK_STATE_BODY ); //15
+
+   end;
+
+   if( ( ValType( DataSet.value("IS_SUBJECTRF", Null, V_STRING)) != V_UNDEF ) and
+    ( ValType( DataSet.value("IS_SUBJECTRF", Null, V_STRING)) != 26 ) and
+    ( DataSet.value("IS_SUBJECTRF", Null, V_STRING) != "0" ) )
+
+    Party.AddOwn( PTK_STATE_BODY_SUBJECT ); //16
+
+   end;
+
+   if( ( ValType( DataSet.value("ISREGION", Null, V_STRING)) != V_UNDEF ) and
+    ( ValType( DataSet.value("ISREGION", Null, V_STRING)) != 26 ) and
+    ( DataSet.value("ISREGION", Null, V_STRING) != "0" ) )
+
+    Party.AddOwn( PTK_LOCAL_BODY ); //17
+
+   end;
+
+   if( ( ValType( DataSet.value("IS_BANK_4_NON_RESIDENT", Null, V_STRING)) != V_UNDEF ) and
+    ( ValType( DataSet.value("IS_BANK_4_NON_RESIDENT", Null, V_STRING)) != 26 ) and
+    ( DataSet.value("IS_BANK_4_NON_RESIDENT", Null, V_STRING) == "Y" ) )
+
+    Party.AddOwn( PTK_BANK ); //2
+
+   elif( ( ValType( DataSet.value(/*"IS_FINORG"*/ "CREDIT_CMP", Null, V_STRING)) != V_UNDEF ) and
+    ( ValType( DataSet.value(/*"IS_FINORG"*/ "CREDIT_CMP", Null, V_STRING)) != 26 ) and
+    ( DataSet.value(/*"IS_FINORG"*/ "CREDIT_CMP", Null, V_STRING) != "0" ) )
+
+    Party.AddOwn( PTK_BANK ); //2
+
+   end;
+
+   if( ( ValType( DataSet.value("LEGAL_ADDRESS", Null, V_STRING)) != V_UNDEF ) and
+       ( ValType( DataSet.value("LEGAL_ADDRESS", Null, V_STRING)) != 26 ) ) 
+
+    PartyAddress = Party.Address(1);
+    PartyAddress.Address = DataSet.value("LEGAL_ADDRESS", Null, V_STRING);
+
+   end;
+
+   if( ( ValType( DataSet.value("POST_ADDRESS", Null, V_STRING)) != V_UNDEF ) and
+       ( ValType( DataSet.value("POST_ADDRESS", Null, V_STRING)) != 26 ) )
+
+    PartyAddress = Party.Address(3);
+    PartyAddress.Address = DataSet.value("POST_ADDRESS", Null, V_STRING);
+
+   end;
+
+   if( ( ValType( DataSet.value("PHONE", Null, V_STRING)) != V_UNDEF ) and
+       ( ValType( DataSet.value("PHONE", Null, V_STRING)) != 26 ) or
+       ( ValType( DataSet.value("E_MAIL", Null, V_STRING)) != V_UNDEF ) and
+       ( ValType( DataSet.value("E_MAIL", Null, V_STRING)) != 26 ) )
+
+    PartyContacts = Party.PartyContact();
+
+   end;
+
+   if( ( ValType( DataSet.value("PHONE", Null, V_STRING)) != V_UNDEF ) and
+       ( ValType( DataSet.value("PHONE", Null, V_STRING)) != 26 ) )
+
+    PartyContacts.Add( CNTK_PHONE, 1, CNTK_PHONE, DataSet.value("PHONE", Null, V_STRING));
+
+   end;
+
+
+   if( ( ValType( DataSet.value("E_MAIL", Null, V_STRING)) != V_UNDEF ) and
+       ( ValType( DataSet.value("E_MAIL", Null, V_STRING)) != 26 ) )
+
+    PartyContacts.Add( CNTK_EMAIL, 1, CNTK_PHONE, DataSet.value("E_MAIL", Null, V_STRING) );
+
+   end;
+
+   if( ( ValType( DataSet.value("PHONE", Null, V_STRING)) != V_UNDEF ) and
+       ( ValType( DataSet.value("PHONE", Null, V_STRING)) != 26 ) )
+
+    PartyContacts.Add( CNTK_PHONE, 3, CNTK_PHONE, DataSet.value("PHONE", Null, V_STRING));
+
+   end;
+
+
+   if( ( ValType( DataSet.value("E_MAIL", Null, V_STRING)) != V_UNDEF ) and
+       ( ValType( DataSet.value("E_MAIL", Null, V_STRING)) != 26 ) )
+
+    PartyContacts.Add( CNTK_EMAIL, 3, CNTK_PHONE, DataSet.value("E_MAIL", Null, V_STRING) );
+
+   end;
+
+
+   if( Party.Update() )
+    PartyId = Party.PartyId;
+   end;
+
+   if( GenerateReference( REFERENCE_PARTY_CODE, RefValue ) == 0 )
+    Party.Code.SetCode( 1, RefValue );
+   end;
+   if( ( ValType( DataSet.value("INN", Null, V_STRING) ) != V_UNDEF ) and 
+       ( ValType( DataSet.value("INN", Null, V_STRING) ) != 26 ) and
+       ( ValType( DataSet.value("KPP", Null, V_STRING) ) != V_UNDEF ) and
+       ( ValType( DataSet.value("KPP", Null, V_STRING) ) != 26 ) )
+
+    Party.Code.SetCode(PTCK_INN /*INN*/, DataSet.value("INN", Null, V_STRING) + "/" + DataSet.value("KPP", Null, V_STRING));
+
+   elif( ( ValType( DataSet.value("INN", Null, V_STRING) ) != V_UNDEF ) and 
+         ( ValType( DataSet.value("INN", Null, V_STRING) ) != 26 ) )
+    /*RU DATA подкладывает свинью и в поле INN хранит TIN для нерезов, а ИНН РФ вообще нигде не предоставляет, даже если он существует*/
+    /*Из-за этого по нерезам ранее появлялись дубли с "новым" ИНН*/
+    if (index(DataSet.value("TIN"), DataSet.value("INN")) > 0)/* Если INN==TIN, значит это не ИНН, а TIN, такая лютая проверка из-за периодической кирвоты РУ ДАТЫ, которая подло рубит ведущие нули в ИНН*/
+       Party.Code.SetCode(62/*TIN*/, DataSet.value("INN", Null, V_STRING));
+    else
+       Party.Code.SetCode(PTCK_INN /*INN*/, DataSet.value("INN", Null, V_STRING));
+    end;
+   end;
+
+   if( (ValType( DataSet.value("ISSUER_INTERFAX", "", V_STRING) ) != V_UNDEF) and 
+     (ValType( DataSet.value("ISSUER_INTERFAX", "", V_STRING) ) != 26) )
+
+    Party.Code.SetCode(106/*INTERFAX*/, DataSet.value("ISSUER_INTERFAX", "", V_STRING));
+
+   end;
+
+
+   if( (ValType( DataSet.value("ogrn", "", V_STRING) ) != V_UNDEF) and 
+     (ValType( DataSet.value("ogrn", "", V_STRING) ) != 26) )
+
+    Party.Code.SetCode(27/*OGRN*/, DataSet.value("ogrn", "", V_STRING));
+
+   end;
+
+   if( ( ValType( DataSet.value("OKATO", Null, V_STRING)) != V_UNDEF ) and
+       ( ValType( DataSet.value("OKATO", Null, V_STRING)) != 26 ) )
+
+    var okatoCode: String = DataSet.value("OKATO", "", V_STRING);
+    
+    if (isOkatoNewFunctional)
+      if (StrLen(okatoCode) < 11)
+        okatoCode = okatoCode + SubStr("00000000000", StrLen(okatoCode) + 1, 11);
+      end;
+    
+      var OKATOAttrID = GetOKATOAttrId(okatoCode);
+      if ((StrLen(okatoCode) == 11) and (OKATOAttrID > 0))
+        var errCode;
+        if (not ConnectObjAttr(errCode, OBJTYPE_PARTY, String(Party.PartyId:o:10), PARTY_ATTR_GROUP_OKATO, OKATOAttrID, null, null, {curdate}))
+          errorText = "Не удалось сохранить код ОКАТО в справочнике значений категорий эмитента"; 
+        end;
+      else
+        errorText = "Не удалось распознать код ОКАТО (" + okatoCode + ") эмитента";
+      end;
+    end;
+    
+    Party.Code.SetCode(73/*OKATO*/, okatoCode);
+    
+   end;
+
+   if( ( ValType( DataSet.value("LEI_CODE", Null, V_STRING)) != V_UNDEF ) and
+       ( ValType( DataSet.value("LEI_CODE", Null, V_STRING)) != 26 ) )
+
+    Party.Code.SetCode(69/*LEI_CODE*/, DataSet.value("LEI_CODE", "", V_STRING));
+
+   end;
+
+
+   /*************************************************************/
+   /*  TODO !!! в порядке приоритета                            */
+   /* 1.Принадлежность к орагану госвласти                      */
+   /*   или к органу госвласти субъекта                         */
+   /*   или к органу местной влпасти, Банк, если банк           */
+   /* 3.Рейтинги                                                */
+   /* 4.Коды ОКВЭД, ОКАТО, ОКТМО, ОКОПФ, КПП                    */
+   /* 5.Адреса, контакты (телефон, email)                       */
+   /* 6.Наименования лат, лат сокращ                            */
+   /*************************************************************/
+   Party.Update();
+
+
+   if( ( ValType( DataSet.value("OKVED", Null, V_STRING)) != V_UNDEF ) and //!!!!!поискать AttrId категории по значению
+       ( ValType( DataSet.value("OKVED", Null, V_STRING)) != 26 ) and
+       ( ValType( DataSet.value("T_ATTRID_OKVED", Null, V_INTEGER) ) != V_UNDEF ) and
+       ( ValType( DataSet.value("T_ATTRID_OKVED", Null, V_INTEGER) ) != 26 ) )
+
+    PartyCateg = Null;             
+    PartyCateg = RsbObjCategories( OBJTYPE_PARTY, mkStr("0", 10-StrLen(string(PartyId))) + string(PartyId) /*UniID( PartyId, OBJTYPE_PARTY )*/ );
+    PartyCateg.ConnectAttr( 64/*ОКВЭД2*/, DataSet.value("T_ATTRID_OKVED", Null, V_INTEGER), null, null, {CurDate});
+    PartyCateg.Save( mkStr("0", 10-StrLen(string(PartyId))) + string(PartyId) /*UniID( PartyId, OBJTYPE_PARTY )*/ );
+    PartyCateg = Null;
+
+   end;
+
+   if( ( ValType( DataSet.value("OKOPF", Null, V_STRING)) != V_UNDEF ) and //!!!!!поискать AttrId категории по значению
+       ( ValType( DataSet.value("OKOPF", Null, V_STRING)) != 26 ) and
+       ( ValType( DataSet.value("T_ATTRID_OKOPF", Null, V_INTEGER) ) != V_UNDEF ) and
+       ( ValType( DataSet.value("T_ATTRID_OKOPF", Null, V_INTEGER) ) != 26 ) )
+
+    PartyCateg = Null;
+    PartyCateg = RsbObjCategories( 3, mkStr("0", 10-StrLen(string(PartyId))) + string(PartyId) );
+    PartyCateg.ConnectAttr( 53, DataSet.value("T_ATTRID_OKOPF", Null, V_INTEGER), null, null, {CurDate});
+    PartyCateg.Save(mkStr("0", 10-StrLen(string(PartyId))) + string(PartyId));
+    PartyCateg = Null;
+
+   end;
+
+   if( ( ValType( DataSet.value("FULLNAME_ENG_NRD", Null, V_STRING)) != V_UNDEF ) and
+       ( ValType( DataSet.value("FULLNAME_ENG_NRD", Null, V_STRING)) != 26 ) )
+
+    PartyNameAddExt(PartyId, 3, DataSet.value("FULLNAME_ENG_NRD", Null, V_STRING) );
+
+   end;
+
+   if( ( ValType( DataSet.value("SHORTNAME_ENG", Null, V_STRING)) != V_UNDEF ) and
+       ( ValType( DataSet.value("SHORTNAME_ENG", Null, V_STRING)) != 26 ) )
+
+    PartyNameAddExt(PartyId, 1000, DataSet.value("SHORTNAME_ENG", Null, V_STRING) );
+
+   end;
+
+
+   Party = Null;
+  end;
+  
+  if (PartyId > 0)
+     //BIQ-10268 отправка обновления в CDI, если включена настройка
+     var cdi_isactive, needcdi=false, error;
+     GetRegistryValue(REG_CDI_ACTIVE, V_BOOL, cdi_isactive, error);
+     if( error > 0 )
+        cdi_isactive = false; // не нашли настройку, значит не включено
+     end;
+     if (cdi_isactive)
+        needcdi = ExecMacro2("NeedSendCDI",PartyId, date());
+        if (needcdi)
+           ExecMacro("PutInProcess",SERV_CDI_FIND_ORG, PartyId, 1, null, "-1"); // создать событие FindOrg 
+        end;
+        var statCat = 0;
+        ConnectObjAttr(statCat, OBJTYPE_PARTY, string(PartyId:o:10), 150, 2 , null, null, {curdate}) ;
+     end;
+  else
+    errorText = string("IssuerUID ",IssuerUID," ",Party.FullName, " "," Неизвестная ошибка");
+  end;
+
+  return PartyId;
+
+
+onError(err)
+
+ errorText = string("IssuerUID ",IssuerUID," ",Party.FullName, " ", err.message," (модуль ", err.module,", строка ",err.line,")");
+  
+ PartyId = -1;
+ Party = Null;
+ return PartyId;
+
+end;
+
+/**
+@brief 				загрузка информации по дивидендам
+@param[in] StrLSIN_ISIN		Код ц/б
+@return 			true -- успешно загружено
+@return 			false -- при ошибке
+*/
+private macro LoadDividend( StrLSIN_ISIN :string ) :bool 
+var Query :string = "",
+    Params :TArray,
+    FlAll :integer = 0;
+
+
+  if( ( Valtype(StrLSIN_ISIN) == V_UNDEF ) or ( Valtype(StrLSIN_ISIN) == 26 ) )
+   FlAll = 0;
+   StrLSIN_ISIN = "_";
+  else
+   FlAll = 1;
+  end;
+
+
+  Query = " BEGIN " +
+          "  INSERT INTO dfiwarnts_dbt(T_FIID, T_NUMBER, T_DRAWINGDATE, T_INCOMEVOLUME, T_LISTDATE, T_PAYPERIOD ) " +
+          "  ( " +
+          "   SELECT G.T_FIID, " +
+          "    NVL((G.MAX_T_NUMBER + " +
+          "         RANK () OVER (PARTITION BY G.T_FIID ORDER BY G.LIST_DATE, G.T_SEQUENCE ASC)), 0) AS T_NUMBER, " +
+          "    NVL(G.LIST_DATE, TO_DATE('01010001','ddmmyyyy')) AS LIST_DATE, NVL(G.PAY_STOCK, 0) AS PAY_STOCK, NVL(G.LIST_DIVIDEND_DATE, TO_DATE('01010001','ddmmyyyy')) AS LIST_DIVIDEND_DATE , " +
+          "    NVL(G.PERIOD_SHORTNAME, CHR(0)) AS PERIOD_SHORTNAME " +
+          "   FROM  ( SELECT F.T_FIID, F.MAX_T_NUMBER, F.LIST_DATE, F.PAY_STOCK, F.LIST_DIVIDEND_DATE, F.PERIOD_SHORTNAME, ROWNUM T_SEQUENCE " +
+          "           FROM ( SELECT A.FINTOOLID, C.T_FIID, " +
+          "                   ( SELECT NVL((SELECT MAX( TO_NUMBER( E.T_NUMBER )) " +
+          "                     FROM dfiwarnts_dbt E " +
+          "                     WHERE E.T_FIID = C.T_FIID), 0) FROM DUAL) AS MAX_T_NUMBER, " +
+          "                     NVL( A.LIST_DATE, TO_DATE('01010001','ddmmyyyy')) AS LIST_DATE, " +
+          "                     NVL(A.PAY_STOCK, 0) AS PAY_STOCK, NVL(A.LIST_DIVIDEND_DATE, TO_DATE('01010001','ddmmyyyy')) AS LIST_DIVIDEND_DATE, " +
+          "                     NVL( A.PERIOD_SHORTNAME, '  '  ) AS PERIOD_SHORTNAME " +
+          "                  FROM sofr_info_sharedividend A, sofr_info_fintoolreferencedata B, davoiriss_dbt C " +
+          "                  WHERE A.FINTOOLID = B.FINTOOLID " +
+
+          "                   AND ( :FlAll_1 = 1 " +  //для загрузки по кодам LSIN ISIN
+          "                   AND ( B.ISINCODE = :p_ISIN " +
+          "                    OR B.REGCODE = :p_LSIN ) " +
+
+          "                   OR :FlAll_2 = 0 " +
+          "                   AND C.T_ISIN = B.ISINCODE " +
+          "                   AND ( B.REGCODE IS NOT NULL   /*REGCODE и LSIN соответствуют*/    " +
+          "                    AND C.T_LSIN <> CHR(1) " +
+          "                    AND B.REGCODE NOT LIKE C.T_LSIN || '%' " +
+          "                   OR B.REGCODE IS NOT NULL  /*REGCODE и LSIN отсутствуют*/ " +
+          "                    AND C.T_LSIN <> CHR(1) " +
+          "                    AND B.REGCODE NOT LIKE C.T_LSIN || '%' " +
+          "                   OR B.REGCODE IS NULL /*REGCODE отсутствует LSIN присутствует*/ " +
+          "                    AND C.T_LSIN <> CHR(1) " +
+          "                    AND C.T_LSIN IS NOT NULL ) ) " +
+          "                   AND NOT EXISTS( SELECT 1 FROM dfiwarnts_dbt D " +
+          "                                   WHERE D.T_FIID = C.T_FIID " +
+          "                                    AND D.T_DRAWINGDATE = A.LIST_DATE ) " +
+          "                  ORDER BY A.FINTOOLID, A.LIST_DATE, A.PERIOD_SHORTNAME " +
+          "                ) F " +
+          "           WHERE 1=1 " +
+          "           ORDER BY F.FINTOOLID, F.LIST_DATE, F.PERIOD_SHORTNAME " +
+          "         ) G " +
+          "  ); " +
+          " END; ";
+
+
+  Params = Null;
+  Params = makeArray( SQLParam("FlAll_1", FlAll),
+                      SQLParam("p_ISIN", StrLSIN_ISIN),
+                      SQLParam("p_LSIN", StrLSIN_ISIN),
+                      SQLParam("FlAll_2", FlAll) );
+
+  execSQL( Query, Params );
+  Params = Null;
+  return true;
+
+onError(err)
+
+  return false;
+//!!!!!!!!!!!!обработать ошибки в LOG
+
+end;
+
+PRIVATE MACRO CheckExistFiWarnt(fiid:integer, ispartial:string, drawingdate:date, number_new:string, number_old:@string)
+  var Query :string = "",
+      Params :TArray,
+      DataSet :RsdRecordset, cmd;
+
+  Query = " select t_number from dfiwarnts_dbt where t_fiid = :p_fiid and t_drawingdate = :p_drawingdate  and t_ispartial = "  + IIF(ispartial == "X", "CHR(88)", "CHR(0)");
+
+  DataSet = Null;
+  Params = Null;
+
+  Params = makeArray( SQLParam("p_fiid", fiid),
+                     SQLParam("p_drawingdate", drawingdate));
+
+  DataSet = execSQLselect( Query, Params );
+  if( DataSet.MoveNext )
+    if(int(DataSet.value(0)) <= int(number_new))
+      number_old = DataSet.value(0);
+      return 1;
+    else
+      return 0;
+    end;
+  end;
+
+  return 0;
+END;
+
+/**
+@brief 				загрузка информации о частичных погашениях
+@param[in] Fiid			ID финансового инструмента
+@param[in] FI_Code		Код финансового инструмента
+@param[in] FlAll		Признак загрузки
+*/
+macro LoadAmortization( Fiid :integer, FI_Code :integer, FlAll :integer ) 
+var Query :string = "",
+    Params :TArray,
+    DataSet :RsdRecordset, cmd;
+  var succes :integer;
+  var number_old :string;
+ Query = " SELECT :p_Fiid AS T_FIID, " +
+         "  NVL (ID_TRANCHE, '0' ) AS T_NUMBER, " +
+         "  NVL( MTY_DATE, TO_DATE('01010001', 'ddmmyyyy') ) AS T_DRAWINGDATE, " +
+         "  NVL( MTY_PART, 0 ) AS T_INCOMERATE, " +
+         "  NVL( PAY_PER_BOND, 0 ) AS T_INCOMEVOLUME, " +
+         "  NVL( FIX_DATE, TO_DATE('01010001', 'ddmmyyyy') ) AS T_LISTDATE, " +
+         "  NVL( PAY_DATE, TO_DATE('01010001', 'ddmmyyyy') )  AS T_FACTDATE, " +
+         "  'X' AS ISPARTIAL, " +
+         "  1 AS T_INCOMESCALE, " +
+         "  'X' AS T_ISCLOSED, " +
+         "  'X' AS T_SPISCLOSED, " +
+         "  'X' AS T_TSISCLOSED, " +
+         "  NVL( FIX_DATE, TO_DATE('01010001', 'ddmmyyyy') ) AS T_LISTDATE, " +
+         " ( CASE WHEN (SELECT COUNT(1) FROM dfiwarnts_dbt " +
+         "              WHERE T_FIID = :p_Fiid_1 " + 
+         "               AND T_NUMBER = NVL (ID_TRANCHE, '0' ) " +
+         "               AND T_ISPARTIAL = CHR(88) ) > 0 THEN 1 ELSE -1 END) AS FL_EXISTS " +
+         " FROM sofr_bond_amortizations " +
+         " WHERE ID_FINTOOL = :p_FI_Code " + 
+         "  AND ( SELECT T_ISCLOSED FROM dfininstr_dbt " +
+         "        WHERE T_FIID = :p_Fiid_2 ) <> CHR(88) order by id_tranche" ;
+
+ DataSet = Null;
+ Params = Null;
+
+ Params = makeArray( SQLParam("p_Fiid", Fiid),
+                     SQLParam("p_Fiid_1", Fiid),
+                     SQLParam("p_FI_Code", FI_Code),
+                     SQLParam("p_Fiid_2", Fiid) );
+
+ DataSet = execSQLselect( Query, Params );
+
+
+//T_FIID, T_NUMBER, T_DRAWINGDATE, T_INCOMERATE, T_INCOMEVOLUME, T_LISTDATE, T_FACTDATE, ISPARTIAL, T_INCOMESCALE, T_ISCLOSED, T_SPISCLOSED, T_TSISCLOSED 
+
+ while( DataSet.MoveNext )
+   ClearRecord(fiwarnts);
+   succes = 1;
+   number_old = "";
+
+   fiwarnts.fiid = DataSet.value(0);
+   fiwarnts.number = DataSet.value(1);
+   fiwarnts.drawingdate = DataSet.value(2);
+   fiwarnts.incomerate = money( DataSet.value(3) );
+   fiwarnts.incomevolume = money( DataSet.value(4) );
+   fiwarnts.listdate = DataSet.value(5);
+   fiwarnts.factdate = DataSet.value(6);
+   fiwarnts.ispartial = DataSet.value(7);
+   fiwarnts.incomescale = DataSet.value(8);
+   fiwarnts.listdate = DataSet.value(12);
+   fiwarnts.incomepoint = 4;
+   if( DataSet.value(2) < {CurDate} )
+     fiwarnts.isclosed   = DataSet.value(9);
+     fiwarnts.spisclosed = DataSet.value(10);
+     fiwarnts.tsisclosed = DataSet.value(11);
+   end;  
+   SetDialogFlag(0);
+   if( ( FlAll == 1 ) and ( DataSet.value(13) < 0 ) )
+      if(CheckExistFiWarnt(fiwarnts.fiid, fiwarnts.ispartial, fiwarnts.drawingdate, fiwarnts.number, @number_old) != 1)
+        succes = FI_InsertWarnt(fiwarnts);
+      else
+        fiwarnts.number = number_old;
+        succes = FI_UpdateWarnt(fiwarnts);
+      end;
+      if( succes != 0 )
+         AddLog( Fiid, DataSet.value(1), DataSet.value(2), FI_Code, "IP", "Error:"+geterrmsg() );
+      else
+         /*BPV update до исправление запроса #276742*/
+         cmd = null;
+         cmd = RsdCommand(" update dfiwarnts_dbt set t_incomepoint = :0 where t_ispartial = chr(88) and t_fiid = :1 and t_drawingdate = :2");
+         cmd.addParam("0", RSDBP_IN, 4);
+         cmd.addParam("1", RSDBP_IN, fiwarnts.fiid);
+         cmd.addParam("2", RSDBP_IN, fiwarnts.drawingdate);
+         cmd.execute();
+         AddLog( Fiid, DataSet.value(1), DataSet.value(2), FI_Code, "IP", "Success:"+geterrmsg() );
+      end;
+   elif( ( FlAll == 0 ) and ( DataSet.value(13) > 0 ) )
+/*
+    if( FI_UpdateWarnt(fiwarnts) != 0 )
+      //!!!!!!!!!!!!!!обработать ошибку в лог 
+    end;
+*/
+   elif( ( FlAll == 0 ) and ( DataSet.value(13) < 0 ) )
+      if(CheckExistFiWarnt(fiwarnts.fiid, fiwarnts.ispartial, fiwarnts.drawingdate, fiwarnts.number, @number_old) != 1)
+        succes = FI_InsertWarnt(fiwarnts);
+      else
+        fiwarnts.number = number_old;
+        succes = FI_UpdateWarnt(fiwarnts);
+      end;
+      if( succes != 0 )
+         AddLog( Fiid, DataSet.value(1), DataSet.value(2), FI_Code, "IP", "Error:"+geterrmsg() );
+      else
+         /*BPV update до исправление запроса #276742*/
+         cmd = null;
+         cmd = RsdCommand(" update dfiwarnts_dbt set t_incomepoint = :0 where t_ispartial = chr(88) and t_fiid = :1 and t_drawingdate = :2");
+         cmd.addParam("0", RSDBP_IN, 4);
+         cmd.addParam("1", RSDBP_IN, fiwarnts.fiid);
+         cmd.addParam("2", RSDBP_IN, fiwarnts.drawingdate);
+         cmd.execute();
+
+         AddLog( Fiid, DataSet.value(1), DataSet.value(2), FI_Code, "IP", "Success:"+geterrmsg() );
+      end;
+   end;
+   SetDialogFlag(1);
+ end;
+
+ DataSet = Null;
+ Params = Null;
+ ClearRecord(fiwarnts);
+
+onError(err)
+ SetDialogFlag(1);
+ AddLog( Fiid, DataSet.value(1), DataSet.value(2), FI_Code, "IP", "Error:"+geterrmsg() + " " + err.message + " " + err.line + " " + err.module );
+ DataSet = Null;
+ Params = Null;
+ ClearRecord(fiwarnts);
+
+end;
+
+/**
+@brief 				загрузка информации о купонах
+@param[in] Fiid			ID финансового инструмента
+@param[in] FI_Code		Код финансового инструмента
+@param[in] FlAll		Признак загрузки
+*/
+macro LoadCoupon( Fiid :integer, FI_Code :integer, FlAll :integer ) 
+var Query :string = "",
+    Params :TArray,
+    DataSet :RsdRecordset, cmd, dt;
+
+
+ Query = " SELECT " +
+         "  :p_Fiid AS T_FIID, " +
+         "  NVL (ID_COUPON, '0' ) AS T_NUMBER, " +
+         "  NVL( END_PERIOD, TO_DATE('01010001', 'ddmmyyyy') ) AS T_DRAWINGDATE, " +
+         "  NVL( COUPON_RATE, 0 ) AS T_INCOMERATE, " +
+         "  NVL( PAY_PER_BOND, 0 ) AS T_INCOMEVOLUME, " +
+         "  NVL( BEGIN_PERIOD + 1, TO_DATE('01010001', 'ddmmyyyy') ) AS T_FIRSTDATE, " +
+         "  NVL( PAY_DATE, TO_DATE('01010001', 'ddmmyyyy') )  AS T_FACTDATE, " +
+         "  1 AS T_INCOMESCALE, " +
+         "  'X' AS T_ISCLOSED, " +
+         "  'X' AS T_SPISCLOSED, " +
+         "  'X' AS T_TSISCLOSED, " +
+         "  NVL( FIX_DATE, TO_DATE('01010001', 'ddmmyyyy') ) AS T_LISTDATE, " +
+         "  ( CASE WHEN INSTR( COUPON_RATE, '.' ) <> 0 THEN LENGTH( SUBSTR( COUPON_RATE,INSTR( COUPON_RATE, '.' ) + 1 ) ) " +
+         "         WHEN INSTR( COUPON_RATE, ',' ) <> 0 THEN LENGTH( SUBSTR( COUPON_RATE,INSTR( COUPON_RATE, ',' ) + 1 ) ) ELSE 2 END ) AS INCOMERATEPOINT, " +
+         "  ( CASE WHEN INSTR( PAY_PER_BOND, '.' ) <> 0 THEN LENGTH( SUBSTR( PAY_PER_BOND,INSTR( PAY_PER_BOND, '.' ) + 1 ) ) " + 
+         "         WHEN INSTR( PAY_PER_BOND, ',' ) <> 0 THEN LENGTH( SUBSTR( PAY_PER_BOND,INSTR( PAY_PER_BOND, ',' ) + 1 ) ) ELSE 2 END ) AS INCOMEVOLUMEPOINT, " +
+         "  (CASE WHEN ( SELECT COUNT (1) FROM dfiwarnts_dbt " +
+         "               WHERE T_FIID = :p_Fiid_1 " +
+         "                AND T_DRAWINGDATE = NVL (END_PERIOD, TO_DATE ('01010001', 'ddmmyyyy')) " +
+         "                AND T_ISPARTIAL = CHR (0)) > 0 THEN 1 " +
+         "   ELSE -1 END ) AS FL_EXISTS, " +
+         "  (SELECT t_id FROM dfiwarnts_dbt " +
+         "               WHERE T_FIID = :p_Fiid_11 " +
+         "                AND T_DRAWINGDATE = NVL (END_PERIOD, TO_DATE ('01010001', 'ddmmyyyy')) " +
+         "                AND T_ISPARTIAL = CHR (0)) t_id, "
+         "  (SELECT DAV.T_FLOATINGRATE  FROM DAVOIRISS_DBT DAV WHERE DAV.T_FIID = :p_Fiid_3 ) T_FLOATINGRATE, " +
+         "  UPDATE_DATE, "
+         ///DEF-52170
+         "  (SELECT P.T_NRCOUNTRY " +
+         "            FROM DOBJCODE_DBT O " +
+         "            JOIN DFININSTR_DBT F " +
+         "              ON F.T_FIID = O.T_OBJECTID " +
+         "            JOIN DPARTY_DBT P " +
+         "              ON F.T_ISSUER = P.T_PARTYID " +
+         "           WHERE O.T_CODE = TO_CHAR(ID_FINTOOL) " +
+         "             AND O.T_CODEKIND = 104 " +
+         "             AND O.T_STATE = 0 " +
+         "             AND O.T_OBJECTTYPE = 9 and rownum = 1) T_NRCOUNTRY " +
+         ///end of DEF-52170
+         " FROM sofr_bond_coupons " +
+         " WHERE ID_FINTOOL = :p_FI_Code " + 
+         "  AND ( SELECT T_ISCLOSED FROM dfininstr_dbt " +
+         "        WHERE T_FIID = :p_Fiid_2 ) <> CHR(88) " ;
+
+ DataSet = Null;
+ Params = Null;
+
+ Params = makeArray( SQLParam("p_Fiid", Fiid),
+                     SQLParam("p_Fiid_1", Fiid), 
+                     SQLParam("p_Fiid_11", Fiid),
+                     SQLParam("p_Fiid_3", Fiid),
+                     SQLParam("p_FI_Code", FI_Code),
+                     SQLParam("p_Fiid_2", Fiid) );
+ DataSet = execSQLselect( Query, Params );
+
+ while( DataSet.MoveNext )
+   ClearRecord(fiwarnts);
+   fiwarnts.fiid         = DataSet.value("T_FIID");
+   fiwarnts.number       = DataSet.value("T_NUMBER");
+   fiwarnts.drawingdate  = DataSet.value("T_DRAWINGDATE");
+   fiwarnts.incomerate   = money( DataSet.value("T_INCOMERATE") );
+   fiwarnts.incomevolume = money( DataSet.value("T_INCOMEVOLUME") );
+   fiwarnts.firstdate    = DataSet.value("T_FIRSTDATE");
+   fiwarnts.factdate     = DataSet.value("T_FACTDATE");
+   fiwarnts.incomescale  = DataSet.value("T_INCOMESCALE");
+   fiwarnts.listdate     = DataSet.value("T_LISTDATE");
+
+   if( DataSet.value("INCOMERATEPOINT") > DataSet.value("INCOMEVOLUMEPOINT") )
+     fiwarnts.incomepoint = DataSet.value("INCOMERATEPOINT");
+   else
+     fiwarnts.incomepoint = DataSet.value("INCOMEVOLUMEPOINT");
+   end;
+   /// DEF-52170
+   if (DataSet.value("T_NRCOUNTRY")=="RUS")
+     fiwarnts.incomepoint = 2;
+   else
+     fiwarnts.incomepoint = 4;
+   end;
+   /// end of DEF-52170
+
+   if (DataSet.value("T_INCOMERATE") != 0)
+     fiwarnts.relativeincome = "X";
+   end;
+
+   if( DataSet.value("T_DRAWINGDATE") < {CurDate} )
+    fiwarnts.isclosed   = DataSet.value("T_ISCLOSED");
+    fiwarnts.spisclosed = DataSet.value("T_SPISCLOSED");
+    fiwarnts.tsisclosed = DataSet.value("T_TSISCLOSED");        
+   end;
+
+   SetDialogFlag(0);
+   if( ( FlAll == 1 ) and ( DataSet.value("FL_EXISTS") < 0 ) )
+
+    if( FI_InsertWarnt(fiwarnts) != 0 )
+       AddLog( Fiid, DataSet.value(1), DataSet.value(2), FI_Code, "I", "Error:"+geterrmsg() );
+    else
+       AddLog( Fiid, DataSet.value(1), DataSet.value(2), FI_Code, "I", "Success "+geterrmsg() );
+    end;
+
+   elif( ( DataSet.value("FL_EXISTS") > 0 ) )
+      if( (fiwarnts.drawingdate >= {CurDate})
+          or ((fiwarnts.drawingdate >= {CurDate}-1) and (DataSet.value("T_FLOATINGRATE")=="X"))  //def-37559
+          /* and ( fiwarnts.firstdate >= date() ) */  
+          )
+          /* 20190916 текущий теперь тоже обновляем*/
+         fiwarnts.id = int(DataSet.Value("t_id")); 
+         Dt = TRsbDataSet(" select * from dfiwarnts_dbt where t_id = " + fiwarnts.id);
+         Dt.movenext(); //ну не может быть чтоб не нашли (
+         if (
+             (dt.IncomeRate    != fiwarnts.incomeRate ) or
+             (dt.IncomeVolume  != fiwarnts.incomeVolume ) or
+             (dt.IncomePoint   != fiwarnts.incomePoint ) or  // DEF-62713
+             (fiwarnts.firstdate >= date())
+            )
+            If( not ((fiwarnts.incomerate == 0) and (fiwarnts.incomevolume == 0)) /*Если данные ставки И значения купона нулевые, то такие не обновляем*/
+                and (StrUpr(ReadNoteForObject(OBJECT_COUPON,string(fiwarnts.id:o:34),OBJECTTYPE_COUPON)) != REZULT_COUPON_NOTETEXT)) //shev 13072020 Если на купоне стоит примечание 101 в значение "НЕТ", то купон не обновляем 
+               if( FI_UpdateWarnt(fiwarnts, SQL_ConvTypeDate(DataSet.Value("UPDATE_DATE"))) != 0 ) 
+                  AddLog( Fiid, DataSet.value(1), DataSet.value(2), FI_Code, "U", "Error:"+geterrmsg() );
+               else
+                  if ((dt.IncomeRate    != fiwarnts.incomeRate ) or
+                      (dt.IncomeVolume  != fiwarnts.incomeVolume ))
+                       AddLog( Fiid, DataSet.value(1), DataSet.value(2), FI_Code, "U", "Success: Изменена ставка "+geterrmsg() );
+                  end;
+                  // setdialogflag(1); msgbox("  1  " + geterrmsg());setdialogflag(0);
+                  /*
+                  /* дата изменения купона по бумаге с плавающей ставкой (по обычной просто ничего не произойдет), должна быть обязательно точной*/
+                  /* поэтому если мы обновляем купон и его дата изменения не совпадает с текущей опердатой, то дату периодов надо подправить */
+                  if (SQL_ConvTypeDate(DataSet.Value("UPDATE_DATE")) != {curdate})
+                     /* дату начала нового периода сдвигаем на дату изменения*/
+                     cmd = RsdCommand(" update dflrhist_dbt set t_begdate = :0 where t_fiwarntid = :1 and t_begdate = :2");
+                     cmd.addParam("0", RSDBP_IN, SQL_ConvTypeDate(DataSet.Value("UPDATE_DATE")));
+                     cmd.addParam("1", RSDBP_IN, fiwarnts.id);
+                     cmd.addParam("2", RSDBP_IN, {curdate});
+                     cmd.Execute();
+                     /* дата окончания предыдущего периода будет равна {curdate}-1, сдвинем ее на update_date-1*/
+                     cmd = null;
+                     cmd = RsdCommand(" update dflrhist_dbt set t_enddate = :0 where t_fiwarntid = :1 and t_enddate = :2");
+                     cmd.addParam("0", RSDBP_IN, SQL_ConvTypeDate(DataSet.Value("UPDATE_DATE"))-1);
+                     cmd.addParam("1", RSDBP_IN, fiwarnts.id);
+                     cmd.addParam("2", RSDBP_IN, {curdate}-1);
+                     cmd.Execute();   
+                     /*если бумага сегодня не обновлялсь или она не с плавающим купоном, то апдейты сделают 0 updated rows*/
+                  end;
+                  */
+               end;
+            end;
+         end;
+      end;
+   elif( ( FlAll == 0 ) and ( DataSet.value(14) < 0 ) )
+
+    if( FI_InsertWarnt(fiwarnts) != 0 )
+        AddLog( Fiid, DataSet.value(1), DataSet.value(2), FI_Code, "I", "Error:"+geterrmsg() );
+     else
+        AddLog( Fiid, DataSet.value(1), DataSet.value(2), FI_Code, "I", "Success "+geterrmsg() );
+    end;
+
+   end;
+   SetDialogFlag(1);
+
+ end;
+
+ DataSet = Null;
+ Params = Null;
+ ClearRecord(fiwarnts);
+
+/*onError(err)
+
+ DataSet = Null;
+ Params = Null;
+ ClearRecord(fiwarnts);*/
+
+end;
+
+/**
+@brief 				добавление эмитента в таблицу USR_RUDATA_LIST_EMITENT
+@param[in] Partyid		ID субъекта
+@param[in] Issueruid		Идентификатор эмитента
+*/
+private macro InsertListEmitent(Partyid, Issueruid)
+   var Query, Params;
+
+   Query =  "DECLARE "+
+            "   v1 number := :PartyId; "+
+            "   v2 number := :Issueruid; "+
+            "   vcnt number; "+
+            "BEGIN "+
+            "   select count(*) into vcnt "+
+            "     from USR_RUDATA_LIST_EMITENT "+
+            "    where partyid = v1 and issueruid = v2; "+
+            "   if vcnt = 0 then "+
+            "      INSERT INTO USR_RUDATA_LIST_EMITENT (partyid, issueruid) "+
+            "      VALUES (v1, v2); "+
+            "   end if; "+
+            "END; ";
+
+   Params = makeArray( SQLParam( "PartyId", PartyId ),
+                       SQLParam( "Issueruid", Issueruid ));
+   execSQL( Query, Params );
+end;
+
+/**
+@brief               Обновление даты погашения ц/б
+@param[in] fiid      код ц/б
+@param[in] datedrw   новая дата погашения
+*/
+private macro UpdateDateDrw(fiid :integer, datedrw :date)
+  var sql, cmd;
+
+  sql = "begin\n" + 
+	"   update dfininstr_dbt\n" + 
+        "      set t_drawingdate = :datedrw\n" + 
+        "    where t_fiid = :fiid;\n" + 
+	"end;\n";
+  cmd = RSDCommand(sql);
+  cmd.AddParam("datedrw", RSDBP_IN, datedrw);
+  cmd.AddParam("fiid", RSDBP_IN, fiid);
+  cmd.Execute;
+  AddLog( fiid, "0", {BranchCurDate}, "", "DateD", "Success: Изменена дата погашения" );
+  cmd = null;
+onError (err)
+  AddLog( fiid, "0", {BranchCurDate}, "", "DateD", "Error: " + err.message );
+  cmd = null;
+end;
+
+macro LoadOne(FlAll, Mode, StrLSIN_ISIN, DataSet, Force, err:@string, LoadBase, needcdi, cdi_isactive)
+   var i:integer = 0,
+       FlResult :bool = true,
+       Params :TArray,
+       DatasetD:RsdRecordset, 
+       PartyCateg,
+       IssuerId,
+       v_email_processor,
+       dr_query :string = "",
+       dr_params :TArray,
+       dr_dataset :RsdRecordset,
+       dr_loadfininstr :bool = true,
+       objectid :string = "";
+   var query_code :string = "", dataset_code = null;  
+   var IsDepRec:bool = false; // признак депозитарной расписки
+
+
+   FlResult = true;
+   ClearRecord(fininstr);
+   ClearRecord(avoiriss);
+   ClearRecord(fiwarnts);
+   avrinvst = TRechandler ("avrinvst");
+
+   if( ( FlAll == 1 ) and ( Mode == 1 ) )
+      FI_InitAvoiriss(FIKIND_ALLAVOIRISS, fininstr, avoiriss);
+   end;
+
+   if ((DataSet.value("T_ISDRAWING", Null, V_INTEGER) != 0) and (not Force)) //погашена
+      FlResult = false;
+      err = "Ценная бумага погашена";
+   end;
+
+   if ( DataSet.value("T_AVOIRKIND") == 0 )
+      FlResult = false;
+      err = "Не определен тип ценной бумаги";
+   end;
+
+   IsDepRec = false;
+   if(  FlResult ) //определен вид ценной бумаги 
+     dr_loadfininstr = true; //DEF-42729 
+
+// Cherednichenko 2022-05-25 is 543126 Депозитарные расписки должны загружаться только после загрузки базовой бумаги
+     if ( (DataSet.value("T_AVOIRKIND") == 45) or (DataSet.value("T_AVOIRKIND") == 46) or (DataSet.value("T_AVOIRKIND") == 47) or (DataSet.value("T_AVOIRKIND") == 49) or (DataSet.value("T_AVOIRKIND") == 10) ) // ДР
+       IsDepRec = true;
+       dr_query = " select a.t_isin, a.t_lsin, f.t_name, (select t_shortname from dparty_dbt where t_partyid = f.t_issuer) issuername " +
+                        " from davoiriss_dbt a, dfininstr_dbt f where a.t_fiid = f.t_fiid " + 
+                        " and ( (a.t_isin = :pficode1 ) or (a.t_lsin =:pficode2))";
+
+       dr_params = makeArray( SQLParam("pficode1", DataSet.value("BASE_DR_FI")), SQLParam("pficode2", DataSet.value("BASE_DR_FI")) );
+       dr_dataset = execSQLselect( dr_query, dr_params );
+       if (not dr_dataset.MoveNext) // если в СОФР нет базовой бумаги - отменяем загрузку ДР
+         var baseLoaded = false;
+         if (LoadBase == true) //если включена загрузка базового, то пробуем его загрузить вместо отмены
+           if (ExecMacroFile( "loadRUData.mac", "SOFR_LoadRuDataByID", DataSet.value("BASE_DR_FI"), 1))
+             baseLoaded = true;
+           end;
+         end;
+         if (not baseLoaded)
+           if (FlAll == 1)
+             err = "Отсутствует базовый актив, загрузка ДР отменена." + geterrmsg();
+             FlResult = false;
+           end;
+           dr_loadfininstr = false;
+         end;
+       else 
+         //def-44729 только НЕ "Локальные линии"
+         if (StrUpr(DataSet.value("SecurityKind")) == StrUpr("Локальные линии"))
+            dr_loadfininstr = false;
+            err = "Депозитарные расписки вида ""Локальные линии"" не загружаются";
+            FlResult = false;
+         end;
+       end;
+     end;
+
+
+     if ( (DataSet.value("T_AVOIRKIND") == 1) or (DataSet.value("T_AVOIRKIND") == 2) ) // акции
+       //def-44729 только "Осн-ой"
+       if (StrUpr(DataSet.value("SecurityKind")) != StrUpr("Осн-ой"))
+          dr_loadfininstr = false;
+          FlResult = false;
+          err = "Акции загружаются только вида ""Осн-ой""";
+       end;
+     end;
+
+     if(Valtype(DataSet.value("T_FACEVALUEFI"))  == V_UNDEF)
+       dr_loadfininstr = false;
+       FlResult = false;
+       err = "Не определен финансовый инструмент";
+       AddLog_it("RUDATA. ошибка загрузки isin="+DataSet.value("ISINCODE", Null, V_STRING));
+     end;
+
+     if (dr_loadfininstr) // по умолчанию загружаем все бумаги
+      var check_err = 0, code_emitent = "", codekind_emitent = 0, current_code = "";
+      needcdi = false;
+
+      fininstr.FaceValueFI = DataSet.value("T_FACEVALUEFI");
+      if( DataSet.value("T_ISSUER", Null, V_INTEGER) != 7 ) //совпал субъект-эмитент по ИНН из буферной таблице с ИНН в RS Bank
+
+         fininstr.Issuer = DataSet.value("T_ISSUER", Null, V_INTEGER);
+         CheckEmitentPartyOwn( DataSet.value("T_ISSUER", Null, V_INTEGER), PTK_ISSUER );
+
+         if( (  Valtype(DataSet.value("OGRN"))  != V_UNDEF ) and (  Valtype(DataSet.value("OGRN") ) != 26 ) and ( Mode == 1 ) )
+            codekind_emitent = 27; /*OGRN*/
+            current_code = DataSet.value("OGRN");
+            if (cdi_isactive and (not needcdi))
+               code_emitent = ПолучитьКодСубъекта(fininstr.Issuer, codekind_emitent, check_err);
+               if(check_err == 0) // код найден
+                  if (code_emitent != current_code)
+                     needcdi = true;
+                  end;
+               else 
+                  needcdi = true;
+               end;
+            end;
+            AddFIIDCode( 3, codekind_emitent, fininstr.Issuer, current_code, Mode );
+
+         end;
+//shev 080421 isup 523418
+         if( (  Valtype(DataSet.value("State_Reg_number"))  != V_UNDEF ) and (  Valtype(DataSet.value("State_Reg_number") ) != 26 ) and ( Mode == 1 ) )
+            codekind_emitent = 33; 
+            current_code = DataSet.value("State_Reg_number");
+            if (cdi_isactive and (not needcdi))
+               code_emitent = ПолучитьКодСубъекта(fininstr.Issuer, codekind_emitent, check_err);
+               if(check_err == 0) // код найден
+                  if (code_emitent != current_code)
+                     needcdi = true;
+                  end;
+               else 
+                  needcdi = true;
+               end;
+            end;
+            AddFIIDCode( 3, codekind_emitent, fininstr.Issuer, current_code, Mode );
+
+         end;
+
+         //DEF-58098 выгрузка в CDI
+         if (needcdi)
+            current_code = ПолучитьКодСубъекта(fininstr.Issuer, PARTY_CODEKIND_CDI, check_err);
+            if(check_err == 0) // код найден
+               ExecMacro("PutInProcess",SERV_CDI_UPDATE_ORG, fininstr.Issuer, 1, null, current_code); // создать событие UpdateOrg 
+            else 
+               ExecMacro("PutInProcess",SERV_CDI_FIND_ORG, fininstr.Issuer, 1, null, "-1"); // создать событие FindOrg 
+            end;
+         end;
+
+      elif( ( Valtype( DataSet.value("T_ISSUERID", Null, V_INTEGER)) != V_UNDEF ) and  //не совпал субъект-эмитент по ИНН из буферной таблице с ИНН в RS Bank
+            ( Valtype( DataSet.value("T_ISSUERID", Null, V_INTEGER)) != 26 ) and
+            ( DataSet.value("T_ISSUERID", Null, V_INTEGER) > 0 )
+           )
+
+         fininstr.Issuer = DataSet.value("T_ISSUERID", Null, V_INTEGER);
+         CheckEmitentPartyOwn( DataSet.value("T_ISSUERID", Null, V_INTEGER), PTK_ISSUER );
+
+         if( (  Valtype(DataSet.value("OGRN"))  != V_UNDEF ) and (  Valtype(DataSet.value("OGRN") ) != 26 ) and ( Mode == 1 ) )
+            codekind_emitent = 27; /*OGRN*/
+            current_code = DataSet.value("OGRN");
+            if (cdi_isactive and (not needcdi))
+               code_emitent = ПолучитьКодСубъекта(fininstr.Issuer, codekind_emitent, check_err);
+               if(check_err == 0) // код найден
+                  if (code_emitent != current_code)
+                     needcdi = true;
+                  end;
+               else 
+                  needcdi = true;
+               end;
+            end;
+            AddFIIDCode( 3, codekind_emitent, fininstr.Issuer, current_code, Mode );
+
+         end;
+
+//shev 29012021   isup 522600
+         if( (  Valtype(DataSet.value("TIN"))  != V_UNDEF ) and (  Valtype(DataSet.value("TIN") ) != 26 )  )
+            codekind_emitent = 62; /*TIN*/
+            current_code = DataSet.value("TIN");
+            if (cdi_isactive and (not needcdi))
+               code_emitent = ПолучитьКодСубъекта(fininstr.Issuer, codekind_emitent, check_err);
+               if(check_err == 0) // код найден
+                  if (code_emitent != current_code)
+                     needcdi = true;
+                  end;
+               else 
+                  needcdi = true;
+               end;
+            end;
+            AddFIIDCode( 3, codekind_emitent, fininstr.Issuer, current_code, Mode );
+         end;
+        
+         //DEF-58098 выгрузка в CDI
+         if (needcdi)
+            current_code = ПолучитьКодСубъекта(fininstr.Issuer, PARTY_CODEKIND_CDI, check_err);
+            if(check_err == 0) // код найден
+               ExecMacro("PutInProcess",SERV_CDI_UPDATE_ORG, fininstr.Issuer, 1, null, current_code); // создать событие UpdateOrg 
+            else 
+               ExecMacro("PutInProcess",SERV_CDI_FIND_ORG, fininstr.Issuer, 1, null, "-1"); // создать событие FindOrg 
+            end;
+         end;
+
+
+      elif( ( Valtype(DataSet.value("ISSUERUID", Null, V_INTEGER) ) == V_UNDEF ) or //новая бумага не нашли фин. инструмент и эмитента из буферной таблицы в RS Bank
+            ( Valtype(DataSet.value("ISSUERUID", Null, V_INTEGER) ) == 26 ) or
+            (DataSet.value("ISSUERUID", Null, V_INTEGER) <= 0) or 
+            (DataSet.value("T_ISSUER") == 7) /* BPV не понял усолвия выше поэтому добавил. иначе в эту ветку мы никогда не попадем*/ 
+          )
+         /*BPV ищем более пристально*/
+         if  (not FindIssuer(
+                           DataSet.value("ISSUER_INTERFAX"),
+                           DataSet.value("ISSUERINN"),
+                           DataSet.value("TIN"),
+                           DataSet.value("ISSUER_NRD"),
+                           DataSet.value("SWIFT"),
+                           DataSet.value("LEI_CODE"),
+                           DataSet.value("KPP"),
+                           @IssuerId
+                           )
+            )
+            var errorText: String = "";
+            fininstr.Issuer = AddEmitentParty( DataSet.value("ISSUERUID", Null, V_INTEGER), DataSet.value("ISSUERINN", Null, V_STRING) , DataSet.value("TIN"), @errorText);
+            //отправляем в почту
+            v_email_processor = Null;
+            v_email_processor = c_email_proc_env();
+            if (fininstr.Issuer > 0)
+				v_email_processor.m_set_msg_head("СОФР - Загрузка RUDATA.");
+				v_email_processor.m_add_row_to_msg_text("ВНИМАНИЕ! Фин.инструмент ISIN " + DataSet.value("ISINCODE") + ". Загружен новый эмитент, код INTERFAX " + DataSet.value("ISSUER_INTERFAX") + "." +
+				  DataSet.value("T_DEFINITION") + " Требуется контроль отсутствия дублирования субъекта." );
+
+				if ((StrLen(errorText) > 0) and isOkatoNewFunctional)
+				  v_email_processor.m_add_row_to_msg_text("Также при сохранении эмитента получены следующие ошибки: " + errorText);
+				  AddLog_it("RUDATA. ошибка при загрузке isin=" + DataSet.value("ISINCODE", Null, V_STRING) + ": " + errorText);
+				end;
+            else
+				v_email_processor.m_set_msg_head("СОФР - Ошибка Загрузки RUData.");
+				v_email_processor.m_add_row_to_msg_text("ВНИМАНИЕ! по фин. инструменту ISIN " + DataSet.value("ISINCODE") + " произошла ошибка загрузки эмитента Код INTERFAX " + 
+				  DataSet.value("ISSUER_INTERFAX") + ", " + errorText+" Требуются сообщить Сопровождению для загрузки эмитента в Справочник эмитентов СОФР.");
+     			AddLog_it("RUDATA. ошибка загрузки эмитента для isin=" + DataSet.value("ISINCODE", Null, V_STRING) + ": " + errorText);
+     			AddEventError_it("Ошибка загрузки эмитента для isin=" + DataSet.value("ISINCODE", Null, V_STRING) + ": " + errorText,"Загрузка эмитента");
+			end;
+            v_email_processor.m_save_to_submit_grp(CV_EMAIL_GRP_RUDATA, true);
+            v_email_processor.m_submit_email_synch();
+            v_email_processor = Null;
+            //отправляем в почту
+         else
+            fininstr.Issuer = IssuerId;
+         end;
+      end;
+
+      fininstr.AvoirKind = DataSet.value("T_AVOIRKIND");
+      //fininstr.FI_Code = DataSet.value("T_FI_CODE");
+      fininstr.FI_Kind = DataSet.value("T_FI_KIND");
+      fininstr.Name = DataSet.value("T_NAME");
+      fininstr.Definition = DataSet.value( "T_NAME" /*"T_DEFINITION"*/ );
+      fininstr.Settlement_Code = DataSet.value("T_SETTLEMENT_CODE");
+      fininstr.FaceValue = DataSet.value("T_FACEVALUE");
+      fininstr.Issued = DataSet.value("T_ISSUED", Null, V_DATE);
+      fininstr.MainFiid = -1;
+      fininstr.GeneralizedFiid = -1;
+
+      fininstr.ParentFI = GetBaseFiid(SQL_ConvTypeStr(DataSet.value("BASE_DR_FI")));
+      avoiriss.oper = {oper};
+
+      fininstr.DrawingDate = DataSet.value("T_DRAWINGDATE");
+      avoiriss.isin = DataSet.value("ISINCODE");
+
+      if( ( Valtype( DataSet.value("REGCODE") ) != V_UNDEF ) and 
+          ( Valtype( DataSet.value("REGCODE") ) != 26 ) 
+         )
+         avoiriss.lsin = DataSet.value("REGCODE");
+      elif( ( Valtype(DataSet.value("T_LSIN")) != V_UNDEF ) and 
+            ( Valtype(DataSet.value("T_LSIN")) != 26 ) 
+          )
+         avoiriss.lsin = DataSet.value("T_LSIN");
+      end;
+
+      avoiriss.qty = DataSet.value("T_QTY");
+      avoiriss.nkdround_kind = DataSet.value("T_NKDROUND_KIND");
+      //avoiriss.incometype = DataSet.value("T_INCOMETYPE");
+      avoiriss.nkdbase_kind = DataSet.value("T_NKDBASE_KIND");
+      avoiriss.incirculationdate = DataSet.value("T_INCIRCULATIONDATE");
+      if((fininstr.Issued == date(0,0,0)) and (FI_IsAvrKindNotEmissive(fininstr.AvoirKind) == false))
+        fininstr.Issued = avoiriss.incirculationdate;
+      end;
+      //avoiriss.begplacementdate = DataSet.value("T_INCIRCULATIONDATE");
+      avoiriss.begplacementdate = DataSet.value("T_BEGPLACEMENTDATE");
+      avoiriss.endplacementdate = DataSet.value("T_ENDPLACEMENTDATE");
+      avoiriss.regdate = fininstr.Issued;
+//!!!         avoiriss.incometype = DataSet.value("INCOMTYPE"); 
+
+      avoiriss.FloatingRate = DataSet.Value("COUPONTYPE");
+//shev 20211215 индексируемый номинал
+      if (DataSet.Value("IndexNom") > 0)
+          avoiriss.IndexNom = "X";
+      end;
+
+      //Генерация основного кода, и кода в номере счета
+      if( ( FlAll == 1 ) and ( Mode == 1 ) )
+         FI_AvoirGenerateCode(fininstr, avoiriss, fininstr.FI_Code, fininstr.CodeInAccount);
+      end;
+//shev isup 519715 запоняем значением isin
+      fininstr.FI_Code = DataSet.value("ISINCODE");
+
+      if ( DataSet.value("T_AVOIRKIND") != 16) //инвестиционный пай
+         avrinvst = null;
+      else
+         avrinvst.rec.type = DataSet.value("T_TYPE");
+         avrinvst.rec.minvaluefiid = DataSet.value("T_FACEVALUEFI");
+         avrinvst.rec.formvaluefiid = DataSet.value("T_FACEVALUEFI");
+         avrinvst.rec.name = DataSet.value("T_NAME");
+      end;
+
+      avoiriss.taxgroup = ОпределитьГНУ_2(fininstr ,avoiriss, avrinvst );
+
+      if (IsDepRec) // DEF-51129
+         if (  (Valtype(DataSet.value("DRQTY"))  != V_UNDEF) and (Valtype(DataSet.value("DRQTY")) != 26) )
+            avoiriss.QTY = DataSet.value("DRQTY");
+         end;
+         if (  (Valtype(DataSet.value("SHQTY"))  != V_UNDEF) and (Valtype(DataSet.value("SHQTY")) != 26) )
+            avoiriss.NumBaseFI = DataSet.value("SHQTY");
+         end;
+      end;
+
+      if( ( FlAll == 1 ) and ( Mode == 1 ) )
+         if( FI_InsertAvoiriss(fininstr, avoiriss, avrinvst, null, false) != 0 ) 
+            FlResult = false;
+            err = "Ошибка вставки ценной бумаги:" + geterrmsg();
+         else
+            FlResult = true;
+            if( avoiriss.floatingrate == "X")
+             //отправляем в почту
+             v_email_processor = Null;
+             v_email_processor = c_email_proc_env();
+             v_email_processor.m_set_msg_head("СОФР - Загрузка RUDATA.");            
+             v_email_processor.m_add_row_to_msg_text("ВНИМАНИЕ! Загружена бумага " +StrLSIN_ISIN + " с плавающей ставкой. Требуется проконтролировать необходимость заполнения истории плавающих ставок по текущему купону.");
+//shev isup503827               v_email_processor.m_add_row_to_msg_text("ВНИМАНИЕ! Загружена бумага " + DataSet.value("T_ISIN")+ " с плавающей ставкой. Требуется проконтролировать необходимость заполнения истории плавающих ставок по текущему купону.");
+             v_email_processor.m_save_to_submit_grp(CV_EMAIL_GRP_RUDATA, true);
+             v_email_processor.m_submit_email_synch();
+             v_email_processor = Null;
+             //отправляем в почту
+
+            end;
+
+         end;
+      elif( (FlAll == 0 ) or ( FlAll == 1 ) and ( Mode != 1 ) )
+         avoiriss.FIID = DataSet.value("T_FIID", Null, V_INTEGER);
+         fininstr.FIID = DataSet.value("T_FIID", Null, V_INTEGER);
+         fininstr.FI_Code = DataSet.value("T_FI_CODE");
+         /*>>bpv 20190916 бумагу не обновляем, но если ГНУ не заполнено, то заполним*/
+         var cmd2 = RSDCommand("update davoiriss_Dbt set t_taxgroup=? where t_fiid=? and t_taxgroup = 0");
+             cmd2.AddParam("", RSDBP_IN, avoiriss.taxgroup);
+             cmd2.AddParam("", RSDBP_IN, avoiriss.fiid);
+             cmd2.execute();
+             cmd2 = null;
+             cmd2 = RSDCommand("update dfininstr_dbt set t_issuer=?, t_name=?, t_definition=?, t_parentfi=? where t_fiid=? ");
+             cmd2.AddParam("", RSDBP_IN, fininstr.issuer);
+             cmd2.AddParam("", RSDBP_IN, fininstr.name);
+             cmd2.AddParam("", RSDBP_IN, fininstr.definition);
+             cmd2.AddParam("", RSDBP_IN, fininstr.parentfi);
+             cmd2.AddParam("", RSDBP_IN, avoiriss.fiid);
+             cmd2.execute();
+
+             if ((fininstr.fi_kind == 2) and (fininstr.AvoirKind == 16))/*для инвестиционных паев */
+                 cmd2 = RSDCommand("update davrinvst_dbt set t_name=? where t_fiid=? ");
+                 cmd2.AddParam("", RSDBP_IN, fininstr.name);
+                 cmd2.AddParam("", RSDBP_IN, avoiriss.fiid);
+                 cmd2.execute();
+             end;
+
+             cmd2 = RSDCommand("update davoiriss_dbt set t_regdate=? where t_fiid=? and t_regdate <> ?");
+             cmd2.AddParam("", RSDBP_IN, avoiriss.regdate);
+             cmd2.AddParam("", RSDBP_IN, avoiriss.fiid);
+             cmd2.AddParam("", RSDBP_IN, avoiriss.regdate);
+             cmd2.execute();
+
+              if ( (DataSet.value("t_fiid",Null, V_INTEGER) > 0) and	// ценная бумага есть в справочнике
+                   (DataSet.value("t_drawingdate", null, V_DATE) != date(0,0,0))  and // Дата погашения указана в RU DATA
+                   (DataSet.value("t_drawingdate", null, V_DATE) != DataSet.value("drawingdate_fm", null, V_DATE)) )// Дата погашения отличается
+               UpdateDateDrw(DataSet.value("t_fiid"), DataSet.value("t_drawingdate"));  // Обновим дату погашения
+            end;    
+
+         /*<<*/	
+         if( ( Valtype(DataSet.value("T_LSIN")) == V_UNDEF ) or  //!!!пока не обновляем бумагу из RUDATA если она есть в справочнмке RS Bank
+             ( Valtype(DataSet.value("T_LSIN")) == 26 ) 
+           )
+            if( ( FI_UpdateAvoiriss(fininstr, avoiriss) != 0 ) )
+               FlResult = false;
+               err = "Ошибка обновления ценной бумаги:" + geterrmsg();
+            else
+               FlResult = true;
+            end;
+         else
+            FlResult = true;
+         end;
+      end;
+     end;
+   end;
+
+   if( FlResult )/*ценная бумага загружена, теперь сопутствующая информация. Обновление ранее загруженых ХП rudata_read.update_fininstr */
+      objectid = String(fininstr.FIID:o:10);
+      
+      LoadCoupon( fininstr.FIID /*DataSet.value(0)*/, DataSet.value("T_FI_CODE"), FlAll ); //загрузка информации о купонах
+      LoadAmortization( fininstr.FIID /*DataSet.value(0)*/, DataSet.value("T_FI_CODE"), FlAll ); //загрузка информации о частичных погашениях
+
+      AddFIIDCode( 9, CODE_KIND_FIID_RUDATA, fininstr.FIID, DataSet.value("T_FI_CODE"), Mode );
+
+      if( (  Valtype(DataSet.value("CFI")) != V_UNDEF ) and (  Valtype(DataSet.value("CFI") )  != 26 )  )
+         AddFIIDCode( 9, CODE_KIND_CFI, fininstr.FIID, DataSet.value("CFI"), Mode );
+      end;
+
+      //def-44729
+      query_code = "select rudata_read.get_seccode_mmvb(p_isin => :isin1) as mmvb_seccode, "
+                 + "       rudata_read.get_seccode_spb(p_isin => :isin2) as spb_seccode"
+                 + "  from dual";	
+      Params = makeArray( SQLParam("isin1", DataSet.value("ISINCODE")), SQLParam("isin2", DataSet.value("ISINCODE")) );
+      DataSet_code = execSQLselect( query_code, Params );
+      if ( DataSet_code.MoveNext )
+         if( (  Valtype(DataSet_code.value("mmvb_seccode"))  != V_UNDEF ) 
+               and (  Valtype(DataSet_code.value("mmvb_seccode") ) != 26 ) )
+            AddFIIDCode( 9, CODE_KIND_MMVBCODE, fininstr.FIID, DataSet_code.value("mmvb_seccode"), Mode );
+         end;
+
+         if( (  Valtype(DataSet_code.value("spb_seccode"))  != V_UNDEF ) 
+               and (  Valtype(DataSet_code.value("spb_seccode") ) != 26 ) )
+            AddFIIDCode( 9, 22, fininstr.FIID, DataSet_code.value("spb_seccode"), Mode );
+         end;
+      end;
+      DataSet_code = null; 
+
+      if( (  Valtype(DataSet.value("NRDCODE")) != V_UNDEF ) and (  Valtype(DataSet.value("NRDCODE") ) != 26 ) /*and ( FlAll != 0)*/ /*в РУДАТА мусор не обновляем*/)
+         AddFIIDCode( 9, CODE_KIND_NRDCODE, fininstr.FIID, DataSet.value("NRDCODE"), Mode );
+      end;
+
+      if((  Valtype(DataSet.value("HAVEDEFAULT")) != V_UNDEF ) and (  Valtype(DataSet.value("HAVEDEFAULT") ) != 26 )
+         and (DataSet.value("HAVEDEFAULT") == 1))
+         PartyCateg = Null;
+         PartyCateg = RsbObjCategories( 12, objectid );
+         PartyCateg.ConnectAttr( 35, 2, null, null, DataSet.value("T_ISSUED", Null, V_DATE));
+         PartyCateg.Save(objectid);
+         PartyCateg = Null;
+      else
+         PartyCateg = Null;
+         PartyCateg = RsbObjCategories( 12, objectid );
+         PartyCateg.DisconnectAttr( 35, 2);
+         PartyCateg.Save(objectid);
+         PartyCateg = Null;
+      end;
+
+//shev 030720 isup  512156
+      var sql =  "  SELECT                                  "+
+        "  ( SELECT D.T_ATTRID FROM dobjattr_dbt D " +
+        "    WHERE D.T_OBJECTTYPE = 12 " +
+        "     AND D.T_GROUPID  = 1 " +
+        "     AND UPPER(D.T_NAME) = :T_ATTR_CODE ) AS T_ATTRID_12_1, " +
+        "  ( SELECT D.T_ATTRID FROM dobjattr_dbt D " +
+        "    WHERE D.T_OBJECTTYPE = 12 " +
+        "     AND D.T_GROUPID  = 5 " +
+        "     AND UPPER(D.T_NAME) = :T_ATTR_CODE ) AS T_ATTRID_12_5, " +
+        "  ( SELECT D.T_ATTRID FROM dobjattr_dbt D " +
+        "    WHERE D.T_OBJECTTYPE = 12 " +
+        "     AND D.T_GROUPID  = 33 " +
+        "     AND UPPER(D.T_NAME) = :T_ATTR_CODE1 ) AS T_ATTRID_12_33, " +
+        "  ( SELECT D.T_ATTRID FROM dobjattr_dbt D " +
+        "    WHERE D.T_OBJECTTYPE = 12 " +
+        "     AND D.T_GROUPID  = 56 " +
+        "     AND UPPER(D.T_NAMEOBJECT) = :T_ATTR_CODE2 ) AS T_ATTRID_12_56 " +
+        "      FROM DUAL    ";
+
+      var Param = makeArray( SQLParam("T_ATTR_CODE",  DataSet.value("T_ATTR_CODE")),
+                             SQLParam("T_ATTR_CODE1", DataSet.value("T_ATTR_CODE")),
+                             SQLParam("T_ATTR_CODE2", DataSet.value("T_ATTR_CODE")),
+                             SQLParam("T_ATTR_CODE3", DataSet.value("T_ATTR_CODE")));
+
+      DatasetD = execSQLselect( sql, Param );
+
+      if( DataSetD.MoveNext )
+
+         if( ( ValType( DataSetD.value("T_ATTRID_12_1", Null, V_INTEGER) ) != V_UNDEF ) and
+             ( ValType( DataSetD.value("T_ATTRID_12_1", Null, V_INTEGER) ) != 26 ) and
+             ( not IsAttrIdExists( 12, 1, fininstr.FIID, DataSetD.value("T_ATTRID_12_1", Null, V_INTEGER), DataSet.value("T_ISSUED", Null, V_DATE) ) ) and
+             ( IsAttrIdDisconnectedSmart( 12, 1, fininstr.FIID, DataSetD.value("T_ATTRID_12_1", Null, V_INTEGER), 0, DataSet.value("T_ISSUED", Null, V_DATE) ) ) 
+           )
+            PartyCateg = Null;
+            PartyCateg = RsbObjCategories( 12, objectid );
+            PartyCateg.ConnectAttr( 1, DataSetD.value("T_ATTRID_12_1", Null, V_INTEGER), null, null, DataSet.value("T_ISSUED", Null, V_DATE));
+            PartyCateg.Save(objectid);
+            PartyCateg = Null;
+         end;
+
+         if( ( ValType( DataSetD.value("T_ATTRID_12_5", Null, V_INTEGER) ) != V_UNDEF ) and
+             ( ValType( DataSetD.value("T_ATTRID_12_5", Null, V_INTEGER) ) != 26 ) and
+             ( not IsAttrIdExists( 12, 5, fininstr.FIID, DataSetD.value("T_ATTRID_12_5", Null, V_INTEGER), DataSet.value("T_ISSUED", Null, V_DATE) ) ) and
+             ( IsAttrIdDisconnectedSmart( 12, 5, fininstr.FIID, DataSetD.value("T_ATTRID_12_5", Null, V_INTEGER), 0, DataSet.value("T_ISSUED", Null, V_DATE) ) ) 
+           )
+            PartyCateg = Null;
+            PartyCateg = RsbObjCategories( 12, objectid );
+            PartyCateg.ConnectAttr( 5, DataSetD.value("T_ATTRID_12_5", Null, V_INTEGER), null, null, DataSet.value("T_ISSUED", Null, V_DATE));
+            PartyCateg.Save(objectid);
+            PartyCateg = Null;
+         end;
+
+         if( ( ValType( DataSetD.value("T_ATTRID_12_33", Null, V_INTEGER) ) != V_UNDEF ) and
+             ( ValType( DataSetD.value("T_ATTRID_12_33", Null, V_INTEGER) ) != 26 ) and
+             ( not IsAttrIdExists( 33, 1, fininstr.FIID, DataSetD.value("T_ATTRID_12_33", Null, V_INTEGER), DataSet.value("T_ISSUED", Null, V_DATE) ) ) and
+             ( IsAttrIdDisconnectedSmart( 33, 1, fininstr.FIID, DataSetD.value("T_ATTRID_12_33", Null, V_INTEGER), 0, DataSet.value("T_ISSUED", Null, V_DATE) ) ) 
+           )
+
+            PartyCateg = RsbObjCategories( 12, objectid );
+            PartyCateg.ConnectAttr( 33, DataSetD.value("T_ATTRID_12_33", Null, V_INTEGER), null, null, DataSet.value("T_ISSUED", Null, V_DATE));
+            PartyCateg.Save(objectid);
+            PartyCateg = Null;
+         end;
+
+         if( ( ValType( DataSetD.value("T_ATTRID_12_56", Null, V_INTEGER) ) != V_UNDEF ) and
+             ( ValType( DataSetD.value("T_ATTRID_12_56", Null, V_INTEGER) ) != 26 ) and
+             ( not IsAttrIdExists( 56, 1, fininstr.FIID, DataSetD.value("T_ATTRID_12_56", Null, V_INTEGER), DataSet.value("T_ISSUED", Null, V_DATE) ) ) and
+             ( IsAttrIdDisconnectedSmart( 56, 1, fininstr.FIID, DataSetD.value("T_ATTRID_12_56", Null, V_INTEGER), 0, DataSet.value("T_ISSUED", Null, V_DATE) ) ) 
+           )
+
+            PartyCateg = RsbObjCategories( 12, objectid );
+            PartyCateg.ConnectAttr( 56, DataSetD.value("T_ATTRID_12_56", Null, V_INTEGER), null, null, DataSet.value("T_ISSUED", Null, V_DATE));
+            PartyCateg.Save(objectid);
+            PartyCateg = Null;
+
+         end;
+
+      end;
+
+//shev 28072020  новое примечание для ЦБ "тип купона"
+
+      if (StrUpr(ReadNoteForObject(OBJECT_SECURITY,objectid,OBJECTTYPE_SECURITY)) != StrUpr(DataSet.value("COUPON_TYPE"))) 
+ //         RemoveNoteForObject(OBJECT_SECURITY,objectid,OBJECTTYPE_SECURITY);
+          addnoteforobject(OBJECT_SECURITY, objectid, OBJECTTYPE_SECURITY, DataSet.value("COUPON_TYPE"));
+      end;
+
+      if( not IsAttrIdExistsSimple( 12, 13, fininstr.FIID) )
+         PartyCateg = Null;
+         PartyCateg = RsbObjCategories( 12, objectid );
+         PartyCateg.ConnectAttr( 13, 1, null, null, {CurDate});
+         PartyCateg.Save(objectid);
+         PartyCateg = Null;
+      end;
+      if( ( ( Valtype(DataSet.value("T_ISSUERID", Null, V_INTEGER) ) == V_UNDEF ) or
+            ( Valtype(DataSet.value("T_ISSUERID", Null, V_INTEGER) ) == 26 ) 
+          ) and ( DataSet.value("T_ISSUER", Null, V_INTEGER) != 7 ) 
+        )
+         InsertListEmitent(DataSet.value("T_ISSUER", Null, V_INTEGER), DataSet.value("ISSUERUID"));
+      elif( ( ValType( DataSet.value("T_ISSUERID", Null, V_INTEGER)) != V_UNDEF ) and ( ValType( DataSet.value("T_ISSUERID", Null, V_INTEGER)) != 26 )  
+         /*and ( DataSet.value("T_ISSUER", Null, V_INTEGER) == 7 )*/ )
+         InsertListEmitent(DataSet.value("T_ISSUERID", Null, V_INTEGER), DataSet.value("ISSUERUID"));
+      end;
+
+      LoadRatingAvoiriss( fininstr.FIID /*DataSet.value(0)*/, DataSet.value("T_FI_CODE") ); //рейтинг ценной бумаги
+      LoadRatingAvoirissRep( fininstr.FIID /*DataSet.value(0)*/, DataSet.value("T_FI_CODE"), 127, 5039, false ); //рейтинг ценной бумаги
+      LoadRatingAvoirissRep( fininstr.FIID /*DataSet.value(0)*/, DataSet.value("T_FI_CODE"), 128, 5040, false ); //рейтинг ценной бумаги
+      LoadRatingAvoirissRep( fininstr.FIID /*DataSet.value(0)*/, DataSet.value("T_FI_CODE"), 127, 5043, true ); //рейтинг ценной бумаги  по 3485
+      LoadRatingAvoirissRep( fininstr.FIID /*DataSet.value(0)*/, DataSet.value("T_FI_CODE"), 128, 5044, true ); //рейтинг ценной бумаги  по 3485
+
+      LoadRatingAvoiriss2014( fininstr.FIID /*DataSet.value(0)*/, DataSet.value("ISINCODE") ); //рейтинг ценной бумаги архив
+
+      LoadOffers( fininstr.FIID, string( DataSet.value("FINTOOLID", Null, V_INTEGER)) ); //оферты
+
+//2021-05-19 Cherednichenko is525670 При наличии выставляем признак "Субординированная"
+      if ( ( Valtype(DataSet.value("IS_SUBORDINATED")) != V_UNDEF ) and ( Valtype(DataSet.value("IS_SUBORDINATED") ) != 26 ) )
+        //avoiriss.subordinated = "X";
+        cmd2 = RSDCommand("update davoiriss_dbt set t_subordinated='X' where t_fiid=?");
+        cmd2.AddParam("", RSDBP_IN, avoiriss.fiid);
+        cmd2.execute();
+      end;
+
+   end;
+
+   cmd2 = RSDCommand("update RUDATA_SECURITIES set STATUS = 'X' where t_id = "+DataSet.value("t_id"));
+   cmd2.execute();
+
+
+   return FlResult;
+onError(er)
+   err = RsbGetErrorEx(er);
+   AddLog_it("RUDATA. ошибка загрузки isin="+DataSet.value("ISINCODE", Null, V_STRING)+" "+err); // DEF-56847, логируем ошибку
+   cmd2 = RSDCommand("update RUDATA_SECURITIES set STATUS = 'E' where t_id = "+DataSet.value("t_id"));
+   cmd2.execute();
+   return false;
+end;
+
+
+/**
+@brief 				загрузка общей информации о ценных бумагах
+@param[in]  StrLSIN_ISIN	код ц/б
+@param[in]  Mode		Режим загрузки
+@param[out] err			код ошибки
+@param[in]  Force		true - грузим и погашенные
+@param[in]  LoadBase		true - грузим базовые инструмент
+@param[out] sys_guid		системный GUID
+@return 			true -- успешно загружено
+@return 			false -- при ошибке
+*/
+private macro LoadBondAndSec( StrLSIN_ISIN:string, Mode:integer, err:@string, Force, LoadBase, sys_guid:@string ):bool
+   var Query :string = "",
+       Params :TArray,
+       DataSet :RsdRecordset,
+       DatasetD:RsdRecordset, 
+       i :integer = 0,
+       FlAll :integer = 0,
+       FlResult :bool = true;
+   var C_FUNCID = 5205;
+
+   DataSet = Null;
+
+   if ( Valtype(Force) == V_UNDEF)
+      Force = false;
+   end;
+
+   if ( Valtype(LoadBase) == V_UNDEF)
+      LoadBase = false;
+   end;
+
+   if( ( Valtype( Mode ) == V_UNDEF ) or ( Valtype( Mode ) == 26 ) )
+      Mode = 0; // обновление цб (1 - новая цб)
+   end;
+
+   if( ( Valtype(StrLSIN_ISIN) == V_UNDEF ) or ( Valtype(StrLSIN_ISIN) == 26 ) or ( StrLSIN_ISIN == "" ) )
+      FlAll = 0; // Загрузка всех бумаг
+      StrLSIN_ISIN = "_";
+   else
+      FlAll = 1;
+   end;
+   
+   CheckCreateTable();
+   var cmd = RSDCommand("truncate table USR_RUDATA_LIST_EMITENT");
+   cmd.execute;
+   cmd.close;
+   cmd = null; 
+ 
+   //DEF-58098 выгрузка в CDI
+   var cdi_isactive, needcdi = false, error;
+   GetRegistryValue(REG_CDI_ACTIVE, V_BOOL, cdi_isactive, error);
+   if( error > 0 )
+      cdi_isactive = false; // не нашли настройку, значит не включено
+   end;
+
+   //DEF-79638
+   sys_guid = "";
+   Params = Null;
+   Params = makeArray( SQLParam("p_FlAll", FlAll),
+                       SQLParam("p_Mode", Mode),
+                       SQLParam("p_ISIN_LSIN", StrLSIN_ISIN) );
+   sys_guid = execStoredFunc( "rudata_read.prepare_temp_table", V_STRING, Params );
+   Params = Null;
+
+   Query = "select distinct number_pack from rudata_securities where session_guid = :p_guid ";
+   Params = makeArray( SQLParam("p_guid", sys_guid) );
+
+   DataSet = execSQLselect( Query, Params );
+
+   var number_pack;
+   var funcobjid;
+   while( DataSet.MoveNext )
+      number_pack = string(Int(DataSet.value("number_pack")));
+
+      if (FlAll == 0) // Загрузка всех бумаг
+         funcobjid = InsertSequenceJobUsrObjString(DataSet.value("number_pack"), 
+                                       C_FUNCID, 
+                                       C_FUNCID, 
+                                       String(sys_guid,";",FlAll,";",Mode,";",StrLSIN_ISIN,";",Force,";",LoadBase,";",needcdi,";",cdi_isactive), 
+                                       null);
+         Query = "update rudata_securities set funcobjid = :p_funcobjid where session_guid = :p_guid and number_pack = :p_number_pack";
+         Params = makeArray( SQLParam("p_funcobjid", funcobjid),
+                             SQLParam("p_guid", sys_guid),
+                             SQLParam("p_number_pack", DataSet.value("number_pack")) );
+         execSQL( Query, Params );
+      else
+         AddLog_it("RUDATA. Начало загрузки пачки "+number_pack+" guid="+sys_guid); // DEF-56847, логируем загрузку по каждой бумаге
+
+         cmd = RSDCommand("select "+RUDATA_SECURITIES_ALL_FIELDS+" from rudata_securities r where session_guid = :p_guid and number_pack = :p_number_pack");
+         cmd.AddParam("p_guid", RSDBP_IN, sys_guid);
+         cmd.AddParam("p_number_pack", RSDBP_IN, DataSet.value("number_pack"));
+         DataSetD = RSDRecordSet(cmd);
+         i = 0;
+         while (DataSetD.movenext)
+            i = i+1;
+            AddLog_it("RUDATA. i="+string(i)+", isin="+DataSetD.value("ISINCODE", Null, V_STRING)+" Пачка="+number_pack+" guid="+sys_guid); // DEF-56847, логируем загрузку по каждой бумаге
+            FlResult = LoadOne(FlAll, Mode, StrLSIN_ISIN, DataSetD, Force, @err, LoadBase, needcdi, cdi_isactive);
+            if (not FlResult)
+               Query = "delete from rudata_securities where session_guid = :p_guid ";
+               Params = makeArray( SQLParam("p_guid", sys_guid) );
+
+               execSQL( Query, Params );
+
+               return false;
+            end;
+         end;
+
+         AddLog_it("RUDATA. Рейтинги эмитентов. Пачка="+number_pack+" guid="+sys_guid);
+
+         // общий список загруженных эмитентов
+         LoadRating( null, null, true ); //рейтинг эмитента
+
+         AddLog_it("RUDATA. Рейтинги эмитентов для отчетности - начало. Пачка="+number_pack+" guid="+sys_guid);
+
+         DataSetD = RsdRecordSet( " SELECT Partyid, ISSUERUID from USR_RUDATA_LIST_EMITENT ");
+         while ( DataSetD.MoveNext )
+            LoadRatingRepNat( DataSetD.value(0), DataSetD.value(1), 122, 5037, false ); //рейтинг эмитента в нац валюте для отчетов
+            LoadRatingRepNat( DataSetD.value(0), DataSetD.value(1), 123, 5038, false ); //рейтинг эмитента в ин валюте для отчетов
+
+            LoadRatingRepMoodys( DataSetD.value(0), DataSetD.value(1), 122, false );
+            LoadRatingRepMoodys( DataSetD.value(0), DataSetD.value(1), 123, false );
+
+            LoadRatingRepNat( DataSetD.value(0), DataSetD.value(1), 122, 5041, true ); //рейтинг эмитента в нац валюте для отчетов по 3485
+            LoadRatingRepNat( DataSetD.value(0), DataSetD.value(1), 123, 5042, true ); //рейтинг эмитента в ин валюте для отчетов по 3485
+
+            LoadRatingRepMoodys( DataSetD.value(0), DataSetD.value(1), 122, true );
+            LoadRatingRepMoodys( DataSetD.value(0), DataSetD.value(1), 123, true );
+            
+            LoadRating2014( DataSetD.value(0) ); //рейтинг эмитента архив
+         end;
+
+         AddLog_it("RUDATA. Рейтинги эмитентов для отчетности - окончание. Пачка="+number_pack+" guid="+sys_guid);
+
+         Query = "delete from rudata_securities where session_guid = :p_guid ";
+         Params = makeArray( SQLParam("p_guid", sys_guid) );
+
+         execSQL( Query, Params );
+      end;
+   end;/*while*/
+
+   if ((ValType(StrLSIN_ISIN) != V_UNDEF) and (i == 0))
+      FlResult = false;
+      err = "Ценная бумага не найдена в базе RU DATA";
+   else 
+      if (FlAll == 0) // Загрузка всех бумаг
+         FlResult = true;
+      end;   
+   end;
+
+   return FlResult;
+end;
+
+// shev DEF-79638 планировщик отключен
+/**
+@brief 				запуск массовой загрузки
+@param[out] error		код ошибки
+@return 			true -- успешно загружено
+@return 			false -- при ошибке
+*/
+macro SOFR_LoadRuData(error:@string) :bool
+
+   AddLog_it("RUDATA. Бумаги - начало");
+   LoadBondAndSec(null,null, @error);
+   AddLog_it("RUDATA. Бумаги - окончание");
+
+   AddLog_it("RUDATA. Рейтинги контрагентов - начало");
+   LoadRating; //рейтинги по всем субъектам-контрагентам по сделкам
+   AddLog_it("RUDATA. Рейтинги контрагентов - окончание");
+
+   //!!!!!!!! LoadDividend;  Выключено! не работает. Вставляет 31тыс полупустых записей по ВСЕМ бумагам
+
+   AddLog_it("RUDATA. Удаление рейтингов эмитентов - начало");
+   DeleteBadEmitentsRatings();
+   AddLog_it("RUDATA. Удаление рейтингов эмитентов - окончание");
+
+/*KD*/
+   AddLog_it("RUDATA. Рейтинги контрагентов для отчетности - начало");
+   LoadRatingRepNatAll;   // рейтинги контрагентов
+   AddLog_it("RUDATA. Рейтинги контрагентов для отчетности - окончание");
+
+   AddLog_it("RUDATA. Рейтинги стран - начало");
+   LoadRatingAllCountrys; // рейтинги стран
+   AddLog_it("RUDATA. Рейтинги стран - окончание");
+
+   return true;
+
+onError(err)
+   error = RsbGetErrorEx(err);
+   setDialogFlag(1);
+
+AddLog_it("RUDATA. "+error);
+   return false;
+
+end;
+
+
+macro  SOFR_LoadBondAndSec(error:@string)
+   var result;
+   var v_cmd, v_rs;
+
+   AddLog_it("RUDATA. Бумаги - начало");
+   var v_guid:string = "";
+   LoadBondAndSec(null, null, @error, null, null, @v_guid);
+
+   var StartDateTime = CB_GetTimeBigInt();
+   var CurDateTime = StartDateTime;
+   var count_notprocesssed = 999;
+   var WaitingSyn = 60*60*6; //в секундах
+   while((count_notprocesssed > 0) AND ((CurDateTime - StartDateTime) <= WaitingSyn)) 
+      v_cmd = RSDCommand("select count(*) from rudata_securities where session_guid = :p_guid and status is null");
+      v_cmd.AddParam("p_guid", RSDBP_IN, v_guid);
+      v_rs = RSDRecordSet(v_cmd);
+      if (v_rs.movenext)
+        count_notprocesssed = v_rs.value(0);
+        if (count_notprocesssed > 0)
+          RSLWait(5000);
+        end;
+      end;
+      CurDateTime = CB_GetTimeBigInt();
+   end;
+
+   if (count_notprocesssed == 0) //завершилось
+      result = true;
+   else 
+      result = false;
+   end;
+
+   v_cmd = RSDCommand("delete from rudata_securities where session_guid = :p_guid ");
+   v_cmd.AddParam("p_guid", RSDBP_IN, v_guid);
+   v_cmd.execute();
+
+   AddLog_it("RUDATA. Бумаги - окончание");
+
+   return result;
+
+onError(err)
+   error = RsbGetErrorEx(err);
+   setDialogFlag(1);
+   AddLog_it("RUDATA. "+error);
+   v_cmd = RSDCommand("delete from rudata_securities where session_guid = :p_guid ");
+   v_cmd.AddParam("p_guid", RSDBP_IN, v_guid);
+   v_cmd.execute();
+
+   return false;
+end;
+
+
+macro SOFR_LoadRating(error:@string) :bool
+
+   AddLog_it("RUDATA. Рейтинги контрагентов - начало");
+   LoadRating; //рейтинги по всем субъектам-контрагентам по сделкам
+   AddLog_it("RUDATA. Рейтинги контрагентов - окончание");
+
+   return true;
+
+onError(err)
+   error = RsbGetErrorEx(err);
+   setDialogFlag(1);
+
+   AddLog_it("RUDATA. "+error);
+   return false;
+end;
+
+
+macro SOFR_DeleteBadEmitentsRatings(error:@string) :bool
+
+   AddLog_it("RUDATA. Удаление рейтингов эмитентов - начало");
+   DeleteBadEmitentsRatings();
+   AddLog_it("RUDATA. Удаление рейтингов эмитентов - окончание");
+
+   return true;
+
+onError(err)
+   error = RsbGetErrorEx(err);
+   setDialogFlag(1);
+
+   AddLog_it("RUDATA. "+error);
+   return false;
+end;
+
+
+macro SOFR_LoadRatingRepNatAll(error:@string) :bool
+
+   AddLog_it("RUDATA. Рейтинги контрагентов для отчетности - начало");
+   LoadRatingRepNatAll;   // рейтинги контрагентов
+   AddLog_it("RUDATA. Рейтинги контрагентов для отчетности - окончание");
+
+   return true;
+
+onError(err)
+   error = RsbGetErrorEx(err);
+   setDialogFlag(1);
+
+   AddLog_it("RUDATA. "+error);
+   return false;
+end;
+
+
+macro SOFR_LoadRatingAllCountrys(error:@string) :bool
+
+   AddLog_it("RUDATA. Рейтинги стран - начало");
+   LoadRatingAllCountrys; // рейтинги стран
+   AddLog_it("RUDATA. Рейтинги стран - окончание");
+
+   return true;
+
+onError(err)
+   error = RsbGetErrorEx(err);
+   setDialogFlag(1);
+
+   AddLog_it("RUDATA. "+error);
+   return false;
+end;
+
+
+/**
+@brief 				запуск единичной загрузки по регистрационному коду ценной бумаги
+@param[in] StrLSIN_ISIN		коду ц/б
+@param[in] Mode			режим загрузки
+@param[out] error		код ошибки
+@param[in] Force		true - грузим и погашенные
+@param[in] LoadBase		true - грузим базовые инструмент
+@return 			true -- успешно загружено
+@return 			false -- при ошибке
+*/
+macro SOFR_LoadRuDataByID( StrLSIN_ISIN :string, Mode :integer, error:@string, Force, LoadBase ) :bool 
+   if ( Valtype(Force) == V_UNDEF)
+      Force = false;
+   end;
+
+   AddLog_it("RUDATA. Бумаги - начало");
+   if( LoadBondAndSec( StrLSIN_ISIN, Mode, @error, Force, LoadBase ) )
+      AddLog_it("RUDATA. Бумаги - окончание");
+      //!!!!!!!!  LoadDividend( StrLSIN_ISIN ); Выключено! не работает. Вставляет 31тыс полупустых записей по ВСЕМ бумагам
+      return true;
+   else
+      AddLog_it("RUDATA. Бумаги - окончание");
+      return false;
+   end;
+
+onError(err)
+   error = err.Message + "|" + err.Module + ":" + err.Line;
+   AddLog_it("RUDATA. Бумаги - ошибка" + error);
+   setDialogFlag(1);
+   return false;
+end;
+
+/**
+@brief 				запуск единичной загрузки рейтинга "контрагента по сделкам" по ИНН
+@param[in] INN			ИНН
+@return 			true -- успешно загружено
+@return 			false -- при ошибке
+*/
+macro SOFR_LoadRuDataByINN( INN :string ) :bool 
+   CheckCreateTable();
+   if( LoadRating( Null, INN ) )
+      return true;
+   else
+      return false;
+   end;
+
+onError(err)
+    return false;
+end;
+
+/**
+@brief 				запуск единичной загрузки по биржевому коду ценной бумаги
+@param[in] StrCode		код ц/б
+@param[in] Mode			режим загрузки
+@param[in] Birg_code		биржевой код ц/б
+@param[out] error		код ошибки
+@param[in] LoadBase		true - грузим базовые инструмент
+@return 			true -- успешно загружено
+@return 			false -- при ошибке
+*/
+macro SOFR_LoadRuDataByCode( StrCode :string, Mode :integer, Birg_code:string, error:@string, LoadBase ) :bool
+var Params :TArray,
+    DataSet :RsdRecordset,
+    Query :string = "",
+    StrLSIN_ISIN :string = "";
+
+   //ищем ISIN по биржевому коду
+   if((Birg_code == "") OR (Birg_code == "ММВБ"))
+   Query = " SELECT ISIN FROM sofr_info_instruments " +
+           " WHERE SECCODE = :p_Code " +
+           "  AND EXCHANGE LIKE 'Московская Биржа / МБ%' " +
+           "  AND EXCH = 206 " +
+           "  AND VISIBLE = 'Видимый' " +
+           "  AND ISIN <> CHR(0) ";
+   else
+      Query = " SELECT ISIN FROM sofr_info_instruments " +
+              " WHERE SECCODE = :p_Code " +
+              "  AND EXCHANGE LIKE '%СПБ%' " +
+              "  AND EXCH = 207 " +
+              "  AND VISIBLE = 'Видимый' " +
+              "  AND ISIN <> CHR(0) ";
+   end;
+
+   Params = Null;
+   DataSet = Null;
+
+   Params = makeArray( SQLParam( "p_Code", StrCode ) ); 
+
+   DataSet = execSQLselect( Query, Params );
+   if( DataSet.MoveNext )
+      StrLSIN_ISIN = DataSet.value(0, Null, V_STRING);
+   else
+      return false;
+   end;
+
+   //ищем ISIN по биржевому коду
+   var Dt = TRsbDataSet(" select a.t_isin, a.t_lsin, f.t_name, (select t_shortname from dparty_dbt where t_partyid = f.t_issuer) issuername " +
+                        " from davoiriss_dbt a, dfininstr_dbt f where a.t_fiid = f.t_fiid " + 
+                        " and ( (a.t_isin = '" +trim(StrLSIN_ISIN)+"') or (a.t_lsin ='" +trim(StrLSIN_ISIN)+"'))");
+   if (Dt.movenext())
+      Mode = 0;
+   else
+      Mode = 1;
+   end;
+
+   AddLog_it("RUDATA. Бумаги - начало");
+   if( LoadBondAndSec( StrLSIN_ISIN, Mode, null, null, LoadBase ) )
+      //!!!!!!!!  LoadDividend( StrLSIN_ISIN ); Выключено! не работает. Вставляет 31тыс полупустых записей по ВСЕМ бумагам
+      return true;
+   else
+      return false;
+   end;
+   AddLog_it("RUDATA. Бумаги - окончание");
+
+onError(err)
+   error = err.err;
+   return false;
+end;
+

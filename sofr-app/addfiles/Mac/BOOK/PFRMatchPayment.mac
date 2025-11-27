@@ -1,0 +1,783 @@
+/*
+$Name:        PFRMatchPayment.mac
+$Module:      RS-Retail
+$Description: ПФР: Обработка реестра зачислений. Сопоставление п/п и входящего РДД
+*/
+import PFRCommon, common_service_caller;
+
+private var {BatchMode};
+private var DocId, DocNumber, DocAmount, PaymentId, TrnContractNumber;
+private record rtdocrec("rtdocument.dbt");
+  
+// Получение ИНН/КРР плательщика для РДД
+private macro GetINNKPP( partyid, tempPartyId, inn, kpp )
+  inn = "";
+  kpp = "";
+  if( partyid )
+    inn = findPartyCode(partyid,PTCK_INN);
+    if( inn != "" )
+      var pos = index(inn,"/");
+      if( pos )
+        kpp = substr(inn,pos+1);
+        inn = substr(inn,1,pos-1);
+      end;
+    end;
+  elif( tempPartyId )
+    var cmd = RsdCommand("select t_INN, t_KPP from dTemporaryParty_dbt where t_TempPartyid = ?");
+    cmd.addParam("",RsdBp_In,tempPartyId);
+    cmd.nullConversion=true;
+    cmd.execute();
+    var rs = RsdRecordSet(cmd);
+    if( rs.moveNext() )
+      inn = SQL_ConvTypeStr(rs.value("t_INN"));
+      kpp = SQL_ConvTypeStr(rs.value("t_KPP"));
+    end;
+  end;
+  setparm(2,inn);
+  setparm(3,kpp);
+end;
+
+// Получение идентификатора платежа входящего РДД по id документа
+private macro GetPaymentId( id )
+  var paymentid = "";
+  var cmd = RsdCommand("select t_incomepaymentid from drtincomedoc_dbt where t_documentid = ?");
+  cmd.addParam("",RsdBp_In,id);
+  cmd.execute();
+  var rs = RsdRecordSet(cmd);
+  if( rs.moveNext() )
+    paymentid = SQL_ConvTypeStr(rs.value(0));
+  end;
+  return paymentid;
+end;
+
+// Поиск договора по номеру
+private macro GetContractByNumber( numberContract )
+  var cmd = RsdCommand("select * from dTrn_Cntr_dbt where t_NumberContract = ? ");
+  cmd.addParam("",RsdBp_In,numberContract);
+  cmd.nullConversion=true;
+  cmd.execute();
+  return RsdRecordSet(cmd);
+end;
+
+// Поиск платежного поручения
+private macro GetPayment( numberContract, numPayMessage )
+  var cmd = RsdCommand("select * from dTrn_Paym_dbt where t_NumberContract = ? and t_Num_PayMessage = ?");
+  cmd.addParam("",RsdBp_In,numberContract);
+  cmd.addParam("",RsdBp_In,numPayMessage);
+  cmd.nullConversion=true;
+  cmd.execute();
+  return RsdRecordSet(cmd);
+end;
+
+// Поиск платежного поручения по филиалу
+private macro FindDepartPayment( numberContract, numPayMessage, department )
+  var cmd = RsdCommand(
+    "select 1 from dtrn_payf_dbt "+
+     "where t_NumberContract = ? "+
+       "and t_Num_PayMessage = ? "+
+       "and t_FNcash = ?");
+  cmd.addParam("",RsdBp_In,numberContract);
+  cmd.addParam("",RsdBp_In,numPayMessage);
+  cmd.addParam("",RsdBp_In,department);
+  cmd.nullConversion = true;
+  cmd.execute( );
+  var rs = RsdRecordSet(cmd);
+  return rs.moveNext();
+end;
+
+// Создание платежного поручения по филиалу
+private macro InsertDepartPayment( trn_cntr )
+  file trnpayf("trn_payf.dbt") key 0 write;
+  trnpayf.Num_PayMessage = DocNumber;
+  trnpayf.DateDocumentFilial = recTrnPaym.rec.DateDocumentGlobal;
+  trnpayf.PaymAppKind = recTrnPaym.rec.iApplicationKind;
+  trnpayf.PaymAppKey = recTrnPaym.rec.ApplicationKey;
+  trnpayf.FNCash = recTrnPaym.rec.Department;
+  trnpayf.NumberContract = recTrnPaym.rec.NumberContract;
+  trnpayf.TypeOper = recTrnPaym.rec.TypeOper;
+  trnpayf.ApplType = recTrnPaym.rec.ApplType;
+  trnpayf.RealFNCash = recTrnPaym.rec.Department;
+  trnpayf.GlobalSumFilial = DocAmount - recTrnPaym.rec.GlobalSumPFR;
+  trnpayf.SignCheckFilial = "X";
+
+  trnpayf.NameBusines = trn_cntr.value("t_NameBusines");
+  trnpayf.AddressBusines = trn_cntr.value("t_AdressBusines");
+  trnpayf.MFO_Busines = trn_cntr.value("t_MFO_Busines");
+  trnpayf.Coracc_Busines = trn_cntr.value("t_Coracc_Busines");
+  trnpayf.Account_Busines = trn_cntr.value("t_Account_Busines");
+  trnpayf.KPP = trn_cntr.value("t_KPP");
+  trnpayf.Ground = trn_cntr.value("t_GroundContract");
+
+  trnpayf.FlagCur = 0;
+  trnpayf.Code_Currency = national_currency;
+  trnpayf.Oper = {Oper};
+  trnpayf.TRN_System = 1;
+  trnpayf.NumSession = -1;
+  trnpayf.InputMethod = 2;
+  return insert(trnpayf);
+end;
+
+// Установка связи между п/п и входящим РДД - сопоставление
+private macro SetMatching( numberContract, numPayMessage, registerId, 
+                            documentId, documentNumber, incomePaymentId )
+  var cmd = RsdCommand(
+    "update dTrn_Doc_dbt t "+
+      " set t.t_PaymentId = ?, t.t_SignCheckList = 'X', t_SumCheck = t_Sum "+
+     "where (t.t_FNCash,t.t_ListTransfer) in ( "+
+        "select payf.t_FNCash, payf.t_AutoKey "+
+          "from dTrn_Payf_dbt payf "+
+         "where payf.t_NumberContract = ? and payf.t_Num_PayMessage = ? )");
+  cmd.addParam("",RsdBp_In,incomePaymentId);
+  cmd.addParam("",RsdBp_In,numberContract);
+  cmd.addParam("",RsdBp_In,numPayMessage);
+  cmd.execute();
+
+  cmd = RsdCommand(
+    "update dTrn_Payf_dbt set t_Num_PayMessage = ? "+
+     "where t_NumberContract = ? and t_Num_PayMessage = ?");
+  cmd.addParam("",RsdBp_In,documentNumber);
+  cmd.addParam("",RsdBp_In,numberContract);
+  cmd.addParam("",RsdBp_In,numPayMessage);
+  cmd.execute();
+
+  cmd = RsdCommand(
+    "update dTrn_Paym_dbt "+
+       "set t_PaymentId = ?, t_Num_PayMessage = ?, t_SignCheck = 'X' "+
+     "where t_NumberContract = ? and t_RegisterId = ?");
+  cmd.addParam("",RsdBp_In,incomePaymentId);
+  cmd.addParam("",RsdBp_In,documentNumber);
+  cmd.addParam("",RsdBp_In,numberContract);
+  cmd.addParam("",RsdBp_In,registerId);
+  cmd.execute();
+
+  cmd = RsdCommand(
+    "update dRTIncomeDoc_dbt set t_ProcessState = 10, t_TrnContractNumber = ? "+
+     "where t_DocumentId = ?");
+  cmd.addParam("",RsdBp_In,numberContract);
+  cmd.addParam("",RsdBp_In,documentId);
+  cmd.execute();
+end;
+
+// Установка связи между п/п и входящим РДД - автосопоставление
+private macro SetMatchingTRN
+  SetMatching(
+    recTrnPaym.rec.NumberContract,
+    recTrnPaym.rec.Num_PayMessage,
+    recTrnPaym.rec.RegisterId, 
+    DocId,
+    DocNumber,
+    PaymentId );
+end;
+
+// Установка связи между п/п и входящим РДД - сопоставление при выполнение сверки из интерфейса
+private macro SetMatchingExTRN
+  SetMatching(
+    recTrnPaym.rec.NumberContract,
+    recTrnPaym.rec.Num_PayMessage,
+    recTrnPaym.rec.RegisterId, 
+    DocId,
+    DocNumber,
+    PaymentId );
+  
+  var cmd;
+  if( DocAmount != recTrnPaym.rec.GlobalSumPFR )  
+    cmd = RsdCommand(
+      "update dTrn_Paym_dbt set t_GlobalSumBusines = ? "+
+       "where t_NumberContract = ? and t_RegisterId = ?");
+    cmd.addParam("",RsdBp_In,DocAmount);
+    cmd.addParam("",RsdBp_In,recTrnPaym.rec.NumberContract);
+    cmd.addParam("",RsdBp_In,recTrnPaym.rec.RegisterId);
+    cmd.execute();
+  end;
+
+  var stat = true;
+  if( DocAmount > recTrnPaym.rec.GlobalSumPFR )
+    if( FindDepartPayment(recTrnPaym.rec.NumberContract, DocNumber, recTrnPaym.rec.Department) )
+      cmd = RsdCommand(
+        "update dTrn_Payf_dbt set t_GlobalSumFilial = t_GlobalSumFilial + ? "+
+         "where t_NumberContract = ? and t_Num_PayMessage = ? and t_FNcash = ?");
+      cmd.addParam("",RsdBp_In,(DocAmount - recTrnPaym.rec.GlobalSumPFR));
+      cmd.addParam("",RsdBp_In,recTrnPaym.rec.NumberContract);
+      cmd.addParam("",RsdBp_In,DocNumber);
+      cmd.addParam("",RsdBp_In,recTrnPaym.rec.Department);
+      cmd.execute();
+    else
+      var cntr = GetContractByNumber(recTrnPaym.rec.NumberContract);
+      stat = cntr.moveNext;
+      if( stat == true )
+        stat = InsertDepartPayment(cntr);
+      end;
+    end;
+  end;
+  
+  if( stat == false )
+    AbortTrn();
+  end;
+end;
+
+// Откат сопоставления входящего РДД с п/п
+private macro RollbackMatchingTRN
+  var cmd = RsdCommand(
+    "update dTrn_Doc_dbt t set t.t_PaymentId = 0, t.t_SignCheckList = chr(0), t_SumCheck = 0 "+
+     "where (t.t_FNCash,t.t_ListTransfer) in ( "+
+        "select payf.t_FNCash, payf.t_AutoKey "+
+          "from dTrn_Payf_dbt payf "+
+         "where payf.t_NumberContract = ? "+
+           "and payf.t_Num_PayMessage = ? )");
+  cmd.addParam("",RsdBp_In,TrnContractNumber);
+  cmd.addParam("",RsdBp_In,DocNumber);
+  cmd.execute();
+
+  cmd = RsdCommand(
+    "update dRTIncomeDoc_dbt "+
+       "set t_ProcessState = 0, t_TrnContractNumber = chr(1) "+
+     "where t_DocumentId = ?");
+  cmd.addParam("",RsdBp_In,DocId);
+  cmd.execute();
+
+  var rs = GetPayment(TrnContractNumber, DocNumber);
+  if( rs.movenext )
+    var sum = rs.value("t_GlobalSumBusines") - rs.value("t_GlobalSumPFR");
+    // Если сумма входящего РДД превышает заявленную в реестре, то откатить изменение суммы в п/п по филиалу
+    if( sum > 0 )
+      cmd = RsdCommand(
+        "delete from dTrn_Payf_dbt t "+
+        " where t.t_NumberContract = ?"+
+          " and t.t_Num_PayMessage = ?"+
+          " and t.t_fncash = ?"+
+          " and not exists ("+
+             " select 1 from dTrn_Doc_dbt d"+
+              " where d.t_FNCash = t.t_FNCash and d.t_ListTransfer = t.t_AutoKey)");
+      cmd.addParam("",RsdBp_In,TrnContractNumber);
+      cmd.addParam("",RsdBp_In,DocNumber);
+      cmd.addParam("",RsdBp_In,rs.value("t_Department"));
+      cmd.execute();
+
+      cmd = RsdCommand(
+        "update dTrn_Payf_dbt "+
+           "set t_GlobalSumFilial = t_GlobalSumFilial - ? "+
+         "where t_NumberContract = ? and t_Num_PayMessage = ? and t_fncash = ?");
+      cmd.addParam("",RsdBp_In,sum);
+      cmd.addParam("",RsdBp_In,TrnContractNumber);
+      cmd.addParam("",RsdBp_In,DocNumber);
+      cmd.addParam("",RsdBp_In,rs.value("t_Department"));
+      cmd.execute();
+    end;
+
+    // Если номер платежа не задан, то восстановить номер п/п "по умолчанию"
+    var NumPayMessage = SQL_ConvTypeStr(rs.value("t_Num_PayMessage"));
+    if( StrLen(SQL_ConvTypeStr(rs.value("t_PayDocNumber"))) == 0 )
+      NumPayMessage = FormDefaultNumPayMessage("NP", SQL_ConvTypeStr(rs.value("t_RegisterId")), SQL_ConvTypeDate(rs.value("t_DateBusinesDocument")));
+
+      cmd = RsdCommand(
+        "update dTrn_Payf_dbt set t_Num_PayMessage = ? "+
+         "where t_NumberContract = ? and t_Num_PayMessage = ?");
+      cmd.addParam("",RsdBp_In,NumPayMessage);
+      cmd.addParam("",RsdBp_In,TrnContractNumber);
+      cmd.addParam("",RsdBp_In,DocNumber);
+      cmd.execute();
+    end;
+
+    cmd = RsdCommand(
+      "update dTrn_Paym_dbt "+
+         "set t_Num_PayMessage = ?, t_PaymentId = 0, t_SignCheck = chr(0), "+
+             "t_GlobalSumBusines = t_GlobalSumPFR "+
+       "where t_NumberContract = ? and t_Num_PayMessage = ?");
+    cmd.addParam("",RsdBp_In,NumPayMessage);
+    cmd.addParam("",RsdBp_In,TrnContractNumber);
+    cmd.addParam("",RsdBp_In,DocNumber);
+    cmd.execute();
+  end;
+end;
+
+// Выбор входящего РДД из списка
+private macro SelectRtDocument( payDocNumber, begdate, enddate )
+  record filter("rtdocument.flt");
+  ClearRecord(filter);
+  filter.direction=1;
+  filter.type=5;
+  filter.type_enabled="X";
+  filter.utype="X";
+  filter.income_state=0;
+  filter.income_state_enabled="X";
+  filter.income_type=30;
+  filter.income_type_enabled="X";
+  filter.department=recTrnPaym.rec.Department;
+  filter.department_enabled="X";
+  filter.inn=recTrnPaym.rec.PayerINN;
+  filter.inn_enabled="X";
+  filter.kpp=recTrnPaym.rec.PayerKPP;
+  filter.kpp_enabled="X";
+  if( StrLen(payDocNumber) != 0 )
+    filter.document_number=payDocNumber;
+    filter.document_number_enabled="X";
+    filter.abbrev="X";
+  end;
+  if( recTrnPaym.rec.PayDocDate != Date(0,0,0) )
+    filter.min_date=recTrnPaym.rec.PayDocDate;
+    filter.max_date=recTrnPaym.rec.PayDocDate;
+    filter.date_enabled="X";
+  end;
+  if( (StrLen(payDocNumber) == 0) and (recTrnPaym.rec.PayDocDate == Date(0,0,0)) and
+      (recTrnPaym.rec.StartPeriod != Date(0,0,0)) )
+    filter.min_date=begdate;
+    filter.max_date=enddate;
+    filter.date_enabled="X";
+  end;
+  return RtDocumentList(filter, rtdocrec);
+end;
+
+// Поиск входящего РДД по данным из п/п для сопоставления при загрузке
+private macro FindRDDByPayment( payment, rdd )
+  var cmdstr =
+    "select t.t_documentid, t.t_documentNumber, t.t_DebitAmount, "+
+           "t.t_PayerPartyID, t.t_PayerTempPartyID, ind.t_incomepaymentid "+
+      "from drtdocument_dbt t, drtincomedoc_dbt ind "+
+     "where t.t_Direction = 1 "+
+       "and t.t_DocTypeId in ( "+
+           "select pmdtype.t_DocTypeId "+
+             "from dPMDType_dbt pmdtype "+
+            "where pmdtype.t_DocTypeId = 5 "+ // Тип РДД <Платежное поручение>
+               "or pmdtype.t_SystemAnalogId = 5 ) "+
+       "and t.t_DocumentId = ind.t_DocumentId "+
+       "and ind.t_IncomeDocType = 30 "+   // Тип входящего РДД <Пакетное зачисление на счет>
+       "and ind.t_ProcessState = 0 "+     // Состояние обработки <Не обработан>, 
+       "and ind.t_Department = ? "+
+       "and t.t_DebitAmount = ? "+
+       "and ltrim(t.t_DocumentNumber,'0') = ? "+
+       "and t.t_Date = ? ";
+  var cmd = RsdCommand(cmdstr);
+  cmd.nullConversion=true;
+  cmd.addParam("",RsdBp_In,recTrnPaym.rec.Department);
+  cmd.addParam("",RsdBp_In,recTrnPaym.rec.GlobalSumPFR);
+  cmd.addParam("",RsdBp_In,LTRIM0(recTrnPaym.rec.PayDocNumber));
+  cmd.addParam("",RsdBp_In,recTrnPaym.rec.PayDocDate);
+  cmd.execute();
+  rdd = RsdRecordSet(cmd);
+  var stat = rdd.moveNext();
+  setparm( 1, rdd );
+  return stat;
+end;
+
+// Поиск входящего РДД по данным из п/п
+private macro FindRDDByPaymentEx( payment, rdd, begDate, endDate )
+  var cmdstr =
+    "select t.t_documentid, t.t_documentNumber, t.t_debitAmount, t.t_date, "+
+           "t.t_PayerPartyID, t.t_PayerTempPartyID, ind.t_incomepaymentid "+
+      "from drtdocument_dbt t, drtincomedoc_dbt ind "+
+     "where t.t_Direction = 1 "+
+       "and t.t_DocTypeId in ( "+
+           "select pmdtype.t_DocTypeId "+
+             "from dPMDType_dbt pmdtype "+
+            "where pmdtype.t_DocTypeId = 5 "+ // Тип РДД <Платежное поручение>
+               "or pmdtype.t_SystemAnalogId = 5 ) "+
+       "and t.t_DocumentId = ind.t_DocumentId "+
+       "and ind.t_IncomeDocType = 30 "+   // Тип входящего РДД <Пакетное зачисление на счет>
+       "and ind.t_ProcessState = 0 "+     // Состояние обработки <Не обработан>, 
+       "and ind.t_Department = ? ";
+
+  var cmdstring = cmdstr;
+  var payDocNumber = recTrnPaym.rec.PayDocNumber;
+  begdate = date(0,0,0);
+  enddate = date(0,0,0);
+  
+  if( StrLen(payDocNumber) > 0 )
+    if( StrLen(payDocNumber) > 6 )
+      payDocNumber = SubStr(payDocNumber, StrLen(payDocNumber) - 5);
+    end;
+    payDocNumber = LTRIM0(payDocNumber);  
+  end;
+  
+  if( recTrnPaym.rec.StartPeriod != Date(0,0,0) )
+    var m, y;
+    datesplit(date(),NULL,m,y);
+    if( recTrnPaym.rec.StartPeriod >= date(1,m,y) )
+      begdate = date(1,m,y);
+    else
+      datesplit(recTrnPaym.rec.StartPeriod,NULL,m,y);
+      begdate = date(1,m,y);
+    end;
+    enddate = date();
+  end;
+
+  if( StrLen(payDocNumber) > 0 )
+    cmdstr = cmdstr + "and ltrim(substr('000000' || t.t_DocumentNumber,-6,6),'0') = ? ";
+  end;
+  
+  if( recTrnPaym.rec.PayDocDate != Date(0,0,0) )
+    cmdstr = cmdstr + "and t.t_Date = ? ";
+  end;
+  
+  if( (StrLen(payDocNumber) == 0) and (recTrnPaym.rec.PayDocDate == Date(0,0,0)) and
+      (recTrnPaym.rec.StartPeriod != Date(0,0,0)) )
+    cmdstr = cmdstr + "and t.t_Date between ? and ? ";
+  end;
+
+  var cmd = RsdCommand(cmdstr);
+  cmd.nullConversion=true;
+  cmd.addParam("",RsdBp_In,recTrnPaym.rec.Department);
+  if( StrLen(payDocNumber) > 0 )
+    cmd.addParam("",RsdBp_In,payDocNumber);
+  end;
+  if( recTrnPaym.rec.PayDocDate != Date(0,0,0) )
+    cmd.addParam("",RsdBp_In,recTrnPaym.rec.PayDocDate);
+  end;
+  if( (StrLen(payDocNumber) == 0) and (recTrnPaym.rec.PayDocDate == Date(0,0,0)) and
+      (recTrnPaym.rec.StartPeriod != Date(0,0,0)) )
+    cmd.addParam("",RsdBp_In,begdate);
+    cmd.addParam("",RsdBp_In,enddate);
+  end;
+  cmd.execute();
+  rdd = RsdRecordSet(cmd);
+  var stat = rdd.moveNext();
+
+  if( (stat == false) and 
+      ((StrLen(payDocNumber) > 0) or (recTrnPaym.rec.PayDocDate != Date(0,0,0))) and
+      (recTrnPaym.rec.StartPeriod != Date(0,0,0)) )
+    cmdstr = cmdstring + "and t.t_Date between ? and ? ";
+    cmd = RsdCommand(cmdstr);
+    cmd.nullConversion=true;
+    cmd.addParam("",RsdBp_In,recTrnPaym.rec.Department);
+    cmd.addParam("",RsdBp_In,begdate);
+    cmd.addParam("",RsdBp_In,enddate);
+    cmd.execute();
+    rdd = RsdRecordSet(cmd);
+    stat = rdd.moveNext();
+  end;
+  
+  setparm( 1, rdd );
+  setparm( 2, begdate );
+  setparm( 3, enddate );
+  return stat;
+end;
+
+
+//--------------------------------------------------------------------//
+// Вызов транспортной компоненты по Уведомлению о расхождении сумм    //
+//--------------------------------------------------------------------//
+private class ( CServiceCallerBase ) CSaveDiscrepancyCaller( _Param, _url )
+  private var m_param = _Param;
+  private var m_url = _url;
+
+  private macro SetRequestParameters( request : @TXRRequest )
+     request.Parms = m_param;
+  end;
+  
+  private macro GetSystemURL() : String
+    var m_systemURL;
+
+    if ( ( ValType( m_url ) == V_STRING ) and ( m_url != "" ) )
+      m_systemURL = m_url;
+    else
+      GetRegistryValue( "RS-CONNECT\\ГИС_ЖКХ\\URL", V_STRING, m_systemURL );
+    end;
+
+    return m_systemURL;
+  end;
+
+  InitCServiceCallerBase( CreateGUID( ), GetSystemURL( ), "ws_pfr_discrepancy", "SaveDiscrepancy", 300000 );
+end;
+
+
+//--------------------------------------------------------------------//
+// Уведомление о расхождении сумм                                     //
+//--------------------------------------------------------------------//
+macro SendDiscrepancy( errorText )
+  var senderID, URL, maxpacket;
+  var errMsg = "";
+  var stat = GetRegValues(senderID, URL, maxpacket);
+  if( stat != 0 )
+    errMsg = ErrMessage(stat);
+  end;
+
+  if( stat == 0 )
+    var source = RSCPFRSource;
+    var report = RSCPFRReport;
+    source.SenderID = senderID;
+    source.MessageID = CreateGUID();
+    source.SenderPointID = NumFNCash();
+    report.ProductId = "NP";
+    report.ReportPart = 1;
+    report.TotalParts = 1;
+    report.RegisterId = recTrnPaym.rec.RegisterId;
+    report.ReportDate = {curdate};
+    report.PayDocNumber = recTrnPaym.rec.PayDocNumber;
+    report.PayDocDate = recTrnPaym.rec.PayDocDate;
+    report.PayDocSumma = recTrnPaym.rec.GlobalSumPFR;
+
+    var paramArray = TArray();
+    paramArray[0] = source;
+    paramArray[1] = report;
+
+    var caller = CSaveDiscrepancyCaller( paramArray, url );
+    var answer;
+    var callService_stat = caller.CallService( @answer );
+
+    if ( callService_stat )
+      if ( GenPropID( answer, "faultString" ) != -1 )
+        stat = ERRORSending;
+        errMsg = ErrMessage( stat ) + ": " + answer.FaultString;
+      else
+        if ( ( GenPropID( answer, "ObjectError" ) != -1 ) and ( ValType( answer.ObjectError ) == V_STRING ) and ( answer.ObjectError != "" ) )
+          stat = ERRORSending;
+          errMsg = ErrMessage( stat ) + ": " + answer.ObjectError;
+        end;
+      end;
+    else
+      stat = 1;
+      errMsg = "Ошибка при вызове транспортной компоненты";
+    end;
+  end;
+  
+  setparm( 0, errMsg );
+
+  return stat;
+end;
+
+//--------------------------------------------------------------------//
+// Сопоставление п/п с РДД из сервиса загрузки реестра                //
+//--------------------------------------------------------------------//
+macro MatchPayment( payment )
+  CopyRSetToFBuff( recTrnPaym, payment );
+
+  var rdd;
+  var stat = FindRDDByPayment( recTrnPaym, rdd );
+ 
+  if( stat )
+    var inn, kpp;
+    var rddCount = 0;
+    // Найденные записи проверить на совпадение ИНН/КПП
+    while( stat )
+      GetINNKPP( rdd.value("t_PayerPartyId"), rdd.value("t_PayerTempPartyId"), inn, kpp );
+      if( (inn == recTrnPaym.rec.PayerINN) and (kpp == recTrnPaym.rec.PayerKPP) )
+        rddCount = rddCount + 1;
+        DocId = rdd.value("t_documentId");
+        DocNumber = SQL_ConvTypeStr(rdd.value("t_documentNumber"));
+        DocAmount = rdd.value("t_DebitAmount");
+        PaymentId = int(SQL_ConvTypeStr(rdd.value("t_incomePaymentId")));
+      end;
+      stat = rdd.moveNext();
+    end;
+    // Установка связи между п/п и входящим РДД
+    if( rddCount == 1 )
+      stat = ProcessTrn(null, "SetMatchingTRN");
+    else
+      stat = false;
+    end;
+  end;
+
+  return stat;
+end;
+
+//--------------------------------------------------------------------//
+// Сопоставление п/п с РДД при сверке п/п                             //
+//--------------------------------------------------------------------//
+macro MatchPaymentEx( recPayment ): integer
+  recTrnPaym = recPayment;
+  DocId = 0;
+  DocNumber = "";
+  DocAmount = $0;
+  PaymentId = 0;
+
+  var retVal = 0;
+  var inn, kpp, DocDate;
+  var rddCount = 0, rddSumCount = 0;
+  var payDocNumber = LTRIM0(recTrnPaym.rec.PayDocNumber);
+  var FullMatchDocId, FullMatchDocNumber = "", FullMatchDocAmount = $0, FullMatchPaymentId = 0;
+  var rdd, begDate, endDate;
+  var stat = FindRDDByPaymentEx( recTrnPaym, rdd, begDate, endDate );
+
+  // Найденные записи проверить на совпадение ИНН/КПП
+  while( stat )
+    GetINNKPP( rdd.value("t_PayerPartyId"), rdd.value("t_PayerTempPartyId"), inn, kpp );
+    if( (inn == recTrnPaym.rec.PayerINN) and (kpp == recTrnPaym.rec.PayerKPP) )
+      rddCount = rddCount + 1;
+      DocId = rdd.value("t_documentId");
+      DocNumber = SQL_ConvTypeStr(rdd.value("t_documentNumber"));
+      DocAmount = rdd.value("t_DebitAmount");
+      PaymentId = int(SQL_ConvTypeStr(rdd.value("t_incomePaymentId")));
+      DocDate = SQL_ConvTypeDate(rdd.value("t_date"));
+      if( (StrLen(payDocNumber) > 0) and (payDocNumber == LTRIM0(DocNumber)) and
+          (recTrnPaym.rec.PayDocDate != Date(0,0,0)) and (recTrnPaym.rec.PayDocDate == DocDate) and
+          (DocAmount == recTrnPaym.rec.GlobalSumPFR) )
+        rddSumCount = rddSumCount + 1;
+        FullMatchDocId = DocId;
+        FullMatchDocNumber = DocNumber;
+        FullMatchDocAmount = DocAmount;
+        FullMatchPaymentId = PaymentId;
+      end;
+    end;
+    stat = rdd.moveNext();
+  end;
+
+  if( rddCount > 0 )
+    // Найден 1 документ, совпадающий по сумме, номеру, дате, ИНН/КПП плательщика с п/п
+    if( rddSumCount == 1 )
+      DocId = FullMatchDocId;
+      DocNumber = FullMatchDocNumber;
+      PaymentId = FullMatchPaymentId;
+      DocAmount = FullMatchDocAmount;
+
+    else // Не найден полностью совпадающий РДД
+      // Предложить пользователю выбор РДД из списка
+      ClearRecord(rtdocrec);
+      retVal = SelectRtDocument( payDocNumber, begdate, enddate );
+      if( retVal == 0 )
+        DocId = rtdocrec.documentId;
+        DocNumber = rtdocrec.documentNumber;
+        PaymentId = int(GetPaymentId(rtdocrec.documentId));
+        DocAmount = rtdocrec.debitAmount;
+      end;
+    end;
+
+    if( (retVal == 0) and (DocAmount != recTrnPaym.rec.GlobalSumPFR) )
+      if( {BatchMode} == 0 )
+        msgbox( ErrMessage(21344) ); // Обнаружено расхождение сумм реестра и ПП
+      end;
+      var errText;
+      // Отправить Уведомление о расхождении сумм
+      var st = SendDiscrepancy(errText);
+      if( st != 0 )
+        var pos = index(StrLwr(errText),"не требуется");
+        if( pos == 0 )
+          retVal = -1;
+        end;
+        if( {BatchMode} == 0 )
+          msgbox( errText );
+        end;
+      end;
+    end;
+
+    // Установка связи между п/п и входящим РДД
+    if( retVal == 0 )
+      if( not ProcessTrn(null, "SetMatchingExTRN") )
+        retVal = -1;
+      end;
+    end;
+  else
+    retVal = 21352; // Не найден входящий РДД, соответствующий п/п
+  end;
+
+  return retVal;
+end;
+
+//--------------------------------------------------------------------//
+// Сопоставление входящего РДД с п/п                                  //
+//--------------------------------------------------------------------//
+macro MatchDocWithPayment( recRTdoc, recIncomeDoc, recPayment ): integer
+  recTrnPaym = recPayment;
+  DocId = recRTdoc.rec.documentId;
+  DocNumber = recRTdoc.rec.documentNumber;
+  PaymentId = int(recIncomeDoc.rec.IncomePaymentId);
+  DocAmount = recRTdoc.rec.debitAmount;
+  var retVal = 0;
+
+  if( DocAmount != recTrnPaym.rec.GlobalSumPFR )
+    if( {BatchMode} == 0 )
+      msgbox( ErrMessage(21344) ); // Обнаружено расхождение сумм реестра и ПП
+    end;
+    var errText;
+    // Отправить Уведомление о расхождении сумм
+    var st = SendDiscrepancy( errText );
+    if( st != 0 )
+      var pos = index(StrLwr(errText),"не требуется");
+      if( pos == 0 )
+        retVal = -1;
+      end;
+      if( {BatchMode} == 0 )
+        msgbox( errText );
+      end;
+    end;
+  end;
+
+  if( retVal == 0 )
+    if( not ProcessTrn(null, "SetMatchingExTRN") )
+      retVal = -1;
+    end;
+  end;
+  return retVal;
+end;
+
+//--------------------------------------------------------------------//
+// Откат сопоставления входящего РДД с п/п                            //
+//--------------------------------------------------------------------//
+macro RollbackMatching( recRTdoc, recIncomedoc ): integer
+  DocId = recRTdoc.rec.DocumentId;
+  DocNumber = recRTdoc.rec.DocumentNumber;
+  DocAmount = recRTdoc.rec.debitAmount;
+  PaymentId = int(recIncomedoc.rec.IncomePaymentId);
+  TrnContractNumber = recIncomedoc.rec.TrnContractNumber;
+  var retVal = 0;
+
+  var cmd = RsdCommand(
+    "SELECT 1 FROM dtrn_doc_dbt t " +
+    " WHERE (t.t_fncash, t.t_listtransfer) IN " +
+      " (SELECT payf.t_fncash, payf.t_autokey " +
+         " FROM dtrn_payf_dbt payf " +
+        " WHERE (payf.t_numbercontract, payf.t_num_paymessage) IN " +
+          " (SELECT paym.t_numbercontract, paym.t_num_paymessage " +
+            " FROM dtrn_paym_dbt paym " +
+            " WHERE paym.t_numbercontract = ? " +
+              " AND paym.t_num_paymessage = ? " +
+              " AND paym.t_paymentid = ?)) " +
+      " AND t.t_status = 'X'");
+  cmd.addParam("",RsdBp_In,TrnContractNumber);
+  cmd.addParam("",RsdBp_In,DocNumber);
+  cmd.addParam("",RsdBp_In,PaymentId);
+  cmd.nullConversion = true;
+  cmd.execute( );
+  var rs = RsdRecordSet(cmd);
+  if( rs.moveNext() )
+    retVal = 21349; // Откат сопоставления невозможен. По платежному поручению уже выполнены проводки
+  else
+    if( ProcessTrn(null, "RollbackMatchingTRN") )
+      msgbox( ErrMessage(21350) ); // Выполнен откат сопоставления с платежным поручением
+    else
+      retVal = -1;
+    end;
+  end;
+
+  return retVal;
+end;
+
+//--------------------------------------------------------------------//
+// Откат сверки п/п (и сопоставления с входящим РДД)                  //
+//--------------------------------------------------------------------//
+macro RollbackCheckPayment( recPayment ): integer
+  DocNumber = recPayment.rec.Num_PayMessage;
+  PaymentId = recPayment.rec.PaymentId;
+  TrnContractNumber = recPayment.rec.NumberContract;
+  var retVal = 0;
+
+  var cmd = RsdCommand(
+    "select t.t_documentid, t.t_DebitAmount "+
+      "from drtdocument_dbt t, drtincomedoc_dbt ind "+
+     "where ind.t_trnContractNumber = ? "+
+       "and ind.t_incomepaymentid = ? "+
+       "and t.t_DocumentNumber = ? "+
+       "and t.t_Direction = 1 "+
+       "and t.t_DocTypeId in ( "+
+           "select pmdtype.t_DocTypeId "+
+             "from dPMDType_dbt pmdtype "+
+            "where pmdtype.t_DocTypeId = 5 "+ // Тип РДД <Платежное поручение>
+               "or pmdtype.t_SystemAnalogId = 5 ) "+
+       "and ind.t_IncomeDocType = 30 "+ // Тип входящего РДД <Пакетное зачисление на счет>
+       "and t.t_DocumentId = ind.t_DocumentId "); 
+  cmd.addParam("",RsdBp_In,TrnContractNumber);
+  cmd.addParam("",RsdBp_In,String(PaymentId));
+  cmd.addParam("",RsdBp_In,DocNumber);
+  cmd.nullConversion = true;
+  cmd.execute( );
+  var rs = RsdRecordSet(cmd);
+  if( rs.moveNext() )
+    DocId = rs.value("t_documentId");
+    DocAmount = rs.value("t_DebitAmount");
+    if( not ProcessTrn(null, "RollbackMatchingTRN") )
+      retVal = -1;
+    end;
+  else
+    retVal = -1;
+  end;
+
+  return retVal;
+end;

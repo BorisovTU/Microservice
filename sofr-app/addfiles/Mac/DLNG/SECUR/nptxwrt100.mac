@@ -1,0 +1,1475 @@
+/**
+ @file nptxwrt100.mac
+ @brief Операция списания и зачисления денежных средств/Шаг проводок
+
+ # changelog
+ |date       |autor          |tasks                                           |note
+ |-----------|---------------|------------------------------------------------|-------------------------------------------------------------
+ |03.07.2025 |Велигжанин А.В.|BOSS-7143_BOSS-7145                             |Основание платежа для целей списания (берется из примечания, 
+ |           |               |                                                |как для вывода на лечение)
+ |17.01.2025 |Велигжанин А.В.|BOSS-6391_BOSS-7438                             |Применение GetGroundOfPayMedical() для основания платежа по выводу ДС
+ |           |               |                                                |см. nptxwrt_func.mac
+ |18.10.2024 |Велигжанин А.В.|DEF-74274                                       |основание платежа для ИИС-3 и дорогостоящего лечения
+ |12.09.2024 |Зыков М.В.     |BOSS-1688                                       |Генерация сообщения для QUIK о нулевом лимите     
+ |03.07.2024 |Велигжанин А.В.|DEF-68258                                       |Для нулевых лимитов используется GetCurrencyByZeroLimit()
+ |           |               |                                                | см. limout.mac
+ |24.11.2023 |Велигжанин А.В.|DEF-56102                                       |Проверка настройки для жесткого или нежесткого отката операции
+ |           |               |                                                | см. GetHardDisableReg()
+*/
+
+import InsCarryDoc, "sp_categ.mac", /*"sp_car.mac", падает в фиссико*/ "nptxcalcfun.mac", "nptxreqfun.mac", RsbDataSet, FIInter, PTinter, limout,dlcontrfunc;
+import "role_model.mac";//ролевая модель
+import sccrpayms, oralib, likepy, usr_connect_attr;
+import "u_common_email_utils.mac";
+import UTL_COMIS_STEP;
+import Enroll_Class;
+import "nptxwrt_func.mac", it_utils, "CFTDocumentTypeCodes.mac";
+import "cblogger2.mac";
+
+private macro Error( ErrStr:STRING ):INTEGER
+  DL_NPTX_PutMsg( ErrStr );
+  MsgBox( ErrStr );
+  return 1;
+end;
+
+Private macro GetDBOParm(Id, DboNum, DboDate)
+   var  Query, cmd, DataSet;
+
+    Query = "select sf.* from ddlcontrmp_dbt mp, ddlcontr_dbt dl, dsfcontr_dbt sf where mp.t_sfcontrid = ? "
+            "and dl.t_dlcontrid = mp.t_dlcontrid and sf.t_id = dl.t_sfcontrid ";
+
+    cmd = DL_RSDCommand(query);
+
+    cmd.AddParam(ID);
+
+    DataSet = cmd.Execute();
+
+    if(DataSet.moveNext())
+      SetParm(1, DataSet.number);
+      SetParm(2, DataSet.dateconc);
+      return true;
+    else
+      return false;
+    end;
+
+End;
+
+/* Возвращает БИК нашего банка
+*/
+private macro НашБик()
+  var party = TBfile("party.dbt");
+  var partcode = TBfile("partcode.dbt");
+  var Ok;
+
+  party.KeyNum = 0;
+  party.rec.PartyID = {OurBank};
+  Ok = party.GetEQ;
+  if(not Ok)
+    return "";
+  end;
+  partcode.KeyNum = 0;
+  partcode.rec.PartyID = party.rec.PartyID;
+  partcode.rec.CodeKind = PTCK_BIC;
+  Ok = partcode.GetEQ;
+  return IIF(Ok,partcode.rec.Code,"");
+END;
+
+//ищет СПИ для налоговой, с назначением: 38 - налог с дохода
+private macro ПолучитьБанкНалоговой( ID, settacc )
+  var found = false;
+  var sql = " select SettAcc.t_SettAccId, SettAcc.t_Account, pmAuto.t_KindOper " +
+            "    from dsettacc_dbt SettAcc,  dpmautoac_dbt pmAuto " +
+            "    where "+
+            "          SettAcc.t_SettAccId = pmAuto.t_SettAccId "+
+            "      and SettAcc.t_PartyID = ? "+
+            "      and pmAuto.t_purpose = " + 38 +//назначение платежа - "Налог с дохода" (справочник - таблица *dpmpurp_dbt*)
+            "      and SettAcc.t_FIID = "+NATCUR;
+  var cmd = DL_RSDCommand(sql);
+  cmd.AddParam(ID);
+
+  var dataset = cmd.execute();
+  if (dataset.MoveNext()) 
+    settacc.KeyNum = 0;
+    settacc.rec.SettAccId = dataset.SettAccId;
+    settacc.GetEQ();
+    found = true;
+  end;
+ 
+ return found;
+end;
+
+        
+MACRO GetRekvContr (t_ID, number:@string, datebegin:@date, servkindsub:@integer):BOOL //BIQ-5485
+var sql, cmd, DSet; 
+   sql = "select T_NUMBER, T_DATEBEGIN, T_SERVKINDSUB from  dsfcontr_dbt where t_id = ? ";
+   cmd = DL_RSDCommand(sql);
+   cmd.AddParam(t_ID);
+   DSet = cmd.Execute();
+      if(DSet.movenext())
+        number = DSet.T_NUMBER;
+        datebegin = DSet.T_DATEBEGIN;
+        servkindsub = DSet.T_SERVKINDSUB;
+        return true;
+      else
+        return false;
+      end;
+END;
+
+private class c_acctrn
+   var t_Date_Carry, 
+       t_NumbDocument, 
+       t_Sum_Payer;
+end;
+
+/**
+@brief 				Получает настройку 
+@param[in] p_HardDisablePath	Путь настройки
+@return 			Значение флага настройки
+*/
+private macro GetHardDisableReg( p_HardDisablePath: STRING ): BOOL
+   var ErrCode;
+   var HardDisableReg: BOOL;
+
+   GetRegistryValue( p_HardDisablePath, V_BOOL, HardDisableReg, ErrCode );
+   if ( ErrCode != 0 )
+      HardDisableReg = true;
+   end;
+   
+   return HardDisableReg;
+end;
+
+MACRO CheckStepAction( mes, FDoc, DocKind, ID_Operation, ID_Step )
+var sql, cmd, rs;  
+var trn_arr = TArray;
+var temp_trn;
+var ai = 0;
+var err_str;
+
+  record nptxop("nptxop");
+  SetBuff( nptxop, FDoc );
+
+  If (mes == OP_BACKOUT_STEP)
+//DEF-36326 Контроль отката операции списания денежных средств
+      sql = "select t_userfield4, to_char(t_Date_Carry,'dd.mm.yyyy') t_Date_Carry , t_Numb_Document, t_Sum_Payer "+
+            "  from doprdocs_dbt opr, dacctrn_dbt trn "+
+            " where opr.t_id_operation = :id_operation "+ 
+            "   and opr.t_acctrnid = trn.t_acctrnid "+
+            "   and trn.t_chapter = 1";
+      cmd = RSDCommand(sql);
+      cmd.AddParam("id_operation", RSDBP_IN, ID_Operation);
+      rs = RSDRecordSet(cmd);
+      while (rs.movenext)
+         if ( (Strlen(rs.value("t_userfield4")) > 1) and (Index(StrUpr(rs.value("t_userfield4")),"АННУЛ") == 0) )
+            temp_trn = c_acctrn;
+            temp_trn.t_Date_Carry = rs.value("t_Date_Carry");  
+            temp_trn.t_NumbDocument = rs.value("t_Numb_Document");  
+            temp_trn.t_Sum_Payer = rs.value("t_Sum_Payer");  
+            trn_arr.value(ai) = temp_trn;
+            ai = ai+1;
+            temp_trn = null;
+         end;
+      end;
+
+      if (trn_arr.size > 0)
+         err_str = "Проводки: \n";
+         for (temp_trn, trn_arr)
+            err_str = err_str + "дата: "+temp_trn.t_Date_Carry+", номер: "+temp_trn.t_NumbDocument+", сумма: "+temp_trn.t_Sum_Payer+"\n";
+         end;
+         err_str = err_str + "выгружены в АБС и не аннулированы в АБС. \n";
+
+         // DEF-56102, проверка настройки жесткого запрета отката операции
+         if( GetHardDisableReg("РСХБ\\ИНТЕГРАЦИЯ\\ЖЕСТКИЙ_ЗАПРЕТ_ОТКАТА") ) 
+            // по настройке -- жесткий запрет (реализовано по DEF-36326)
+            err_str = err_str + " Откат невозможен. Для выполнения отката выполните аннулирование проводок в АБС. ";
+            Msgbox(err_str);
+            return 1;
+         else 
+            // по настройке -- нежесткий запрет
+            err_str = err_str + " Продолжить откат операции?";
+            if (GetTRUE (false,err_str))
+                WS_WriteAuditMessage("Откат шага формирования проводок операции вида "+nptxop.DocKind+" номер "+nptxop.Code+
+                                     " за дату "+nptxop.OperDate+" пользователем "+{Oper}+". Проводки выгружены в АБС и не аннулированы в АБС");
+                return 0;
+            else 
+                return 1;
+            end;
+         end;
+      end;
+
+      return 0;
+  end;
+
+  return 0;
+END;
+
+
+//Создаётся платёж по налогу + проводка по нему
+private macro СформироватьПлатежНДФЛ (nptxop, PayerAccount, Taxe, BttTICode)/*PNV i-support 543497*/
+  var settacc  = TBfile("settacc.dbt");
+  var pt_self  = TBFile  ("party.dbt");
+  var Pmobj    = RSBPayment();
+  var regValue = 0;
+  var stat     = 0;
+  var tr, m, y;
+
+  Pmobj.DocKind       = nptxop.DocKind;
+  Pmobj.DocumentID   = string(nptxop.ID:o:34);
+  Pmobj.Purpose      = PM_PURP_TAXINCOME_NJ; // Налог с дохода
+  Pmobj.BaseAmount   = Taxe;
+  Pmobj.BaseFIID     = NATCUR;
+  Pmobj.ReceiverFIID = NATCUR;
+  Pmobj.PayerFIID    = NATCUR;
+  Pmobj.ValueDate    = nptxop.OperDate;   // Дата валютирования
+  Pmobj.PaymStatus   = PM_READY_TO_SEND;  // Статус платежа - 3000 - Готов к отправке
+  Pmobj.Ground       = "Налог на доходы физ. лиц от операций с ценными бумагами ("+GetPartyNames(nptxop.Client, 0)(1)+")";
+  Pmobj.Number       = nptxop.ID;
+  pmObj.PrimDocKind  = DOC_BO_PAYMENT;
+  pmObj.NumberPack   = 11;
+  pmobj.Priority     = 3;
+
+  Pmobj.Oper = GetMainOperInGroup(Pmobj.DocKind);
+  if (Pmobj.Oper <= 0)
+    Pmobj.Oper = {oper};
+  end;
+
+  //Параметры налогового платежа
+  //pmObj.BttTICode = "18210102010011000110";
+  pmObj.BttTICode = BttTICode; /*PNV i-support 543497*/
+  pmObj.PaymentByOtherPerson = PM_OTHRPRSN_PRSN;
+  pmObj.TaxPmGround = "ТП"; //платежи текущего года
+
+  DateSplit(pmObj.ValueDate, null, m, y);
+
+  if(m <= 9)
+    m = "0"+m;
+  end;
+
+  pmObj.OKATOCode   = ПолучитьКодСубъекта({OurBank}, 74/*Код ОКТМО*/);
+  pmObj.TaxPmPeriod = "МС."+m+"."+y;
+  pmObj.TaxPmNumber = "0";
+  pmObj.TaxPmDate   = string(pmObj.ValueDate:f);
+  pmObj.TaxPmType   = "0";
+  pmObj.PayType     = BPT_TAX;
+
+  pmObj.PayerBankEnterDate = pmObj.ValueDate;
+  pmObj.PayerChargeOffDate = pmObj.ValueDate;
+
+  Pmobj.SetPayerPI(
+              PAYMENTS_GROUP_UNDEF, // Group
+              {OurBank},                       // BankID  // Банк плательщика
+              3,                               // BankCodeKind
+              НашБик(),                        // BankCode
+              "",                              // BankName
+              "",                              // CorrAcc
+              NATCUR,                          // AccountFI
+              1,                               // AccountChapter
+              PayerAccount,                    // Account   // Счет плательщика
+              {OurBank},                       // ClientID  // Плательщик
+              "",                              // ClientName,
+              {INN_Bank},                      // ClientINN,
+              3,                               // ClientCodeKind,
+              НашБик()                         // ClientCode
+             );
+  
+  if (not GetRegistryValue( "РСХБ\\БРОКЕРСКОЕ ОБСЛУЖИВАНИЕ\\НАЛОГОВЫЙ_АГЕНТ_ФИЗ_ЛИЦ", V_INTEGER, regValue) )
+    regValue = 0;
+  end;
+
+  pt_self.KeyNum = 0;
+  pt_self.rec.PartyID = regValue;
+  if (not pt_self.GetEQ() )
+    stat = Error("Не найден налоговый орган нашего банка");
+  end;
+
+  if (stat == 0)
+    if ( not ПолучитьБанкНалоговой( pt_self.rec.PartyID, settacc ))
+      stat = Error("Не найден Банк налогового органа. Проверьте платежные инструкции");
+    end;
+  end;
+
+  if ( stat == 0 )
+    if( settacc.rec.BankID == {OurBank} )
+      Pmobj.SetReceiverPI(
+                PAYMENTS_GROUP_UNDEF,                // Group
+                settacc.rec.BankID,                  // BankID         // Банк налогового органа
+                0,                                   // BankCodeKind
+                "",                                  // BankCode
+                "",                                  // BankName
+                "",                                  // CorrAcc
+                settacc.rec.FIID,                    // AccountFI
+                1,                                   // AccountChapter
+                settacc.rec.Account,                 // Account        // счет в Банке налогового органа
+                pt_self.rec.PartyID,                 // ClientID       // Налоговый орган
+                pt_self.rec.name,                    // ClientName,
+                "",                                  // ClientINN,
+                1,                                   // ClientCodeKind,
+                ПолучитьКодСубъекта(pt_self.rec.PartyID, 1) // ClientCode
+               );
+    else
+      Pmobj.SetReceiverPI(
+                PAYMENTS_GROUP_UNDEF,                // Group
+                settacc.rec.BankID,                  // BankID         // Банк налогового органа
+                settacc.rec.BankCodeKind,            // BankCodeKind
+                settacc.rec.BankCode,                // BankCode
+                settacc.rec.BankName,                // BankName
+                settacc.rec.CorrAcc,                 // CorrAcc
+                settacc.rec.FIID,                    // AccountFI
+                1,                                   // AccountChapter
+                settacc.rec.Account,                 // Account        // счет в Банке налогового органа
+                pt_self.rec.PartyID,                 // ClientID       // Налоговый орган
+                pt_self.rec.name,                    // ClientName,
+                "",                                  // ClientINN,
+                1,                                   // ClientCodeKind,
+                ПолучитьКодСубъекта(pt_self.rec.PartyID, 1) // ClientCode
+               );
+    end;
+  end;
+
+  if ( settacc.rec.BankID != {OurBank} ) 
+    pmobj.OutTransferDate = Pmobj.ValueDate; 
+  end;
+  Pmobj.IsFactPaym   = "X"; //Этот флаг должен бысть установлен уже после добавления схем расчётов. Иначе по платежу не создаётся операция 4001 (или 14001)
+  pmObj.TaxAuthorState = "02"; //статус составителя - налоговый агент //Это тоже должно задаваться после Set***PI(), иначе "Не найдена схема расчетов по умолчанию"
+
+  pmobj.BaseRate.Actuate(nptxop.OperDate, false);
+  pmobj.FactRate.Actuate(nptxop.OperDate, false);
+  pmobj.Actuate();
+
+  //Создание проводки
+  tr = pmobj.MakeTransaction();
+  if( tr == NULL )
+    stat = Error("Ошибка при создании проводки по платежу");
+  else
+    tr.Shifr_Oper    = "";
+    tr.ResultCarry   = 1;
+    tr.Number_Pack   = pmobj.NumberPack;
+    tr.Chapter       = 1;
+    tr.Numb_Document = nptxop.Code;
+
+    if( not tr.Carry() )
+      stat = Error("Ошибка при выполнении проводки");
+    end;
+  end;
+
+  return stat;
+End;
+
+/*
+Сначала формируется проводка ДТ 306 - КТ 603
+Далее формируется платёж ДТ 603
+*/
+private macro ВыполнитьУдержаниеНДФЛ (nptxop, FD, doc, Taxe, Taxe15, AddTaxeArr)
+  var DtAccount  = TRecHandler("account");
+  var CtAccount  = TRecHandler("account");
+  var pt_clnt    = TRecHandler("party");
+  var stat = 0;
+  var ground = "", ground_pfx = "";
+  var CategNDFL = "";
+  var DboNum   = "";
+  var DboDate  = Date();
+  var year;
+  var MainTaxAccount = TRecHandler("account.dbt");
+  var AddTaxAccount = TRecHandler("account.dbt");
+  var Notres = false;
+  var party = TRecHandler("party.dbt");
+  var AddTaxe = $0, AddTaxe15 = $0;
+  var ClientResident = DL_GetPartyResident(nptxop.Client);
+  var i = 0;
+
+  DateSplit(nptxop.OperDate, null, null, year);
+
+  GetDBOParm(nptxop.contract, DboNum, DboDate);
+  ground = "Начисление налога на доходы физ. лиц за "+year+"г. по клиенту ("+GetPartyNames(nptxop.Client, 0)(1)+")";
+  ground_pfx = " на доходы физ. лиц за "+year+"г. по клиенту ("+GetPartyNames(nptxop.Client, 0)(1)+")";
+
+  if (nptxop.tax == 0) 
+    return stat;
+  end;
+
+  if( (ПолучитьСубъекта(nptxop.Client, party) == 0) AND (party.rec.NotResident == SET_CHAR) )
+       Notres = True;
+  end;
+
+  if(not stat and ((Taxe != 0) or (Taxe15 != 0) or (AddTaxeArr.size > 0)))
+
+     if (ПолучитьСубъекта(nptxop.Client, pt_clnt) )
+         return Error( "Не удалось найти клиента с ИД <"+nptxop.Client+">." );
+     end;
+
+     if(pt_clnt.rec.LegalForm != PTLEGF_PERSN) // клиент не физ.лицо
+        return stat;
+     end;
+
+     i = 0;
+     while(i < AddTaxeArr.size)
+       if(AddTaxeArr[i].Ставка == IIF(ClientResident == NPTXPARTY_RESIDENT, int(NPTXGENTAXRATE_RESIDENT*100), int(NPTXGENTAXRATE_NOTRESIDENT*100)))
+         AddTaxe = AddTaxeArr[i].Налог;
+       elif(AddTaxeArr[i].Ставка == int(NPTXGENTAXRATE_RESIDENT_15*100))
+         AddTaxe15 = AddTaxe15 + AddTaxeArr[i].Налог;
+       end;
+
+       i = i + 1;
+     end;
+
+     if((Taxe > 0) or (AddTaxe > 0))
+        if( GetAccount(1, NATCUR, nptxop.AccountTax, DtAccount, true) == false )
+            return Error( "Не найден счет удержания НДФЛ <"+nptxop.AccountTax+">, заданный в форме операции");
+        end;
+
+        if( not FD.OpenAccount( "НДФЛ к перечислению, FLR", null, false, null, CtAccount, nptxop.OperDate, NATCUR) )
+            return Error( "Ошибка при определении счета по категории <НДФЛ к перечислению, FLR>." );
+        end;
+
+        if(Taxe > 0)
+          if( not ПроводкаПоКатегориямУчета( FD,
+                                       DtAccount, CtAccount,
+                                       nptxop.OperDate,               /* Дата */
+                                       1,                             /* Глава */
+                                       NATCUR,                        /* Валюта суммы проводки */
+                                       Taxe,                          /* Сумма проводки*/
+                                       Doc,                           /* Документ */
+                                       INPCARRY,                      /* Result_Carry */
+                                       " 1",                          /* Kind_Oper */
+                                       nptxop.Code,                   /* Numb_Document */
+                                       "Удержание налога" + ground_pfx /* Ground */
+                                     )
+              )
+              return Error( "Ошибка при выполнении проводки" );
+         end;
+         DL_NPTX_PutMsg( "Выполнена проводка: Дт<"+DtAccount.rec.Account+"> Кт<"+CtAccount.rec.Account+"> на сумму " + string(abs(Taxe)) + " " + ПолучитьКодФинИн(NATCUR) );
+       end;
+
+       if(nptxop.OperDate < date(1,1,2023))
+         stat = СформироватьПлатежНДФЛ(nptxop, CtAccount.rec.account, Taxe+AddTaxe );
+       end;
+    end;
+
+
+    if (stat != 0)
+       return 1;
+    end;
+
+    if((Taxe15 > 0) or (AddTaxe15 > 0))          
+       if( GetAccount(1, NATCUR, nptxop.AccountTax, DtAccount, true) == false )
+           return Error( "Не найден счет удержания НДФЛ <"+nptxop.AccountTax+">, заданный в форме операции");
+       end;
+
+       if( not FD.OpenAccount( "НДФЛ к перечислению 15%", null, false, null, CtAccount, nptxop.OperDate, NATCUR) )
+           return Error( "Ошибка при определении счета по категории <НДФЛ к перечислению 15%>." );
+       end;
+
+       if(Taxe15 > 0)
+         if( not ПроводкаПоКатегориямУчета( FD,
+                                            DtAccount, CtAccount,
+                                            nptxop.OperDate,               /* Дата */
+                                            1,                             /* Глава */
+                                            NATCUR,                        /* Валюта суммы проводки */
+                                            Taxe15,                        /* Сумма проводки*/
+                                            Doc,                           /* Документ */
+                                            INPCARRY,                      /* Result_Carry */
+                                            " 1",                          /* Kind_Oper */
+                                            nptxop.Code,                   /* Numb_Document */
+                                            "Удержание налога по повышенной ставке" + ground_pfx  /* Ground */
+                                          )
+           )
+            return Error( "Ошибка при выполнении проводки" );
+          end;
+          DL_NPTX_PutMsg( "Выполнена проводка: Дт<"+DtAccount.rec.Account+"> Кт<"+CtAccount.rec.Account+"> на сумму " + string(abs(Taxe15)) + " " + ПолучитьКодФинИн(NATCUR) );
+       end;
+        
+        
+       if(nptxop.OperDate < date(1,1,2023))
+         stat =  СформироватьПлатежНДФЛ(nptxop, CtAccount.rec.account, Taxe15+AddTaxe15, "18210102080011000110" );/*PNV i-support 543497*/
+       end;
+    end;
+
+    i = 0;
+    while(i < AddTaxeArr.size)
+        if(AddTaxeArr[i].Налог > 0)
+          if( GetAccount(1, NATCUR, nptxop.AccountTax, DtAccount, true) == false )
+              return Error( "Не найден счет удержания НДФЛ <"+nptxop.AccountTax+">, заданный в форме операции");
+          end;
+
+          if( not FD.OpenAccount( "НДФЛ к перечислению "+AddTaxeArr[i].Ставка+"%", null, false, null, CtAccount, nptxop.OperDate, NATCUR) )
+              return Error( "Ошибка при определении счета по категории <НДФЛ к перечислению "+AddTaxeArr[i].Ставка+"%>." );
+          end;
+          
+          if( not ПроводкаПоКатегориямУчета( FD,
+                                             DtAccount, CtAccount,
+                                             nptxop.OperDate,               /* Дата */
+                                             1,                             /* Глава */
+                                             NATCUR,                        /* Валюта суммы проводки */
+                                             AddTaxeArr[i].Налог,           /* Сумма проводки*/
+                                             Doc,                           /* Документ */
+                                             INPCARRY,                      /* Result_Carry */
+                                             " 1",                          /* Kind_Oper */
+                                             nptxop.Code,                   /* Numb_Document */
+                                             "Доудержание НДФЛ КБК = *"+substr(AddTaxeArr[i].КБК, 7, 5)+"* по " + party.rec.Name  /* Ground */
+                                           )
+            )
+             return Error( "Ошибка при выполнении проводки" );
+           end;
+           DL_NPTX_PutMsg( "Выполнена проводка: Дт<"+DtAccount.rec.Account+"> Кт<"+CtAccount.rec.Account+"> на сумму " + string(abs(AddTaxeArr[i].Налог)) + " " + ПолучитьКодФинИн(NATCUR) );
+
+        end;
+
+      i = i + 1;
+    end;
+  end;
+
+  if (stat != 0)
+      return 1;
+  end;
+
+  return 0;
+end;
+
+/*вернет пачку в завсимости от вида обслуживания договора*/
+private macro GetNumForContr(ContrID:integer):integer
+  var rs, cmd, sql;
+  sql = "select t_servkind from dsfcontr_dbt where t_id = ?";
+  cmd = RsdCommand(sql);
+  cmd.addParam( "", RSDBP_IN, ContrID);
+  rs = RsdRecordSet(cmd);
+  if (rs and rs.MoveNext())
+    if (rs.value("t_servkind") == PTSK_DV)
+      return 40;
+    elif (rs.value("t_servkind") == PTSK_CM)
+      return 90;
+    else
+      return 0;
+    end;
+  else
+    return 0;
+  end;
+onerror(x)
+  return 0;
+end;
+
+private macro isEdp(_sfcontrid)
+  var rs, cmd, sql;
+  sql = "SELECT rshb_rsi_sclimit.SfcontrIsEDP(?) as t_isedp FROM dual";
+  cmd = RsdCommand(sql);
+  cmd.addParam( "", RSDBP_IN, _sfcontrid);
+  rs = RsdRecordSet(cmd);
+  if (rs.movenext())
+      return (rs.value("t_isedp") == 1);
+  end;
+  return false;
+end;
+
+private macro GetMarketId(_sfcontrid)
+  var rs, cmd, sql;
+  sql = "select t.t_marketid from ddlcontrmp_dbt t where t.t_sfcontrid = ?";
+  cmd = RsdCommand(sql);
+  cmd.addParam( "", RSDBP_IN, _sfcontrid);
+  rs = RsdRecordSet(cmd);
+  if (rs.movenext())
+      return rs.value("t_marketid");
+  else
+     RunError ("Не найден субдоговор sfcontrid = "+string(_sfcontrid));
+  end;
+end;
+
+
+private macro Chk_calc_LIMITCASH(_sfcontrid)
+  var tradedate = DL_GetMinDateOfCalends( date(),//календарная дата проведения шага формирования проводок операции Списание/зачисление д/с
+                                          0,
+                                          DL_GetCalendarArrByParam(DL_KeyPair("ObjectType",DL_CALLNK_MARKET),DL_KeyPair("DayType", DL_CALLNK_MRKTDAY_TRADE))
+                  );
+
+  var rs, cmd, sql;
+  sql = "select (select count(*) from DDL_LIMITCASHSTOCK_DBT where t_date = ? and rownum < 2) as t_calc, "
+       +"       (select count(*) from DDL_LIMITCASHSTOCK_DBT where t_date = ? and t_client_code in (select t_mpcode from ddlcontrmp_dbt where t_sfcontrid = ?)) as t_calc_contr "
+       +" from dual ";
+  cmd = RsdCommand(sql);
+  cmd.addParam( "", RSDBP_IN, tradedate);
+  cmd.addParam( "", RSDBP_IN, tradedate);
+  cmd.addParam( "", RSDBP_IN, _sfcontrid);
+  rs = RsdRecordSet(cmd);
+  if (rs.movenext())
+      return ((rs.value("t_calc") > 0) and (rs.value("t_calc_contr") == 0)) ;
+  end;
+  return false;
+end;
+
+
+private macro MakeCorrLimit(contract, sign, corrSum, commiss, currency, dt, IDOperation)
+  var v_IsEDP = isEdp(contract.rec.id);
+  if ((contract.rec.servkind == PTSK_CM) AND (not v_IsEDP)) 
+    InsertLimitAdjust(contract.rec.ID, "0",   "MONEY", sign*(corrSum-commiss), currency, dt, IDOperation);
+    InsertLimitAdjust(contract.rec.ID, "1",   "MONEY", sign*(corrSum-commiss), currency, dt, IDOperation);
+  else
+    InsertLimitAdjust(contract.rec.ID, "0",   "MONEY", sign*(corrSum), currency, dt, IDOperation);
+    InsertLimitAdjust(contract.rec.ID, "1",   "MONEY", sign*(corrSum), currency, dt, IDOperation);
+    InsertLimitAdjust(contract.rec.ID, "2",   "MONEY", sign*(corrSum), currency, dt, IDOperation);
+    InsertLimitAdjust(contract.rec.ID, "365", "MONEY", sign*(corrSum), currency, dt, IDOperation);
+  end;
+
+end;
+
+private macro MakeCorrLimitZero(contract, dt, IDOperation)
+  var v_IsEDP;
+    it_log(string(" Старт "," contract.rec.id=",contract.rec.id,", IDOperation=",IDOperation),"nptxwrt100.mac");
+
+  if (Chk_calc_LIMITCASH(contract.rec.id))
+    v_IsEDP = isEdp(contract.rec.id);
+
+    if ((contract.rec.servkind == PTSK_STOCKDL) AND (not v_IsEDP))
+      var v_MarketId = GetMarketId( contract.rec.id);
+      if (v_MarketId == MMVB_ID())
+        InsertLimitAdjust(contract.rec.ID, "0",   "DEPO", 0, -1 /*314 GAZP*/, dt, IDOperation);
+      elif (v_MarketId == SPB_ID())
+        InsertLimitAdjust(contract.rec.ID, "0",   "DEPO", 0, -1 /* 1853 AAPL*/, dt, IDOperation);
+      else
+        RunError ("Неизвестная площадка  MarketId = "+string(v_MarketId));
+      end;
+    elif ((contract.rec.servkind == PTSK_CM) AND (not v_IsEDP)) 
+      InsertLimitAdjust(contract.rec.ID, "0",   "DEPO", 0, GetCurrencyByZeroLimit() /*USDRUB_TOM*/, dt, IDOperation); 
+    else
+      var rs, cmd, sql;
+      sql = " select mp2.t_marketid, sfcontr.t_servkind, mp2.t_sfcontrid from ddlcontrmp_dbt mp "+
+            " join ddlcontrmp_dbt mp2 on mp.t_dlcontrid = mp2.t_dlcontrid  join dsfcontr_dbt sfcontr on mp2.t_SfContrID = sfcontr.t_ID "+
+            " where mp.t_sfcontrid = ? and sfcontr.t_DateClose = date'0001-01-01' and sfcontr.t_servkind != 15 " ;
+      cmd = RsdCommand(sql);
+      cmd.addParam( "", RSDBP_IN, contract.rec.ID);
+      rs = RsdRecordSet(cmd);
+      while (rs.movenext)
+        if ((rs.value("t_servkind") == PTSK_STOCKDL) AND ( rs.value("t_marketid") == MMVB_ID()))
+           InsertLimitAdjust(rs.value("t_sfcontrid"), "0",   "DEPO", 0, -1 /*314 GAZP*/, dt, IDOperation);
+        elif ((rs.value("t_servkind") == PTSK_STOCKDL) AND ( rs.value("t_marketid") == SPB_ID()))
+           InsertLimitAdjust(rs.value("t_sfcontrid"), "0",   "DEPO", 0, -1 /* 1853 AAPL*/, dt, IDOperation);
+        elif (rs.value("t_servkind") == PTSK_CM) 
+           InsertLimitAdjust(rs.value("t_sfcontrid"), "0",   "DEPO", 0, GetCurrencyByZeroLimit() /*USDRUB_TOM*/, dt, IDOperation); 
+        end;
+      end;
+
+    end;
+    it_log(string(" ФИНИШ "," contract.rec.id=",contract.rec.id,", IDOperation=",IDOperation),"nptxwrt100.mac");
+  else
+    it_log(string(" Не пройден Chk_calc_LIMITCASH "," contract.rec.id=",contract.rec.id,", IDOperation=",IDOperation),"nptxwrt100.mac");
+  end;
+end;
+
+private macro MakeCorrLimitEnroll(contract, corrSum, commiss, currency, dt, IDOperation)
+  if ( not NeedCorrLimit(contract.rec.ID) )
+    it_log(string(" Не пройден NeedCorrLimit "," contract.rec.id=",contract.rec.id,", IDOperation=",IDOperation),"nptxwrt100.mac");
+    return;
+  end; 
+
+  MakeCorrLimit(contract, 1, corrSum, commiss, currency, dt, IDOperation);
+  MakeCorrLimitZero(contract, dt, IDOperation);
+end;
+
+private macro MakeCorrLimitWriteOff(contract, corrSum, currency, dt, IDOperation)
+  MakeCorrLimit(contract, -1, corrSum, 0, currency, dt, IDOperation);
+end;
+
+/**
+  @brief GetMaxDt - возвращает наибольшее из даты операции или даты регистрации договора
+*/
+private macro GetMaxDt(nptxop)
+  CaptureOutput();
+  [
+  SELECT mp.t_mpregdate 
+   FROM dsfcontr_dbt sf, ddlcontrmp_dbt mp, dnptxop_dbt nx 
+   WHERE nx.t_id = :id AND mp.t_sfcontrid = sf.t_id AND nx.t_contract = sf.t_id
+  ];
+
+  var rs = execsqlselect(StopCaptureOutput(), makearray( sqlparam(":id",nptxop.id)));
+  if (rs.movenext)
+    return arrMax( makeArray( nptxop.operDate, SQL_ConvTypeDate(rs.value("t_mpregdate")) ) );
+  else
+    return nptxop.operDate;
+  end;
+end;
+
+/**
+  @brief Проверить, является ли операция операцией из ДБО ЮЛ
+  @param[in] pnptxopid Идентификатор операции dnptxop_dbt
+  @return true/false
+*/
+private macro IsWriteoffDBOUL(pnptxopid)
+  var sql_str = "select 1 from nontrading_orders_buffer "+
+                " where operation_id = :nptxopid "+
+                  " and nontrading_orders_read.get_servkind(marketplace_withdrawal) in "+
+                       " (nontrading_orders_read.buf_servkind_currency,nontrading_orders_read.buf_servkind_forts) "+
+                  " and src = 'ДБО ЮЛ' ";
+  var rs = execsqlselect(sql_str, makearray( sqlparam("nptxopid",pnptxopid)));
+  if (rs.movenext)
+    return true;
+  else 
+    return false;
+  end;
+end;
+
+private macro isUseCorrForAddKBK(NpTxOpID)
+  var query =   " select msg.t_Message "
+              + "   from dnptxmes_dbt msg"
+              + "  where msg.t_DocID = ? "
+              + "    and msg.t_Type in (205) "
+              + "    and msg.t_Message = 'X' "
+              + " order by msg.t_ID ASC";
+
+  var cmd = DL_RSDCommand(query);
+  cmd.AddParam(NpTxOpID);
+  var DataSet = cmd.Execute();
+  if(DataSet.moveNext())
+    return true;
+  end;
+  
+  return false;
+end;
+
+macro ExecuteStep( Doc, FDoc, DocKind, ID_Operation, ID_Step )
+  var paym   = TBFile("pmpaym.dbt");
+  var dlrq   = TRecHandler("dlrq.dbt");
+  var DtAccount = TRecHandler("account");
+  var CtAccount = TRecHandler("account");
+  var AccFictive = TRecHandler("account");
+  var AccountBuf = TRecHandler("account");
+  var rqacc = TRecHandler("dlrqacc");
+  var sa = TRecHandler("settacc");
+  record nptxop("nptxop");
+  record DebProp("pmprop") BTR;
+  record CredProp("pmprop") BTR;
+  record PayerAccountBuff("account");
+  record ReceiverAccountBuff("account");
+  var DlRqNew = TRecHandler("dlrq.dbt");
+  var PaymentObj = null;
+  var Ground = "";
+  var tr = null;
+  var stat = 0;
+  var FD = null;
+  var ВидРО = 0;
+  var query, cmd, Select, DataSet;
+  var doCarryByPaym:bool = false;
+  var Oper = TRecHandler("nptxop.dbt");
+  var SumTaxVal = $0.0;
+  var rRqAcc = TRecHandler("dlrqacc.dbt");
+  var MainTaxAccount = TRecHandler("account.dbt");
+  var AddTaxAccount = TRecHandler("account.dbt");
+  var party = TRecHandler("party.dbt");
+  var Notres = false;
+  var Taxe = $0, Taxe15 = $0;
+  var nptxopFile = TRecHandLer("nptxop.dbt");
+  var DboNum = "", DboDate = date();
+  var sss, ssb;
+  var Cms_sm = $0.0;
+  var paymNewStatus = -1;//Simanov
+  var number="", datebegin=date("01.01.0001"), servkindsub=0;//BIQ-5485 Для назначения платежа
+  var Enroll;
+  var ErrStr = "";
+  var AddTaxeArr = TArray();
+  var SumCorrBalArr = TArray();
+  var SumCorrBal = $0;
+  var SumAddTaxe = $0;
+  var i = 0;
+  var logger:c_logger;
+  var logFactory = LoggerFactory().NewItLog("NPTXWRT100.MAC").WithElapsedTime();
+
+  ClearGTT_DNPTXOBJ_TMP();
+
+  SetBuff( nptxop, FDoc );
+  Copy(Oper, nptxop);
+
+  logger = logFactory.WithPrefix("id = " + nptxop.ID).GetLogger;
+  logFactory = null;
+
+  FD = DLFirstDocNPTXOP(nptxop);
+
+  if(nptxop.SubKind_Operation != DL_NPTXOP_WRTKIND_ENROL) //если НЕ зачисление
+    stat = CreateHoldTaxObjects8(Oper, ID_Step, abs(Oper.rec.Tax), @Taxe, @Taxe15);
+    
+    if(IsUseProgressScale(nptxop.OperDate))
+      if(not stat)
+        GetSumCorrBalInOpPRGS(nptxop.DocKind, nptxop.ID, nptxop.Client, IIF(nptxop.IIS==SET_CHAR, true, false), false, @SumCorrBalArr);
+
+        i = 0;
+        while(i < SumCorrBalArr.size)
+          if(isUseCorrForAddKBK(nptxop.ID))
+            Taxe15 = Taxe15 + SumCorrBalArr[i].Налог;
+          else
+            SumCorrBal = SumCorrBal + SumCorrBalArr[i].Налог;
+          end;
+          i = i + 1;
+        end;
+
+        stat = СоздатьНДРКоррБал_ПРГС(nptxop.DocKind, nptxop.ID, nptxop.Client, ID_Operation, ID_Step);
+      end;
+
+      if((not stat) and (isUseCorrForAddKBK(nptxop.ID) == false))
+        stat = УчестьКоррБалНДФЛ_ПРГС(FD, Oper, Oper.rec.Client, @AddTaxeArr, @ErrStr);
+      end;
+    else
+
+      if(not stat)
+        var CorrTaxBalMain = GetSumCorrBalInOp(nptxop.DocKind, nptxop.ID, nptxop.Client, NPTXKBK_MAIN, IIF(nptxop.IIS==SET_CHAR, true, false), false);
+        var CorrTaxBal15   = GetSumCorrBalInOp(nptxop.DocKind, nptxop.ID, nptxop.Client, NPTXKBK_15, IIF(nptxop.IIS==SET_CHAR, true, false), false);
+
+        SumCorrBal = CorrTaxBalMain + CorrTaxBal15;
+
+        stat = СоздатьНДРКоррБал(nptxop.DocKind, nptxop.ID, nptxop.Client, ID_Operation, ID_Step);
+      end;
+
+      if(not stat)
+        var AddTaxe, AddTaxe15;
+        stat = УчестьКоррБалНДФЛ(FD, Oper, Oper.rec.Client, @Taxe, @Taxe15, @AddTaxe, @AddTaxe15, @ErrStr);
+        if(not stat)
+          AddTaxeArr.size = 0;
+
+          if(AddTaxe > 0)
+            AddTaxeArr[AddTaxeArr.size] = STB_TaxRateParm(IIF(DL_GetPartyResident(nptxop.Client) == NPTXPARTY_RESIDENT, int(NPTXGENTAXRATE_RESIDENT*100), int(NPTXGENTAXRATE_NOTRESIDENT*100)),
+                                                          $0, 
+                                                          AddTaxe,
+                                                          NPTXKBK_MAIN
+                                                         );
+          end;
+
+          if(AddTaxe15 > 0)
+            AddTaxeArr[AddTaxeArr.size] = STB_TaxRateParm(int(NPTXGENTAXRATE_RESIDENT_15*100),
+                                                          $0, 
+                                                          AddTaxe15,
+                                                          NPTXKBK_15
+                                                         );
+          end;
+        end;
+      end;
+    end;
+  end;
+  
+  if(not stat)
+     var saveTaxDp = nptxop.TaxDp;
+
+     copy(nptxopFile, nptxop);
+
+     nptxopFile.rec.TaxDp = Taxe15;
+     nptxopFile.rec.Tax   = Taxe + Taxe15;
+
+     i = 0;
+     while(i < AddTaxeArr.size)
+       if(AddTaxeArr[i].КБК != NPTXKBK_MAIN)
+         nptxopFile.rec.TaxDp = nptxopFile.rec.TaxDp + AddTaxeArr[i].Налог;
+       end;
+       nptxopFile.rec.Tax   = nptxopFile.rec.Tax + AddTaxeArr[i].Налог;
+
+       SumAddTaxe = SumAddTaxe + AddTaxeArr[i].Налог;
+
+       i = i + 1;
+     end;
+
+     if(saveTaxDp != nptxopFile.rec.TaxDp)
+        if( DL_NPTX_UpdateSumm( nptxopFile ) != 0 )
+           logger.Error("Ошибка при обновлении сумм в dnptxop_dbt");
+           return Error( "Ошибка при обновлении сумм в dnptxop_dbt" );
+        end;
+     end;
+  end;
+  
+  if( ПолучитьТОпоДокументу(nptxop.DocKind, nptxop.ID, 1, DLRQ_TYPE_PAYMENT, 0, dlrq) )
+     DlRq.rec.Amount = nptxop.TaxSum2;
+     DlRq.rec.State = DLRQ_STATE_EXEC;
+     DLRq.rec.FactDate = nptxop.OperDate;
+     DL_ChangeDLRQ(DlRq, nptxop.OperDate, DLRQ_ACTION_UPDATE);
+     /*ak - w487: создание платежа по ТО*/
+     //Платёж нужен для перевода денег в другой филиал (или банк), т.к. в платеже содержится больше информации, чем в проводке
+     //Далее этот платёж будет выгружаться по интеграции в цфт.
+     //  Если платёж внутри ГО, то платёж и проводка отвязываются друг от друга и выгружается только проводка
+     //  Если платёж в другой филиал/банк, то он выгружается стандартными средствами. Проводка "отрезается" по корсчетам
+     //В переводах платёж не нужен, т.к. перевод всегда будет по счетам ГО.
+     //Почему не нужен платёж в зачислениях, могу только предполагать.
+     //  Мы получаем деньги и нужно лишь провести проводку по соответсвующим счетам. Откуда именно пришли деньги - не принципиально (конкретно тут)
+     //Не факт что этот функционал работает, т.к. платёж создаётся ниже в CreatePaymByRQ();
+     if ( nptxop.SubKind_Operation == DL_NPTXOP_WRTKIND_WRTOFF )
+        var errmsg, err;
+        err = ExecMacroFile("paymutil", "CreatingPaym", DlRq.rec.ID, null, @errmsg, true/*InStepOp*/, true/*IsSWIFT*/);
+        if(err < 0)
+           logger.Error("Ошибка при создании платежа по ТО: " + errmsg);
+           return 1;
+        end;
+     end;
+     
+/*~ak*/
+
+     if((not stat) and ((nptxopFile.rec.TaxDp) != 0) )
+        DlRqNew.Clear();
+        DlRqNew.rec.DocKind       = nptxop.DocKind;
+        DlRqNew.rec.DocID         = nptxop.ID;
+        DlRqNew.rec.DealPart      = 1;
+        DlRqNew.rec.Kind          = IIF((nptxopFile.rec.TaxDp) > 0, DLRQ_KIND_REQUEST, DLRQ_KIND_COMMIT);
+        DlRqNew.rec.SubKind       = DLRQ_SUBKIND_CURRENCY;
+        DlRqNew.rec.Type          = DLRQ_TYPE_TAX_FLR_ADD;
+        DlRqNew.rec.Amount        = abs(nptxopFile.rec.TaxDp);
+        DlRqNew.rec.FIID          = NATCUR;
+        DlRqNew.rec.Party         = nptxop.Client;
+        DlRqNew.rec.State         = DLRQ_STATE_EXEC;
+        DlRqNew.rec.PlanDate      = nptxop.OperDate;
+        DlRqNew.rec.FactDate      = nptxop.OperDate;
+        DlRqNew.rec.RQAccID       = DlRq.rec.RQAccID;
+        DlRqNew.rec.PlaceID       = DlRq.rec.PlaceID;
+       
+       //Simanov. Платёж по налоговому ТО не формируется, т.к. в ФИССиКО нет ТО. Сделана единая точка входа по созданию платежа по налогу
+       if( DL_CreateDLRQ(DlRqNew, nptxop.OperDate, DLRQ_ACTION_CREATE) != 0 )
+          logger.Error("Ошибка при создании ТО");
+          return Error( "Ошибка при создании ТО" );
+       end;
+    end;
+      
+    stat = ПолучитПлатежныеРеквизитыПоТО(DlRq, rqacc);
+
+    if(not stat)
+       Enroll = GetClientEnroll(0, nptxop.id);
+       if (Enroll.rec.m_EnRollID == 0)/*нет связанной буферной записи*/
+          stat = ПолучитьСчетПоПлатежнымРеквизитам(rqacc, AccountBuf, rqacc.rec.FIID);
+
+          if (stat and (rqacc.rec.BankID == {OurBank}) )
+             if (MsgBoxEx("Открыть счет " + rqacc.rec.Account + "?", MB_YES + MB_NO, IND_YES) == IND_YES)
+                OpenNewAccount(rqacc.rec.Account, 1, rqacc.rec.FIID, rqacc.rec.Party, nptxop.OperDate, GetPartyNames(rqacc.rec.Party, 1)(0), "Ф");
+                stat = ПолучитьСчетПоПлатежнымРеквизитам(rqacc, AccountBuf, rqacc.rec.FIID);
+             end;
+          end;
+       end;
+
+       if(not stat)
+          GetDBOParm(FD.GetSubContr.rec.ID, DboNum, DboDate);
+          if( nptxop.SubKind_Operation == DL_NPTXOP_WRTKIND_ENROL )
+             if ((substr(Enroll.rec.m_DebetAccount, 1, 5) == "47422") or 
+                 (substr(Enroll.rec.m_DebetAccount, 1, 5) == "55555") or
+                 ВидСубъекта(Enroll.rec.PayerID(), PTK_INCOMEPAYER))
+               Ground = strsubst(Enroll.rec.m_Ground, ".", ",") + ".";
+             else
+               Ground = "Пополнение Брокерского счета по Соглашению об оказании брокерских услуг № " + DboNum + " от " + SQL_ConvTypeDate(DboDate);
+             end;
+
+             if (Enroll.rec.m_EnRollid != 0)
+                if(GetAccount( 1, Enroll.rec.CurrID(), IIF(Enroll.rec.m_LegalForm == PTLEGF_PERSN, Enroll.rec.m_CreditAccount, Enroll.rec.m_DebetAccount), AccountBuf, false ) == 0)
+                   stat = 1;
+                end;
+             end;
+             if (not stat)
+                DtAccount = AccountBuf;
+
+                if(GetAccount( 1, nptxop.Currency, nptxop.Account, CtAccount, false ) == 0)
+                   stat = 1;
+                end;
+             end;
+             doCarryByPaym = false;
+          elif ( nptxop.SubKind_Operation == DL_NPTXOP_WRTKIND_TBSABC )
+             Ground = "Перевод средств по Соглашению об оказании брокерских услуг № " + DboNum + " от " + SQL_ConvTypeDate(DboDate) + ". НДС не облагается.";
+
+             CtAccount = AccountBuf;
+
+             if(GetAccount( 1, nptxop.Currency, nptxop.Account, DtAccount, false ) == 0)
+                stat = 1;
+             end;
+             doCarryByPaym = false;
+          elif ( nptxop.SubKind_Operation == DL_NPTXOP_WRTKIND_WRTOFF )
+             // DEF-74274, Основание платежа для вывода на дорогостоящее лечение
+             if (nptxop.PayMedical == "X")
+               Ground = "Вывод денежных средств с ИИС № "
+                        + DboNum + " от " + SQL_ConvTypeDate(DboDate) + "г.. "
+                        + FD.GetSubContr.rec.Name
+                        + ", на оплату дорогостоящего лечения, согласно Требования Клиента "
+                        + "от " + SQL_ConvTypeDate(nptxop.OperDate) + "г."
+               ;
+             else
+               Ground = "Вывод денежных средств с брокерского счета по соглашению об оказании брокерских услуг № " 
+                        + DboNum + " от " + SQL_ConvTypeDate(DboDate) + ".";
+             end;
+             if (nptxop.Tax != 0)
+                Ground = Ground + " Удержан НДФЛ " + (nptxop.Tax) + " руб.";
+             end;
+
+             Ground = Ground + " НДС не облагается.";
+
+             //BIQ - 5485,  если подвид договора - андеррайтинг, изменим назначение
+             GetRekvContr (nptxop.Contract, @number, @datebegin, @servkindsub) ;
+             if (servkindsub == 10)
+                Ground = "Платёж по договору андерайтинга № " + number + " от " + SQL_ConvTypeDate(datebegin) + ". НДС не облагается.";
+             end;
+
+             // BOSS-6391_BOSS-7438 для вывода на лечение по ИИС-3 основание проводки получаем из соответствующего примечания
+             //                     делается в последнюю очередь при определении основания (на случай, если примечания нет)
+             // BOSS-7143_BOSS-7145 основание платежа для целей списания (берется из примечания, как для вывода на лечение)
+             if ((nptxop.PayMedical == "X") OR (nptxop.PayPurpose > 0))
+                Ground = GetGroundOfPayMedical( nptxop.ID, Ground );
+             end;
+
+             CtAccount = AccountBuf;
+
+             if(GetAccount( 1, nptxop.Currency, nptxop.Account, DtAccount, false ) == 0)
+                stat = 1;
+             end;
+
+             doCarryByPaym = true;
+          end;
+
+          if ( (not stat) and (dlrq.rec.Amount > 0) )
+             if (doCarryByPaym) 
+                CreatePaymByRQ(null, dlrq, FD, null, null, null, null, null, Ground, null, true, true);
+             else
+                if(not ПроводкаПоКатегориямУчета( FD, 
+                                      DtAccount, CtAccount,
+                                      nptxop.OperDate,      /* Дата */
+                                      1,                    /* Глава */
+                                      dlrq.rec.FIID,        /* Валюта */
+                                      dlrq.rec.Amount,      /* Сумма  */
+                                      Doc,                  /* Документ */
+                                      INPCARRY,             /* Result_Carry */
+                                      " 1",                 /* Kind_Oper */
+                                      "",                   /* Numb_Document */
+                                      Ground, null,null,null,
+                                      DtAccount.rec.Code_Currency, CtAccount.rec.Code_Currency     /* валюты счетов: Дт - Кт */ 
+                                     )
+                  )
+                   stat = 1;
+                end;
+             end;
+          end;
+       end;
+    end;
+  else
+     /*bpv сначала считаем комиссию*/
+     if (not stat)
+        if (not make_comis_step(nptxop, DocKind, ID_Operation, ID_Step, @Cms_sm))
+           stat = 1;
+        end;
+     end;
+
+     paym.AddFilter("t_DocKind = " + nptxop.DocKind + " and t_DocumentID = " + nptxop.ID + " and t_Purpose = " + BAi);
+
+     if( paym.Next() )
+        DebProp.PaymentID = paym.rec.PaymentID;
+        DebProp.DebetCredit = 0;
+        CredProp.PaymentID = paym.rec.PaymentID;
+        CredProp.DebetCredit = 1;
+
+        if(paym.rec.PayerAccount == "")
+           stat = 1;
+           msgbox("Не заполнен счет плательщика в платеже");
+        elif(paym.rec.ReceiverAccount == "")
+           stat = 1;
+           msgbox("Не заполнен счет получателя в платеже");
+        elif(not GetEQ(DebProp))
+           stat = 1;
+           msgbox("Не найдено свойство платежа дебет");
+        elif(not GetEQ(CredProp))
+           stat = 1;
+           msgbox("Не найдено свойство платежа кредит");
+        else
+           PaymentObj = RSBPayment( paym.rec.PaymentID );
+
+           //Simanov. Актуализировать сумму платежа с учетом налога
+           PaymentObj.PayerAmount = PaymentObj.ReceiverAmount = PaymentObj.BaseAmount = nptxop.TaxSum2 - IIF ((nptxop.SubKind_Operation ==  DL_NPTXOP_WRTKIND_WRTOFF) ,Cms_Sm, $0.0) /*bpv*/ - SumCorrBal;
+           PaymentObj.IsFactPaym = "X";
+           //Chesnokov 505522 - поставим пачку на платеж
+           PaymentObj.NumberPack = GetNumForContr(FD.nptxop.rec.contract);
+           /*PNV 510082*/
+           GetDBOParm(nptxop.contract, DboNum, DboDate);
+           if( nptxop.SubKind_Operation == DL_NPTXOP_WRTKIND_ENROL )
+              Enroll = GetClientEnroll(0, nptxop.id);
+              
+              if  ((substr(Enroll.rec.m_DebetAccount, 1, 5) == "47422") or 
+                   (substr(Enroll.rec.m_DebetAccount, 1, 5) == "55555") or
+                   ВидСубъекта(Enroll.rec.PayerID(), PTK_INCOMEPAYER))
+                PaymentObj.Ground = strsubst(Enroll.rec.m_Ground, ".", ",") + ".";
+              else
+                PaymentObj.Ground = "Пополнение Брокерского счета по Соглашению об оказании брокерских услуг № " + DboNum + " от " + SQL_ConvTypeDate(DboDate);
+              end;
+           else
+              PaymentObj.Ground = "Вывод денежных средств с брокерского счета по соглашению об оказании брокерских услуг № " + DboNum + " от " + SQL_ConvTypeDate(DboDate) + ".";
+           end;
+           if( nptxop.Tax != 0 )
+              PaymentObj.Ground = PaymentObj.Ground + " Удержан НДФЛ " + (nptxop.Tax) + " руб.";
+           end;
+           PaymentObj.Ground = PaymentObj.Ground + " НДС не облагается.";
+           /*PNV 510082 + 523472*/
+           PaymentObj.Actuate();
+
+           tr = PaymentObj.MakeTransaction();
+           if( tr == NULL )
+              stat = 1;
+              msgbox("Ошибка при создании проводки по платежу");
+           else
+
+              /*DAN.Ролевая модель Определяем конечного операциониста для проводки */
+              var retvalGetMO = GetMainOperInGroup(FD.Kind);
+              if (retvalGetMO > 0)
+                Tr.Oper = retvalGetMO;
+              else
+                Tr.Oper = {Oper};
+              end;
+              /*DAN*/
+              /*24.04.2020. RAS:509051*/
+              var trnGround;
+              //18.05.2020 RAS:510031 убрал привзяку к 90-пачке
+              GetDBOParm(nptxop.contract, DboNum, DboDate);
+              if( nptxop.SubKind_Operation == DL_NPTXOP_WRTKIND_WRTOFF )
+                 trnGround = "Вывод денежных средств с брокерского счета по соглашению об оказании брокерских услуг № " + DboNum + " от " + SQL_ConvTypeDate(DboDate) + ".";
+                    if( nptxop.Tax != 0 )
+                       trnGround = trnGround + " Удержан НДФЛ " + (nptxop.Tax + SumCorrBal) + " руб.";
+                    end;
+                    trnGround = trnGround + " НДС не облагается.";
+              else
+                 trnGround = PaymentObj.Ground;
+              end;
+              /*~RAS:509051*/
+              tr.Chapter         = 1;
+              tr.Date_Carry      = PaymentObj.ValueDate;
+              tr.Number_Pack     = PaymentObj.NumberPack;
+              tr.Numb_Document   = nptxop.Code;
+              tr.ResultCarry     = 1;
+              tr.Kind_Oper       = "";
+              // tr.Ground          = PaymentObj.Ground; 24.04.2020. RAS:509051 
+              tr.Ground = trnGround;//24.04.2020. RAS:509051 
+              tr.Department      = {OperDprt};
+              tr.Oper            = {oper};
+              tr.FIIDPayer       = PaymentObj.BaseFIID;
+              tr.FIIDReceiver    = PaymentObj.BaseFIID;
+              tr.SumPayer        = PaymentObj.BaseAmount;
+              tr.SumReceiver     = PaymentObj.BaseAmount;
+
+              if( nptxop.SubKind_Operation == DL_NPTXOP_WRTKIND_ENROL )
+                 Enroll = GetClientEnroll(0, nptxop.id);
+                 if (Enroll.rec.m_EnRollID == 0)/*нет связанной буферной записи*/
+                    if( (tr.AccountPayer = ПолучитьСчетИзПлатежа(paym.rec, DebProp, CredProp, true, PayerAccountBuff, false)) == "" )
+                       msgbox("Не удалось получить счет из платежа");
+                       if (PaymentObj.payerbankid == {OurBank})
+                          if (MsgBoxEx("Открыть счет " + PaymentObj.PayerAccount + "?", MB_YES + MB_NO, IND_YES) == IND_YES)
+                             OpenNewAccount(PaymentObj.PayerAccount, 1, PaymentObj.PayerFIID, nptxop.client, nptxop.OperDate, GetPartyNames(nptxop.client, 1)(0), "Ф");
+                             if( (tr.AccountPayer = ПолучитьСчетИзПлатежа(paym.rec, DebProp, CredProp, true, PayerAccountBuff, false)) == "" )
+                                msgbox("Не удалось получить счет из платежа");
+                                logger.Error("Не удалось получить счет из платежа");
+                                stat = 1;
+                             end;
+                          end;
+                       end;
+                    end;
+                 else
+                    if (Enroll.rec.m_EnRollid != 0)
+                       if(GetAccount( 1, Enroll.rec.CurrID(), Enroll.rec.m_CREDITACCOUNT, PayerAccountBuff, false ) == 0)
+                          stat = 1;
+                       else
+                          tr.AccountPayer = PayerAccountBuff.Account;
+                       end;
+                    end;
+                 end;
+                 tr.AccountReceiver = PaymentObj.ReceiverAccount;
+                 tr.UserField2 = "1";
+              else                                                     
+                 tr.AccountPayer    = PaymentObj.PayerAccount;
+
+                 if( (tr.AccountReceiver = ПолучитьСчетИзПлатежа(paym.rec, DebProp, CredProp, false, ReceiverAccountBuff, false)) == "" )
+                    msgbox("Не удалось получить счет из платежа");
+                    if (PaymentObj.receiverbankid == {OurBank})
+                       if (MsgBoxEx("Открыть счет " + PaymentObj.receiverAccount + "?", MB_YES + MB_NO, IND_YES) == IND_YES)
+                          OpenNewAccount(PaymentObj.receiverAccount, 1, PaymentObj.receiverFIID, nptxop.client, nptxop.OperDate, GetPartyNames(nptxop.client, 1)(0), "Ф");
+                          if( (tr.AccountPayer = ПолучитьСчетИзПлатежа(paym.rec, DebProp, CredProp, false, receiverAccountBuff, false)) == "" )
+                             msgbox("Не удалось получить счет из платежа");
+                             logger.Error("Не удалось получить счет из платежа");
+                             stat = 1;
+                          end;
+                       end;
+                    end;
+                 end;
+              end;
+
+              tr.Shifr_Oper = "";
+
+              if( not tr.Carry() )
+                 msgbox("Ошибка при выполнении проводки");
+                 logger.Error("Ошибка при выполнении проводки");
+                 stat = 1;
+              end;
+           end;
+
+           if(not stat)
+              paymNewStatus = IIF( nptxop.SubKind_Operation == DL_NPTXOP_WRTKIND_ENROL, PM_FINISHED, PM_READIED );
+              if( ПроставитьСтатусНаПлатеж( paym.rec, paymNewStatus/*PM_FINISHED*/, null, true, PaymentObj, true ) == false )
+                 logger.Error("Не проставлен статус " + paymNewStatus + " платежу");
+                 stat = 1;
+              end;
+              //DEF-77872 для платежей, созданных для операции списания ДБО ЮЛ установить статус "готов к отправке"
+              if ( (nptxop.SubKind_Operation ==  DL_NPTXOP_WRTKIND_WRTOFF) and (IsWriteoffDBOUL(nptxop.id)) )
+                PaymentObj.FutureReceiverAccount = paym.rec.FutureReceiverAccount;
+                if( ПроставитьСтатусНаПлатеж( paym.rec, PM_READY_TO_SEND, null, true, PaymentObj, true ) == false )
+                   logger.Error("Не проставлен статус " + PM_READY_TO_SEND + " платежу");
+                   stat = 1;
+                end;
+              end;
+           end;
+
+        end;
+     else
+        msgbox("Не найден платеж по операции");
+        logger.Error("Не найден платеж по операции");
+        stat = 1;
+     end;
+
+     paym.DropFilter();
+  end;
+
+  if ((Taxe!= 0) or (Taxe15!= 0) or (AddTaxeArr.size > 0))
+    stat = ВыполнитьУдержаниеНДФЛ(nptxop, FD, doc, Taxe, Taxe15, AddTaxeArr);
+  end;
+
+  //ВУ
+  if(not stat)
+     ВидРО = FD.ВУ_ПолучитьВидРО();
+
+     if( not ПроводкаПоКатегориямВнутреннегоУчета( ВидРО, 
+                                                  FD, 
+                                                  Doc, 
+                                                  nptxop.OperDate, 
+                                                  FD.GetParametr(MC_TYPE_PARAMETR_FIID), 
+                                                  nptxop.TaxSum2 - IIF((nptxop.SubKind_Operation == DL_NPTXOP_WRTKIND_WRTOFF), Cms_Sm, $0.0 ),
+                                                  null,
+                                                  null,
+                                                  nptxop.Code
+                                                ) )
+        stat = 1;
+     end;
+
+     if(nptxop.SubKind_Operation == DL_NPTXOP_WRTKIND_TBSABC) /*Перевод ДС между субсчетами ДБО (по активным счетам ВУ)*/
+        ВидРО = 37; /*Перевод ДС между субсчетами ДБО (по пассивным счетам ВУ)*/
+        if( not ПроводкаПоКатегориямВнутреннегоУчета( ВидРО, 
+                                                      FD, 
+                                                      Doc, 
+                                                      nptxop.OperDate, 
+                                                      FD.GetParametr(MC_TYPE_PARAMETR_FIID), 
+                                                      nptxop.TaxSum2,
+                                                      null,
+                                                      null,
+                                                      nptxop.Code
+                                                  ) )
+          stat = 1;
+        end;
+     else //На практике налог удерживается только при списании, для зачислений проводки не сформируются
+        ВидРО = IIF(Taxe+Taxe15 > 0, 17, 6); //На практике встречается только первый вариант, Возврата налога для 4607 вида операции нет
+        if( not ПроводкаПоКатегориямВнутреннегоУчета( ВидРО, 
+                                                      FD, 
+                                                      Doc, 
+                                                      nptxop.OperDate, 
+                                                      NATCUR/*FD.GetParametr(MC_TYPE_PARAMETR_FIID)*/, 
+                                                      abs(Taxe+Taxe15),
+                                                      null,
+                                                      null,
+                                                      nptxop.Code,
+                                                      IIF((Taxe+Taxe15) > 0, "Удержание налога", "Возврат налога"),
+                                                      null, null,
+                                                      FIROLE_BA, FIROLE_BA
+                                                    ) )
+           stat = 1;
+        end;
+
+        if(not stat and ((SumAddTaxe) > 0))
+          ВидРО = 17;
+          if( not ПроводкаПоКатегориямВнутреннегоУчета( ВидРО, 
+                                                        FD, 
+                                                        Doc, 
+                                                        nptxop.OperDate, 
+                                                        NATCUR/*FD.GetParametr(MC_TYPE_PARAMETR_FIID)*/, 
+                                                        SumAddTaxe,
+                                                        null,
+                                                        null,
+                                                        nptxop.Code,
+                                                        "Доудержание налога",
+                                                        null, null,
+                                                        FIROLE_BA, FIROLE_BA
+                                                      ) )
+             stat = 1;
+          end;
+        end;
+     end;
+  end;
+
+  if(not stat)
+     stat = DL_NPTX_StartInsertTaxObject(nptxop.ID, ID_Step);
+  end;
+  /*BPV вставка лимита*/
+  var corLimSum = nptxop.taxsum2 + nptxop.tax;
+  var limCorrDate = GetMaxDT(nptxop); // get maximum from operation date and contract registration date
+  if (nptxop.SubKind_Operation == DL_NPTXOP_WRTKIND_ENROL)
+    MakeCorrLimitEnroll(FD.GetSubContr, corLimSum, Cms_Sm, nptxop.currency, limCorrDate, ID_Operation);
+
+  elif (nptxop.SubKind_Operation == DL_NPTXOP_WRTKIND_WRTOFF)
+    MakeCorrLimitWriteOff(FD.GetSubContr, corLimSum, nptxop.currency, limCorrDate, ID_Operation);
+
+  elif (nptxop.SubKind_Operation == DL_NPTXOP_WRTKIND_TBSABC)
+    MakeCorrLimitWriteOff(FD.GetSubContr, corLimSum, nptxop.currency, limCorrDate, ID_Operation);
+    MakeCorrLimitEnroll(FD.GetSubContrTo, corLimSum, Cms_Sm, nptxop.currency, limCorrDate, ID_Operation);
+  end;
+  
+  if((not stat) and (nptxop.SubKind_Operation == DL_NPTXOP_WRTKIND_WRTOFF))
+    CreateTaxMsg(Oper);
+  end;
+
+  if(not stat)
+    DL_NPTX_SaveOperLog( nptxop.ID, 100 );
+  end;
+    
+  if (stat!=0)
+    logger.Error("Неопределённая ошибка выполнения");
+  end;
+
+  return stat;
+end;
+
+MACRO PostStep (    
+                CommitOrRollback, /*1-выполнение шага,2 -отакат шага*/
+                errTrn,        /* Статус выполнения шага-!0-произошла ошибка */
+                FDoc,      /* Указатель на первичный документ */
+                ID_Operation,  /* Номер экземпляра операции */
+                Num_Step,      /* Номер шага операции(из настроек) */
+                Kind_Operation,/* Вид операции */
+                KindDoc,       /* Вид первичного документа */
+                KindStep,      /* Вид шага операции */
+                ID_Step)       /* Номер шага операции */
+
+    
+  record nptxop("nptxop");
+  SetBuff( nptxop, FDoc );
+
+  Var q, Dt, cmd, exec;
+  var emailText = "";
+  var v_email_processor;
+
+  if ( (errTrn and (CommitOrRollback == 1)) OR (not errTrn and (CommitOrRollback == 2))) // При ошибке выполнения или удачном откате шага 
+      q = " select 1 from dobjatcor_dbt where t_objecttype = 131 and t_groupid in (101,106) and t_object = lpad(?, 34,'0')";
+      cmd = DL_RSDCommand(q);
+      
+      cmd.AddParam(nptxop.id);
+
+      Dt = cmd.Execute();
+      if (Dt.movenext())
+        //if (GetTrue(true,"Внимание!!! | По операции уже была выгружена корректировка лимита QUIK "))
+        MsgBox("Внимание!!! | По операции уже была выгружена корректировка лимита QUIK ");
+        v_email_processor = c_email_proc_env();
+
+        emailText = emailText  + "\n\n Внимание! Выполнен откат операции ";
+        if (nptxop.SubKind_Operation == 10) emailText = emailText  + "зачисления"; else emailText = emailText  + "списания";  end;
+        emailText = emailText + " ДС, по которой уже была выгружена корректировка лимита в файл для обработки QUIK. \n";
+        emailText = emailText + " Необходимо проконтролировать корректность лимитов! ";
+        v_email_processor.m_add_broker_email_to_list();
+        v_email_processor.m_set_msg_head("Выполнен откат операции списания/зачисления ДС № " + nptxop.code);
+        v_email_processor.m_add_row_to_msg_text(emailText);
+        v_email_processor.m_save_to_submit_synch();
+        v_email_processor.m_submit_email_synch();
+
+        exec = DL_RsdCommand("delete from dobjatcor_dbt  where t_objecttype = 131 and t_groupid in ( 101,106) and t_object = lpad(?, 34,'0')");
+        exec.AddParam(nptxop.id);
+        exec.ExecuteCMD();
+        exec = null;
+        exec = DL_RsdCommand("delete from dnotetext_dbt  where t_objecttype = 131 and t_notekind in (101,106) and t_documentid = lpad(?, 34,'0')");
+        exec.AddParam(nptxop.id);
+        exec.ExecuteCMD();
+        //else
+        //   return 1;
+        //end;
+     end;
+     exec = null;
+     exec = DL_RsdCommand("delete from ddl_limitadjust_dbt where t_id_oper = ? ");
+     exec.AddParam(ID_Operation);
+     exec.ExecuteCMD();
+     return;
+  elif (CommitOrRollback == 2) // При откате шага с ошибкой errTrn
+     return;
+  end;
+
+  //Костыль.
+  //Для внутренних платежей принудительно создаётся операция в АРМ-позиционера.
+  //Для внешних платежей присваивается категория с кодом документа БИС для корректной выгрузки
+  var pmObj, stat, query, sql;
+  var logger = LoggerFactory().NewItLog("NPTXWRT100.MAC").WithElapsedTime().WithPrefix("id = " + nptxop.ID).GetLogger;
+
+  var FD;
+
+  FD = DLFirstDocNPTXOP(nptxop);
+
+  var queryPMBO = 
+           " SELECT q.*, "                                                                                    +
+           "             LPAD (id_operation, 12, '0') || LPAD (t_paymentid, 12, '0') "                        +
+           "                oprdocs_documentid, "                                                             +
+           "             NVL ( "                                                                              +
+           "                (SELECT t_autokey "                                                               +
+           "                   FROM doprdocs_dbt "                                                            +
+           "                  WHERE t_documentid = "                                                          +
+           "                           LPAD (id_operation, 12, '0') "                                         +
+           "                           || LPAD (t_paymentid, 12, '0') "                                       +
+           "                        AND t_dockind = 451), "                                                   +
+           "                0) "                                                                              +
+           "                existsdoc "                                                                       +
+           "        FROM (SELECT t_paymentid, t_basefiid, t_receiverbankid, t_futurereceiveraccount, "        +
+           "                     NVL ( "                                                                      +
+           "                        (SELECT t_id_operation "                                                  +
+           "                           FROM doproper_dbt "                                                    +
+           "                          WHERE t_documentid = LPAD (t_paymentid, 34, '0') "                      +
+           "                                AND t_dockind = 450), "                                           +
+           "                        0) "                                                                      +
+           "                        id_operation "                                                            +
+           "                FROM dpmpaym_dbt "                                                                +
+           "               WHERE t_dockind = ? AND t_purpose = 1 AND t_documentid = ?) q ";
+
+
+  var NeedPMBO = True;
+  var cmdPMBO = DL_RSDCommand(queryPMBO);
+
+  cmdPMBO.AddParam(FD.Kind);
+  cmdPMBO.AddParam(FD.ID);
+  
+  var sqlPMBO = cmdPMBO.Execute();
+
+  if (sqlPMBO.MoveNext() )
+     if (sqlPMBO.value("id_operation") != 0)
+       NeedPMBO = False;
+     end;
+  end;
+
+  if ( nptxop.SubKind_Operation != DL_NPTXOP_WRTKIND_ENROL )
+     query = "select t_paymentid, "
+           + "       t_receiverbankid, "
+           + "       t_futurereceiveraccount, "
+           + "       case "
+           + "         when exists (select 1 "
+           + "                        from ddp_dep_dbt d "
+           + "                       where d.t_partyid = p.t_receiverbankid) "
+           + "         then 1 "
+           + "         else 0 "
+           + "       end t_is_internal_department "
+           + "  from dpmpaym_dbt p "
+           + " where t_dockind = ? "
+           + "   and t_purpose in (1, 2) "
+           + "   and t_documentid = ? ";
+
+     cmd = DL_RSDCommand(query);
+     
+     cmd.AddParam(nptxop.DocKind);
+     cmd.AddParam(nptxop.ID);
+
+     sql = cmd.Execute();
+     if (sql.MoveNext() )
+        if ( (sql.receiverbankid == {OurBank}) or (IsWriteoffDBOUL(nptxop.id)) )
+           pmObj = RsbPayment(sql.t_paymentid);
+           if(substr(sql.futurereceiveraccount,1,5) !="30102")/*PNV DEF-16647*/
+             if(NeedPMBO) 
+               stat = PM_BOOperation(pmObj);
+             end;
+           end;
+        elif (sql.is_internal_department == 1)
+          Connect_attr_to_paym (sql.paymentid, ATTR_GROUP_DOCUMENT_BIS, CFTDocumentTypeCodes.BANK_ORDER);
+        else
+          Connect_attr_to_paym (sql.paymentid, ATTR_GROUP_DOCUMENT_BIS, CFTDocumentTypeCodes.PAYMENT_ORDER);
+        end;
+     end;
+  end;
+
+  var Oper = TRecHandler("nptxop.dbt");
+
+  Oper.SetRecordAddr( FDoc );
+
+  SendTaxMsg(Oper, 100);
+
+  logger.Debug("постобработка шага завершена");
+  return 0;
+
+END;

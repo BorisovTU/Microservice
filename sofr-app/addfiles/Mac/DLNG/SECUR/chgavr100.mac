@@ -1,0 +1,470 @@
+/*
+$Name:        chgavr100.mac
+$Module:      Ценные бумаги
+$Description: Операция изменения номинала ц/б. Шаг корректировки лотов
+*/
+
+import InsCarryDoc, "sp_car.mac", RsbDataSet, "SpRepFun.mac";
+import "CbLogger2.mac";
+
+PRIVATE VAR logger = NewLogger(c_logger.IT_LOG_TYPE, "chgavr100.mac");
+
+private const CHAPT22 = 22;
+private const ALG_SP_CHGAVRNOM_SUBKINDS = 3150;
+
+// Есть ли проводки по счету Account за дату позднее ADate
+private macro FindAccountCarry(Code_Currency, Account, ADate)
+  var query, DataSet;
+  var Select;
+
+  /*Проверим что по этому счету не было проводок за более поздние даты(фактические проводки)*/
+  query = " SELECT t_AccTrnID " +
+          " FROM dacctrn_dbt "                    
+          " WHERE t_Chapter = " + CHAPT22 +
+          "   AND t_State = 1 " +/*фактическая TRN_STATE_FACT*/
+          "   AND ((t_Account_Payer = ? /*1*/ and t_fiid_Payer = ?/*2*/) OR (t_Account_Receiver = ? /*3*/ and t_fiid_Receiver = ?/*4*/)) " +
+          "   AND t_Date_Carry > ? /*5*/ ";
+
+  Select = RSDCommand( query );
+
+  Select.addParam( "", RSDBP_IN, Account ); /*1*/
+  Select.addParam( "", RSDBP_IN, Code_Currency ); /*2*/
+  Select.addParam( "", RSDBP_IN, Account ); /*3*/
+  Select.addParam( "", RSDBP_IN, Code_Currency ); /*4*/
+  Select.addParam( "", RSDBP_IN, ADate ); /*5*/
+
+  Select.execute();
+
+  DataSet = TRsbDataSet(Select);
+
+  if(DataSet.MoveNext())
+    return TRUE;
+  end;
+
+  return FALSE;
+end;
+
+PRIVATE MACRO GetTemplNumClient(CatCode:string, CatID:INTEGER, Number:INTEGER, TemplNum:@INTEGER)
+  var query, DataSet;
+  var Select;
+
+  /* У клиента 2 цифра в балансовом счете зависит от вида обслуживания. */
+  /* Для этого в sql запросе есть условие t1.t_value1 = t2.t_value1. */
+  query =   " SELECT t2.t_Number TemplNum"
+          + " FROM dmctempl_dbt t1, dmctempl_dbt t2 "
+          + " WHERE t1.t_CatID = ? "
+          + "   and t1.t_Number = ? "
+          + "   and t1.t_value1 = t2.t_value1 "
+          + "   and t2.t_CatID = (SELECT t_ID FROM dmccateg_dbt WHERE t_Code = ?) ";
+
+  Select = RSDCommand( query );
+
+  Select.addParam( "", RSDBP_IN, CatID ); 
+  Select.addParam( "", RSDBP_IN, Number ); 
+  Select.addParam( "", RSDBP_IN, CatCode ); 
+
+  Select.execute();
+
+  DataSet = TRsbDataSet(Select);
+
+  if(DataSet.MoveNext())
+    TemplNum = DataSet.TemplNum;
+    return TRUE;
+  end;
+
+  return FALSE;
+END;
+
+
+private macro ОткрытьОбщесистСчет( CatCode:string, ActionDate:Date, mcaccdoc:Variant, AccBuf:Variant )
+   var BackOutAccount = false, ChangeOpenDate  = false;
+   var RealOpenMode, FindAccount = "";
+   var TemplNum;
+
+   MC_GetAccountOpenParms( CatCode, @BackOutAccount, @ChangeOpenDate );
+
+   /* Добавила поиск номера шаблона для КУ "ЦБ, Расч. с клиентом, ВУ", */
+   /* т.к. номера шаблона (TemplNum) счета mcaccdoc и КУ "ЦБ, Расч. с клиентом, ВУ" не совпадают.*/
+   /* У банка такой проблемы нет.*/
+   if (CatCode == "ЦБ, Расч. с клиентом, ВУ")
+      if (not GetTemplNumClient(CatCode, mcaccdoc.rec.CatID, mcaccdoc.rec.TemplNum, @TemplNum))
+         MsgBox("Счет категории \"" + CatCode + "\" неопределен или недоступен в данной операции");
+         return false;
+      end;
+   else
+      TemplNum = mcaccdoc.rec.TemplNum;
+   end;
+   
+   FindAccount = MC_FindAndOpenCommonAcc( CatCode,
+                                          ActionDate,
+                                          MC_OPENACC_CREATE,
+                                          TemplNum,
+                                          mcaccdoc,
+                                          mcaccdoc.rec.PeriodID,
+                                          mcaccdoc.rec.FIID,
+                                          NULL,
+                                          mcaccdoc.rec.DepartmentID,
+                                          AccBuf,
+                                          RealOpenMode,
+                                          null,
+                                          MC_PAIRACCMODE_MANUAL,
+                                          BackOutAccount,
+                                          ChangeOpenDate 
+                                        );
+
+   if( FindAccount=="" )
+     MsgBox("Счет категории \"" + CatCode + "\" неопределен или недоступен в данной операции");
+     return false;
+   end;
+
+   return true;
+end;
+
+
+// Найти номер категории
+private macro FindCategNumberByID(CatID)
+  var query, DataSet;
+  var Select;
+
+  /*Проверим что по этому счету не было проводок за более поздние даты.*/
+  query = " SELECT categ.t_Number Num " +
+          " FROM dmccateg_dbt categ "
+          " WHERE categ.T_ID = ? /*1*/ ";
+
+  Select = RSDCommand( query );
+
+  Select.addParam( "CatID", RSDBP_IN, CatID ); /*1*/
+
+  Select.execute();
+
+  DataSet = TRsbDataSet(Select);
+
+  if(DataSet.MoveNext())
+    return DataSet.Num;
+  end;
+
+  return 0;
+end;
+
+
+private macro ПроводкиПоВУ(comm, Doc)
+  var query, DataSet;
+  var Select;
+  var stat, ContinueOper = TRUE;
+  var Rest, RestNew;
+  var FD;
+  var accdoc = TRecHandler("mcaccdoc");
+  var AccDeb, AccCred, Ground, FI_Code, SubKindName, ВидРО, CatNum;
+  var fininstr = TRecHandler( "fininstr" );
+
+  record acc1( account );
+  record acc2( account );
+
+  if( ВестиВнутреннийУчет() )
+
+    query = " SELECT accdoc.* " +
+            " FROM dmcaccdoc_dbt accdoc, DMCCATEG_DBT categ " +
+            " WHERE accdoc.t_IsCommon = 'X' " +
+            "   AND accdoc.t_Chapter = " + CHAPT22 +
+            "   AND accdoc.t_FIID = ? /*1*/ " +
+            "   AND accdoc.t_Account != chr(1) " +
+            "   AND accdoc.t_CatID = categ.T_ID " +
+            "   AND categ.t_Number IN (550, 560) " +
+            "   AND accdoc.t_DepartmentID = " + comm.Division +
+            " ORDER BY categ.t_Number ";
+
+    Select = RSDCommand( query );
+
+    Select.AddParam("FIID", RSDBP_IN, comm.FIID );  /*1*/
+
+    Select.Execute();
+
+    DataSet = TRsbDataSet(Select);
+
+    stat = DataSet.MoveNext();
+    while(stat)
+      DataSet.GetRecord().CopyTo( accdoc.rec );
+
+      // Если л/с найден и он не закрыт и на нем не нулевой остаток
+      if( GetAccount( CHAPT22, accdoc.rec.FIID, accdoc.rec.Account, acc1, true ) AND 
+          (acc1.Open_Close != "З") AND
+          ((Rest = abs(GetRestAccount(acc1, comm.CommDate))) != 0.0) )
+
+        /*Проверим что по этому счету не было проводок за более поздние даты.*/
+        if(FindAccountCarry(accdoc.rec.FIID, accdoc.rec.Account, comm.CommDate))
+          MsgBox( "По счету " + DataSet.Account + " есть проводки за более позднюю дату" );
+          stat = FALSE;
+          ContinueOper = FALSE;
+        end;
+
+        if(stat)
+          CatNum = FindCategNumberByID(accdoc.rec.CatID);
+          if(CatNum == 0)
+            MsgBox("Не найдена категория учета с ID = " + accdoc.rec.CatID);
+            stat = FALSE;
+            ContinueOper = FALSE;
+          end;
+
+          if(CatNum == 550 ) // ц/б Банка
+            if(not ОткрытьОбщесистСчет("ЦБ, Прч. счета банка, ВУ", comm.CommDate, accdoc, acc2) )
+              stat = FALSE;
+              ContinueOper = FALSE;
+            end;
+          else
+            if(not ОткрытьОбщесистСчет("ЦБ, Расч. с клиентом, ВУ", comm.CommDate, accdoc, acc2) )
+              stat = FALSE;
+              ContinueOper = FALSE;
+            end;
+          end;
+
+          if(stat)
+            RestNew = Rest * comm.Hidden_Sum / comm.Currency_Sum;
+
+            if(Rest > RestNew)
+              ВидРО = 81;
+              AccDeb = acc2;
+              AccCred = acc1;
+            else
+              ВидРО = 80;
+              AccDeb = acc1;
+              AccCred = acc2;
+            end;
+
+            FD = SPFirstDocDLCOMM(comm);
+
+            if(ПолучитьФинИн( comm.FIID, fininstr ) == 0)
+              FI_Code = fininstr.rec.FI_Code;
+            else
+              FI_Code = "";
+            end;
+
+            SubKindName = DL_GetNameAlg( ALG_SP_CHGAVRNOM_SUBKINDS, comm.OperSubkind );
+
+            Ground = "Корректировка остатков лицевых счетов ВУ в операции " + SubKindName + " выпусков " + FI_Code;
+
+            if( not ПроводкаПоКатегориямВнутреннегоУчета( ВидРО,
+                                                          FD,
+                                                          Doc,                 /* Документ */
+                                                          comm.CommDate,       /* Дата */
+                                                          comm.FIID,           /* Валюта */
+                                                          money(round(abs(Rest-RestNew),comm.SumPrecision)),   /* Сумма */ /*точность BOSS-2703*/
+                                                          null, null, null, Ground,
+                                                          AccDeb, AccCred ) )
+              stat = FALSE;
+              ContinueOper = FALSE;
+            end;
+          end;
+        end;
+      end;
+
+      if(stat == TRUE)
+        stat = DataSet.MoveNext();
+      end;
+    end;
+  end;
+
+  return ContinueOper;
+end;
+
+
+private macro IsExistFivlhist( FIID, CommDate )
+  var query, DataSet;
+  var Select;
+
+  query = " SELECT t_FIID " + 
+          " FROM dfivlhist_dbt " +
+          " WHERE t_FIID = ? " +
+          "   AND t_ValKind = " + FI_CHANGE_NOMINAL +
+          "   AND t_EndDate >= ? ";
+
+  Select = RSDCommand( query );
+
+  Select.AddParam("FIID", RSDBP_IN, FIID );
+  Select.AddParam("EndDate", RSDBP_IN, CommDate );
+
+  Select.Execute();
+
+  DataSet = TRsbDataSet(Select);
+  if(DataSet.moveNext())
+    return TRUE;
+  else
+    return FALSE;
+  end;
+end;
+
+// Есть ли лоты БОЦБ по FIID в другом филиале в котором НЕ выполнялась операция конвертации
+private macro IsAnyWrtSumOtherDepartment( FIID, Department, CommDate )
+  var query, DataSet;
+  var Select;
+
+  query = " SELECT wrt.t_SumID " + 
+          " FROM dpmwrtsum_dbt wrt " +
+          " WHERE wrt.t_Trust = CHR(0) " +
+          "   AND wrt.t_FIID = ? /*1*/ " +
+          "   AND wrt.t_State IN ( " + PM_WRTSUM_FORM + ", " + PM_WRTSUM_NOTFORM + " ) " +
+          "   AND wrt.t_Amount > 0 " +
+          "   AND wrt.t_Department != ? /*2*/" +
+          "   AND NOT EXISTS( SELECT comm.t_DocumentID " +
+          "                   FROM ddl_comm_dbt comm " +
+          "                   WHERE comm.t_DocKind = " + DL_CHGAVRNOM +
+          "                     AND comm.t_Division = wrt.t_Department " +
+          "                     AND comm.t_CommStatus = " + DL_COMM_CLOSED +
+          "                     AND comm.t_FIID = wrt.t_FIID )"
+          "UNION ALL " +
+          " SELECT cl.t_ID " +
+          "   FROM dpmwrtcl_dbt cl " +
+          "  WHERE cl.t_FIID = ? /*3*/" +
+          "    AND cl.t_EndDate <> " + GetSQLDate(date(31,12,9999)) +
+          "    AND cl.t_EndDate >= ? /*4*/" +
+          "    AND cl.t_Department <> ? /*5*/" +
+          "    AND NOT EXISTS( SELECT comm.t_DocumentID " +
+          "                   FROM ddl_comm_dbt comm " +
+          "                   WHERE comm.t_DocKind = " + DL_CHGAVRNOM +
+          "                     AND comm.t_Division = cl.t_Department " +
+          "                     AND comm.t_CommStatus = " + DL_COMM_CLOSED +
+          "                     AND comm.t_FIID = cl.t_FIID )";
+
+
+  Select = RSDCommand( query );
+
+  Select.AddParam("", RSDBP_IN, FIID );  /*1*/
+  Select.AddParam("", RSDBP_IN, Department );  /*2*/
+  Select.AddParam("", RSDBP_IN, FIID );  /*3*/
+  Select.AddParam("", RSDBP_IN, CommDate );  /*4*/
+  Select.AddParam("", RSDBP_IN, Department );  /*5*/
+
+  Select.Execute();
+
+  DataSet = TRsbDataSet(Select);
+  if(DataSet.moveNext())
+    return TRUE;
+  else
+    return FALSE;
+  end;
+end;
+
+private macro IsExistAvoirSrv( FIID )
+  var query, DataSet;
+  var Select;
+
+  query = " SELECT t_FIID " + 
+          " FROM davoirsrv_dbt " +
+          " WHERE t_FIID = ? " +
+          "   AND t_ServiceState <> 0 ";
+
+  Select = RSDCommand( query );
+
+  Select.AddParam("FIID", RSDBP_IN, FIID );
+
+  Select.Execute();
+
+  DataSet = TRsbDataSet(Select);
+  if(DataSet.moveNext())
+    return TRUE;
+  else
+    return FALSE;
+  end;
+end;
+
+private macro IsExistWrtsumTrust( FIID )
+  var query, DataSet;
+  var Select;
+
+  query = " SELECT t_FIID " + 
+          " FROM dpmwrtsum_dbt " +
+          " WHERE t_FIID = ? " +
+          "   AND t_trust = 'X' " + 
+          "   AND t_Amount <> 0 ";
+
+  Select = RSDCommand( query );
+
+  Select.AddParam("FIID", RSDBP_IN, FIID );
+
+  Select.Execute();
+
+  DataSet = TRsbDataSet(Select);
+  if(DataSet.moveNext())
+    return TRUE;
+  else
+    return FALSE;
+  end;
+end;
+
+
+private macro ИЗМЕНЯТЬ_НОМИНАЛ_НЕЗАВИСИМО_ОСТ()
+   var ErrCode, Режим_ИЗМЕНЯТЬ_НОМИНАЛ_НЕЗАВИСИМО_ОСТ;
+
+   GetRegistryValue( "SECUR\\ИЗМЕНЯТЬ НОМИНАЛ НЕЗАВИСИМО ОСТ", V_BOOL, Режим_ИЗМЕНЯТЬ_НОМИНАЛ_НЕЗАВИСИМО_ОСТ, ErrCode );
+
+   return Режим_ИЗМЕНЯТЬ_НОМИНАЛ_НЕЗАВИСИМО_ОСТ and (ErrCode == 0);
+end;
+
+
+macro ExecuteStep( Doc, FDoc, DocKind, OperationID )
+   var ErrCode, Режим_ИЗМЕНЯТЬ_НОМИНАЛ_НЕЗАВИСИМО_ОСТ;
+
+  record comm( dl_comm );
+  record Avoiriss( avoiriss );
+  record Fin(fininstr);
+
+  SetBuff( comm, FDoc );
+
+  logger.Info("Start, comm.DocumentID: "+string(comm.DocumentID));
+
+  logger.Info("ПроводкиПоВУ()");
+  var OldPrec = setDefMoneyPrec(12);  //BOSS-2703
+  if( not ПроводкиПоВУ(comm, Doc) )
+    logger.Error("0");
+    return 1;
+  end;
+  setDefMoneyPrec(OldPrec);
+
+  logger.Info("IsExistFivlhist()");
+  if(IsExistFivlhist( comm.FIID, comm.CommDate ))
+    msgbox("В анкете ц/б уже было выполнено изменение номинала");
+    logger.Error("1");
+    return 1;
+  end;
+
+  logger.Info("IsAnyWrtSumOtherDepartment()");
+  if(IsAnyWrtSumOtherDepartment( comm.FIID, comm.Division, comm.CommDate ))
+    msgbox("Номинал ц/б в анкете не изменен, так как выпуск учитывается на неотконвертированнных лотах в другом филиале");
+    logger.Error("2");
+    return 1;
+  end;
+
+  logger.Info("ПолучитьФинИн()");
+  if( ПолучитьФинИн( comm.FIID, Fin, Avoiriss ) ) 
+     msgbox("Ошибка при получении выпуска ц/б с ID = " + comm.FIID);
+     logger.Error("3");
+     return 1;  
+  end;
+
+  if (ИЗМЕНЯТЬ_НОМИНАЛ_НЕЗАВИСИМО_ОСТ() == false)
+     logger.Info("IsExistAvoirSrv()");
+     if(IsExistAvoirSrv( comm.FIID ))
+       msgbox("Номинал ц/б в анкете не изменен, так как выпуск находится на обслуживании в депозитарии");
+       logger.Error("4");
+       return 1;
+     end;
+
+     logger.Info("IsExistWrtsumTrust()");
+     if(IsExistWrtsumTrust( comm.FIID ))
+       msgbox("Номинал ц/б в анкете не изменен, так как выпуск учитывается в ДУ");
+       logger.Error("5");
+       return 1;
+     end;
+  end;
+
+  // Изменить номинал ц/б на значение нового номинала
+  logger.Info("SP_ChangeFINominal()");
+  if(NOT SP_ChangeFINominal(comm.FIID, comm.Currency_Sum, comm.CommDate-1))
+    msgbox("Ошибка вставки события изменения номинала ц/б с ID = " + comm.FIID);
+    logger.Error("6");
+    return 1;
+  end;
+
+  logger.Info("End");
+
+  return 0;
+end; 

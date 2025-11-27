@@ -1,0 +1,239 @@
+BEGIN
+--   execute immediate 'ALTER TRIGGER DFUNC_SYS_TRG DISABLE';
+   INSERT INTO DFUNC_DBT (
+                            t_FuncID,
+                            t_Code,
+                            t_Name,
+                            t_Type,
+                            t_FileName,
+                            t_FunctionName,
+                            t_Interval,
+                            t_Version,
+                            t_Module
+                         )
+                  VALUES (
+                            5037,
+                            'FUNPRN',
+                            'Печать через funcobj',
+                            1,
+                            'SumConfirmExp_FuncObj.mac',
+                            'PrintStartFunc',
+                            0,
+                            0,
+                            NULL
+                         );
+--   execute immediate 'ALTER TRIGGER DFUNC_SYS_TRG ENABLE';
+EXCEPTION 
+   WHEN DUP_VAL_ON_INDEX THEN NULL;
+END;
+/
+
+BEGIN
+   INSERT INTO DOBJECTS_DBT (T_OBJECTTYPE, T_NAME, T_CODE, T_USERNUMBER, T_PARENTOBJECTTYPE, T_SERVICEMACRO, T_MODULE)
+   VALUES(4601,'Печать через funcobj','ПечатьFO',0,0,CHR(1),CHR(0));
+
+EXCEPTION 
+   WHEN DUP_VAL_ON_INDEX THEN NULL;
+END;
+/
+
+BEGIN
+   INSERT INTO DLLVALUES_DBT(T_LIST, T_ELEMENT, T_CODE, T_NAME, T_FLAG, T_NOTE, T_RESERVE)
+   VALUES(4601,1,'ПечатьFO','Печать через funcobj',1,'Печать через funcobj',CHR(1));
+
+EXCEPTION 
+   WHEN DUP_VAL_ON_INDEX THEN NULL;
+END;
+/
+
+
+-- Таблица DPRINTFUNCOBJFILES_DBT
+
+DECLARE 
+    e_object_exists EXCEPTION;
+    PRAGMA EXCEPTION_INIT(e_object_exists, -955); 
+BEGIN
+    EXECUTE IMMEDIATE 
+        'CREATE TABLE DPRINTFUNCOBJFILES_DBT' || 
+        '(' || 
+        'T_GUID VARCHAR2(32),' || 
+        'T_PACKNUM NUMBER(10),' || 
+        'T_DATE DATE,' || 
+        'T_TIME DATE,' || 
+        'T_FILEID NUMBER(10),' || 
+        'T_FILENAME VARCHAR2(511),' || 
+        'T_FMTBLOBDATA_XXXX  BLOB' || 
+        ')';
+
+  EXECUTE IMMEDIATE 'COMMENT ON TABLE DPRINTFUNCOBJFILES_DBT IS ''Файлы печати пачек через funcobj''';
+
+  EXECUTE IMMEDIATE 'COMMENT ON COLUMN DPRINTFUNCOBJFILES_DBT.T_GUID IS ''Уникальный идентификатор''';
+  EXECUTE IMMEDIATE 'COMMENT ON COLUMN DPRINTFUNCOBJFILES_DBT.T_PACKNUM IS ''Номер пачки данных''';
+  EXECUTE IMMEDIATE 'COMMENT ON COLUMN DPRINTFUNCOBJFILES_DBT.T_DATE IS ''Дата''';
+  EXECUTE IMMEDIATE 'COMMENT ON COLUMN DPRINTFUNCOBJFILES_DBT.T_TIME IS ''Время''';
+  EXECUTE IMMEDIATE 'COMMENT ON COLUMN DPRINTFUNCOBJFILES_DBT.T_FILEID IS ''Идентификатор данных''';
+  EXECUTE IMMEDIATE 'COMMENT ON COLUMN DPRINTFUNCOBJFILES_DBT.T_FILENAME IS ''Имя файла''';
+  EXECUTE IMMEDIATE 'COMMENT ON COLUMN DPRINTFUNCOBJFILES_DBT.T_FMTBLOBDATA_XXXX IS ''Файл''';
+
+EXCEPTION 
+    WHEN e_object_exists THEN NULL; 
+END;
+/
+
+BEGIN
+  EXECUTE IMMEDIATE 'DROP INDEX DPRINTFUNCOBJFILES_DBT_IDX0';
+EXCEPTION
+  WHEN OTHERS THEN NULL;
+END;
+/
+
+BEGIN
+  EXECUTE IMMEDIATE 'CREATE INDEX DPRINTFUNCOBJFILES_DBT_IDX0 ON DPRINTFUNCOBJFILES_DBT (T_GUID, T_PACKNUM)';
+EXCEPTION
+  WHEN OTHERS THEN NULL;
+END;
+/
+
+BEGIN
+  EXECUTE IMMEDIATE 'DROP INDEX DPRINTFUNCOBJFILES_DBT_IDX1';
+EXCEPTION
+  WHEN OTHERS THEN NULL;
+END;
+/
+
+BEGIN
+  EXECUTE IMMEDIATE 'CREATE UNIQUE INDEX DPRINTFUNCOBJFILES_DBT_IDX1 ON DPRINTFUNCOBJFILES_DBT (T_FILEID)';
+EXCEPTION
+  WHEN OTHERS THEN NULL;
+END;
+/
+
+BEGIN
+  EXECUTE IMMEDIATE 'DROP SEQUENCE DPRINTFUNCOBJFILES_DBT_SEQ';
+EXCEPTION
+  WHEN OTHERS THEN NULL;
+END;
+/
+
+DECLARE
+   e_exist_seq EXCEPTION;
+   PRAGMA EXCEPTION_INIT(  e_exist_seq,    -955 );
+BEGIN
+   EXECUTE IMMEDIATE 'CREATE SEQUENCE DPRINTFUNCOBJFILES_DBT_SEQ 
+  START WITH 1
+  MAXVALUE 999999999999999999999999999
+  MINVALUE 1
+  NOCYCLE
+  NOCACHE
+  NOORDER';
+EXCEPTION
+   WHEN e_exist_seq THEN NULL;
+END;
+/
+
+CREATE OR REPLACE TRIGGER dprintfuncobjfiles_dbt_t1_ainc
+ BEFORE INSERT OR UPDATE OF t_FileId ON dprintfuncobjfiles_dbt FOR EACH ROW
+DECLARE
+ v_id INTEGER;
+BEGIN
+ IF (:new.t_FileId = 0 OR :new.t_FileId IS NULL) THEN
+ SELECT dprintfuncobjfiles_dbt_seq.nextval INTO :new.t_FileId FROM dual;
+ ELSE
+ select last_number into v_id from user_sequences where sequence_name = upper ('dprintfuncobjfiles_dbt_SEQ');
+ IF :new.t_FileId >= v_id THEN
+ RAISE DUP_VAL_ON_INDEX;
+ END IF;
+ END IF;
+END;
+/
+
+
+DECLARE 
+    e_object_exists EXCEPTION;
+    PRAGMA EXCEPTION_INIT(e_object_exists, -955); 
+BEGIN
+    EXECUTE IMMEDIATE 
+        'CREATE TABLE DPRINTFUNCOBJ_DBT' || 
+        '(' || 
+        'T_GUID VARCHAR2(32),' || 
+        'T_PACKNUM NUMBER(10),' || 
+        'T_FUNCOBJECTID NUMBER(10)' || 
+        ')';
+
+  EXECUTE IMMEDIATE 'COMMENT ON TABLE DPRINTFUNCOBJ_DBT IS ''Печать пачек через funcobj''';
+
+  EXECUTE IMMEDIATE 'COMMENT ON COLUMN DPRINTFUNCOBJ_DBT.T_GUID IS ''Уникальный идентификатор''';
+  EXECUTE IMMEDIATE 'COMMENT ON COLUMN DPRINTFUNCOBJ_DBT.T_PACKNUM IS ''Номер пачки данных''';
+  EXECUTE IMMEDIATE 'COMMENT ON COLUMN DPRINTFUNCOBJ_DBT.T_FUNCOBJECTID IS ''Идентификатор данных''';
+
+EXCEPTION 
+    WHEN e_object_exists THEN NULL; 
+END;
+/
+
+BEGIN
+  EXECUTE IMMEDIATE 'DROP INDEX DPRINTFUNCOBJ_DBT_IDX0';
+EXCEPTION
+  WHEN OTHERS THEN NULL;
+END;
+/
+
+BEGIN
+  EXECUTE IMMEDIATE 'CREATE INDEX DPRINTFUNCOBJ_DBT_IDX0 ON DPRINTFUNCOBJ_DBT (T_GUID, T_PACKNUM)';
+EXCEPTION
+  WHEN OTHERS THEN NULL;
+END;
+/
+
+BEGIN
+  EXECUTE IMMEDIATE 'DROP INDEX DPRINTFUNCOBJ_DBT_IDX1';
+EXCEPTION
+  WHEN OTHERS THEN NULL;
+END;
+/
+
+BEGIN
+  EXECUTE IMMEDIATE 'CREATE UNIQUE INDEX DPRINTFUNCOBJ_DBT_IDX1 ON DPRINTFUNCOBJ_DBT (T_FUNCOBJECTID)';
+EXCEPTION
+  WHEN OTHERS THEN NULL;
+END;
+/
+
+BEGIN
+  EXECUTE IMMEDIATE 'DROP SEQUENCE DPRINTFUNCOBJ_DBT_SEQ';
+EXCEPTION
+  WHEN OTHERS THEN NULL;
+END;
+/
+
+DECLARE
+   e_exist_seq EXCEPTION;
+   PRAGMA EXCEPTION_INIT(  e_exist_seq,    -955 );
+BEGIN
+   EXECUTE IMMEDIATE 'CREATE SEQUENCE DPRINTFUNCOBJ_DBT_SEQ 
+  START WITH 1
+  MAXVALUE 999999999999999999999999999
+  MINVALUE 1
+  NOCYCLE
+  NOCACHE
+  NOORDER';
+EXCEPTION
+   WHEN e_exist_seq THEN NULL;
+END;
+/
+
+CREATE OR REPLACE TRIGGER dprintfuncobj_dbt_t1_ainc
+ BEFORE INSERT OR UPDATE OF t_FuncObjectId ON dprintfuncobj_dbt FOR EACH ROW
+DECLARE
+ v_id INTEGER;
+BEGIN
+ IF (:new.t_FuncObjectId = 0 OR :new.t_FuncObjectId IS NULL) THEN
+ SELECT dprintfuncobj_dbt_seq.nextval INTO :new.t_FuncObjectId FROM dual;
+ ELSE
+ select last_number into v_id from user_sequences where sequence_name = upper ('dprintfuncobj_dbt_SEQ');
+ IF :new.t_FuncObjectId >= v_id THEN
+ RAISE DUP_VAL_ON_INDEX;
+ END IF;
+ END IF;
+END;
+/

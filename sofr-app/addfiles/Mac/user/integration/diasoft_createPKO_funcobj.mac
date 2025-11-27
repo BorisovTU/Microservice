@@ -1,0 +1,286 @@
+/**
+  @file diasoft_createPKO_funcobj.mac 
+  @brief Макрос, запускаемый из funcobj, для создания операции списания ЦБ по поручению Диасофт
+
+ # changelog
+ |date       |autor          |tasks                                           |note
+ |-----------|---------------|------------------------------------------------|-------------------------------------------------------------
+ |01.04.2025 |Велигжанин А.В.|DEF-86670                                       |Убрал debugbreak из кода
+*/
+
+import secinter,bankinter,rsd;
+import "lim_utils.mac", "cblogger2.mac", "RegvalReader.mac", "FuncObj.mac";
+import "SecurDealExecutor.mac";
+
+/**
+  @brief SplitString - реализация Split - взято из какого-то макроса
+  @param[in] - строка, которую нужно разбить
+  @param[in] - разделитель
+  @result - возвращает масссив 
+*/
+private macro SplitString(str, delim)
+  var arr = TArray();
+  var idx = 0;
+  var len = StrLen(delim);
+
+  while(str != "")
+    idx = Index(str, delim);
+
+    if(idx == 0)
+      arr[arr.size] = str;
+      return arr;
+    end;
+
+    arr[arr.size] = substr(str, 1, idx - 1);
+    str = substr(str, idx + len);
+  end;
+
+  return arr;
+end;
+
+/**
+  @brief findFirstError - находит первый не нулевой элемент списка
+*/
+private macro findFirstError(strErrList)
+  var errList = Tarray();
+  var result:integer = 0;
+  errList = SplitString(strErrList, ",");                          
+  if (errList.size>0)
+    for (var i,0,errList.size-1)
+      if (errList(i)!="")
+        result =  errList(i); //приведение типа
+        return result;
+      end; 
+    end;
+  end;
+  return result;
+end;
+
+macro getRSD_PKO(pParam)
+  var sql = " select * from PKO_WriteOff where guid = :1 order by id desc ";
+  var cmd = RSDCommand(sql);
+  cmd.AddParam("1", RSDBP_IN, pParam);
+  var rs = RSDRecordSet(cmd);
+  if (rs.movenext)
+    return rs;
+  end;
+  RunError("Не найдена запись в Картотеке");
+end;
+
+/**
+  @brief AddCategory добавление категории к объекту. Взято из LoadCSA_func.mac 
+*/
+macro AddCategory(_objecttype, _objectid, _groupid, _attrid)
+  var stat = 0;
+  if (_attrid > 0)
+    DisconnectObjAttr(_objecttype, _objectid, _groupid, 0);
+    ConnectObjAttr(stat, _objecttype, _objectid, _groupid, _attrid);
+  end;
+end;
+
+/**
+  @brief Внутренность вызова funcobj обертки createEnroll. Выделена для автотеста
+  описание https://sdlc.go.rshbank.ru/confluence/pages/viewpage.action?pageId=284155958
+*/
+macro createEnroll_t(pObjectid, pParam)
+  record BoardPrm("BoardPrm.rec");
+
+  var stat, BoardID = 0 /*id созданной операции*/, outerr = 0; 
+  var errMsg = "";
+
+  macro SP_InsertBoardLot_TRN()
+    stat = SP_InsertBoardLotNoIFace( BoardPrm, BoardID, errMsg); //возвращает 0/1
+  end;
+
+  var rsPKO;
+  var logBuilder = LoggerFactory().NewItLog("PKO_CREATE_OPERATION");
+  var logger:c_logger = logBuilder.GetLogger();
+
+  rsPKO = getRSD_PKO(pParam);
+  logger = logBuilder.WithPrefix("id = " + rsPKO.value("ID")).GetLogger();
+
+  //ставим монопольную межсессионную блокировку
+  //остальные процессы будут ждать не дольше 60 сек
+  var lockName:string = "PKO_CREATE_OPERATION_LOCK_" + rsPKO.value("ID");
+  var insertLotLocker = UniConcurrentLocker(lockName, 60);
+  if (not insertLotLocker.Lock())
+    logger.Error("Не удалось установить блокировку " + lockName);
+    return 1;
+  end;
+
+  if (valtype(rsPKO.value("dealid")) != 26)
+    logger.Info("Сделка уже была создана ранее, шаг пропускается");
+    return 0;
+  end;
+
+  /// Если были ошибки в ХП Diasoft_SendPkoInfo
+  if (strLen(strSubst( strSubst(SQL_ConvTypeStr(rsPKO.value("errList")),",0","") ,",",""))!=0)
+     /// ничего не делаем, запускаем ХП diasoft_CreatePKO_part2
+     outErr = findFirstError(SQL_ConvTypeStr(rsPKO.value("errList")));
+
+  /// Создание операции списания или зачисления, так как не найдена операция с внешним кодом
+  elif (
+         (SQL_ConvTypeStr(rsPKO.value("foundCustodyOrderId"))==strfor(0))
+         and (  (    (     ( SQL_ConvTypeInteger(rsPKO.value("PkoStatus"))==1 ) 
+                           or ( SQL_ConvTypeInteger(rsPKO.value("PkoStatus"))==2 ) 
+                           or ( SQL_ConvTypeInteger(rsPKO.value("PkoStatus"))==3 )  
+                           or ( SQL_ConvTypeInteger(rsPKO.value("PkoStatus"))==4 )
+                     ) 
+                     and ((rsPKO.value("OperType") == 2) or (rsPKO.value("OperType") == 102))
+                )
+                or (SQL_ConvTypeInteger(rsPKO.value("PkoStatus"))==7) 
+             ) 
+      )
+    /// Создаем операцию
+    BoardPrm.Point = 2;
+    BoardPrm.Contragent = -1; 
+    BoardPrm.Department = 1; // по умолчанию, TODO получать из функции
+    BoardPrm.Client = SQL_ConvTypeInteger(rsPKO.value("clientid")); // код клиента
+    BoardPrm.ClientContr = SQL_ConvTypeInteger(rsPKO.value("idcontract")); // код договора 
+    BoardPrm.DeliveringFIID = BoardPrm.FIID = SQL_ConvTypeInteger(rsPKO.value("SecurityID")); //код ЦБ - PKO_WriteOff.SecurityID
+    BoardPrm.Amount = SQL_ConvTypeSum(rsPKO.value("Qnty")); //количество ЦБ - PKO_WriteOff.QuantitySecurities
+    BoardPrm.Oper = {oper};  //какой oper у funcobj?
+    BoardPrm.DealCode = SQL_ConvTypeStr(rsPKO.value("DealCode"));
+
+    /// Установка депозитария
+    /// TODO заменить на поиск в БД
+    if (SQL_ConvTypeStr(rsPKO.value("Market"))=="НКО АО НРД")
+      BoardPrm.DepoClientCustody = 4;
+      BoardPrm.Custody = 4;
+    elif (SQL_ConvTypeStr(rsPKO.value("Market"))=="ПАО СПБ Банк")
+      BoardPrm.DepoClientCustody = 1450;
+      BoardPrm.Custody = 1450;
+    else
+      BoardPrm.Custody = {ourbank};
+      BoardPrm.DepoClientCustody = {ourbank};
+    end;
+    logger.Info(string("BoardPrm.Custody=", BoardPrm.Custody, "; BoardPrm.DepoClientCustody=", BoardPrm.DepoClientCustody));
+
+    if ((rsPKO.value("OperType") == 2) or (rsPKO.value("OperType") == 102)) //списание
+      if (RegValReader.GetBool("РСХБ\\ИНТЕГРАЦИЯ\\CHECK_WRITEOFF", false))
+        BoardPrm.DealType = 32743; //новый тип операции списание ЦБ
+      else
+        BoardPrm.DealType = 2010; //на первом этапе 
+      end;
+      BoardPrm.DealTime = Time;
+      BoardPrm.DealDate = Date;
+    else //зачисление
+      BoardPrm.DealType = 2011; //дистрибутивный типа операции зачисления ЦБ 
+      BoardPrm.DealTime = rsPKO.value("OperationTimeOra");  ///<  Для зачисления: Дата и время создаваемой операции передаются в XML   
+      BoardPrm.DealDate = rsPKO.value("OperationTimeOra");
+    end;
+
+    ProcessTrn(0,"SP_InsertBoardLot_TRN");
+    if (stat!=0)  ///< операцию не удалось создать
+      logger.Info(string("Ошибка выполния SP_InsertBoardLot (код: ", stat, "): ", errMsg));
+      outerr = 21;
+      BoardID = 0;
+    else
+      if ((rsPKO.value("PkoStatus")!=7) and (BoardPrm.DealType == 32743))
+        //< Установка графиков СОБУ 
+        var sql_Set_GRSOBUDate = "call it_diasoft.Set_GRSOBUDate(p_deailid => :dealid , p_GRSOBUDate => date'9999-12-31');";
+        var cmd_Set_GRSOBUDate = rsdcommand(sql_Set_GRSOBUDate);
+        cmd_Set_GRSOBUDate.AddParam("",RSDBP_IN,BoardID);
+        cmd_Set_GRSOBUDate.execute;
+      end;
+      outerr = 0;  ///< операция успещно создана
+      println("Success");
+      var stat1 = AddNoteForObject(101, string(Boardid:34:o), 407, date(rsPKO.value("OperationTimeOra")));
+      var stat2 = AddNoteForObject(101, string(Boardid:34:o), 406, date(rsPKO.value("ExpirationDate")));
+      var stat3 = AddCategory(101, string(Boardid:34:o), 111, 2);
+      var stat4 = AddNoteForObject(101, string(Boardid:34:o), 404, rsPKO.value("GUID"));
+      var stat5 = AddNoteForObject(101, string(Boardid:34:o), 405, rsPKO.value("ClientType"));
+    end;
+
+
+  // Изменение через откат, так как найдена операция с таким же внешним кодом
+  elif (
+      (rsPKO.value("foundCustodyOrderId")==strfor(88))
+      and ( 
+           ( SQL_ConvTypeInteger(rsPKO.value("PkoStatus"))==0 ) or ( SQL_ConvTypeInteger(rsPKO.value("PkoStatus"))==1 ) or
+           ( SQL_ConvTypeInteger(rsPKO.value("PkoStatus"))==2 ) or ( SQL_ConvTypeInteger(rsPKO.value("PkoStatus"))==3 ) 
+          ) 
+      )
+     /// в первой очереди работ по БИК не делаем ничего, во второй очереди работ делаем откат 
+     outerr = 2; 
+
+  // не найдена операция с таким же внешним кодом для вариантов у Диасофта отменено или удалено 
+  elif (
+      (rsPKO.value("foundCustodyOrderId")==strfor(0))
+      and ( 
+           ( SQL_ConvTypeInteger(rsPKO.value("PkoStatus"))==2 ) or ( SQL_ConvTypeInteger(rsPKO.value("PkoStatus"))==3 ) 
+          ) 
+      )
+     /// в первой очереди работ по БИК не делаем ничего, во второй очереди работ делаем откат 
+     outerr = 2; 
+  // Введено или значение по дефолту для ошибки
+  elif (
+         ( SQL_ConvTypeInteger(rsPKO.value("PkoStatus"))==9 ) or ( (SQL_ConvTypeInteger(rsPKO.value("PkoStatus"))==0) and (rsPKO.value("OperType")==1)) )
+     outerr = 1; 
+  end;
+
+  /** 
+      Запуск ХП Diasoft.SendPkoInfo из BIQ-13034. 
+      Первая часть Diasoft.SendPkoInfo по сообщению из Кафки запускает задание на этот макрос посредством dfunc.
+      Такое разбиение Diasoft.SendPkoInfo на 2 части вызвано  невозможностью создать операцию списания из SQL 
+      Обновить там dealcodets и прочие поля и примечания, отправить сообщение в Диасофт;
+  */
+  var sql_crPko = 
+     "begin "+
+     "  diasoft_CreatePKO_part2(:1,:2,:3); "+
+     "end;";
+  var cmd_crPKO = rsdcommand(sql_crPko);
+  cmd_crPKO.addParam(":1", RSDBP_IN,     BoardID);
+  cmd_crPKO.addParam(":2", RSDBP_IN,     pParam );
+  cmd_crPKO.addParam(":3", RSDBP_IN_OUT, outerr );
+  cmd_crPKO.execute;
+  var outerr_crPKO = cmd_crPKO.value(2);
+
+  //если не было ошибок, то прогон операции списания нового типа 32473 сквозь инициализацию (открытие) операции и все шаги до закрытия
+  logger.Info(string("outerr_crPKO=",outerr_crPKO," BoardPrm.DealType =",BoardPrm.DealType));
+
+  if ( 
+       (outerr_crPKO==0) and (BoardPrm.DealType == 32743) 
+       and (rsPKO.value("PkoStatus")==7) and (stat==0) 
+     )  //в данном случае нужно закрыть операцию
+    rsPKO = getRSD_PKO(pParam);
+    var stat6 = AddCategory(101, string(Boardid:34:o), 113, 1);
+    //разрешим выполнение шага Ожидание статуса и далее шаг Списание, 
+    // а шаг Отказ (pko_writeoff.step2_reject) не разрешаем
+    var sql_wait_step = "update pko_writeoff set step1_waitstatus = 1, step3_writeoff = 1 where dealid = :1";
+    var cmd_wait_step = RSDCommand(sql_wait_step);
+    cmd_wait_step.addParam(":1", RSDBP_IN, rsPKO.value("Dealid"));
+    cmd_wait_step.execute;
+
+    var dealExecutor = SecurDealExecutor();
+    var execDealResult = dealExecutor.RunDeal(rsPKO.value("Dealid"), {curdate});
+    if(execDealResult == false)
+      logger.Error(string("Сделка с ID = ", rsPKO.value("Dealid"), ". Ошибка "));
+    end;
+  end; 
+
+  return 0;
+
+onError(errObj)
+  logger.ErrorClob("Error", GetFullErrMsg(errObj));
+  return 1;
+end;
+
+/**
+  @brief createEnroll - точка входа dfuncobj. Задание было создано в Diasoft.SendPkoInfo 
+  @param[in]  pObjecttype - используется редко - тип сообщения funcobj
+  @param[in]  pObjectid - id таблицы картотеки PKO_WriteOff
+  @param[in]  pParam - параметр - PKO_WriteOff.guid
+  @return 1-ошибка, 0-успешно
+*/
+macro createEnroll(pObjecttype, pObjectid, pParam)
+  var result  = createEnroll_t(pObjectid, pParam);
+  if (result == 0)
+    return FuncObjResult(FUNCOBJ_STATE_OK, "", FUNCOBJ_RESULT_OK);
+  else
+    return FuncObjResult(FUNCOBJ_STATE_FATAL_ERROR, "Ошибка при создании сервисной операции списания ц.б.", FUNCOBJ_RESULT_ERROR);
+  end;
+onError(er)
+  AddDBLogWithErrorObj("CreatePKO",er);
+  return FuncObjResult(FUNCOBJ_STATE_FATAL_ERROR, "Ошибка при создании сервисной операции списания ц.б.", FUNCOBJ_RESULT_ERROR);
+end;

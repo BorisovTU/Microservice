@@ -1,0 +1,671 @@
+/*
+reserve_perc_report.mac
+Отчёт о загруженных ставках оценочных резервов на финансовые инструменты
+*/
+import oralib, likepy, or_rep_h, "vsbnrfd.mac", "CbReport_h.mac";
+import "u_common_email_utils.mac", "file_archive.mac", "commonutil.mac";
+
+var repDate;
+var SendReportFlag;
+
+macro get_subject_type (partyid):string
+  return execStoredFunc("rshb_reserve_or.getIssuerType", V_STRING, makeArray(sqlParam("", partyid)));
+End;
+
+macro get_subject_rating (partyid, dt, ratingid, ratingname, agencyid, agencyname, entrynumber)
+  var params = MakeArray(SqlParam("0", partyid,   RSDBP_IN),
+                         SqlParam("1", dt,        RSDBP_IN),
+                         SqlParam("2", V_INTEGER, RSDBP_OUT),
+                         SqlParam("3", V_STRING,  RSDBP_OUT, 255),
+                         SqlParam("4", V_INTEGER, RSDBP_OUT),
+                         SqlParam("5", V_STRING,  RSDBP_OUT, 255),
+                         SqlParam("6", V_INTEGER, RSDBP_OUT));
+  var retval = execStoredFunc("rshb_reserve_or.getSubjectRating", V_INTEGER, params);
+
+  if (retval == 1) 
+    SetParm(2, params(2).value);
+    SetParm(3, params(3).value);
+    SetParm(4, params(4).value);
+    SetParm(5, params(5).value);
+    SetParm(6, params(6).value);
+  else
+/*очистим*/
+    SetParm(2, 0);
+    SetParm(3, "");
+    SetParm(4, 0);
+    SetParm(5, "");
+    SetParm(6, 0);
+  end;
+End;
+
+macro get_term_fi (days):string
+  var levelNames = makeArray("0", "1.[LT1M]", "2.[1-6M]", "3.[6-12M]", "4.[GT1Y]");
+  var termLevel = execStoredFunc("rshb_reserve_or.GetTermValue", V_INTEGER, makeArray(sqlParam("", days)));
+
+  return levelNames(termLevel);
+End;
+
+private macro SaveFileToAppServ(filepath:string, FileName):string
+  if(not isStandAlone()) // когда мы на терминале, копируем файл на СП     
+    var path_appserv = "..\\txtfile\\" + FileName;
+      
+    if(not CopyFile(filepath, path_appserv))
+      msgbox("Ошибка при передаче файла на сервер приложений");
+    end;
+    filepath = path_appserv;
+  end;
+    
+  return filepath;
+end;
+
+PRIVATE MACRO GetTxtPath()
+  var RegistryPath = "BANK_INI\\ОБЩИЕ ПАРАМЕТРЫ\\ДИРЕКТОРИИ\\TEXTDIR";
+  var Path = "";
+  var stat = 0;
+
+  GetRegistryValue(RegistryPath, V_STRING, Path, stat);
+  if(stat) 
+     msgbox("Не задана настройка в реестре банка:|", RegistryPath);      
+  end;
+
+  return Path;
+END;
+
+
+PRIVATE MACRO GetRepFullPath()
+  var Path = "";
+
+    var txtPath = GetTxtPath();
+ /*
+    if( substr( txtPath, 1, 2 ) == ".." ) /* ссылка на вышестоящий каталог */
+      txtPath = substr(txtPath, 3 );
+    end;
+
+    if( substr( txtPath, 1, 1 ) == "\\" ) /* ссылка на вышестоящий каталог */
+      txtPath = substr(txtPath, 2 );
+    end;
+   */
+    Path = GetCurDir(false) + "\\" + txtPath + "\\"; 
+
+  // получить полный путь
+  return Path;
+END;
+
+
+/* Отправить письмо с вложением xlsx
+ * attach_path - путь к прикрепляемому файлу
+ * attach_name - имя прикрепляемого файла
+ * вложение архивируется
+ */
+macro SendMessage (tittle:string, message:string, receiverGroupID:integer, attach_path:string, attach_name:string)
+  var email = c_email_proc_env();
+  var arh_name = StrSubst(attach_path,"$","")+StrSubst(attach_name, ".xlsx", ".7z");
+  var SpPath = "", SpFileName = "";
+  email.m_set_msg_head(tittle);
+  email.m_add_row_to_msg_text(message);
+
+  var arh = c_inarch_kit( arh_name, StrSubst(attach_path,"$","") );
+  arh.add_file_name(attach_name);
+
+  if (not (arh.Add_to_Archive("zip7")))
+      msgbox("Ошибка архивирования файла " + attach_name + " " + arh.get_state_message() + " \n" +
+                     "Путь 7zip на терминале: " + arh.get_zip7_util_path_term() + "\n" +
+                     "Путь 7zip на СП: " + arh.get_zip7_util_path_sp() + "\n" +
+                     "Путь архивации: " + attach_path + "\n" +
+                     "Файл архива: " + arh_name);
+      return;
+  end;
+
+  //arh_name = "$" + arh_name;
+  
+  SpPath = GetRepFullPath();
+  SpFileName = SpPath + StrSubst(attach_name, ".xlsx", ".7z");
+  If ( not copyfile("$" + arh_name, SpFileName))   //отправка это ява и файл должен быть на СП
+      SpFileName = arh_name;
+  end;
+
+  email.m_add_attach_to_list(SpFileName);
+  email.m_save_to_submit_grp(receiverGroupID);
+  email.m_submit_email_synch();
+End;
+
+// CLASS (CB_CReportTemplate) ReservePrecReport( Form:DL_CPanel, TemplateName:STRING, UseCSV:BOOL, IsWebService:BOOL, ReportHashCode:INTEGER, UsePOI:BOOL, UseBigReportMode:BOOL, FocreFormatRep:INTEGER )
+CLASS (CB_CReportTemplate) ReservePrecReport( )
+
+  var rn = 1;
+  var sql;
+  var error_str = "";
+  var rate;
+
+  var last_issuer = 0, rating, rating_agency, entrynumber, termDate, stage;
+  
+  const SHEET_N1    = "Облигации",
+        SHEET_N2    = "Векселя",
+        SHEET_N3    = "МБК",
+        SHEET_N4    = "Обратное РЕПО";
+
+  private macro adderr (text:string)
+  if (error_str == "")
+      error_str = text;
+    else
+      error_str = error_str + ";\n" + text;
+    end;
+  End;
+
+  PRIVATE MACRO PrintMode():INTEGER
+    return DL_OUTREPORT_EXCEL;
+  END;
+
+  PRIVATE MACRO BeginReport()
+  END;
+
+  MACRO Create( NumCopy:INTEGER )
+     
+      SetActiveSheet(SHEET_N1);
+      RegisterTable( "N1_TableLine", "",
+            /*A*/    "N1_Code",
+            /*B*/    "N1_Name",
+            /*C*/    "N1_ISIN",
+            /*D*/    "N1_RegNum",
+            /*E*/    "N1_NameEm",
+            /*F*/    "N1_BuyDate",
+            /*G*/    "N1_RateEstRres",
+            /*H*/    "N1_ReservStage",
+            /*I*/    "N1_Recovery",
+            /*J*/    "N1_Rating",
+            /*K*/    "N1_RatAgency",
+            /*L*/    "N1_InnerRatLvl",
+            /*M*/    "N1_TypeEm",
+            /*N*/    "N1_RepaymentDate",
+            /*O*/    "N1_ToolLife",
+            /*P*/    "N1_Source",
+            /*Q*/    "N1_ErrMes" );
+
+
+      sql = "";
+      CaptureOutput();
+[ with parm as (select :1 t_date from dual) 
+  select t.t_fi_code,
+        t.t_definition,
+        t.t_isin,
+        t.t_lsin,
+        t.t_issuer,
+        t.t_dealdate,
+        t.t_issuerid,
+        t.t_drawingdate, t.t_termless, t.DrawingDateless,
+        case when dealrate >= 0 then dealrate
+              else nvl((select rsb_struct.getdouble(note.t_text)
+                        from dnotetext_dbt note
+                        where note.t_objecttype = RSHB_RESERVE_OR.GET_AVR_OBJTYPE and
+                              note.t_notekind = RSHB_RESERVE_OR.GET_AVR_NOTEKIND_OR and
+                              note.t_documentid = lpad(t.t_fiid, 10, '0') and
+                              (select t_date from parm) between note.t_date and note.t_validtodate), -1)
+          end t_rate,
+          nvl((select attr.t_name
+              from dobjatcor_dbt atcor
+              join dobjattr_dbt attr ON attr.t_objecttype = atcor.t_objecttype and
+                                        attr.t_groupid = atcor.t_groupid and
+                                        attr.t_attrid = atcor.t_attrid
+              where atcor.t_objecttype = decode(dealrate, -1, RSHB_RESERVE_OR.GET_AVR_OBJTYPE, RSHB_RESERVE_OR.GET_DEAL_OBJTYPE) and
+                    atcor.t_groupid = decode(dealrate, -1, RSHB_RESERVE_OR.GET_AVR_ATTR_METHOD, RSHB_RESERVE_OR.GET_DEAL_ATTR_METHOD) and
+                    (select t_date from parm) between atcor.t_validfromdate and atcor.t_validtodate and
+                    atcor.t_object = decode(dealrate, -1, lpad(t.t_fiid, 10, 0), lpad(t.t_dealid, 34, 0))), chr(1)) t_source,
+          nvl((select attr.t_name
+              from dobjatcor_dbt atcor
+              join dobjattr_dbt attr ON attr.t_objecttype = atcor.t_objecttype and
+                                        attr.t_groupid = atcor.t_groupid and
+                                        attr.t_attrid = atcor.t_attrid
+              where atcor.t_objecttype = decode(dealrate, -1, RSHB_RESERVE_OR.GET_AVR_OBJTYPE, RSHB_RESERVE_OR.GET_DEAL_OBJTYPE) and
+                    atcor.t_groupid = decode(dealrate, -1, RSHB_RESERVE_OR.GET_AVR_ATTR_STAGE_SOFR, RSHB_RESERVE_OR.GET_DEAL_ATTR_STAGE) and
+                    (select t_date from parm) between atcor.t_validfromdate and atcor.t_validtodate and
+                    atcor.t_object = decode(dealrate, -1, lpad(t.t_fiid, 10, 0), lpad(t.t_dealid, 34, 0))), chr(1)) t_stage,
+          nvl((select attr.t_name
+              from dobjatcor_dbt atcor
+              join dobjattr_dbt attr ON attr.t_objecttype = atcor.t_objecttype and
+                                        attr.t_groupid = atcor.t_groupid and
+                                        attr.t_attrid = atcor.t_attrid
+              where atcor.t_objecttype = decode(dealrate, -1, RSHB_RESERVE_OR.GET_AVR_OBJTYPE, RSHB_RESERVE_OR.GET_DEAL_OBJTYPE) and
+                    atcor.t_groupid = decode(dealrate, -1, RSHB_RESERVE_OR.GET_AVR_ATTR_RECOVERY, RSHB_RESERVE_OR.GET_DEAL_ATTR_RECOVERY) and
+                    (select t_date from parm) between atcor.t_validfromdate and atcor.t_validtodate and
+                    atcor.t_object = decode(dealrate, -1, lpad(t.t_fiid, 10, 0), lpad(t.t_dealid, 34, 0))), chr(1)) t_recovery
+  from (
+    SELECT /*+ leading(v) index(v.lot DPMWRTSUM_DBT_USR1) index(v.vbcex.lot DPMWRTSUM_DBT_USR1) */ fi.t_fi_code,
+           fi.t_definition,
+           (select t_isin from davoiriss_dbt where t_FIID = v.t_FIID) t_isin,
+           (select t_lsin from davoiriss_dbt where t_FIID = v.t_FIID) t_lsin,
+           nvl((select t_name from dparty_dbt where t_partyid = fi.t_issuer), ' ') t_issuer,
+           fi.t_issuer t_issuerid,
+           tick.t_dealdate,
+           nvl((select rsb_struct.getdouble(note.t_text)
+                from dnotetext_dbt note
+                where note.t_objecttype = tick.t_bofficekind and
+                      note.t_notekind = RSHB_RESERVE_OR.GET_DEAL_NOTEKIND_OR and
+                      note.t_documentid = lpad(tick.t_dealid, 34, '0') and
+                      (select t_date from parm) between note.t_date and note.t_validtodate), -1) dealrate,
+          fi.t_fiid,
+          tick.t_dealid,
+          fi.t_drawingdate, avr.t_termless, RSI_RSB_FIInstr.FI_GetNominalDrawingDate(fi.t_FIID, avr.t_Termless) DrawingDateless
+      FROM V_SCWRTHISTEX v, dfininstr_dbt fi, ddl_tick_dbt tick, davoiriss_dbt avr
+     WHERE     v.t_ChangeDate <= (select t_date from parm)
+           AND v.t_Amount > 0
+           AND v.t_party = -1
+           AND v.t_contract = 0
+           and (v.t_portfolio =5 or v.t_portfolio = 4 or v.t_portfolio = 3 or v.t_portfolio = 2)
+           AND v.t_buy_sale = 0
+           AND v.t_state in (1, 3)
+           AND tick.t_ClientID = -1
+           AND fi.t_Issuer != 1
+           AND avr.t_fiid = fi.t_fiid
+           AND RSI_RSB_FIInstr.FI_AvrKindsGetRootByFIID (v.t_FIID) = 17
+           and decode(v.t_instance,(select max(v2.t_Instance)
+                                 from V_SCWRTHISTEX v2
+                                where v2.t_SumID = v.t_SumID
+                                  and v2.t_ChangeDate <= (select t_date from parm)),1,0) = 1
+           AND fi.t_FIID = v.t_FIID
+           AND tick.t_DealID = v.t_DealID
+    ORDER BY fi.t_FIID) t
+];
+      sql = ExecSqlSelect(stopCaptureOutput, MakeArray(SqlParam("1", repDate)), false);
+
+      rn = 1;
+      while (sql.MoveNext() )
+        error_str = "";
+        rate = sql.value("t_rate");
+        termDate = date(sql.value("t_drawingdate"));
+        If(sql.value("t_termless") == "X")
+          termDate = date(sql.value("DrawingDateless"));
+        end;
+        if (rate == -1)
+          adderr("Не загружен реквизит: \"МСФО. Ставка резервирования\"");
+          rate = "";
+        end;
+
+        if ( (sql.value("t_source") == "DEALS") and (sql.value("t_stage") == "") )
+          adderr("Не загружен реквизит: \"МСФО. Этап резервирования\"");
+        end;
+
+        if (last_issuer != sql.value("t_issuerid"))
+          last_issuer = sql.value("t_issuerid");
+          get_subject_rating(last_issuer, repDate, null, rating, null, rating_agency, entrynumber);
+        end;
+
+        rn = rn + 1;
+        SetRowHeight(rn, 34);
+        PrintTableLine( "N1_Code",          sql.value("t_fi_code"),                                   null, //1. Код ценной бумаги
+               /*B*/    "N1_Name",          sql.value("t_definition"),                                null, //2. Наименование
+               /*C*/    "N1_ISIN",          sql.value("t_isin"),                                      null, //3. ISIN
+               /*D*/    "N1_RegNum",        sql.value("t_lsin"),                                      null, //4. Номер гос. регистрации
+               /*E*/    "N1_NameEm",        sql.value("t_issuer"),                                    null, //5. Наименование эмитента
+               /*F*/    "N1_BuyDate",       date(sql.value("t_dealdate")),                            null, //6. Дата приобретения
+               /*G*/    "N1_RateEstRres",   rate,                                                     null, //7. Ставка ОР
+               /*H*/    "N1_ReservStage",   sql.value("t_stage"),                                     null, //8. Этап резервирования
+               /*I*/    "N1_Recovery",      sql.value("t_recovery"),                                  null, //9. Признак выздоровления
+               /*J*/    "N1_Rating",        rating,                                                   null, //10. Рейтинг
+               /*K*/    "N1_RatAgency",     rating_agency,                                            null, //11. Рейтинговое агенство
+               /*L*/    "N1_InnerRatLvl",   entrynumber,                                              null, //12. Внутренний уровень рейтинга
+               /*M*/    "N1_TypeEm",        get_subject_type(sql.value("t_issuerid")),                null, //13. Тип эмитента/контрагента
+               /*N*/    "N1_RepaymentDate", termDate,                                                 null, //14. Дата погашения
+               /*O*/    "N1_ToolLife",      get_term_fi(termDate - repDate),                          null, //15. Срок инструмента
+               /*P*/    "N1_Source",        sql.value("t_source"),                                    null, //16. Источник загрузки
+               /*Q*/    "N1_ErrMes",        error_str,                                                null  //17. Описание ошибки 
+               );
+      end;
+
+      EndTable();
+
+      /************************************Векселя**********************************************************/
+      SetActiveSheet(SHEET_N2);
+      RegisterTable( "N2_TableLine", "",
+            /*A*/    "N2_SerNum",
+            /*B*/    "N2_IssuerName",
+            /*C*/    "N2_DealDate",
+            /*D*/    "N2_Rate",
+            /*E*/    "N2_ResStage",
+            /*F*/    "N2_Recovery",
+            /*G*/    "N2_Rating",
+            /*H*/    "N2_RatAgency",
+            /*I*/    "N2_InnerRatLvl",
+            /*J*/    "N2_IssuerType",
+            /*K*/    "N2_RepaymentDate",
+            /*L*/    "N2_ToolLife",
+            /*M*/    "N2_Source",
+            /*N*/    "N2_ErrMes" );
+
+      sql = "";
+      CaptureOutput();
+[ with parm as (select :dt t_date from dual) 
+  select bnr.t_bcid, bnr.t_issuername, bnr.t_bcseries || ' ' || Trim(bnr.t_bcnumber) as sernum,
+        case when note.t_text is not null then rsb_struct.getdouble(note.t_text) else -1 end t_rate,
+        (select t_dealdate from ddl_tick_dbt where t_dealid = (select t_contractid from dvsordlnk_dbt where t_bcid = bnr.t_bcid and t_dockind = 141 and t_linkkind = 1 and rownum = 1)) t_dealdate,
+        rshb_reserve_or.GetBnrPlanRepayDate(bnr.t_bcid) as t_termDate,
+        nvl((select attr.t_name
+              from dobjatcor_dbt atcor
+              join dobjattr_dbt attr ON attr.t_objecttype = atcor.t_objecttype and
+                                        attr.t_groupid = atcor.t_groupid and
+                                        attr.t_attrid = atcor.t_attrid
+              where atcor.t_objecttype = RSHB_RESERVE_OR.GET_VA_OBJTYPE and
+                    atcor.t_groupid = RSHB_RESERVE_OR.GET_VA_ATTR_STAGE_SOFR and
+                    (select t_date from parm) between atcor.t_validfromdate and atcor.t_validtodate and
+                    atcor.t_object = lpad( bnr.t_bcid, 10, 0)), chr(1)) t_stage,
+          nvl((select attr.t_name
+              from dobjatcor_dbt atcor
+              join dobjattr_dbt attr ON attr.t_objecttype = atcor.t_objecttype and
+                                        attr.t_groupid = atcor.t_groupid and
+                                        attr.t_attrid = atcor.t_attrid
+              where atcor.t_objecttype = RSHB_RESERVE_OR.GET_VA_OBJTYPE and
+                    atcor.t_groupid = RSHB_RESERVE_OR.GET_VA_ATTR_RECOVERY and
+                    (select t_date from parm) between atcor.t_validfromdate and atcor.t_validtodate and
+                    atcor.t_object = lpad( bnr.t_bcid, 10, 0)), chr(1)) t_recovery,
+          nvl((select attr.t_name
+              from dobjatcor_dbt atcor
+              join dobjattr_dbt attr ON attr.t_objecttype = atcor.t_objecttype and
+                                        attr.t_groupid = atcor.t_groupid and
+                                        attr.t_attrid = atcor.t_attrid
+              where atcor.t_objecttype = RSHB_RESERVE_OR.GET_VA_OBJTYPE and
+                    atcor.t_groupid = RSHB_RESERVE_OR.GET_VA_ATTR_METHOD and
+                    (select t_date from parm) between atcor.t_validfromdate and atcor.t_validtodate and
+                    atcor.t_object = lpad( bnr.t_bcid, 10, 0)), chr(1)) t_source,
+          t_issuer
+  from dvsbanner_dbt bnr
+  left join dnotetext_dbt note on note.t_objecttype = RSHB_RESERVE_OR.GET_VA_OBJTYPE and
+                                  note.t_notekind = RSHB_RESERVE_OR.GET_VA_NOTEKIND_OR and
+                                  note.t_documentid = lpad(bnr.t_bcid, 10, 0) and
+                                  :dt between note.t_date and note.t_validtodate
+  where bnr.t_issuer not in (select t_partyid from ddp_dep_dbt)
+        and bnr.t_issuedate <= (select t_date from parm)
+        and (bnr.t_repaymentdate > (select t_date from parm) or bnr.t_repaymentdate = to_date('01.01.0001', 'dd.mm.yyyy'))
+        and not exists (select 1 from dvsordlnk_dbt lnk, ddl_tick_dbt tick
+                        where     lnk.t_bcid = bnr.t_bcid
+                              and lnk.t_linkkind = 0
+                              and lnk.t_interestchargedate > :dt
+                              and tick.t_dealid = lnk.t_contractid
+                              and tick.t_dealstatus = 20)
+];
+      sql = ExecSqlSelect(stopCaptureOutput(), MakeArray(SqlParam("dt", repDate)), false);
+
+      rn = 1;
+      while (sql.MoveNext() )
+        error_str = "";
+        rate = sql.value("t_rate");
+        termDate = date(sql.value("t_termDate"));
+
+        if (rate == -1)
+          adderr("Не загружен реквизит: \"МСФО. Ставка резервирования\"");
+          rate = "";
+        end;
+
+        if ( (sql.value("t_source") == "DEALS") and (sql.value("t_stage") == "") )
+          adderr("Не загружен реквизит: \"МСФО. Этап резервирования\"");
+        end;
+
+        get_subject_rating(sql.value("t_issuer"), repDate, null, rating, null, rating_agency, entrynumber);
+        /*KD*/
+        var m_FD = VSBannerFD (DL_VSBANNER, sql.value("t_bcid"), DL_VARESERVE, VARES_SUBKIND_OR);
+        termDate = DL_GetBnrPlanRepayDate(m_FD.GetBnr(), m_FD.GetLeg());
+
+        rn = rn + 1;
+        SetRowHeight(rn, 34);
+        PrintTableLine( "N2_SerNum",        sql.value("sernum"),                                   null, //1. Серия номер
+               /*B*/    "N2_IssuerName",    sql.value("t_issuername"),                             null, //2. Векселедатель
+               /*C*/    "N2_DealDate",      Date(sql.value("t_dealdate")),                         null, //3. Дата приобретения
+               /*D*/    "N2_Rate",          rate,                                                  null, //4. Ставка
+               /*E*/    "N2_ResStage",      sql.value("t_stage"),                                  null, //5. Этап резервирования
+               /*F*/    "N2_Recovery",      sql.value("t_recovery"),                               null, //6. Признак выздоровления
+               /*G*/    "N2_Rating",        rating,                                                null, //7. Рейтинг
+               /*H*/    "N2_RatAgency",     rating_agency,                                         null, //8. Рейтинговое агенство
+               /*I*/    "N2_InnerRatLvl",   entrynumber,                                           null, //9. Внутренний уровень рейтинга
+               /*J*/    "N2_IssuerType",    get_subject_type(sql.value("t_issuer")),               null, //10. Тип эмитента/контрагента
+               /*K*/    "N2_RepaymentDate", termDate,                                              null, //11. Дата погашения
+               /*L*/    "N2_ToolLife",      get_term_fi(termDate - repDate),                       null, //12. Срок инструмента
+               /*M*/    "N2_Source",        sql.value("t_source"),                                 null, //13. Источник загрузки
+               /*N*/    "N2_ErrMes",        error_str,                                             null  //14. Описание ошибки
+               );
+      end;
+
+      EndTable();
+
+      /************************************Сделки МБК**********************************************************/
+      SetActiveSheet(SHEET_N3);
+      RegisterTable( "N3_TableLine", "",
+            /*A*/    "N3_DealCode",
+            /*B*/    "N3_ContractorName",
+            /*C*/    "N3_DealDate",
+            /*D*/    "N3_Rate",
+            /*E*/    "N3_ResStage",
+            /*F*/    "N3_Recovery",
+            /*G*/    "N3_Rating",
+            /*H*/    "N3_RatAgency",
+            /*I*/    "N3_InnerRatLvl",
+            /*J*/    "N3_ContractorType",
+            /*K*/    "N3_RepaymentDate",
+            /*L*/    "N3_ToolLife",
+            /*M*/    "N3_Source",
+            /*N*/    "N3_ErrMes" );
+
+      sql = "";
+      CaptureOutput();
+[ with parm as (select :dt t_date from dual) 
+  select tick.t_dealcode,
+        (select t_name from dparty_dbt where t_partyid = tick.t_partyid) t_contractorname,
+        tick.t_dealdate,
+        nvl(mmhst.t_percloss, -1) t_rate,
+        nvl(to_char(mmhst.t_impgrade + 1), chr(1)) t_stage,
+        nvl(mmhst.t_comment, chr(1)) t_source,
+        nvl((select attr.t_name
+              from dobjatcor_dbt atcor
+              join dobjattr_dbt attr ON attr.t_objecttype = atcor.t_objecttype and
+                                        attr.t_groupid = atcor.t_groupid and
+                                        attr.t_attrid = atcor.t_attrid
+              where atcor.t_objecttype = rshb_reserve_or.get_mbk_objtype and
+                    atcor.t_groupid = RSHB_RESERVE_OR.GET_MBK_ATTR_RECOVERY and
+                    (select t_date from parm) between atcor.t_validfromdate and atcor.t_validtodate and
+                    atcor.t_object = lpad( tick.t_dealid, 34, 0)), chr(1)) t_recovery,
+        tick.t_partyid t_contractor,
+        (select t_maturity from ddl_leg_dbt where t_dealid = tick.t_dealid and t_legid = 1 and t_legkind = 0) t_termDate,
+  accdoc.t_account, accdoc.t_currency
+  from dmcaccdoc_dbt accdoc, ddl_tick_dbt tick
+  left join dmmhstimp_dbt mmhst on mmhst.t_dealid = tick.t_dealid 
+  where     tick.t_bofficekind = rshb_reserve_or.get_mbk_dockind
+        and tick.t_dealtype in (12305, 12306, 12335, 32305)
+        and tick.t_dealdate <= (select t_date from parm)
+        and (t_closedate = to_date('01.01.0001', 'dd.mm.yyyy') or t_closedate > (select t_date from parm))
+        and mmhst.t_date = (select max(t_date) from dmmhstimp_dbt where t_dealid = mmhst.t_dealid and t_date <= (select t_date from parm))
+  and accdoc.t_dockind = 102 and accdoc.t_docid = tick.t_dealid and accdoc.t_catnum = (select decode((SELECT 1 FROM DMCACCDOC_DBT WHERE T_dockind = 102 and t_docid = tick.t_dealid and t_catnum = 601 AND t_account = accdoc.t_account ), 1, 601, 700) from dual)        
+  and RSB_ACCOUNT.Restac(accdoc.t_account, accdoc.t_currency, (select t_date from parm), 1, 0)<>0
+];
+      sql = ExecSqlSelect(stopCaptureOutput(), MakeArray(SqlParam("dt", repDate)), false);
+
+      rn = 1;
+      while (sql.MoveNext() )
+        error_str = "";
+        rate = sql.value("t_rate");
+        termDate = date(sql.value("t_termDate"));
+
+        If(Index(sql.value("t_source"), "ID") == 0)
+          stage = "";
+        else
+          stage = string(sql.value("t_stage"));
+        end;
+
+        if (sql.value("t_rate") == -1)
+          adderr("Не загружен реквизит: \"МСФО. Ставка резервирования\"");
+          rate = "";
+        end;
+
+        if ( (sql.value("t_source") == "DEALS") and (sql.value("t_stage") == "") )
+          adderr("Не загружен реквизит: \"МСФО. Этап резервирования\"");
+        end;
+
+        get_subject_rating(sql.value("t_contractor"), repDate, null, rating, null, rating_agency, entrynumber);
+
+        rn = rn + 1;
+        SetRowHeight(rn, 34);
+        PrintTableLine( "N3_DealCode",       sql.value("t_dealcode"),                               null, //1. Номер сделки
+               /*B*/    "N3_ContractorName", sql.value("t_contractorname"),                         null, //2. Контрагент
+               /*C*/    "N3_DealDate",       Date(sql.value("t_dealdate")),                         null, //3. Дата заключения
+               /*D*/    "N3_Rate",           rate,                                                  null, //4. Ставка
+               /*E*/    "N3_ResStage",       stage,                                                 null, //5. Этап резервирования
+               /*F*/    "N3_Recovery",       sql.value("t_recovery"),                               null, //6. Признак выздоровления
+               /*G*/    "N3_Rating",         rating,                                                null, //7. Рейтинг
+               /*H*/    "N3_RatAgency",      rating_agency,                                         null, //8. Рейтинговое агенство
+               /*I*/    "N3_InnerRatLvl",    entrynumber,                                           null, //9. Внутренний уровень рейтинга
+               /*J*/    "N3_ContractorType", get_subject_type(sql.value("t_contractor")),           null, //10. Тип эмитента/контрагента
+               /*K*/    "N3_RepaymentDate",  termDate,                                              null, //11. Дата погашения
+               /*L*/    "N3_ToolLife",       get_term_fi(termDate - repDate),                       null, //12. Срок инструмента
+               /*M*/    "N3_Source",         sql.value("t_source"),                                 null, //13. Источник загрузки
+               /*N*/    "N3_ErrMes",         error_str,                                             null  //14. Описание ошибки
+               );
+               
+      end;
+
+      EndTable();
+
+      /************************************Сделки обратного РЕПО*********************************************************/
+      SetActiveSheet(SHEET_N4);
+      RegisterTable( "N4_TableLine", "",
+            /*A*/    "N4_DealCode",
+            /*B*/    "N4_ContractorName",
+            /*C*/    "N4_DealDate",
+            /*D*/    "N4_Rate",
+            /*E*/    "N4_ResStage",
+            /*F*/    "N4_Recovery",
+            /*G*/    "N4_Rating",
+            /*H*/    "N4_RatAgency",
+            /*I*/    "N4_InnerRatLvl",
+            /*J*/    "N4_ContractorType",
+            /*K*/    "N4_RepaymentDate",
+            /*L*/    "N4_ToolLife",
+            /*M*/    "N4_Source",
+            /*N*/    "N4_ErrMes" );
+      
+      sql = "";
+      CaptureOutput();
+[ with parm as (select :dt t_date from dual) 
+  select tick.t_dealcode,
+        (select t_name from dparty_dbt where t_partyid = tick.t_partyid) t_contractorname,
+        tick.t_dealdate,
+        case when note.t_text is not null then rsb_struct.getdouble(note.t_text) else -1 end t_rate,
+        tick.t_partyid t_contractor,
+        leg.t_maturity t_termDate,
+        nvl((select attr.t_name
+            from dobjatcor_dbt atcor
+            join dobjattr_dbt attr ON attr.t_objecttype = atcor.t_objecttype and
+                                      attr.t_groupid = atcor.t_groupid and
+                                      attr.t_attrid = atcor.t_attrid
+            where atcor.t_objecttype = RSHB_RESERVE_OR.GET_DEAL_OBJTYPE and
+                  atcor.t_groupid = RSHB_RESERVE_OR.GET_DEAL_ATTR_METHOD and
+                  (select t_date from parm) between atcor.t_validfromdate and atcor.t_validtodate and
+                  atcor.t_object = lpad(tick.t_dealid, 34, 0)), chr(1)) t_source,
+        nvl((select attr.t_name
+            from dobjatcor_dbt atcor
+            join dobjattr_dbt attr ON attr.t_objecttype = atcor.t_objecttype and
+                                      attr.t_groupid = atcor.t_groupid and
+                                      attr.t_attrid = atcor.t_attrid
+            where atcor.t_objecttype = RSHB_RESERVE_OR.GET_DEAL_OBJTYPE and
+                  atcor.t_groupid = RSHB_RESERVE_OR.GET_DEAL_ATTR_STAGE_SOFR and
+                  (select t_date from parm) between atcor.t_validfromdate and atcor.t_validtodate and
+                  atcor.t_object = lpad(tick.t_dealid, 34, 0)), chr(1)) t_stage,
+        nvl((select attr.t_name
+            from dobjatcor_dbt atcor
+            join dobjattr_dbt attr ON attr.t_objecttype = atcor.t_objecttype and
+                                      attr.t_groupid = atcor.t_groupid and
+                                      attr.t_attrid = atcor.t_attrid
+            where atcor.t_objecttype = RSHB_RESERVE_OR.GET_DEAL_OBJTYPE and
+                  atcor.t_groupid = RSHB_RESERVE_OR.GET_DEAL_ATTR_RECOVERY and
+                  (select t_date from parm) between atcor.t_validfromdate and atcor.t_validtodate and
+                  atcor.t_object = lpad(tick.t_dealid, 34, 0)), chr(1)) t_recovery,
+                  accdoc.t_account, accdoc.t_currency
+  from dmcaccdoc_dbt accdoc, ddl_leg_dbt leg, ddl_tick_dbt tick
+  left join dnotetext_dbt note on note.t_objecttype = RSHB_RESERVE_OR.GET_DEAL_OBJTYPE and
+                                  note.t_notekind = RSHB_RESERVE_OR.GET_DEAL_NOTEKIND_OR and
+                                  note.t_documentid = lpad(tick.t_dealid, 34, 0) and
+                                  :dt2 between note.t_date and note.t_validtodate
+  where     rsb_secur.IsRepo(RSB_SECUR.get_OperationGroup(RSB_SECUR.get_OperSysTypes(TICK.t_DealType, TICK.t_BofficeKind))) = 1
+        and RSB_SECUR.IsBuy(RSB_SECUR.get_OperationGroup(RSB_SECUR.get_OperSysTypes(TICK.t_DealType, TICK.t_BofficeKind))) = 1
+        and tick.t_bofficekind = RSHB_RESERVE_OR.GET_DEAL_OBJTYPE
+        and tick.t_dealdate <= (select t_date from parm)
+        and tick.t_dealid = leg.t_Dealid
+        and leg.t_legkind = 2
+        and (greatest(leg.t_maturity, leg.t_expiry) > (select t_date from parm) /*or tick.t_closedate = to_Date('01.01.0001', 'mm.dd.yyyy')*/)
+        and  accdoc.t_dockind = 176 and  accdoc.t_docid = leg.t_id and accdoc.t_catnum = 603
+        and RSB_ACCOUNT.Restac(accdoc.t_account, accdoc.t_currency, (select t_date from parm), 1, 0)<>0
+];
+      sql = ExecSqlSelect(stopCaptureOutput(), MakeArray(SqlParam("dt", repDate), SqlParam("dt2", repDate)), false);
+
+      rn = 1;
+      while (sql.MoveNext() )
+        error_str = "";
+        rate = sql.value("t_rate");
+        termDate = date(sql.value("t_termDate"));
+
+        if (rate == -1)
+          adderr("Не загружен реквизит: \"МСФО. Ставка резервирования\"");
+          rate = "";
+        end;
+
+        if ( (sql.value("t_source") == "DEALS") and (sql.value("t_stage") == "") )
+          adderr("Не загружен реквизит: \"МСФО. Этап резервирования\"");
+        end;
+
+        get_subject_rating(sql.value("t_contractor"), repDate, null, rating, null, rating_agency, entrynumber);
+
+        rn = rn + 1;
+        SetRowHeight(rn, 34);
+        PrintTableLine( "N4_DealCode",       sql.value("t_dealcode"),                               null, //1. Номер сделки
+               /*B*/    "N4_ContractorName", sql.value("t_contractorname"),                         null, //2. Контрагент
+               /*C*/    "N4_DealDate",       Date(sql.value("t_dealdate")),                         null, //3. Дата заключения
+               /*D*/    "N4_Rate",           rate,                                                  null, //4. Ставка
+               /*E*/    "N4_ResStage",       sql.value("t_stage"),                                  null, //5. Этап резервирования
+               /*F*/    "N4_Recovery",       sql.value("t_recovery"),                               null, //6. Признак выздоровления
+               /*G*/    "N4_Rating",         rating,                                                null, //7. Рейтинг
+               /*H*/    "N4_RatAgency",      rating_agency,                                         null, //8. Рейтинговое агенство
+               /*I*/    "N4_InnerRatLvl",    entrynumber,                                           null, //9. Внутренний уровень рейтинга
+               /*J*/    "N4_ContractorType", get_subject_type(sql.value("t_contractor")),           null, //10. Тип эмитента/контрагента
+               /*K*/    "N4_RepaymentDate",  termDate,                                              null, //11. Дата погашения
+               /*L*/    "N4_ToolLife",       get_term_fi(termDate - repDate),                       null, //12. Срок инструмента
+               /*M*/    "N4_Source",         sql.value("t_source"),                                 null, //13. Источник загрузки
+               /*N*/    "N4_ErrMes",         error_str,                                             null  //14. Описание ошибки
+               );  
+
+      end;
+
+      EndTable();
+
+      SetIsShowAppl(not SendReportFlag);
+      //Rep.PrintWinRep("Облигации");
+      SetActiveSheet(SHEET_N1);
+
+  END;
+
+  initCB_CReportTemplate(NULL, "Report_reserve_perc.xlsx", false, null, null, true, true, WINREP_FORMAT_XLSX);
+
+END; // class ReservePrecReport
+
+
+macro print_or_rep (dt:date, SendReport)
+  var Rep, FullNameFile;
+  var FileName = "";
+  var ExtName = "";
+
+  begAction(0, "Ждите, идёт отбор данных", false);
+
+  /************************************Облигации**********************************************************/
+  repDate = dt;
+  SendReportFlag = SendReport;
+  Rep = ReservePrecReport( );
+  Rep.Run();
+
+  FullNameFile = Rep.GetFullReportFileNames()[0];
+  splitfile(FullNameFile, FileName, ExtName);
+  FileName = FileName + ExtName;
+  SaveFileToAppServ("$"+FullNameFile, FileName);
+  endAction();
+
+  if (SendReport)
+    SendMessage("Протокол загрузки ставок оценочного резерва " + dt, "Это сообщение оправлено автоматически, не нужно отвечать на него.", 19, substr(FullNameFile, 1, index(FullNameFile, FileName) - 1)+"\\", FileName);
+  end;
+
+  onerror()
+  endAction();
+  MsgBox("Ошибка при формировании отчета");
+End;

@@ -1,0 +1,254 @@
+/*
+$Name:        dvoverfv.mac
+$Module:      Производные инструменты
+$Description: Сервисная операция переоценки СС
+*/
+IMPORT DVInter, RsbDataSet, "cb_sql.mac", "dvservop.mac", "dv_car.mac", "dv_grfun.mac";
+
+PRIVATE VAR ServOp = TRecHandler( "dvoper.dbt" ); /*Сервисная операция, из которой выполняется расчет*/
+
+PRIVATE MACRO Exception( RslErrObj ):INTEGER
+  RemProgress();
+  MsgBox( RslErrObj.Module + " строка " + RslErrObj.Line + "|" + RslErrObj.Message);
+  return 1;
+END;
+
+PRIVATE MACRO PumpFairValueOld( fvover:VARIANT, ServOp:TRecHandler, pFrValID:integer )
+
+  var Query, DataSet, Select, FrValID:integer = MAX_INT32;
+
+  if( pFrValID != NULL )
+     FrValID = pFrValID;
+  end;
+
+  fvover.rec.OldFairValue = 0.0;
+
+  Select = " SELECT t_FairValue             " +
+           "   FROM DDVNFRVAL_DBT           " +
+           "  WHERE t_DealID = ?            " +
+           "    AND t_DocKind = ?           " +
+           "    AND t_Date  <= ?            " +
+           "    AND t_ID     < ?            " +
+           " ORDER BY t_Date Desc, t_ID Desc";
+  Query = RSDCommand( Select );
+  Query.NullConversion = true;
+  Query.addParam( "", RSDBP_IN, fvover.rec.DealID );
+  Query.addParam( "", RSDBP_IN, fvover.rec.DocKind );
+  Query.addParam( "", RSDBP_IN, ServOp.rec.Date   );
+  Query.addParam( "", RSDBP_IN, FrValID           );
+  Query.execute();
+  DataSet = TRSBDataSet(Query);
+  if( DataSet.MoveNext() )
+     fvover.rec.OldFairValue = SQL_ConvTypeSum(DataSet.FairValue);
+  end;
+
+END;
+
+MACRO РассчитатьСС( _ServOp:MEMADDR )
+  var ndeal = TRecHandler( "dvndeal.dbt" );
+  var FrVal = TRecHandler( "dvnfrval" );
+  var cmd, fvover, RecCount:integer = 0, MaxRecCount:integer = 0;
+
+  ServOp.SetRecordAddr( _ServOp );
+
+  InitProgress( -1, "Операция переоценки справедливой стоимости ПФИ", "Отбор переоцениваемых сделок");
+  cmd = RsdCommand(RslDefCon, "begin\n RSB_Derivatives.DV_SelectNDealForOverFrVal(?);\n end; ");
+  cmd.NullConversion = true;
+  cmd.addParam( "", RSDBP_IN, ServOp.rec.ID );
+  cmd.execute();
+
+  MaxRecCount = SQL_GetNRecs( "SELECT * FROM DDVFVOVER_TMP" );
+  RemProgress();
+
+  InitProgress( MaxRecCount, "Выполнение ...", "Операция переоценки справедливой стоимости ПФИ" );
+  fvover = TBfile( "DVFVOVER.TMP", "W", 0 );
+  while( fvover.Next() )
+     PumpFairValueOld( fvover, ServOp );
+     FrVal.Clear();
+     FrVal.rec.DealID = fvover.rec.DealID;
+     FrVal.rec.DocKind = fvover.rec.DocKind;
+     FrVal.rec.Date   = ServOp.rec.Date;
+     if( DV_CalcFrVal(FrVal) != 0 )
+        fvover.rec.FairValue = fvover.rec.OldFairValue;
+        fvover.rec.NotCourse = "X";
+     else
+        fvover.rec.FairValue     = FrVal.rec.FairValue;
+        fvover.rec.SetDemand     = FrVal.rec.SetDemand;
+        fvover.rec.Demand        = FrVal.rec.Demand;
+        fvover.rec.SetLiability  = FrVal.rec.SetLiability;
+        fvover.rec.Liability     = FrVal.rec.Liability;
+        fvover.rec.SetDemand2    = FrVal.rec.SetDemand2;
+        fvover.rec.Demand2       = FrVal.rec.Demand2;
+        fvover.rec.SetLiability2 = FrVal.rec.SetLiability2;
+        fvover.rec.Liability2    = FrVal.rec.Liability2;
+     end;
+
+     /*  Для рассчитанных сумм по опциону выполнять проверку:
+         для опциона с направлением "покупка", если рассчитанная сумма СС меньше нуля, то приравнять рассчитанную сумму к нулю;
+         для опциона с направлением "продажа", если рассчитанная сумма СС больше нуля, то приравнять полученную сумму к нулю.*/
+     if( fvover.rec.DVKind == DV_OPTION )
+        if( (DL_GetRecHandler(ndeal,"select * from ddvndeal_dbt where t_ID = "+string(fvover.rec.DealID)+" and t_DocKind = "+string(fvover.rec.DocKind)) == true) AND
+            ( ((fvover.rec.FairValue < 0) and (ndeal.rec.Type == ALG_DV_BUY)) OR
+              ((fvover.rec.FairValue > 0) and (ndeal.rec.Type == ALG_DV_SALE))
+            )
+          )
+           fvover.rec.FairValue = 0;
+        end;
+     end;
+
+     if( not fvover.update() )
+        runerror( "Ошибка при обновлении записи в DDVFVOVER_TMP" );
+     end;
+     UseProgress( RecCount = RecCount + 1 );
+  end;
+  RemProgress();
+
+  return 0;
+
+OnError( RslErrObj )
+  return Exception( RslErrObj );
+END;
+
+MACRO ВыполнитьПереоценкуСС( doc:MEMADDR, FDoc:MEMADDR, DocKind )
+
+  record ndeal(dvndeal);
+  var FD;
+  var fvover = TRecHandler( "DVFVOVER.TMP" );
+  var FrVal = TRecHandler( "dvnfrval" );
+  var InsOperPS = TRecHandler( "dvoperps" );
+  var Sum:money = $0.0;
+  var DebAccount:string = "", CredAccount:string = "";
+
+  if( SvOpDvOper.rec.ID <= 0 )
+     MsgBox("Шаг \"Переоценка справедливой стоимости ПФИ\" должен выполняться только из соответствующей сервисной операции.");
+     return 1;
+  end;
+
+  SetBuff( ndeal, FDoc );
+  FD = DVFirstDocNDeal(DocKind, ndeal);
+
+  /* Проверяется, что по сделке еще не выполнена операция переоценки CC ПФИ */
+  var sql = RSDCommand( " SELECT oper.t_ID                               " +
+                        "   FROM ddvoperps_dbt operps, ddvoper_dbt oper  " +
+                        "  WHERE operps.t_DocKind =  ? AND               " +
+                        "        operps.t_DocID   =  ? AND               " +
+                        "        oper.t_ID        =  operps.t_OperID AND " +
+                        "        oper.t_DocKind   =  ? AND               " +
+                        "        oper.t_Date      >= ?                   " );
+  sql.addParam( "", RSDBP_IN, DocKind );
+  sql.addParam( "", RSDBP_IN, FD.Deal.rec.ID );
+  sql.addParam( "", RSDBP_IN, DL_DVOPER_OVERFRVAL );
+  sql.addParam( "", RSDBP_IN, SvOpDvOper.rec.Date );
+  sql.execute();
+  var OperPS = TRsbDataSet( sql );
+  if( OperPS.MoveNext() )
+     return DV_SrvOpSayError( DocKind, FD.DealRecHandler(), "По сделке уже выполнена переоценка справедливой стоимости ПФИ.", 1, true );
+  end;
+
+  if( not DL_GetRecHandler( fvover, " SELECT * FROM DDVFVOVER_TMP WHERE t_DealID = "+ string(FD.Deal.rec.ID) +" and t_DocKind = "+string(FD.Deal.rec.DocKind)) )
+     return DV_SrvOpSayError( DocKind, FD.DealRecHandler(), "Для сделки \"" + FD.Deal.rec.Code + "\" не были рассчитаны суммы переоценки.", 1, true );
+  end;
+
+  if( FD.IsOption() )
+     if( FD.IsBuy() and (fvover.rec.FairValue < 0) )
+        SvOpInsertError( DocKind, FD.DealRecHandler(), 1, "Для сделки \"" + FD.Deal.rec.Code + "\" не были рассчитаны суммы переоценки: "+
+                          "Покупатель опциона не допускает отражение в бух. учете стоимости ПФИ, представляющего собой обязательство.");
+        return 0;
+     elif( FD.IsSale() and (fvover.rec.FairValue > 0) )
+        SvOpInsertError( DocKind, FD.DealRecHandler(), 1, "Для сделки \"" + FD.Deal.rec.Code + "\" не были рассчитаны суммы переоценки: "+
+                          "Продавец опциона не допускает отражение в бух. учете стоимости ПФИ, представляющего собой актив.");
+        return 0;
+     end;
+  end;
+
+  FrVal.rec.ID             = 0;
+  FrVal.rec.DealID         = fvover.rec.DealID;
+  FrVal.rec.DocKind        = fvover.rec.DocKind;
+  FrVal.rec.Date           = SvOpDvOper.rec.Date;
+  FrVal.rec.InterimPayDate = SvOpDvOper.rec.Flag2;
+  FrVal.rec.FairValue      = fvover.rec.FairValue;
+  FrVal.rec.FairValueAlg   = FD.FairValueAlg();
+  FrVal.rec.SetDemand      = fvover.rec.SetDemand;
+  FrVal.rec.Demand         = fvover.rec.Demand;
+  FrVal.rec.SetLiability   = fvover.rec.SetLiability;
+  FrVal.rec.Liability      = fvover.rec.Liability;
+  FrVal.rec.SetDemand2     = fvover.rec.SetDemand2;
+  FrVal.rec.Demand2        = fvover.rec.Demand2;
+  FrVal.rec.SetLiability2  = fvover.rec.SetLiability2;
+  FrVal.rec.Liability2     = fvover.rec.Liability2;
+
+  if( ПроводкиПоПереоценкеСС( FD, doc, FrVal, fvover.rec.OldFairValue, true, Sum, DebAccount, CredAccount ) != 0 )
+     return 1;
+  end;
+
+  if( Sum > 0.0 )
+     InsOperPS.Clear();
+     InsOperPS.rec.DocKind = DL_DVHIST_CHANGE_FRVAL;
+     /*
+     Заполняется в сишнике
+       InsOperPS.rec.DocID   = FrVal.rec.ID;
+     */
+     InsOperPS.rec.OperID  = SvOpDvOper.rec.ID;
+     InsOperPS.rec.SetDate = Date(0,0,0);
+     InsOperPS.rec.Rate    = 0;
+     InsOperPS.rec.Summ    = Sum;
+     InsOperPS.rec.Flag    = IIF(fvover.rec.NotCourse == "X", 1, 0);
+
+     if( DV_InsertFrVal(FrVal, InsOperPS) != 0 )
+        return DV_SrvOpSayError( DocKind, FD.DealRecHandler(), "Ошибка при вставке записи оценки справедливой стоимости.", 1, true );
+     elif( РАБОТА_С_РЕПОЗИТАРИЕМ )
+        if( InsertGrDealFairValueRevaluation(FD, SvOpDvOper.rec.Date, DocKind) != 0 )
+           return DV_SrvOpSayError( DocKind, FD.DealRecHandler(), "Ошибка вставки строки графика \"Переоценка справедливой стоимости\"", 1, true );
+        end;
+     end;
+
+     InsOperPS.Clear();
+     /*
+     Заполняется в сишнике
+       InsOperPS.rec.DocKind = DL_DVOPER_OVERFRVAL;
+       InsOperPS.rec.DocID   = FD.Deal.rec.ID;
+       InsOperPS.rec.Flag    = 0;
+     */
+     InsOperPS.rec.Summ    = Sum;
+     InsOperPS.rec.Rate    = 0;
+     InsOperPS.rec.SetDate = Date(0,0,0);
+
+     InsOperPS.rec.DocID   = FD.Deal.rec.ID;   
+     if( OprInsertDVOPERPS( InsOperPS ) == false )
+        return DV_SrvOpSayError( DocKind, FD.DealRecHandler(), "Ошибка при вставке записи во временный файл операций.", 1, true );
+     end;
+  end;
+
+  SvOpReportData.InsertData( DebAccount, CredAccount, Abs(Sum) );
+
+  return 0;
+
+OnError( RslErrObj )
+  return Exception( RslErrObj );
+END;
+
+MACRO РассчитанныеЗначенияСС( _ServOp:MEMADDR )
+  VAR cmd, fvover;
+
+  ServOp.SetRecordAddr( _ServOp );
+
+  cmd = RsdCommand(RslDefCon, "begin\n RSB_Derivatives.DV_SelectNDealIncomOverFrVal(?);\n end; ");
+  cmd.NullConversion = true;
+  cmd.addParam( "", RSDBP_IN, ServOp.rec.ID );
+  cmd.execute();
+
+  fvover = TBfile( "DVFVOVER.TMP", "W", 0 );
+  while( fvover.Next() )
+     PumpFairValueOld( fvover, ServOp, int(fvover.rec.OldFairValue) );
+     if( not fvover.update() )
+        runerror( "Ошибка при обновлении записи в DDVFVOVER_TMP" );
+     end;
+  end;
+
+  return 0;
+
+OnError( RslErrObj )
+  RemProgress();
+  MsgBox( RslErrObj.Module + " строка " + RslErrObj.Line + "|" + RslErrObj.Message);
+  return 1;
+END;

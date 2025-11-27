@@ -1,0 +1,1 @@
+"C:\Program Files\liquibase\liquibase.bat" --changeLogFile=main-changelog.xml --logLevel=FINE update

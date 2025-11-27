@@ -1,0 +1,802 @@
+/**
+  @file nptxreqfun.mac
+  @brief Функции работы с заявлениями на возврат налога НДФЛ
+
+  В этом макросе собраны все функции для работы с заявлениями на возврат налога.
+  Тут и расчет сумм к возврату, и отправка уведомление клиентам на шагах операций
+
+  #tag
+  - functional_block:НДФЛ
+
+  #changelog
+*/
+
+IMPORT InsCarryDoc, DealsInter, "secinter.mac", "nptxcalcfun.mac", "SpRepFun.mac", "sccomiss.mac";
+import "u_common_email_utils.mac";
+
+/**
+  @brief Определить дату возврата излишнеудержанного налога по дате заявления
+         D1 + N календарных дней из настройки
+  @param[in] D1 - date Дата завления на возврат налога
+  @return DateRefund - дата возврата налога
+*/
+MACRO GetNptxReqDateRefund(D1:date):date
+  return GetDateAfterWorkDays((D1 + ПредельныйСрокВозвратаНалога(D1)),0); 
+END;
+
+/**
+  @brief Получить остаток счета НДФЛ к перечислению по основной ставке
+  @param[in] FD - объект класса перчиного документа
+  @param[in] ClientID - integer Идентификатор клиента
+  @param[in] dat - date Дата остатка
+  @return S1осн - остаток на дату
+*/
+MACRO GetS1осн(FD, ClientID:integer, dat:date)
+  var acc     = TRecHandler("account.dbt");
+  var S1осн   = $0;
+
+  if( FD.IsExistAccount("НДФЛ к перечислению, FLR", null, true, null, acc, null, dat, NATCUR ) )
+    S1осн = DL_GetRestAccount(acc.rec, dat);
+  end;
+
+  return S1осн;
+END;
+
+/**
+  @brief Получить остаток счета НДФЛ к перечислению по повышенной ставке
+  @param[in] FD - объект класса перчиного документа
+  @param[in] ClientID - integer Идентификатор клиента
+  @param[in] dat - date Дата остатка
+  @return S1повыш - остаток на дату
+*/
+MACRO GetS1повыш(FD, ClientID:integer, dat:date)
+  var acc     = TRecHandler("account.dbt");
+  var S1повыш   = $0;
+  
+  if( FD.IsExistAccount("НДФЛ к перечислению 15%", null, true, null, acc, null, dat, NATCUR ) )
+    S1повыш = DL_GetRestAccount(acc.rec, dat);
+  end;
+
+  return S1повыш;
+END;
+
+/**
+  @brief Получить остаток счета НДФЛ к перечислению по основной ставке в операции возврата НДФЛ
+         Вызывается из исходного кода
+  @param[in] nptxop - Адрес буфера dnptxop_dbt операции возврата НДФЛ
+  @return S1осн - остаток на дату операции
+*/
+MACRO GetS1osnToRefund(nptxop)
+  record rec_nptxop("nptxop");
+  var Oper = TRecHandler("nptxop.dbt");
+  var S1осн = $0;
+
+  SetBuff(rec_nptxop, nptxop);
+
+  Copy(Oper, rec_nptxop);
+
+  var FD = DLFirstDocNPTXOP(Oper);
+
+  S1осн = GetS1осн(FD, Oper.rec.Client, Oper.rec.OperDate);
+
+  return S1осн;
+END;
+
+/**
+  @brief Получить остаток счета НДФЛ к перечислению по повышенной ставке в операции возврата НДФЛ
+         Вызывается из исходного кода
+  @param[in] nptxop - Адрес буфера dnptxop_dbt операции возврата НДФЛ
+  @return S1повыш - остаток на дату операции
+*/
+MACRO GetS1povToRefund(nptxop)
+  record rec_nptxop("nptxop");
+  var Oper = TRecHandler("nptxop.dbt");
+  var S1осн = $0;
+
+  SetBuff(rec_nptxop, nptxop);
+
+  Copy(Oper, rec_nptxop);
+
+  var FD = DLFirstDocNPTXOP(Oper);
+
+  S1осн = GetS1повыш(FD, Oper.rec.Client, Oper.rec.OperDate);
+
+  return S1осн;
+END;
+
+
+//Проверить, что заявление создано при удержании НДФЛ
+macro CheckReqByEndYear(ReqID:integer, NpTxOpID:@integer)
+  var query, cmd, DataSet;
+
+  NpTxOpID = 0;
+
+  query =    "   SELECT nptxop.t_ID "
+           + "     FROM dnptxop_dbt req, doprdocs_dbt oprdoc, doproper_dbt op, dnptxop_dbt nptxop "
+           + "    WHERE req.t_DocKind = "+DL_RETREQ
+           + "      AND req.t_ID = ? "
+           + "      AND oprdoc.t_DocKind = 4752 /*DL_INSERT_NPTXOP*/ "
+           + "      AND oprdoc.t_DocumentID = LPAD(req.t_ID, 34, '0') "
+           + "      AND op.t_ID_Operation = oprdoc.t_ID_Operation "
+           + "      AND op.t_DocKind = " + DL_HOLDNDFL
+           + "      AND nptxop.t_ID = TO_NUMBER(op.t_DocumentID) ";
+
+  cmd = DL_RSDCommand();
+
+  cmd.AddParam(ReqID);
+
+  DataSet = cmd.Execute(query);
+  if(DataSet.moveNext())
+    NpTxOpID = DataSet.ID;
+    return true;
+  end;
+
+  return false;
+end;
+
+/**
+  @brief Расчитать налог к возврату по основной и повышенной ставке
+  @param[in] nptxop - TRecHandler Буфер dnptxop_dbt заявления на возврат налога
+  @param[in] ID_Step - integer Идентификатор шага операции сопровождения заявления на возврат налога
+  @param[out] retTaxMain - money Сумма налога по основной ставке
+  @param[out] retTaxHigh - money Сумма налога по повышенной ставке
+  @return S1повыш - остаток на дату операции
+*/
+MACRO CalcRetTax(nptxop, ID_Step, retTaxMain:@money, retTaxHigh:@money)
+  var Ds=$0, Dg=$0, Dp=$0, Dm=$0;
+  var Year = 0;
+  var err = 0;
+  var HoldEndYearNpTxOpID = 0;
+  var HoldEndYearNpTxOp = TBFile("nptxop.dbt");
+
+  retTaxMain = $0;
+  retTaxHigh = $0;
+
+  datesplit(nptxop.rec.PrevDate, 0, 0, Year);
+
+  CheckReqByEndYear(nptxop.rec.ID, @HoldEndYearNpTxOpID);
+
+  if(HoldEndYearNpTxOpID > 0)
+    if(HoldEndYearNpTxOpID > 0)
+      HoldEndYearNpTxOp.rec.ID = HoldEndYearNpTxOpID;
+      if(not HoldEndYearNpTxOp.GetEQ())
+        err = 1;
+      end;
+    end;
+
+    var SOFR_taxe0201     = STB_GetSavedNptxval(HoldEndYearNpTxOp.rec.DocKind, HoldEndYearNpTxOp.rec.ID, NPTXVAL_KIND_SOFR_TAXE0201);
+    var SOFR_taxe0208     = STB_GetSavedNptxval(HoldEndYearNpTxOp.rec.DocKind, HoldEndYearNpTxOp.rec.ID, NPTXVAL_KIND_SOFR_TAXE0208);
+    var DEPO_taxe0201     = STB_GetSavedNptxval(HoldEndYearNpTxOp.rec.DocKind, HoldEndYearNpTxOp.rec.ID, NPTXVAL_KIND_DEPO_TAXE0201);
+    var DEPO_taxe0207     = STB_GetSavedNptxval(HoldEndYearNpTxOp.rec.DocKind, HoldEndYearNpTxOp.rec.ID, NPTXVAL_KIND_DEPO_TAXE0207);
+    var DEPO_taxe0208     = STB_GetSavedNptxval(HoldEndYearNpTxOp.rec.DocKind, HoldEndYearNpTxOp.rec.ID, NPTXVAL_KIND_DEPO_TAXE0208);
+    var SOFR_taxe0201_IIS = STB_GetSavedNptxval(HoldEndYearNpTxOp.rec.DocKind, HoldEndYearNpTxOp.rec.ID, NPTXVAL_KIND_SOFR_TAXE0201_IIS);
+    var SOFR_taxe0208_IIS = STB_GetSavedNptxval(HoldEndYearNpTxOp.rec.DocKind, HoldEndYearNpTxOp.rec.ID, NPTXVAL_KIND_SOFR_TAXE0208_IIS); 
+    var DEPO_taxe0201_IIS = STB_GetSavedNptxval(HoldEndYearNpTxOp.rec.DocKind, HoldEndYearNpTxOp.rec.ID, NPTXVAL_KIND_DEPO_TAXE0201_IIS);
+    var DEPO_taxe0207_IIS = STB_GetSavedNptxval(HoldEndYearNpTxOp.rec.DocKind, HoldEndYearNpTxOp.rec.ID, NPTXVAL_KIND_DEPO_TAXE0207_IIS);
+    var DEPO_taxe0208_IIS = STB_GetSavedNptxval(HoldEndYearNpTxOp.rec.DocKind, HoldEndYearNpTxOp.rec.ID, NPTXVAL_KIND_DEPO_TAXE0208_IIS);
+    
+    Dg = SOFR_taxe0201 + DEPO_taxe0201 + DEPO_taxe0207 + SOFR_taxe0201_IIS + DEPO_taxe0201_IIS + DEPO_taxe0207_IIS;
+    Dp = SOFR_taxe0208 + DEPO_taxe0208 + SOFR_taxe0208_IIS + DEPO_taxe0208_IIS;
+  else
+    ///Вычисляем суммы налога по объектам НДР
+    err = CalcTaxDueReq(nptxop, ID_Step, 0, @retTaxMain, @retTaxHigh, @Ds, @Dg, @Dp, @Dm);
+  end;
+
+  if (err == 0)
+    /**
+      помимо добавления операции сопровождения 
+      ещё и пришлось отказаться от отдельной таблицы чисто под заявления на возврат
+      в пользу хранения заявлений на возврат во всё том же nptxop
+      
+      проблема возникла на стыке сохранения НДР
+      в связке НДР <-> операция, не существует вида документа
+      поэтому нет возвможности НДР крепить к другим сущеностям, нежели nptxop
+      а на какую-либо отдельную доработку уже не хватило времени
+      а с переделкой связки рискую что-либо отломать
+      
+      поле в БД и на форме сопоставлены так:
+      Код завления: Code
+      Клиент: Client
+      Дата заявления: OperDate
+      Время заявления: Time
+      Сумма к возврату: Tax
+      Налоговый год: PrevDate
+      Статус: Status
+      Налог к возврату по основной: TaxToPay
+      Налог к возврату по повышенной: TaxDp
+      Налог возвращенный по основной: TaxSum
+      Налог возвращенный по повышенной: TaxSum2
+    */
+    retTaxMain = Ds + Dg;
+    if (retTaxMain < $0)
+      retTaxMain = ABS(retTaxMain);
+    else
+      retTaxMain = $0;
+    end;
+
+    retTaxHigh = Dp;
+    if (retTaxHigh < $0)
+      retTaxHigh = ABS(retTaxHigh);
+    else
+      retTaxHigh = $0;
+    end;
+  end;
+
+  return err;
+END;
+
+/**
+  @brief Проверить операции списания при обработке заявлений на возврат налога
+         Согласно ТЗ: " Необходимо выдавать сообщение пользователю, если <DcalcBase> < <Dend> и найдены операции списания в период с <Dcalcbase>+1 по <Dend> включительно. 
+                      Примерный текст сообщения: "Обнаружены операции списания ц/б, для которых не проводился расчет связей и поэтому невозможно определить их стоимость", далее номера и даты таких операций.
+  @param[in] Client    - integer Идентификатор клиента
+  @param[in] BeginDate - date Дата начала периода проверки
+  @param[in] EndDate   - date Дата окончания периода проверки
+  @return stat - 0 в случае успеха, код ошибки в случае неудачи
+*/
+MACRO CheckSaleOperations(Client, BeginDate, EndDate)
+  var Query, rsd, DataSet;
+  var stat = 0;
+  var i = 0;
+
+  Query = "select SDL.t_DealDate, SDL.t_DealCode " +
+          "  from ddl_tick_dbt SDL, ddl_leg_dbt Leg, " +
+          "       (SELECT t_Kind_Operation, t_DocKind, rsb_secur.get_OperationGroup(t_SysTypes) oGrp " +
+          "          FROM doprkoper_dbt) Opr " +
+          " where SDL.t_BOfficeKind = " + string(DL_AVRWRT) +
+          "   and SDL.t_ClientID = ? " +
+          "   and SDL.t_DealDate >= ? " +
+          "   and SDL.t_DealDate <= ? " +
+          "   and Opr.t_Kind_Operation = SDL.t_DealType " +
+          "   and Opr.t_DocKind = SDL.t_BOfficeKind " +
+          "   and Rsb_Secur.IsSale(Opr.oGrp) = 1 " +
+          "   and Leg.t_DealID = SDL.t_DealID " +
+          "   and Leg.t_LegID = 0 " +
+          "   and Leg.t_LegKind = 0 " +
+          "   and (Exists " +
+                      " ( SELECT 1 FROM dobjatcor_dbt objatcor " +
+                      "    WHERE objatcor.t_ObjectType = "+ OBJTYPE_SECDEAL + " AND " + 
+                      "          objatcor.t_GroupID    = 30 AND " + /*"Является выплатой дохода в натуральной форме"*/
+                      "          objatcor.t_Object     = LPAD( SDL.t_DealID, 34, '0' ) AND "+
+                      "          objatcor.t_AttrID     = 1" + /*Да*/
+                      " ) " +
+          "       or" +
+          "          (select t_NotResident from dparty_dbt where t_PartyID = Leg.t_DepositID) = 'X'" +
+          "       )";
+
+  rsd = RSDCommand(Query);
+  rsd.addParam( "", RSDBP_IN, Client );
+  rsd.addParam( "", RSDBP_IN, BeginDate );
+  rsd.addParam( "", RSDBP_IN, EndDate );
+  rsd.execute();
+  DataSet = TRsbDataSet(rsd);
+  while( (DataSet.MoveNext()) and (not stat))
+    if(i == 0)
+      stat = DL_NPTX_PutMsg("Обнаружены операции списания ц/б, для которых не проводился расчет связей и поэтому невозможно определить их стоимость.");
+    end;
+    if(not stat)
+      stat = DL_NPTX_PutMsg("Операция №"+DataSet.DealCode+" от "+date(DataSet.DealDate));
+    end;
+    i = i + 1;
+  end;
+
+  return stat;
+END;
+
+
+/**
+  @brief Рассчитать налога к вовзрату в операции НДФЛ.
+  @param[in] nptxop - TRecHandler Буфер dnptxop_dbt. Не является записью о заявлении на вывод, а является, например, операцией удержания НДФЛ или списания д/с
+  @param[out] taxe     - money Рассчитанный налог по основной ставке
+  @param[out] taxe15   - money Рассчитанный налог по повышенной ставке
+  @param[out] TaxToPay - money Рассчитанный Налог к возврату
+*/
+MACRO CalcTaxPaymentToRefund(nptxop, taxe:@money, taxe15:@money, TaxToPay:@money, BreakFlag:@bool)
+  var EndDate = date(0,0,0), CalcDate = date(0,0,0);
+  var Year = 0;
+  var TO = $0, SO = $0, SZ = $0;
+  var Bg, Bm, Bs, Bo, Bd, Bp;
+  var Dg = $0, Dm = $0, Ds = $0, Dp = $0, Po = $0;
+
+  taxe     = $0; 
+  taxe15   = $0;
+  TaxToPay = $0;
+
+  BreakFlag = false;
+
+  DateSplit(nptxop.rec.PrevDate, NULL, NULL, Year);
+  EndDate = date(31,12,Year);
+
+  if(nptxop.rec.OperDate < EndDate)
+    EndDate = nptxop.rec.OperDate;
+  end;
+  
+  CalcDate = DL_GetCalcPeriodDate(NPTXCALC_CALCNDFL, nptxop.rec.Client, nptxop.rec.IIS);
+  if(EndDate < CalcDate)
+    CalcDate = EndDate;
+  end;
+
+  if((nptxop.rec.Subkind_Operation == DL_TXHOLD_OPTYPE_OUTMONEY) or (nptxop.rec.Subkind_Operation == DL_TXHOLD_OPTYPE_CLOSE)) //"Вывод д/с" или "Закрытие договора"
+    if(nptxop.rec.TOut == $0)
+      nptxop.rec.TOut = GetOutCurrencySum(nptxop.rec.Client, IIF(nptxop.rec.IIS == SET_CHAR, 1, 0), nptxop.rec.OperDate, nptxop.rec.OperDate, true, nptxop.rec.OperDate);
+    end;
+
+    TO = nptxop.rec.TOut;
+  end;
+
+  if((nptxop.rec.Subkind_Operation == DL_TXHOLD_OPTYPE_OUTMONEY) or (nptxop.rec.Subkind_Operation == DL_TXHOLD_OPTYPE_OUTAVOIR))
+    SO = nptxop.rec.OutSum = GetOutCurrencySum(nptxop.rec.Client, IIF(nptxop.rec.IIS == SET_CHAR, 1, 0), nptxop.rec.PrevDate, EndDate, false, nptxop.rec.OperDate);
+
+    if( nptxop.rec.Subkind_Operation == DL_TXHOLD_OPTYPE_OUTAVOIR )
+       SZ = nptxop.rec.OutCost = GetOutAvoirissSum(nptxop.rec.Client, IIF(nptxop.rec.IIS == SET_CHAR, 1, 0), nptxop.rec.PrevDate, EndDate, @TO);
+       nptxop.rec.TOut = TO;
+    else
+       SZ = nptxop.rec.OutCost = GetOutAvoirissSum(nptxop.rec.Client, IIF(nptxop.rec.IIS == SET_CHAR, 1, 0), nptxop.rec.PrevDate, EndDate);
+    end;
+
+    if(CalcDate < EndDate)
+      CheckSaleOperations(nptxop.rec.Client, CalcDate+1, EndDate);
+    end; 
+  end;
+
+
+  CalcPaidSum(nptxop.rec.Client, nptxop.rec.Contract, nptxop.rec.DocKind, nptxop.rec.Subkind_Operation, nptxop.rec.PrevDate, EndDate, SO, SZ, TO, @Bg, @Bm, @Bs, @Dm, @Ds, @Dg, nptxop.rec.IIS, @Po, @Bd, @Bp, @Dp );
+
+  if(nptxop.rec.Subkind_Operation == DL_TXHOLD_OPTYPE_TAXREF) ///<Возврат налога
+    var cmd, query, DataSet;
+    var nptxreq = TRecHandler("nptxop.dbt");
+
+    var FD = DLFirstDocNPTXOP(nptxop);
+    var S1осн   = GetS1осн(FD, nptxop.rec.Client, nptxop.rec.OperDate); 
+    var S1повыш = GetS1повыш(FD, nptxop.rec.Client, nptxop.rec.OperDate);
+
+    nptxreq.Clear();
+    
+    query =  "   SELECT * "
+           + "     FROM dnptxop_dbt "
+           + "    WHERE t_DocKind = "+DL_RETREQ+" AND t_Status IN ("+DLNPTXRETREQ_CHECKED+", "+DLNPTXRETREQ_PARTEXECUTED+") "
+           + "      AND t_Client = ? "
+           + " ORDER BY t_OperDate ASC, t_Time ASC";
+
+    cmd = DL_RSDCommand();;
+
+    cmd.AddParam(nptxop.rec.Client);
+     
+    DataSet = cmd.execute(query);
+    if(DataSet.moveNext())
+      DataSet.GetRecord().CopyTo(nptxreq.rec);
+
+      var DateRefund = GetNptxReqDateRefund(nptxreq.rec.OperDate);
+      var S2 = nptxreq.rec.TaxToPay;
+      var S3 = nptxreq.rec.TaxDp;
+      var S4 = nptxreq.rec.TaxSum;
+      var S5 = nptxreq.rec.TaxSum2;
+
+      var taxRefundDebt   = S2 - S4;
+      var taxRefundDebt15 = S3 - S5;
+
+      TaxToPay = (S2 - S4) + (S3 - S5);
+
+      if(nptxop.rec.OperDate >= DateRefund) ///<Наступил или прошел срок возврата
+        taxe   = taxRefundDebt;
+        taxe15 = taxRefundDebt15;
+      else ///<Не наступил срок возврата
+        if((S1осн < taxRefundDebt) or (S1повыш < taxRefundDebt15))
+          BreakFlag = true; //Необходимо прервать операцию
+        elif(nptxop.rec.OperDate < DateRefund) ///<Не наступил срок возврата
+          taxe   = min(S1осн,   taxRefundDebt);
+          taxe15 = min(S1повыш, taxRefundDebt15);
+        end;
+      end;
+
+     /* TaxToPay = min(TaxToPay, abs(min(Ds + Dg, 0)) + abs(min(Dp, 0)));
+
+      taxe   = min(taxe,   abs(min(Ds + Dg, 0)));
+      taxe15 = min(taxe15, abs(min(Dp, 0))); */    
+    else ///<Нет заявлений на возврат
+      TaxToPay = abs(min(Ds + Dg, 0)) + abs(min(Dp, 0));
+
+      taxe   = min(S1осн,   abs(min(Ds + Dg, 0)));
+      taxe15 = min(S1повыш, abs(min(Dp, 0)));
+    end;
+  end;
+END;
+
+/**
+  @brief Рассчитать налога к вовзрату в операции НДФЛ
+         Обертка CalcTaxPaymentToRefund для в ызывается из исходного кода
+  @param[in] nptxop - Адрес буфера dnptxop_dbt операции возврата НДФЛ
+  @return 0
+*/
+MACRO SetTaxPaymentToRefund(nptxop)
+  record rec_nptxop("nptxop.dbt");
+  var Oper = TRecHandler("nptxop.dbt");
+  var taxe = $0, taxe15 = $0, TaxToPay = $0;
+  
+  SetBuff(rec_nptxop, nptxop);
+
+  Copy(Oper, rec_nptxop);
+  
+  CalcTaxPaymentToRefund(Oper, @taxe, @taxe15, @TaxToPay);
+
+  rec_nptxop.Tax   = taxe + taxe15;
+  rec_nptxop.TaxDp = taxe15;
+
+  return 0;
+END;
+
+/**
+  @brief Получить сохраненную сумму по операции
+  @param[in] Oper - TRecHandler Буфер dnptxop_dbt
+  @param[in] ValueKind - вид сохраненной суммы 
+  @return val - money сохраненная сумма
+*/
+PRIVATE MACRO GetOperValue(Oper, ValueKind)
+  var query, cmd, DataSet;
+  var val = 0;
+
+  query =   " select v.t_Sum as Val"
+          + "   from ddl_value_dbt v "
+          + "  where v.t_DocKind = ? "
+          + "    and v.t_DocID = ? "
+          + "    and v.t_Kind = ? ";
+
+  cmd = DL_RSDCommand(query);
+
+  cmd.AddParam(Oper.rec.DocKind);
+  cmd.AddParam(Oper.rec.ID);
+  cmd.AddParam(ValueKind);
+
+  DataSet = cmd.Execute();
+  if(DataSet.moveNext())
+    val = DataSet.Val;
+  end;
+
+  return val;
+END;
+
+/**
+  @brief Сформировать уведомления о исполнении заявления/зачете налога на шаге операции НДФЛ
+  @param[in] Oper - TRecHandler Буфер dnptxop_dbt записи операции возврата НДФЛ или списания д/с
+*/
+MACRO CreateTaxMsg(Oper)
+  var nptxreq = TRecHandler("nptxop.dbt");
+  var query, cmd, DataSet;
+  var Year = 0;
+
+  nptxreq.Clear();
+
+  query =  "   SELECT * "
+         + "     FROM dnptxop_dbt "
+         + "    WHERE t_DocKind = "+DL_RETREQ+" AND t_Status IN ("+DLNPTXRETREQ_CHECKED+", "+DLNPTXRETREQ_PARTEXECUTED+") "
+         + "      AND t_Client = ? "
+         + "      AND t_PrevDate = ? "
+         + " ORDER BY t_OperDate ASC, t_Time ASC";
+
+  cmd = DL_RSDCommand();
+
+  cmd.AddParam(Oper.rec.Client);
+
+  if(Oper.rec.DocKind == DL_HOLDNDFL)
+    datesplit(Oper.rec.PrevDate, null, null, Year);
+  else
+    datesplit(Oper.rec.OperDate, null, null, Year);
+  end; 
+
+  cmd.AddParam(date(1,1,Year));
+
+  DataSet = cmd.execute(query);
+  if(DataSet.moveNext()) 
+    DataSet.GetRecord().CopyTo(nptxreq.rec);
+
+    DL_NPTX_PutMsg(string(nptxreq.rec.ID), 100); ///<Запомним в dnptxmes_dbt ID заявления для отправки уведомления по нему
+
+    var S2 = nptxreq.rec.TaxToPay;
+    var S3 = nptxreq.rec.TaxDp;
+    var S4 = nptxreq.rec.TaxSum;
+    var S5 = nptxreq.rec.TaxSum2;
+
+    var taxe   = Oper.rec.Tax - Oper.rec.TaxDp;
+    var taxe15 = Oper.rec.TaxDp;
+
+    var ReqStatus = nptxreq.rec.Status;
+    var prevReqStatus = ReqStatus;
+
+    if((Oper.rec.DocKind == DL_HOLDNDFL) and (Oper.rec.Subkind_Operation == DL_TXHOLD_OPTYPE_TAXREF)) //Возврат налога
+      S4 = S4 + taxe;
+      S5 = S5 + taxe15;
+
+      if((S4 == S2) and (S5 == S3))
+        
+        ReqStatus = DLNPTXRETREQ_EXECUTED; ///<Исполнено
+
+        /**Формируем и клиенту Уведомление 1
+           Текст уведомления и его вид запоминаем в таблице dnptxmes_dbt
+        */
+        DL_NPTX_PutMsg(   "<p style=\"text-align: center;\"><strong>Уведомление </strong></p>\n"
+                        + "<p style=\"text-align: center;\"><strong>о полном исполнении заявления о возврате налога</strong></p>\n"
+                        + "<p style=\"text-align: justify;\">Уважаемый клиент! Настоящим АО \"Россельхозбанк\" извещает о том, что Ваше заявление от "+string(nptxreq.rec.OperDate:f)+" исполнено в полном объёме.</p>\n",
+                        101
+                      );
+
+      elif(((S4 > 0) and (S4 < S2)) or ((S5 > 0) and (S5 < S3)) or ((S4 + S5 > 0) and (S4 + S5 < Oper.rec.TaxSum)))
+        ReqStatus = DLNPTXRETREQ_PARTEXECUTED; //Исполнено частично
+      end;
+
+      DL_RslChangeNptxRetReq(nptxreq.rec.ID, 
+                             "Status", ReqStatus,
+                             "RetSumMain", S4,
+                             "RetSumHigh", S5);
+
+
+    else ///<НЕ возврат налога
+      var Ds = GetOperValue(Oper, DL_VALUE_KIND_NPTXHOLD_PREV_DS);
+      var Dg = GetOperValue(Oper, DL_VALUE_KIND_NPTXHOLD_PREV_DG);
+      var Dp = GetOperValue(Oper, DL_VALUE_KIND_NPTXHOLD_PREV_DP);
+
+      if(((Ds + Dg) >= 0) and (S2 > 0))
+        S4 = S2;
+      else
+        if(abs(Ds + Dg) < (S2 - S4))
+          S4 = S2 - abs(Ds + Dg);
+        end;
+      end;
+
+      if((Dp >= 0) and (S3 > 0))
+        S5 = S3;
+      else
+        if(abs(Dp) < (S3 - S5))
+          S5 = S3 - abs(Dp);
+        end;
+      end;
+
+      if((S4 == S2) and (S5 == S3))
+        ReqStatus = DLNPTXRETREQ_EXECUTEDBART; ///<Исполнено зачетом
+
+        /**Формируем и клиенту Уведомление 2
+           Текст уведомления и его вид запоминаем в таблице dnptxmes_dbt
+        */
+        DL_NPTX_PutMsg(  "<p style=\"text-align: center;\"><strong>Уведомление </strong></p>\n"
+                       + "<p style=\"text-align: center;\"><strong>о полном зачете суммы налога к возврату и суммы удержанного налога</strong></p>\n"
+                       + "<p style=\"text-align: justify;\">Уважаемый клиент! Настоящим АО \"Россельхозбанк\" извещает о том, что в дату "+string(Oper.rec.OperDate:f)+" был произведен взаимозачет сумм удержанного налога и суммы налога к возврату в полном объеме по Вашему заявлению от "+string(nptxreq.rec.OperDate:f)+".</p>\n"
+                       , 102
+                      );
+
+      elif(((S4 > 0) and (S4 < S2)) or ((S5 > 0) and (S5 < S3)))
+        ReqStatus = DLNPTXRETREQ_PARTEXECUTED; //Исполнено частично
+
+        /**Формируем и клиенту Уведомление 3
+           Текст уведомления и его вид запоминаем в таблице dnptxmes_dbt
+        */
+        DL_NPTX_PutMsg(  "<p style=\"text-align: center;\"><strong>Уведомление </strong></p>\n"
+                       + "<p style=\"text-align: center;\"><strong>о частичном зачете суммы налога к возврату и суммы удержанного налога</strong></p>\n"
+                       + "<p style=\"text-align: justify;\">Уважаемый клиент! Настоящим АО \"Россельхозбанк\" извещает о том, что в дату "+string(Oper.rec.OperDate:f)+" был произведен частичный взаимозачет сумм удержанного налога и налога к возврату в сумме "+string(S4+S5)+" руб.  по Вашему заявлению от "+string(nptxreq.rec.OperDate:f)+". Остаток налога к возврату "+string(((S2+S3) - (S4+S5)))+" руб.</p>\n"
+                       , 103
+                      );
+      end;
+
+      DL_RslChangeNptxRetReq(nptxreq.rec.ID, 
+                             "Status", ReqStatus,
+                             "RetSumMain", S4,
+                             "RetSumHigh", S5);
+
+      if(prevReqStatus != ReqStatus)
+        ///На примечании к заявлению "Дата зачета" проставляем дату операции
+        AddNoteForObject(OBJTYPE_NPTXRETREQ, UniID(nptxreq,OBJTYPE_NPTXRETREQ), 1 /*Дата зачета*/, Oper.rec.OperDate, Oper.rec.OperDate);
+      end;
+    end;
+  end;
+END;
+
+/**
+  @brief Отправить уведомления о исполнении заявления/зачете налога, сфоримровнные на шаге операции НДФЛ
+         Вызывается в PostStep шага
+  @param[in] Oper - TRecHandler Буфер dnptxop_dbt записи операции возврата НДФЛ или списания д/с
+  @param[in] Action - integer Номер шага, на котором обрабатывалось завление
+*/
+MACRO SendTaxMsg(Oper, Action)
+  var query, cmd, DataSet;
+  var exec;
+  var Email = "", ContrNumber = "", ClientName = "";
+  
+  if(Oper.rec.Contract <= 0) ///<Если в операции нет договора
+    if((Oper.rec.Method == DL_TYPEGETNALOG_BROKER_ACC) and (Oper.rec.Account != ""))
+      ///Если возврат налога на брокерский счет, то ищем ДБО, к которому привязан счет и берем оттуда email и номер договора
+      query =   " select dlc.t_Email, sf.t_Number, pt.t_Name "
+              + "   from daccount_dbt acc, ddlcontracc_dbt dlacc, ddlcontr_dbt dlc, dsfcontr_dbt sf, dparty_dbt pt "
+              + "  where acc.t_Account = ? "
+              + "    and dlacc.t_AccountID = acc.t_AccountID "
+              + "    and dlc.t_DlContrID = dlacc.t_DlContrID "
+              + "    and sf.t_ID = dlc.t_SfContrID "
+              + "    and pt.t_PartyID = sf.t_PartyID ";
+
+
+      cmd = DL_RSDCommand(query);
+
+      cmd.AddParam(Oper.rec.Account);
+
+      DataSet = cmd.Execute();
+      if(DataSet.moveNext())
+        Email       = DataSet.Email;
+        ContrNumber = DataSet.Number;
+        ClientName  = DataSet.Name;
+      end;
+    else
+      ///Иначе ищем дейсвующий на дату возрата ДБО и берем оттуда email и номер договора
+      query =   " select q.t_Email, q.t_Number, q.t_Name "
+              + "   from (select dlc.t_Email, sf.t_Number, pt.t_Name"
+              + "           from dsfcontr_dbt sf, ddlcontr_dbt dlc, dparty_dbt pt "
+              + "          where sf.t_PartyID = ? "
+              + "            and sf.t_DateBegin <= ? "
+              + "            and dlc.t_SfContrID = sf.t_ID "
+              + "            and dlc.t_IIS = " + IIF((Oper.rec.IIS == SET_CHAR), "'X'" , "CHR(0)" )
+              + "            and pt.t_PartyID = sf.t_PartyID "
+              + "          order by sf.t_DateBegin DESC, sf.t_ID DESC "
+              + "        ) q ";
+
+      cmd = DL_RSDCommand(query);
+
+      cmd.AddParam(Oper.rec.Client);
+      cmd.AddParam(Oper.rec.OperDate);
+      DataSet = cmd.Execute();
+      if(DataSet.moveNext())
+        Email       = DataSet.Email;
+        ContrNumber = DataSet.Number;
+        ClientName  = DataSet.Name;
+      end;
+    end;
+  else ///В операции есть конкретный договор (субдоговор)
+    ///Тогда по субдоговору ищем ДБО и берем оттуда email и номер договора 
+    query =   " select dlc.t_Email, sf.t_Number, pt.t_Name "
+            + "   from ddlcontrmp_dbt mp, ddlcontr_dbt dlc, dsfcontr_dbt sf, dparty_dbt pt "
+            + "  where mp.t_SfContrID = ? "
+            + "    and dlc.t_DlContrID = mp.t_DlContrID "
+            + "    and sf.t_ID = dlc.t_SfContrID "
+            + "    and pt.t_PartyID = sf.t_PartyID ";
+
+    cmd = DL_RSDCommand(query);
+
+    cmd.AddParam(Oper.rec.Contract);
+
+    DataSet = cmd.Execute();
+    if(DataSet.moveNext())
+      Email       = DataSet.Email;
+      ContrNumber = DataSet.Number;
+      ClientName  = DataSet.Name;
+    end;
+
+  end;
+  
+  if(Email != "")
+    var ReqID = 0;
+
+    SQL_Execute("TRUNCATE TABLE DNPTXMES_TMP");
+
+    ///Ищем ID заявления, которое мы обрабатывали на шаге. Мы запомнили его в dnptxmes_dbt в записи с видом 100
+    query =   " select TO_NUMBER(msg.t_Message) as ReqID"
+            + "   from dnptxmes_dbt msg"
+            + "  where msg.t_DocID = ? "
+            + "    and msg.t_Action = ? "
+            + "    and msg.t_Type = 100 "
+            + " order by msg.t_ID ASC";
+
+    cmd = DL_RSDCommand(query);
+
+    cmd.AddParam(Oper.rec.ID);
+    cmd.AddParam(Action);
+
+    DataSet = cmd.Execute();
+    if(DataSet.moveNext())
+      ReqID = int(DataSet.ReqID);
+    end;
+
+    if(ReqID > 0)
+      ///Ищем сформированные Уведомления, которые мы запомнили в dnptxmes_dbt в записях с видом 101, 102, 103
+      query =   " select msg.t_Message, msg.t_Type "
+              + "   from dnptxmes_dbt msg"
+              + "  where msg.t_DocID = ? "
+              + "    and msg.t_Action = ? "
+              + "    and msg.t_Type in (101, 102, 103) "
+              + " order by msg.t_ID ASC";
+
+      cmd = DL_RSDCommand(query);
+
+      cmd.AddParam(Oper.rec.ID);
+      cmd.AddParam(Action);
+
+      DataSet = cmd.Execute();
+      while(DataSet.moveNext())
+        var emailText, Subject, v_email_processor;
+
+        ///Для каждого Уведомления формируем заголовок (тему) письма
+        if(DataSet.Type == 101)
+          Subject = "Заявление на возврат НДФЛ. Договор " + ContrNumber + "_" + ClientName;
+        elif(DataSet.Type == 102)
+          Subject = "Взаимозачет по НДФЛ. Договор " + ContrNumber + "_" + ClientName;
+        elif(DataSet.Type == 103)
+          Subject = "Взаимозачет по НДФЛ. Договор " + ContrNumber + "_" + ClientName;
+        end;
+
+        emailText = DataSet.Message; ///<Содержимое Уведомления, которое мы сформировали ранее и запомнили
+
+        if(DataSet.Type == 101)
+          ///Для уведомления о полном исполнении заявления добавляем в тело письма табличку с проводками
+          var q, d, select;
+          var tableStr = "";
+
+          q =   " with grdoc as (select distinct grdoc.t_ServDocKind, grdoc.t_ServDocID from ddlgrdoc_dbt grdoc where grdoc.t_DocKind = ? and grdoc.t_DocID = ?) "
+              + " select /*+LEADING(grdoc, op, odoc, trn)*/ SUM(trn.t_Sum_Payer) as S, trn.t_Date_Carry "
+              + "   from grdoc, doproper_dbt op, doprdocs_dbt odoc, dacctrn_dbt trn "
+              + "  where op.t_DocKind = grdoc.t_ServDocKind "
+              + "    and op.t_DocumentID = LPAD(grdoc.t_ServDocID, 34, '0') "
+              + "    and odoc.t_ID_Operation = op.t_ID_Operation "
+              + "    and odoc.t_DocKind = " + DLDOC_CARRY
+              + "    and trn.t_AccTrnID = odoc.t_AccTrnID "
+              + "    and trn.t_Chapter = 1 "
+              + "    and trn.t_Account_Payer LIKE '603%' "
+              + "  group by trn.t_Date_Carry"
+              + "  order by trn.t_Date_Carry ASC"; 
+
+          select = DL_RSDCommand(q);
+
+          select.AddParam(DL_RETREQ);
+          select.AddParam(ReqID);
+
+          if(select.GetCount() > 0)
+            ///Заголовок таблицы в html-формате
+            tableStr =   "<table style=\"border-collapse: collapse; width: 55%;\" border=\"1\">"
+                       + "<tbody>"
+                       + "<tr>"
+                       + "<td style=\"width: 19%; text-align: center;\">Дата возврата</td>"
+                       + "<td style=\"width: 36%; text-align: center;\">Сумма возврата</td>"
+                       + "</tr>";
+
+            d = select.Execute();
+            while(d.moveNext())
+              ///Добавляем по строке с проводками
+              tableStr = tableStr + "<tr>"
+                                  + "<td style=\"width: 19%; text-align: center;\">"+string(date(d.Date_Carry):f)+"</td>"
+                                  + "<td style=\"width: 36%; text-align: center;\">"+string(d.S)+"</td>"
+                                  + "</tr>";
+            end;
+
+            tableStr = tableStr + "</tbody></table>";
+          end;
+
+          emailText = emailText + tableStr;
+        end;
+
+        emailText =   "<div>"
+                    + emailText
+                    + "\n<br>"
+                    + "\n<br>По всем возникающим вопросам просьба обращаться по электронной почте Broker@rshb.ru"
+                    + "</div>";
+
+        v_email_processor = c_email_proc_env();
+        v_email_processor.m_add_email_to_list(Email);
+        v_email_processor.m_add_broker_email_to_list();
+        v_email_processor.m_set_msg_head(Subject);
+        v_email_processor.m_add_row_to_msg_text(emailText);
+        v_email_processor.m_save_to_submit_synch(true);
+        v_email_processor.m_submit_email_synch(); ///<Отправка Уведомления
+
+        ///Добавляем сообщение в протокол операции
+        if(v_email_processor.m_get_error_status())
+           exec = DL_RSDCommand("call RSI_NPTMSG.PutMsg(10,?)");
+           exec.AddParam("Уведомление о зачете суммы налога к возврату и суммы удержанного налога не отправлено: " + v_email_processor.get_service_msg());
+           exec.ExecuteCMD();
+        else
+           exec = DL_RSDCommand("call RSI_NPTMSG.PutMsg(50,?)");
+           exec.AddParam("Уведомление о зачете суммы налога к возврату и суммы удержанного налога отправлено");
+           exec.ExecuteCMD();
+        end;
+      end;
+      ///Сохранение всех сообщений протокола в базе
+      exec = DL_RSDCommand("call RSI_NPTMSG.SaveOperLog(?,?,1)");
+      exec.AddParam(Oper.rec.ID);
+      exec.AddParam(Action);
+      exec.ExecuteCMD();
+    end;
+  end;
+
+END;

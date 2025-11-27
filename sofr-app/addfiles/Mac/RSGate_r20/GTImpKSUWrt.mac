@@ -1,0 +1,295 @@
+/*
+ $Name:         GTImpKSUWrt.mac
+ $Module:       Шлюз Securities
+ $Description:  Импорт операций списания/зачисления КСУ
+*/
+
+import OPrInter, SpInter, FiInter, PtInter, SfInter, CtInter, DealsInter, BankInter, SecInter, "globals.mac", "gtdlfun.mac";
+import "rgtgtrec.mac", "gtconst.inc", "rgobj.mac";
+IMPORT "cb_err.mac";
+
+PRIVATE CONST UnknownParty = -1;
+
+PRIVATE CONST SET_CHAR   = "X";
+PRIVATE CONST UNSET_CHAR = "";
+
+PRIVATE CONST Код_на_ММВБ_ФинИн   = 11;
+PRIVATE CONST Код_на_ММВБ_Субъект = 8;
+
+VAR Код_ФинИн, Код_Субъект;
+VAR imp_date;
+VAR ErrMes:string;
+
+//UPD 83 GAA: перенес из дистрибутива, т.к. фрагмент имеется в 80,81, 82 версиях
+PRIVATE MACRO SetWarning( Comment:@STRING, WarningText:String )
+  Comment = WarningText; 
+  return -1;
+END;
+//ГЗВ 83
+
+PRIVATE MACRO SetError( ErrorText )
+  RunError( "", ErrorText );
+END;
+
+PRIVATE MACRO GetMarketSchemeByDepSet(TradAcc:string,MarketID:integer,ErrMsg:@string)
+   var MarketSchemeID = 0, DEPSETID = 0;
+   var sql = DL_RSDCommand( " select nvl(DEP.T_DEPSETID,0) DEPSETID, nvl(DEP.T_CODE,chr(1)) DEPSETCODE, nvl(MARKET.T_ID,0) MarketSchemeID "
+                           +"   from ddltracc_dbt tracc, ddldepset_dbt dep, ddlmarket_dbt market "
+                           +"  where tracc.t_TradAcc  = ? "                          
+                           +"    and tracc.t_MarketID = ? "                                     
+                           +"    and tracc.t_Affiliation = ? "                                  
+                           +"    and DEP.T_DEPSETID(+) = TRACC.T_DEPSETID "                     
+                           +"    and MARKET.T_DEPSETID(+) = TRACC.T_DEPSETID "                  
+                           +"    and MARKET.T_MARKET(+) = ? "                                   
+                           +"    and MARKET.T_ORCB(+) = chr(88) "                               
+                           +"    and MARKET.T_ISTRUST(+) != chr(88) "                           
+                           +"    and MARKET.T_FI_KIND(+) = ? "                                  
+                           +" order by DEPSETID desc, MarketSchemeID desc "
+                          );                 
+                           
+   sql.addParam(TradAcc);
+   sql.addParam(MarketID);                  
+   sql.addParam(ALG_SP_MONEY_SOURCE_OWN);/*КСУ загружаем только для собственных*/
+   sql.addParam(MarketID);                  
+   sql.addParam(FIKIND_AVOIRISS);
+
+   var DataSet = sql.execute();
+   if(DataSet.MoveNext())
+      DEPSETID = SQL_ConvTypeInteger(DataSet.DEPSETID);             
+      MarketSchemeID = SQL_ConvTypeInteger(DataSet.MarketSchemeID);
+      if( DEPSETID == 0 )
+         ErrMsg = "В списке схем депозитарного учета не определена схема для торгово-клирингового счета "+TradAcc;
+      elif( MarketSchemeID == 0 )
+         ErrMsg = "Не найдена схема расчетов, в которой указана схема депозитарного учета "+DataSet.DEPSETCODE;
+      end;
+   else
+      ErrMsg = "В списке торговых счетов не определен торгово-клиринговый счет "+TradAcc;
+   end;
+
+   return MarketSchemeID;
+END;
+
+macro _SecDeal_KSUWrt_CreateNew(RecordID:INTEGER, SeanceID:INTEGER, ID:@STRING, Comment:@STRING):INTEGER
+   var RG;
+   var OperGroup;
+   var stat:integer, type:integer, BaseFIID = ALLFININSTR;
+
+   var tick    = TRecHandler( "dl_tick.dbt"  );
+   var dl_leg1  = TRecHandler( "dl_leg.dbt"   );
+   var ExtBuff = TRecHandler( "dl_extsettlecode.dbt" );
+
+   record fininstr(fininstr);
+   record finin_delivering(fininstr);
+   record issues(avoiriss);
+
+   var ClntRep        = TRecHandler( "spground.dbt" );
+   var outlay         = TRecHandler( "dlsum.dbt"    );
+
+   var spgrdoc        = TRecHandler( "spgrdoc.dbt"  );
+   var dl_leg2        = TRecHandler( "dl_leg.dbt"   );
+   var spgr1          = TRecHandler( "spground.dbt" );
+   var spgr2          = TRecHandler( "spground.dbt" );
+
+   var rq_avance1   = TRecHandler( "dlrq.dbt" );
+   var rq_avance2   = TRecHandler( "dlrq.dbt" );
+   var rq_acc_clnt  = TRecHandler( "dlrqacc.dbt" );
+   var rq_acc_contr = TRecHandler( "dlrqacc.dbt" );
+   var rq_acc_clnt_depo  = TRecHandler( "dlrqacc.dbt" );
+   var rq_acc_contr_depo = TRecHandler( "dlrqacc.dbt" );
+
+   var dlcomis_market = TRecHandler( "dlcomis.dbt"  );
+   var dlmarket       = TRecHandler( "dlmarket.dbt");  
+
+   VAR ArrComSums = TArray();/*список комиссиий (бирже)*/
+   var spground = TBFile( "spground", "R", 4 );
+ 
+   var StrTempParm:string = "";
+
+   Comment = "";
+
+   RG = TGTRecord();
+   RG.LoadFromDB(RecordID);
+
+   VAR SourceID = RG.GetSourceID();
+
+   Код_ФинИн   = Код_на_ММВБ_ФинИн;
+   Код_Субъект = Код_на_ММВБ_Субъект;
+
+   tick.rec.DealStatus  = DL_PREPARING;
+   tick.rec.ClientID    = tick.rec.BrokerID = tick.rec.DepositID = tick.rec.KindDealPartyClient = UnknownParty;
+
+   tick.rec.PortfolioID = KINDPORT_BACK_KSU;/*ПВО_КСУ*/
+   tick.rec.PortfolioID_2 = -1;
+
+   tick.rec.Department = {OperDprt};
+   tick.rec.Oper       = {Oper};    
+
+   tick.rec.Flag3 = SET_CHAR;
+
+   dl_leg1.rec.Scale       = dl_leg1.rec.IncomeScale = 1;
+   dl_leg1.rec.IncomePoint = 2;
+   dl_leg1.rec.Session     = -1;
+   dl_leg1.rec.Registrar   = UnknownParty;
+
+   if( (GetParmByName( RG,"RGDLWRT_DEALTYPE", @tick.rec.DealType, @type)  == NULL) OR (type != V_INTEGER) )
+      SetError( "Не найден вид операции в параметре RGDLWRT_DEALTYPE объекта " + String(RecordID) );
+   else
+      if( tick.rec.DealType != 0 )
+         var koper    = TBFile( "oprkoper", "R", 0 );
+
+         koper.Clear();
+         koper.rec.Kind_Operation = tick.rec.DealType;
+
+         if( koper.GetEQ() )
+            if(koper.rec.DocKind == DL_AVRWRT)
+               tick.rec.BofficeKind = koper.rec.DocKind;
+               OperGroup = GetOperationGroup( tick.rec.DealType );
+            else
+               SetError( "Операция " +  string(tick.rec.DealType) + " не является сервисной операцией списания/зачисления ц/б БОЦБ" );
+            end;
+         else
+            SetError( "Не найден вид операции " + string(tick.rec.DealType) + " в параметре RGDLWRT_DEALTYPE объекта " + String(RecordID) );
+         end;
+      end;
+   end;
+
+   if( (GetParmByName(RG, "RGDLWRT_BANKACCID", @StrTempParm, @type) == NULL) OR (type != V_STRING) )
+      SetError( "Не найден расчетный код  в параметре RGDLWRT_BANKACCID объекта " + String(RecordID) );
+   else
+      if( FindDL_EXTSETTLECODEbyCode( StrTempParm, ExtBuff ) != 0 )
+         ErrMes = GetErrMsg();
+         if( ErrMes != "" )
+            SetError("Расчетный код " + StrTempParm + " не может быть использован.\n" + ErrMes);
+         else
+         SetError("В справочнике расчетных кодов банка не найден код " + StrTempParm);
+      end; 
+      end; 
+      if( (ExtBuff.rec.MarketKind != DL_MARKETKIND_SETTLE_STOCK_T0) and (ExtBuff.rec.MarketKind != DL_MARKETKIND_SETTLE_STOCK_TPLUS) )
+         SetError("В справочнике расчетных кодов банка для расчетного кода " + StrTempParm + " задан некорректный биржевой рынок");
+      end;
+      if( ExtBuff.rec.CodeType != ALG_SP_MONEY_SOURCE_OWN )
+         SetError("Тип, заданный в справочнике расчетных кодов банка для " + StrTempParm + ", не соответствует принадлежности загружаемой операции. Загружаются операции с принадлежностью \"собственные\"");
+      end;
+   end;
+
+   if( (GetParmByName(RG, "RGDLWRT_DEALDATE", @tick.rec.DealDate, @type) == NULL) OR (type != V_DATE) )
+      SetError( "Не найдена дата операции в параметре RGDLWRT_DEALDATE объекта " + String(RecordID) );
+   end;
+
+   dl_leg1.rec.Expiry = dl_leg1.rec.Maturity = tick.rec.DealDate;
+
+   if( (GetParmByName( RG,"RGDLWRT_DEALCODETS", @tick.rec.DealCodeTS, @type )  == NULL) OR (type != V_STRING) )
+      SetError( "Не найден номер операции в торговой системе в параметре RGDLWRT_DEALCODETS объекта " + String(RecordID) );
+   end;
+
+   if( (GetParmByName( RG,"RGDLWRT_DEALTIME", @tick.rec.DealTime, @type )  == NULL) OR (type != V_TIME) )
+      SetError( "Не найдено время заключения операции в параметре RGDLWRT_DEALTIME объекта " + String(RecordID) );
+   end;
+
+   dl_leg1.rec.SupplyTime = tick.rec.DealTime;
+
+   if( (GetParmByName( RG,"RGDLWRT_ISIN", @StrTempParm, @type )  == NULL) OR (type != V_STRING) OR (StrTempParm == "") )
+      SetError( "Не найден ISIN в параметре RGDLWRT_ISIN объекта " + String(RecordID) );
+   else
+      if( ПолучитьФинИн( StrTempParm, fininstr, issues, NULL, NULL, FICK_ISIN ) != 0 )
+         if( (GetParmByName( RG,"RGDLWRT_SECURITYID", @StrTempParm, @type )  == NULL) OR (type != V_STRING) OR (StrTempParm == "") )
+            SetError( "Не найден код ц/б в параметре RGDLWRT_SECURITYID объекта " + String(RecordID) );
+         else
+            if( ПолучитьФинИн( StrTempParm, fininstr, issues, NULL, NULL, FICK_MICEX ) != 0 )
+               SetError( "В справочнике не найдена ценная бумага с кодом на ММВБ = \"" + StrTempParm + "\" объекта " + String(RecordID) );
+            end; 
+         end;
+      end; 
+   end;
+
+   if( fininstr.AvoirKind != AVOIRISSKIND_KSU )
+      SetError( "Операция с кодом "+tick.rec.DealCodeTS+" является операцией зачисления/списания КСУ. Вид ц/б "+fininstr.FI_CODE+" не соответствует виду \'Клиринговый сертификат участия\'" );
+   end;
+
+   tick.rec.PFI = dl_leg1.rec.PFI = dl_leg1.rec.DeliveringFIID = fininstr.FIID;
+//UPD 83 GAA: перенес из дистрибутива, т.к. фрагмент имеется в 80,81, 82 версиях
+   dl_leg1.rec.CFI = dl_leg1.rec.PayFIID = dl_leg1.rec.NKDFIID = tick.rec.PreOutlayFIID = fininstr.FaceValueFI;
+//UPD 83
+   if( (GetParmByName( RG,"RGDLWRT_MARKET", @StrTempParm, @type )  == NULL) OR (type != V_STRING) OR (StrTempParm == "") )
+      SetError( "Не найден код биржи в параметре RGDLWRT_MARKET объекта " + String(RecordID) );
+   else
+      if( GetRealID( RG_PARTY, StrTempParm, PTCK_CONTR, @tick.rec.MarketID, @ErrMes ) != 0 )
+         SetError( ErrMes );
+      end;
+   end;
+
+   if( (GetParmByName( RG,"RGDLWRT_TRDACCID", @StrTempParm, @type )  == NULL) OR (type != V_STRING) )
+      SetError( "Не найден код торгово-клирингового счета в параметре RGDLWRT_TRDACCID объекта " + String(RecordID) );
+   else
+      tick.rec.MarketSchemeID = GetMarketSchemeByDepSet(StrTempParm,tick.rec.MarketID,@ErrMes);
+      if( tick.rec.MarketSchemeID == 0 )
+         SetError( ErrMes );
+      else
+         if( FindDLMARKET(tick.rec.MarketSchemeID,dlmarket) != 0 )
+            SetError( "Не найдена схема расчетов по ID = "+string(tick.rec.MarketSchemeID) );
+         end;
+         tick.rec.TraderID       = dlmarket.rec.Centr;
+         tick.rec.MarketOfficeID = dlmarket.rec.CentrOffice;
+         tick.rec.DepSetID       = dlmarket.rec.DepSetID;/*схему ДУ записываем, но в депозитарий помещаем НРД (по ТЗ)*/
+      end;
+   end;
+
+   if( not RG_GetCentralContrForMarket( IIF(((SourceID == GT_SPB) or (SourceID == GT_PAYMENTS_SPB)), false, true ),null,@tick.rec.PartyID,@ErrMes) )
+      SetError( ErrMes );
+   end;
+
+   if( (GetParmByName( RG,"RGDLWRT_AMOUNT", @dl_leg1.rec.Principal, @type )  == NULL) OR (type != V_MONEY) )
+      SetError( "Не найдено кол-во ц/б в параметре RGDLWRT_AMOUNT объекта " + String(RecordID) );
+   end;
+
+   dl_leg1.rec.Price = 1.0;
+   dl_leg1.rec.TotalCost = dl_leg1.rec.Cost = dl_leg1.rec.Principal;
+   tick.rec.Points = dl_leg1.rec.Point = 4;
+
+   if( IsAVRWRTIN( OperGroup ) )
+       dl_leg1.rec.Start = tick.rec.DealDate;
+   end;
+   if( RG_GetSecurNRDCode(@StrTempParm,@ErrMes) != 0 )
+      SetError( ErrMes );
+   else
+      if( GetRealID( RG_PARTY, StrTempParm, PTCK_CONTR, @dl_leg1.rec.DepositID, @ErrMes ) == 0 )
+      else
+         SetError( "Не найден субъект с кодом " + String(StrTempParm) + " вида " + string(PTCK_CONTR) );
+      end;
+   end;
+
+//DAN Снятие признака "Учитывать в налоговом учете"
+   tick.rec.flag3 = UNSET_CHAR;
+//DAN
+
+   stat = SP_DealGateCreateNew(  tick,
+                                 dl_leg1, dl_leg2,
+                                 spgr1, spgr2,
+                                 rq_avance1,   
+                                 rq_avance2,
+                                 rq_acc_clnt,
+                                 rq_acc_contr,
+                                 rq_acc_clnt_depo,
+                                 rq_acc_contr_depo,
+                                 ClntRep,
+                                 outlay,  ArrComSums,
+                                 spgrdoc );
+
+   if(stat != 0)
+      SetError("Ошибка при вставке операции списания/зачисления ц/б в БОЦБ.\n"
+        + CB_ErrMsg(GetErrMsg(), tick.rec.clientid, dl_leg1.rec.cfi) // DEF-66627 заменяем неинформативное сообщение
+      );
+   end;
+
+   ID  = string( tick.rec.DealID );
+   Comment = Comment + "В БОЦБ создана операция списания/зачисления ц/б № " + tick.rec.DealCode + ". DealID = " + tick.rec.DealID;
+   return 0;
+
+OnError( ErrObj )
+   if( ErrObj.Err != NULL )
+      Comment = ErrObj.Err;
+   else
+      Comment = ErrObj.Module + " строка " + ErrObj.Line + "\n" + ErrObj.Message;
+   end;
+   return 1;
+end;

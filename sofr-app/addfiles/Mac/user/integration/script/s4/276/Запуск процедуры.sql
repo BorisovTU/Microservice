@@ -1,0 +1,3 @@
+begin
+    rsFillPFI(:pdate);
+end;

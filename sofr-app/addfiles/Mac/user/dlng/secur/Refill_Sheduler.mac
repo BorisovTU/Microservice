@@ -1,0 +1,344 @@
+/** 
+ @file Refill_Sheduler.mac
+ @brief Процедуры для планировщика по созданию платежей подкрепления
+  
+ # tag 
+ - functional_block:Клиенты_Зачисление
+ - code_type:API
+
+   
+ # changeLog 
+ |date       |author         |tasks            |note                            
+ |-----------|---------------|-----------------|--------------------------------
+ |01.04.2024 |Гераськина Т.В.|BOSS-1702        | Создание
+
+*/ 
+import Refill_CreatePayment;
+import Refill_Class;
+import "u_common_email_utils.mac", "cblogger2.mac";
+
+
+// для ответа планировщика
+private var SS_RESPONSE_REPEAT_OK = 0; /* Продолжение попытки выполнить исполняемую процедуру (функцию) после успешного исполнения */
+private var SS_RESPONSE_REPEAT_ERROR = 1; /* Продолжение попытки выполнить исполняемую процедуру (функцию) после ошибки */
+private var SS_RESPONSE_NEXT = 2; /* Успешное завершение работы метода - переход к следующему методу */
+private var SS_RESPONSE_END = 3; /* Успешное завершение всего сервиса */
+private var SS_RESPONSE_FATAL = 4; /* Ошибка исполнения, обработка всей цепочки прерывается */
+private var SS_RESPONSE_PROXY = 5; /* Запрос отправлен во внешнюю систему через Proxy, требуется перриодический анализ изменения состояния */
+
+private var itlog = NewLogger(c_logger.IT_LOG_TYPE, "Refill");
+
+/**
+@brief Класс ответа планировщика
+@param[in] p_ProcessState  статус обработки
+@param[in] p_ErrorNumber номер ошибки
+@param[in] p_ErrorText текст ошибки
+
+*/
+private class c_ssRunResult(p_ProcessState, p_ErrorNumber, p_ErrorText)
+   var ProcessState;
+   var ErrorNumber;
+   var ErrorText;
+
+   private macro init_ssRunResult(p_ProcessState, p_ErrorNumber, p_ErrorText)
+      if(ValType(p_ProcessState) != V_UNDEF)
+         ProcessState = p_ProcessState;
+      end;
+      if(ValType(p_ErrorNumber) != V_UNDEF)
+         ErrorNumber = p_ErrorNumber;
+      end;
+      if(ValType(p_ErrorText) != V_UNDEF)
+         ErrorText = p_ErrorText;
+      end;
+   end;
+
+   init_ssRunResult(p_ProcessState, p_ErrorNumber, p_ErrorText);
+end;
+
+
+/**
+@brief Запуск создания платежей подкрепления
+
+*/
+macro PushRefill()
+   var flag, err;
+   GetRegistryValue("РСХБ\\БРОКЕРСКОЕ ОБСЛУЖИВАНИЕ\\РУБИЛЬНИК AVT_BOSS-104", V_BOOL, flag, err);
+   if(flag)
+      return 0;
+   end;    
+   const C_TIME_EXPIRED = 10; // минут
+   const C_ERROR_CODE_EXPIRED = -1001;
+   const C_ERROR_CODE_PROCESS = 0;
+   const C_ERROR_CODE_FATAL = -2002;
+   const C_EMAIL_GRP = 16;
+
+   var ds, sql, cmd;
+   var ResultSheduler = c_ssRunResult(SS_RESPONSE_END);
+   var v_Link = TLink();
+   var sql_upd, cmd_upd;
+   var sql_upd_step, cmd_upd_step;
+
+   var regname;
+   var stat = IsRegAutoRefillOn(regname);
+   if (not stat)
+      return ResultSheduler;
+   end;
+
+   sql = String("select op.*, mp.t_sfcontrid, mp.t_rcodetks, sf.t_number        \n"+
+                "  from dnptxop_dbt op, dparty_dbt p,                           \n"+
+                "       dsfcontr_dbt sf, ddlcontrmp_dbt mp                      \n"+
+                " where op.t_client = p.t_partyid                               \n"+
+                "   and p.t_legalform = "+PTLEGF_INST+"                         \n"+
+                "   and sf.t_id = op.t_contract                                 \n"+
+                "   and sf.t_servkind = "+PTSK_STOCKDL+                        "\n"+
+                "   and sf.t_servkindsub = "+CC_SERV_SUBKIND_STOCK+            "\n"+
+                "   and sf.t_id = mp.t_sfcontrid                                \n"+
+                "   and op.t_status in (0,1)                                    \n"+
+                "   and op.t_dockind = 4607                                     \n"+
+                "   and op.t_subkind_operation = 10                             \n"+
+                "   and not NVL(mp.t_rcodetks, CHR(1)) in ('" + C_RCODE_OWN + "', '" + C_RCODE_SEPARATE + "', '" + C_RCODE_NONSEPARATE + "', CHR(1)) \n"+
+                "   and not exists (select 1 from UNPTXOP_PAYMENT_LINK_DBT u    \n"+
+                "                    where u.t_nptxopid = op.t_id)                ");
+   ds = TRsbDataSet(sql);
+   while (ds.movenext())
+
+      // транзакция для каждой операции
+      if ( not rslDefCon.isInTrans() )
+         rslDefCon.beginTrans();   
+      end;
+      
+      var refill = TRefill();
+      refill.Rec.m_ID                = 0;
+      refill.Rec.m_DATE_OPERATION    = date();
+      refill.Rec.m_TIME_OPERATION    = time();
+      refill.Rec.m_TIME_ACCEPT       = time(0,0,0);
+      refill.Rec.m_TYPE              = C_REFILL_TYPE_AUTO;
+      refill.Rec.m_TYPE_REFILL       = C_REFILL_TYPE_INDIVIDUAL;
+      refill.Rec.m_TYPE_REFILL_NAME  = C_REFILL_TYPE_INDIVIDUAL_NAME;
+      refill.Rec.m_SUM_OPERATION     = ds.outsum;
+      refill.Rec.m_RCODE             = ds.rcodetks;
+      refill.Rec.m_Account           = C_ACCOUNT_PAYER_INDIVIDUAL;
+      refill.Rec.m_CONTRACT          = ds.sfcontrid;
+      refill.Rec.m_CONTRACT_NUMBER   = ds.number;
+      refill.Rec.m_STATUS            = C_REFILL_ACTION_OPENED;
+      refill.Rec.m_STATUS_NAME       = refill_GetStatusName(C_REFILL_ACTION_OPENED);
+      refill.Rec.m_OPER              = {Oper};
+      refill.Rec.m_OPER_NAME         = refill_OperName(refill.Rec.m_OPER);
+      
+      if (not refill.SaveRefillOperation())
+        itlog.Error("Ошибка при создании операции SaveRefillOperation для ДО '" + ds.number + "', РК '" + ds.rcodetks + "'");
+        continue;
+      end;
+      
+      v_Link.Refillid = refill.Rec.m_ID;
+      v_Link.Nptxopid = ds.id;
+      if (StrLen(ds.rcodetks) <= 1)
+         v_Link.ErrorCode = 1;
+         v_Link.ErrorText = "Не задан расчетный код клиента для договора "+ds.number;
+      elif ((ds.rcodetks == C_RCODE_OWN) or (ds.rcodetks == C_RCODE_SEPARATE) or (ds.rcodetks == C_RCODE_NONSEPARATE))
+         v_Link.ErrorCode = 1;
+         v_Link.ErrorText = "Расчетный код клиента " + ds.rcodetks + " не является индивидуальным";
+      else 
+         v_Link.ErrorCode = CreateRefillPayment(ds.operdate, ds.outsum, ds.rcodetks, ds.id, 0, C_ACCOUNT_PAYER_INDIVIDUAL, 
+                                                @v_Link.AccTrnId, @v_Link.PaymentId, @v_Link.ErrorText);
+         
+         if (v_Link.ErrorCode == 0)
+           refill.Rec.m_CurStepID = C_STEP_ACTION_UNLOAD;
+         
+           if (not refill.SaveRefillOperation())
+             v_Link.ErrorCode = 1;
+             v_Link.ErrorText = "Ошибка создания операции";
+           end;
+         end;
+      end;
+
+      if ( rslDefCon.isInTrans() )
+        if (v_Link.ErrorCode == 1) // произошла ошибка
+           rslDefCon.rollbackTrans();
+        else 
+           rslDefCon.commitTrans();
+        end;
+      end;
+
+      FixLink(v_Link);  // фиксирование результата вне транзакции
+
+   end; 
+
+   /* запуск платежей на выполнение (контроль платежа - добавление в таблицу событий) */
+   RunRefillPayment();
+
+   /* проверка созданных событий на выгрузку */
+   sql = String(" declare                                                                           \n"+
+                "     v_recid number(10);                                                           \n"+
+                "     OBJTYPE_PAYMENT number(10):= 501;                                             \n"+
+                "     v_rec UREFILL_DBT%rowtype;                                                    \n"+
+                "     v_oper number(10) := :poper;                                                  \n"+
+                " begin                                                                             \n"+
+                "     for c in (select d.*, rowid from UNPTXOP_PAYMENT_LINK_DBT d                   \n"+
+                "                                 where t_eventid = 0) loop                         \n"+
+                "         v_recid  := - 1;                                                          \n"+
+                "         begin                                                                     \n"+
+                "             select t_recid into v_recid                                           \n"+
+                "               from utableprocessevent_dbt u                                       \n"+
+                "              where t_objecttype = OBJTYPE_PAYMENT                                 \n"+
+                "                and t_objectid = c.t_paymentid                                     \n"+
+                "                and t_recid = (select max(t_recid) from utableprocessevent_dbt u2  \n"+
+                "                                where u2.t_objecttype = u.t_objecttype             \n"+
+                "                                  and u2.t_objectid = u.t_objectid);               \n"+
+                "         exception                                                                 \n"+
+                "             when no_data_found then                                               \n"+
+                "                        v_recid := -1;                                             \n"+
+                "         end;                                                                      \n"+
+                "         if v_recid > 0 then                                                       \n"+
+                "             update UNPTXOP_PAYMENT_LINK_DBT                                       \n"+
+                "                 set t_eventid = v_recid                                           \n"+
+                "              where rowid = c.rowid;                                               \n"+
+
+                "             INSERT INTO UNPTXOP_PAYMENT_LINK_STEP_DBT                             \n"+
+                "                (T_STEPID, T_REFILLID, T_SYSTEMDATE, T_ACTION, T_COMMENT, T_OPER)  \n"+
+                "             VALUES (0, c.t_refillid, sysdate, 40, 'Отправка платежа ', v_oper);   \n"+
+
+                "             begin                                                                 \n"+
+                "               select * into v_rec                                                 \n"+
+                "                 from UREFILL_DBT                                                  \n"+
+                "                where t_id = c.t_refillid;                                         \n"+
+
+                "               INSERT INTO UREFILL_STEP_DBT                                        \n"+
+                "                     (T_STEPID, T_REFILLID, T_DATE_OPERATION, T_SYSTEMDATE,        \n"+
+                "                      T_ACTION, T_COMMENT, T_OPER)                                 \n"+
+                "               VALUES (0, v_rec.t_id, v_rec.t_date_operation, sysdate,             \n"+
+                "                      :paction, :pcomment, v_oper);                                \n"+
+                "             exception                                                             \n"+
+                "               when no_data_found then null;                                       \n"+
+                "             end;                                                                  \n"+
+                "         end if;                                                                   \n"+
+                "    end loop;                                                                      \n"+
+                " end;                                                                              ");
+   cmd = RSDCommand(sql);
+   cmd.AddParam("poper", RSDBP_IN, {oper});
+   cmd.AddParam("paction", RSDBP_IN, C_STEP_ACTION_PROCESS_STATUS);
+   cmd.AddParam("pcomment", RSDBP_IN, "");
+   cmd.execute();
+   cmd.close();
+
+   /* проверка времени обработки созданных событий */
+   sql = String(" declare                                                                              \n"+
+                "    v_messageid number(10) :=0;                                                       \n"+
+                "    v_error varchar2(2000 byte);                                                      \n"+
+                "    v_code number(10);                                                                \n"+
+                "    TIME_EXPIRED number(10) := :ptime;                                                \n"+
+                "    CODE_EXPIRED number(10) := :pcode;                                                \n"+
+                "    v_rec UREFILL_DBT%rowtype;                                                        \n"+
+                "    v_oper number(10) := :poper;                                                      \n"+
+                " begin                                                                                \n"+
+                "    for c in (select u.*, l.rowid, l.t_refillid                                       \n"+
+                "                from UNPTXOP_PAYMENT_LINK_DBT l,                                      \n"+
+                "                     UTABLEPROCESSEVENT_DBT u                                         \n"+
+                "               where l.t_eventid = u.t_recid                                          \n"+
+                "                 and t_responseid = 0) loop                                           \n"+
+                "       v_messageid := 0;                                                              \n"+
+                "       v_error := '';                                                                 \n"+
+                "       v_code := 0;                                                                   \n"+
+                "       if c.t_status = 4 then                                                         \n"+
+                "          v_messageid := c.t_messageid;                                               \n"+
+                "          v_error := 'OK';                                                            \n"+
+                "       elsif c.t_status = 5 then                                                      \n"+
+                "          v_messageid := -1;                                                          \n"+
+                "          v_error := c.t_resulttext;                                                  \n"+
+                "          v_code := c.t_resultcode;                                                   \n"+
+                "       else                                                                           \n"+
+                "          if c.t_timestamp < (sysdate - NUMTODSINTERVAL(TIME_EXPIRED, 'MINUTE')) then \n"+
+                "             v_messageid := CODE_EXPIRED;                                             \n"+
+                "             v_error := 'Ответ не получен за '||TIME_EXPIRED||' минут';               \n"+
+                "             v_code := CODE_EXPIRED;                                                  \n"+
+                "          end if;                                                                     \n"+
+                "       end if;                                                                        \n"+
+                "       update UNPTXOP_PAYMENT_LINK_DBT                                                \n"+
+                "          set t_responseid = v_messageid,                                             \n"+
+                "              t_errorcode = v_code,                                                   \n"+
+                "              t_errortext = v_error                                                   \n"+
+                "        where rowid = c.rowid;                                                        \n"+
+                "       if v_messageid <> 0 then                                                       \n"+
+                "         INSERT INTO UNPTXOP_PAYMENT_LINK_STEP_DBT                                    \n"+
+                "            (T_STEPID, T_REFILLID, T_SYSTEMDATE, T_ACTION, T_COMMENT, T_OPER)         \n"+
+                "         VALUES (0, c.t_refillid, sysdate, 50, SUBSTR('Ответ на отправку платежа '||v_error, 1, 200), v_oper); \n"+
+                "       end if;                                                                        \n"+
+                "       if c.t_status = 4 then                                                         \n"+
+                "          begin                                                                       \n"+
+                "             select * into v_rec                                                      \n"+
+                "               from UREFILL_DBT                                                       \n"+
+                "              where t_id = c.t_refillid;                                              \n"+
+                "             INSERT INTO UREFILL_STEP_DBT                                             \n"+
+                "                (T_STEPID, T_REFILLID, T_DATE_OPERATION, T_SYSTEMDATE,                \n"+
+                "                 T_ACTION, T_COMMENT, T_OPER)                                         \n"+
+                "             VALUES (0, v_rec.t_id, v_rec.t_date_operation, sysdate,                  \n"+
+                "                     :paction, :pcomment, v_oper);                                    \n"+
+                "             update UREFILL_DBT                                                       \n"+
+                "                set t_status = :pstatus, t_status_name = :pstatusname                 \n"+
+                "              where t_id = v_rec.t_id;                                                \n"+
+                "          exception                                                                   \n"+
+                "             when no_data_found then null;                                            \n"+
+                "          end;                                                                        \n"+
+                "       end if;                                                                        \n"+
+                "    end loop;                                                                         \n"+
+                " end;                                                                                  ");
+   cmd = RSDCommand(sql);
+   cmd.Addparam("ptime", RSDBP_IN, C_TIME_EXPIRED);
+   cmd.Addparam("pcode", RSDBP_IN, C_ERROR_CODE_EXPIRED);
+   cmd.AddParam("poper", RSDBP_IN, {oper});
+   cmd.AddParam("paction", RSDBP_IN, C_STEP_ACTION_CLOSE);
+   cmd.AddParam("pcomment", RSDBP_IN, "");
+   cmd.AddParam("pstatus", RSDBP_IN, C_REFILL_ACTION_CLOSED);
+   cmd.AddParam("pstatusname", RSDBP_IN, refill_GetStatusName(C_REFILL_ACTION_CLOSED));
+   cmd.execute();
+   cmd.close();
+
+   /* рассылка просроченных событий */
+   var count_errors = 0;
+   var list_paymentid_str = "";
+   sql = String("select s.*, rowid from UNPTXOP_PAYMENT_LINK_DBT s \n"+
+                " where t_responseid = "+C_ERROR_CODE_EXPIRED+    "\n"+ 
+                "   and t_errorcode = "+C_ERROR_CODE_EXPIRED        );
+   sql_upd = String(" update UNPTXOP_PAYMENT_LINK_DBT  \n"+
+                    "   set t_errorcode = :pcode       \n"+
+                    " where rowid = :r                  ");
+   sql_upd_step = String(" INSERT INTO UNPTXOP_PAYMENT_LINK_STEP_DBT  \n"+
+                         "  (T_STEPID, T_REFILLID, T_SYSTEMDATE, T_ACTION, T_COMMENT, T_OPER)  \n"+
+                         " VALUES (0, :prefillid, sysdate, 99, 'Ответ на отправку платежа просрочен', :poper) ");
+
+   ds = TRsbDataSet(sql);
+   while (ds.movenext())
+      count_errors = count_errors + 1;
+      list_paymentid_str = String(list_paymentid_str, " ", ds.paymentid, " \n");
+      cmd_upd = RSDCommand(sql_upd);
+      cmd_upd.AddParam("pcode", RSDBP_IN, C_ERROR_CODE_FATAL);
+      cmd_upd.AddParam("r", RSDBP_IN, ds.rowid);
+      cmd_upd.execute();
+      cmd_upd.close();
+      cmd_upd_step = RSDCommand(sql_upd_step);
+      cmd_upd_step.AddParam("prefillid", RSDBP_IN, ds.refillid);
+      cmd_upd_step.AddParam("poper", RSDBP_IN, {oper});
+      cmd_upd_step.execute();
+      cmd_upd_step.close();
+   end;
+
+   if (count_errors > 0)
+      var v_email_processor = c_email_proc_env();
+      v_email_processor.m_set_msg_head("СОФР - Выгрузка подкрепления счетов НКЦ");
+      v_email_processor.m_add_row_to_msg_text("Не получен ответ за "+C_TIME_EXPIRED+" минут на выгруженные платежи. Список Id платежей СОФР: ");
+      v_email_processor.m_add_row_to_msg_text(list_paymentid_str);
+      v_email_processor.m_save_to_submit_grp(C_EMAIL_GRP, true);
+      v_email_processor.m_submit_email_synch();      
+   end;
+
+   return ResultSheduler;
+onError(err)  
+   var error = c_err_obj.obtain_err_msg(err);
+   var code = c_err_obj.obtain_err_code(err); 
+   
+   if ( rslDefCon.isInTrans() )
+      rslDefCon.rollbackTrans();
+   end;
+
+   return ResultSheduler = c_ssRunResult(SS_RESPONSE_FATAL, code, error);
+end;

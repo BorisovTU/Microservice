@@ -1,0 +1,4758 @@
+/*
+$Name:        spserv.mac
+$Module:      Ценные бумаги
+$Description: Функции для операций с ценными бумагами
+*/
+IMPORT CurrInter, FIInter, PaymInter, CTInter, SfInter, OprInter, DealsInter, BankInter, secinter, globals, Календарь, "dltransf.mac";
+import RsbDataSet, "cb_sql.mac", "Rcbconst.mac", "dldlngfun.mac", captureoutput;
+
+PRIVATE  record   fininstr(fininstr);
+PRIVATE  file     FindOper( oproper )  key 1; 
+
+CONST ONCECOM_MODE_CALC_ALL   = 0; /*все комиссии*/
+CONST ONCECOM_MODE_CALC_AGENT = 1; /*посреднику*/
+CONST ONCECOM_MODE_CALC_BANK  = 2; /*банку*/
+CONST ONCECOM_MODE_CALC_REG   = 3; /*регистратору - рег.сбор*/
+
+/*Вид действия*/
+CONST DL_SERVACTION_UNDEF = -1,
+      DL_SERVACTION_PAY   = 0,/*Оплата*/
+      DL_SERVACTION_CLOSE = 10;/*Закрытие*/
+
+private const DOCKIND_CONTR_FIRSTPART  = 22, /* вид - договора по первой части */
+        DOCKIND_CONTR_SECONDPART = 23, /* вид - договора по второй части */
+        DOCKIND_BUYSALEREPORT    = 26; /* вид - договор купли/продажи */
+
+
+
+/*Определяем коррсчет по схеме рассчетов с учетом признака 
+   клиентская/собственная в пользовательском поле1 значение Z 
+   на схеме рассчетов. 30.01.2019 Chesnokov D.S. */
+MACRO ПолучитьКоррсчетПоКоррсхеме(BoKind, DealID, FIID, BankID):string
+  var RetAcc:string = "";
+  var rs, cmd, str;
+
+  str = " SELECT t_account                                      " +
+        "   FROM DCORSCHEM_DBT                                  " +
+        "  WHERE t_corrid = ? AND t_fiid = ?                    " +
+        "    AND t_userfield1 = (CASE (SELECT t_clientid        " + 
+        "                                FROM ddl_tick_dbt      " +
+        "                               WHERE t_bofficekind = ? " +
+        "                                 AND t_dealid = ?)     " +
+        "                        WHEN -1 THEN CHR (1)           " +
+        "                        ELSE CHR(90) /*Z*/             " +
+        "                        END)                           ";
+
+  cmd = RsdCommand(str);
+  cmd.addParam("corrid", RSDBP_IN, BankID);
+  cmd.addParam("fiid",   RSDBP_IN, FIID);
+  cmd.addParam("bokind", RSDBP_IN, BoKind);
+  cmd.addParam("dealid", RSDBP_IN, DealID);
+
+  rs = RsdRecordset(cmd);
+  if (rs and rs.MoveNext())
+    return string(rs.value("t_account"));
+  end;
+
+  return RetAcc;
+END;
+
+MACRO GenerateNumberByReference( ObjType:INTEGER, RefType:INTEGER, RefID:@INTEGER, RefNum:@STRING )
+  if( GetReferenceIDByType( ObjType, RefType, RefID) )
+     MsgBox( "Не найден описатель референса" );
+     return false;
+  elif( GenerateReference( RefID, RefNum ) )
+     MsgBox( "Ошибка при генерации референса по описателю " + string(RefID) );
+     return false;
+  end;
+  return true;
+END;
+
+MACRO GetDealCodeNew( ) : string
+
+  var RefNum : string = "";
+  var RefID : integer = 0;
+
+  GenerateNumberByReference(RCB_OBJTYPE_SECDEAL, RCB_REFOBJ_SEC_DEALCODE, @RefID, @RefNum);
+  println(RefNum);
+
+  return RefNum;
+end;
+      
+//сформировать код для "Операции изменения номинала"
+MACRO GetCommCodeNew( ) : string
+
+  var RefNum : string = "";
+  var RefID : integer = 0;
+
+  GenerateNumberByReference(RCB_OBJTYPE_SECURSERVOP, RCB_REFOBJ_SVOP_UNIAVR, @RefID, @RefNum);
+  println(RefNum);
+
+  return RefNum;
+end;
+      
+MACRO GetCommCodeNewByPrm( OBJTYPE, REFOBJ ) : string
+
+  var RefNum : string = "";
+  var RefID : integer = 0;
+
+  GenerateNumberByReference(OBJTYPE, REFOBJ, @RefID, @RefNum);
+  println(RefNum);
+
+  return RefNum;
+end;
+      
+
+/* Получить относительный доход (в процентах) с учетом масштаба.
+   Возвращаем double. */
+macro fiwarnts_GetIncomeRate( fiwarnts )
+   return fiwarnts.IncomeRate / fiwarnts.IncomeScale;
+end;
+
+/* Получить процент дохода по купону. Если доход по купону задан в процентах,
+   то возвращаем его, если в абсолютной величине, то считаем величину
+   абсолютного дохода от номинала (FaceValue) в процентах.
+   FaceValue - номинал бумаги в double
+   Возвращаем double.
+   Учитываем точность и масштаб. */
+macro fiwarnts_GetIncomePercent( fiwarnts, FaceValue )
+   if( fiwarnts.RelativeIncome == SET_CHAR )
+      return fiwarnts_GetIncomeRate(fiwarnts);
+   else
+      /* Абсолютный доход */
+      if( (FaceValue != $0) AND (fiwarnts.IncomeScale != 0) )
+
+         return   100 * (fiwarnts.IncomeVolume)
+                  / pow(10,fiwarnts.IncomePoint-2)
+                  / fiwarnts.IncomeScale / FaceValue;
+      else
+         return $0;
+      end;
+   end;
+end;
+
+/*** Работа с курсами валют *************************************************/
+
+PRIVATE MACRO ПолучитьПрямойКурсПоТипу( RateRec, RateDate:DATE, fiidTo:INTEGER, fiidFrom:INTEGER, Type:INTEGER ):INTEGER
+  VAR Data, Query, ErrorFlag = -1;
+
+  if( Type > 0 )
+     Query = RSDCommand(
+               "SELECT t_rateid "+
+               "  FROM (SELECT t_rateid "+
+               "            FROM (SELECT rate.t_rateid, rate.t_sincedate "+
+               "                    FROM dratedef_dbt rate "+
+               "                   WHERE rate.t_otherfi = ? "+ /*string(Fiid_from) */
+               "                     AND rate.t_FIID    = ? "+ /*string(FIIDT_to) */
+               "                     AND rate.t_type    = ? "+ /*string(type) */
+               "                     AND t_sincedate    = (SELECT MAX (t_sincedate) "+
+               "                                             FROM dratedef_dbt "+
+               "                                            WHERE     t_otherfi = rate.t_otherfi "+
+               "                                                  AND t_type    = rate.t_type  "+
+               "                                                  AND t_sincedate <= ? "+ /*RateDate*/
+               "                                          ) "+
+               "                  UNION "+
+               "                    SELECT r.t_rateid, h.t_sincedate "+
+               "                      FROM dratehist_dbt h, dratedef_dbt r "+
+               "                     WHERE     r.t_rateid    = h.t_rateid "+
+               "                           AND r.t_otherfi   = ? "+  /*string(Fiid_from) */
+               "                           AND r.t_FIID      = ? "+ /*string(FIIDT_to) */
+               "                           AND r.t_type      = ? "+ /*string(type) */
+               "                           AND h.t_sincedate = ( SELECT MAX (h2.t_sincedate) "+
+               "                                                   FROM dratehist_dbt h2, dratedef_dbt r2 "+
+               "                                                  WHERE r2.t_rateid  = h2.t_rateid "+
+               "                                                    AND r2.t_otherfi = r.t_otherfi "+
+               "                                                    AND r2.t_type    = r.t_type  "+
+               "                                                    AND h2.t_sincedate <= ?  "+ /*RateDate*/
+               "                                               ) "+
+               "                 ) "+
+               "        ORDER BY t_sincedate DESC "+
+               "       ) "+
+               " WHERE ROWNUM = 1 "
+                       );
+
+    Query.addParam( "", RSDBP_IN, fiidFrom );
+    Query.addParam( "", RSDBP_IN, fiidTo );
+    Query.addParam( "", RSDBP_IN, Type );
+    Query.addParam( "", RSDBP_IN, RateDate );
+    Query.addParam( "", RSDBP_IN, fiidFrom );
+    Query.addParam( "", RSDBP_IN, fiidTo );
+    Query.addParam( "", RSDBP_IN, Type );
+    Query.addParam( "", RSDBP_IN, RateDate );
+    Query.execute();
+
+    Data = TRsbDataSet( Query );
+    if( Data.MoveNext() )
+        ErrorFlag = ПолучитьКурс( RateRec, SQL_ConvTypeInteger( Data.rateid ) ); 
+    end;
+  end;
+
+  return ErrorFlag;
+END;  
+
+PRIVATE MACRO ПолучитьКурсПоТипу( RateRec, RateDate:DATE, fiidTo:INTEGER, fiidFrom:INTEGER, Type:INTEGER ):INTEGER
+   VAR ErrorFlag = ПолучитьПрямойКурсПоТипу( RateRec, RateDate, fiidTo, fiidFrom, Type );
+
+   if( ErrorFlag )
+      ErrorFlag = ПолучитьПрямойКурсПоТипу( RateRec, RateDate, fiidFrom, fiidTo, Type );
+      if( not ErrorFlag )
+         RateRec.IsInverse = IIF( RateRec.IsInverse == SET_CHAR, UNSET_CHAR, SET_CHAR );
+      end;
+   end;
+
+   return ErrorFlag;
+END;
+
+macro isIndexNom(fiid)
+  var cmd = DL_RSDCommand();
+  var q = "select 1 from dfininstr_dbt fin, davoiriss_dbt avr "
+          " where fin.t_fiid = ? "
+          "   and fin.t_fiid = avr.t_fiid "
+          "   and avr.t_indexnom = 'X'";
+  cmd.AddParam(fiid);
+  var ds = cmd.Execute(q);
+  return ds.moveNext();
+end;
+
+macro GetRateValueOnDate( RateRec, ADate:DATE, fiidFrom:INTEGER, fiidTo:INTEGER, SayError, Error, SinceDate )
+
+   /* Получить коэффициент. */
+   macro CalcK( RateRec )
+      return RateRec.Rate / RateRec.Scale / pow(10, RateRec.Point);
+   end;
+
+   var
+      FaceValue = 0.0, FaceFIID = -1, K = 0.0,
+      ErrorFlag   = false;
+   
+   var avr = TRecHandler("avoiriss.dbt"), indexnom:bool = false;
+   
+   if (ПолучитьФинИн(fiidFrom, null, avr) == 0)
+     if(avr.rec.indexnom == SET_CHAR)
+       indexnom = true;
+     end;
+   end;
+
+   if( (ПолучитьЗначениеКурса( RateRec, ADate ) == 0) and (RateRec.OtherFI == fiidFrom) )
+
+      /* Курс нашли. Надо проверить признак обратной котировки и признак
+         относительного курса. Сразу оба не могут быть установлены.
+         Проверка RateRec.OtherFI == fiidFrom нужна, т.к. функция
+         ПолучитьКурс иногда, но не всегда, берет обратный курс, а нам
+         это не надо. */
+      SinceDate = RateRec.SinceDate;
+
+      if( RateRec.IsInverse == SET_CHAR )
+
+         /* Обратная котировка. */
+         if( CalcK(RateRec) == 0.0 )
+            K = 0.0;
+         else
+            K = 1.0 / CalcK(RateRec);
+         end;
+
+      elif( RateRec.IsRelative == SET_CHAR )
+
+         /* Относительная цена */
+         FaceValue = 0.0;
+         if(   (FI_GetNominal(fiidFrom, FaceValue, FaceFIID) == 0)
+               and (FaceFIID == fiidTo)
+               )
+            if (indexnom)//бумаги с индексированным номиналом
+              FaceValue = GetFaceValue( fiidFrom, ADate);
+              if( FaceValue > 0.0 ) //CDS по облигациям с индексированным номиналом, номинал на дату курса
+                K = CalcK(RateRec) / 100 * FaceValue;
+              else//или на ближайшую меньшую дату 
+                var Query = RsdCommand("select t_facevalue from dv_fi_facevalue_hist where t_fiid = ? and t_begdate <= ? order by t_begdate desc");
+                    Query.AddParam("FIID", RSDBP_IN, fiidFrom);
+                    Query.AddParam("BEGD", RSDBP_IN, ADate);
+                var Dt = TRsbDataSet(Query);
+                if (Dt.movenext())
+                   if (Dt.FaceValue > 0.0)
+                     K = CalcK(RateRec) / 100 * Dt.FaceValue;
+                   end;
+                end;
+              end;
+            else
+              FaceValue = GetFaceValue( fiidFrom, ADate);//CDS номинал всегда на дату курса
+              if( FaceValue > 0.0 ) 
+                 K = CalcK(RateRec) / 100 * FaceValue;
+              end;
+            end;
+         else
+            ErrorFlag = true;
+         end;
+
+      else
+
+         /* Обычный случай. */
+         K = CalcK(RateRec);
+      end;
+   else
+      K = 0.0;
+      ErrorFlag = true;
+   end;
+
+   if( ErrorFlag and SayError )
+      Msgbox( GetCurrencyConvertErrorMsg(fiidFrom, fiidTo, ADate) );
+   end;
+   
+   SetParm( 5, ErrorFlag );
+   SetParm( 6, SinceDate );
+   return K;
+end;
+
+/* Получить коэффициент перевода суммы из одной валюты в другую.
+   Возвращаем double. Если произошла ошибка, то вернем 0. Найти коэффицент
+   через обратный курс не пытаемся.
+      ADate    - Дата, на которую брать курс
+      fiidFrom - Из какой валюты.
+      fiidTo   - В какую валюту.
+      SayError - Флаг. Если задан, то в случае ошибки выводим сообщение
+                 пользователю.
+      Type     - Тип курса. Если не задан или 0, то берем основной курс.
+      Error    - Флаг. Запишем сюда true, если произошла ошибка. 
+      SinceDate   - дата начала действия курса*/
+macro GetRateOnDate( ADate:DATE, fiidFrom:INTEGER, fiidTo:INTEGER, SayError, Type, Error, SinceDate, MarketID, CentrOffice )
+   VAR ErrorFlag, K;
+
+   record RateRec(ratedef);
+
+   if( fiidTo == fiidFrom )
+      /* Валюты совпадают. */
+      SetParm( 5, false );
+      return 1.0;
+   end;
+
+   /* Если тип курса не задан, то берем основной. */
+   if( (Type == null) or (Type == 0) )
+      ErrorFlag = ПолучитьКурс( RateRec, fiidTo, fiidFrom );
+   else
+      if( MarketID != null )
+         if( MarketID > 0 ) 
+            if( CentrOffice == null )
+               CentrOffice = 0;
+            end;
+         else
+            MarketID = null;
+            CentrOffice = null;
+         end;
+      end;
+
+      if( MarketID != null )
+         ErrorFlag = ПолучитьКурс( RateRec, fiidTo, fiidFrom, Type, MarketID, CentrOffice );
+         if( ErrorFlag )                                                                   
+            if( CentrOffice != 0  )                                                     
+               ErrorFlag = ПолучитьКурс( RateRec, fiidTo, fiidFrom, Type, MarketID, 0 );
+            end;                                                                        
+            if( ErrorFlag )                                                                
+               ErrorFlag = ПолучитьКурсПоТипу( RateRec, ADate, fiidTo, fiidFrom, Type );             
+            end;                                                                           
+         end;                                                                              
+      else
+         ErrorFlag = ПолучитьКурсПоТипу( RateRec, ADate, fiidTo, fiidFrom, Type );
+      end;
+   end;
+
+   if( not ErrorFlag )
+      K = GetRateValueOnDate( RateRec, ADate, fiidFrom, fiidTo, SayError, ErrorFlag, SinceDate );
+   else
+      K = 0.0;
+      ErrorFlag = true;
+   end;
+
+   if( ErrorFlag and SayError )
+      Msgbox( GetCurrencyConvertErrorMsg(fiidFrom, fiidTo, ADate) );
+   end;
+
+   SetParm( 5, ErrorFlag );
+   SetParm( 6, SinceDate );
+   return K;
+end;
+
+/* Конвертация суммы типа double другую валюту. Проверяем прямой и обратный
+   курс. Функциональность аналогична функции ConvSum из FIInter.
+      SumToDbl    - Сюда запишем результат. Double.
+      SumFromDbl  - Сумма для конвертации. Double.
+      ADate       - Дата, на которую брать курс.
+      fiidFrom    - Из какой валюты.
+      fiidTo      - В какую валюту.
+      SayError    - Флаг. Выдавать сообщения об ошибке. Если не задан, то
+                    сообщения не выдаем.
+      Type        - Тип курса. Integer. Если не задан или 0, то берем основной
+                    курс.
+      SinceDate   - дата начала действия курса
+   В случае ошибки возвращаем False, в SumToDbl устанавливаем 0. */
+macro ConvSumDbl( SumToDbl, SumFromDbl, ADate, fiidFrom, fiidTo, SayError, Type, SinceDate, MarketID, CentrOffice )
+
+   var
+      K,
+      Inverse     = false,
+      ErrorFlag   = true;
+
+   K = GetRateOnDate( ADate, fiidFrom, fiidTo, false, Type, ErrorFlag, SinceDate, MarketID, CentrOffice );
+   if( ErrorFlag )
+      /* Не нашли курс. Попробуем найти обратный. */
+      Inverse = true;
+      K = GetRateOnDate( ADate, fiidTo, fiidFrom, false, Type, ErrorFlag, SinceDate, MarketID, CentrOffice);
+   end;
+
+   if( not ErrorFlag )
+      if( Inverse )
+         SetParm( 0, SumFromDbl / K );
+      else
+         SetParm( 0, SumFromDbl * K );
+      end;
+      SetParm( 7, SinceDate );
+      return true;
+   end;
+
+   if( SayError )
+      MsgBox( GetCurrencyConvertErrorMsg(fiidFrom, fiidTo, ADate) );
+   end;
+   SetParm( 0, 0.0 );
+  /* Сбрасываем ошибку. */
+   InitError();
+   return false;
+end;
+
+/* Конвертация суммы типа double другую валюту через рубли.
+      SumToDbl    - Сюда запишем результат. Double.
+      SumFromDbl  - Сумма для конвертации. Double.
+      ADate       - Дата, на которую брать курс.
+      fiidFrom    - Из какой валюты.
+      fiidTo      - В какую валюту.
+      SayError    - Флаг. Выдавать сообщения об ошибке. Если не задан, то
+                    сообщения не выдаем.
+   В случае ошибки возвращаем False, в SumToDbl устанавливаем 0. */
+macro ConvSumCrossDbl( SumToDbl, SumFromDbl, ADate, fiidFrom, fiidTo, SayError, Type, SinceDate, MarketID, CentrOffice )
+   var
+      SumFIFrom, SumFITo;
+
+   if(   ConvSumDbl( SumFIFrom, 1, ADate, fiidFrom, NATCUR, false, Type, SinceDate, MarketID, CentrOffice )
+         and ConvSumDbl( SumFITo, 1, ADate, fiidTo, NATCUR, false, Type, SinceDate, MarketID, CentrOffice )
+         )
+      if( SumFITo == 0.0 )
+         SetParm( 0, 0.0 );
+      else
+         SetParm( 0, SumFromDbl * SumFIFrom / SumFITo );
+      end;
+      SetParm( 7, SinceDate );
+      return true;
+   end;
+
+   if( SayError )
+      MsgBox( GetCurrencyConvertErrorMsg(fiidFrom, fiidTo, ADate) );
+   end;
+   SetParm( 0, 0.0 );
+   /* Сбрасываем ошибку. */
+   InitError();
+   return false;
+end;
+
+
+/* Получить коэффициент перевода суммы из одной валюты в другую. 
+   Пытаемся взять по очереди прямой курс, обратный и кросс-курс через рубли.
+   Возвращаем double. Если произошла ошибка, то вернем 0. Найти коэффицент
+   через обратный курс не пытаемся.
+      ADate    - Дата, на которую брать курс
+      fiidFrom - Из какой валюты.
+      fiidTo   - В какую валюту.
+      SayError - Флаг. Если задан, то в случае ошибки выводим сообщение
+                 пользователю.
+      Type     - Тип курса. Если не задан или 0, то берем основной курс.
+      Error    - Флаг. Запишем сюда true, если произошла ошибка. 
+      SinceDate   - дата начала действия курса*/
+macro GetRateOnDateCrossDbl( ADate, fiidFrom, fiidTo, SayError, Type, Error, SinceDate )
+   VAR ErrorFlag, K=0.0;
+   
+   record RateRec(ratedef);
+
+   if( fiidTo == fiidFrom )
+      /* Валюты совпадают. */
+      SetParm( 5, false );
+      return 1.0;
+   end;
+
+
+   if(ConvSumDbl( K, 1.0, ADate, fiidFrom, fiidTo, false, Type, SinceDate ) != true ) //не нашли ничего
+     if(ConvSumCrossDbl( K, 1.0, ADate, fiidFrom, fiidTo, false, Type, SinceDate ) != true) //не нашли ничего
+       if( SayError )
+         K = 0.0;
+         ErrorFlag = true;
+         Msgbox( GetCurrencyConvertErrorMsg(fiidFrom, fiidTo, ADate) );
+       end;
+     end;
+   end;
+   
+   SetParm( 5, ErrorFlag );
+   SetParm( 6, SinceDate );
+   return K;
+end;
+
+
+/* Конвертация суммы типа double из одной валюты в другую.
+   Для конвертации пытаемся использовать: прямой, обратный, кросс-курс.
+   Всегда берем основной курс. Функциональность аналогична SmartConvertSum.
+      SumToDbl    - Сюда запишем результат. Double.
+      SumFromDbl  - Сумма для конвертации. Double.
+      ADate       - Дата, на которую брать курс.
+      fiidFrom    - Из какой валюты.
+      fiidTo      - В какую валюту.
+      SayError    - Флаг. Выдавать сообщения об ошибке. Если не задан, то
+                    сообщения не выдаем.
+   В случае ошибки возвращаем False, в SumToDbl устанавливаем 0. */
+macro SmartConvertSumDbl(  SumToDbl, SumFromDbl, ADate, fiidFrom, fiidTo,
+                           SayError, Type, SinceDate, MarketID, CentrOffice, ErrorMes )
+   var
+      NewSum;
+
+   if( sinceDate != NULL )
+      sinceDate = DATE(sinceDate);
+   end;
+   if( ADate != NULL )
+      ADate = DATE(ADate);
+   end;
+
+   if( fiidFrom == fiidTo )
+      NewSum = SumFromDbl;
+   elif( not ConvSumDbl( NewSum, SumFromDbl, ADate, fiidFrom, fiidTo, false, Type, SinceDate, MarketID, CentrOffice ) )
+      if( not ConvSumCrossDbl( NewSum, SumFromDbl, ADate, fiidFrom, fiidTo, false, Type, SinceDate, MarketID, CentrOffice ) )
+         if( SayError )
+            MsgBox( GetCurrencyConvertErrorMsg(fiidFrom, fiidTo, ADate) );
+         end;
+         if( ErrorMes != null )
+            SetParm(10, GetCurrencyConvertErrorMsg(fiidFrom, fiidTo, ADate) );
+         end;
+         SetParm( 0, 0.0 );
+         /* Сбрасываем ошибку. */
+         InitError();
+         return false;
+      end;
+   end;
+   SetParm( 0, NewSum );
+   SetParm( 7, SinceDate );
+   return true;
+end;
+
+/* Конвертация сумм в разных валютах с обработкой ошибок. Используется
+   для конвертации денег (money). */
+MACRO SmartConvertSum( sumTo, sumFrom, sinceDate, fiidFrom:INTEGER, fiidTo:INTEGER, SayError )
+    var NewSum = $0;
+    if( sinceDate != NULL ) 
+       sinceDate = DATE(sinceDate);
+    end;
+    if( fiidFrom == fiidTo )  NewSum = sumFrom;
+    elif( ConvSum( NewSum, sumFrom, sinceDate, fiidFrom, fiidTo ) != 0 )
+      /* IL 27.08.02 может быть есть кросс-курс*/
+      if( ConvSumCross( NewSum, sumFrom, sinceDate, fiidFrom, fiidTo ) != true ) 
+         if( SayError == true )
+            MsgBox( GetCurrencyConvertErrorMsg(fiidFrom, fiidTo, sinceDate) );
+         end; 
+         /* Сбрасываем ошибку. */
+         InitError();
+         SetParm( 0, $0.0 );
+         return false;
+      end;
+    end;
+    SetParm( 0, NewSum );
+    return true;
+END;
+
+/****************************************************************************/
+
+MACRO SP_GetValueLL( List:INTEGER, ElementOrCode:VARIANT, Code:@STRING, Name:@STRING ):INTEGER
+  var ll = TRecHandler("llvalues.dbt");
+
+  LL_FindLLVALUES( List, ElementOrCode, ll );
+  Name = ll.rec.Name;
+  Code = ll.rec.Code;
+
+  return ll.rec.Element;
+END;
+
+/* llvalues для objects = 2800 - Учетные события ДУ)*/
+MACRO SP_DemandEvent( EventNumber:STRING ):INTEGER
+   return SP_GetValueLL( OBJTYPE_TSEVENT, EventNumber ); 
+END;
+
+/* llvalues для objects = 2820 - Вид дохода/расхода ДУ)*/
+MACRO SP_ProfitKind( KindNumber:STRING ):INTEGER
+   return SP_GetValueLL( OBJTYPE_TSKIND_PROFIT, KindNumber ); 
+END;
+
+
+MACRO SPSERV_InitPayment( p_payms , issFIID , Receiver)
+   p_payms.Receiver = Receiver;
+   p_payms.DocKind = DL_SECURITYDOC;
+   p_payms.Purpose = BAi;
+   p_payms.FIID = issFIID; 
+   p_payms.ValueDate = Date(1,1,2100);
+END;
+
+MACRO SPSERV_PaymentOK( p_payms , issFIID , end_date , Receiver)
+
+   return ( (p_payms.Receiver == Receiver) and  
+            (p_payms.DocKind == DL_SECURITYDOC) and
+            (p_payms.Purpose == BAi) and
+            (p_payms.FIID == issFIID) and
+            (p_payms.ValueDate <= end_date) );
+END;
+
+
+MACRO ПолучитьЦенуИДатуПокупкиЦБ(oper_end_date,issFIID,Receiver,Price,Date)
+  file _payms(pmpaym) key 7;
+  file _wrtsums(pmwrtsum) key 0;
+   
+  var _continue : bool;
+  
+  SPSERV_InitPayment( _payms , issFIID , Receiver);
+  _payms.ValueDate = oper_end_date ;
+
+  _continue = getLE( _payms );
+  while( _continue and SPSERV_PaymentOK( _payms, issFIID , oper_end_date , Receiver) )
+     ClearRecord( _wrtsums );
+     _wrtsums.DocKind  = DLDOC_PAYMENT;
+     _wrtsums.DocID    = _payms.PaymentID;
+     _wrtsums.Buy_Sale = 0;
+     if( getEQ(_wrtsums) )  
+        if(_wrtsums.Amount != 0.0)
+           SetParm(3,_wrtsums.Sum/_wrtsums.Amount);
+        else
+           SetParm(3,0.0);
+        end;  
+        SetParm(4,_payms.ValueDate);
+        return true;
+     end;
+     _continue = prev(_payms);
+  end;
+  return false;
+END;
+
+/* процедура проверки допустимости выполнения операции заданного типа*/
+MACRO IsToleranceOper( FD, dat )
+   var err = 0;
+   var AvoirStat = FI_GetStatus( FD.fininstr.rec.FIID, dat, err  );
+   if( err == 0 )
+      if( AvoirStat     == FI_STATE_PLACEMENT       ) /*  размещение */
+         /*разрешены только покупки и погашения*/
+         if( IsBUY(FD.Group) OR IsRET_COUPON(FD.Group) OR IsRET_ISSUE(FD.Group) OR FD.ExistBack ) 
+            return true;
+         else
+            return false;
+         end;         
+      elif( AvoirStat   == FI_STATE_INCIRCULATION   ) /*  в обращении*/
+
+            return true;
+
+      elif( AvoirStat   == FI_STATE_DRAWING         ) /*  погашение  */
+
+         if( FD.ExistBack AND (FD.fininstr.rec.DrawingDate == dat) ) /*для сделок с обратной частью можно и в день погашения*/
+            return true;
+         elif( IsBUY(FD.Group) OR IsRET_COUPON(FD.Group) OR IsSALE(FD.Group) ) /*запрещены покупки, продажи и погашения купона*/         
+            return false;
+         else
+            return true;
+         end;          
+      elif( AvoirStat   == FI_STATE_CLOSE           ) /*  закрыт     */
+         return false; /*все операции запрещены*/      
+      end;
+   else
+      return false;
+   end;
+END;
+
+MACRO ПолучитьОперациюПоСделке( Deal, oper, NoSayError )
+  var rDeal = TRecHandler("dl_tick.dbt"); 
+  ClearRecord( FindOper );
+  Copy( rDeal, Deal ); 
+  FindOper.DocKind    = rDeal.rec.BofficeKind;   
+  FindOper.DocumentID = UniID( rDeal, OBJTYPE_SECDEAL);
+  FindOper.Start_Date = rDeal.rec.DealDate; 
+  if( not GetEQ(FindOper) )
+     if( (NoSayError == null) OR (NoSayError == false) )
+        msgbox( "Не найдена операция по сделке " + rDeal.rec.DealCode );
+     end;
+     return false;
+  end;
+  copy( oper, FindOper );
+  return true;
+END;
+
+/**********************************************************************/
+MACRO ОпределитьПосредникаСделки( Deal )
+
+   var     dl_leg, AgentID = -1;
+   var     Group = SP_GetOperationGroup ( Deal);          
+
+   if( IsRET_ISSUE( Group ) )
+      if( Deal.Flag1 == SET_CHAR ) /*ОРЦБ*/
+         AgentID = deal.MarketID;
+      else /*получатель комиссии - депозитарий*/
+         dl_leg = TRecHandler("dl_leg");
+         if( FindDL_LEG( LEG_KIND_DL_TICK, Deal.DealID, 0, dl_leg ) == 0 )
+            AgentID = dl_leg.rec.Registrar;
+         end;
+      end;
+   else
+      if( IsEXCHANGE( Group ) )    
+         AgentID = deal.MarketID;
+      elif( IsBROKER( Group ) )
+         AgentID = deal.BrokerID;
+      else 
+         AgentID = deal.BrokerID;
+      end;
+   end;
+   return AgentID;
+END;
+
+MACRO КлиентВОнлайне( ClientID, ClientContrID )
+ var ClientName = "", Contract = "",
+     party = TRecHandler( "party" );
+ file pmwrtmet( pmwrtmet );
+ file sfcontr(sfcontr);
+
+ ClearRecord( pmwrtmet );
+
+ if( ClientID == {OurBank} )
+    pmwrtmet.Party = -1;
+ else
+    pmwrtmet.Party = ClientID;
+ end;  
+
+ pmwrtmet.Contract = ClientContrID;
+ if( not GetEQ(pmwrtmet) )
+   
+   if( ПолучитьСубъекта( ClientID, party ) )
+      MsgBox( "Не могу получить данные о субъекте (PartyID = " + String(ClientID) + ")");
+   else
+      ClientName = party.rec.ShortName;
+   end;
+      
+   ClearRecord(sfcontr);
+   sfcontr.ID = ClientContrID;
+
+   if( GetEQ(sfcontr) )
+      Contract = sfcontr.Number;
+   end;
+
+   MsgBox( "Не найден режим списания для субъекта " + ClientName + " по договору " + Contract + "." );
+   return false;
+ end;
+
+ return true;
+END; 
+
+/* Получаем буфер счета. Если счет не найден, то возвращаем false.
+      Chapter     -  глава
+      FIID        -  валюта
+      Account     -  номер счета
+      AccBuf      -  возвращам буфер счета через этот параметр
+      NoSayError  -  флаг, если = false или не задан, то не выводим
+                     сообщение о ошибке */
+MACRO GetAccount( Chapter, FIID, Account, AccBuf, NoSayError )
+   file AccR( "account.dbt" );
+   var fin = TBFile("fininstr");
+
+   if( (Chapter == null) or (Chapter == 0)) Chapter = 1; end;
+   if( FIID == null ) FIID = 0; end;
+
+   if (ПолучитьФинИн( FIID, fin ) == 0)
+     if(fin.rec.FI_Kind == FIKIND_AVOIRISS) //по ц/б счет не ищем
+       ClearRecord( AccR );
+
+       AccR.Code_Currency = FIID;
+       AccR.Account       = Account;
+       AccR.Chapter       = Chapter;
+       Copy( AccBuf, AccR );
+       return true;
+     else
+       ClearRecord( AccR );
+       AccR.Chapter       = Chapter;
+       AccR.Code_Currency = FIID;
+       AccR.Account       = Account;
+       if( GetEQ(AccR) )
+          Copy( AccBuf, AccR );
+          return true;
+       end;
+     end;
+   end;
+
+   if( NoSayError != true )
+      msgbox( "Счет " + Account + " не найден." );
+   end;
+   return false;
+END;
+
+MACRO minDate( D1, D2 )
+   if( D1 < D2 ) return D1;
+   else return D2;
+   end;
+END;
+
+MACRO maxDate( D1, D2 )
+   if( D1 > D2 ) return D1;
+   else return D2;
+   end;
+END;
+
+/*Проверяем оплаченность единовременных комиссий (начислена но не оплачена)*/
+MACRO ОплаченыВсеЕдинКомиссии( dl_leg, FD )
+  if( ( bAND( dl_leg.BitMask, DL_LEG_ADD_BANK_ONCE) AND
+        (not bAND( dl_leg.BitMask, DL_LEG_PAY_BANK_ONCE)) 
+      ) OR
+      ( bAND( dl_leg.BitMask, DL_LEG_ADD_AGENT_ONCE) AND
+        ( (not bAND( dl_leg.BitMask, DL_LEG_PAY_AGENT_ONCE)) AND
+          ( (FD == NULL) )
+        )
+      ) 
+    ) 
+     return false;
+  end;
+  return true;
+END;
+
+/* Проверяем оплаченность периодических комиссий (начислена но не оплачена)   */
+/* признаки:                                                                  */
+/*    ExistAgent        - есть комиссии посреднику */
+/*    ExistClient       - есть клиентские комиссии */
+/*    ExistClientComInPay     - есть клиентские комиссии с моментом расчета в дату оплаты сделки      */
+/*    ExistClientComInStart   - есть клиентские комиссии с моментом расчета в дату заключения сделки  */
+MACRO ОплаченыВсеПериодКомиссии( dl_leg, ExistClient, ExistAgent, ExistClientComInPay, ExistClientComInStart, CommDateInDeal )
+
+  /*если дату комиссии в сделке передали в процедуру, то для проверки наличия комиссии посредника она должна быть ненулевая*/ 
+  if( (CommDateInDeal == null) OR (CommDateInDeal != Date(0,0,0) ) )
+     if( (ExistAgent ==null) OR (ExistAgent == true) ) 
+        if( bAND( dl_leg.BitMask, DL_LEG_ADD_AGENT_PERIOD) AND (not bAND( dl_leg.BitMask, DL_LEG_PAY_AGENT_PERIOD)) )
+           return false;
+        end; 
+     end;       
+  end;
+ 
+  if( (ExistClient == null) OR (ExistClient == true) ) 
+
+     if( (ExistClientComInStart == null) OR (ExistClientComInStart == true) ) 
+        if( bAND( dl_leg.BitMask, DL_LEG_ADD_BANK_PERIOD) AND
+            (not bAND( dl_leg.BitMask, DL_LEG_PAY_BANK_PERIOD)) 
+        )
+           return false;
+        end;
+     end;
+
+     if( (ExistClientComInPay == null) OR (ExistClientComInPay == true) ) 
+        if( bAND( dl_leg.BitMask, DL_LEG_ADD_BANK_INPAY_PERIOD) AND 
+            (not bAND( dl_leg.BitMask, DL_LEG_PAY_BANK_INPAY_PERIOD)) 
+        )
+           return false;
+        end;
+     end; 
+  end; 
+  return true;
+END;
+
+macro ПолучитьДокументПоСделке(BofficeKind, DealID, Kind, DocNum, DocDate, DocTime, KindName)
+
+  var Query, DataSet, OK = false;
+
+  DocNum   = "";
+  DocDate  = Date(0,0,0);
+  DocTime  = Time(0,0,0);
+  KindName = "";
+
+  Query = " SELECT spground.t_Xld, spground.t_RegistrDate, spground.t_RegistrTime, spground.t_Kind " +
+          "   FROM dspground_dbt spground, dspgrdoc_dbt spgrdoc " +
+          "  WHERE spgrdoc.t_SourceDocKind = " + string(BofficeKind) + " AND " +
+          "        spgrdoc.t_SourceDocID   = " + string(DealID)      + " AND " +
+          "        spground.t_SPgroundID   = spgrdoc.t_SPGroundID "; 
+
+  if( kind <= 0 )
+     Query = Query + " AND " +
+             " spground.t_Kind != " + string(DOCKIND_CONTR_FIRSTPART)  + " AND " +
+             " spground.t_Kind != " + string(DOCKIND_CONTR_SECONDPART) + " AND " +
+             " spground.t_Kind != " + string(DOCKIND_BUYSALEREPORT);
+  else
+     Query = Query + " AND spground.t_Kind = " + string(Kind);
+  end;
+
+  Query = Query + " AND ROWNUM = 1";
+
+  DataSet = TRsbDataSet( query );
+  if( DataSet.MoveNext() )
+     DocNum  = DataSet.Xld;
+     DocDate = date(DataSet.RegistrDate);
+     DocTime = Time(DataSet.RegistrTime);        
+     DL_GetValueName( OBJTYPE_KINDDOC, DataSet.Kind, KindName );
+     OK = true;
+  end;
+
+  SetParm( 3, DocNum   );
+  SetParm( 4, DocDate  );
+  SetParm( 5, DocTime  );
+  SetParm( 6, KindName );
+
+  return OK;
+end; 
+
+MACRO ПарамПодтвДокум( Deal, DocNum, DocKind, DocDate, DocTime )
+  ПолучитьДокументПоСделке(Deal.BofficeKind, Deal.DealID, -1, DocNum, DocDate, DocTime, DocKind);
+  SetParm( 1, DocNum  );
+  SetParm( 2, DocKind );
+  SetParm( 3, DocDate );
+  SetParm( 4, DocTime );
+END;
+
+MACRO GetRestAccount( accbuf, Dat )
+   return DL_GetRestAccount(accbuf, Dat);
+END; 
+
+/*получить нефиксированную или фиксированную валюту суммы платежа*/
+MACRO GetPaymFIID( paym, get_fix )
+   if( paym.IsFixAmount ) 
+      if( get_fix == true )
+         return paym.FIID;
+      else
+         return paym.PayFIID;
+      end;
+   else
+      if( get_fix == true )
+         return paym.PayFIID;
+      else
+         return paym.FIID;
+      end;
+   end; 
+END;
+
+/*получить нефиксированную или фиксированную суммы платежа*/
+MACRO GetPaymAmount( paym, get_fix )
+   VAR amount = $0;
+
+   if( not SmartConvertSum(amount, paym.OrderAmount, paym.ValueDate, paym.OrderFIID, GetPaymFIID(paym, get_fix), true) )
+      return $0;
+   end;
+
+   return amount;
+END;
+
+
+MACRO GetPayAmountRq( rq:object, PayFIID )
+   VAR amount = $0;
+
+   if( not SmartConvertSum(amount, rq.rec.Amount, rq.rec.PlanDate, rq.rec.FIID, PayFIID, true) )
+      return $0;
+   end;
+
+   return amount;
+END;
+
+/*заполнить нефиксированную или фиксированную суммы платежа*/
+MACRO SetPaymAmount( paym, Amount, set_fix )
+   if( paym.IsFixAmount ) 
+      if( set_fix == true )
+         paym.Amount = Amount;
+      else
+         paym.PayAmount = Amount;
+      end;
+   else
+      if( set_fix == true )
+         paym.PayAmount = Amount;
+      else
+         paym.Amount = Amount;
+      end;
+   end; 
+END;
+
+/*конвертировать или скорректировать суммы платежа*/
+MACRO КонвертацияСуммПлатежа( paym, dat, not_class )   
+
+   var pmobj, ConvAmount, FixFIID, NoFixFIID, FixAmount = $0;
+   /*конвертация через класс*/
+   if( (not_class == null) OR (not_class == false) )
+      pmobj = RsbPayment( paym.PaymentID );
+      /*возвращает 0, если ничего не сконвертили, ошибку не возвращает*/
+      pmobj.Actuate();
+   /*конвертация без класса*/
+   else
+      FixFIID = GetPaymFIID( paym, true );
+      if( (FixFIID != -1) AND (paym.BaseFIID == FixFIID) )
+         SetPaymAmount( paym, paym.BaseAmount, true );
+      else
+         if( not SmartConvertSum( ConvAmount, paym.BaseAmount, paym.BaseRateDate, paym.BaseFIID, FixFIID, true ) )
+            return false;
+         else
+            SetPaymAmount( paym, ConvAmount, true );
+         end;
+      end;
+
+      /* Если валюта базовая равна  валюте нефикс, то копировать базовую в нефикс       */
+      /* иначе если валюта фикс равна валюте нефикс  то копировать фикс сумму в нефигс  */
+      /* иначе конвертить фикс в нефикс по курсу конвертации фигс в нефигс.             */
+      NoFixFIID = GetPaymFIID( paym, false );
+      if( (NoFixFIID != -1) AND (paym.BaseFIID == NoFixFIID) )
+         SetPaymAmount( paym, paym.BaseAmount, false );
+      else
+         FixAmount = GetPaymAmount( paym, true );
+         if( FixFIID == NoFixFIID )
+            /*копируем сумму в фиксировнной валюте, в сумму в нефиксированной*/
+            SetPaymAmount( paym, FixAmount, false );
+         else
+            if( not SmartConvertSum( ConvAmount, FixAmount, paym.RateDate, FixFIID, NoFixFIID, true ) )
+               return false;
+            else
+               SetPaymAmount( paym, ConvAmount, false );
+            end;
+         end;
+      end;
+   end;
+
+   return true;
+END;  
+
+/* заполнить счет платежа, через заданную категорию учета                        
+   если AccCateg == "Корсчет", то уже должен быть заполнен (програмно при 
+   вводе платежа), иначе через категорию, заданную в AccCateg  
+   если IsPayer == true, то заполняем счет плательщика, иначе счет получателя */
+private var PaymAccBuf = TRecHandler( "account" );
+MACRO ЗаполнитьСчетПлатежа( FD, paym, PaymName, dat, AccCateg, FIID, IsPayer, PartyID, AccBuf, pmobj )
+  var Direct = "", Account = "", Payer = -1, Receiver = -1;
+
+  if( (AccCateg == "Корсчет") OR (AccCateg == null) )
+     if( IsPayer ) 
+        Account   = paym.rec.PayerAccount;
+        Payer     = PartyID;
+        Direct = " плательщика ";
+     else
+        Account   = paym.rec.ReceiverAccount;
+        Receiver  = PartyID;    
+        Direct = " получателя ";
+     end;  
+  end;
+
+  if( Account == "" )
+     if( AccCateg == "Корсчет" )
+        Msgbox( "Ошибка при формировании платежа " + PaymName + "|Не заполнен счет" +Direct );
+        return false;
+     else
+        if( (AccCateg != null) AND (AccCateg != "") ) 
+           if( not FD.OpenAccount( AccCateg, Account, false, null, PaymAccBuf, dat, FIID ) )
+              return false;
+           end;
+           if( IsPayer ) 
+
+              paym.rec.PayerAccount    = Account;
+              paym.rec.PayerBankID     = {OurBank}; /*счет, полученный по категории точно в нашем банке*/
+              paym.rec.FIID            = PaymAccBuf.rec.Code_Currency;
+
+              if (pmobj)
+                 
+                 pmobj.SetPayerPI( PAYMENTS_GROUP_UNDEF, 
+                                  {OurBank}, 
+                                  0, 
+                                  "", 
+                                  "",
+                                  "",
+                                  PaymAccBuf.rec.Code_Currency,           
+                                  1/*CHAPT1*/, 
+                                  PaymAccBuf.rec.Account,                 
+                                  pmobj.Payer,                       
+                                  pmobj.PayerName,                   
+                                  pmobj.PayerINN );                  
+              end;
+           else
+              paym.rec.ReceiverAccount = Account;
+              paym.rec.ReceiverBankID  = {OurBank};
+              paym.rec.PayFIID         = PaymAccBuf.rec.Code_Currency;
+
+              if (pmobj)
+                
+                 pmobj.SetReceiverPI( PAYMENTS_GROUP_UNDEF, 
+                                  {OurBank}, 
+                                  0, 
+                                  "", 
+                                  "",
+                                  "",
+                                  PaymAccBuf.rec.Code_Currency,           
+                                  1/*CHAPT1*/, 
+                                  PaymAccBuf.rec.Account, 
+                                  pmobj.Payer,                       
+                                  pmobj.PayerName,                   
+                                  pmobj.PayerINN );                  
+
+              end;
+           end;  
+        end;
+     end;
+  end;
+
+  if( AccBuf )
+     copy( AccBuf, PaymAccBuf );
+  end;
+
+  return true;
+END;
+
+/* Возвращаем количество ценных бумаг на лотах продажи, связанных с данным
+   лотом покупки, дата поставки которых больше _Date. */
+
+private macro КоличествоБумагНаСвязанныхЛотахПродажи( lotbuy, _Date )
+   var
+      Query, A;
+
+   Query = RSDCommand(
+         "  select   sum( link.t_Amount ) as Amount"
+      +  "  from     dpmwrtlnk_dbt link"
+      +  "           inner join dpmwrtsum_dbt lotsale on link.t_SaleID = lotsale.t_SumID"
+      +  "  where    link.t_BuyID = ?"
+      +  "           and link.t_CreateDate > ?"
+      +  "           and lotsale.t_Buy_Sale = ?"
+                     );
+   Query.addParam("BuyID", RSDBP_IN, lotbuy.SumID);
+   Query.addParam("CreateDate", RSDBP_IN, _Date);
+   Query.addParam("Buy_Sale", RSDBP_IN, PM_WRITEOFF_SUM_SALE);
+   Query.execute();
+
+   A = TRsbDataSet(Query);
+
+   if(A.MoveNext() AND (ValType(A.Amount) != V_UNDEF))
+      return ToMoney( A.Amount );
+   end;
+
+   return $0;
+end;
+
+/* Возвращает количество ц/б на лоте покупки на конец конкретного дня.
+   Если _Date меньше даты поставки лота, то возвращаем $0.
+   Возвращаем: к-во бумаг на лоте + к-во бумаг в лотам продажи, связанных
+   с этим лотом покупки, имеющих дату поставки больше указанной даты и
+   статус поставлен или готов. */
+macro КоличествоНаЛотеПокупкиНаКонецДня( lotbuy, _Date )
+
+   if( lotbuy.Date > _Date )
+      /*на дату лот еще не был поставлен*/
+      return $0;
+   else
+      return   lotbuy.Amount
+               + КоличествоБумагНаСвязанныхЛотахПродажи( lotbuy, _Date );
+   end;
+end;
+
+/* Получить к-во бумаг на лоте на дату (на начало дня).
+   По сути дублируем функцию КоличествоНаЛотеПокупкиНаКонецДня, но
+   у нее слишком длинное название - неудобно использовать и
+   там определяем к-во на конец для, а здесь на начало. */
+macro GetLotAmountOnDate( lotbuy, ADate )
+   return КоличествоНаЛотеПокупкиНаКонецДня( lotbuy, ADate-1 );
+end;
+
+/* Получает исходное количество ц/б на лоте покупки (до всех списаний) */
+macro ИсходноеКоличествоНаЛотеПокупки( lotbuy )
+   return   lotbuy.Amount
+            + КоличествоБумагНаСвязанныхЛотахПродажи( lotbuy, Date(2,1,1) );
+end;
+
+CONST
+   /* Возможные значения параметра ConvDateType. */
+   ConvDateType_DateFee = 1,
+   ConvDateType_DatePay = 2;
+
+/* Функция рассчитывает и возвращает сумму распределенных комиссий по сделке.
+   Как результат функция возвращает сумму комиссий посредника с НДС и данные
+   через параметры SummAgent, NDSAgent, SummBank, NDSBank.
+   Параметры:
+      tick        - тикет сделки
+
+      SummAgent   - Возвращаемый. Комиссии агенту без НДС.
+      NDSAgent    - Возвращаемый. НДС комиссий агента.
+      SummBank    - Возвращаемый. Комиссии банку без НДС.
+      NDSBank     - Возвращаемый. НДС комиссий банка.
+
+      FIID        - Необязательный. Фильтрация комиссий по валюте суммы. Если
+                    параметр не задан или -1, то все комиссии.
+
+      Account     - Необязательный. Фильтрация комиссий по счету с которого
+                    идет проводка. Если параметр не задан или пустой, то
+                    все комиссии.
+
+      ConvFIID    - Необязательный. В какую валюту конвертировать суммы. Если
+                    параметр не задан, то в рубли.
+
+      ConvDate    - Необязательный. Дата по курсу на которую переводим суммы
+                    в валюту ConvFIID. Если параметр не задан, то дата
+                    перевода выбирается в зависимости от параметра ConvDateType.
+
+      CommStatus  - Необязательный. Фильтр по статусу комиссий.
+                     SFDEFCOM_STATUS_CREATED    = 0,   // Создана
+                     SFDEFCOM_STATUS_ACCRUAL    = 10,  // Начисляется
+                     SFDEFCOM_STATUS_CALCULATED = 20,  // Рассчитана
+                     SFDEFCOM_STATUS_FOR_PAY    = 30,  // К оплате
+                     SFDEFCOM_STATUS_PAYED      = 40   // Оплачена
+                     Если параметр не задан, то оплаченные.
+
+      MaxPayDate  - Необязательный. Фильтр по дате оплата комисии
+                    (sfdefcom.DatePay). Если задан, то берем только комиссии
+                    с датой оплаты <= MaxPayDate. Если не задан, то берем
+                    все комиссии.
+
+      ConvDateType   - Необязательный. Указывает как выбирать дату для перевода
+                       денег, если параметр ConvDate не задан.
+                       Если параметр не задан или ConvDateType_DateFee - делаем
+                       перевод на дату взимания комиссии (sfdefcom.DateFee).
+                       Если параметр = ConvDateType_DatePay, то делаем перевод
+                       на дату оплаты комисии (sfdefcom.DatePay).          */
+MACRO ПолучитьСуммуРаспределенныхКомиссийПоСделке(
+   tick, SummAgent, NDSAgent, SummBank, NDSBank, FIID, Account, 
+   ConvFIID, ConvDate, CommStatus,
+   MaxPayDate, ConvDateType
+)
+   /* !!! При возможности добавить AddFilter */
+
+  var SummWithoutNDS = $0, SummNDS = $0,
+      SummWithoutNDSBank = $0, SummNDSBank = $0;
+  var DataSet, Select = "", RecSelect;
+  var sfdefcom = TRecHandler("sfdefcom");
+  var CommSum, NDSSum;
+
+  if( CommStatus == null )
+     CommStatus = SFDEFCOM_STATUS_PAYED;
+  end;
+
+  if( ConvFIID == null )
+     ConvFIID = NATCUR;
+  end;
+
+  RecSelect = DL_RSDCommand();
+
+  Select = " select defcom.t_DateFee, defcom.t_DatePay, defcom.t_FIID_commSum, "+ 
+           "        basobj.t_FIID, basobj.t_AccountedInIncluded, basobj.t_CommSum, basobj.t_NDSSum, " +
+           "        comiss.t_ReceiverID "
+           "   from dsfbasobj_dbt basobj, dsfdefcom_dbt defcom, dsfcomiss_dbt comiss " +
+           "  where basobj.t_DefCommID = defcom.t_ID " +
+           "    and basobj.t_FeeType = defcom.t_FeeType " +
+           "    and basobj.t_BaseObjectType = ? " +
+           "    and basobj.t_BaseObjectID = ? " +
+           "    and comiss.t_FeeType = defcom.t_FeeType " +
+           "    and comiss.t_Number = defcom.t_CommNumber " +
+           "    and basobj.t_AccountedInIncluded = 1 ";
+
+  
+  RecSelect.addParam(tick.BofficeKind);
+  RecSelect.addParam(tick.DealID);
+
+  if( (FIID != null) AND (FIID != -1) ) 
+    Select = Select + " and basobj.t_FIID = ? "; 
+    RecSelect.addParam(FIID); 
+  end;
+
+  if((MaxPayDate != null) and (MaxPayDate > date(0,0,0)))
+    Select = Select + " and defcom.t_DatePay <= ? "; 
+    RecSelect.addParam(MaxPayDate);
+  end;
+
+  if(CommStatus >= 0)
+    Select = Select + " and defcom.t_Status = ? "; 
+    RecSelect.addParam(CommStatus);
+  end;
+
+  if( (Account != null) AND (Account != "") ) 
+     Select = Select + " and Exists(select 1 "
+                     + "              from dsfsi_dbt sfsi "
+                     + "             where sfsi.t_ObjectType = 663 "
+                     + "               and sfsi.t_ObjectID = LPAD(defcom.t_ID, 10, '0') "
+                     + "               and sfsi.t_DebetCredit = 0 "
+                     + "               and sfsi.t_Account = ? "
+                     + "           )";
+     
+     RecSelect.addParam(Account);
+  end;
+
+  DataSet = RecSelect.execute(Select);
+
+  while( DataSet.MoveNext() )
+
+     if( ConvDate == null )
+        if( (ConvDateType == null) or (ConvDateType == ConvDateType_DateFee) )
+           ConvDate = DataSet.DateFee;
+        elif( ConvDateType == ConvDateType_DatePay )
+           ConvDate = DataSet.DatePay;
+        else
+           RunError( "Неверное значение параметра ConvDateType." );
+        end;
+     end;
+
+     SmartConvertSum( CommSum, DataSet.CommSum, ConvDate, DataSet.FIID_commSum, ConvFIID, true);
+     SmartConvertSum( NDSSum, DataSet.NDSSum,  ConvDate, DataSet.FIID_commSum, ConvFIID, true);
+
+     if( (DataSet.ReceiverID != 0) AND (DataSet.ReceiverID != {OurBank}) )
+        /* получатель не наш банк */
+        SummWithoutNDS = SummWithoutNDS + CommSum;
+        SummNDS = SummNDS + NDSSum;
+     else
+        /* получатель наш банк */
+        SummWithoutNDSBank = SummWithoutNDSBank + CommSum;
+        SummNDSBank = SummNDSBank + NDSSum;
+     end;
+  end;
+
+  SetParm(1, SummWithoutNDS);
+  SetParm(2, SummNDS);
+  SetParm(3, SummWithoutNDSBank);
+  SetParm(4, SummNDSBank);
+  return (SummWithoutNDS + SummNDS);
+END;
+
+
+MACRO GetRateRetirePartly( FD, CurRate )
+   var SumRate:double = 0.0, Rate:double = 0.0, CurrNominal:double = 0.0;
+   var RateTMP:double = 0.0, Continue_cicle;
+
+   if( FI_IsAvoirissPartly( FD.fininstr.rec.FIID, SumRate ) AND
+       FI_IsCouponPartly( FD.fininstr.rec.FIID, FD.tick.rec.Number_Partly, Rate ) )
+      SetParm( 1, Rate );
+      CurrNominal = FD.FaceValue * (1 - SumRate / 100.);
+      return (FD.FaceValue * Rate / 100.) / CurrNominal; 
+   else
+      return 0.0;
+   end;
+END;
+
+PRIVATE file fiwarnt(fiwarnts) key 0;
+
+MACRO ПолучитьКупон( FIID, Number, IsPartial, fiw )
+    ClearRecord( fiwarnt );
+    fiwarnt.IsPartial = IsPartial;
+    fiwarnt.FIID      = FIID;
+    fiwarnt.Number    = Number;
+    if( GetEQ(fiwarnt) )
+       Copy(fiw,fiwarnt);
+       return true;
+    end;
+    return false; 
+END;
+
+/*для оптимизации отчетности желательно использовать именно эту функцию при получении короткого наименования субъекта*/
+/*эта функция кэширует последнее полученное значения                                                                 */
+/*при передачи даты - получает наименование субъекта на дату из истории*/
+private var _rParty     = TRecHandler( "party.dbt" );
+private var _onDate = null;
+MACRO ПолучитьКороткоеИмяСубъекта( PartyID, onDate )
+
+   var ret =  "";
+
+   if( PartyID > 0 )
+      if( ValType(onDate) != V_UNDEF )
+        if( (PartyID != _rParty.rec.partyid) or (onDate != _onDate) )
+           _onDate = onDate;
+           if( not GetPartyOnDate(PartyID, onDate, _rParty) )
+              ret = _rParty.rec.ShortName;
+           end;
+        else
+           ret = _rParty.rec.ShortName;
+        end;
+      else
+        if(PartyID != _rParty.rec.partyid)
+           if( not ПолучитьСубъекта( PartyID, _rParty ) )
+              ret = _rParty.rec.ShortName;
+           end;
+        else
+           ret = _rParty.rec.ShortName;
+        end;
+      end;
+   end;
+
+   return ret;
+END;
+
+/*для оптимизации отчетности желательно использовать именно эту функцию при получении данных по договору  */
+/*эта функция кэширует последнее полученное значения                                                      */
+private var _rContr        = TRecHandler( "sfcontr.dbt" );
+MACRO ПолучитьДанныеПоДоговору( ContractID )
+
+   var ret =  "";
+
+   if( ContractID > 0 )
+      if( ContractID != _rContr.rec.Id )
+         if( SfGetContr( ContractID, _rContr ) == true )      
+            ret = _rContr.rec.number + " от " + string(_rContr.rec.dateBegin);
+         else
+            ret = "";
+         end;
+      else
+         ret = _rContr.rec.number + " от " + string(_rContr.rec.dateBegin);
+      end;
+   end;
+
+   return ret;
+END;
+
+macro SP_FindPrevPeriod( ID, FindPrevPeriod )
+  file Period( mcperiod ) key 0;
+  file PrevPeriod( mcperiod ) key 3;
+
+  ClearRecord( Period );
+  Period.ID = ID;
+  if( GetEQ( Period ) )     
+     copy( PrevPeriod, Period );
+     PrevPeriod.Number = PrevPeriod.Number - 1;
+     if( GetEQ(PrevPeriod) )
+        Copy( FindPrevPeriod, PrevPeriod );
+        return 0;
+     end;
+     /*Copy( FindPeriod, Period );*/
+  end; 
+  return 8400; 
+end;
+
+/* OprDate   - Дата вполнения шага (актуализации счетов "Форвард"). 
+               Для первой части (или сделок без обр. части) - дата сделки, для второй - дата учета 
+               первой части, либо дата изменения условий сделки, если она больше
+   DateBegin - Базовая дата (параметр MC_TYPE_PARAMETR_FINDATE для роли FIROLE_FIREQ/FIROLE_FICOM)*/ 
+MACRO НужноПереноситьПоСрокам( FD, Account, OprDate, DateBegin, DocID, FIID, FIRole, ActivateDate, ActionDate, retPeriod, pid  )
+  record Period(mcperiod);
+  var    stat, NeedTransf = false;
+
+  ActionDate = ActivateDate = Date( 0, 0, 0 );
+
+  if( pid ) 
+     stat = SP_FindPrevPeriod( pid, Period );
+  else 
+     stat = MC_GetPeriodForCurrAcc( Account, FD.Kind, DocID, FD.GetBasisFIRole(FIRole), FIID, MC_PERIOD_PREV, false, Period);
+  end; 
+
+  if( stat == 0 )
+     ActionDate   = GetTransferActionDate( Period, OprDate, DateBegin );
+     ActivateDate = GetTransferActivateDate( Period, ActionDate );
+
+     if( ActivateDate == Date( 0, 0, 0 ) ) /*Перенос по срокам не нужен*/ 
+        if( ActivateDate > FD.DateArray[DATE_DEALBEGINEXEC] ) /*запрос 61288 */
+           NeedTransf = true;
+        end;
+     else
+        NeedTransf = true;
+     end;
+  elif (stat == 8400)
+     stat = 0;
+  end;
+
+  SetParm( 7, ActivateDate );
+  SetParm( 8, ActionDate );
+
+  if( retPeriod != null )
+     copy( retPeriod, Period );
+  end;
+
+  return NeedTransf;
+END;
+
+/*Получить максимальную плановую дату из выполненных шагов операции */
+macro SP_GetMaxPlanStepDate( ID_Op:Integer, FactDate:Date )
+   var steps = TBFile( "oprstep.dbt", "R", 11 );
+
+   steps.Clear();
+   steps.rec.ID_Operation = ID_Op;
+   steps.rec.IsExecute    = SET_CHAR;
+   steps.rec.Plan_date    = FactDate+1;
+
+   if( steps.GetGE() AND 
+       (steps.rec.ID_Operation == ID_Op) AND (steps.rec.IsExecute == SET_CHAR) 
+     )
+      return Steps.rec.Plan_date;
+   end;
+   return Date(0,0,0);
+end;
+
+/*найти среди запланированных шагов операции шаг заданного системного вида (Kind_action)
+  FindFirstStep == true - найти шаг по Kind_action с любым статусом
+  FindFirstStep == false или не задан - найти невыполненный шаг
+*/
+MACRO SP_IsExistOprStep( ID_Op:Integer, Kind_action:Integer, FindFirstStep:BOOL )
+   var steps = TBFile( "oprstep.dbt", "R" );
+   var loop;
+
+   steps.Clear();
+   steps.rec.ID_Operation = ID_Op;
+   loop = steps.GetGE();   
+   while( (loop == true) AND (steps.rec.ID_Operation == ID_Op) )
+      if( (steps.rec.Kind_action == Kind_action) AND 
+          ( 
+            (FindFirstStep == true) OR (steps.rec.IsExecute != "X") 
+          )
+        )
+         return true; /*есть подходящий шаг заданного системного вида*/
+      end;
+      loop = steps.Next();
+   end;
+   return false;
+END;
+
+/* получить дату последнего выполненного начисления %%
+   начисления выполняются только подряд (по датам), это проверяется при выполнении */
+macro ПолучитьДатуПоследнегоВыполненногоНачисления( PcAccID:INTEGER );
+  var PcAddHis = TBFile( "pcaddhis.dbt", "R", 1 ),
+      LastDate = Date(0,0,0);
+
+  PcAddHis.Clear();
+  PcAddHis.rec.AutoPerc = PcAccID;
+  while( PcAddHis.Next() AND 
+         (PcAddHis.rec.AutoPerc == PcAccID) AND (PcAddHis.rec.oprID != 0)
+       )
+     LastDate = PcAddHis.rec.AddDate;
+  end;
+
+  return LastDate;
+end;
+
+macro БылоПогашениеКупонов( FIID:INTEGER, BeginDate:DATE, EndDate:DATE )
+  var rs, Error, Query;
+           
+  if( BeginDate == Date(0,0,0) )
+     BeginDate = Date(2,1,1);
+  end;
+
+  if( EndDate == Date(0,0,0) )
+     EndDate = Date(2,1,1);
+  end;
+
+  Query = " SELECT count(1)" + 
+          " FROM   dpmwrtsum_dbt"+
+          " WHERE  dpmwrtsum_dbt.t_Buy_Sale ="+string(PM_WRITEOFF_SUM_COUPON) + " AND " +
+          "        dpmwrtsum_dbt.t_Date >= TO_DATE('" + string(BeginDate) +"','DD.MM.YYYY') AND " +
+          "        dpmwrtsum_dbt.t_Date <= TO_DATE('" + string(EndDate)   +"','DD.MM.YYYY') AND " +
+          "        dpmwrtsum_dbt.t_FIID = " + string(FIID)                +" AND " +
+          "        dpmwrtsum_dbt.t_State >= " + string(PM_WRTSUM_FORM);
+
+  rs = ExecuteSQLCommand( Query, "Определение наличия лотов погашения купонов.", @Error );
+  if( rs == NULL )
+     return false; /*Ошибка при выполнении запроса*/
+  elif( rs.moveNext() )
+     return true;  /*Есть лоты погашения купона*/
+  end;
+
+  return false;
+end;
+
+/*проверка - включен ли режим хранилища данных для НУ*/
+macro CheckTaxDepositoryMode()
+   var ErrCode, DepMode;
+
+   GetRegistryValue( "SECUR\\РЕЖИМ ХРАНИЛИЩА ДАННЫХ ДЛЯ НУ", V_BOOL, DepMode, ErrCode );
+
+   return DepMode and (ErrCode == 0);
+end;
+
+/*проверка - включен ли режим работы БО СЭБ с БО ЦБ */
+PRIVATE VAR SecMode = NULL;
+macro CheckOurSecuritiesMode():integer
+   var ErrCode, RegPath = "SECUR\\РЕЖИМ РАБОТЫ БО СЭБ С БО ЦБ";
+
+   GetRegistryValue( RegPath, V_INTEGER, SecMode, ErrCode );
+
+   if( ErrCode != 0 )
+      MsgBox( "Ошибка при получении значения настройки \"" + RegPath + "\"");
+   end;
+
+   return SecMode;
+end;
+
+/*проверка - разрешено ли отображать шаги операции*/
+macro CheckOperationStepsMode()
+   var ErrCode, OpStepsMode;
+
+   GetRegistryValue( "SECUR\\ОТОБРАЖАТЬ ШАГИ ОПЕРАЦИИ", V_BOOL, OpStepsMode, ErrCode );
+
+   return OpStepsMode and (ErrCode == 0);
+end;
+
+macro GetDateBuildTaxReg()
+   var ErrCode, DateBuildTaxReg;
+
+   GetRegistryValue("SECUR\\DATE_BUILD_TAXREG", V_DATE, DateBuildTaxReg, ErrCode);
+
+   return DateBuildTaxReg;
+end;
+
+macro CheckLastRetOver61210()
+   var ErrCode, RetMode;
+
+   GetRegistryValue( "SECUR\\LastRetOver61210", V_BOOL, RetMode, ErrCode );
+
+   return RetMode and (ErrCode == 0);
+end;
+
+macro CheckChargeBonus()
+   var ErrCode, RetMode;
+
+   GetRegistryValue( "SECUR\\CHARGE_BONUS", V_BOOL, RetMode, ErrCode );
+
+   return RetMode and (ErrCode == 0);
+end;
+
+macro CheckCalcDiscountWithoutPartly()
+   var ErrCode, RetMode;
+
+   GetRegistryValue( "SECUR\\CALC_DISCOUNT_WITHOUT_PARTLY", V_BOOL, RetMode, ErrCode );
+
+   return RetMode and (ErrCode == 0);
+end;
+
+macro CheckCalcBonusWithoutPartly()
+   var ErrCode, RetMode;
+
+   GetRegistryValue( "SECUR\\МСФО\\НАЧИСЛЕНИЕ ПРЕМИИ БЕЗ УЧЕТА ЧП", V_BOOL, RetMode, ErrCode );
+
+   return RetMode and (ErrCode == 0);
+end;
+
+macro CheckCalcDefDiffWithoutPartly()
+   var ErrCode, RetMode;
+
+   GetRegistryValue( "SECUR\\МСФО\\CALC_DEFDIFF_WITHOUT_PARTLY", V_BOOL, RetMode, ErrCode );
+
+   return RetMode and (ErrCode == 0);
+end;
+
+MACRO WRTAreGlobalChangesAfterDate( p_Department    :INTEGER,
+                                    p_FIID          :INTEGER,
+                                    p_Party         :INTEGER,
+                                    p_Contract      :INTEGER,
+                                    p_P1            :INTEGER,
+                                    p_P2            :INTEGER,
+                                    p_P3            :INTEGER,
+                                    p_P4            :INTEGER,
+                                    p_P5            :INTEGER,
+                                    p_CalcDate      :DATE,
+                                    p_Delivered     :BOOL,
+                                    p_NotDelivered  :BOOL,
+                                    p_WithoutAccept :BOOL
+                                  ) :BOOL
+   VAR cmd = RsdCommand(RslDefCon, "begin ? := RSB_PMWRTOFF.WRTAreGlobalChangesAfterDate( ?,?,?,?,?,?,?,?,?,?,?,?,? ); end;" );
+
+   cmd.addParam("retval",          RSDBP_RETVAL, V_INTEGER  );
+   cmd.addParam("p_Department",    RSDBP_IN, p_Department   );
+   cmd.addParam("p_FIID",          RSDBP_IN, p_FIID         );
+   cmd.addParam("p_Party",         RSDBP_IN, p_Party        );
+   cmd.addParam("p_Contract",      RSDBP_IN, p_Contract     );
+   cmd.addParam("p_P1",            RSDBP_IN, p_P1           );
+   cmd.addParam("p_P2",            RSDBP_IN, p_P2           );
+   cmd.addParam("p_P3",            RSDBP_IN, p_P3           );
+   cmd.addParam("p_P4",            RSDBP_IN, p_P4           );
+   cmd.addParam("p_P5",            RSDBP_IN, p_P5           );
+   cmd.addParam("p_CalcDate",      RSDBP_IN, p_CalcDate     );               
+   cmd.addParam("p_Delivered",     RSDBP_IN, IIF(p_Delivered,1,0)     );         
+   cmd.addParam("p_NotDelivered",  RSDBP_IN, IIF(p_NotDelivered,1,0)  );        
+   cmd.addParam("p_WithoutAccept", RSDBP_IN, IIF(p_WithoutAccept,1,0) );     
+   cmd.execute();
+
+   RETURN (cmd.value(0) > 0);
+END;
+
+macro ПлатежБылПросрочен( paym )
+  var cmd, rsd;
+
+   if( (paym.rec.PaymStatus == PM_REMOVE_OVERDUE) OR 
+       (paym.rec.PaymStatus == PM_OVERDUE) )
+      return true;
+   end;
+
+   cmd = RsdCommand(RslDefCon, "select count(1) Stat from dpmhist_dbt where t_PaymentID = ? and t_StatusIDto = ?" );
+   cmd.addParam("", RSDBP_IN, paym.rec.PaymentID);
+   cmd.addParam("", RSDBP_IN, PM_OVERDUE);
+   cmd.execute();
+
+   rsd = TRsbDataSet(cmd);
+
+   if( rsd.MoveNext() ) 
+      if( rsd.rec.Stat > 0 )
+         return true;
+      end;
+   end;
+
+   return false;
+
+end;
+
+/*Дата поручения равна дате сделки. Время поручения равно дате сделки минус 10 минут. 
+  Номер поручения генерируется по шаблону 0.ГГММДДЧЧММСС, 
+где ГГММДДЧЧММСС - год, месяц, день, час, минута и секунда получения поручения*/
+macro SPCreateXldClient( DealDate:Date, DealTime:Time, MarketID:integer, GroundDate:@Date, GroundTime:@Time )
+  var XLD = "", Y, Mnd, D, H, Mnt, S;
+
+  DateSplit(DealDate, D, Mnd, Y);
+  TimeSplit(DealTime, H, Mnt, S);
+
+  if( Mnt < 10 )
+
+     if( H == 0 )
+        DateSplit(DealDate - 1, D, Mnd, Y);
+        H = 23;
+     else
+        H = H - 1;
+     end;
+
+     Mnt = 60 - (10 - Mnt);
+  else
+     Mnt = Mnt - 10;
+  end;
+
+  if( MarketID > 0 )/*код биржи (определяется по значению параметра "код в номере л/счета")*/
+     XLD = ПолучитьКодСубъектаДляСчета( MarketID, PTCK_ACC );
+  else
+     XLD = "0";
+  end;
+
+  XLD = XLD + "." + SubStr(string(Y), strlen(string(Y))-1)+string(Mnd:2:o)+string(D:2:o)+string(H:2:o)+string(Mnt:2:o)+string(S:2:o);
+
+  if( GroundDate != null )
+     GroundDate = Date(D, Mnd, Y);
+  end;
+
+  if( GroundTime != null )
+     GroundTime = Time(H,Mnt,S);
+  end;
+
+  return XLD;
+end;
+
+/*Генерируется поручение на сделку. 
+  Получившееся поручение добавляется в список документов по сделке.*/
+macro ФормПоручКлНаСделку( Deal_Tick, DealDate:Date, DontShowError:bool )
+
+  record SpgrPrm("spgroundprm.rec");
+  record party("party");
+  var GroundTime = Time(0,0,0);
+  var GroundDate = Date(0,0,0);
+  var err = 0;
+  var ErrStr:string, actstr, bftext;
+
+  SpgrPrm.Division           =  SelfDivision;
+  SpgrPrm.Direction          =  1; 
+  SpgrPrm.Kind               =  251; /*DOCKIND_ORD_CLIENTOP Поручение клиента на операцию*/
+  SpgrPrm.Xld                =  SPCreateXldClient( DealDate, Deal_Tick.DealTime, 0, @GroundDate, @GroundTime );
+  SpgrPrm.RegistrDate        =  GroundDate;
+  SpgrPrm.RegistrTime        =  GroundTime;
+  SpgrPrm.DocLog             =  513; /*ВидыДокументовБОЦБ*/
+  SpgrPrm.PartyID            =  Deal_Tick.ClientID;
+
+  if( not ПолучитьСубъекта(Deal_Tick.ClientID, party) ) 
+     SpgrPrm.PartyName = party.Name;
+     SpgrPrm.PartyCode = ПолучитьКодСубъекта(SpgrPrm.PartyID, PTCK_CONTR);
+  end;
+      
+  SpgrPrm.AltXld             =  SpgrPrm.Xld;
+  SpgrPrm.SignedDate         =  GroundDate;
+  SpgrPrm.SignedTime         =  GroundTime;
+  SpgrPrm.Receptionist       =  Deal_Tick.Oper;
+  SpgrPrm.DeliveryKind       =  "U";  //автоформирование
+  SpgrPrm.BackOffice         =  "S";
+  SpgrPrm.BeginningDate      =  date(0,0,0);
+  SpgrPrm.TerminateDate      =  date(0,0,0);
+  SpgrPrm.Department         =  {OperDprt};
+  SpgrPrm.Branch             =  {OperDprt};
+  SpgrPrm.PrimaryDocKind     =  Deal_Tick.BofficeKind;
+  SpgrPrm.PrimaryDocID       =  Deal_Tick.DealID;
+
+  err = SP_InsertSPGroundClnt(ErrStr,SpgrPrm);
+
+  if( not DontShowError )
+    actstr = "Вставка поручения клиента на сделку";
+
+    if( (err == 0) and (ErrStr != "") )
+          msgbox( actstr + "|", " Предупреждение: ", ErrStr );    
+    elif( err == 10 ) 
+          msgbox( actstr + "|", "Не задан обязательный параметр|", ErrStr );
+    elif( err == 20 ) 
+          msgbox( actstr + "|", "Заданный параметр отсутствует в справочнике|", ErrStr );
+    elif( err == 30 ) 
+          msgbox( actstr + "|", "Заданный параметр некорректен|", ErrStr );
+    elif( (err == 1)  or (err == 4) or (err == 9) )
+          Status(bftext);
+          msgbox( actstr + "|", "Ошибка: " + bftext + "|", ErrStr );
+    else
+          InitError();
+          MemoryError(err);
+          DisplayError();
+    end;
+
+  end;
+
+  return IIF(err==0,true,false);
+end;
+
+MACRO NewSubpurpose( Purpose:INTEGER, DocKind:INTEGER, DocID:INTEGER )
+
+  VAR RS = TRsbDataSet( "SELECT (NVL(MAX(t_SubPurpose), -1)+1) AS NewSubpurpose FROM dpmpaym_dbt " +
+                        " WHERE t_DocKind    = " + string(DocKind) + " AND " +
+                        "       t_DocumentID = " + string(DocID)   + " AND " +
+                        "       t_Purpose    = " + string(Purpose) 
+                      );
+  if( RS.MoveNext() )
+     return RS.NewSubpurpose;
+  end;
+  return 0;
+END;
+
+PRIVATE VAR Party_ForGet = TRecHandler( "party.dbt" );
+PRIVATE MACRO GetPartyName( PartyID:INTEGER, LongName:@STRING ) :STRING
+
+  if( ПолучитьСубъекта( PartyID, Party_ForGet ) == 0 )
+     LongName = Party_ForGet.rec.Name;
+     return Party_ForGet.rec.ShortName;
+  end;
+  return "";
+end;
+
+
+PRIVATE VAR dl_leg = TRecHandler("dl_leg");
+MACRO ВалютаЦеныСделки( BofficeKind:INTEGER, DealID:INTEGER, DealPart:INTEGER, BaseFIID:INTEGER ):INTEGER
+  if ((BofficeKind == DL_SECURITYDOC) or (BofficeKind == DL_RETIREMENT) or (BofficeKind == DL_AVRWRT))
+  if( FindDL_LEG( IIF( DealPart != 2, LEG_KIND_DL_TICK, LEG_KIND_DL_TICK_BACK ), DealID, 0, dl_leg ) != 0 )
+     MsgBox( "Не найдены условия сделки dl_leg.dbt (ID сделки=", DealID,")" );
+     else
+        return dl_leg.rec.CFI;
+     end;
+  else
+     return BaseFIID;
+  end;
+
+  return -1;
+END;
+
+/*Сформировать платеж */
+PRIVATE VAR Payment  = TRecHandler( "pmpaym.dbt" );
+PRIVATE VAR PaymPropDT = TRecHandler( "pmprop.dbt" );
+PRIVATE VAR PaymPropCT = TRecHandler( "pmprop.dbt" );
+PRIVATE VAR RmProp   = TRecHandler( "pmrmprop.dbt" );
+
+MACRO Sp_CreatePayment( FD, Purpose:INTEGER, DocKind:INTEGER, DocID:INTEGER, 
+                        ValueDate:DATE, Chapter:INTEGER,
+                        PayerID:INTEGER, PayerBankID:INTEGER,
+                        ReceiverID:INTEGER, ReceiverBankID:INTEGER,
+                        IsFactPaym:STRING, 
+                        BaseAmount:MONEY, BaseFIID:INTEGER, 
+                        Amount:MONEY, FIID:INTEGER,       // Payer
+                        PayAmount:MONEY, PayFIID:INTEGER, // Receiver
+                        Ground:STRING, 
+                        PayerAccount:STRING, ReceiverAccount:STRING,
+                        Department:INTEGER, SubPurpose:INTEGER, 
+                        PaymStatus:INTEGER, TmpPaymentID:INTEGER,
+                        RetPmObj:@RsbPayment, RetPayment:@variant,
+                        RetPaymPropDT:@variant, RetPaymPropCT:@variant,
+                        CorschemDT:INTEGER, CorschemCT:INTEGER,
+                        IsFixAmount:BOOL 
+                      ) :INTEGER
+
+  VAR ErrStr = "", PayerName:string = "", ReceiverName:string = "", PayerBankName:string = "", ReceiverBankName:string = "";
+  VAR PMObj, SavePayer, SaveReceiver;
+  
+  /* Если на одном шаге создается несколько обьектов то нужно обязательно передавать TmpPaymentID с отрицательным значением
+     изза того что криво работает класс платежа
+  */
+  if( TmpPaymentID == NULL )
+     TmpPaymentID = 0;
+  end;
+
+  PMObj = RsbPayment( TmpPaymentID );
+
+  if( PMObj )
+     /*Дублировать заполнение полей через Payment (TRecHandler) приходится из за отсутствия
+       FillPaymentAccounts в классе платежа*/
+     Payment.Clear();
+
+     if( SubPurpose == NULL )
+        SubPurpose = NewSubpurpose( Purpose, DocKind, DocID );
+     end;
+
+     Payment.rec.Purpose    = PMObj.Purpose      = Purpose;  
+     Payment.rec.SubPurpose = PMObj.SubPurpose   = SubPurpose;
+     Payment.rec.PaymStatus = PMObj.PaymStatus   = IIF( PaymStatus == NULL, PM_PREPARING, PaymStatus );
+     Payment.rec.DocKind    = PMObj.DocKind      = DocKind;
+     Payment.rec.DocumentID = PMObj.DocumentID   = DocID;
+
+     Payment.rec.Payer     = PayerID;
+     Payment.rec.Receiver  = ReceiverID;
+     Payment.rec.PayFIID   = PayFIID;
+     Payment.rec.FIID      = FIID;
+
+     if( IsFixAmount )
+        Payment.rec.IsFixAmount  = PMObj.IsFixPayerAmount = "X";
+     end;
+
+     Payment.rec.ValueDate  = PMObj.ValueDate    = ValueDate;
+     Payment.rec.Department = PMObj.Department   = Department;
+     Payment.rec.OrderFIID  = PMObj.OrderFIID    = ВалютаЦеныСделки( DocKind, DocID, 1, BaseFIID );
+     Payment.rec.BaseFIID   = PMObj.BaseFIID     = BaseFIID;
+     Payment.rec.IsPlanPaym = PMObj.IsPlanPaym   = "X";
+     Payment.rec.IsFactPaym = PMObj.IsFactPaym   = IsFactPaym;
+     Payment.rec.BaseAmount = PMObj.BaseAmount     = BaseAmount;
+     Payment.rec.Amount     = PMObj.PayerAmount    = Amount;
+     Payment.rec.PayAmount  = PMObj.ReceiverAmount = PayAmount;
+                              PMObj.Ground       = Ground;
+
+     PaymPropDT.Clear();
+     PaymPropCT.Clear();
+     RmProp.Clear();
+     PaymPropDT.rec.DebetCredit = PRT_Debet;
+     PaymPropCT.rec.DebetCredit = PRT_Credit;
+
+     SavePayer = Payment.rec.Payer;
+     SaveReceiver = Payment.rec.Receiver;
+
+     if( PayerAccount != "" ) /*Счет переданный параметром считаем более важным, чем счет из СПИ*/
+        Payment.rec.Payer = -1;
+     end;
+
+     if( ReceiverAccount != "" ) /*Счет переданный параметром считаем более важным, чем счет из СПИ*/
+        Payment.rec.Receiver = -1;
+     end;
+
+     if( FillPaymentAccounts( Payment.rec.Payer, Payment.rec.Receiver, 0, Payment, PaymPropDT, PaymPropCT, ErrStr ) == 0 )
+
+         Payment.rec.Payer = SavePayer;
+         Payment.rec.Receiver = SaveReceiver;
+
+         if( CorschemDT != NULL )
+         PaymPropDT.rec.Corschem = CorschemDT;
+         end;
+
+         if( CorschemCT != NULL )
+         PaymPropCT.rec.Corschem = CorschemCT;
+         end;
+
+         if( PayerAccount != "" ) /*Счет переданный параметром считаем более важным, чем счет из СПИ*/
+            Payment.rec.PayerAccount = PayerAccount;
+         end;
+
+         /*Дозаполнить параметры плательщика, если они не заполнилось из СПИ*/
+         if( PaymPropDT.rec.CodeKind <= 0 ) 
+            PaymPropDT.rec.CodeKind     = PTCK_BIC;
+            PMObj.PayerBankCorrCodeKind = PTCK_BIC;
+         end;
+
+         if( (Payment.rec.PayerBankID <= 0) AND (PayerBankID > 0) ) 
+            Payment.rec.PayerBankID = PayerBankID;
+            PaymPropDT.rec.BankCode = ПолучитьКодСубъекта( PayerBankID, PaymPropDT.rec.CodeKind );
+         end;
+
+         if( ReceiverAccount != "" ) /*Счет переданный параметром считаем более важным, чем счет из СПИ*/
+            Payment.rec.ReceiverAccount = ReceiverAccount;
+         end;
+
+         /*Дозаполнить параметры получателя, если они не заполнилось из СПИ*/
+         if( PaymPropCT.rec.CodeKind <= 0 ) 
+            PaymPropCT.rec.CodeKind          = PTCK_BIC;
+            PMObj.ReceiverBankCorrCodeKind   = PTCK_BIC;
+         end;
+
+         if( (Payment.rec.ReceiverBankID <= 0) AND (ReceiverBankID > 0) ) 
+            Payment.rec.ReceiverBankID   = ReceiverBankID;
+            PaymPropCT.rec.BankCode = ПолучитьКодСубъекта( Payment.rec.ReceiverBankID, PaymPropCT.rec.CodeKind );
+         end;
+
+         /*Параметры отправителя/получателя*/
+         GetPartyName( Payment.rec.Payer, @PayerName );
+         GetPartyName( Payment.rec.PayerBankID, @PayerBankName );
+
+         GetPartyName( Payment.rec.Receiver, @ReceiverName );
+         GetPartyName( Payment.rec.ReceiverBankID, @ReceiverBankName );
+
+         PMObj.SetPayerPI( PAYMENTS_GROUP_UNDEF, 
+                          Payment.rec.PayerBankID, 
+                          PaymPropDT.rec.CodeKind, 
+                          PaymPropDT.rec.BankCode, 
+                          PayerBankName,
+                          "",
+                          FIID, 
+                          Chapter/*CHAPT1*/, 
+                          Payment.rec.PayerAccount, 
+                          PayerID, 
+                          PayerName, 
+                          ПолучитьКодСубъекта( Payment.rec.Payer, PTCK_INN ) );
+
+
+         PMObj.SetReceiverPI( PAYMENTS_GROUP_UNDEF, 
+                          Payment.rec.ReceiverBankID, 
+                          PaymPropCT.rec.CodeKind, 
+                          PaymPropCT.rec.BankCode, 
+                          ReceiverBankName,
+                          "",
+                          PayFIID, 
+                          Chapter/*CHAPT1*/, 
+                          Payment.rec.ReceiverAccount, 
+                          ReceiverID, 
+                          ReceiverName, 
+                          ПолучитьКодСубъекта( Payment.rec.Receiver, PTCK_INN ) );
+
+         PaymPropDT.rec.Corschem = PMObj.InCorschem;
+         PaymPropCT.rec.Corschem = PMObj.OutCorschem;
+
+         /*Плательщик*/
+         PMObj.PayerFIID             = FIID;
+         PMObj.PayerDpNode           = Payment.rec.PayerDpNode;
+
+         PMObj.PayerBankCorrAcc      = PaymPropDT.rec.CorrAcc;
+         PMObj.PayerBankCorrCode     = PaymPropDT.rec.CorrCode;
+         PMObj.PayerBankCorrCodeKind = PaymPropDT.rec.CorrCodeKind;
+
+         PMObj.PayerInOurBalance     = PaymPropDT.rec.InOurBalance;
+         PMObj.PayerOurCorrAcc       = PaymPropDT.rec.OurCorrAcc;
+         PMObj.PayerOurCorrID        = PaymPropDT.rec.OurCorrID;
+
+         /*Получатель*/
+         PMObj.ReceiverFIID             = PayFIID;
+         PMObj.ReceiverDpNode           = Payment.rec.ReceiverDpNode;
+
+         PMObj.ReceiverBankCorrAcc      = PaymPropCT.rec.CorrAcc;
+         PMObj.ReceiverBankCorrCode     = PaymPropCT.rec.CorrCode;
+         PMObj.ReceiverBankCorrCodeKind = PaymPropCT.rec.CorrCodeKind;
+
+         PMObj.ReceiverInOurBalance     = PaymPropCT.rec.InOurBalance;
+         PMObj.ReceiverOurCorrAcc       = PaymPropCT.rec.OurCorrAcc;
+         PMObj.ReceiverOurCorrID        = PaymPropCT.rec.OurCorrID;
+
+         PMObj.Actuate();
+         RetPmObj      = PMObj;
+         RetPayment    = Payment;
+         RetPaymPropDT = PaymPropDT;
+         RetPaymPropCT = PaymPropCT;
+     else 
+        MsgBox( "Ошибка определения СПИ плательщика/получателя при создании платежа.\n" + ErrStr );
+        return 1;
+     end;
+
+  else
+     return 1;
+  end;
+  return 0;
+END;
+
+
+MACRO Sp_CreateAvrPayment( FD, Purpose:INTEGER, DocKind:INTEGER, DocID:INTEGER, 
+                           ValueDate:DATE,
+                           PayerID:INTEGER, PayerBankID:INTEGER,
+                           ReceiverID:INTEGER, ReceiverBankID:INTEGER,
+                           BaseAmount:MONEY, BaseFIID:INTEGER, 
+                           Amount:MONEY, FIID:INTEGER,       // Payer
+                           PayAmount:MONEY, PayFIID:INTEGER, // Receiver
+                           Ground:STRING, 
+                           PayerAccount:STRING, ReceiverAccount:STRING,
+                           Department:INTEGER, SubPurpose:INTEGER, 
+                           PaymStatus:INTEGER, TmpPaymentID:INTEGER,
+                           RetPmObj:@RsbPayment, RetPayment:@variant,
+                           RetPaymPropDT:@variant, RetPaymPropCT:@variant
+                         ) :INTEGER
+
+  VAR ErrStr = "", PayerName:string = "", ReceiverName:string = "", PayerBankName:string = "", ReceiverBankName:string = "";
+  VAR PMObj;
+  
+  /* Если на одном шаге создается несколько обьектов то нужно обязательно передавать TmpPaymentID с отрицательным значением
+     изза того что криво работает класс платежа
+  */
+  if( TmpPaymentID == NULL )
+     TmpPaymentID = 0;
+  end;
+
+  PMObj = RsbPayment( TmpPaymentID );
+
+  if( PMObj )
+     /*Дублировать заполнение полей через Payment (TRecHandler) приходится из за отсутствия
+       FillPaymentAccounts в классе платежа*/
+     Payment.Clear();
+
+     if( SubPurpose == NULL )
+        SubPurpose = NewSubpurpose( Purpose, DocKind, DocID );
+     end;
+
+     Payment.rec.Purpose    = PMObj.Purpose      = Purpose;  
+     Payment.rec.SubPurpose = PMObj.SubPurpose   = SubPurpose;
+     Payment.rec.PaymStatus = PMObj.PaymStatus   = IIF( PaymStatus == NULL, PM_PREPARING, PaymStatus );
+     Payment.rec.DocKind    = PMObj.DocKind      = DocKind;
+     Payment.rec.DocumentID = PMObj.DocumentID   = DocID;
+
+     Payment.rec.Payer     = PayerID;
+     Payment.rec.Receiver  = ReceiverID;
+     Payment.rec.PayFIID   = PayFIID;
+     Payment.rec.FIID      = FIID;
+
+
+     Payment.rec.ValueDate  = PMObj.ValueDate    = ValueDate;
+     Payment.rec.Department = PMObj.Department   = Department;
+     Payment.rec.OrderFIID  = Payment.rec.BaseFIID   = PMObj.BaseFIID = PMObj.OrderFIID = BaseFIID;
+     Payment.rec.IsPlanPaym = PMObj.IsPlanPaym   = "X";
+     Payment.rec.IsFactPaym = PMObj.IsFactPaym   = "X";
+     Payment.rec.BaseAmount = PMObj.BaseAmount     = BaseAmount;
+     Payment.rec.Amount     = PMObj.PayerAmount    = Amount;
+     Payment.rec.PayAmount  = PMObj.ReceiverAmount = PayAmount;
+                              PMObj.Ground       = Ground;
+
+     PaymPropDT.Clear();
+     PaymPropCT.Clear();
+     RmProp.Clear();
+     PaymPropDT.rec.DebetCredit = PRT_Debet;
+     PaymPropCT.rec.DebetCredit = PRT_Credit;
+
+//     if( FillPaymentsByDeal( FD.tick, Payment, PaymPropDT, PaymPropCT, RmProp, false, ErrStr ) == 0 )
+     if( FillPaymentAccounts( Payment.rec.Payer, Payment.rec.Receiver, 0, Payment, PaymPropDT, PaymPropCT, ErrStr ) == 0 )
+         if( PayerAccount != "" ) /*Счет переданный параметром считаем более важным, чем счет из СПИ*/
+            Payment.rec.PayerAccount = PayerAccount;
+         end;
+
+         /*Дозаполнить параметры плательщика, если они не заполнилось из СПИ*/
+         if( PaymPropDT.rec.CodeKind <= 0 ) 
+            PaymPropDT.rec.CodeKind     = PTCK_BIC;
+            PMObj.PayerBankCorrCodeKind = PTCK_BIC;
+         end;
+
+         if( Payment.rec.PayerBankID <= 0 ) 
+            Payment.rec.PayerBankID = PayerBankID;
+            PaymPropDT.rec.BankCode = ПолучитьКодСубъекта( PayerBankID, PaymPropDT.rec.CodeKind );
+         end;
+
+         if( ReceiverAccount != "" ) /*Счет переданный параметром считаем более важным, чем счет из СПИ*/
+            Payment.rec.ReceiverAccount = ReceiverAccount;
+         end;
+
+         /*Дозаполнить параметры получателя, если они не заполнилось из СПИ*/
+         if( PaymPropCT.rec.CodeKind <= 0 ) 
+            PaymPropCT.rec.CodeKind          = PTCK_BIC;
+            PMObj.ReceiverBankCorrCodeKind   = PTCK_BIC;
+         end;
+
+         if( Payment.rec.ReceiverBankID <= 0 ) 
+            Payment.rec.ReceiverBankID   = ReceiverBankID;
+            PaymPropCT.rec.BankCode = ПолучитьКодСубъекта( Payment.rec.ReceiverBankID, PaymPropCT.rec.CodeKind );
+         end;
+
+         /*Параметры отправителя/получателя*/
+         GetPartyName( Payment.rec.Payer, @PayerName );
+         GetPartyName( Payment.rec.PayerBankID, @PayerBankName );
+
+         GetPartyName( Payment.rec.Receiver, @ReceiverName );
+         GetPartyName( Payment.rec.ReceiverBankID, @ReceiverBankName );
+         
+         PMObj.SetPayerPI( PAYMENTS_GROUP_UNDEF, 
+                           Payment.rec.PayerBankID, 
+                           PaymPropDT.rec.CodeKind, 
+                           PaymPropDT.rec.BankCode, 
+                           PayerBankName,
+                           "",
+                           FIID, 
+                           5/*CHAPT1*/, 
+                           Payment.rec.PayerAccount, 
+                           PayerID, 
+                           PayerName, 
+                           ПолучитьКодСубъекта( Payment.rec.Payer, PTCK_INN ),
+                           PTCK_CONTR,
+                           ПолучитьКодСубъекта( Payment.rec.Payer, PTCK_CONTR),
+                           -1,
+                           PM_CORRPOS_TYPE_USER
+                          );
+
+
+         PMObj.SetReceiverPI( PAYMENTS_GROUP_UNDEF, 
+                              Payment.rec.ReceiverBankID, 
+                              PaymPropCT.rec.CodeKind, 
+                              PaymPropCT.rec.BankCode, 
+                              ReceiverBankName,
+                              "",
+                              PayFIID, 
+                              5/*CHAPT1*/, 
+                              Payment.rec.ReceiverAccount, 
+                              ReceiverID, 
+                              ReceiverName, 
+                              ПолучитьКодСубъекта( Payment.rec.Receiver, PTCK_INN ),
+                              PTCK_CONTR,
+                              ПолучитьКодСубъекта( Payment.rec.Receiver, PTCK_CONTR ),
+                              -1,
+                              PM_CORRPOS_TYPE_USER
+                             );
+
+         /*Плательщик*/
+         PMObj.PayerFIID             = FIID;
+         PMObj.PayerDpNode           = Payment.rec.PayerDpNode;
+
+         PMObj.PayerBankCorrAcc      = PaymPropDT.rec.CorrAcc;
+         PMObj.PayerBankCorrCode     = PaymPropDT.rec.CorrCode;
+         PMObj.PayerBankCorrCodeKind = PaymPropDT.rec.CorrCodeKind;
+
+         PMObj.PayerInOurBalance     = PaymPropDT.rec.InOurBalance;
+         PMObj.PayerOurCorrAcc       = PaymPropDT.rec.OurCorrAcc;
+         PMObj.PayerOurCorrID        = PaymPropDT.rec.OurCorrID;
+
+         /*Получатель*/
+         PMObj.ReceiverFIID             = PayFIID;
+         PMObj.ReceiverDpNode           = Payment.rec.ReceiverDpNode;
+
+         PMObj.ReceiverBankCorrAcc      = PaymPropCT.rec.CorrAcc;
+         PMObj.ReceiverBankCorrCode     = PaymPropCT.rec.CorrCode;
+         PMObj.ReceiverBankCorrCodeKind = PaymPropCT.rec.CorrCodeKind;
+
+         PMObj.ReceiverInOurBalance     = PaymPropCT.rec.InOurBalance;
+         PMObj.ReceiverOurCorrAcc       = PaymPropCT.rec.OurCorrAcc;
+         PMObj.ReceiverOurCorrID        = PaymPropCT.rec.OurCorrID;
+
+         PMObj.Actuate();
+         RetPmObj      = PMObj;
+         RetPayment    = Payment;
+         RetPaymPropDT = PaymPropDT;
+         RetPaymPropCT = PaymPropCT;
+     else 
+        MsgBox( "Ошибка определения СПИ плательщика/получателя при создании платежа.\n" + ErrStr );
+        return 1;
+     end;
+
+  else
+     return 1;
+  end;
+  return 0;
+END;
+
+
+PRIVATE VAR CalcNKDCourse = NULL;
+MACRO РАСЧЕТ_НКД_ЧЕРЕЗ_КУРС():BOOL
+  CONST RegPath = "SECUR\\РАСЧЕТ НКД ПО КУРСУ";
+  VAR   err;
+
+  if( CalcNKDCourse == NULL )
+     GetRegistryValue( RegPath, V_BOOL, CalcNKDCourse, err );
+     if( err != 0 )
+        MsgBox( "Ошибка при получении значения настройки \"" + RegPath + "\"");
+     end;
+  end;
+  return CalcNKDCourse;
+END;
+
+PRIVATE VAR NKDCourseType = NULL;
+MACRO ВИД_КУРСА_НКД_ДЛЯ_ЦБ():DOUBLE
+  CONST RegPath = "SECUR\\ВИД КУРСА НКД ДЛЯ ЦБ";
+  VAR   err;
+
+  if( NKDCourseType == NULL )
+     GetRegistryValue( RegPath, V_INTEGER, NKDCourseType, err );
+     if( err != 0 )
+        MsgBox( "Ошибка при получении значения настройки \"" + RegPath + "\"");
+     end;
+  end;
+  return NKDCourseType;
+END;
+
+MACRO ПолучитьНКДПоКурсу( FIID, CalcDate )
+  var RSD;
+  var cmd = RSDCommand( "select RSB_FIINSTR.FindNKDCource( ?, ?, ? ) NKD from dual" );
+  cmd.addParam( "", RSDBP_IN, FIID );
+  cmd.addParam( "", RSDBP_IN, CalcDate );
+  cmd.addParam( "", RSDBP_IN, 0 );
+  cmd.execute();
+
+  RSD = TRsbDataSet(cmd);
+  if( RSD.MoveNext() )
+     return RSD.rec.NKD;
+  end;
+
+  return 0;
+END;
+
+MACRO ЕстьНулевыеКупоны( FIID, CalcDate )
+  var RSD;
+  var cmd = RSDCommand( "select RSB_FIINSTR.FI_HasZeroCoupons( ?, ? ) v_Exist from dual" );
+  cmd.addParam( "", RSDBP_IN, FIID );
+  cmd.addParam( "", RSDBP_IN, CalcDate );
+  cmd.execute();
+
+  RSD = TRsbDataSet(cmd);
+  if( RSD.MoveNext() )
+     if (RSD.v_Exist == 0)
+        return false;
+     else
+        return true;
+     end;
+  end;
+
+  return false;
+END;
+
+macro CheckComissOver50905()
+   var ErrCode, RetMode;
+
+   GetRegistryValue( "SECUR\\КОМИССИИ НА 50905", V_BOOL, RetMode, ErrCode );
+
+   return RetMode and (ErrCode == 0);
+end;
+
+PRIVATE VAR InsNDS = NULL;
+macro УчетНДСВМоментОплатыКом()
+   CONST RegPath = "SECUR\\УЧЕТ НДС В МОМЕНТ ОПЛАТЫ КОМИС";
+   var err;
+
+   if( InsNDS == NULL )
+      GetRegistryValue( RegPath, V_BOOL, InsNDS, err );
+      if( err != 0 )
+         MsgBox( "Ошибка при получении значения настройки \"" + RegPath + "\"");
+      end;
+   end;
+   return InsNDS;
+end;
+
+macro ОтдельныйУчетУплНКД()
+   CONST RegPath = "SECUR\\ОТДЕЛЬНЫЙ УЧЁТ УПЛАЧЕННОГО НКД";
+   var DelimNKD, err;
+
+   GetRegistryValue( RegPath, V_BOOL, DelimNKD, err );
+   if( err != 0 )
+      MsgBox( "Ошибка при получении значения настройки \"" + RegPath + "\"");
+   end;
+   return DelimNKD;
+end;
+
+macro ОтдельныйУчетУплНКД_Клиента()
+   CONST RegPath = "SECUR\\ОТДЕЛЬНЫЙ УЧЁТ УПЛАЧ. НКД (КЛ.)";
+   var DelimNKD, err;
+
+   GetRegistryValue( RegPath, V_BOOL, DelimNKD, err );
+   if( err != 0 )
+      MsgBox( "Ошибка при получении значения настройки \"" + RegPath + "\"");
+   end;
+   return DelimNKD;
+end;
+
+macro ЕдинаяПроводкаПо2ЧастиКлРЕПО()
+   CONST RegPath = "SECUR\\ЕДИНАЯ ПРОВОДКА ПО 2Ч КЛ РЕПО";
+   var UNITrnREPO2Cl, err;
+
+   GetRegistryValue( RegPath, V_BOOL, UNITrnREPO2Cl, err );
+   if( err != 0 )
+      MsgBox( "Ошибка при получении значения настройки \"" + RegPath + "\"");
+   end;
+   return UNITrnREPO2Cl;
+end;
+
+macro ЕдиныйПлатежПо2ЧастиСобРЕПО()
+   CONST RegPath = "SECUR\\ЕДИНЫЙ ПЛАТЕЖ ПО 2Ч. СОБС. РЕПО";
+   var IsUNITrnREPO2_Own, err;
+
+   GetRegistryValue( RegPath, V_BOOL, IsUNITrnREPO2_Own, err );
+   if( err != 0 )
+      MsgBox( "Ошибка при получении значения настройки \"" + RegPath + "\"");
+   end;
+   return IsUNITrnREPO2_Own;
+end;
+
+macro ПроверятьСущественностьЗатрат()
+   var CheckOutlay, ErrCode, RegPath = "SECUR\\ПРОВЕРЯТЬ СУЩЕСТВЕННОСТЬ ЗАТРАТ";
+
+   GetRegistryValue( RegPath, V_BOOL, CheckOutlay, ErrCode );
+
+   if( ErrCode != 0 )
+      MsgBox( "Ошибка при получении значения настройки \"" + RegPath + "\"");
+   end;
+
+   return CheckOutlay and (ErrCode == 0);
+end;
+
+macro GetMaxOutlay()
+   var ErrCode, RetValue;
+
+   GetRegistryValue( "SECUR\\МАКС. ВЕЛИЧИНА ДЛЯ НЕСУЩ.ЗАТРАТ", V_DOUBLE, RetValue, ErrCode );
+
+   if (ErrCode == 0)
+      return RetValue;
+   else
+      return 0.0;
+   end;
+end;
+
+PRIVATE VAR RsvRepoCostCB = NULL;
+macro РВПпоПРЕПОпоСтоимостиЦБ():integer
+   var ErrCode, RegPath = "CB\\РЕЗЕРВЫ\\РВП ПО ПР. РЕПО";
+
+   GetRegistryValue( RegPath, V_INTEGER, RsvRepoCostCB, ErrCode );
+
+   if( ErrCode != 0 )
+      MsgBox( "Ошибка при получении значения настройки \"" + RegPath + "\"");
+   end;
+
+   return RsvRepoCostCB;
+end;
+
+PRIVATE VAR MarketCommByClirAcc = NULL;
+macro УчетБиржКомиссииНаКлирСчете()
+   var ErrCode, RegPath = "SECUR\\БИРЖ. КОМИССИИ НА КЛИР. СЧ.";
+
+   GetRegistryValue( RegPath, V_BOOL, MarketCommByClirAcc, ErrCode );
+
+   if( ErrCode != 0 )
+      MsgBox( "Ошибка при получении значения настройки \"" + RegPath + "\"");
+   end;
+
+   return (MarketCommByClirAcc and (ErrCode == 0));
+end;
+
+//Sum_Deal - Сумма сделки вкл. НКД в ВН
+//Sum_Outlay - Сумма затрат по группе в ВН
+macro CheckOutlayMaterial(Sum_Deal, Sum_Outlay)
+   if (ПроверятьСущественностьЗатрат())
+      if (Sum_Outlay / Sum_Deal * 100.0 <= GetMaxOutlay())
+         return false; // Затраты несущественны
+      else
+         return true;
+      end;
+   else
+      return true;
+   end;
+end;
+
+macro GetImmaterialFlagByComiss(leg_buf, dlcomis_buf, _Immaterial)
+  var Immaterial = UNSET_CHAR;
+  var Sum_Deal, Sum_Outlay;
+  var fininstr = TRecHandler( "fininstr" );
+  record sfcomiss( sfcomiss );
+
+  ClearRecord( sfcomiss );
+  if(SfGetComiss(dlcomis_buf.FeeType, dlcomis_buf.ComNumber, sfcomiss) == false)
+     msgbox( "Не найдены параметры комиссии (FeeType = " + string(dlcomis_buf.FeeType) + ", CommNumber = " + string(dlcomis_buf.ComNumber) + ")" );
+     return 1;
+  end;
+
+  if(ПолучитьФинИн( leg_buf.PFI, fininstr ) != 0)
+     msgbox( "Не найден финансовый инструмент (FIID = " + string(leg_buf.PFI) );
+     return 1;
+  end;
+
+  // Проверим существенность затрат. Все суммы сравниваем в ВН.
+  if( SmartConvertSum( Sum_Deal, leg_buf.TotalCost, dlcomis_buf.Date, leg_buf.CFI, fininstr.rec.FaceValueFI, true ) == false )
+     msgbox( "Не могу сконвертировать сумму из ", ПолучитьКодФинИн(leg_buf.CFI)," в ", ПолучитьКодФинИн(fininstr.rec.FaceValueFI) );
+     return 1;
+  end; 
+
+  if( SmartConvertSum( Sum_Outlay, dlcomis_buf.Sum, dlcomis_buf.Date, sfcomiss.FIID_Comm, fininstr.rec.FaceValueFI, true ) == false )
+     msgbox( "Не могу сконвертировать сумму из ", ПолучитьКодФинИн(sfcomiss.FIID_Comm)," в ", ПолучитьКодФинИн(fininstr.rec.FaceValueFI) );
+     return 1;
+  end; 
+
+  if (CheckOutlayMaterial(Sum_Deal, Sum_Outlay))
+     Immaterial = UNSET_CHAR;
+  else
+     Immaterial = SET_CHAR;
+  end;
+
+  SetParm( 2, Immaterial );
+
+  return 0;
+end;
+
+macro GetImmaterialFlagByDealComiss(DocKind, DocID, dlcomis, _Immaterial)
+  var Immaterial = UNSET_CHAR, stat = 0, Group, 
+      dl_leg    = TrecHandler( "dl_leg.dbt" ),
+      tick      = TBfile("dl_tick.dbt");
+
+  tick.rec.DealID = DocID;
+  if( tick.GetEQ() == false) 
+     return 1;
+  end;
+
+  Group = SP_GetOperationGroup(tick.rec);
+
+  // Несущественные затраты не бывают по клиентским сделкам, а также РЕПО, зачислениям, списаниям
+  if( IsClientDeal(tick.rec) OR IsTwoPart(Group) OR IsAVRWRTIN(Group) OR IsAVRWRTOUT(Group)) 
+     Immaterial = UNSET_CHAR;
+  else
+     if( FindDL_LEG( LEG_KIND_DL_TICK, DocID, 0, dl_leg ) != 0 )
+        return 1;
+     end;
+
+     if (ПроверятьСущественностьЗатрат())
+        stat = GetImmaterialFlagByComiss(dl_leg.rec, dlcomis.rec, Immaterial);
+     end;
+  end;
+
+  SetParm( 3, Immaterial );
+  return stat;
+end;
+
+
+/*Получить сумму комиссий*/
+/*Вход:
+       pDocKind          - вид ПД операции (сделки)
+       pDocID            - ID ПД операции (сделки). Если pDocKind == pDocID == 0, то по всем сделкам 
+       pContract         - договор. Если pContract == 0, то по всем договорам
+       pBegDate          - дата начала периода фактической оплаты (для оплаченных). Если нач. дата, то не проверять.
+       pEndDate          - дата окончания периода фактической оплаты (для оплаченных). Если нач. дата, то не проверять.
+       pCalcByOurBank    - выполнять расчет по комиссиям Нашему Банку (1 - да, 0 - нет)
+       pCalcByMarket     - выполнять расчет по комиссиям Бирже (1 - да, 0 - нет)
+       pCalcByPayed      - выполнять расчет по оплаченным (1 - да, 0 - нет)
+       pCalcByNotPayed   - выполнять расчет по неоплаченным (1 - да, 0 - нет)
+       pCalcByMaterial   - выполнять расчет по существенным затратам (1 - да, 0 - нет)
+       pCalcByImmaterial - выполнять расчет по несущественным затратам (1 - да, 0 - нет)
+       pConvDate         - дата, на которую нужно конвертировать сумму. Если не задано, то нач. дата(оплаченные всегда конвертятся на дату оплаты)
+       pConvFIID         - валюта, в которую нужно конвертировать сумму. Если не задано, то -1
+       pIncReg_          - включать в сумму комиссий комиссию регистратору по 1 части(true - да, false - нет) если не задан , то не включаем
+       pIncRegBack_      - включать в сумму комиссий комиссию регистратору по 2 части(true - да, false - нет) если не задан , то не включаем
+       pByFIID_          - для отчета, бывает, нужно вывести комиссии по конкретной валюте (Отчет "Расчет по итогам торгов")
+Выход:
+       pSum - сумма комиссий(c НДС)
+       pNDS - сумма НДС
+       pSumWithoutNDS - сумма комиссий без НДС
+       pSumFIID - валюта суммы. Если задан pConvFIID, то равен pConvFIID.
+*/
+MACRO SP_GetSumCom( pSum_:money, pNDS_:money, pSumWithoutNDS_:money, pSumFIID_:integer, 
+                    pDocKind:integer, pDocID:integer, pContract:integer, pBegDate:date, pEndDate:date, pCalcByOurBank:integer, pCalcByMarket:integer,   
+                    pCalcByPayed:integer, pCalcByNotPayed:integer, pCalcByMaterial:integer, pCalcByImmaterial:integer, pConvDate_:date, pConvFIID_:integer, SayError_:bool, pIncReg_:bool, pIncRegBack_:bool, pByFIID_:integer
+                  )
+   var sql = "", cmd, RSD, pSum = $0.0, pNDS = $0.0, pSumWithoutNDS = $0.0, Sum = $0.0, NDS = $0.0, SumWithoutNDS = $0.0, pSumFIID = -1, IsFirst = true;
+   var pConvFIID = -1, pConvDate = Date(0,0,0), SayError = false, pIncReg = false, pIncRegBack = false, pByFIID = -1;
+
+   if( (pConvFIID_ != null) and (pConvFIID_ != -1) )
+      pConvFIID = pConvFIID_;
+   end;
+
+   if( (pByFIID_ != null) and (pByFIID_ != -1) )
+      pByFIID = pByFIID_;
+   end;
+
+   if( SayError_ != null )
+      SayError = SayError_;
+   end;
+
+   if( pIncReg_ != null )
+      pIncReg = pIncReg_;
+   end;
+
+   if( pIncRegBack_ != null )
+      pIncRegBack = pIncRegBack_;
+   end;
+
+   cmd = DL_RsdCommand();
+
+/* аналог V_DLCOMISALL*/
+   sql = 
+       " select Com.T_SUM, Com.T_NDS, Com.T_FACTPAYDATE, M.T_FIID_COMM FROM( "+
+       " SELECT  q.T_ID,q.T_DOCKIND,q.T_DOCID,q.T_CONTRACT,q.T_FEETYPE,q.T_COMNUMBER,q.T_SUM,q.T_NDS,q.T_DATE,q.T_PLANPAYDATE,q.T_FACTPAYDATE,q.T_INPUTMEDIUM,q.T_SERVOPERID,q.T_ISBACK,q.T_IMMATERIAL,q.T_TYPE  "+
+       "   FROM (SELECT DLCOMIS.T_ID AS T_ID, "+
+       "                 DLCOMIS.T_DOCKIND AS T_DOCKIND, "+
+       "                 DLCOMIS.T_DOCID AS T_DOCID, "+
+       "                 DLCOMIS.T_CONTRACT AS T_CONTRACT, "+
+       "                 DLCOMIS.T_FEETYPE AS T_FEETYPE, "+
+       "                 DLCOMIS.T_COMNUMBER AS T_COMNUMBER, "+
+       "                 DLCOMIS.T_SUM AS T_SUM, "+
+       "                 DLCOMIS.T_NDS AS T_NDS, "+
+       "                 DLCOMIS.T_DATE AS T_DATE, "+
+       "                 DLCOMIS.T_PLANPAYDATE AS T_PLANPAYDATE, "+
+       "                 DLCOMIS.T_FACTPAYDATE AS T_FACTPAYDATE, "+
+       "                 DLCOMIS.T_INPUTMEDIUM AS T_INPUTMEDIUM, "+
+       "                 DLCOMIS.T_SERVOPERID AS T_SERVOPERID, "+
+       "                 DLCOMIS.T_ISBACK AS T_ISBACK, "+
+       "                 DLCOMIS.T_IMMATERIAL AS T_IMMATERIAL, "+
+       "                 1 AS T_TYPE "+
+       "            FROM DDLCOMIS_DBT DLCOMIS "
+       "           WHERE ";
+
+       if( (pDocKind > 0) and (pDocID > 0) )
+         sql = sql + "  DLCOMIS.T_DOCKIND = ? "+
+         "           and DLCOMIS.T_DOCID = ? ";
+
+         cmd.addParam(pDocKind );        
+         cmd.addParam(pDocID );
+       else
+         sql = sql + "  DLCOMIS.T_DOCKIND <> ? ";
+
+         cmd.addParam(DL_DVNDEAL);
+       end;
+
+       sql = sql + 
+       "                 AND NOT EXISTS "+
+       "                            (SELECT 1 "+
+       "                               FROM DOBJATCOR_DBT OBJATCOR "+
+       "                              WHERE     OBJATCOR.T_OBJECTTYPE = 650 "+
+       "                                    AND OBJATCOR.T_GROUPID = 13 "+
+       "                                    AND OBJATCOR.T_ATTRID = 1 "+
+       "                                    AND OBJATCOR.T_OBJECT =CONCAT (LPAD (DLCOMIS.T_FEETYPE,5,'0'),LPAD (DLCOMIS.T_COMNUMBER,5,'0')) "+
+       "                             ) "+
+       "          UNION ALL "+
+       "          SELECT DEFCOM.T_ID AS T_ID, "+
+       "                 BASOBJ.T_BASEOBJECTTYPE AS T_DOCKIND, "+
+       "                 TO_NUMBER (BASOBJ.T_BASEOBJECTID) AS T_DOCID, "+
+       "                 DEFCOM.T_CONID AS T_CONTRACT, "+
+       "                 DEFCOM.T_FEETYPE AS T_FEETYPE, "+
+       "                 DEFCOM.T_COMMNUMBER AS T_COMNUMBER, "+
+       "                 BASOBJ.T_COMMSUM AS T_SUM, "+
+       "                 BASOBJ.T_NDSSUM AS T_NDS, "+
+       "                 DEFCOM.T_DATEFEE AS T_DATE, "+
+       "                 DEFCOM.T_DATEFEE AS T_PLANPAYDATE, "+
+       "                 DEFCOM.T_DATEFEE AS T_FACTPAYDATE, "+
+       "                 'Р' AS T_INPUTMEDIUM, "+
+       "                 0 AS T_SERVOPERID, "+
+       "                 CHR (0) AS T_ISBACK, "+
+       "                 CHR (0) AS T_IMMATERIAL, "+
+       "                 2 AS T_TYPE "+
+       "            FROM DSFBASOBJ_DBT BASOBJ, "+
+       "                 DSFDEFCOM_DBT DEFCOM, "+
+       "                 DSFCOMISS_DBT COMISS "+
+       "           WHERE     DEFCOM.T_ID = BASOBJ.T_DEFCOMMID "+
+       "                 AND COMISS.T_FEETYPE = DEFCOM.T_FEETYPE "+
+       "                 AND COMISS.T_NUMBER = DEFCOM.T_COMMNUMBER  "+
+       "                 AND COMISS.T_SERVICEKIND = 1 ";
+
+       if( (pDocKind > 0) and (pDocID > 0) )
+         sql = sql + " AND BASOBJ.T_BASEOBJECTTYPE = ? "+
+                     " AND BASOBJ.T_BASEOBJECTID = to_char(?) ";
+
+         cmd.addParam(pDocKind );        
+         cmd.addParam(pDocID );
+       else
+         sql = sql + "  AND BASOBJ.T_BASEOBJECTTYPE <> ? ";
+
+         cmd.addParam(DL_DVNDEAL);
+       end;
+       
+       sql = sql + 
+       "                 AND EXISTS "+
+       "                        (SELECT 1 "+
+       "                           FROM DOBJATCOR_DBT OBJATCOR "+
+       "                          WHERE     OBJATCOR.T_OBJECTTYPE = 650 "+
+       "                                AND OBJATCOR.T_GROUPID = 13 "+
+       "                                AND OBJATCOR.T_ATTRID = 1 "+
+       "                                AND OBJATCOR.T_OBJECT = "+
+       "                                       CONCAT (LPAD (COMISS.T_FEETYPE, 5, '0'),LPAD (COMISS.T_NUMBER, 5, '0')))) q "+
+       " ) Com, DSFCOMISS_DBT M "+
+       " WHERE M.T_FEETYPE = Com.T_FEETYPE and M.T_NUMBER = Com.T_COMNUMBER ";
+
+
+   if( (pContract != null) and (pContract > 0) )
+      sql = sql +
+         "   and Com.T_CONTRACT = ? ";
+
+      cmd.addParam(pContract );
+   end; 
+
+   if( (pBegDate != null) and (pBegDate != Date(0,0,0)) )
+      sql = sql +
+         "   and rsb_secur.CheckExistGrDealByCom(DECODE(Com.t_Type, 2, "+OBJTYPE_SFCONTR+", Com.T_DocKind), DECODE(Com.t_Type, 2, Com.T_Contract, Com.T_DocID), Com.T_Contract, Com.T_PLANPAYDATE, "+DLGRACC_STATE_PLAN+") = 0 and Com.T_FACTPAYDATE >= ? ";
+
+      cmd.addParam(pBegDate );
+   end; 
+
+   if( (pEndDate != null) and (pEndDate != Date(0,0,0)) )
+      sql = sql +
+         "   and rsb_secur.CheckExistGrDealByCom(DECODE(Com.t_Type, 2, "+OBJTYPE_SFCONTR+", Com.T_DocKind), DECODE(Com.t_Type, 2, Com.T_Contract, Com.T_DocID), Com.T_Contract, Com.T_PLANPAYDATE, "+DLGRACC_STATE_PLAN+") = 0 and Com.T_FACTPAYDATE <= ? ";
+
+      cmd.addParam(pEndDate );
+   end; 
+
+   var RegComPart_1 = " (Com.T_IsBack = chr(0) "+
+                      "  and M.T_RECEIVERID = NVL((select leg.t_Registrar from ddl_leg_dbt leg "+
+                      "                             where leg.t_DealID = Com.T_DOCID " +
+                      "                               and leg.t_LegID = 0 " +
+                      "                               and leg.t_LegKind = " +LEG_KIND_DL_TICK+/*по 1 ч*/
+                      "                               and leg.t_PayRegTax = 'X' "+
+                      "                           ),0) "+
+                      " )";
+
+   var RegComPart_2 = " (Com.T_IsBack = 'X' "+
+                      "  and M.T_RECEIVERID = NVL((select leg.t_Registrar from ddl_leg_dbt leg "+
+                      "                             where leg.t_DealID = Com.T_DOCID " +
+                      "                               and leg.t_LegID = 0 " +
+                      "                               and leg.t_LegKind = " +LEG_KIND_DL_TICK_BACK+/*по 2 ч*/
+                      "                               and leg.t_PayRegTax = 'X' "+
+                      "                           ),0) "+
+                      "  and M.T_RECEIVERID > 0 "+
+                      " ) ";
+
+   /*включать или нет в сумму комиссий комиссию регистратору*/
+   if( pIncReg and pIncRegBack )
+      /*включаем все комиссии в том числе и регсбор по 1 и 2 частям*/
+      sql = sql +                               
+         "   and (Com.T_IsBack = chr(0) "+
+         "        or "+RegComPart_2+
+         "       )";
+   elif( pIncReg )/*включать регсбор только по 1 ч*/
+      sql = sql +                               
+         "   and not (Com.T_IsBack = 'X')";
+   elif( pIncRegBack )/*включать регсбор только по 2 ч*/
+      sql = sql +
+         "   and ( (Com.T_IsBack = chr(0) "+
+         "          and not "+RegComPart_1+
+         "         ) or "+
+                 RegComPart_2+
+         "       )";
+   else/*комисии регсбора не включаем вообще*/
+      sql = sql +
+         "   and not (Com.T_IsBack = 'X') "+
+         "   and not "+RegComPart_1;
+   end; 
+
+   sql = sql +
+      "   and (("+string(pCalcByOurBank)+" = 1 and M.T_RECEIVERID = "+string({OurBank})+") or "+
+      "        ("+string(pCalcByMarket)+" = 1 and M.T_RECEIVERID != "+string({OurBank})+")) "+
+      "   and (("+string(pCalcByPayed)+" = 1 and rsb_secur.CheckExistGrDealByCom(DECODE(Com.t_Type, 2, "+OBJTYPE_SFCONTR+", Com.T_DocKind), DECODE(Com.t_Type, 2, Com.T_Contract, Com.T_DocID), Com.T_Contract, Com.T_PLANPAYDATE, "+DLGRACC_STATE_PLAN+") = 0 ) or "+
+      "        ("+string(pCalcByNotPayed)+" = 1 and rsb_secur.CheckExistGrDealByCom(DECODE(Com.t_Type, 2, "+OBJTYPE_SFCONTR+", Com.T_DocKind), DECODE(Com.t_Type, 2, Com.T_Contract, Com.T_DocID), Com.T_Contract, Com.T_PLANPAYDATE, "+DLGRACC_STATE_PLAN+") = 1 )) "+
+      "   and (("+string(pCalcByMaterial)+" = 1 and Com.T_IMMATERIAL = chr(0)) or "+
+      "        ("+string(pCalcByImmaterial)+" = 1 and Com.T_IMMATERIAL = 'X')) ";
+
+   if( pByFIID != -1 )
+      sql = sql +
+         "   and M.T_FIID_COMM = ? ";
+
+      cmd.addParam(pByFIID );
+   end;
+
+   sql = sql +
+         " order by M.T_FIID_COMM, Com.T_FACTPAYDATE ";
+   
+   RSD = cmd.execute(sql);
+   while( RSD.MoveNext() )
+
+      if( (pConvFIID == -1) and (IsFirst == false) and (pSumFIID != RSD.FIID_COMM) )
+         if(SayError)
+            MsgBox( "Попытка суммировать комиссии в разных валютах");
+         end;
+
+         SetParm(0, $0);
+         SetParm(1, $0);
+         SetParm(2, $0);
+         SetParm(3, -1);
+
+         return false;
+      end;
+
+      Sum = RSD.SUM;
+      NDS = RSD.NDS;
+      SumWithoutNDS = Sum - NDS;
+
+      if( pConvFIID != -1 )      
+
+         /*если оплачена, конвертим на дату оплаты, неоплаченные - на дату pConvDate_ (пока так)*/
+         if( (SQL_ConvTypeDate(RSD.FACTPAYDATE) != NULL) and (SQL_ConvTypeDate(RSD.FACTPAYDATE) != Date(0,0,0)) )
+            pConvDate = SQL_ConvTypeDate(RSD.FACTPAYDATE);
+         elif( (pConvDate_ != null) and (pConvDate_ != Date(0,0,0)) )
+            pConvDate = pConvDate_;
+         else
+            pConvDate = {curdate};
+         end;
+
+         if( not SmartConvertSum( Sum, Sum, pConvDate, RSD.FIID_COMM, pConvFIID, SayError ) )
+            SetParm(0, $0);
+            SetParm(1, $0);
+            SetParm(2, $0);
+            SetParm(3, -1);
+            return false;
+         end;
+        
+         if( not SmartConvertSum( NDS, NDS, pConvDate, RSD.FIID_COMM, pConvFIID, SayError ) )
+            SetParm(0, $0);
+            SetParm(1, $0);
+            SetParm(2, $0);
+            SetParm(3, -1);
+            return false;
+         end;
+
+         if( not SmartConvertSum( SumWithoutNDS, SumWithoutNDS, pConvDate, RSD.FIID_COMM, pConvFIID, SayError ) )
+            SetParm(0, $0);
+            SetParm(1, $0);
+            SetParm(2, $0);
+            SetParm(3, -1);
+            return false;
+         end;
+
+         pSumFIID = pConvFIID;
+
+      else
+         pSumFIID = RSD.FIID_COMM;
+      end;
+
+      pSum = pSum + Sum;
+      pNDS = pNDS + NDS;
+      pSumWithoutNDS = pSumWithoutNDS + SumWithoutNDS;
+
+      IsFirst = false;
+
+   end;
+
+   SetParm(0, pSum);
+   SetParm(1, pNDS);
+   SetParm(2, pSumWithoutNDS);
+   SetParm(3, pSumFIID);
+
+   return true;
+end;
+
+/*проверить, что на договре есть навешанные комиссии с выставленной категорией "Расчет комиссий в БО ЦБ" в "При завершении торгового дня"*/
+/*CheckCalc - проверять оплаченные в дату OnDate_
+*/
+macro SPIsExistPeriodComissOnFinalTrDay(ContrID:integer,CheckCalc:bool,OnDate_:Date)
+
+   var rComiss = TRecHandler( "sfcomiss.dbt" ), OnDate = {curdate};
+
+   var DataSet, Query, cmd;
+
+   Query = "SELECT comis.* "+ 
+           "  FROM DSFCONCOM_DBT concom, DSFCOMISS_DBT comis "+
+           " Where concom.T_FEETYPE = ? "+
+           "   AND concom.T_OBJECTID = ? "+
+           "   AND concom.T_FEETYPE = comis.T_FEETYPE "+
+           "   AND concom.T_COMMNUMBER = comis.T_NUMBER ";
+
+   if( CheckCalc )
+
+      if( (OnDate_ != null) and (OnDate_ != Date(0,0,0)) )
+         OnDate = OnDate_;
+      end;
+
+      Query = Query +
+           "   AND NVL(( select count(1) "+
+           "               from ddlcomis_dbt dlcomis "+
+           "              where dlcomis.t_FEETYPE = comis.T_FEETYPE "+
+           "                and dlcomis.t_COMNUMBER = comis.T_NUMBER "+
+           "                and dlcomis.t_CONTRACT = concom.T_OBJECTID "+
+           "                and rsb_secur.CheckExistGrDealByCom(dlcomis.T_DocKind, dlcomis.T_DocID, dlcomis.T_Contract, dlcomis.T_PLANPAYDATE, "+DLGRACC_STATE_FACTEXEC+") = 1 "+
+           "                and dlcomis.t_FACTPAYDATE = ? "+
+           "           ),0) > 0 ";
+   end;
+
+   cmd = RSDCommand(Query);
+
+   cmd.addParam("", RSDBP_IN, SF_FEE_TYPE_PERIOD );        
+   cmd.addParam("", RSDBP_IN, ContrID );        
+
+   if( CheckCalc )
+      cmd.addParam("", RSDBP_IN, OnDate );        
+   end;
+
+   cmd.execute();
+   DataSet = TRsbDataSet(cmd);
+
+   while(DataSet.MoveNext())
+
+      rComiss.Clear();
+      DataSet.GetRecord().CopyTo( rComiss.rec );
+
+      if( ПроверитьКатегориюКомиссии( rComiss, "TDF", OBJGROUP_SFCOM_CALCBYBO ) == true )
+         return true;
+      end;
+
+   end;
+
+   return false;
+end;
+
+PRIVATE MACRO GetForvardAcc( FD, AccFIID:@INTEGER ):STRING
+   if( (FD.ВидСрочностиСделки() == СделкаToday) AND 
+       ( (IsOUTEXCHANGE(FD.Group) OR 
+          IsBROKER(FD.Group) OR 
+          (IsEXCHANGE(FD.Group) AND (not FD.СделкаОРЦБ()))
+         ) AND 
+         (GetOption_NotUse47407_08() == true) 
+       )
+     )
+       AccFIID = NATCUR;/*для категории "Реализация, ц/б" всегда НацВ*/
+       return "Реализация, ц/б";
+   end;
+
+   return "+Форвард, расчеты";
+END;
+
+MACRO СчетПолученияСредствЗаПогашение( FD, AccFIID:@INTEGER, IsCarry )
+  if( IsBROKER(FD.Group) OR FD.СделкаОРЦБ() OR IsCarry )
+     if( IsRET_ISSUE(FD.Group) ) 
+        AccFIID = NATCUR;
+        return "Реализация, ц/б";
+     else 
+        AccFIID = NATCUR;
+        return "+%ДЦ/б";
+     end; 
+  else
+     AccFIID = null; /*определится по платежу*/
+     if( not Использовать47422_23ПриПогашении() )
+        return "Реализация, ц/б";
+     else
+       /*AEA*/
+       if( (IsRET_COUPON(FD.Group)) OR (IsRET_PARTLY(FD.Group))) 
+          if( (FD.FaceFIID() == NATCUR) and (FD.tick.rec.partyid == 4) )
+                 If(FD.GetRQ(DLRQ_TYPE_payment).rec.factdate == Getdateafterworkdays(fd.dl_leg.rec.expiry))
+                      return "+Биржа";
+                 else
+                   return "+РасчетыПогаш";
+                 end;
+
+//             return "+Биржа";
+//             return "+РасчетыПогаш";
+
+          end;
+       end;
+/*КД*/
+       if((IsRET_COUPON(FD.Group)) OR (IsRET_PARTLY(FD.Group))) 
+          if( (FD.FaceFIID() != NATCUR) and (FD.tick.rec.partyid == 4) )
+             return "+РасчетыПогаш";
+          end;
+       end;
+
+       /*******/
+        return "+Расчеты";
+     end;
+  end;
+  return "";
+END;
+
+MACRO ЮзерСчетСписанияСредствЗаПогашениеКупона( FD, IsPaym )
+  if( FD.СделкаОРЦБ() == true ) /*ОРЦБ*/
+     return "+Биржа";
+  elif( FD.tick.rec.Flag4 == SET_CHAR ) /*БРОКЕР*/
+     return "Брокер";
+  else /*Не ОРЦб и не Брокер*/
+     if( IsPaym and (not IsClientDeal(FD.tick.rec)) )
+        return "Корсчет";
+     else
+        if( IsClientDeal(FD.tick.rec) )
+           if( not Использовать47422_23ПриПогашении() )
+              return "Корсчет";
+           else
+              return "+Расчеты";
+           end;
+        else
+           if( not Использовать47422_23ПриПогашении() )
+              return "Корсчет";
+           else
+              return "+Расчеты";
+           end;
+        end;
+     end;
+  end;
+  return "";
+END;
+
+
+MACRO СчетСписанияСредствЗаПогашение( FD, IsPaym )
+  if( FD.СделкаОРЦБ() == true ) /*ОРЦБ*/
+     return "+Биржа";
+  elif( FD.tick.rec.Flag4 == SET_CHAR ) /*БРОКЕР*/
+     return "Брокер";
+  else /*Не ОРЦб и не Брокер*/
+     if( IsPaym and (not IsClientDeal(FD.tick.rec)) )
+        if( (FD.FaceFIID() != NATCUR) and (FD.tick.rec.partyid == 4) )
+            return "Торговый счет";
+        else
+            return "Корсчет";
+        end;
+     else
+        if( IsClientDeal(FD.tick.rec) )
+           if( not Использовать47422_23ПриПогашении() )
+              return "Корсчет";
+           else
+              return "+Расчеты";
+           end;
+        else
+           if( not Использовать47422_23ПриПогашении() )
+              return "Корсчет";
+           elif((IsRET_COUPON(FD.Group)) OR (IsRET_PARTLY(FD.Group))) /*AEA*/
+              if( (FD.FaceFIID() == NATCUR) and (FD.tick.rec.partyid == 4) )
+                 If(FD.GetRQ(DLRQ_TYPE_payment).rec.factdate == Getdateafterworkdays(fd.dl_leg.rec.expiry))
+                      return "+Биржа";
+                 else
+                   return "+РасчетыПогаш";
+                 end;
+
+              else
+//	         return "+Расчеты";
+             return "+РасчетыПогаш";
+
+              end;
+           /*******/
+           else
+              return "+Расчеты";
+           end;
+        end;
+     end;
+  end;
+  return "";
+END;
+
+//////////////////////
+//Для ТО
+//////////////////////
+
+MACRO ПолучитьКатегориюСчетаКонтрагента( FD, IsSale )
+  var MarketAcc = "";
+
+  if( IsRET_ISSUE( FD.Group ) OR (FD.BuySale == DEAL_TYPE_RET_COUPON) OR (FD.BuySale == DEAL_TYPE_RET_PARTLY) ) 
+     MarketAcc = СчетСписанияСредствЗаПогашение( FD, true );
+
+  elif( FD.ЧерезКорсчет() )
+
+     MarketAcc = "Корсчет"; /*счет получим по автогенерации*/
+
+  elif( IsBasket(FD.Group) and IsOUTEXCHANGE(FD.Group) )
+
+     MarketAcc = "Торговый счет";
+
+  elif(IsTwoPart(FD.Group) and FI_IsKSU(FD.fininstr))
+
+     if(ИспКлиринговыйСчетВРЕПОсКСУ() and (not IsClientDeal(FD.tick.rec)))
+       MarketAcc = "Клиринговый счет";
+     else
+       if( IsSale )
+          MarketAcc = "+Биржа";
+       else
+          MarketAcc = "+Биржа";
+       end;
+     end;
+
+  elif( IsEXCHANGE( FD.Group ) ) 
+
+     if( not FD.СделкаОРЦБ() )
+        MarketAcc = "Корсчет";
+     else
+        if( FD.СделкаРЕПОБрокер() )
+           MarketAcc = "Брокер";
+        else
+           if( IsSale )
+              MarketAcc = "+Биржа";
+           else
+              MarketAcc = "+Биржа";
+           end;
+        end;
+     end;
+
+  elif( IsBROKER(FD.Group) or FD.СделкаРЕПОБрокер() )
+     MarketAcc = "Брокер"; /*счет получим по автогенерации*/
+  end;
+ 
+  return MarketAcc;
+END;
+
+MACRO ПолучитьНашСчетТОПоПроцентам( DlRq:TRecHandler, FD, dat, AccountBuff:TRecHandler, RqAccBuf, IsCreatingPayms:bool )
+
+  var Cat = "", IsOverdue = false;
+
+  if( ТОБылоПросрочено(DlRq) ) 
+     IsOverdue = true;
+  end;
+  
+  if( not IsClientDeal(FD.tick.rec) )
+     if (( IsBUY(FD.Group) and (FD.dl_leg.rec.IncomeRate < 0.0)) or
+         ( IsSALE(FD.Group) and (FD.dl_leg.rec.IncomeRate > 0.0))
+        )
+        if (IsOverdue == false)
+           Cat = "-% к погашению"; 
+        else
+           Cat = "-% с н.с."; 
+        end;
+
+        if( Cat != "" ) 
+          if( not FD.ActualAccount( Cat, AccountBuff.rec.Account, true, null, AccountBuff, dat) )
+            if( not FD.OpenAccount( Cat, AccountBuff.rec.Account, false, null, AccountBuff, dat) )
+              return 1;
+            end;
+          end;
+        end; 
+     else
+        if (IsOverdue == false)
+           Cat = "+% к погашению"; 
+        else
+           Cat = "+% с н.с."; 
+        end;
+
+        if( Cat != "" ) 
+          if( (IsCreatingPayms == NULL) or (IsCreatingPayms == false) or (not FD.ActualAccount( Cat, AccountBuff.rec.Account, true, null, AccountBuff, dat)) )
+            if( not FD.OpenAccount( Cat, AccountBuff.rec.Account, false, null, AccountBuff, dat) )
+              return 1;
+            end;
+          end;
+        end;
+     end;
+  end;
+
+  return 0; 
+END;
+
+MACRO ПолучитьНашСчетТОПоПроцентамДляКвитовки( DlRq:TRecHandler, FD, dat, AccountBuff:TRecHandler, RqAccBuf, IsCreatingPayms:bool )
+
+  var PT_IsResp = false;// определенность
+  var Cat = "";
+
+  PT_IsResp = PT_IsResponsible(FD.tick.rec.PartyID, dat);
+
+  if (PT_IsResp)
+     Cat = "+% к погашению";
+  else
+     Cat = "+%Пкр";
+  end;
+
+  if( Cat != "" ) 
+    if( (IsCreatingPayms == NULL) or (IsCreatingPayms == false) or (not FD.ActualAccount( Cat, AccountBuff.rec.Account, true, null, AccountBuff, dat)) )
+      if( not FD.OpenAccount( Cat, AccountBuff.rec.Account, false, null, AccountBuff, dat) )
+        return 1;
+      end;
+    end;
+  end; 
+
+  return 0; 
+END;
+
+MACRO ПолучитьНашСчетТОПоАвансуЗадатку( DlRq:TRecHandler, FD, dat, AccountBuff:TRecHandler, RqAccBuff, IsCreatingPayms:bool )
+
+  var FindAccount = "", CatName = "";
+
+  if(ValType(RqAccBuff) != V_UNDEF)
+    RqAccBuff.Clear();
+  end;
+
+  if( (not IsClientDeal(FD.tick.rec)) AND 
+      ((FD.ExistAvance == true) OR (FD.ExistDeposit == true)) )
+
+     if( IsREPO(FD.Group) )
+        if( IsBUY(FD.Group) )
+           if( ТОБылоПросрочено(FD.GetRQ(DLRQ_TYPE_AVANCE) ) and FD.IsBack )
+              CatName = IIF(FD.НуженСчетКорзина(), "Треб. с н.с., корзина", "Треб. с н.с.");
+           else
+              CatName = IIF(FD.НуженСчетКорзина(), "+ОД, Корзина", "+ОД");
+           end;
+        else
+           if( ТОБылоПросрочено(FD.GetRQ(DLRQ_TYPE_AVANCE) ) and FD.IsBack )
+              CatName = IIF(FD.НуженСчетКорзина(), "Обяз. с н.с., корзина", "Обяз. с н.с.");
+           else
+              CatName = IIF(FD.НуженСчетКорзина(), "-ОД, Корзина", "-ОД");
+           end;
+        end;
+     else
+        if( FD.BuySale == DEAL_TYPE_SALE ) 
+           if( FD.ExistAvance == true )      
+              if( ТОБылоПросрочено(FD.GetRQ(DLRQ_TYPE_AVANCE) ) )
+                 CatName = "Треб. с н.с.";
+              else
+                 CatName = "+Форвард, расчеты";                 
+              end;
+           else 
+              CatName = "-Расчеты"; 
+           end;          
+        else
+           if( FD.ExistAvance == true )      
+              if(ТОБылоПросрочено(FD.GetRQ(DLRQ_TYPE_AVANCE) ) )
+                 CatName = "Обяз. с н.с.";
+              else
+                 CatName = "-Форвард, расчеты";
+              end;
+           else 
+              CatName = "+Расчеты"; 
+           end; 
+        end;      
+     end;
+ 
+     /*  IsExistAccount здесь не подходит, так как создание счета и занесение его номера     */ 
+     /*  в платеж могут быть на одном шаге, в этом случае IsExistAccount счет еще не найдет  */
+     if( CatName != "" ) 
+       if( (IsCreatingPayms == NULL) or (IsCreatingPayms == false) or (not FD.ActualAccount( CatName, AccountBuff.rec.Account, true, null, AccountBuff, dat, FD.GetPayFIID())) )
+         if( not FD.OpenAccount( CatName, AccountBuff.rec.Account, false, null, AccountBuff, dat, FD.GetPayFIID()) )
+           return 1;
+         end;
+       end;   
+     end;
+
+  end;
+  return 0; 
+END;
+
+MACRO ПолучитьНашСчетТОПоОплате( DlRq:TRecHandler, FD, dat, DtAccount:TRecHandler, CtAccount:TRecHandler, DtCateg:@string, CtCateg:@string, IsCreatingPayms:bool )
+
+  var CategForvard = "", CtAccFIID = null, FindAccount = ""; 
+  var rqPaym = NULL;
+  Var Stakan = "";
+  if( not IsClientDeal(FD.tick.rec) ) /* наша сделка */
+
+     if( DlRq.rec.type == DLRQ_TYPE_PAYMENT )
+        rqPaym = DlRq;
+     else
+        if( IsLoan(FD.Group) )
+           rqPaym = FD.GetRQ(DLRQ_TYPE_INCREPO);
+        else
+           rqPaym = FD.GetRQ(DLRQ_TYPE_PAYMENT);
+        end;
+     end;
+
+     if (FD.tick.rec.BofficeKind == DL_SECUROWN)
+        CategForvard = "Размещ. ОЭБ";
+     elif(FD.tick.rec.BofficeKind == DL_RETIREMENT_OWN)
+        CategForvard = "ДС в КО";
+     elif( IsTwoPart(FD.Group) )
+        if( IsBUY(FD.Group) )                                  
+           if(ТОБылоПросрочено(rqPaym ) and FD.IsBack  )
+              CategForvard = IIF(FD.НуженСчетКорзина(), "Треб. с н.с., корзина", "Треб. с н.с.");
+           else
+              if( rqPaym.rec.type == DLRQ_TYPE_INCREPO )
+                 CategForvard = "-% к погашению";
+              else
+                 CategForvard = IIF(FD.НуженСчетКорзина(), "+ОД, Корзина", "+ОД");
+              end;
+           end;
+        else                                                       
+           if(ТОБылоПросрочено(rqPaym ) and FD.IsBack )
+              CategForvard = IIF(FD.НуженСчетКорзина(), "Обяз. с н.с., корзина", "Обяз. с н.с.");
+           else
+              if( rqPaym.rec.type == DLRQ_TYPE_INCREPO )
+                 //CategForvard = "+% к погашению";
+                 CategForvard = "+Расчеты";
+              else
+                 CategForvard = IIF(FD.НуженСчетКорзина(), "-ОД, Корзина", "-ОД");
+              end;
+           end;
+        end;
+     elif( FD.BuySale == DEAL_TYPE_BUY )
+
+        if( FD.tick.rec.BofficeKind == DL_INVESTSHARE )
+           CategForvard = "+Расчеты";
+        else
+           if( ТОБылоПросрочено(rqPaym ) ) /*ТО не снято с просрочки*/
+              CategForvard = IIF(IsBasket(FD.Group), "Обяз. с н.с., корзина", "Обяз. с н.с.");
+           else
+              CategForvard = "-Форвард, расчеты";
+           end;
+        end;
+
+     else
+        if( FD.tick.rec.BofficeKind == DL_SECURITYDOC ) 
+
+           if( FD.ВедетсяБалансУчетПоСделке() ) 
+              if( ТОБылоПросрочено(rqPaym) ) /*ТО не снято с просрочки*/
+                 CategForvard = IIF(IsBasket(FD.Group), "Треб. с н.с., корзина", "Треб. с н.с.");
+              else
+                 CategForvard = GetForvardAcc( FD, @CtAccFIID );
+              end;
+           else
+              CategForvard = GetForvardAcc( FD, @CtAccFIID );
+           end;
+
+        else
+           CategForvard = СчетПолученияСредствЗаПогашение( FD, @CtAccFIID );
+        end;  
+
+     end; 
+
+     if((FD.BuySale == DEAL_TYPE_BUY) or (FD.tick.rec.BofficeKind == DL_RETIREMENT_OWN))
+        if( CategForvard != "" ) 
+           if( (IsCreatingPayms == NULL) or (IsCreatingPayms == false) or (not FD.ActualAccount(CategForvard, FindAccount, true, null, DtAccount, dat, CtAccFIID)) )
+              If(CategForvard == "-Форвард, расчеты")
+                 if( not FD.OpenAccount( CategForvard, FindAccount, false, null, DtAccount, dat, CtAccFIID, null, null, MC_PAIRACCMODE_OPEN) )
+                    return 1;
+                 end;
+              else
+                 if( not FD.OpenAccount( CategForvard, FindAccount, false, null, DtAccount, dat, CtAccFIID) )
+                    return 1;
+                 end;
+              end;
+           end;
+
+           if( DtCateg != NULL )
+              DtCateg = CategForvard;
+           end;
+/*КД По ПФИ переопределяем счет, т.к. по остатку берется парный 47408 вместо 47407*/
+           if(( FD.DealAsResultDVExe == true ) and (CategForvard == "-Форвард, расчеты") ) 
+               If(DtAccount.rec.balance == "47408")
+                   Stakan = DtAccount.rec.account;
+                   DtAccount.rec.account = DtAccount.rec.pairaccount;
+                   DtAccount.rec.pairaccount = Stakan;
+               end;
+           end;
+
+        end; 
+     else
+        if( CategForvard != "" ) 
+           if( (IsCreatingPayms == NULL) or (IsCreatingPayms == false) or (not FD.ActualAccount(CategForvard, FindAccount, true, null, CtAccount, dat, CtAccFIID)) )
+              If(CategForvard == "+Форвард, расчеты")
+                 if( not FD.OpenAccount( CategForvard, FindAccount, false, null, CtAccount, dat, CtAccFIID, null, null, MC_PAIRACCMODE_OPEN) )
+                    return 1;
+                 end;
+              else
+                 if( not FD.OpenAccount( CategForvard, FindAccount, false, null, CtAccount, dat, CtAccFIID) )
+                    return 1;
+                 end;
+              end;
+           end;
+
+           if( CtCateg != NULL )
+              CtCateg = CategForvard;
+           end;
+        end;
+     end;
+  end;
+
+  return 0; 
+END;
+
+MACRO ПолучитьСчетПоСПИ(sa:TRecHandler, AccountBuff:TRecHandler)
+  var Acc = TRecHandler("account");
+  var CorrAcc = "";
+  var err = 0;
+  
+  AccountBuff.Clear();
+
+  if(sa.rec.BankID == {OurBank})
+    if(GetAccount( sa.rec.Chapter, sa.rec.FIID, sa.rec.Account, Acc, false ) == 0)
+      err = 1;
+    end;
+  elif(sa.rec.BankCorrID > 0)
+    if(sa.rec.BankCorrID == {OurBank})
+      if(GetAccount( sa.rec.Chapter, sa.rec.FIID, sa.rec.CorrAcc, Acc, false ) == 0)
+        err = 1;
+      end;
+    else
+      //ищем корсхему
+      CorrAcc = GetCorAcc( sa.rec.FIID, ПолучитьКорсхемуПоУмолчанию(sa.rec.BankCorrID, sa.rec.FIID, 1), CORS_ACC_ACCOUNT);
+      if((CorrAcc == "") or (GetAccount( sa.rec.Chapter, sa.rec.FIID, CorrAcc, Acc, false ) == 0))
+        err = 1;
+      end;
+    end;
+  else
+    //ищем корсхему
+    CorrAcc = GetCorAcc( sa.rec.FIID, ПолучитьКорсхемуПоУмолчанию(sa.rec.BankID, sa.rec.FIID, 1), CORS_ACC_ACCOUNT);
+    if((CorrAcc == "") or (GetAccount( sa.rec.Chapter, sa.rec.FIID, CorrAcc, Acc, false ) == 0))
+      err = 1;
+    end;
+  end;
+
+  if(not err)
+    copy(AccountBuff, Acc);
+  end;
+
+  return err;
+END;
+
+MACRO ПолучитьСчетПоПлатежнымРеквизитам( rqacc:TRecHandler, AccountBuff:TRecHandler, FIID:integer )
+  var Acc = TRecHandler("account");
+  var CorrAcc = "";
+  var err = 0;
+  var RQAccFIID:integer = ALLFININSTR;
+  AccountBuff.Clear();
+  Acc.Clear();
+
+  if( (rqacc.rec.FIID == ALLFININSTR) and (FIID != NULL) )
+     RQAccFIID = FIID;
+  else
+     RQAccFIID = rqacc.rec.FIID;
+  end;
+
+  if(rqacc.rec.BankID == {OurBank})
+    if(GetAccount( rqacc.rec.Chapter, RQAccFIID, rqacc.rec.Account, Acc, false ) == 0)
+      err = 1;
+    end;
+  elif(rqacc.rec.BankCorrID > 0)
+    if(rqacc.rec.BankCorrID == {OurBank})
+      if(GetAccount( rqacc.rec.Chapter, RQAccFIID, rqacc.rec.CorrAcc, Acc, false ) == 0)
+        err = 1;
+      end;
+    else
+      //ищем корсхему
+      CorrAcc = GetCorAcc( RQAccFIID, ПолучитьКорсхемуПоУмолчанию(rqacc.rec.BankCorrID, RQAccFIID, 1), CORS_ACC_ACCOUNT);
+      if((CorrAcc == "") or (GetAccount( rqacc.rec.Chapter, RQAccFIID, CorrAcc, Acc, false ) == 0))
+        err = 1;
+      end;
+    end;
+  elif(rqacc.rec.BankID > 0)
+    //ищем корсхему !!! переписать эту стыдобу как можно скорее !!!
+    //30.01.2019 Chesnokov D.S. Стыдобу переписал
+    CorrAcc = ПолучитьКоррсчетПоКоррсхеме(rqacc.rec.dockind, rqacc.rec.docid, RQAccFIID, rqacc.rec.BankID );
+
+//    if (rqacc.rec.BankID == 72832)
+//      var Dt = TRsbDataSet(" select * from ddl_tick_dbt where t_bofficekind = " +rqacc.rec.dockind+" and t_dealid = " + rqacc.rec.docid);
+//      if (Dt.movenext())
+//         if (Dt.Clientid == -1)
+//            if (RQAccFIID == 0)
+//              CorrAcc = "30114810400000000001";
+//            elif (RQAccFIID == 7)
+//              CorrAcc = "30114840800000000011";
+//            elif (RQAccFIID == 8)
+//              CorrAcc = "30114978300000000030";
+//            end;
+//         else
+//            if (RQAccFIID == 0)
+//              CorrAcc = "30114810700000000002";
+//            elif (RQAccFIID == 7)
+//              CorrAcc = "30114840300000000029";
+//            elif (RQAccFIID == 8)
+//              CorrAcc = "30114978600000000031";
+//            end;
+//         end;
+//         if((CorrAcc == "") or (GetAccount( rqacc.rec.Chapter, RQAccFIID, CorrAcc, Acc, false ) == 0))
+//            err = 1;
+//         end;
+//      end;
+//    else
+    if ((CorrAcc == "") or (GetAccount( rqacc.rec.Chapter, RQAccFIID, CorrAcc, Acc, false ) == 0))
+      CorrAcc = GetCorAcc( RQAccFIID, ПолучитьКорсхемуПоУмолчанию(rqacc.rec.BankID, RQAccFIID, 1), CORS_ACC_ACCOUNT);
+      if((CorrAcc == "") or (GetAccount( rqacc.rec.Chapter, RQAccFIID, CorrAcc, Acc, false ) == 0))
+        err = 1;
+      end;
+    end;
+  end;
+
+  if(not err)
+    copy(AccountBuff, Acc);
+  end;
+
+  return err;
+END;
+
+MACRO ПолучитПлатежныеРеквизитыПоТО(DlRq:TRecHandler, rqacc:TRecHandler)
+  var query, Select, DataSet;
+  var err = 0;
+
+  rqacc.Clear();
+
+  query =   "select rqacc.* "
+          + "  from ddlrqacc_dbt rqacc "
+          + " where rqacc.t_ID = ? ";
+  Select = Dl_RSDCommand(query);
+  Select.AddParam(DlRq.rec.RqAccID);
+
+  DataSet = Select.Execute();
+  if(DataSet.moveNext())
+    DataSet.GetRecord().CopyTo( rqacc.rec );
+  else
+    err = 1;
+  end;
+
+  return err;
+END;
+
+MACRO ПолучитьСчетКонтрагентаТО(DlRq:TRecHandler, AccountBuff:TRecHandler, RqAccBuff)
+  
+  var rqacc = TRecHandler("dlrqacc");
+  var err = ПолучитПлатежныеРеквизитыПоТО(DlRq, rqacc);
+
+  if(not err)
+    if(ValType(RqAccBuff) != V_UNDEF)
+      copy(RqAccBuff, rqacc);
+    end;
+
+    err = ПолучитьСчетПоПлатежнымРеквизитам(rqacc, AccountBuff);
+  end;
+
+  return err;
+END;
+
+MACRO ПолучитьПлатежныеРеквизитыСубъектаПоСделке(DocKind, DocID, PartyID, SubKind, PayFIID, RqType, RqAccBuff:TRecHandler)
+  var query, Select, DataSet;
+  var err = 0;
+
+  RqAccBuff.Clear();
+
+  query =   "select rqacc.* "
+          + "  from ddlrqacc_dbt rqacc "
+          + " where rqacc.t_ID = RSI_DLRQ.RSI_GetAnyRQACC(?, ?, ?, ?, ?, ?) ";
+
+  Select = Dl_RSDCommand(query);
+  Select.AddParam(DocKind);
+  Select.AddParam(DocID);
+  Select.AddParam(SubKind);
+  Select.AddParam(PartyID);
+  Select.AddParam(PayFIID);
+  Select.AddParam(RqType);
+
+  DataSet = Select.Execute();
+  if(DataSet.moveNext())
+    DataSet.GetRecord().CopyTo( RqAccBuff.rec );
+  else
+    err = 1;
+  end;
+
+  return err;
+END;
+
+MACRO ПолучитьСчетСубъектаПоСделке(DocKind, DocID, PartyID, SubKind, PayFIID, AccountBuff:TRecHandler, RqAccBuff)
+  var err = 0;
+  var rqacc = TRecHandler("dlrqacc.dbt");
+
+  err = ПолучитьПлатежныеРеквизитыСубъектаПоСделке(DocKind, DocID, PartyID, SubKind, PayFIID, DLRQ_TYPE_UNKNOWN, rqacc);
+  if(err == 0)
+    if(ValType(RqAccBuff) != V_UNDEF)
+      copy(RqAccBuff, rqacc);
+    end;
+    err = ПолучитьСчетПоПлатежнымРеквизитам(rqacc, AccountBuff, PayFIID);
+  end;
+
+  return err;
+END;
+
+MACRO ПолучитьДенежныйСчетСубъектаПоСделке(DocKind, DocID, PartyID, PayFIID, AccountBuff:TRecHandler, RqAccBuff)
+  return ПолучитьСчетСубъектаПоСделке(DocKind, DocID, PartyID, DLRQ_SUBKIND_CURRENCY, PayFIID, AccountBuff, RqAccBuff);
+END;
+
+MACRO ПолучитьЦБСчетСубъектаПоСделке(DocKind, DocID, PartyID, PayFIID, AccountBuff:TRecHandler, RqAccBuff)
+  return ПолучитьСчетСубъектаПоСделке(DocKind, DocID, PartyID, DLRQ_SUBKIND_AVOIRISS, PayFIID, AccountBuff, RqAccBuff);
+END;
+
+MACRO ПолучитьСчетаТОПоАвансуЗадатку( DlRq:TRecHandler, FD, dat, IsSale, DebetAccount:TRecHandler, CreditAccount:TRecHandler, DebetRqAccBuff, CreditRqAccBuff, IsCreatingPayms:bool )
+
+   var AccBuff = TRecHandler("account");
+   var rqacc   = TRecHandler("dlrqacc");
+   var FindAccount = "";
+
+   AccBuff.Clear();
+   rqacc.Clear();
+
+   if( IsClientDeal(FD.tick.rec) ) 
+      if( ПолучитьДенежныйСчетСубъектаПоСделке( FD.tick.rec.BOfficeKind, FD.tick.rec.DealID, FD.tick.rec.ClientID, FD.GetPayFIID(), AccBuff, rqacc ) != 0 )
+         msgbox("Не удалось определить счет клиента по ТО аванса/задатка");
+         return 1;
+      end; 
+      if(IsSale)
+        copy(CreditAccount, AccBuff);
+        if(ValType(CreditRqAccBuff) != V_UNDEF)
+          copy(CreditRqAccBuff, rqacc);
+        end;
+      else
+        copy(DebetAccount, AccBuff);
+        if(ValType(DebetRqAccBuff) != V_UNDEF)
+          copy(DebetRqAccBuff, rqacc);
+        end;
+      end;
+   else
+      if( ПолучитьНашСчетТОПоАвансуЗадатку( DlRq, FD, dat, AccBuff, rqacc, IsCreatingPayms ) != 0 )
+         msgbox("Не удалось определить счет расчетов по ТО аванса/задатка");
+         return 1;
+      end; 
+      if(IsSale)
+        copy(CreditAccount, AccBuff);
+        if(ValType(CreditRqAccBuff) != V_UNDEF)
+          copy(CreditRqAccBuff, rqacc);
+        end;
+      else
+        copy(DebetAccount, AccBuff);
+        if(ValType(DebetRqAccBuff) != V_UNDEF)
+          copy(DebetRqAccBuff, rqacc);
+        end;
+      end;
+   end;
+
+   AccBuff.Clear();
+   rqacc.Clear();
+   if( FD.СделкаРЕПОБрокер() )
+      if( not FD.OpenAccount( "Брокер", null, false, null, AccBuff, dat, FD.GetPayFIID() ) )
+         return 1;
+      end;
+   else
+      if( ПолучитьСчетКонтрагентаТО( DlRq, AccBuff, rqacc ) != 0 )
+         msgbox("Не удалось определить счет контрагента по ТО аванса/задатка");
+         return 1;
+      end;
+   end;
+
+   if(IsSale)
+     copy(DebetAccount, AccBuff);
+     if(ValType(DebetRqAccBuff) != V_UNDEF)
+       copy(DebetRqAccBuff, rqacc);
+     end;
+   else
+     copy(CreditAccount, AccBuff);
+     if(ValType(CreditRqAccBuff) != V_UNDEF)
+       copy(CreditRqAccBuff, rqacc);
+     end;
+   end;
+
+   return 0;
+END;
+
+MACRO IsUnitREPO2_Own(DlRq, FD)
+  var IsUnitREPO2_Own = false;
+/////    по процентам                            по второй части                                 репо                      отрицательная ставка                          установлена настройка                    
+  if( (DlRq.rec.Type == DLRQ_TYPE_INCREPO) and  (FD.IsBack()) /*(DlRq.rec.DealPart == 2)*/ and ( IsRepo(FD.Group)) and (FD.dl_leg.rec.IncomeRate < 0.0) and (ЕдиныйПлатежПо2ЧастиСобРЕПО()) 
+  //        собственная                                  не брокер                          не сквитован               не в неттинге
+      and (not IsClientDeal(FD.tick.rec)) and ( not (FD.tick.rec.Flag4 == SET_CHAR)) and (not ТОСквитовано(DlRq)) and (not ТОВНеттинге(DlRq)) )
+    IsUnitREPO2_Own = true;
+  end;
+  return IsUnitREPO2_Own;
+END;
+
+MACRO ПолучитьСчетКонтрагентаПоТООплаты( DlRq, FD, dat, DtAccount:TRecHandler, CtAccount:TRecHandler, DebetRqAccBuff, CreditRqAccBuff, IsCreatingPayms:bool )
+
+  var FindAccount = "";
+  var IsSale = SP_RqIsSale( DlRq, FD.tick );
+
+  if( IsLoan(FD.Group) and (DlRq.rec.type == DLRQ_TYPE_INCREPO) )
+     IsSale = (FD.BuySale == DEAL_TYPE_SALE);
+  end;
+
+  var AccCateg = ПолучитьКатегориюСчетаКонтрагента( FD, IsSale );
+  if( IsUnitREPO2_Own(DlRq, FD))
+    var IsOverdue = false;
+    if( ТОБылоПросрочено(DlRq) )
+      IsOverdue = true;
+    end;
+
+    if( IsBUY(FD.Group) )    //продажа, обратное РЕПО 2ч., т.к.первая покупка 
+      AccCateg = IIF( IsOverdue, "Треб. с н.с.", "+ОД");
+    else            //покупка, прямое РЕПО 2ч.
+      AccCateg = IIF( IsOverdue, "Обяз. с н.с.", "-ОД");
+    end;
+  end;
+
+  if( (AccCateg != null) AND (AccCateg != "") )
+    if( AccCateg == "Корсчет" )
+       if( ПолучитьСчетКонтрагентаТО( DlRq, IIF(IsSale, DtAccount, CtAccount), IIF(IsSale, DebetRqAccBuff, CreditRqAccBuff)) != 0 )
+          msgbox("Не удалось определить счет контрагента по ТО");
+          return 1;
+       end;
+    elif( AccCateg == "Торговый счет" )
+       if( not FD.IsExistAccount(AccCateg, FindAccount, false, null, IIF(IsSale, DtAccount, CtAccount), null, dat) )
+           return 1;
+       end;
+    else
+       if( (IsCreatingPayms == NULL) or (IsCreatingPayms == false) or (not FD.ActualAccount(AccCateg, FindAccount, true, null, IIF(IsSale, DtAccount, CtAccount), dat)) )
+         if( not FD.OpenAccount( AccCateg, FindAccount, false, null, IIF(IsSale, DtAccount, CtAccount), dat ) )
+           return 1;
+         end;
+       end;
+    end;
+  else
+     return 1;
+  end;
+
+  return 0;
+END;
+
+MACRO ПолучитьСчетаТОПоПроцентам( DlRq:TRecHandler, FD, dat, In, DebetAccount:TRecHandler, CreditAccount:TRecHandler, DebetRqAccBuff, CreditRqAccBuff, IsCreatingPayms:bool )
+
+   var AccBuff = TRecHandler("account");
+   var rqacc   = TRecHandler("dlrqacc");
+   var FindAccount = "";
+
+   AccBuff.Clear();
+   rqacc.Clear();
+
+   if( IsClientDeal(FD.tick.rec) ) 
+      if( ПолучитьДенежныйСчетСубъектаПоСделке( FD.tick.rec.BOfficeKind, FD.tick.rec.DealID, FD.tick.rec.ClientID, FD.GetPayFIID(), AccBuff, rqacc ) != 0 )
+         msgbox("Не удалось определить счет клиента по ТО процентов");
+         return 1;
+      end; 
+      if(In)
+        copy(CreditAccount, AccBuff);
+        if(ValType(CreditRqAccBuff) != V_UNDEF)
+          copy(CreditRqAccBuff, rqacc);
+        end;
+      else
+        copy(DebetAccount, AccBuff);
+        if(ValType(DebetRqAccBuff) != V_UNDEF)
+          copy(DebetRqAccBuff, rqacc);
+        end;
+      end;
+   else
+      if( ПолучитьНашСчетТОПоПроцентам( DlRq, FD, dat, AccBuff, rqacc, IsCreatingPayms ) != 0 )
+         msgbox("Не удалось определить счет расчетов по ТО процентов");
+         return 1;
+      end; 
+      if(In)
+        copy(CreditAccount, AccBuff);
+        if(ValType(CreditRqAccBuff) != V_UNDEF)
+          copy(CreditRqAccBuff, rqacc);
+        end;
+      else
+        copy(DebetAccount, AccBuff);
+        if(ValType(DebetRqAccBuff) != V_UNDEF)
+          copy(DebetRqAccBuff, rqacc);
+        end;
+      end;
+   end;
+
+   AccBuff.Clear();
+   rqacc.Clear();
+   if( IsBasket(FD.Group) and IsOUTEXCHANGE(FD.Group) )
+      if( not FD.IsExistAccount("Торговый счет", FindAccount, false, null, AccBuff, null, dat) )
+         return 1;
+      end;
+   elif( FD.СделкаРЕПОБрокер() )
+      if( not FD.OpenAccount( "Брокер", null, false, null, AccBuff, dat, FD.GetPayFIID() ) )
+         return 1;
+      end;
+   else
+      if( ПолучитьСчетКонтрагентаПоТООплаты( DlRq, FD, dat, AccBuff, AccBuff, rqacc, rqacc, IsCreatingPayms ) != 0)
+         msgbox("Не удалось определить счет контрагента по ТО процентов");
+         return 1;
+      end;
+   end;
+
+   if(In)
+      copy(DebetAccount, AccBuff);
+      if(ValType(DebetRqAccBuff) != V_UNDEF)
+        copy(DebetRqAccBuff, rqacc);
+      end;
+   else
+      copy(CreditAccount, AccBuff);
+      if(ValType(CreditRqAccBuff) != V_UNDEF)
+        copy(CreditRqAccBuff, rqacc);
+      end;
+   end;
+
+   return 0;
+END;
+
+MACRO ПолучитьСчетаТОПоНалогам( DlRq:TRecHandler, FD, dat, In, DebetAccount:TRecHandler, CreditAccount:TRecHandler, DebetRqAccBuff, CreditRqAccBuff, IsCreatingPayms:bool )
+
+   var AccBuff = TRecHandler("account");
+   var rqacc   = TRecHandler("dlrqacc");
+   var FindAccount = "";
+   var CatCode = "";
+
+   AccBuff.Clear();
+   rqacc.Clear();
+
+
+   if(ПолучитьСчетКонтрагентаТО(DlRq, AccBuff, rqacc) != 0)
+     msgbox("Не удалось определить счет ТО по налогам");
+     return 1;
+   end;
+
+   copy(CreditAccount, AccBuff);
+   if(ValType(CreditRqAccBuff) != V_UNDEF)
+     copy(CreditRqAccBuff, rqacc);
+   end; 
+   
+   if(DlRq.rec.Type == DLRQ_TYPE_TAX_ULN)
+   CatCode = "-Бюджетб ф.налоги, ULN";   //DAN    CatCode = "-Бюджет, ф.налоги";
+   elif((DlRq.rec.Type == DLRQ_TYPE_TAX_FLN) or DlRq.rec.Type == DLRQ_TYPE_TAX_FLR)
+     CatCode = "НДФЛ к перечислению";
+   end;
+
+   if(CatCode == "")
+     msgbox("Неизвестный тип ТО по налогам");
+     return 1;
+   end;
+
+   if( not FD.IsExistAccount(CatCode, FindAccount, false, null, AccBuff, null, dat) )
+      return 1;
+   end;
+
+   copy(DebetAccount, AccBuff);
+   if(ValType(DebetRqAccBuff) != V_UNDEF)
+     copy(DebetRqAccBuff, rqacc);
+   end;
+
+   return 0;
+END;
+
+
+MACRO ДепозитарийКонтрагентаТО(DlRq:Object )
+   var Select, DataSet;
+   var CustodyID = {OurBank};
+
+   if(DlRq.rec.RqAccID != 0)
+     Select = DL_RSDCommand(  " select rqacc.t_BankID "
+                            + "   from ddlrqacc_dbt rqacc "
+                            + "  where rqacc.t_ID = ? ");
+     Select.AddParam(DlRq.rec.RqAccID);
+
+     DataSet = Select.Execute();
+     if((DataSet.moveNext()) and (DataSet.BankID != -1))
+       CustodyID = DataSet.BankID;
+     end;
+   end;
+   
+   return CustodyID;
+END;
+
+MACRO ПолучитьБанкСубъектаПоСделке(PartyID, DocKind, DocID, PayFIID, RqType)
+   var rqacc = TRecHandler("dlrqacc.dbt");
+   var CustodyID = {OurBank};
+
+   if((ПолучитьПлатежныеРеквизитыСубъектаПоСделке(DocKind, DocID, PartyID, DL_GetRQSubKindbyType(RqType), PayFIID, RqType, rqacc) == 0) AND (rqacc.rec.BankID != -1))
+     CustodyID = rqacc.rec.BankID;
+   end;
+
+   return CustodyID;
+END;
+
+MACRO КлиентПоСделкеВНашемБанке( ClientID, DocKind, DocID, PayFIID, RqType )
+   var InOurBank = true;
+   
+   if(ПолучитьБанкСубъектаПоСделке(ClientID, DocKind, DocID, PayFIID, RqType) != {OurBank})
+     InOurBank = false;
+   end;
+
+   return InOurBank;
+END;
+
+MACRO ПолучитьНашСчетТОПоОплатеКомиссии( FD, dat, DtAccount:TRecHandler, НеВыделятьНДС:@bool, DlRq, IsCreatingPayms:bool )
+
+  var Categ = "", CtAccFIID = DlRq.rec.FIID, FindAccount = "", Dк, Dп; 
+
+  НеВыделятьНДС = true;
+  if( IsTwoPart( FD.Group ) )
+     if( IsREPO(FD.Group) )
+        Categ = "РасРасх, Репо";
+     else
+        if( IsBUY(FD.Group) )
+           Categ = "-КВ проц.расход, ц/б";
+        else
+           Categ = "-КВ проц.доход, ц/б";
+        end;
+        НеВыделятьНДС = false;
+     end;
+     CtAccFIID = NATCUR;
+  elif(DlRq.rec.DocKind == DL_RETIREMENT_OWN)
+     Categ = "-Расчеты";
+  else
+     Dк = FD.DateArray[DATE_DEALCOMISS];
+     Dп = FD.DateArray[DATE_DEALSETAVOIRISS];
+
+     if( IsBUY( FD.Group ) )
+        /*по ТЗ Операция_Бухгалтерский учёт.docx*/
+        if( Dк < Dп )
+           /*if( not CheckComissOver50905() )
+              Categ = "+Расчеты";
+           else*/
+              Categ = "Предв.затраты, ц/б";
+           //end;
+           if( УчетНДСВМоментОплатыКом() )
+              НеВыделятьНДС = false;
+           end;
+        elif( Dк > Dп )
+           Categ = "-Расчеты";
+        elif( (not FD.СделкаОРЦБ()) AND (Dк == Dп) )
+           Categ = "+Расчеты";
+        end;
+     else
+        if (Dк > Dп)
+           if( IsOUTEXCHANGE( FD.Group ) or 
+               (IsEXCHANGE( FD.Group ) and 
+                not FD.СделкаОРЦБ()
+               )
+             )
+              Categ = "-Расчеты";
+
+           elif( IsEXCHANGE( FD.Group ) and 
+                 FD.СделкаОРЦБ() 
+               )
+              Categ = "-Расчеты";
+
+           elif( IsBROKER( FD.Group ) )
+              Categ = "-Расчеты";
+           end;
+
+        elif (Dк < Dп)
+           if( not CheckComissOver50905() )
+              Categ = "+Расчеты";
+           else
+              Categ = "Предв.затраты, ц/б";
+           end;
+        elif (Dк == Dп)
+           if( IsOUTEXCHANGE( FD.Group ) or 
+               (IsEXCHANGE( FD.Group ) and 
+                not FD.СделкаОРЦБ()
+               )
+             )
+              Categ = "+Расчеты";
+           end;
+        end;
+     end;
+  end;
+
+  if( Categ != "" )
+    if( (IsCreatingPayms == NULL) or (IsCreatingPayms == false) or (not FD.ActualAccount(Categ, FindAccount, true, null, DtAccount, dat, CtAccFIID)) )
+      if( not FD.OpenAccount(Categ, FindAccount, false, null, DtAccount, dat, CtAccFIID) )
+        return 1;
+      end;
+    end;
+  end; 
+
+  return 0;
+END;
+
+/*
+ReceiverID - получатель комиссии, используется для РЕПО, в которм могут быть уазаны сразу 2 комиссии: брокеру и регистратору.
+Причем в собств. сделке РЕПО не ОРЦБ комиссия брокеру (при указанном брокере)  пойдет
+  1) на счет Брокер, если выставлена галочка "рачеты ч\брокера"
+  2) на счет -Расчеты, если галочка не выставлена
+  Комиссия регистратору пойдет на счет -Расчеты
+А в собств. сделке РЕПО ОРЦБ  комиссия брокеру (при указанном брокере) всегда (независимо от галочки) будет идти на счет Брокер
+Аналогично и в клиентских
+*/
+MACRO ПолучитьСчетКонтрагентаПоТООплатыКомиссии( DlRq, FD, dat, CtAccount:TRecHandler, ReceiverID_:integer, CategCode:@string, RqAccBuff, ByRqAccBuff:bool, IsCreatingPayms:bool )
+  var Categ = "Корсчет", FindAccount = "", FiRole = null;
+
+  var ReceiverID:integer = -1;
+
+  if( (ReceiverID_!=null) and (ReceiverID_ > 0) )
+     ReceiverID = ReceiverID_;
+  end;
+
+  if( IsTwoPart( FD.Group ) )
+     if( (FD.СделкаОРЦБ() == true) and ((FD.tick.rec.BrokerID < 0) or (FD.tick.rec.BrokerID != ReceiverID)) ) /*ОРЦБ*/
+        Categ = "+Биржа";
+     /*для не ОРЦБ, если галочка "Расчеты ч\брокера" снята, счет получателя берется не БРОКЕР, а -Расчеты */
+     elif( (FD.tick.rec.BrokerID > 0) and (FD.tick.rec.BrokerID == ReceiverID) and
+           ((FD.СделкаОРЦБ() == true) or ((FD.СделкаОРЦБ() == false) and (FD.tick.rec.Flag4 == SET_CHAR))) 
+         ) 
+        Categ = "Брокер";
+     else
+        Categ = "-Расчеты";
+     end;
+  else
+     if( IsBROKER(FD.Group) )
+        Categ = "Брокер";
+     elif( IsEXCHANGE(FD.Group) )
+        if( FD.СделкаОРЦБ() )
+           Categ = "+Биржа";
+        else
+           Categ = "Корсчет";
+        end;
+     end;
+  end;
+ 
+  if(Categ == "Корсчет")
+
+     if( (ByRqAccBuff != null) and (ByRqAccBuff == true) and (ValType(RqAccBuff) != V_UNDEF) )
+        if( ПолучитьСчетПоПлатежнымРеквизитам(RqAccBuff, CtAccount) != 0 )
+           msgbox("Не удалось определить счет контрагента по ТО");
+           return 1;
+        end;
+     else
+        if( ПолучитьСчетКонтрагентаТО( DlRq, CtAccount, RqAccBuff ) != 0 )
+           msgbox("Не удалось определить счет контрагента по ТО");
+           return 1;
+        end;
+     end;
+
+  else
+     if( (Categ != null) AND (Categ != "") )
+        if( Categ == "Клиринговый счет (комис.)" )
+           if( IsClientDeal(FD.tick.rec) )
+              FiRole = FIROLE_MONEYSOURCE_CLIENT;
+           else
+              FiRole = FIROLE_MONEYSOURCE_OWN;
+           end;
+
+           if( not FD.IsExistAccount( Categ, FindAccount, true, FiRole, CtAccount, null, dat, DlRq.rec.FIID ) )
+              return 1;
+           end; 
+        else
+          if( (IsCreatingPayms == NULL) or (IsCreatingPayms == false) or (not FD.ActualAccount( Categ, FindAccount, true, null, CtAccount, dat, DlRq.rec.FIID)) ) 
+            if( not FD.OpenAccount(Categ, FindAccount, false, null, CtAccount, dat, DlRq.rec.FIID) )
+              return 1;
+            end;
+          end;
+        end;
+     else
+        return 1;
+     end;
+  end;
+
+  if( CategCode != null )
+     CategCode = Categ;
+  end;
+
+  return 0;
+END;
+
+MACRO ПолучитьСчетКомпТО( FD, dat, AccCateg, PartyID, FIID, IsPayer, AccBuff:TRecHandler, RqAccBuf, IsCreatingPayms:bool )
+  var Direct = "", Account = "";
+
+  if(ValType(RqAccBuf) != V_UNDEF)
+    RqAccBuf.Clear();
+  end;
+
+  if( (AccCateg == null) OR (AccCateg == "Корсчет") )
+     Direct = IIF((IsPayer == true), " плательщика ", " получателя ");
+
+     if(ПолучитьДенежныйСчетСубъектаПоСделке(FD.tick.rec.BOfficeKind, FD.tick.rec.DealID, PartyID, FIID, AccBuff, RqAccBuf) != 0)
+       Msgbox( "Ошибка |Не заполнен счет" +Direct );
+       return 1;
+     end;
+  else
+    if( (IsCreatingPayms == NULL) or (IsCreatingPayms == false) or (not FD.ActualAccount( AccCateg, Account, false, null, AccBuff, dat, FIID )))
+       if( (AccCateg != "Торговый счет") and (AccCateg != "Клиринговый счет") )
+          if( not FD.OpenAccount(AccCateg, Account, false, null, AccBuff, dat, FIID) )
+             return 1;
+          end;
+       else
+          if( not FD.IsExistAccount(AccCateg, Account, false, null, AccBuff, null, dat, FIID) )
+             return 1;
+          end;
+       end;
+    end;
+  end;
+
+  return 0;
+END;
+
+macro ПолучитьСчетаКомпенсационногоТО(DlRq, FD, dat:DATE, PayerAccountBuff:TRecHandler, ReceiverAccountBuff:TRecHandler, PayerRqAccBuff, ReceiverRqAccBuff, IsCreatingPayms:bool)
+  var CatDeb = "", CatCred = "", 
+      PaySum, PayFIID = FD.GetPayFIID();
+  var IsIncrease = false;
+
+  if( IsBUY(FD.Group) ) /* Обратное РЕПО */
+     if( DlRq.rec.Kind == DLRQ_KIND_COMMIT ) /* увеличение */
+        IsIncrease = true;
+        if (FD.tick.rec.Flag4 == SET_CHAR)
+           CatCred = "Брокер";
+        else
+           if( FD.СделкаОРЦБ() )
+              CatCred = "+Биржа";
+           else
+              CatCred = "Корсчет";
+           end;
+        end;
+
+        if( IsClientDeal(FD.tick.rec) )
+           CatDeb = "Корсчет";
+        else
+           CatDeb = "+ОД";
+        end;
+     else
+        if (FD.tick.rec.Flag4 == SET_CHAR)
+           CatDeb = "Брокер";
+        else
+           if( FD.СделкаОРЦБ() )
+              CatDeb = "+Биржа";
+           else
+              CatDeb = "Корсчет";
+           end;
+        end;
+
+        if( IsClientDeal(FD.tick.rec) )
+           CatCred = "Корсчет";
+        else
+           CatCred = "+ОД";
+        end;
+     end;
+  else
+     if( IsBasket(FD.Group) )
+        if( DlRq.rec.Kind == DLRQ_KIND_REQUEST ) /* увеличение */
+           IsIncrease = true;
+           if( IsEXCHANGE(FD.Group) ) /*корзина c ЦК*/
+              CatDeb = "+Биржа";
+           else
+              CatDeb = "Торговый счет";
+           end;
+
+           if( IsClientDeal(FD.tick.rec) )
+              CatCred = "Корсчет";
+           else
+              CatCred = "-ОД";
+           end;
+        else
+           if( IsEXCHANGE(FD.Group) ) /*корзина c ЦК*/
+              CatCred = "+Биржа";
+           else
+              CatCred = "Торговый счет";
+           end;
+
+           if( IsClientDeal(FD.tick.rec) )
+              CatDeb = "Корсчет";
+           else
+              CatDeb = "-ОД";
+           end;
+        end;
+     else
+        if( DlRq.rec.Kind == DLRQ_KIND_REQUEST ) /* увеличение */
+           IsIncrease = true;
+           if( IsClientDeal(FD.tick.rec) )
+              CatCred = "Корсчет";
+           else
+              CatCred = "-ОД";
+           end;
+
+           if( FD.tick.rec.Flag4 == SET_CHAR )
+              CatDeb = "Брокер";
+           else
+              if( FD.СделкаОРЦБ() )
+                 CatDeb = "+Биржа";
+              else
+                 CatDeb = "Корсчет";
+              end;
+           end;
+        else
+           if( IsClientDeal(FD.tick.rec) )
+              CatDeb = "Корсчет";
+           else
+              CatDeb = "-ОД";
+           end;
+          
+           if( FD.tick.rec.Flag4 == SET_CHAR )
+              CatCred = "Брокер";
+           else
+              if( FD.СделкаОРЦБ() )
+                 CatCred = "+Биржа";
+              else
+                 CatCred = "Корсчет";
+              end;
+           end;
+        end;
+     end;
+  end;
+
+  if (not IsClientDeal(FD.tick.rec))
+     if(ПолучитьСчетКомпТО( FD, dat, CatDeb, DlRq.rec.Party, PayFIID, true, PayerAccountBuff, PayerRqAccBuff, IsCreatingPayms ) != 0)
+       return 1;
+     end;
+
+     if(ПолучитьСчетКомпТО( FD, dat, CatCred, DlRq.rec.Party, PayFIID, false, ReceiverAccountBuff, ReceiverRqAccBuff, IsCreatingPayms ) != 0)
+       return 1;
+     end;
+  else
+     if (IsSale(FD.Group))
+        /*FD - по 2 части сделки*/
+        /*клиент - плательщик в платеже*/
+        if(ПолучитьСчетКомпТО( FD, dat, CatDeb, IIF( IsIncrease, DlRq.rec.Party,  FD.tick.rec.ClientID), PayFIID, true, PayerAccountBuff, PayerRqAccBuff, IsCreatingPayms ) != 0)
+          return 1;
+        end;
+
+        /*контрагент - получатель в платеже*/
+        if(ПолучитьСчетКомпТО( FD, dat, CatCred, IIF( IsIncrease, FD.tick.rec.ClientID, DlRq.rec.Party), PayFIID, false, ReceiverAccountBuff, ReceiverRqAccBuff, IsCreatingPayms ) != 0)
+          return 1;
+        end;
+     else
+        /*контрагент - плательщик*/
+        if(ПолучитьСчетКомпТО( FD, dat, CatDeb, IIF( IsIncrease, FD.tick.rec.ClientID, DlRq.rec.Party), PayFIID, true, PayerAccountBuff, PayerRqAccBuff, IsCreatingPayms ) != 0)
+          return 1;
+        end;
+
+        if(ПолучитьСчетКомпТО( FD, dat, CatCred, IIF( IsIncrease, DlRq.rec.Party, FD.tick.rec.ClientID), PayFIID, false, ReceiverAccountBuff, ReceiverRqAccBuff, IsCreatingPayms ) != 0)
+          return 1;
+        end;
+    end;
+  end;
+
+  return 0;
+end;
+
+macro ПолучитьСчетаТОПоКупонуЧП(DlRq, FD, dat:DATE, PayerAccountBuff:TRecHandler, ReceiverAccountBuff:TRecHandler, PayerRqAccBuff, ReceiverRqAccBuff, IsCreatingPayms:bool)
+  var CatDeb = "", CatCred = "", AccountFIID:integer = ALLFININSTR;
+
+  if( IsLoan(FD.Group) )
+     AccountFIID = FD.GetRQ(DLRQ_TYPE_INCREPO).rec.FIID;
+  else
+     AccountFIID = FD.GetRQ(DLRQ_TYPE_PAYMENT).rec.FIID;
+  end;
+
+  /*для клиентских потом переопределим.*/
+  if( IsSale(FD.Group) ) // ПР
+     CatDeb  = IIF(IsEXCHANGE(FD.Group), ПолучитьКатегориюСчетаКонтрагента(FD, true), IIF(IsBasket(FD.Group), "Торговый счет", "Корсчет"));
+     CatCred = "+Расчеты";
+  else
+     CatDeb  = "-Расчеты";
+     CatCred = IIF(IsEXCHANGE(FD.Group), "Клиринговый счет", IIF(IsBasket(FD.Group), "Торговый счет", "Корсчет"));
+  end;
+
+  if( not IsClientDeal(FD.tick.rec) )
+     if(ПолучитьСчетКомпТО( FD, dat, CatDeb, DlRq.rec.Party, AccountFIID, true, PayerAccountBuff, PayerRqAccBuff, IsCreatingPayms ) != 0)
+       return 1;
+     end;
+
+     if(ПолучитьСчетКомпТО( FD, dat, CatCred, DlRq.rec.Party, AccountFIID, false, ReceiverAccountBuff, ReceiverRqAccBuff, IsCreatingPayms ) != 0)
+       return 1;
+     end;
+  else
+     if( IsBuy(FD.Group) )
+        /*клиент - плательщик */
+        if(ПолучитьСчетКомпТО( FD, dat, "Корсчет", FD.tick.rec.ClientID, AccountFIID, true, PayerAccountBuff, PayerRqAccBuff, IsCreatingPayms ) != 0)
+          return 1;
+        end;
+
+        /*контрагент - получатель */
+        if(ПолучитьСчетКомпТО( FD, dat, CatCred, DlRq.rec.Party, AccountFIID, false, ReceiverAccountBuff, ReceiverRqAccBuff, IsCreatingPayms ) != 0)
+          return 1;
+        end;
+     else
+        /*контрагент - плательщик*/
+        if(ПолучитьСчетКомпТО( FD, dat, CatDeb, DlRq.rec.Party, AccountFIID, true, PayerAccountBuff, PayerRqAccBuff, IsCreatingPayms ) != 0)
+          return 1;
+        end;
+
+        /*клиент - получатель */
+        if(ПолучитьСчетКомпТО( FD, dat, "Корсчет", FD.tick.rec.ClientID, AccountFIID, false, ReceiverAccountBuff, ReceiverRqAccBuff, IsCreatingPayms ) != 0)
+          return 1;
+        end;
+     end;
+  end;
+
+  return 0;
+end;
+
+//удаление сделки со всеми связанными записями
+MACRO SP_DeleteDeal(DealCode,     //внутренний код сделки
+                    BOfficeKind   //вид первичного документа сделки
+                   )
+  var stat = 0;
+  var RSD;
+  var cmd = RSDCommand( "select t_DealID from ddl_tick_dbt where t_BOfficeKind = ? and t_DealCode = ? " );
+
+  if(ValType(BOfficeKind) == V_UNDEF)
+    BOfficeKind = DL_SECURITYDOC;
+  end;
+
+  cmd.addParam( "", RSDBP_IN, BOfficeKind );
+  cmd.addParam( "", RSDBP_IN, DealCode );
+  cmd.execute();
+
+  RSD = TRsbDataSet(cmd);
+  if( RSD.MoveNext() )
+    stat = SP_DelDealWithLinks(RSD.DealID);
+  else
+    msgbox("Сделка не найдена");
+    stat = 1;
+  end;
+
+  return stat;
+END;
+
+//определить вид срочности сделки по первой части
+macro ВидСрочностиСделкиПоПервойЧасти(BofficeKind, BitMask, Dз, Dо, Dп, IsPFI);
+  var ret;
+  var Dз2 = GetDateAfterWorkDays(Dз,2);
+  var Dз3 = GetDateAfterWorkDays(Dз,3);
+
+  if( (BofficeKind == DL_RETIREMENT) OR 
+      ( (Dз == Dо) AND (Dо == Dп) ) ) 
+     ret = СделкаToday;
+  elif( ( (Dо != Dз) OR (Dп != Dз) ) AND (Dо <= Dз2) AND (Dп <= Dз2) )
+     ret = СделкаПрочая;
+  elif( (Dо >= Dз3) OR (Dп >= Dз3) ) 
+     ret = СделкаНеРанееТретьегоДня; 
+  end;
+
+  if( (ret == СделкаToday) AND bAND( BitMask, DL_LEG_ALWAYS_DUE ) )
+     ret = СделкаНеРанееТретьегоДня; /*при изменении условий сделки меняли сроки - СделкаToday теперь всегда СделкаНеРанееТретьегоДня*/
+  elif( ret == 0 )
+     ret = VALUE_NOT_FIND;
+  end;
+
+  if( IsPFI == SET_CHAR )
+     ret = СделкаНеРанееТретьегоДня;          /*при установленном признаке IsPFI считаем сделкой Т+.. */  // проверка на модуль?
+  end;
+
+  return ret;
+end;
+
+// Получить дату ТО
+macro SP_GetPlanDateRQ( leg_buf, tick_buf, Type, Group)
+  var dat = Date(0,0,0);
+
+  if((Type == DLRQ_TYPE_AVANCE) or (Type == DLRQ_TYPE_DEPOSIT))
+    //аванс или задаток
+    dat = leg_buf.Start;
+  elif(Type == DLRQ_TYPE_DELIVERY)
+    //поставка ц/б
+    if(tick_buf.BOfficeKind == DL_RETIREMENT_OWN)
+       dat = leg_buf.Expiry;
+    elif((IsAVRWRTIN(Group)) or (IsAVRWRTOUT(Group)) or (IsRET_ISSUE(Group)))
+       dat = tick_buf.DealDate;
+    elif(leg_buf.MaturityIsPrincipal == SET_CHAR)
+       dat = leg_buf.Maturity;
+    else
+       dat = leg_buf.Expiry;
+    end;
+  elif(Type == DLRQ_TYPE_PAYMENT)
+     /*оплата*/
+     if((IsRET_ISSUE(Group)) or (IsRET_COUPON(Group)) or (IsRET_PARTLY(Group)))
+        if(tick_buf.BOfficeKind == DL_RETIREMENT_OWN)
+          dat = leg_buf.MoveDate;
+        else
+          if( leg_buf.Maturity != date(0,0,0) )
+             dat = leg_buf.Maturity;
+          else
+             dat = tick_buf.DealDate;
+          end;
+        end;
+     elif((IsCONVERT_SHARE(Group)) or (IsCONVERT_RECEIPT(Group)))     
+        dat = date(0,0,0);
+     elif( IsBasket(Group) )
+        dat = leg_buf.Expiry;
+     elif(leg_buf.MaturityIsPrincipal == SET_CHAR)
+        dat = leg_buf.Expiry;
+     else
+        dat = leg_buf.Maturity;
+     end;
+  elif(Type == DLRQ_TYPE_INCREPO)
+     //проценты в РЕПО
+     if( IsBasket(Group) )
+        dat = leg_buf.Expiry;
+     elif(leg_buf.MaturityIsPrincipal == SET_CHAR)
+        dat = leg_buf.Expiry;
+     else
+        dat = leg_buf.Maturity;
+     end;
+  elif(Type == DLRQ_TYPE_PAYINCOME)
+     //выплата дохода
+     dat = leg_buf.MoveDate;
+  end;
+  return dat;
+end;
+
+/*
+FiRole - роль основного счета по операции
+FiRole_Other - роль "другого" счета по операции (используется при перевода с основного счета на другой и обратно)
+*/
+macro GetSettlFiRoleByOperSubKind(OperSubKind:integer,FiRole:@integer,FiRole_Other:@integer)
+  FiRole = FiRole_Other = null;
+  if(OperSubKind == ALG_SP_MONEY_SOURCE_TRUST)
+     FiRole = FIROLE_MONEYSOURCE_TRUST;
+     FiRole_Other = FIROLE_ORCB_OTHCLIRACC_TRUST;
+  elif(OperSubKind == ALG_SP_MONEY_SOURCE_CLIENT)
+     FiRole = FIROLE_MONEYSOURCE_CLIENT;
+     FiRole_Other = FIROLE_ORCB_OTHCLIRACC_CLIENT;
+  else
+     FiRole = FIROLE_MONEYSOURCE_OWN;
+     FiRole_Other = FIROLE_ORCB_OTHCLIRACC;
+  end;
+end;
+
+
+//Получить сумму налога к удержанию для проводки в операции возврата дивидендов
+macro SP_GetTaxAmountInRetDivid(ClientID, PartyID,FactReceiverID,
+                                DivDeal, TaxPay, TaxGet, 
+                                amount:@money, CatCred:@string): bool
+    var stat: bool = true;
+    record reciepient_party(party);  // получатель PartyID
+    record payer_party(party);       // плательщик ClientID
+    record fact_party(party);        // фактический получатель (BenefCode)
+
+    if ( ПолучитьСубъекта(PartyID, reciepient_party) != 0 )
+        stat = false;
+    end;
+
+    if ( (stat == true) and (ClientID != -1) ) /*and  {OurBank} != ClientID*/ 
+        if ( ПолучитьСубъекта(ClientID, payer_party) != 0)
+            stat = false;
+        end;
+    end;
+
+    if ( (stat == true) and (FactReceiverID > 0) )
+        if ( ПолучитьСубъекта(FactReceiverID, fact_party) != 0 )
+            stat = false;
+        end;
+    end;
+
+    if ( stat == false )
+        return false;
+    end;
+
+    IF ( {OurBank} != ClientID )  // OurBank=NO - (клиентская сделка)
+        // получатель - физ-лицо и плательщик - физлицо, и Tax-Pay<TaxGet                      // Уаа
+        if ( (reciepient_party.LegalForm == 2) and (payer_party.LegalForm == 2)  /*and (TaxPay < TaxGet)*/) 
+            //amount = leg.ReceiptAmount - leg.ReturnIncome;
+            amount = TaxGet - TaxPay;
+            CatCred = "НДФЛ к перечислению";
+        
+        // получатель - физ-лицо и плательщик - юрлицо                                          // Уаа
+        elif( (reciepient_party.LegalForm == 2) and (payer_party.LegalForm == 1)  )
+                //amount = leg.ReceiptAmount;
+            amount = TaxGet;
+            CatCred = "НДФЛ к перечислению";
+       
+        // получатель - юрлицо , и плательщик - юрлицо, BenefCode - юрлицо и Tax-Pay<TaxGet       // Уаб
+        elif ( (reciepient_party.LegalForm == 1) and (payer_party.LegalForm == 1) and (fact_party.LegalForm == 1) /*and (TaxPay<TaxGet)*/ )
+                //amount  = leg.ReceiptAmount - leg.ReturnIncome;
+            amount = TaxGet - TaxPay;
+            CatCred = "-Бюджет, ф.налоги";
+
+        // получатель ? юрлицо (ContrCode), а факти-ческий получатель ? физ.лицо (BenefCode) и плательщик ? физ-лицо, и TaxPay<TaxGet
+        elif ((reciepient_party.LegalForm == 1) and (fact_party.LegalForm == 2) and (payer_party.LegalForm == 2) /*and (TaxPay<TaxGet)*/  ) 
+            amount = TaxGet - TaxPay;
+            CatCred = "-Бюджет, ф.налоги";
+
+        // Если получатель -? юрлицо (ContrCode и  BenefCode юрлицо), и плательщик - физлицо                      // Уаб
+        elif( (reciepient_party.LegalForm == 1) and (fact_party.LegalForm == 1) and (payer_party.LegalForm == 2) )
+                //amount = leg.ReceiptAmount;
+            amount = TaxGet;
+            CatCred = "-Бюджет, ф.налоги";
+
+        // Если получатель ? юрлицо (ContrCode), а фактический получатель ? физ.лицо (BenefCode), и пла-тельщик ? юрлицо
+        elif ( (reciepient_party.LegalForm == 1) and (fact_party.LegalForm == 2) and (payer_party.LegalForm == 1) )
+           amount = TaxGet; 
+           CatCred = "-Бюджет, ф.налоги";
+        end;
+       
+    ELSE // OurBank=Yes, (собственная сделка) - вторая очередь реализации     // Уб
+        // получатель - физ-лицо                                              // Уба
+        if ( reciepient_party.LegalForm == 2 )              
+            //amount  = leg.ReturnIncome - leg.ReceiptAmount;
+            amount = TaxPay - TaxGet;
+            CatCred = "НДФЛ к перечислению";
+        // получатель - юрлицо                                                // Убб
+        elif ( reciepient_party.LegalForm == 1 )
+            //amount  = leg.ReturnIncome - leg.ReceiptAmount;
+            amount = TaxPay - TaxGet;
+            CatCred = "-Бюджет, ф.налоги";
+        end;
+    END;
+
+    return stat;
+end;
+
+macro SP_GetPayAgentOwn(FIID)
+  var query, cmd, DataSet;
+  var PayAgent = -1;
+
+  query =   " select t_PartyP "
+          + "   from davrserv_dbt "
+          + "  where t_FIID = ? ";
+
+  cmd = DL_RSDCommand(query);
+
+  cmd.AddParam(FIID);
+
+  DataSet = cmd.Execute();
+  if(DataSet.moveNext())
+    PayAgent = DataSet.PartyP;
+  end;
+
+  return PayAgent;
+end;
+
+macro ПолучитьДатуНачальногоРазмещенияОЭБ(FIID:integer)
+  var cmd, ds;
+  var Dразм = date(0,0,0);
+
+  // Определим дату начального размещения
+/*
+  cmd = DL_RSDCommand("SELECT T_DATE FROM DPMWRTSUM_DBT WHERE T_FIID = ? AND T_KIND = ? AND T_BUY_SALE = ? AND ROWNUM = 1 ORDER BY T_DATE");
+  cmd.AddParam(FIID);
+  cmd.AddParam(PM_WRTSUM_KIND_DSTR);
+  cmd.AddParam(PM_WRITEOFF_SUM_PLACE);
+  ds = cmd.Execute();
+  if(ds.moveNext())
+    Dразм = SQL_ConvTypeDate(ds.Date);
+  end;
+*/
+/*AD*/
+cmd = DL_RSDCommand("SELECT av.T_ENDPLACEMENTDATE  from davoiriss_dbt av where av.t_fiid =? and rownum = 1");
+  cmd.AddParam(FIID);
+  ds = cmd.Execute();
+  if(ds.moveNext())
+    Dразм = SQL_ConvTypeDate(ds.ENDPLACEMENTDATE);
+  end;
+
+
+  return Dразм;
+end;
+
+
+
+
+
+//Определить сумму затрат по ц/б ОЭБ
+macro ПолучитьСуммуЗатратПоЦБ(FIID, SumComisRub:@money, SumNDSRub:@money, IncludeMonthAmort:bool)
+  var cmd, ds;
+  var Dразм = date(0,0,0);
+  
+  SumComisRub = $0;
+  SumNDSRub   = $0;
+
+  if(IncludeMonthAmort == NULL)
+    IncludeMonthAmort = false;
+  end;
+
+  Dразм = ПолучитьДатуНачальногоРазмещенияОЭБ(FIID);
+
+  if(Dразм > date(0,0,0))
+    // Определим сумму затрат по ц/б
+    cmd = DL_RSDCommand("SELECT NVL(SUM(RSB_FIInstr.ConvSum(DLC.T_SUM, CM.T_FIID_COMM, "+NATCUR+", DLC.T_PLANPAYDATE)), 0) as SumComisRub, " +
+                               " NVL(SUM(RSB_FIInstr.ConvSum(DLC.T_NDS, CM.T_FIID_COMM, "+NATCUR+", DLC.T_PLANPAYDATE)), 0) as SumNDSRub " +
+                          " FROM DDLCOMIS_DBT DLC, DSFCOMISS_DBT CM " +
+                         " WHERE DLC.T_DOCKIND = ? " +
+                           " AND DLC.T_DOCID = ? " +
+                           " AND DLC.T_PLANPAYDATE <= ? " +
+                           " AND CM.T_FEETYPE = DLC.T_FEETYPE " +
+                           " AND CM.T_NUMBER = DLC.T_COMNUMBER " + //AND CM.T_NUMBER != 77" +
+                       IIF(IncludeMonthAmort==false, " AND DLC.T_MONTHAMORTSUM = 0 ", "")
+                       );
+    cmd.AddParam(DLDOC_ISSUE);
+    cmd.AddParam(FIID);
+    cmd.AddParam(Dразм);
+    ds = cmd.Execute();
+    if(ds.moveNext())
+      SumComisRub = ds.SumComisRub;
+      SumNDSRub   = ds.SumNDSRub;
+    end;
+  end;
+end;
+
+//Проверяет, является ли дата переходящей для погашения ОЭБ
+MACRO ДатаЯвляетсяПереходящейПогашОЭБ(DrawingDate:date)
+  var PrevDate = date(0,0,0);
+  var IsRollingDate = false;
+  var PrevMonth = 0, DrawingMonth = 0;
+
+  //под "переходящей датой" понимается дата, выпадающая на нерабочий 
+  //либо следующий за ним первый рабочий день нового календарного месяца, 
+  //и на которую условиями выпуска Облигаций приходится дата погашения (выплаты) купона/выпуска
+
+  PrevDate = GetDateAfterWorkDays(DrawingDate, -1);
+
+  DateSplit(DrawingDate, null, DrawingMonth, null);
+  DateSplit(PrevDate, null, PrevMonth, null);
+
+  if(PrevMonth != DrawingMonth)
+    IsRollingDate = true;
+  end;
+
+  return IsRollingDate;
+END;
+
+/*Учет валютных долевых ц/б: 0 - в рублях, 1 - в валюте номинала*/
+PRIVATE VAR AcCurSec = NULL;
+macro УЧЕТ_ВАЛЮТНЫХ_ДОЛЕВЫХ_ЦБ():integer
+   var ErrCode, RegPath = "SECUR\\МСФО\\УЧЕТ ВАЛЮТНЫХ ДОЛЕВЫХ ЦБ";
+
+   GetRegistryValue( RegPath, V_INTEGER, AcCurSec, ErrCode );
+
+   if( ErrCode != 0 )
+      MsgBox( "Ошибка при получении значения настройки \"" + RegPath + "\"");
+   end;
+
+   return AcCurSec;
+end;
+
+
+macro СС_ДНЕЙ():integer
+   var ErrCode, RegPath = "SECUR\\МСФО\\СС_ДНЕЙ";
+   var nDays = 0;
+
+   GetRegistryValue( RegPath, V_INTEGER, nDays, ErrCode );
+
+   if( ErrCode != 0 )
+      MsgBox( "Ошибка при получении значения настройки \"" + RegPath + "\"");
+   end;
+
+   return nDays;
+end;
+//Открывает новый счет с отстатком 0 и СПИ Фондовый дилинг операция списания/зачисления дс
+macro OpenNewAccount (account, chapter, cur, Clientid, opendate, name, type)
+  var cmd, query;
+  var BankID = {OurBank};
+  var bln = SubStr(account, 1, 5);
+
+  file SettAccRec("settacc.dbt") write KEY 4;
+
+  if ((bln != "40817") and (bln != "40701") and (bln != "40702"))
+    MsgBox("Не верный счет "+account);
+    return 1;
+  end;
+
+  if (StrLen(account) != 20)
+    MsgBox("Не верный счет "+account);
+    return 1;
+  end;
+
+  rslDefCon.beginTrans();
+
+  StartCaptureOutput ();
+  [insert all
+  when 1=1 then
+  into daccount_dbt values (/*t_accountid*/ daccount_dbt_seq.nextval,
+                            /*t_open_close*/ chr (0),
+                            /*t_code_currency*/ v_fiid,
+                            /*t_account*/ v_account,
+                            /*t_chapter*/ v_chapter,
+                            /*t_department*/ 1,
+                            /*t_branch*/ 1,
+                            /*t_client*/ v_partyid,
+                            /*t_oper*/ 1,
+                            /*t_balance*/ substr (v_account, 1, 5),
+                            /*t_sort*/ chr (1),
+                            /*t_open_date*/ v_dtopen,
+                            /*t_close_date*/ to_date ('01010001','ddmmyyyy'),
+                            /*t_index2*/ chr (0),
+                            /*t_index3*/ chr (0),
+                            /*t_kind_account*/ nvl (v_kind, chr (1)),
+                            /*t_type_account*/ nvl (v_type, chr (1)),
+                            /*t_etype_account*/ chr (1),
+                            /*t_usertypeaccount*/ chr (1),
+                            /*t_final_date*/ to_date ('01010001','ddmmyyyy'),
+                            /*t_datenochange*/ to_date ('01010001','ddmmyyyy'),
+                            /*t_symbol*/ chr (1),
+                            /*t_nameaccount*/ nvl (v_name, chr (1)),
+                            /*t_change_date*/ to_date ('01010001','ddmmyyyy'),
+                            /*t_change_dateprev*/ to_date ('01010001','ddmmyyyy'),
+                            /*t_pairaccount*/ nvl (v_pair, chr (0)),
+                            /*t_userfield1*/ chr (1),
+                            /*t_userfield2*/ chr (1),
+                            /*t_userfield3*/ chr (1),
+                            /*t_userfield4*/ chr (1),
+                            /*t_operationdate*/ to_date ('01010001','ddmmyyyy'),
+                            /*t_daystoend*/ 0,
+                            /*t_orscheme*/ 0,
+                            /*t_contractrko*/ 0,
+                            /*t_officeid*/ 0,
+                            /*t_depoacc*/ 0,
+                            /*t_deporoot*/ 0,
+                            /*t_havesubaccounts*/ chr (0),
+                            /*t_controloper*/ 0,
+                            /*t_currencyeq*/ -1,
+                            /*t_currencyeq_ratedate*/ 0,
+                            /*t_currencyeq_ratetype*/ 0,
+                            /*t_currencyeq_rateextra*/ 0,
+                            /*t_opucode*/ chr (1),
+                            /*t_beneficiaryid*/ 0,
+                            /*t_version*/ 0,
+                            /*t_ofrrecid*/ 0,
+                            /*t_contragent*/ 0)
+  when 1=1 then
+  into daccblnc_dbt values (daccount_dbt_seq.currval,
+                            v_account,
+                            v_fiid,
+                            v_chapter,
+                            substr (v_account, 1, 5),
+                            chr (1),
+                            chr (1),
+                            chr (1),
+                            chr (1),
+                            chr (1),
+                            chr (1),
+                            chr (1),
+                            chr (1),
+                            chr (1),
+                            chr (1),
+                            chr (1))
+  when 1=1 then
+  into drestdate_dbt values (daccount_dbt_seq.currval,
+                             v_date,
+                             v_fiid,
+                             v_rest,
+                             v_rest,
+                             0,
+                             0,
+                             0,
+                             0)
+  when v_fiid > 0 then 
+  into drestdate_dbt values (daccount_dbt_seq.currval,
+                             v_date,
+                             0,
+                             v_restrub,
+                             v_restrub,
+                             0,
+                             0,
+                             0,
+                             0)
+  with parm as (select :account v_account, :chapter v_chapter from dual)
+  select :cur v_fiid,
+         (select v_account from parm) v_account,
+         (select v_chapter from parm) v_chapter,
+         :partyid v_partyid,
+         :dopen v_dtopen,
+         (select t_kind_account from dbalance_dbt where t_chapter = (select v_chapter from parm) and t_inumplan = 0 and t_balance = (select substr (v_account, 1, 5) from parm)) v_kind,
+         :type v_type,
+         :name v_name,
+         chr(0) v_pair,
+         :curdate v_date,
+         :rest v_rest,
+         :restrub v_restrub
+  from dual];
+  cmd = RSDCommand(EndCaptureOutput());
+  cmd.AddParam("account",   RSDBP_IN, account);
+  cmd.AddParam("chapter",   RSDBP_IN, chapter);
+  cmd.AddParam("cur",       RSDBP_IN, cur);
+  cmd.AddParam("partyid",   RSDBP_IN, Clientid);
+  cmd.AddParam("dopen",     RSDBP_IN, opendate);
+  cmd.AddParam("type",      RSDBP_IN, type);
+  cmd.AddParam("name",      RSDBP_IN, name);
+  cmd.AddParam("curdate",   RSDBP_IN, opendate);
+  cmd.AddParam("rest",      RSDBP_IN, 0);
+  cmd.AddParam("restrub",   RSDBP_IN, 0);
+  cmd.Execute();
+
+  SettAccRec.PartyID          = ClientID;
+  SettAccRec.BankID           = BankID;
+  SettAccRec.FIID             = cur;
+  SettAccRec.Chapter          = chapter;
+  SettAccRec.Account          = account;
+  SettAccRec.RecName          = name;
+  SettAccRec.BankCodeKind     = 3; //БИК
+  SettAccRec.BankCode         = ПолучитьКодСубъекта(BankID, SettAccRec.BankCodeKind);
+  SettAccRec.BankName         = {Name_Bank};
+  SettAccRec.BankCorrID       = -1;
+  SettAccRec.BankCorrCodeKind = 3;
+  SettAccRec.FiKind           = 1;
+  SettAccRec.BeneficiaryID    = ClientID;
+  SettAccRec.CodeKind         = 1;
+  SettAccRec.Code             = ПолучитьКодСубъекта(ClientID, SettAccRec.CodeKind);
+  SettAccRec.Description      = "ДС клиента";
+  SettAccRec.Order            = 5;
+  SettAccRec.ShortName        = "ДС клиента";
+
+  if (PT_CreateSettAcc(SettAccRec) )
+    RunError("Ошибка при добавлении ПИ субъекта");
+  end;
+
+  StartCaptureOutput();
+  [insert into DPMAUTOAC_DBT (T_PARTYID, T_FIID, T_KINDOPER, T_PURPOSE, T_SETTACCID, T_FIKIND, T_SERVICEKIND, T_ORDER, T_ACCOUNT, T_RESERVE)
+   values (?, ?, 2037, 0, ?, ?, ?, ?, chr(1), chr(1));
+  ]; 
+  //Фондовый дилинг
+  cmd = RSDCommand(EndCaptureOutput());
+  cmd.AddParam("partyid",   RSDBP_IN, SettAccRec.PartyID);
+  cmd.AddParam("fiid",      RSDBP_IN, SettAccRec.FIID);
+  cmd.AddParam("settaccid", RSDBP_IN, SettAccRec.SETTACCID);
+  cmd.AddParam("fikind",    RSDBP_IN, SettAccRec.FIKIND);
+  cmd.AddParam("servkind",  RSDBP_IN, 1);
+  cmd.AddParam("ord",       RSDBP_IN, SettAccRec.ORDER);
+  cmd.Execute();
+
+  rslDefCon.commitTrans();
+
+  return 0;
+onerror()
+  if ( rslDefCon.isInTrans() )
+    rslDefCon.rollbackTrans();
+  end;
+  return 1;
+End;
+macro ЦЕНА_ОТРАЖ_НА_КУ_МИНУС_ОД_ПРИ_ПРОДАЖЕ_ИЗ_ПВО():integer
+   var ErrCode, RegPath = "SECUR\\ЦЕНА ОТРАЖ. -ОД ПРОД. ИЗ ПВО";
+   var Val = 0;
+
+   GetRegistryValue( RegPath, V_INTEGER, Val, ErrCode );
+
+   if( ErrCode != 0 )
+      MsgBox( "Ошибка при получении значения настройки \"" + RegPath + "\"");
+   end;
+
+   return Val;
+end;
+
+macro ВедениеСчетовБПППоВыпуску():bool
+   var ErrCode, RegPath = "SECUR\\СПОСОБ ВЕДЕНИЯ СЧЕТОВ БПП";
+   var Val = 0;
+
+   GetRegistryValue( RegPath, V_INTEGER, Val, ErrCode );
+
+   if( ErrCode != 0 )
+      MsgBox( "Ошибка при получении значения настройки \"" + RegPath + "\"");
+   end;
+
+   if(Val == 1)
+     return true;
+   end;
+
+   return false;
+end;
+
+
+/*ОЭБ_АМОРТИЗАЦИЯ_ДО_ОФЕРТЫ: 0 - нет, 1 - да*/
+PRIVATE VAR AmOwnOffer = NULL;
+macro ОЭБ_АМОРТИЗАЦИЯ_ДО_ОФЕРТЫ():integer
+   var ErrCode, RegPath = "SECUR\\ОЭБ_АМОРТИЗАЦИЯ_ДО_ОФЕРТЫ";
+   GetRegistryValue( RegPath, V_INTEGER, AmOwnOffer, ErrCode );
+   if( ErrCode != 0 )
+      MsgBox( "Ошибка при получении значения настройки \"" + RegPath + "\"");
+   end;
+   return AmOwnOffer;
+end;
+MACRO ПолучитьБлижайшуюДатуОферты(FIID:integer, BegDate:date)
+  var cmd, ds;
+  var OfferDate = ZeroDate;
+  cmd = DL_RSDCommand("SELECT MIN(T_DATEREDEMPTION) OfferDate " +
+                       " FROM doffers_dbt " +
+                      " WHERE t_FIID = ? " +
+                        " AND T_DATEREDEMPTION >= ? ");
+  cmd.AddParam(FIID);
+  cmd.AddParam(BegDate);
+  ds = cmd.Execute();
+  if(ds.moveNext())
+    OfferDate = SQL_ConvTypeDate(ds.OfferDate);
+  end;
+  return OfferDate;
+END;
+macro ПереоценкаПриПереносеВПДОНа50505()
+   CONST RegPath = "SECUR\\ПЕРЕОЦ. ПРИ ПЕРЕНОСЕ В ПДО";
+   var flag, err;
+
+   GetRegistryValue( RegPath, V_BOOL, flag, err );
+   if( err != 0 )
+      MsgBox( "Ошибка при получении значения настройки \"" + RegPath + "\"");
+   end;
+   return flag;
+end;

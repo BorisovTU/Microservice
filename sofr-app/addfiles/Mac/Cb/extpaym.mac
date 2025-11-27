@@ -1,0 +1,445 @@
+/* ***************************************************************************
+            Автоматизированная банковская система RS-Bank v5.1
+                    Copyright (c) R-Style Software Lab. 2000
+
+          Описание : Отчет о внешних платежах дня
+  Имя макрофункции : ExtPaymentsListDate()
+          Параметр : дата операционного дня, за который выпускается отчет
+*************************************************************************** */
+import "globals.mac";
+import oralib, likepy;
+
+FILE   pm("pmpaym.dbt");         /* Платежи банка */
+FILE   pmprop("pmprop.dbt");     /* Свойства платежей банка */
+RECORD pmpdebet("pmprop.dbt");   /* Буфер свойств платежей банка-плательщика */
+RECORD pmpcredit("pmprop.dbt");  /* Буфер свойств платежей банка-получателя */
+
+/* Константы */
+/* Направление начальные/ответные */
+const PM_IN = TRUE, PM_OUT = FALSE;
+/* Флаги свойств */
+const PROP_DEBET = 0, PROP_CREDIT = 1;
+/* Необходимые для работы статусы платежа */
+const PM_READIED       = 1000,   
+      PM_IS_RECEIVING  = 2990,
+      PM_READY_TO_SEND = 3000,
+      PM_IS_SENDING    = 3010,
+      PM_KVITWAIT      = 2995,   // Готов к квитовке
+      PM_FINISHED      = 32000,
+/*  Статусы из pmprop.dbt */
+      ALLPMSTATUS          = -1,
+      PM_PROP_UNKNOWN      = 2000,   // Невыясненный
+      PM_PROP_UNKVITED     = 2250,   // Ответный несквитованный
+      PM_PROP_DISCHARGED   = 6000,   // Выгружен во фронт-офис        
+      PM_PROP_MESDONE      = 6300,   // Сообщение сформировано     
+      PM_PROP_MESCONTROL   = 6600;   // Сообщение проконтролировано
+
+/* Глобальные управляющие и накопительные переменные */
+/* Дата за которую выпускаем отчет */
+var DateRep;
+
+/* Количества документов по категориям - начальные */
+var StatReadyToWork_Num  = 0,
+    StatReadyToSend_Num  = 0,
+    StatIsSending_Num    = 0,
+    StatDischarged_Num   = 0,
+    StatOutClosed_Num    = 0,
+    StatOutTotal_Num     = 0;
+/* Суммы документов по категориям - начальные */
+var StatReadyToWork_Sum:money = 0.0,
+    StatReadyToSend_Sum:money = 0.0,
+    StatIsSending_Sum  :money = 0.0,
+    StatDischarged_Sum :money = 0.0,
+    StatOutClosed_Sum  :money = 0.0,
+    StatOutTotal_Sum   :money = 0.0;
+
+/* Количества документов по категориям - ответные */
+var StatIsReceiving_Num  = 0,
+    StatInUnknown_Num    = 0,
+    StatInUnkvited_Num   = 0,
+    StatInKvitWait_Num   = 0,
+    StatInClosed_Num     = 0,
+    StatInTotal_Num      = 0;
+/* Суммы документов по категориям - ответные */
+var StatIsReceiving_Sum:money = 0.0,
+    StatInUnknown_Sum  :money = 0.0,
+    StatInUnkvited_Sum :money = 0.0,
+    StatInKvitWait_Sum :money = 0.0,
+    StatInClosed_Sum   :money = 0.0,
+    StatInTotal_Sum    :money = 0.0;
+
+
+macro GetPMPropStatus(pm)
+
+  pmprop.PaymentID = pm.PaymentID;
+  pmprop.DebetCredit = PROP_DEBET;
+  ClearRecord(pmpdebet);
+  if (GetEQ(pmprop) == TRUE)
+    Copy(pmpdebet, pmprop);
+  end;
+
+  pmprop.PaymentID = pm.PaymentID;
+  pmprop.DebetCredit = PROP_CREDIT;
+  ClearRecord(pmpcredit);
+  if (GetEQ(pmprop) == TRUE)
+    Copy(pmpcredit, pmprop);
+  end;
+
+  if (pmpdebet.PaymentID != 0)
+    return pmpdebet.PropStatus;
+  elif (pmpcredit.PaymentID != 0)
+    return pmpcredit.PropStatus;
+  end;
+  
+end;
+
+/* Определить направление платежа по его свойствам */
+macro DirectPaym()
+
+  KeyNum( pmprop, 0 ); /* PaymentID+DebetCredit */
+
+  /* Находим свойства плательщика */
+  pmprop.PaymentID = pm.PaymentID;
+  pmprop.DebetCredit = PROP_DEBET;
+
+  ClearRecord( pmpdebet );
+
+  if( GetEQ( pmprop ) == TRUE )
+    Copy( pmpdebet, pmprop );
+  end;
+
+  /* Находим свойства получателя */
+  pmprop.PaymentID = pm.PaymentID;
+  pmprop.DebetCredit = PROP_CREDIT;
+
+  ClearRecord( pmpcredit );
+
+  if( GetEQ( pmprop ) == TRUE )
+    Copy( pmpcredit, pmprop );
+  end;
+
+  if( (( pmpdebet.PaymentID != 0 ) AND ( pmpdebet.IsSender == "" ))
+      OR (( pmpcredit.PaymentID != 0 ) AND ( pmpcredit.IsSender == "" ))
+    )
+    return PM_OUT; /* Начальный */
+  elif( (( pmpdebet.PaymentID != 0 ) AND ( pmpdebet.IsSender == "X" ))
+      OR (( pmpcredit.PaymentID != 0 ) AND ( pmpcredit.IsSender == "X" ))
+      )
+    return PM_IN;  /* Ответный */
+  end;
+
+  /* ошибка - не смогли определить (вообще говоря, возникать не должна) */
+  return V_UNDEF;
+end;
+
+
+/* Проверка - является ли платеж Не внешним */
+macro NotExternal()
+  return (( pm.PayerBankID == 0 ) AND ( pm.ReceiverBankID == 0 ));
+end;
+
+
+/* Фильтр на "внешность" и направление платежа в зависимости от статуса */
+macro FilterPaym( pm_status, direct )
+
+  /* Эти статусы принадлежат только внешним платежам */
+  /* Фильтровать ничего не надо */
+  if(    ( pm_status == PM_IS_RECEIVING )
+      OR ( pm_status == PM_READY_TO_SEND )
+      OR ( pm_status == PM_IS_SENDING )
+      OR ( pm_status == PM_KVITWAIT)
+    )
+    return TRUE;
+  elif( pm_status == PM_READIED )
+    /* Проверим наличие ссылок на банки в платеже, если */
+    /* нет ни одной - платеж не внешний */
+    if( NotExternal() )
+      return FALSE;
+    end;
+    return ( DirectPaym() == direct );
+  elif( pm_status == PM_FINISHED )
+    /* Проверим наличие ссылок на банки в платеже, если */
+    /* нет ни одной - платеж не внешний */
+    if( NotExternal() )
+      return FALSE;
+    end;
+    return ( DirectPaym() == direct );
+  else
+    return FALSE; /* На неизвестные статусы не пропускаем ничего */
+  end;
+end;
+
+
+/* Подсчитать платежи с заданным статусом */
+macro CountExtPaymentsState( direct, pm_status, pmprop_status )
+  var stat, status = -2;
+  var SelectCred:string, SelectDeb:string, SelectDebCred:string;
+  var params:TArray;
+  var rsD:object, rsC:object, rsDC:object;
+  var Amount:money;
+  var Count:integer;
+  var d:string;
+  d = string(DateRep);
+  if (pmprop_status == V_UNDEF)
+    pmprop_status = -1;
+  end;
+  /*Искать кол-во платежей и суммы будем искать тремя запросами!!!
+    1) у которых есть кредитовые свойства, 
+    2) у которых есть дебетовые свойства,
+    3) у которых есть и те и другие свойства*/
+  SelectCred = "SELECT nvl(sum(t_amount), 0.0), count(*) " +
+               "FROM dpmpaym_dbt pm, dpmprop_dbt cred "    +
+               "WHERE pm.t_PaymStatus = :status"           +
+               " AND pm.t_ValueDate  = to_date('" + d + "', 'DD-MM-YYYY:HH24:MI:SS')" +
+               " AND cred.t_PaymentID = pm.t_PaymentID"    +
+               " AND cred.t_DebetCredit = 1 ";
+  SelectDeb  = "SELECT nvl(sum(t_amount), 0.0), count(*) " +                            
+               "FROM dpmpaym_dbt pm, dpmprop_dbt deb "     +                            
+               "WHERE pm.t_PaymStatus = :status"           +                            
+               " AND pm.t_ValueDate  = to_date('" + d + "', 'DD-MM-YYYY:HH24:MI:SS')" + 
+               " AND deb.t_PaymentID = pm.t_PaymentID"     +
+               " AND deb.t_DebetCredit = 0 ";                               
+  SelectDebCred  = "SELECT nvl(sum(t_amount), 0.0), count(*) "                            +                            
+                   "FROM dpmpaym_dbt pm, dpmprop_dbt cred, dpmprop_dbt deb "              +                            
+                   "WHERE pm.t_PaymStatus = :status"                                      +                            
+                   " AND pm.t_ValueDate  = to_date('" + d + "', 'DD-MM-YYYY:HH24:MI:SS')" + 
+                   " AND deb.t_DebetCredit = 0 "                                          +                            
+                   " AND deb.t_PaymentID = pm.t_PaymentID"                                +
+                   " AND cred.t_DebetCredit = 1 "                                         +                            
+                   " AND cred.t_PaymentID = pm.t_PaymentID";                             
+
+  /*для некоторых статусов и направлений платежа накладываются свои условия*/
+  if( (pm_status == PM_READIED) or (pm_status == PM_FINISHED))
+    SelectCred    = SelectCred    + " AND (pm.t_PayerBankID > 0 OR pm.t_ReceiverBankID > 0)";
+    SelectDeb     = SelectDeb     + " AND (pm.t_PayerBankID > 0 OR pm.t_ReceiverBankID > 0)";
+    SelectDebCred = SelectDebCred + " AND (pm.t_PayerBankID > 0 OR pm.t_ReceiverBankID > 0)";
+    if( direct == PM_OUT )
+      SelectCred = SelectCred + " AND cred.t_IsSender = chr(0)";
+      SelectDeb  = SelectDeb  + " AND deb.t_IsSender = chr(0)";
+      SelectDebCred = SelectDebCred + " AND deb.t_IsSender = chr(0) AND cred.t_IsSender = chr(0)";
+    elif( direct == PM_IN )
+      SelectCred = SelectCred + " AND cred.t_IsSender = 'X'";
+      SelectDeb  = SelectDeb  + " AND deb.t_IsSender = 'X'";
+      SelectDebCred = SelectDebCred + " AND deb.t_IsSender = 'X' AND cred.t_IsSender = 'X'";
+    end;
+  end;
+  /*условия для pmprop_status*/
+  if( (( pm_status == PM_IS_RECEIVING ) OR ( pm_status == PM_IS_SENDING )) 
+       AND (pmprop_status != -1) )
+    SelectCred = SelectCred + " AND cred.t_PropStatus = :prop_status";
+    SelectDeb  = SelectDeb + " AND deb.t_PropStatus = :prop_status";
+    SelectDebCred = SelectDebCred + " AND cred.t_PropStatus = :prop_status";
+  end;
+
+  /*!!!параметры запроса!!!*/
+  /*если определяем и по pmprop_status, то 2 параметра, иначе - 1*/
+  if( (( pm_status == PM_IS_RECEIVING ) OR ( pm_status == PM_IS_SENDING ))
+       AND (pmprop_status != -1) )
+    params = makeArray( SQLParam("status"     , pm_status    ),
+                        SQLParam("prop_status", pmprop_status));
+    else
+    params = makeArray( SQLParam("status"     , pm_status    ));   
+  end;
+  
+  /*запускаем каждый запрос в отдельности*/
+  rsD =  execSQLselect( selectDeb,     params, FALSE );
+  rsC =  execSQLselect( selectCred,    params, FALSE );
+  rsDC = execSQLselect( selectDebCred, params, FALSE );
+
+  if( rsD  AND rsD.moveNext() AND
+      rsC  AND rsC.moveNext() AND
+      rsDC AND rsDC.moveNext() )
+     /*данные из 3-го отнимаем от 2-х первых*/
+     Amount = rsD.value(0) + rsC.value(0) - rsDC.value(0);
+     Count  = rsD.value(1) + rsC.value(1) - rsDC.value(1);
+        if( pm_status == PM_READIED )
+       StatReadyToWork_Num = StatReadyToWork_Num + Count;
+       StatReadyToWork_Sum = StatReadyToWork_Sum + Amount;
+        elif( pm_status == PM_IS_RECEIVING )
+          if (pmprop_status == -1)
+         StatIsReceiving_Num = StatIsReceiving_Num + Count;
+         StatIsReceiving_Sum = StatIsReceiving_Sum + Amount;
+          end;
+       if (pmprop_status == PM_PROP_UNKNOWN)
+         StatInUnknown_Num = StatInUnknown_Num + Count;
+         StatInUnknown_Sum = StatInUnknown_Sum + Amount;
+            end;
+            if (pmprop_status == PM_PROP_UNKVITED)
+         StatInUnkvited_Num = StatInUnkvited_Num + Count;
+         StatInUnkvited_Sum = StatInUnkvited_Sum + Amount;
+          end;
+        elif( pm_status == PM_READY_TO_SEND )
+       StatReadyToSend_Num = StatReadyToSend_Num + Count;
+       StatReadyToSend_Sum = StatReadyToSend_Sum + Amount;
+        elif( pm_status == PM_IS_SENDING )
+          if (pmprop_status == -1)
+         StatIsSending_Num = StatIsSending_Num + Count;
+         StatIsSending_Sum = StatIsSending_Sum + Amount;
+          end;
+            if ((pmprop_status == PM_PROP_DISCHARGED) OR
+                (pmprop_status == PM_PROP_MESDONE)    OR
+                (pmprop_status == PM_PROP_MESCONTROL))
+         StatDischarged_Num = StatDischarged_Num + Count;
+         StatDischarged_Sum = StatDischarged_Sum + Amount;
+          end;
+
+        elif( pm_status == PM_FINISHED )
+          if( direct == PM_IN )
+         StatInClosed_Num = StatInClosed_Num + Count;
+         StatInClosed_Sum = StatInClosed_Sum + Amount;
+          else
+         StatOutClosed_Num = StatOutClosed_Num + Count;
+         StatOutClosed_Sum = StatOutClosed_Sum + Amount;
+          end;
+        elif( pm_status == PM_KVITWAIT )
+       StatInKvitWait_Num = StatInKvitWait_Num + Count;
+       StatInKvitWait_Sum = StatInKvitWait_Sum + Amount;        
+    end;
+  end;
+end;
+
+
+/* Подсчитать все платежи */
+macro CountExtPayments( direct )
+  if( direct == PM_IN ) /* Ответные */
+    CountExtPaymentsState( direct, PM_IS_RECEIVING, ALLPMSTATUS);
+    CountExtPaymentsState( direct, PM_IS_RECEIVING, PM_PROP_UNKNOWN );
+    CountExtPaymentsState( direct, PM_IS_RECEIVING, PM_PROP_UNKVITED );
+    CountExtPaymentsState( direct, PM_KVITWAIT     );
+    CountExtPaymentsState( direct, PM_FINISHED     );
+  else
+    CountExtPaymentsState( direct, PM_READIED       );
+    CountExtPaymentsState( direct, PM_READY_TO_SEND );
+    CountExtPaymentsState( direct, PM_IS_SENDING, ALLPMSTATUS);
+    CountExtPaymentsState( direct, PM_IS_SENDING, PM_PROP_DISCHARGED);
+    CountExtPaymentsState( direct, PM_IS_SENDING, PM_PROP_MESDONE);   
+    CountExtPaymentsState( direct, PM_IS_SENDING, PM_PROP_MESCONTROL);
+    CountExtPaymentsState( direct, PM_FINISHED      );
+  end;
+
+end;
+
+
+/* Вывести отчет */
+macro PutResults( direct )
+
+  if( direct == PM_IN ) /* Ответные */
+
+    /* Суммируем количество документов */
+    StatInTotal_Num = StatIsReceiving_Num/* + StatInUnknown_Num + StatInUnkvited_Num*/
+                     + StatInKvitWait_Num + StatInClosed_Num;
+    /* Суммируем суммы документов */
+    StatInTotal_Sum = StatIsReceiving_Sum/* + StatInUnknown_Sum + StatInUnkvited_Sum*/
+                     + StatInKvitWait_Sum + StatInClosed_Sum;
+
+[
+  Состояние ответных платежей за ##########:
+
+    платежей со статусом "на приеме", из них     - ####, сумма ###################
+      невыясненные                               - ####, сумма ###################
+      несквитованные                             - ####, сумма ###################
+    платежей со статусом "готов к квитовке"      - ####, сумма ###################
+    платежей со статусом "завершен"              - ####, сумма ###################
+
+  Итого ответных платежей                        - ####, сумма ###################
+
+
+]( DateRep, StatIsReceiving_Num:r, StatIsReceiving_Sum:r,
+            StatInUnknown_Num:r, StatInUnknown_Sum:r,
+            StatInUnkvited_Num:r, StatInUnkvited_Sum:r,
+            StatInKvitWait_Num:r, StatInKvitWait_Sum:r,
+            StatInClosed_Num:r, StatInClosed_Sum:r,
+            StatInTotal_Num:r,  StatInTotal_Sum:r );
+
+  else
+    /* Суммируем количество документов */
+    StatOutTotal_Num = StatReadyToWork_Num + StatReadyToSend_Num
+                      + StatIsSending_Num/*  + StatDischarged_Num*/
+                      + StatOutClosed_Num;
+    /* Суммируем суммы документов */
+    StatOutTotal_Sum = StatReadyToWork_Sum + StatReadyToSend_Sum
+                      + StatIsSending_Sum/*  + StatDischarged_Num*/
+                      + StatOutClosed_Sum;
+
+[
+  Состояние начальных платежей за ##########:
+
+    платежей со статусом "готов к обработке"    - ####, сумма ###################
+    платежей со статусом "готов к отправке"     - ####, сумма ###################
+    платежей со статусом "на отправке", из них  - ####, сумма ###################
+      выгруженые во фронт-офис                  - ####, сумма ###################
+    платежей со статусом "завершен"             - ####, сумма ###################
+
+  Итого начальных платежей                      - ####, сумма ###################
+
+
+]( DateRep, StatReadyToWork_Num:r, StatReadyToWork_Sum:r,
+            StatReadyToSend_Num:r, StatReadyToSend_Sum:r,
+            StatIsSending_Num:r,   StatIsSending_Sum:r,
+            StatDischarged_Num:r,  StatDischarged_Sum:r,
+            StatOutClosed_Num:r,   StatOutClosed_Sum:r,
+            StatOutTotal_Num:r,    StatOutTotal_Sum:r );
+  end;
+end;
+
+/* Вывести отчет */
+macro PutResults_Panel()
+
+  record pmp(UNDONEPM, "userop.lbr") dialog;
+    /* Суммируем количество документов */
+    StatInTotal_Num = StatIsReceiving_Num/* + StatInUnknown_Num + StatInUnkvited_Num*/
+                     + StatInKvitWait_Num + StatInClosed_Num;
+    /* Суммируем суммы документов */
+    StatInTotal_Sum = StatIsReceiving_Sum/* + StatInUnknown_Sum + StatInUnkvited_Sum*/
+                     + StatInKvitWait_Sum + StatInClosed_Sum;
+
+    /* Суммируем количество документов */
+    StatOutTotal_Num = StatReadyToWork_Num + StatReadyToSend_Num
+                      + StatIsSending_Num/*  + StatDischarged_Num*/
+                      + StatOutClosed_Num;
+    /* Суммируем суммы документов */
+    StatOutTotal_Sum = StatReadyToWork_Sum + StatReadyToSend_Sum
+                      + StatIsSending_Sum/*  + StatDischarged_Sum*/
+                      + StatOutClosed_Sum;
+
+   pmp.ReadyToProcess = StatReadyToWork_Num;   pmp.ReadyToProcess_Sum = StatReadyToWork_Sum;
+   pmp.ReadyToSend    = StatReadyToSend_Num;   pmp.ReadyToSend_Sum    = StatReadyToSend_Sum;
+   pmp.Sending        = StatIsSending_Num;     pmp.Sending_Sum        = StatIsSending_Sum;  
+   pmp.Discharged     = StatDischarged_Num;    pmp.Discharged_Sum     = StatDischarged_Sum;  
+   pmp.Finished       = StatOutClosed_Num;     pmp.Finished_Sum       = StatOutClosed_Sum;  
+   pmp.AllOut         = StatOutTotal_Num;      pmp.AllOut_Sum         = StatOutTotal_Sum;  
+
+   pmp.Receiving      = StatIsReceiving_Num;   pmp.Receiving_Sum      = StatIsReceiving_Sum;
+   pmp.Unknown        = StatInUnknown_Num;     pmp.Unknown_Sum        = StatInUnknown_Sum;
+   pmp.Unkvited       = StatInUnkvited_Num;    pmp.Unkvited_Sum       = StatInUnkvited_Sum;
+   pmp.KvitWaitIn     = StatInKvitWait_Num;    pmp.KvitWaitIn_Sum     = StatInKvitWait_Sum;
+   pmp.Closed         = StatInClosed_Num;      pmp.Closed_Sum         = StatInClosed_Sum;   
+   pmp.AllIn          = StatInTotal_Num;       pmp.AllIn_Sum          = StatInTotal_Sum;    
+
+   RunDialog(pmp);
+end;
+
+/* ************************************************************************ */
+/* Точка входа в макрос                                                     */
+/* ************************************************************************ */
+macro ExtPaymentsListDate( date_rep )
+  DateRep = date_rep;
+
+  CountExtPayments( PM_OUT );
+  PutResults( PM_OUT );
+
+  CountExtPayments( PM_IN );
+  PutResults( PM_IN );
+  return StatDischarged_Num;
+end;
+
+macro ExtPaymentsListDate_Panel()
+  DateRep = {curdate};
+  CountExtPayments( PM_OUT );
+  CountExtPayments( PM_IN  );
+  PutResults_Panel();
+  return StatDischarged_Num;
+end;
+
+/* ExtPaymentsListDate( date( 21, 12, 1999 ) ); */
+

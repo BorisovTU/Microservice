@@ -1,0 +1,764 @@
+/* SecurRedemptionProcessor.mac
+
+  Макрос по исполнению корпоративного действия "погашение ценной бумаги".
+  В основном, сосредоточена логика, накрученная "поверх" дистрибутивного механизма софра
+*/
+import "cblogger2.mac", "FuncObj.mac", "SecurRedemptionService.mac", "SecurRedemptionStatuses.mac";
+import "SecurRedemptionSpreadCreator.mac", globals, "FuncObjController.mac";
+import "RegvalReader.mac", "SecurLimitLocksService.mac", "dlutils.mac";
+import "HashMap.mac", "PartiesConstant.mac", "SecurDealExecutor.mac";
+import likepy, "SimpleService.mac", "DiasoftDepoRestService.mac";
+import "SecurRedemptionNotifier.mac";
+
+private class ErrorMessageFormatter()
+    macro getGlobal(id:integer):string
+        return "Ошибка при исполнении глобальной операции id = " + String(id);
+    end;
+
+    macro getPersonal(id:integer):string
+        return "Ошибка при исполнении персональной операции id = " + String(id);    
+    end;
+end;
+
+private class ActionContext
+    private var storage:HashMap; //HashMap<String>String
+    private var iteration:integer = 0;
+
+    macro Get(key:string):string
+        return storage.get(key);
+    end;
+
+    macro Set(key:string, value:string)
+        storage.put(key, value);
+    end;
+
+    macro IncIteration()
+        iteration = iteration + 1;
+    end;
+
+    macro GetIteration():integer
+        return iteration;
+    end;
+end;
+
+private class StepActionInterface
+    macro run(redemption:SecurRedemptionStruct, ctx:ActionContext):bool
+        return false;
+    end;
+
+    macro name():string
+        return "empty interface";
+    end;
+end;
+
+private class (StepActionInterface) StepActionSpreadCreate
+    macro run(redemption:SecurRedemptionStruct):bool
+        var spreadCreator:SecurRedemptionSpreadCreator = SecurRedemptionSpreadCreator();
+        return spreadCreator.CreateByRedemptionId(redemption);
+    end;
+
+    macro name():string
+        return "StepActionSpreadCreator";
+    end;
+end;
+
+private class (StepActionInterface) StepActionIsFixDatePassed
+    macro run(redemption:SecurRedemptionStruct):bool
+        return ((redemption.fixDate != null) and (redemption.fixDate < {curdate}));
+    end;
+
+    macro name():string
+        return "StepActionIsFixDatePassed";
+    end;
+end;
+
+private class (StepActionInterface) StepActionSumsSpread
+    macro run(redemption:SecurRedemptionStruct):bool
+        var spreadCreator:SecurRedemptionSpreadCreator = SecurRedemptionSpreadCreator();
+        return spreadCreator.CreateLinks(redemption);
+    end;
+
+    macro name():string
+        return "StepActionSumsSpread";
+    end;
+end;
+
+private class (StepActionInterface) StepActionCompleteDateCheck
+    macro run(redemption:SecurRedemptionStruct):bool
+        return redemption.IsCompleteDateReached({curdate});
+    end;
+
+    macro name():string
+        return "StepActionCompleteDateCheck";
+    end;
+end;
+
+private class (StepActionInterface) StepActionSpreadFinalize
+    macro run(redemption:SecurRedemptionStruct):bool
+
+        if (redemption.actionType == "MCAL")
+            var securService:SecurityService = SecurityService();
+            var security = securService.FindByIsin(redemption.isin);
+
+            if (security.drawingDate != redemption.completeDate)
+                security.drawingDate = redemption.completeDate;
+                securService.Save(security);
+            end;
+        end;
+
+        private var spreadService:SecurRedemptionSpreadDealService = SecurRedemptionSpreadDealService();
+
+        var deal = spreadService.FindById(redemption.dealId);
+        if ((deal.payDate != redemption.completeDate) or (deal.deliveryDate != redemption.completeDate))
+            deal.payDate = redemption.completeDate;
+            deal.deliveryDate = redemption.completeDate;
+            spreadService.Save(deal);
+        end;
+
+        return true;
+    end;
+
+    macro name():string
+        return "StepActionSpreadFinalize";
+    end;
+end;
+
+private class (StepActionInterface) StepActionOperationsExecute
+    private var ctxActionName = "OperationsExecute";
+
+    macro run(redemption:SecurRedemptionStruct, ctx:ActionContext):bool
+        //проверка, что в рамках данного запуска процедура ещё не выполнялась
+        if (ctx.Get(ctxActionName) != null)
+            return false;
+        end;
+
+        ctx.Set(ctxActionName, "true");
+
+        var linkService:SecurRedemptionLinkService = SecurRedemptionLinkService();
+        var links = linkService.GetLinksBySpreadId(redemption.dealId);
+
+        for (var link, links)
+            linkService.PushToFuncObj(link.id);
+        end;
+
+        return true;
+    end;
+
+    macro name():string
+        return "StepActionOperationsExecute";
+    end;
+end;
+
+private class (StepActionInterface) StepActionIsCancelAllowed    
+    macro run(redemption:SecurRedemptionStruct):bool
+        var redemptionService:SecurRedemptionService = SecurRedemptionService();
+        return redemptionService.isCancellationAllowed(redemption);
+    end;
+
+    macro name():string
+        return "StepActionIsCancelAllowed";
+    end;
+end;
+
+private class (StepActionInterface) StepActionLinksToCancellation
+    macro run(redemption:SecurRedemptionStruct):bool
+        var linkService = SecurRedemptionLinkService();
+        var linkStatuses:SecurRedemptionLinkStatuses = SecurRedemptionLinkStatuses();
+
+        var links = linkService.GetLinksBySpreadId(redemption.dealId);
+
+        for (var link, links)
+            if (link.statusId != linkStatuses.TO_CANCELLATION)
+                linkService.SaveStatus(link, linkStatuses.TO_CANCELLATION);
+            end;
+        end;
+
+        return true;
+    end;
+
+    macro name():string
+        return "StepActionLinksToCancellation";
+    end;
+end;
+
+private class (StepActionInterface) StepActionIsAllLinksCancelled
+    macro run(redemption:SecurRedemptionStruct):bool
+        var linkService = SecurRedemptionLinkService();
+        var linkStatuses:SecurRedemptionLinkStatuses = SecurRedemptionLinkStatuses();
+
+        var links = linkService.GetLinksBySpreadId(redemption.dealId);
+
+        for (var link, links)
+            if (link.statusId != linkStatuses.CANCELLED)
+                return false;
+            end;
+        end;
+
+        return true;
+    end;
+
+    macro name():string
+        return "StepActionIsAllLinksCancelled";
+    end;
+end;
+
+private class (StepActionInterface) StepActionSpreadDelete
+    macro run(redemption:SecurRedemptionStruct):bool
+        var dealService =  SecurRedemptionSpreadDealService();
+
+        if (dealService.IsDealExists(redemption.dealId) == false)
+            return true;
+        end;
+
+        var result = dealService.deleteDealByDealId(redemption.dealId);
+        if (result)
+            var redemptionService = SecurRedemptionService();
+            redemptionService.unlinkDealId(redemption);
+        end;
+
+        return result;
+    end;
+
+    macro name():string
+        return "StepActionSpreadDelete";
+    end;
+end;
+
+private class (StepActionInterface) StepActionFinalizeRollback
+    macro run(redemption:SecurRedemptionStruct):bool
+        return true;
+    end;
+
+    macro name():string
+        return "StepActionFinalizeRollback";
+    end;
+end;
+
+private class StepActionLinkInterface
+    macro run(redemptionLink:SecurRedemptionLink, ctx:ActionContext):bool
+        return false;
+    end;
+
+    macro name():string
+        return "empty interface";
+    end;
+end;
+
+private class (StepActionLinkInterface) StepActionCheckAndFixSum
+    private var actionName = "StepActionCheckAndFixSum";
+
+    macro run(redemptionLink:SecurRedemptionLink, ctx:ActionContext):bool
+        //проверка, что в рамках данного запуска процедура ещё не выполнялась
+        if (ctx.Get(actionName) != null)
+            return false;
+        end;
+
+        ctx.Set(actionName, "true");
+
+        //todo
+        //на данный момент не реализовано
+
+        return true;
+    end;
+
+    macro name():string
+        return actionName;
+    end;
+end;
+
+private class (StepActionLinkInterface) StepActionCompareRests
+    var redemptionService = SecurRedemptionService();
+
+    private macro CalcDiasoftRest(redemptionLink:SecurRedemptionLink):money
+        var restService:DiasoftDepoRestService;
+        var redemption = redemptionService.FindById(redemptionLink.redemptionId);
+
+        var restDate = redemption.fixDate + 1;
+
+        if (restService.IsRestsOnDateExists(restDate) == false)
+            return null; //не найдены остатки на дату restDate
+        end;
+
+        var restValue = restService.GetRestBySubContr(redemptionLink.contractId, redemption.isin, restDate);
+        return restValue;
+    end;
+
+    macro run(redemptionLink:SecurRedemptionLink):bool
+        var isNeedSaveLink:bool = false;
+
+        if (redemptionLink.diasoftRest == null)
+            redemptionLink.diasoftRest = CalcDiasoftRest(redemptionLink);
+
+            isNeedSaveLink = (redemptionLink.diasoftRest != null); //если посчитались остатки - нужно сохранить
+        end;
+
+        var isBalancesEqual:bool = redemptionLink.diasoftRest == redemptionLink.amount;
+
+        //не уведомляем, если нет остатков из диаса. На случай, если остатки ещё не доехали и доедут позже
+        var isNeedNotify:bool = ((isBalancesEqual == false) and
+                (redemptionLink.diasoftRest != null) and
+                (redemptionLink.lastNotifyTime == null)
+        );
+
+        if (isNeedNotify)
+            var notifier:SecurRedemptionNotifier;
+            var redemption = redemptionService.FindById(redemptionLink.redemptionId);
+
+            notifier.BalancesIsNotEqual(redemptionLink, redemption);
+            redemptionLink.lastNotifyTime = DtTm(Date(), Time());
+            isNeedSaveLink = true;
+        end;
+
+        if (isNeedSaveLink)
+            var linkService:SecurRedemptionLinkService = SecurRedemptionLinkService();
+            linkService.SaveLink(redemptionLink);
+        end;
+
+        return isBalancesEqual;
+    end;
+
+    macro name():string
+        return "StepActionCompareRests";
+    end;
+end;
+
+private class (StepActionLinkInterface) StepActionLimitLock
+    macro run(redemptionLink:SecurRedemptionLink):bool
+        //если настройка выключена, просто выходим с true(успешное выполнение) не повешав блокировку
+        if (not RegValReader.GetBool("РСХБ\\КОРПОРАТИВНЫЕ ДЕЙСТВИЯ\\ИСПОЛНЕНИЕ\\ПОГАШЕНИЯ ЦБ. БЛОК ЛИМИТОВ", false))
+            return true;
+        end;
+
+        var securService:SecurityService = SecurityService();
+        var limitLockService = SecurLimitLocksService();
+        var redemptionService = SecurRedemptionService();
+
+        var redemption = redemptionService.FindById(redemptionLink.redemptionId);
+        var security = securService.FindByIsin(redemption.isin);
+
+        var lock = SecurLimitLockStruct();
+        lock.sourceType = SecurLimitLockSourceTypes.SECUR_REDEMPTION;
+        lock.sourceId = redemptionLink.id;
+        lock.fiId = security.fiId;
+        lock.startDate = redemption.fixDate + 1;
+        lock.marketId = PartiesConstant.MOEX;
+        lock.contractId = redemptionLink.contractId;
+        lock.quantity = redemptionLink.amount;
+        limitLockService.SaveLock(lock);
+
+        var linkService:SecurRedemptionLinkService = SecurRedemptionLinkService();
+        redemptionLink.isLimitLocked = true;
+        linkService.SaveLink(redemptionLink);
+
+        return true;
+    end;
+
+    macro name():string
+        return "StepActionLimitLock";
+    end;
+end;
+
+private class (StepActionLinkInterface) StepActionLimitLockRelease
+    macro run(redemptionLink:SecurRedemptionLink):bool
+        var limitLockService = SecurLimitLocksService();
+        var redemptionService = SecurRedemptionService();
+
+        var lock = limitLockService.FindBySource(SecurLimitLockSourceTypes.SECUR_REDEMPTION, redemptionLink.id);
+        var redemption = redemptionService.FindById(redemptionLink.redemptionId);
+
+        if (lock != null)
+            lock.endDate = redemption.completeDate;
+            limitLockService.SaveLock(lock);
+
+            var linkService:SecurRedemptionLinkService = SecurRedemptionLinkService();
+            redemptionLink.isLimitLocked = false;
+            linkService.SaveLink(redemptionLink);
+        end;
+
+
+        return true;
+    end;
+
+    macro name():string
+        return "StepActionLimitLockRelease";
+    end;
+end;
+
+private class (StepActionLinkInterface) StepActionLimitLockRollback
+    macro run(redemptionLink:SecurRedemptionLink):bool
+        var limitLockService = SecurLimitLocksService();
+
+        var lock = limitLockService.FindBySource(SecurLimitLockSourceTypes.SECUR_REDEMPTION, redemptionLink.id);
+
+        if (lock != null)
+            limitLockService.DisableLock(lock);
+
+            var linkService:SecurRedemptionLinkService = SecurRedemptionLinkService();
+            redemptionLink.isLimitLocked = false;
+            linkService.SaveLink(redemptionLink);
+        end;
+
+
+        return true;
+    end;
+
+    macro name():string
+        return "StepActionLimitLockRollback";
+    end;
+end;
+
+private class (StepActionLinkInterface) StepActionCheckForCompleteDate
+    macro run(redemptionLink:SecurRedemptionLink):bool
+        var redemptionService = SecurRedemptionService();
+        var redemption = redemptionService.FindById(redemptionLink.redemptionId);
+
+        return redemption.IsCompleteDateReached({curdate});
+    end;
+
+    macro name():string
+        return "StepActionCheckForCompleteDate";
+    end;
+end;
+
+private class (StepActionLinkInterface) StepActionCreateOperation
+    macro run(redemptionLink:SecurRedemptionLink):bool
+        var linkService = SecurRedemptionLinkService();
+        var redemptionService = SecurRedemptionService();
+
+        var redemption = redemptionService.FindById(redemptionLink.redemptionId);
+        
+        return linkService.CreateOperation(redemptionLink, redemption.completeDate);
+    end;
+
+    macro name():string
+        return "StepActionCreateOperation";
+    end;
+end;
+
+private class (StepActionLinkInterface) StepActionExecuteOperation
+    macro run(redemptionLink:SecurRedemptionLink):bool
+        var dealExecutor = SecurDealExecutor();
+        return dealExecutor.RunDeal(redemptionLink.dealId, {curdate});
+    end;
+
+    macro name():string
+        return "StepActionExecuteOperation";
+    end;
+end;
+
+private class (StepActionLinkInterface) StepActionDeleteLink
+    macro run(redemptionLink:SecurRedemptionLink):bool
+        var linkService:SecurRedemptionLinkService = SecurRedemptionLinkService();
+        linkService.DeleteById(redemptionLink.id);
+
+        return true;
+    end;
+
+    macro name():string
+        return "StepActionDeleteLink";
+    end;
+end;
+
+private class (StepActionLinkInterface) StepActionSendSpeadToExecute
+    private var ctxActionName = "SentSpeadToExecute";
+
+    macro run(redemptionLink:SecurRedemptionLink, ctx:ActionContext):bool
+        //проверка, что в рамках данного запуска процедура ещё не выполнялась
+        if (ctx.Get(ctxActionName) != null)
+            return false;
+        end;
+
+        ctx.Set(ctxActionName, "true");
+
+        var redemptionService = SecurRedemptionService();
+        redemptionService.PushToFuncObj(redemptionLink.redemptionId);
+
+        return true;
+    end;
+
+    macro name():string
+        return "StepActionSendSpeadToExecute";
+    end;
+end;
+
+private class SpreadAction(act, resStatus:integer, errResStatus:integer)
+    var action = act; //экземпяр класса действия, которое нужно выполнять <StepActionInterface> или <StepActionLinkInterface>
+    var resultStatus:integer = resStatus; //какой статус присвоить в случае, если действие вернуло true
+    var errorResultStatus:integer = errResStatus; //какой статус присвоить в случае, если действие вернуло false (необязательный)
+end;
+
+/*  что-то среднее между "наблюдатель" и "state machine"
+    SpreadAction
+        структура, с информацией
+        - action: какое действие выполнить
+        - resultStatus: какой статус присвоить при успешном выполнении действия
+        - errorResultStatus: какой статус присвоить при НЕ успешном выполнении действия (необязательный)
+
+    StepActionInterface
+        шаблон действия. умеет что-то выполнять через метод run() и знает своё имя через метод name()
+        каждый наследник - одно независимое действие
+
+    stepActionsMap
+        мапа "статус"-"действие"
+        другими словами, содержит информацию, какому статусу какое действие соответствует
+
+    Управление статусами
+        централизванное в однм месте в методе ProcessGlobalRedemption
+
+    таким образом получается в методе ProcessGlobalRedemption
+    практически декларативно описывается flow погашения по статусам и само управление статусами redemption
+*/
+class SecurRedemptionProcessor
+    private var statuses:SecurRedemptionStatuses = SecurRedemptionStatuses();
+    private var linkStatuses:SecurRedemptionLinkStatuses = SecurRedemptionLinkStatuses();
+    private var redemptionService:SecurRedemptionService = SecurRedemptionService();
+    private var LinkService:SecurRedemptionLinkService = SecurRedemptionLinkService();
+
+    private var logFactory = LoggerFactory().NewItLog("SecurRedemptionProcessor");
+    
+    macro ProcessGlobalRedemption(id:integer):bool
+        var logger = logFactory.WithPrefix("ProcessGlobalRedemption. id = " + id).GetLogger;
+
+        var regvalPath:string = "РСХБ\\КОРПОРАТИВНЫЕ ДЕЙСТВИЯ\\ЗАГРУЗКА\\ПОГАШЕНИЯ ЦБ";
+        if (not RegValReader.GetBool(regvalPath, false))
+            logger.Debug(string("Автоматическое исполнение КД погашения бумаг выключено: \"", regvalPath, "\""));
+            return false;
+        end;
+
+        var lockName:string = string("SECURSPREADPROCESSORLOCK-", id);
+        var locker = UniConcurrentLocker(lockName, 0);
+        if (not locker.Lock())
+            RunError("Не удалось установить блокировку " + lockName);
+        end;
+
+        var capacity = 16;
+        var loadFactor = 1;
+        var stepActionsMap:HashMap = HashMap(capacity, loadFactor);
+
+        //основной flow
+
+        //создание распределения
+        stepActionsMap.put(statuses.CREATED,                SpreadAction(StepActionSpreadCreate(), statuses.SPREAD_CREATED));
+        stepActionsMap.put(statuses.SPREAD_CREATED,         SpreadAction(StepActionIsFixDatePassed(), statuses.AFTER_FIX_DATE));
+        stepActionsMap.put(statuses.AFTER_FIX_DATE,         SpreadAction(StepActionSumsSpread(), statuses.SUMS_SPREADED));
+        stepActionsMap.put(statuses.SUMS_SPREADED,          SpreadAction(StepActionOperationsExecute(), statuses.WAIT_FOR_COMPLETE_DATE));
+
+        //исполнение распределения
+        stepActionsMap.put(statuses.WAIT_FOR_COMPLETE_DATE, SpreadAction(StepActionCompleteDateCheck(), statuses.READY_TO_EXECUTE));
+        stepActionsMap.put(statuses.READY_TO_EXECUTE,       SpreadAction(StepActionSpreadFinalize(), statuses.SPREAD_FINALIZED));
+        stepActionsMap.put(statuses.SPREAD_FINALIZED,       SpreadAction(StepActionOperationsExecute(), statuses.SENT_TO_EXECUTING));
+        stepActionsMap.put(statuses.SENT_TO_EXECUTING,      SpreadAction(StepActionOperationsExecute(), statuses.SENT_TO_EXECUTING));
+
+        //flow отмены
+        stepActionsMap.put(statuses.REQUEST_TO_CANCEL,      SpreadAction(StepActionIsCancelAllowed(), statuses.CANCEL_APPROVED, statuses.CANCEL_REJECTED));
+
+        stepActionsMap.put(statuses.CANCEL_APPROVED,        SpreadAction(StepActionLinksToCancellation(), statuses.PREPARED_TO_CANCEL));
+        stepActionsMap.put(statuses.PREPARED_TO_CANCEL,     SpreadAction(StepActionOperationsExecute(), statuses.IN_CANCELLATION));
+        stepActionsMap.put(statuses.IN_CANCELLATION,        SpreadAction(StepActionIsAllLinksCancelled(), statuses.SPREADED_SUMS_DELETED));
+        stepActionsMap.put(statuses.SPREADED_SUMS_DELETED,  SpreadAction(StepActionSpreadDelete(), statuses.SPREAD_DELETED));
+        stepActionsMap.put(statuses.SPREAD_DELETED,         SpreadAction(StepActionFinalizeRollback(), statuses.CANCELLED));
+
+        var redemption:SecurRedemptionStruct = redemptionService.findById(id);
+        var ctx = ActionContext();
+        while (true)
+            //простой circuit breaker. По хорошему, это число 20 должно быть вынесено в настройки
+            if (ctx.GetIteration() > 20)
+                logger.Error("Прервано из-за превышения количества итераций: " + ctx.GetIteration());
+                break;
+            end;
+
+            var stepInfo = stepActionsMap.get(redemption.statusId);
+            if (stepInfo == null)
+                logger.Debug("Не определён шаг для статуса: " + redemption.statusId);
+                break;
+            end;
+
+            var success = stepInfo.action.run(redemption, ctx);
+            ctx.IncIteration();
+
+            var nextStatus = ifThenElse(success, stepInfo.resultStatus, stepInfo.errorResultStatus);
+            if ((success == false) and (nextStatus == null))
+                logger.Debug("Не выполнен шаг " + stepInfo.action.name());
+                return false;
+            end;
+
+            redemption = redemptionService.SaveStatus(redemption, nextStatus);
+        end;
+
+        return true;
+    OnError(err)
+        logger.ErrorClob("error", GetFullErrMsg(err));
+        return false;
+    end;
+   
+    macro ProcessPersonalRedemption(linkId:integer):bool
+        var logger = logFactory.WithPrefix("ProcessPersonalRedemption. id = " + linkId).GetLogger;
+        if (not RegValReader.GetBool("РСХБ\\КОРПОРАТИВНЫЕ ДЕЙСТВИЯ\\ЗАГРУЗКА\\ПОГАШЕНИЯ ЦБ", false))
+            return false;
+        end;
+
+        var lockName:string = string("SECURREDEMPTIONPROCESSORLOCK-", linkId);
+        var locker = UniConcurrentLocker(lockName, 0);
+        if (not locker.Lock())
+            RunError("Не удалось установить блокировку " + lockName);
+        end;
+
+        var capacity = 16;
+        var loadFactor = 1;
+        var stepActionsMap:HashMap = HashMap(capacity, loadFactor);
+
+        //создание погашения
+        stepActionsMap.put(linkStatuses.CREATED, SpreadAction(StepActionCheckAndFixSum(), linkStatuses.SUMS_CHECKED));
+        stepActionsMap.put(linkStatuses.SUMS_CHECKED, SpreadAction(StepActionCompareRests(), linkStatuses.CHECK_RESTS_PASSED, linkStatuses.CREATED));
+        stepActionsMap.put(linkStatuses.CHECK_RESTS_PASSED, SpreadAction(StepActionLimitLock(), linkStatuses.LIMITS_LOCKED));
+        stepActionsMap.put(linkStatuses.LIMITS_LOCKED, SpreadAction(StepActionCheckForCompleteDate(), linkStatuses.AFTER_COMPLETE_DATE));
+        stepActionsMap.put(linkStatuses.AFTER_COMPLETE_DATE, SpreadAction(StepActionCreateOperation(), linkStatuses.OPERATION_CREATED));
+        stepActionsMap.put(linkStatuses.OPERATION_CREATED, SpreadAction(StepActionExecuteOperation(), linkStatuses.OPERATION_COMPLETED));
+        stepActionsMap.put(linkStatuses.OPERATION_COMPLETED, SpreadAction(StepActionLimitLockRelease(), linkStatuses.LIMIT_LOCK_DISABLED));
+
+        //flow отмены
+        stepActionsMap.put(linkStatuses.TO_CANCELLATION, SpreadAction(StepActionLimitLockRollback(), linkStatuses.LIMIT_LOCK_ROLLED_BACK));
+        stepActionsMap.put(linkStatuses.LIMIT_LOCK_ROLLED_BACK, SpreadAction(StepActionDeleteLink(), linkStatuses.CANCELLED));
+
+        //может немного заспамить фанкобж операцию распределения, но пока не видно в этом ничего страшного
+        stepActionsMap.put(linkStatuses.CANCELLED, SpreadAction(StepActionSendSpeadToExecute(), linkStatuses.CANCELLED));
+
+        var link = LinkService.FindById(linkId);
+        var ctx = ActionContext();
+        while (true)
+            //простой circuit breaker. По хорошему, это число 20 должно быть вынесено в настройки
+            if (ctx.GetIteration() > 20)
+                logger.Error("Прервано из-за превышения количества итераций: " + ctx.GetIteration());
+                break;
+            end;
+
+            var stepInfo = stepActionsMap.get(link.statusId);
+            if (stepInfo == null)
+                logger.Debug("Не определён шаг для статуса: " + link.statusId);
+                break;
+            end;
+
+            var success = stepInfo.action.run(link, ctx);
+            ctx.IncIteration();
+
+            var nextStatus = ifThenElse(success, stepInfo.resultStatus, stepInfo.errorResultStatus);
+            if ((success == false) and (nextStatus == null))
+                logger.Debug("Не выполнен шаг " + stepInfo.action.name());
+                return false;
+            end;
+
+            link = linkService.SaveStatus(link, nextStatus);
+        end;
+
+        return true;
+
+    OnError(err)
+        logger.ErrorClob("error", GetFullErrMsg(err));
+        return false;
+    end;
+end;
+
+/*
+    Не используемые параметры:
+    objectType
+    paramStr
+*/
+macro SecurRedemptionGlobalProcessorFuncObj(objectType:integer, objectId:integer, paramStr:string):FuncObjResult
+    var logger:c_logger = LoggerFactory().NewItLog("SecurRedemptionGlobalProcessorFuncObj").GetLogger();
+    var errMesFormatter = ErrorMessageFormatter();
+    var processor = SecurRedemptionProcessor();
+    var result = processor.ProcessGlobalRedemption(objectId);
+    var errorMessage:string = "";
+
+    if (result)
+        return FuncObjResult(FUNCOBJ_STATE_OK, errorMessage, FUNCOBJ_RESULT_OK);
+    end;
+
+    errorMessage = errMesFormatter.getGlobal(objectId);
+    logger.Error(errorMessage);
+    return FuncObjResult(FUNCOBJ_STATE_FATAL_ERROR, errorMessage, FUNCOBJ_RESULT_ERROR);
+OnError(errObj)
+    errorMessage = errMesFormatter.getGlobal(objectId);
+    logger.ErrorClob(errorMessage, GetFullErrMsg(errObj));
+    return FuncObjResult(FUNCOBJ_STATE_FATAL_ERROR, errorMessage, FUNCOBJ_RESULT_ERROR);
+end;
+
+/*
+    Не используемые параметры:
+    objectType
+    paramStr
+*/
+macro SecurRedemptionPersonalProcessorFuncObj(objectType:integer, objectId:integer, paramStr:string):FuncObjResult
+    var logger:c_logger = LoggerFactory().NewItLog("SecurRedemptionPersonalProcessorFuncObj").GetLogger();
+    var errMesFormatter = ErrorMessageFormatter();
+    var processor = SecurRedemptionProcessor();
+    var result = processor.ProcessPersonalRedemption(objectId);
+    var errorMessage:string = "";
+
+    if (result)
+        return FuncObjResult(FUNCOBJ_STATE_OK, errorMessage, FUNCOBJ_RESULT_OK);
+    end;
+
+    errorMessage = errMesFormatter.getPersonal(objectId);
+    logger.Error(errorMessage);
+    return FuncObjResult(FUNCOBJ_STATE_FATAL_ERROR, errorMessage, FUNCOBJ_RESULT_ERROR);
+OnError(errObj)
+    errorMessage = errMesFormatter.getPersonal(objectId);
+    logger.ErrorClob(errorMessage, GetFullErrMsg(errObj));
+    return FuncObjResult(FUNCOBJ_STATE_FATAL_ERROR, errorMessage, FUNCOBJ_RESULT_ERROR);
+end;
+
+macro PushPendingSecurRedemptions()
+    var logger:c_logger = LoggerFactory().NewItLog("PushPendingSecurRedemptions").GetLogger();
+    var redemptionService:SecurRedemptionService = SecurRedemptionService();
+    var statuses:SecurRedemptionStatuses = SecurRedemptionStatuses();
+
+    var statusesToPush = TArray();
+    statusesToPush[statusesToPush.size()] = statuses.WAIT_FOR_COMPLETE_DATE;
+    statusesToPush[statusesToPush.size()] = statuses.SPREAD_CREATED;
+
+    var count = 0;
+    for (var status, statusesToPush)
+        var redemptions = redemptionService.GetRedemptionsWithStatus(status);
+
+        for (var redemption, redemptions)
+            redemptionService.PushToFuncObj(redemption.redemptionId);
+            count = count + 1;
+        end;
+    end;
+
+    logger.Debug("Отправлено в фанкобж:" + count);
+
+    return SsExecResult(SS_RESPONSE_END);
+OnError(err)
+    var errText = GetFullErrMsg(err);
+    logger.ErrorClob("error", errText);
+    return SsExecResult(SS_RESPONSE_FATAL, errText);
+end;
+
+macro PushPendingSecurRedemptionLinks()
+    var logger:c_logger = LoggerFactory().NewItLog("PushPendingSecurRedemptionLinks").GetLogger();
+    var linkService:SecurRedemptionLinkService = SecurRedemptionLinkService();
+    var linkStatuses:SecurRedemptionLinkStatuses = SecurRedemptionLinkStatuses();
+
+    var statusesToPush = TArray();
+    statusesToPush[statusesToPush.size()] = linkStatuses.CREATED;
+
+    var count = 0;
+    for (var status, statusesToPush)
+        var links = linkService.GetLinksWithStatus(status);
+
+        for (var link, links)
+            linkService.PushToFuncObj(link.id);
+            count = count + 1;
+        end;
+    end;
+
+    logger.Debug("Отправлено в фанкобж:" + count);
+
+    return SsExecResult(SS_RESPONSE_END);
+OnError(err)
+    var errText = GetFullErrMsg(err);
+    logger.ErrorClob("error", errText);
+    return SsExecResult(SS_RESPONSE_FATAL, errText);
+end;

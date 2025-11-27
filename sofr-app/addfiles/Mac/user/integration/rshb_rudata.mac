@@ -1,0 +1,752 @@
+/*
+RU-data
+RSHB
+Комментарии:
+1. SOFR_INFO_FINTOOLREFERENCEDATA.FaceFTName - должна быть валюта номинала текстом. по факту везде "0"
+2. Эмитент ищется только по ИНН
+3. Если эмитент(субъект) не найден - осуществляется попытка добавления эмитента в базу
+4. Если субъект найден, но не имеет принадлежности к эмитентам - проставляется принадлежность
+5. Валюта определяется по полю SOFR_INFO_FINTOOLREFERENCEDATA.FaceFTName_NRD. Если оно пустое, то валюта указывается "RUB"
+6. Если валюта не найдена в справочнике - работа прерывается
+7. Если не удалось определить вид ценной бумаги - работа прерывается
+8. Каким значением заполнять dfininstr_dbt.t_fi_code? Сейчас туда падает ИД из рудаты
+9. Никак не обрабатывается, если бумага в буфере уже "погашена" (загружает в список открытых, как и остальные)
+*/
+
+import oralib, likepy, BankInter, FIInter, globals, PTInter, rshb_offers;
+
+const TECH_EMITENT = 7; //ИД технического эмитента
+
+const CODE_KIND_RUDATA_ID = 104;
+
+record fininstr ("fininstr");
+record avoiriss ("avoiriss");
+record fiwarnts ("fiwarnts");
+
+var avrinvst;
+var depo = false; //Идендификатор депозитарной расписки
+var bond = false; //Идендификатор облигации
+
+var BOND_AMORTIZATIONS;
+var BOND_COUPONS;
+var INFO_EMITENTS;
+var INFO_FINTOOLREFERENCEDATA;
+
+Private class CError(_context, _objecttype, _extid, _missid, _missidobjtype);
+   var context = "", objecttype = "", extid = "", missid = "", missidobjtype = "";
+   if (_context) context = _context; end;
+   if (_objecttype) objecttype = _objecttype;end;
+   if (_extid) extid = _extid;       end;
+   if (_missid) missid = _missid;    end;
+   if (_missidobjtype) missidobjtype = _missidobjtype;   end;
+end;
+
+Private class CProtokolData
+    Private var outStr;
+  Var logid;
+  
+    Macro SetLogid()
+      Var sql = execSqlSelect ("select user_cnvhlplogex_seq.nextval from dual");
+       if (sql.MoveNext())
+        logid = int (sql.value (0));
+       end;
+    end;
+
+    Macro add ( kind, line, err)
+        execSql ("insert into user_cnvhlplogex values (:1, :2, :3, :4, :5, :6, :7, systimestamp, :8)", 
+                makeArray (sqlParam ("1", kind), sqlParam ("2", line), sqlParam ("3", SubStr(err.context,1,400)), sqlParam ("4", SubStr(err.objecttype,1,40)), sqlParam ("5", err.extid), sqlParam ("6", SubStr(err.missid,1,40)),sqlParam ("7", SubStr(err.missidobjtype,1,40)),sqlParam ("8", logid)));
+    End;
+
+    Macro getKindName ( kind )
+        Var sql = execSqlSelect ("select t_name from davrkinds_dbt where t_fi_kind = 2 and  t_numlist = :1", makeArray (sqlParam ("1", kind)));
+        if ( sql.moveNext () ) return sql.value (0); end;
+    End;
+
+    Macro addLine ( kind, line, avoirid, leftId, avoirkind, name, emitent )
+        Var data = string ("│", line:8, "│", avoirId:10, "│", leftId:14, "│", getKindName (avoirkind):30, "│", name:40, "│");
+        add (kind, line, CError(data, "AVOIRISS", avoirid, "",""));
+    End;
+
+    SetLogid();
+
+End;
+
+macro SelectData (isin, regcode)
+  var sql, stat = true;
+
+  if ((valtype(isin) == V_UNDEF) or (isin == null) or (isin == ""))
+    isin = "noisin";
+  end;
+  if ((valtype(regcode) == V_UNDEF) or (regcode == null) or (regcode == ""))
+    regcode = "noregcode";
+  end;
+
+  //ценная бумага
+  sql = "select status, "
+      + "       nvl(fullname, ' ') fullname, "
+      + "       nvl(isincode, chr(0)) isincode, "
+      + "       nvl(regcode, chr(0)) regcode, "
+      + "       nvl(FaceFTName_NRD, 'RUB') FaceValueFI, " //!!
+      + "       nvl(IssuerINN, ' ') IssuerINN, "
+      + "       nvl(FintoolType, ' ') FintoolType, "
+      + "       nvl(Securitytype, ' ') Securitytype, "
+      + "       nvl(Country, ' ') Country, "
+      + "       FinToolID, "
+      + "       nvl(NickName, ' ') NickName, "
+      + "       nvl(FaceValue, 0) FaceValue, "
+      + "       nvl(ISINCodeBase_NRD, ' ') ISINCodeBase_NRD, "
+      + "       nvl(EndMtyDate, to_date('01.01.0001', 'dd.mm.yyyy')) EndMtyDate, "
+      + "       nvl(SumIssueVol, 0) SumIssueVol, "
+      + "       nvl(CouponType, ' ') CouponType, "
+      + "       nvl(Basis, ' ') Basis, "
+      + "       nvl(BegDistDate, to_date('01.01.0001', 'dd.mm.yyyy')) BegDistDate, "
+      + "       nvl(IssuerUID, 0) IssuerUID "
+      + "from SOFR_INFO_FINTOOLREFERENCEDATA "
+      + "where isincode = :isin or regcode = :regcode";
+  INFO_FINTOOLREFERENCEDATA = ExecSqlSelect(sql, MakeArray(SqlParam("isin", isin), SqlParam("regcode", regcode)), false);
+  if (not INFO_FINTOOLREFERENCEDATA.MoveNext() )
+    stat = false;
+  end;
+
+  //купоны
+  sql = "select nvl(id_coupon, '0') id_coupon, "
+      + "       nvl(end_period, to_date('01.01.0001', 'dd.mm.yyyy')) end_period, "
+      + "       nvl(coupon_rate, 0) coupon_rate,  "
+      + "       nvl(pay_per_bond, 0) pay_per_bond,  "
+      + "       nvl(begin_period, to_date('01.01.0001', 'dd.mm.yyyy')) begin_period,  "
+      + "       nvl(pay_date, to_date('01.01.0001', 'dd.mm.yyyy')) pay_date  "
+      + "from SOFR_BOND_COUPONS "
+      + "where id_fintool = :id ";
+  BOND_COUPONS = ExecSqlSelect(sql, MakeArray(SqlParam("id", INFO_FINTOOLREFERENCEDATA.value("FinToolID"))), false);
+
+  //купоны частичного погашения
+  sql = "select nvl(id_tranche, ' ') id_tranche, "
+      + "       nvl(mty_date, to_date('01.01.0001', 'dd.mm.yyyy')) mty_date, "
+      + "       nvl(mty_part, 0) mty_part, "
+      + "       nvl(pay_per_bond, 0) pay_per_bond, "
+      + "       nvl(fix_date, to_date('01.01.0001', 'dd.mm.yyyy')) fix_date, "
+      + "       nvl(pay_date, to_date('01.01.0001', 'dd.mm.yyyy')) pay_date "
+      + "from SOFR_BOND_AMORTIZATIONS "
+      + "where id_fintool = :id ";
+  BOND_AMORTIZATIONS = ExecSqlSelect(sql, MakeArray(SqlParam("id", INFO_FINTOOLREFERENCEDATA.value("FinToolID"))), false);
+
+  return stat;
+End;
+
+//Найти ИД валюты по буквенному коду
+private macro Getvaluta (ccy:string):integer
+  var sql = "select t_fiid from dfininstr_dbt where t_ccy = :ccy";
+  sql = ExecSqlSelect(sql, MakeArray(SqlParam("ccy", ccy)), false);
+  if (sql.MoveNext())
+    return sql.value(0);
+  end;
+  return -1;
+End;
+
+//проверка, является ли субъект эмитентом
+private macro IsEmitent (partyid)
+  var sql = "select 1 from dpartyown_dbt where t_partyid = :pid and t_partykind = 5";
+  if (ExecSqlSelect(sql, MakeArray(SqlParam("pid", partyid)), false).MoveNext() )
+    return true;
+  end;
+  return false;
+End;
+
+//Добавляет субъекту признак эмитента
+private macro SetIssuerFlag (PartyID)
+  var stat = true;
+  var Own = Tbfile ("partyown", "W");
+  var Party = RsbParty(PartyID);
+
+  if (not Party.IsOwned(5/*Эмитент*/)) 
+    Own.Clear();
+    Own.rec.partyid = PartyID;
+    Own.rec.partykind = 5;
+    if (not Own.insert() )
+      stat = false;
+    end;
+  end;
+
+  return stat;
+End;
+
+//Добавляет эмитента в справочник
+private macro CreateEmitent (FininstID)
+  var sql;
+  var PartyID = 0;
+  var Party = RsbParty(0);
+
+  sql = "select fullname_rus, "
+      + "       shortname_rus, "
+      + "       nvl(inn, 'null') inn, "
+      + "       nvl(ogrn, 'null') ogrn, "
+      + "       nvl(code, 'null') code "
+      + "from SOFR_INFO_EMITENTS where fininstid = :fininstid";
+  INFO_EMITENTS = ExecSqlSelect(sql, MakeArray(SqlParam("fininstid", FininstID)), false);
+
+  if (not INFO_EMITENTS.MoveNext() )
+    println("Не найден эмитент в буферной таблице");
+    return false;
+  end;
+  
+  Party.LegalForm = 1;/*Юрик*/
+  Party.FullName  = INFO_EMITENTS.value("fullname_rus", "", V_STRING);
+  Party.ShortName = INFO_EMITENTS.value("shortname_rus", "", V_STRING);
+
+  if (INFO_EMITENTS.value("inn", "", V_STRING) != "null")
+    Party.Code.SetCode(16/*INN*/, INFO_EMITENTS.value("inn"/*, "", V_STRING*/));
+  end;
+
+  if (INFO_EMITENTS.value("ogrn", "", V_STRING) != "null")
+    Party.Code.SetCode(27/*ogrn*/, INFO_EMITENTS.value("ogrn", "", V_STRING));
+  end;
+
+  if (INFO_EMITENTS.value("code", "", V_STRING) != "null")
+    Party.Code.SetCode(1/*code*/, INFO_EMITENTS.value("code", "", V_STRING));
+  end;
+
+  Party.Update();
+
+  return Party.PartyID;
+End;
+
+//Найти ИД эмитента по ИНН
+private macro GetIssuerByINN (inn:string):integer
+  var sql, PartyID = 0;
+  sql = "select t_objectid from dobjcode_dbt "
+      + "where     t_codekind = 16 "
+      + "      and t_objecttype = 3 "
+      + "      and t_state = 0 "
+      + "      and t_code = :inn ";
+  sql = ExecSqlSelect(sql, MakeArray(SqlParam("inn", Trim(inn))), false);
+  if (sql.MoveNext() )
+    PartyID = sql.value("t_objectid", null, V_INTEGER);
+  end;
+
+  return PartyID;
+End;
+
+//FininstID - ИД эмитента в базе интерфакс
+macro SetIssuer (inn, FininstID)
+  var IssuerID = 0;
+  IssuerID = GetIssuerByINN(inn);
+
+  if (IssuerID == 0)
+    println("Не найден субъект с ИНН = " + inn + " в справочнике. \nПопытка загрузить эмитента из РуДаты");
+    IssuerID = CreateEmitent(FininstID);
+    if (IssuerID == 0)
+      println("Не удалось добавить эмитента в справочник");
+    end;
+  end;
+
+  if (not SetIssuerFlag(IssuerID))
+    println("Не удалось поставить признак эмитента на субъекта с ИНН = " + inn);
+  end;
+
+  return IssuerID;
+End;
+
+//Нужно будет числа заменить на константы
+/*Вид облигации*/
+private macro SetKIndBond (kind, country)
+  if (country != "RU")
+    return 50;
+  end;
+  if (kind == "Гос")
+    if (country == "RU")
+      avoiriss.state = "X";
+      return 21;
+    else
+      return 50;
+    end;
+  elif (kind == "ЕвроГос")
+    if (country == "RU")
+      avoiriss.state = "X";
+      return 28;
+    else
+      return 50;
+    end;
+  elif (kind == "Корп")
+    return 42;
+  elif (kind == "Муни")
+    return 38;
+  elif (kind == "ЕвроМуни")
+    return 39;
+  elif (kind == "ЕвроКорп")
+    return 43;
+  end;
+  return 0;
+End;
+
+/*Вид акции*/
+private macro SetKindSecurity (kind)
+  if (kind == "Обыкн-ая")
+    return 1;
+  elif (kind == "Привилег-ая")
+    return 2;
+  end;
+  return 0;
+End;
+
+/*Вид депо-расписки*/
+private macro SetKindDepo (kind)
+  depo = true;
+  if (kind == "GDR") //глобальная
+    return 46;
+  elif (kind == "ADR") //американская
+    return 45;
+  elif (kind == "RDR") //российская
+    return 47;
+  elif (kind == "SDR") //европейская
+    return 49;
+  end;
+  return 10;
+End;
+
+//определить тип цб
+private macro SetAvoirKind (type, kind, country)
+  var rez = 0;
+  if (type == "Облигация")
+    bond = true;
+    rez = SetKIndBond(kind, country);
+  elif (type == "Акция")
+    rez = SetKindSecurity(kind);
+  elif (type == "Депозитарная расписка")
+    rez = SetKindDepo(kind);
+  elif (type == "Фонд")
+    rez = 16;
+  elif (type == "Ипотечный сертификат")
+    rez = 35;
+  end;
+  return rez;
+End;
+
+private macro ВыборВидаЦеннойБумаги ()
+  var avr = TRechandler("avrkinds.dbt");
+  if (ListAvrKindsTree(FIKIND_AVOIRISS, avr) == true)
+    return avr.rec.avoirkind;
+  end;
+  return 0;
+End;
+
+//Ищет ФИИД ценной бумаги по ISIN или регистрационному номеру
+private macro GetFIIDByISIN (isin)
+  var fiid = 0, sql;
+  if ((isin == "") or (isin == null))
+    println("Не возможно определить базовый ФИ по депозитарной расписке");
+    return 0;
+  end;
+
+  sql = ExecSqlSelect("select t_fiid from davoiriss_dbt where t_isin = :1 or t_lsin = :2", MakeArray(SqlParam("1", isin), SqlParam("2", isin)), false);
+  if (sql.MoveNext()) 
+    fiid = sql.value("t_fiid", null, V_INTEGER);
+  end;
+  return fiid;
+End;
+
+/*вид дохода: 1 - процентный, 2 - дисконтный*/
+private macro GetIncomeType (CouponType)
+  if (CouponType == "Дисконт")
+    return 2;
+  end;
+  return 1;
+End;
+
+//определить базис 
+private macro GetBasis (basis)
+  if (basis == "act/365")
+    return 0;
+  elif (basis == "30E/360")
+    return 1;
+  end;
+  return 1;
+End;
+
+private macro SetInvstType ()
+  var SecurType = Trim(INFO_FINTOOLREFERENCEDATA.value("securitytype"));
+  if (SecurType == "ETF")
+    avrinvst.rec.type = 3;
+  elif (SecurType == "Закрытый")
+    avrinvst.rec.type = 2;
+  elif (SecurType == "Открытый")
+    avrinvst.rec.type = 1;
+  elif (SecurType == "Интервальный")
+    avrinvst.rec.type = 0;
+  end;
+End;
+
+//Заполнить таблицу для инвестиционного пая
+private macro InitInvst ()
+  if (fininstr.avoirkind != 16) //инвестиционный пай
+    avrinvst = null;
+    return;
+  end;
+  SetInvstType();
+  avrinvst.rec.minvaluefiid  = fininstr.facevaluefi;
+  avrinvst.rec.formvaluefiid = fininstr.facevaluefi;
+  avrinvst.rec.name          = fininstr.Name;
+End;
+
+macro CreateSecur (isin, regcode, msg:@string)
+  var fiCode, fiCodeInAcc, codeRefID, accCodeRefID;
+  var stat = true;
+  var str;
+
+  ClearRecord(fininstr);
+  ClearRecord(avoiriss);
+  ClearRecord(fiwarnts);
+  avrinvst = TRechandler ("avrinvst");
+
+  if (not SelectData(isin, regcode) )
+    println("Данные по ценной бумаге не найдены в буферной таблице");
+    msg = msg + "\nДанные по ценной бумаге не найдены в буферной таблице";
+    return false;
+  end;
+
+  fininstr.FaceValueFI = GetValuta(INFO_FINTOOLREFERENCEDATA.value("FaceValueFI"));
+  fininstr.Issuer      = SetIssuer(INFO_FINTOOLREFERENCEDATA.value("IssuerINN", null, V_STRING),
+                                   INFO_FINTOOLREFERENCEDATA.value("IssuerUID"), null, V_INTEGER);
+  fininstr.AvoirKind   = SetAvoirKind(Trim(INFO_FINTOOLREFERENCEDATA.value("fintooltype")),
+                                      Trim(INFO_FINTOOLREFERENCEDATA.value("securitytype")),
+                                      Trim(INFO_FINTOOLREFERENCEDATA.value("country"))
+                                     );
+
+  if (fininstr.Issuer == 0)
+    fininstr.Issuer = TECH_EMITENT;
+  end;
+
+  if (fininstr.FaceValueFI == -1) 
+    println("Не найдена валюта " + INFO_FINTOOLREFERENCEDATA.value("FaceValueFI") + " в справочнике");
+    msg = msg + "\nНе найдена валюта " + INFO_FINTOOLREFERENCEDATA.value("FaceValueFI") + " в справочнике";
+    return false;
+  end;
+
+  if (fininstr.AvoirKind == 0)
+    str = "Не удалось установить вид финансового инструмента:\n"+INFO_FINTOOLREFERENCEDATA.value("fullname")+"\nУстановить вручную?";
+    msg = msg + "\nНе установлен вид фин. инструмента";
+    return false;
+/*
+    str = MsgBoxEx(str, MB_YES+MB_NO, IND_YES, "Внимание!");
+    if (str == IND_NO)
+      msg = msg + "\nНе установлен вид фин. инструмента";
+      return false;
+    end;
+    fininstr.AvoirKind = ВыборВидаЦеннойБумаги();
+    if (fininstr.AvoirKind == 0)
+      println("Не удалось установить вид финансового инструмента");
+      msg = msg + "\nНе установлен вид фин. инструмента";
+      return false;
+    end;
+*/
+  end;
+
+
+  //данные для dfininstr_dbt
+  //fininstr.FI_Code         = INFO_FINTOOLREFERENCEDATA.value("FinToolID");
+  fininstr.FI_Kind         = FIKIND_AVOIRISS;
+  fininstr.Name            = INFO_FINTOOLREFERENCEDATA.value("NickName", null, V_STRING);
+  fininstr.Definition      = INFO_FINTOOLREFERENCEDATA.value("fullname", null, V_STRING);
+  fininstr.Settlement_Code = 0;
+  fininstr.FaceValue       = INFO_FINTOOLREFERENCEDATA.value("facevalue", null, V_MONEY);
+  if (depo)
+    fininstr.ParentFI      = GetFIIDByISIN(INFO_FINTOOLREFERENCEDATA.value("ISINCodeBase_NRD"), null, V_STRING);
+    if (fininstr.ParentFI == 0) 
+      println("Не указан базовый ФИ депозитарной расписки");
+      msg = msg + "\nНе указан базовый ФИ депозитарной расписки";
+      stat = false;
+    end;
+  end;
+  fininstr.DrawingDate = INFO_FINTOOLREFERENCEDATA.value("EndMtyDate", null, V_Date);
+
+  //данные для davoiriss_dbt
+  avoiriss.isin           = INFO_FINTOOLREFERENCEDATA.value("isincode");
+  avoiriss.lsin           = INFO_FINTOOLREFERENCEDATA.value("regcode");
+  avoiriss.qty            = INFO_FINTOOLREFERENCEDATA.value("SumIssueVol");
+  avoiriss.nkdround_kind  = 1;                 //вид округления при расчёте нкд
+  avoiriss.incometype     = GetIncomeType(INFO_FINTOOLREFERENCEDATA.value("CouponType"));
+  if (bond == true)
+    avoiriss.nkdbase_kind      = GetBasis(INFO_FINTOOLREFERENCEDATA.value("Basis"));
+    avoiriss.incirculationdate = INFO_FINTOOLREFERENCEDATA.value("BegDistDate", null, V_DATE);  //дата ввода в обращение
+    //? fininstr.expirydate          = DRSHB_CB_A_DBT.value("T_enddistdate_nrd");  //дата закрытия
+  end;
+
+  if (FI_AvoirGenerateCode(fininstr, avoiriss, fiCode, fiCodeInAcc, codeRefID, accCodeRefID)==0)
+    fininstr.Fi_Code       = fiCode;
+    fininstr.CodeInAccount = fiCodeInAcc;
+  end;
+
+  InitInvst();
+  if (FI_InsertAvoiriss(fininstr, avoiriss, avrinvst, null, false) != 0)
+    println("Ошибка при вставке финансового инструмента");
+    msg = msg + "\nОшибка при вставке финансового инструмента";
+    return false;
+  end;
+
+  //вставка инф-ии о купонах
+  while (BOND_COUPONS.MoveNext())
+    ClearRecord(fiwarnts);
+    fiwarnts.fiid         = fininstr.fiid;
+    fiwarnts.number       = BOND_COUPONS.value("id_coupon");
+    fiwarnts.drawingdate  = BOND_COUPONS.value("end_period", null, V_DATE);
+    fiwarnts.incomerate   = BOND_COUPONS.value("coupon_rate");
+    fiwarnts.incomevolume = BOND_COUPONS.value("pay_per_bond");
+    fiwarnts.firstdate    = BOND_COUPONS.value("begin_period", null, V_DATE)+1;
+    fiwarnts.factdate     = BOND_COUPONS.value("pay_date", null, V_DATE);
+    fiwarnts.incomescale  = 1;
+
+    if (fiwarnts.drawingdate < {curdate})
+      fiwarnts.isclosed   = "X";
+      fiwarnts.spisclosed = "X";
+      fiwarnts.tsisclosed = "X";        
+    end;
+
+    if (FI_InsertWarnt(Fiwarnts) != 0)
+      println("Не удалось добавить купон номер " + BOND_COUPONS.value("id_coupon"));
+      msg = msg + "\nНе удалось добавить купон номер " + BOND_COUPONS.value("id_coupon");
+      stat = false;
+    end;  
+  end;
+
+  //вставка инф-ии о частичном погашении
+  while (BOND_AMORTIZATIONS.MoveNext())
+    ClearRecord(fiwarnts);
+    fiwarnts.fiid         = fininstr.fiid;
+    fiwarnts.number       = BOND_AMORTIZATIONS.value("id_tranche");
+    fiwarnts.drawingdate  = BOND_AMORTIZATIONS.value("mty_date", null, V_DATE);
+    fiwarnts.incomerate   = BOND_AMORTIZATIONS.value("mty_part");
+    fiwarnts.incomevolume = BOND_AMORTIZATIONS.value("pay_per_bond");
+    fiwarnts.listdate     = BOND_AMORTIZATIONS.value("fix_date", null, V_DATE);
+    fiwarnts.factdate     = BOND_AMORTIZATIONS.value("pay_date", null, V_DATE);
+    fiwarnts.ispartial    = "X";
+    fiwarnts.incomescale  = 1;
+
+    if (fiwarnts.drawingdate < {curdate})
+      fiwarnts.isclosed   = "X";
+      fiwarnts.spisclosed = "X";
+      fiwarnts.tsisclosed = "X";
+    end;  
+
+    if (FI_InsertWarnt(Fiwarnts) != 0)
+      println("Не удалось добавить купон частичного погашения номер" + BOND_AMORTIZATIONS.value("id_tranche"));
+      msg = msg + "\nНе удалось добавить купон частичного погашения номер" + BOND_AMORTIZATIONS.value("id_tranche");
+      stat = false;
+    end;
+  end;
+  
+  str = FindAndInsertOffer(fininstr.fiid);
+  if (str != "") 
+    msg = msg + "\n" + str;
+  end;
+
+  return stat;
+End;
+
+macro ЗагрузитьБумагуИзБуфера (isin, regcode)
+  var InfoLogFileName = GetTxtFileName( "info");
+  var err = "";
+
+  //SetOutput( InfoLogFileName, false ); //Clear log
+  
+  println("Загрузка ценной бумаги. ISIN = " + isin + "; REGCODE = " + regcode);
+
+  CreateSecur(isin, regcode, @err);
+
+  //SetOutput(null, false);
+  //ViewFile(InfoLogFileName);
+  return err;
+End;
+
+
+/*******************************************************************************************/
+//Cкроллинг сделан для отладки
+
+private macro _AddCol(ar, ind, fld, head, width, fldType, decPoint)
+  ar.value( ind * 6 + 0 ) = fld;
+  ar.value( ind * 6 + 1 ) = head;
+  ar.value( ind * 6 + 2 ) = width;
+  ar.value( ind * 6 + 3 ) = fldType;
+  ar.value( ind * 6 + 4 ) = decPoint;
+  ar.value( ind * 6 + 5 ) = 0;   // reserv
+end;
+
+macro OpenScroll ()
+
+  macro ScrollProc(sql, cmd, id, key)
+    if(cmd == DLG_KEY)
+      if(key == 13)
+        ЗагрузитьБумагуИзБуфера(sql.value("isincode", null, V_STRING), sql.value("regcode", null, V_STRING));
+        return CM_IGNORE;
+      end;
+    end;
+  end;
+
+  var col = TArray();
+  var sql = "select status, "
+          + "       fullname, "
+          + "       nvl(isincode, chr(0)) isincode, "
+          + "       nvl(regcode, chr(0)) regcode "
+          + "from SOFR_INFO_FINTOOLREFERENCEDATA";
+  sql = ExecSqlSelect(sql, null, false, RSDVAL_CLIENT, RSDVAL_STATIC);
+
+  _AddCol ( col, 0, "fullname", "Полное название", 45 );
+  _AddCol ( col, 1, "status" ,  "status"         , 10 );
+  _AddCol ( col, 2, "isincode", "isin"           , 15 );
+  _AddCol ( col, 3, "regcode",  "regcode"        , 10 );
+
+  RunScroll (sql, col.size/6, col, "users_scroll", "ScrollProc", "Список цб", "ESC Выход  F4 Поиск  Enter Загрузить цб", true, 20, 2, 105, 40);
+
+  onerror()
+  MsgBoxEx("Ошибка функции");
+  exit(1);
+end;
+
+//Возвращает количество знаков после запятой
+macro GetLenAfterPoint (_number:double)
+  var number:string = _number;
+  var i = index(number, ".");
+  var count = 0;
+
+  if (i != 0)
+    count = StrLen(SubStr(number, i+1));
+  end;
+
+  return count;
+End;
+
+//обновляет купон, если поменялась ставка или цена. И добавляет недостающие
+macro UpdateCoupons (fiid, RuDataID, log)
+var Query :string = "",
+    Params :TArray,
+    DataSet :RsdRecordset,
+    LenRate :integer = 0,  //Количество знаков после запятой в ставке
+    LenIncome :integer = 0; //Количество знаков после запятой в цене
+
+ private var fiwarnt = TBFile("fiwarnts", "W");
+
+ Query = " SELECT :p_Fiid AS T_FIID, " +
+         "  NVL (ID_COUPON, '0' ) AS T_NUMBER, " +
+         "  NVL( END_PERIOD, TO_DATE('01010001', 'ddmmyyyy') ) AS T_DRAWINGDATE, " +
+         "  NVL( TO_NUMBER(COUPON_RATE), 0 ) AS T_INCOMERATE, " +
+         "  NVL( TO_NUMBER(PAY_PER_BOND), 0 ) AS T_INCOMEVOLUME, " +
+         "  NVL( BEGIN_PERIOD + 1, TO_DATE('01010001', 'ddmmyyyy') ) AS T_FIRSTDATE, " +
+         "  NVL( PAY_DATE, TO_DATE('01010001', 'ddmmyyyy') )  AS T_FACTDATE, " +
+         "  1 AS T_INCOMESCALE, " +
+         "  NVL( FIX_DATE, TO_DATE('01010001', 'ddmmyyyy') ) AS T_LISTDATE " +
+         " FROM sofr_bond_coupons " +
+         " WHERE ID_FINTOOL = :p_FI_Code ";
+
+ DataSet = Null;
+ Params = Null;
+
+ Params = makeArray( SQLParam("p_Fiid", Fiid),
+                     SQLParam("p_FI_Code", RuDataID) );
+
+ DataSet = execSQLselect( Query, Params );
+
+ while( DataSet.MoveNext )
+   fiwarnt.Clear;
+
+   fiwarnt.rec.fiid = DataSet.value("t_fiid");
+   fiwarnt.rec.number = DataSet.value("t_number");
+
+   if (fiwarnt.GetEQ())
+     //Если ставки или цена отличается от данных из Рудаты, и у купона нет признака "погашен"
+     if ( ((fiwarnt.rec.incomerate != DataSet.value("T_INCOMERATE", null, V_DOUBLE)) or
+           (fiwarnt.rec.incomevolume != DataSet.value("T_INCOMEVOLUME", null, V_DOUBLE)
+          )
+          and (fiwarnt.isclosed != "X") )
+
+        fiwarnt.rec.incomerate = DataSet.value("T_INCOMERATE");
+        fiwarnt.rec.incomevolume = DataSet.value("T_INCOMEVOLUME");
+
+        LenRate = GetLenAfterPoint(fiwarnt.rec.incomerate);
+        LenIncome = GetLenAfterPoint(fiwarnt.rec.incomevolume);
+        if (LenRate > LenIncome)
+          fiwarnt.rec.incomepoint = LenRate;
+        else
+          fiwarnt.rec.incomepoint = LenIncome;
+        end;
+
+        if (fiwarnt.rec.incomerate != 0)
+          fiwarnt.rec.relativeincome = "X";
+        end;
+
+       if( FI_UpdateWarnt(fiwarnt) != 0 )
+         //!!!!!!!!!!!!!!обработать ошибку в лог
+         log.add (1, 0, CError( "Ошибка при обновлении купона № " + DataSet.value("t_number"), "AVOIRISS", fiid));
+       else
+         log.add (0, 0, CError( "Купон № " + DataSet.value("t_number") + " успешно обновлен", "AVOIRISS", fiid));
+       end;
+     else
+       //log.add(3, 0, CError( "Купон № " + DataSet.value("t_number") + " не требует обновления", "AVOIRISS", fiid));
+     end;
+   else //купона нет, добавляем в базу
+     fiwarnt.rec.drawingdate  = DataSet.value("T_DRAWINGDATE");
+     fiwarnt.rec.incomerate   = DataSet.value("T_INCOMERATE");
+     fiwarnt.rec.incomevolume = DataSet.value("T_INCOMEVOLUME");
+     fiwarnt.rec.firstdate    = DataSet.value("T_FIRSTDATE");
+     fiwarnt.rec.factdate     = DataSet.value("T_FACTDATE");
+     fiwarnt.rec.incomescale  = DataSet.value("T_INCOMESCALE");
+     fiwarnt.rec.listdate     = DataSet.value("T_LISTDATE");
+
+     LenRate = GetLenAfterPoint(fiwarnt.rec.incomerate);
+     LenIncome = GetLenAfterPoint(fiwarnt.rec.incomevolume);
+     if (LenRate > LenIncome)
+       fiwarnt.rec.incomepoint = LenRate;
+     else
+       fiwarnt.rec.incomepoint = LenIncome;
+     end;
+
+     if (fiwarnt.rec.incomerate != 0)
+       fiwarnt.rec.relativeincome = "X";
+     end;
+
+     if( fiwarnt.rec.drawingdate < {CurDate} )
+      fiwarnt.isclosed = "X";
+      fiwarnt.spisclosed = "X";
+      fiwarnt.tsisclosed = "X";
+     end;
+
+     if( FI_InsertWarnt(fiwarnt) != 0 )
+       //!!!!!!!!!!!!!!обработать ошибку в лог
+       log.add (1, 0, CError( "Ошибка при добавлении купона № " + DataSet.value("t_number"), "AVOIRISS", fiid));
+     else
+       log.add (0, 0, CError( "Купон № " + DataSet.value("t_number") + " успешно добавлен", "AVOIRISS", fiid));
+     end;  
+
+   end;
+
+ end;
+
+ DataSet = Null;
+ Params = Null;
+
+onError(err)
+
+ DataSet = Null;
+ Params = Null;
+End;
+
+//обновить все купоны
+macro UpdateCouponsAll ()
+  var old;
+  var log = CProtokolData();
+  var sql = "select fin.t_fiid fiid, code.t_code rudataid "
+          + "from dfininstr_Dbt fin, avoiriss_dbt avr, dobjcode_Dbt code "
+          + "where fin.t_fi_kind = 2 "
+          + "      and fin.t_fiid = code.t_objectid "
+          + "      and fin.t_fiid = avr.t_fiid "
+          + "      and avr.t_spisclosed <> 'X' "
+          + "      and code.t_codekind = :codekind "
+          + "      and code.t_objecttype = 9 ";
+  sql = ExecSqlSelect(sql, MakeArray(SqlParam("codekind", CODE_KIND_RUDATA_ID)), false);
+  
+  old = SetDialogFlag(0);
+  while (sql.MoveNext() ) 
+    UpdateCoupons(sql.value("fiid"), sql.value("rudataid"), log);
+  end;
+  SetDialogFlag(old);
+
+onError()
+  SetDialogFlag(old);
+End;

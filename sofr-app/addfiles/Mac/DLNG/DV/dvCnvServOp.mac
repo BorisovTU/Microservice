@@ -1,0 +1,222 @@
+/**
+ @file dvCnvServOp.mac
+ @brief Реализация конвейерной обработки для сервисной операции по переоценки ФИССиКО.
+ 
+ Файл содержит реализацию функционала конвейерной обработки для сервисной операции по переоценки ФИССиКО.
+ 
+  # tag
+ - functional_block:СО - сервисные операции
+ - code_type:API
+ - Конвейер
+ - Переоценка
+ - Производные инструменты
+ 
+  # changeLog
+ |date       |author       |tasks                                                     |note                                                        
+ |-----------|-------------|----------------------------------------------------------|-------------------------------------------------------------
+ |23.09.2024 |Топорков Д.В.|BIQ-16474 CCBO-10322                                      | Доработки по конвейерному выполнению СО по переоценке
+ |23.08.2023 |Велигжанин А.|DEF-29076                                                 | Создание
+ */
+import XmlRpcInter, BankInter, DVInter, OprInter, "cb_sql.mac", "dlquery.mac";
+import "dv_const.mac", "dv_car.mac";
+import "CbLogger2.mac";
+
+private const ERR_REVALUATION_NOT_NEEDED = -1;
+
+/**
+@brief Проверить сделку на необходимость выполнения переоценки
+@param[in] _DealID ID сделки
+@param[in] _Params Параметры переданные в конвейер
+@return true в случае, если требуется выполнение переоценки
+*/
+private macro IsDVFXNeedOvervalue(_DealID, _Params)
+  var result = true;
+
+  if (_Params.dvoper.rec.flag1 == DV_KIND_OVERVALUE_SUPPLY)
+    result = ExecMacroFile("dv_car", "DVFX_NeedOverValue", _DealID, _Params.dvoper.rec.fi_kind, _Params.dvoper.rec.fiid, _Params.dvoper.rec.date );
+  end;
+  
+  return result;
+end;
+
+/**
+@brief Функция вставки  шагов и выполнения переоценки
+@param[in] _DealID ID сделки
+@param[in] _Params Параметры переданные в конвейер
+@param[out] errMessage Текст ошибки
+@return V_INTEGER Код ошибки
+*/
+private macro ExecOneDeal(_DealID, _Params, errMessage: @String): Integer
+  var stat: Integer = 0;
+  errMessage = "";
+
+  if (IsDVFXNeedOvervalue(_DealID, _Params)) 
+    stat = DV_AddBranchNDeal(_DealID, _Params.dvoper.rec.DocKind, _Params.dvoper.rec.ID, true);
+  
+    if (stat != 0)
+      errMessage = GetErrMsg();
+      
+      if (StrLen(errMessage) == 0)
+        errMessage = GetErrMsgEx(stat, "Описание кода ошибки не найдено");
+      end;
+    end;
+  else
+    stat = ERR_REVALUATION_NOT_NEEDED;
+    errMessage = "Переоценка не требуется (DVFX_NeedOverValue вернула false)";
+  end;
+
+  return stat;
+  
+OnError(err)
+  errMessage = GetFullErrMsg(err);
+  
+  return err.Code;
+end;
+
+/**
+@brief Процедура обновления статуса пачки сделок во время конвейерной обработки
+@param[in] _execID ID запуска
+@param[in] _convTypeID ID типа конвейера
+@param[in] _packID ID пачки документов, для которой устанавливается статус
+@param[in] _errCode Код ошибки обработки пачки
+@param[in] _errMsg Сообщение об ошибке
+*/
+private macro ChangeCnvPackStatus(_execID: Integer, _convTypeID: Integer, _packID: Integer, _errCode: Integer, _errMsg: String)
+  var query = "UPDATE dcnvpack_dbt " +
+                 "SET t_State = t_State + 1, " +
+                     "t_Error = :errCode, " +
+                     "t_ErrMsg = :errMsg " +
+               "WHERE t_ExecID = :execID " +
+                 "AND t_ConvTypeID = :convTypeID " +
+                 "AND t_PackID = :packID ";
+  var cmd = RSDCommand(query);
+  
+  cmd.AddParam("errCode", RSDBP_IN, _errCode);
+  cmd.AddParam("errMsg", RSDBP_IN, _errMsg);
+  cmd.AddParam("execID", RSDBP_IN, _execID);
+  cmd.AddParam("convTypeID", RSDBP_IN, _convTypeID);
+  cmd.AddParam("packID", RSDBP_IN, _packID);
+  
+  cmd.Execute();
+  cmd.Close();
+end;
+
+/**
+@brief Функция исполнения переоценки пачки сделок в конвейерной обработке
+@param[in] _taskID ID задачи
+@param[in] _execID ID запуска
+@param[in] _conveyerID ID конвейера
+@param[in] _operationID ID операции
+@param[in] _packetID ID пачки документов для обработки
+@param[in] _Params Объект с параметрами
+@return Код первой ошибки
+*/
+macro ExecDeals(_taskID: Integer, _execID: Integer, _conveyerID: Integer, _operationID: Integer, _packetID: Integer, _Params)
+  const MAX_ERROR_LENGTH = 2000;
+  
+  var statTotal: Integer = 0;
+  var errMessageTotal: String = "";
+  var stat: Integer = 0;
+  var errMessage: String = "";
+  var itLog = NewLogger(c_logger.IT_LOG_TYPE, REVALUATION_CNVOP_LOGID + "(" + _execID + ")");
+
+  var query = "SELECT cnvDoc.t_ObjectID as t_ID, " +
+                     "NVL(ndeal.t_code, '<сделка не найдена>') t_code " +
+                "FROM dCnvDoc_dbt cnvDoc " +
+                "LEFT JOIN dDvNdeal_dbt ndeal ON cnvDoc.t_objectID = ndeal.t_ID " +
+               "WHERE cnvDoc.t_ExecID = :execID " +
+                 "AND cnvDoc.t_ConvTypeID = :convID " +
+                 "AND cnvDoc.t_PackID = :packID";
+  var dealsInfoCmd = RSDCommand(query);
+  
+  dealsInfoCmd.AddParam("execID", RSDBP_IN, _execID);
+  dealsInfoCmd.AddParam("convID", RSDBP_IN, _conveyerID);
+  dealsInfoCmd.AddParam("packID", RSDBP_IN, _packetID);
+  
+  var dataSet = RSDRecordSet(dealsInfoCmd);
+
+  while (dataSet.MoveNext())
+    var dealID = SQL_ConvTypeInteger(dataset.Value("t_ID"));
+    stat = ExecOneDeal(dealID, _Params, @errMessage);
+    
+    if (stat != 0)
+      if (stat == ERR_REVALUATION_NOT_NEEDED)
+        itLog.Info(dataSet.Value("t_code") + "||" + String(dealID) + "||" + String(stat) + "||" + errMessage);
+      else
+        itLog.Error(dataSet.Value("t_code") + "||" + String(dealID) + "||" + String(stat) + "||" + errMessage);
+
+        if (statTotal == 0)
+          statTotal = stat;
+        end;
+      
+        if (StrLen(errMessageTotal) < MAX_ERROR_LENGTH)
+          errMessageTotal = errMessageTotal + "\n" + String(dealID) + ", " + String(stat);
+        end;
+      end;
+    end;
+  end;
+  
+  if (StrLen(errMessageTotal) > 0)
+    errMessageTotal = "ID сделки, Ошибка" + errMessageTotal;
+    
+    if (StrLen(errMessageTotal > MAX_ERROR_LENGTH))
+      errMessageTotal = SubStr(errMessageTotal, 1, MAX_ERROR_LENGTH - 3) + "...";
+    end;
+  end;
+  
+  ChangeCnvPackStatus(_execID, _conveyerID, _packetID, statTotal, errMessageTotal);
+  
+  return statTotal;
+  
+OnError(err)
+  NewLogger(c_logger.IT_LOG_TYPE, REVALUATION_CNVOP_LOGID + "(" + _execID + ")").Error("Ошибка процедуры ExecDeals: " + GetFullErrMsg(err));
+  
+  return err.Code;
+end;
+
+/**
+@brief Функция отбора сделок и распределение по пачкам для выполения в конвейере
+@param[in] _taskID ID задачи
+@param[in] _execID ID запуска
+@param[in] _conveyerID ID конвейера
+@param[in] _packetSize Размер пачки для обработки
+@param[in] _Params Объект с параметрами
+@return Количество пачек для исполнения
+*/
+macro SelectDealsForServOp(_taskID, _execID, _conveyerID, _packetSize, _Params)
+  if (_packetSize <= 0)
+    _packetSize = 1000;
+  end;
+  
+  // Вставим сделки для обработки
+  var query = "INSERT INTO dCnvDoc_dbt (t_taskID, t_execID, t_convTypeID, t_packID, t_objectType, t_objectID) " +
+              "SELECT :taskID, :execID, :conveyerID, CEIL(ROWNUM/:packetSize), 0, q.t_ID " +
+              "FROM (" + _Params.SqlQuery + ") q";
+  
+  var insertDealsCmd = RSDCommand(query);
+  
+  insertDealsCmd.AddParam("taskID", RSDBP_IN, _taskID);
+  insertDealsCmd.AddParam("execID", RSDBP_IN, _execID);
+  insertDealsCmd.AddParam("conveyerID", RSDBP_IN, _conveyerID);
+  insertDealsCmd.AddParam("packetSize", RSDBP_IN, _packetSize);
+  
+  insertDealsCmd.Execute();
+  insertDealsCmd.Close();
+  
+  // Вернем количество пачек
+  var cnt: Integer = 0;
+
+  var dataSet = TRsbDataSet("SELECT NVL(MAX(t_PackID), 0) as cnt " +
+                              "FROM dCnvDoc_dbt " +
+                             "WHERE t_ExecID = " + _execID);
+  if (dataSet.MoveNext())
+    cnt = SQL_ConvTypeInteger(dataSet.cnt);
+  end;
+  
+  return cnt;
+  
+OnError(err)
+  NewLogger(c_logger.IT_LOG_TYPE, REVALUATION_CNVOP_LOGID + "(" + _execID + ")").Error("Ошибка процедуры SelectDealsForServOp: " + GetFullErrMsg(err));
+  
+  return 0;
+end;

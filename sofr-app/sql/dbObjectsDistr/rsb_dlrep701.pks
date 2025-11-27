@@ -1,0 +1,45 @@
+CREATE OR REPLACE package rsb_dlrep701
+is
+  PARTY_NOTE_KIND_SWIFT_CODE_FOR_701 CONSTANT INTEGER := 84; -- Код SWIFT для 701-й формы
+
+  /**
+ * Принадлежность средств */
+       DL_EXTCODETYPE_OWN        CONSTANT NUMBER := 1; -- Собственные
+       DL_EXTCODETYPE_CLIENT     CONSTANT NUMBER := 2; -- Клиентские
+
+  /**
+ * Виды биржевого рынка */
+       DV_MARKETKIND_CURRENCY    CONSTANT NUMBER := 2; -- Валютный рынок
+       DV_MARKETKIND_DERIV       CONSTANT NUMBER := 4; -- Срочный рынок
+       DV_MARKETKIND_OTHER       CONSTANT NUMBER := -1;-- Прочие сделки
+
+  /**
+ * Виды сделок для отчёта */
+       DLKIND_DVFUTURES    CONSTANT NUMBER := 4; -- Покупка/продажа фьючерса
+       DLKIND_DVOPTION     CONSTANT NUMBER := 6; -- Покупка/продажа опциона
+
+  FUNCTION  GetContractorID( p_IsExchange IN NUMBER, p_PARTYID IN NUMBER, p_MARKETID IN NUMBER, p_BROKERID IN NUMBER ) RETURN NUMBER;
+  PROCEDURE GetBankContragentInfo( p_ContractorID IN NUMBER, p_ISRESIDENT IN CHAR, p_IsREPO IN NUMBER, p_Date IN DATE, p_BANKCONTRAGENT OUT VARCHAR2, p_IsSWIFTCode OUT CHAR, p_TypeContr OUT NUMBER ); 
+  FUNCTION  GetOTHERInfo(p_ContractorID IN NUMBER, p_IsClient IN CHAR, p_PartyKind IN VARCHAR2, p_COST IN NUMBER, p_COST_FIID IN NUMBER, p_OnDate IN DATE, p_FIID_840 IN NUMBER, p_TYPEADDINFO IN VARCHAR2 DEFAULT chr(1), p_IsOTC IN NUMBER DEFAULT 0) RETURN VARCHAR2;
+  PROCEDURE GetFloatRate(p_DEALID IN NUMBER, p_TYPE IN NUMBER, p_FIID_BA IN NUMBER, p_FloatRate OUT VARCHAR2, p_RateCCY OUT VARCHAR2, p_RateName OUT VARCHAR2, p_RateSpread OUT FLOAT);
+  FUNCTION  GetTypeFinActive(p_FIID IN NUMBER, p_IsParent IN NUMBER DEFAULT 0) RETURN VARCHAR2;
+  FUNCTION  GetFIIDForIndex(p_FIID IN NUMBER) RETURN NUMBER;
+
+  PROCEDURE CreateData_NotREPO(DepartmentID IN NUMBER, OnDate IN DATE, FIID_840 IN NUMBER, CodeType IN NUMBER, IsIntermediate NUMBER DEFAULT 0);
+  PROCEDURE CreateData_REPO(DepartmentID IN NUMBER, OnDate IN DATE, CodeType IN NUMBER, IsIntermediate NUMBER DEFAULT 0);
+
+  PROCEDURE CreateData_DV_NDEAL(DepartmentID IN NUMBER, OnDate IN DATE, FIID_840 IN NUMBER, MarketKind IN NUMBER, CodeType IN NUMBER, IsIntermediate NUMBER DEFAULT 0);
+  PROCEDURE CreateData_DV_DEAL(DepartmentID IN NUMBER, OnDate IN DATE, FIID_840 IN NUMBER, CodeType IN NUMBER, IsIntermediate NUMBER DEFAULT 0);
+
+  PROCEDURE CreateData_SC(DepartmentID IN NUMBER, OnDate IN DATE, FIID_840 IN NUMBER, CodeType IN NUMBER, IsIntermediate NUMBER DEFAULT 0);
+
+  PROCEDURE CreateData_DV(DepartmentID IN NUMBER, OnDate IN DATE, FIID_840 IN NUMBER, MarketKind IN NUMBER, CodeType IN NUMBER, IsIntermediate NUMBER DEFAULT 0);
+
+  PROCEDURE CreateData_MBK(DepartmentID IN NUMBER, OnDate IN DATE, FIID_840 IN NUMBER, IsIntermediate NUMBER DEFAULT 0);
+
+  PROCEDURE CorrectData;
+
+  FUNCTION TimeIsIntermediate(p_Time IN DATE) RETURN NUMBER;
+end rsb_dlrep701;
+/
+

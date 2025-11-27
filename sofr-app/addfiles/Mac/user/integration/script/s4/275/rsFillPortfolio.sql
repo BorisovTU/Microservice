@@ -1,0 +1,1 @@
+сам скрипт находится в sql\dbObjects\rsFillPortfolio.prc 

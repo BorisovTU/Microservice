@@ -1,0 +1,301 @@
+/*
+Создание операции "Перевод обеспечения" в модуле БОЦБ на основании сделки из МБК
+Симанов А.В.
+*/
+import oralib, likepy, globals;
+import spserv;
+
+private const DOCKIND_TRANS_GUARANTEE   = 4622, // Первичный документ "Перевод обеспечения"
+              DOCKIND_MMSCZ             = 126, // Договор залога МБК
+              OPERATION_TRANS_GUARANTEE = 2821, // операция "Перевод обеспечения"
+              OPERSTATUS_PREP           = 0; // статус - отложенная
+
+private const CONST_LIAB_TYPE = 3, // вид обеспечиваемого обязательства. Не знаю, что тут должно быть, ставлю по умолчанию "гарантия"
+              CONST_COLLATERAL_TYPE = 100; // вид обеспечения. По умолчанию ставлю Обеспечение кредитов МБК (пользовательское значение)
+
+private var sqlString, Error_array = TArray();
+
+//Подвиды операции. Передача или возврат
+var guarantee_opersubkind_in = 1,
+    guarantee_opersubkind_out = 2;
+
+private macro AddError (err:string)
+  Error_array(Error_array.size) = err;
+  return 1;
+End;
+
+private macro ShowErrors ()
+  println (join(Error_array, "\n"));
+End;
+
+//-----------------------------------------------------------------------------------------
+
+private macro collectOutProc ( str )
+    sqlString = sqlString + "\n" + trim (str);
+End;
+//-----------------------------------------------------------------------------------------
+
+private macro CaptureOutput ()
+   sqlString = "";
+   SetOutHandler (@collectOutProc);
+End;
+//-----------------------------------------------------------------------------------------
+                     
+private macro StopCaptureOutput ()
+    SetOutHandler ();
+    return sqlString;
+End;
+//-----------------------------------------------------------------------------------------
+
+/*Проверка, существует ли в БОЦБ операция перевода обеспечения по сделке МБК с ИД = dealid. Связка через примечание.
+  Приходится проверять наличие самой сделки, т.к. примечание из БД удаляется только при откате шага в операции МБК
+  subkind: 1 - передача в обеспечение. 2 - возврат
+  status - если есть, то ищет сделку в этом статусе
+*/
+macro Check_exists_guarantee_from_mbk (dealid:integer, subkind:integer, status)
+  var StatusFilter = ifThenElse(valtype(status) != V_UNDEF, " and comm.t_commstatus = " + status, "");
+  var query = "select 1 from dnotetext_dbt n "
+            + "where     t_objecttype = 212 "
+            + "      and t_notekind = 101 "
+            + "      and rsb_struct.getint(t_text) = " + dealid
+            + "      and exists (select 1 from ddl_comm_dbt comm "
+            + "                  where     comm.t_documentid = to_number(n.t_documentid) " + StatusFilter
+            + "                        and comm.t_opersubkind = " + subkind + ") ";
+
+  if (ExecSqlSelect(query).MoveNext() )
+    return true;
+  end;
+  return false;
+onerror()
+  AddError("Ошибка базы данных при выполнении запроса \""+query+"\". \nПожалуйста, обратитесь к администратору");
+  return false;
+End;
+
+private macro get_value_from_select (value, query, params)
+  var sql = ExecSqlSelect(query, params);
+  if (sql.MoveNext() )
+    return sql.value(0);
+  end;
+  return value;
+onerror()
+  AddError("Ошибка базы данных при выполнении запроса \""+query+"\". \nПожалуйста, обратитесь к администратору");
+  return null;
+End;
+
+//-----------------------------------------------------------------------------------------------------------------------------
+
+//Создаёт договор обеспечения в БОЦБ
+macro Create_guarantee_contract (number:string, numberts:string, dt:date, name:string, partyid:integer, liabtype:integer, collateraltype:integer, ContractID)
+  var scsecagr = TbFile("scsecagr.dbt", "W");
+  var stat = false;
+
+  if (not ExecSqlSelect("select 1 from dparty_dbt where t_partyid = " + partyid).MoveNext() )
+    return AddError("Не найден в справочнике субъект с ИД = " + partyid);
+  end;
+
+  if (not ExecSqlSelect("select 1 from dnamealg_dbt where t_itypealg = 8227 and t_inumberalg = " + liabtype).MoveNext() )
+    return AddError("Не определён вид обеспечиваемого обязательства");
+  end;
+
+  if (not ExecSqlSelect("select 1 from dllvalues_dbt where t_list = 1144 and t_element = " + collateraltype).MoveNext() )
+    return AddError("Не определён вид обеспечения");
+  end;
+
+  scsecagr.rec.Number   = number;
+  scsecagr.rec.NumberTS = numberts;
+  scsecagr.rec.Date     = dt;
+  scsecagr.rec.Name     = name;
+  scsecagr.rec.PartyID  = partyid;
+  scsecagr.rec.LiabType = liabtype;
+  scsecagr.rec.CollateralType = collateraltype;
+
+  stat = scsecagr.Insert();
+  if (stat) 
+    SetParm(7, scsecagr.rec.ID);
+  end;
+
+  return ifThenElse(stat, 0, 1);
+
+onerror(err)
+  return AddError(err.Message,"| Модуль: ",err.Module,"| строка: ",err.Line );
+End;
+
+
+//-----------------------------------------------------------------------------------------------------------------------------
+
+private macro Get_party_by_contract (ContractID):integer
+  return get_value_from_select(-1, "select t_partyid from dscsecagr_dbt where t_id = " + ContractID);
+End;
+
+//Создаёт операцию "Перевод обеспечения" в БОЦБ. Возвращает ИД созданной операции в DocID
+macro Create_guarantee_operation (code:string, code_ts:string, subkind:integer, dt:date, Amount:integer, FIID:integer, ContractID:integer, DocID)
+  var dl_comm  = TbFile("dl_comm.dbt", "W");
+  var oproper  = TbFile("oproper.dbt", "W");
+  var fininstr = TbFile("fininstr.dbt");
+  var stat;
+
+  if (not ExecSqlSelect("select 1 from dnamealg_dbt where t_itypealg = 8228 and t_inumberalg = " + subkind).MoveNext() )
+    return AddError("Не определён вид операции");
+  end;
+
+  if (not ExecSqlSelect("select 1 from dfininstr_dbt where t_fi_kind = 2 and t_fiid = " + FIID).MoveNext() )
+    return AddError("В справочнике не найдена ценная бумага с ИД = " + FIID);
+  end;
+
+  if (not ExecSqlSelect("select 1 from dscsecagr_dbt where t_id = " + ContractID).MoveNext() )
+    return AddError("В справочнике не найден договор обеспечения с ИД = " + ContractID);
+  end;
+
+  if (subkind == guarantee_opersubkind_out) 
+    code = code + "_out";
+  end;
+
+  fininstr.KeyNum = 0;
+  fininstr.rec.FIID = FIID;
+  if (not fininstr.GetEQ() )
+    return AddError("Не удалось определить ценную бумагу с ИД " + FIID);
+  end;
+
+  dl_comm.rec.DocKind       = DOCKIND_TRANS_GUARANTEE;
+  dl_comm.rec.Oper          = {oper};
+  dl_comm.rec.CommCode      = Code;
+  dl_comm.rec.OperationKind = OPERATION_TRANS_GUARANTEE;
+  dl_comm.rec.ClientId      = -1;
+  //dl_comm.rec.CommDate      = dt;
+  dl_comm.rec.CommDate      = {curdate};
+  dl_comm.rec.CommStatus    = OPERSTATUS_PREP;
+  dl_comm.rec.Hidden_sum    = Amount;
+  dl_comm.rec.FIID          = fininstr.rec.FIID;
+  dl_comm.rec.OperSubKind   = subkind;
+  dl_comm.rec.ContractID    = ContractID;
+  dl_comm.rec.PartyID       = Get_party_by_contract(ContractID);
+  dl_comm.rec.AvoirKind     = fininstr.rec.AvoirKind;
+  dl_comm.rec.IssuerID      = fininstr.rec.Issuer;
+  dl_comm.rec.CommCodeTS    = code_ts;
+  dl_comm.rec.CommTime      = Time();
+  dl_comm.rec.Division      = {OperDprt};
+
+  stat = SC_CreateDlCommOperation(dl_comm);
+
+  if (stat == 0)
+    SetParm(7, dl_comm.rec.DocumentID);
+  end;
+
+  return stat;
+
+onerror(err)
+  return AddError(err.Message,"| Модуль: ",err.Module,"| строка: ",err.Line );
+End;
+
+//-----------------------------------------------------------------------------------------------------------------------------
+
+//Найти ИД договора залога по сделке МБК
+private macro Get_orderID (DealID):integer
+  CaptureOutput();
+  [select ord.t_contractid
+   from ddl_grnt_dbt grnt, ddl_order_dbt ord
+   where     grnt.t_dealid = :dealid
+         and ord.t_contractid = grnt.t_contractid
+         and ord.t_dockind = :dockind];
+  return get_value_from_select(0, StopCaptureOutput(), MakeArray(SqlParam("dealid", DealID), SqlParam("dockind", DOCKIND_MMSCZ)));
+End;
+
+//Найти договор обеспечения в БОЦБ, который по параметрам подходил бы к договору залога в МБК.
+private macro find_guarantee_contract (order)
+  CaptureOutput();
+  [select t_id from dscsecagr_dbt
+   where     t_number = :numb
+         and t_date = :dt
+         and t_partyid = :partyid
+         and t_liabtype = :liabtype
+         and t_collateraltype = :collateraltype];
+  return get_value_from_select(0, StopCaptureOutput(), MakeArray(SqlParam("numb",           order.rec.OrderNumber),
+                                                                 SqlParam("dt",             order.rec.SignDate),
+                                                                 SqlParam("partyid",        order.rec.Contractor),
+                                                                 SqlParam("liabtype",       CONST_LIAB_TYPE),
+                                                                 SqlParam("collateraltype", CONST_COLLATERAL_TYPE)));
+End;
+
+private macro Get_fiid_by_order (DocKind, DocID):integer
+  return get_value_from_select(0, "select t_fiid from ddl_secur_dbt where t_contractkind = " + DocKind + " and t_contractid = " + DocID);
+End;
+
+private macro Get_quantity_by_order (DocKind, DocID):integer
+  return get_value_from_select(0, "select t_quantity from ddl_secur_dbt where t_contractkind = " + DocKind + " and t_contractid = " + DocID);
+End;
+
+//Точка входа для создания операции обеспечения в БОЦБ
+/*1. Найти договор обеспечения в БОЦБ, который по параметрам подходил бы к договору залога в МБК.
+     а) Если договор обеспечения не найден - создать его.
+  2. Создать операцию Перевод обеспечения в БОЦБ, основываясь на договоре залога и сделке МБК
+     Пока будет реализовано создание только одной операции. Но в теории возможно, что под обеспечение одного кредита в МБК (в одном договоре залога) будет несколько разных бумаг.
+      И тут нужно будет создавать новую операцию перевода обеспечения под каждую ЦБ в залоге.
+  direct - направление. 1 - Передача в обеспечение. 2 - Возврат из обеспечения
+*/
+macro start_guarantee_from_mbk (tick, direct)
+  var dl_order = TbFile("dl_order.dbt");
+  var ContractID = 0;
+  var DocID = 0;
+  var stat = 0;
+
+  dl_order.KeyNum = 0;
+  dl_order.rec.ContractID = Get_orderID(tick.DealID);
+  if ( (dl_order.rec.ContractID < 1)  or not dl_order.GetEQ() )
+    AddError("Не найден договор залога по сделке " + tick.DealCode);
+    return false;
+  end;
+
+  RslDefCon.BeginTrans();
+
+  ContractID = find_guarantee_contract(dl_order);
+  if (ContractID < 1)
+    stat = Create_guarantee_contract(dl_order.rec.OrderNumber, //number
+                                     dl_order.rec.OrderNumber, //numberts
+                                     dl_order.rec.SignDate,    //dt
+                                     dl_order.rec.OrderNumber, //name
+                                     dl_order.rec.Contractor,  //partyid
+                                     CONST_LIAB_TYPE,          //liabtype
+                                     CONST_COLLATERAL_TYPE,    //collateraltype
+                                     ContractID                // OUT - ContractID
+                                     );
+    if (stat != 0) 
+      AddError("Не удалось создать новый договор обеспечения в БОЦБ ");
+    end;
+  end;
+
+  if (stat == 0) 
+    stat = Create_guarantee_operation (tick.DealCode,   //code
+                                       tick.DealCodeTS, //code_ts
+                                       direct,          //subkind
+                                       tick.DealDate,   //dt
+                                       Get_quantity_by_order(dl_order.rec.DocKind, dl_order.rec.ContractID), //amount
+                                       Get_fiid_by_order(dl_order.rec.DocKind, dl_order.rec.ContractID),     //fiid
+                                       ContractID,      //contractid
+                                       DocID            //OUT - docid
+                                       );
+    if (stat != 0)
+      AddError("Не удалось создать операцию перевода обеспечения в БОЦБ ");
+    end;
+  end;
+
+  if (stat == 0)
+    stat = addnoteforobject(212, string(DocID:o:34), 101, tick.DealID);
+  end;
+
+  if (stat == 0)
+    stat = SC_ServOperExecuteSilent(DOCKIND_TRANS_GUARANTEE, int(docid));
+  end;
+
+  if (stat == 0) 
+    RslDefCon.CommitTrans();
+  else
+    RslDefCon.RollbackTrans();
+  end;
+  
+  return (stat == 0);
+onerror()
+  if (RslDefCon.IsInTrans()) 
+    RslDefCon.RollbackTrans();
+  end;
+  return false;
+End;

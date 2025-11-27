@@ -1,0 +1,626 @@
+/*
+$Name: sp_car2.mac
+$Module: Ценные бумаги
+$Description: ОБЩИЕ ПРОЦЕДУРЫ ДЛЯ ПРОВОДОК В ОПЕРАЦИЯХ С ЦЕННЫМИ БУМАГАМИ
+*/
+IMPORT "sp_carb.mac", "sp_cars.mac", "sp_carou.mac", "spservsql.mac", "oprmassexec.mac";
+
+/*** Ф-и для работы с предварительным формированием поручений ДЕПО (см. 104217)**********/
+
+/*Ф-я для определения необходимости предварительной вставки поручения ДЕПО.*/
+/*_err - возвращаемая ошибка*/
+macro НужноПредФормПоручДЕПО(FD, _err)
+  var DepParm, err = 0, res = false;
+  record sf(sfcontr);
+
+  if ( (DL_NDaysBeforeInsertDepoDraft >= 0) and
+       //(DL_CustodyAccounting == DL_CUSTODYACCOUNTING_CUSTODY) and
+       (FD.tick.rec.BofficeKind == DL_SECURITYDOC)
+     )     
+
+     if (IsOUTEXCHANGE(FD.Group) or IsBROKER(FD.Group))
+        res = true;
+        if(IsClientDeal(FD.tick.rec))
+          ClearRecord(sf);
+          sf.ID = FD.tick.rec.ClientContrID;
+          if(trim(readNoteForObject( OBJTYPE_SFCONTR, UniID( sf, OBJTYPE_SFCONTR), NOTEKIND_SFCONTR_ISOUTCUSTODY)) != "")
+            res =  false;
+          end;
+        end; 
+     end;
+
+     if (IsEXCHANGE(FD.Group) and (FD.tick.rec.Flag1/*ОРЦБ*/ != SET_CHAR))
+        DepParm = TRecHandler( "dldepset.dbt" ); /*Параметры депозитарного учета*/
+        /*на биржевой не ОРЦБ тоже задается схема расчетов, в кот. может быть задана схема депозит учета, кот. в свою очередь 
+          уазана в параметрах депозитарного учета для данной биржи*/
+        if( not ПолучитьПараметрыДУ( DepParm, FD.tick.rec.MarketID, FD.GetMarketSchemeID() ) )
+           err = 1;
+        end;
+
+        if (DepParm.rec.Consolidate == DEPSET_CONSOLIDATE_NO)  /*не нужны сводные поручения*/
+           res = true;
+        end;
+     end;
+  end;
+
+  SetParm(1, err);
+  return res;
+end;
+
+/*Ф-я для определения даты предварительной вставки поручения ДЕПО.*/
+macro GetDateInsDepoDraft( FD )
+  var Dp, Dc;
+
+  /*Вычислим плановую дату поставки*/
+  Dp = IIF(FD.dl_leg.rec.MaturityIsPrincipal == SET_CHAR, FD.dl_leg.rec.Maturity, FD.dl_leg.rec.Expiry);
+
+  if( DL_NDaysBeforeInsertDepoDraft > 0 )
+     Dp = Dp - DL_NDaysBeforeInsertDepoDraft;
+  end;
+
+  if (Dp < FD.tick.rec.DealDate)
+     Dp = FD.tick.rec.DealDate;
+  end;
+
+  if (FD.ExistBack)
+     if( FD.IsBack )
+        GetOprDate( DATE_DEALOUTBAL_2, Dc );
+     else 
+        GetOprDate( DATE_DEALDATE, Dc );
+     end;
+     Dp = maxDate(Dc, Dp);
+  else
+     if( FD.BuySale == DEAL_TYPE_SALE )
+        GetOprDate( DATE_DEALDATE, Dc );
+        Dp = maxDate(Dc, Dp);
+     end;
+  end;
+
+  return Dp;
+end;
+
+macro ExistDepoDraft(avr_dlrq:TRecHandler, State, Number)
+  var query, sql, DataSet, retVal;
+
+  query = "Select Draft.t_Status State, Ground.t_Xld Numb " 
+        + "  From ddlgrdoc_dbt grdoc, ddlgrdeal_dbt grdeal, dspdrprop_dbt Prop, dspdraft_dbt Draft, dspground_dbt Ground " 
+        + " Where grdoc.t_DocKind = " + DL_DEPODRAFT
+        + "   and grdeal.t_ID = grdoc.t_GrDealID "
+        + "   and grdeal.t_DocKind = ? "
+        + "   and grdeal.t_DocID = ? "
+        + "   and grdeal.t_TemplNum IN ("+IIF(avr_dlrq.rec.DealPart == 1, DLGR_TEMPL_DEPODRAFT+","+DLGR_TEMPL_DEPODRAFTCONTR, DLGR_TEMPL_DEPODRAFT2+","+DLGR_TEMPL_DEPODRAFTCONTR2)+")"
+        + "   and Prop.t_PaymentID = Prop.t_DocumentID " 
+        + "   And Prop.t_DocumentID = grdeal.t_ID " 
+        + "   And Prop.t_DocumentKind = " + DL_DLGRDEAL 
+        + "   And Draft.t_AutoKey = Prop.t_DraftID " 
+        + "   And Prop.t_IsMain   = chr(88) " 
+        + "   And Ground.t_SpGroundID = Draft.t_SpGroundID ";
+
+  sql = DL_RSDCommand(query);
+                           
+  sql.addParam( avr_dlrq.rec.DocKind );
+  sql.addParam( avr_dlrq.rec.DocID );
+  DataSet = sql.execute();
+
+  if (DataSet.MoveNext())
+     retVal = true;
+  else
+     retVal = false;
+  end;
+
+  SetParm(1, DataSet.State);
+  SetParm(2, DataSet.Numb);
+  return retVal;
+end;
+
+private macro ПроверитьПараметрыПорученияДепо(avr_dlrq:TRecHandler)
+  var sql, DataSet, str_error, ExistError = false;
+
+  str_error = "Следующие параметры поручения ДЕПО не соответствуют параметрам сделки:";
+
+  sql = RSDCommand("Select  DpPm.t_Amount, DpPm.t_PayerBankID, DpPm.t_ReceiverBankID, spground.t_RegistrDate " +
+                            "  From dspdrprop_dbt Prop, dspdraft_dbt Draft, dspdrmove_dbt Move, dpmpaym_dbt DpPm, dspground_dbt spground " +
+                            " Where Prop.t_PaymentID = ? " +
+                            "   And Prop.t_DocumentID = ? " +
+                            "   And Prop.t_DocumentKind = ? " +
+                            "   And Draft.t_AutoKey = Prop.t_DraftID " +
+                            "   And Draft.t_AutoKey = Move.t_DraftID " +
+                            "   And Move.t_PaymentID = DpPm.t_PaymentID " +
+                            "   And Draft.t_SpGroundID = spground.t_SpGroundID " +
+                            "   And Prop.t_IsMain   = chr(88) "
+                  );
+                           
+  sql.addParam( "", RSDBP_IN, avr_dlrq.rec.ID );
+  sql.addParam( "", RSDBP_IN, avr_dlrq.rec.DocID );
+  sql.addParam( "", RSDBP_IN, avr_dlrq.rec.DocKind );
+  sql.execute();
+
+  DataSet = TRsbDataSet( sql );
+  if (DataSet.MoveNext())
+     if (avr_dlrq.rec.Amount != DataSet.Amount)
+        str_error = str_error + " количество";
+        ExistError = true;
+     end;
+
+     /*if (avr_paym.PayerBankID != DataSet.PayerBankID)
+        if (ExistError)
+           str_error = str_error + ",";
+        end;
+        str_error = str_error + " отправитель";
+        ExistError = true;
+     end;
+
+     if (avr_paym.ReceiverBankID != DataSet.ReceiverBankID)
+        if (ExistError)
+           str_error = str_error + ",";
+        end;
+        str_error = str_error + " получатель";
+        ExistError = true;
+     end;*/
+
+     if (avr_dlrq.rec.PlanDate < DataSet.RegistrDate)
+        if (ExistError)
+           str_error = str_error + ",";
+        end;
+        str_error = str_error + " дата регистрации";
+        ExistError = true;
+     end;
+
+     if (ExistError)
+        if (DL_KindLinkCustody == DL_KINDLINKCUSTODY_SINGLE)
+           MsgBox(str_error);
+           return true;
+
+        elif( (DL_KindLinkCustody == DL_KINDLINKCUSTODY_DOUBWITHCTRL) OR 
+              (DL_KindLinkCustody == DL_KINDLINKCUSTODY_DOUBWITHSYNCANDCTRL) 
+            )
+           if(not GetTrue(true, str_error + ".|Продолжить выполнение сделки?"))
+              return false;
+           end;
+        end;
+     end;
+  end;
+
+  return true;
+end;
+
+macro ПолучитьСтрокуГрафика(DocKind, DocID, TemplNum)
+  var DataSet, GrDealID = 0;
+  var cmd = DL_RSDCommand(  " select t_ID "
+                          + "   from ddlgrdeal_dbt "
+                          + "  where t_DocKind = ? "
+                          + "    and t_DocID = ? "
+                          + "    and t_TemplNum = ?"
+                         );
+
+  cmd.AddParam(DocKind);
+  cmd.AddParam(DocID);
+  cmd.AddParam(TemplNum);
+
+  DataSet = cmd.Execute();
+  if(DataSet.moveNext())
+    GrDealID = DataSet.ID;
+  end;
+
+  return GrDealID;
+end;
+
+macro ПроверитьПорученияДепо(FD)
+  var avr_dlrq = TRecHandler("dlrq");
+  var DraftDate, DraftAmount, GrDealID;
+
+  if( not DL_WorkWithDepositary OR
+      ((DL_KindLinkCustody != DL_KINDLINKCUSTODY_DOUBWITHCTRL) AND (DL_KindLinkCustody != DL_KINDLINKCUSTODY_DOUBWITHSYNCANDCTRL)) OR
+      (IsEXCHANGE(FD.Group))
+    )
+    return true; //проверки не требуются
+  end;
+  if(FD.GetRQ(DLRQ_TYPE_DELIVERY).rec.Netting == UNSET_CHAR) //только, если ТО не включено в неттинг
+    avr_dlrq = FD.GetRQ(DLRQ_TYPE_DELIVERY);
+  else
+    //найти итоговое ТО по неттингу, куда включено текущее ТО
+    var query, cmd, DataSet;
+
+    query =   " select rq.* "
+            + "   from ddlrq_dbt rq, dpmlink_dbt lnk "
+            + "  where lnk.t_InitialPayment = ? "
+            + "    and lnk.t_LinkKind = ? "
+            + "    and rq.t_ID = lnk.t_PurposePayment "
+            + "    and rq.t_DocKind = lnk.t_DocKind "
+            + "    and rq.t_DocID = lnk.t_DocumentID ";
+
+    cmd = DL_RSDCommand(query);
+    cmd.AddParam(FD.GetRQ(DLRQ_TYPE_DELIVERY).rec.ID);
+    cmd.AddParam(PMLINK_KIND_RQNETTING);
+
+    DataSet = cmd.Execute();
+    if(DataSet.moveNext())
+      DataSet.GetRecord().CopyTo( avr_dlrq.rec );
+    else
+      MsgBox("Не найдено итоговое ТО операции неттинга");
+      return false;
+    end;
+  end;               
+  
+  /*Если итоговое ТО нулевое, поручение не формируется (выполняется взаимозачёт без фактического движения ценных бумаг: поручения депо не формируются ни в сделках, ни в операции неттинга)*/
+  if( not( (FD.GetRQ(DLRQ_TYPE_DELIVERY).rec.Netting == SET_CHAR) and (avr_dlrq.rec.Amount == $0) ) )
+     if (ExistDepoDraft(avr_dlrq))
+   
+        GrDealID = ПолучитьСтрокуГрафика(avr_dlrq.rec.DocKind, avr_dlrq.rec.DocID, IIF(avr_dlrq.rec.DealPart == 1, DLGR_TEMPL_DEPODRAFT, DLGR_TEMPL_DEPODRAFT2));
+        if(GrDealID)
+          ExecMacroFile("dpdrutl.mac", "SP_GetDraftAmount", GrDealID, DraftAmount, DL_DLGRDEAL, GrDealID);
+   
+          if( DraftAmount < avr_dlrq.rec.Amount )
+             MsgBox("Нет отчетов об исполнении всех поручений депо данной сделки");
+             return false;
+          elif( DraftAmount > avr_dlrq.rec.Amount )
+             MsgBox("Количество ц/б в исполненных поручениях депо больше, чем в сделке");
+             return false;
+          end;
+        end;
+   
+        if(СделкаСКлиентомКонтрагентом(FD.tick))
+          GrDealID = ПолучитьСтрокуГрафика(avr_dlrq.rec.DocKind, avr_dlrq.rec.DocID, IIF(avr_dlrq.rec.DealPart == 1, DLGR_TEMPL_DEPODRAFTCONTR, DLGR_TEMPL_DEPODRAFTCONTR2));
+          if(GrDealID)
+            ExecMacroFile("dpdrutl.mac", "SP_GetDraftAmount", GrDealID, DraftAmount, DL_DLGRDEAL, GrDealID);
+   
+            if( DraftAmount < avr_dlrq.rec.Amount )
+               MsgBox("Нет отчетов об исполнении всех поручений депо данной сделки");
+               return false;
+            elif( DraftAmount > avr_dlrq.rec.Amount )
+               MsgBox("Количество ц/б в исполненных поручениях депо больше, чем в сделке");
+               return false;
+            end;
+          end;
+        end;
+     else
+        MsgBox("Не сформировано поручение по ТО");
+        return false;
+     end; 
+  end; 
+
+  return true;
+end;
+
+/*Тут немного не по проекту, т.к. так уже реализовано и работает.*/
+MACRO ВыполнитьЭкспортПорученияДепо( firstdoc, avr_dlrq, OperDate, IsReject, PrevDraft, FD )
+   return InsertDepoDraft( firstdoc, avr_dlrq, OperDate, IsReject, PrevDraft, FD );
+END;
+
+private macro СформироватьПоручениеДепо( firstdoc, avr_dlrq, OperDate, IsReject, PrevDraft, FD )
+  var state, Number = "";
+
+  if( (avr_dlrq.rec.State == DLRQ_STATE_EXEC) and (avr_dlrq.rec.Netting == SET_CHAR)) /*если платеж закрыт без движения*/
+     if (ExistDepoDraft(avr_dlrq, state, Number))
+        if (((state == 2) or /*открытое*/
+             (state == 3)    /*закрытое*/
+            ) and
+            (DL_KindLinkCustody == DL_KINDLINKCUSTODY_DOUBWITHSYNCANDCTRL)
+           )
+           MsgBox("Необходимо откатить исполнение поручения депо № " + Number + ", сформированного по платежу, включенному в неттинг");
+           return false;
+        else
+           MsgBox("Необходимо отменить поручение депо № " + Number + ", сформированное по платежу, включенному в неттинг");
+        end;
+     end;
+  else
+     if (ExistDepoDraft(avr_dlrq, state, Number))
+        if(not ПроверитьПараметрыПорученияДепо(avr_dlrq))
+           return false;
+        end;
+        MsgBox("Поручение депо № " + Number + " уже сформировано");
+     else
+        return ВыполнитьЭкспортПорученияДепо(firstdoc, avr_dlrq, OperDate, IsReject, PrevDraft, FD);
+     end;
+
+  end;
+  return true;
+end;
+
+/*PrevDraft = true - признак - предв. поручение.*/
+MACRO ВыполнитьФормированиеПорученийДепо( firstdoc, avr_dlrq, OperDate, IsReject, PrevDraft, FD )
+/*тут всякие навороты будут после реализации внетренни сделок. А пока просто вызов.*/
+   return СформироватьПоручениеДепо( firstdoc, avr_dlrq, OperDate, IsReject, PrevDraft, FD );
+END;
+
+
+PRIVATE MACRO ВыполнитьНатуральныйУчетЦенныхБумагПоТО( FD, dat, avr_dlrq )
+   
+  if(avr_dlrq.rec.Netting != SET_CHAR)
+
+    if( not( ( (not FD.IsTrust()) AND (IsClientDeal(FD.tick.rec)) AND (КлиентПоСделкеВНашемБанке( FD.tick.rec.ClientID, avr_dlrq.rec.DocKind, avr_dlrq.rec.DocID, avr_dlrq.rec.DocID, avr_dlrq.rec.Type ) == false) ) /*сделка БОЦБ клиентская, и счет получателя в платеже открыт не в нашем банке*/ 
+             OR
+             ( FD.IsTrust() AND /*(TS_CustodyAccounting == DL_CUSTODYACCOUNTING_NO) AND*/ (ДепозитарийКонтрагентаТО(avr_dlrq) != {OurBank}) ) /*сделка с ц/б ДУ, депо.учет не ведется, счет контрагента не в нашем банке */
+           )
+      )
+          if( (IsEXCHANGE( FD.Group ) OR IsBROKER( FD.Group ) ) AND 
+              (ДепозитарийКонтрагентаТО(avr_dlrq) == {OurBank} )
+            ) 
+//             MsgBox( "Депозитарий контрагента ТО по поставке не должен быть нашим банком." );
+//             return 1;
+          end;
+    end; 
+
+    if(УстановитьСтатусТО(avr_dlrq, DLRQ_STATE_EXEC, dat) != 0)
+      return 1;
+    end;
+  end;
+
+  return 0; 
+END;
+
+MACRO ВыполнитьНатуральныйУчетЦенныхБумаг( FD, Doc, dat, AvrDlRq )
+  var RetVal = 0;
+
+  if( AvrDlRq )
+     var avr_dlrq = TRecHandler("dlrq");
+     copy( avr_dlrq, AvrDlRq );
+     RetVal = ВыполнитьНатуральныйУчетЦенныхБумагПоТО(FD, dat, avr_dlrq);
+  else
+     var ArrFIID = FD.RQGetArrFIID(DLRQ_TYPE_DELIVERY);
+     var j:integer = 0;
+     while( (j < ArrFIID.size) and (RetVal == 0) )
+        RetVal = ВыполнитьНатуральныйУчетЦенныхБумагПоТО(FD, dat, FD.GetRQ(DLRQ_TYPE_DELIVERY, NULL, ArrFIID(j)));
+        j = j + 1;
+     end;
+  end;
+
+  return RetVal;
+END;
+
+/* Разблокирование счета при отказе от 2 части Репо
+   Выполняется в сделках Репо покупка при отказе от 2 части, если установлен признак 
+   "блокирован" и лот первой ч. поставлен и остаток на нем не 0.*/
+MACRO УчетДвиженияЦенныхБумагПриОтказе( FD, Doc, dat )
+  return 0; 
+END;
+
+/*dat - дата поставки*/
+MACRO УчетДвиженияЦенныхБумаг( FD, Doc, dat )
+  var DlRq = TRecHandler("dlrq.dbt");
+
+  DlRq = FD.GetRQ(DLRQ_TYPE_DELIVERY);
+
+  if( FD.tick.rec.BofficeKind != DL_INVESTSHARE ) /*у паев нет просрочек и НКД*/
+     if( ПроверитьТОНаПросроченность( DlRq, "поставке" ) == false )
+        return false;
+     end;
+
+     /*Обновляем только dl_leg без платежей по курсу даты поставки*/
+     if( not СконвертироватьСуммыСделки(FD, dat, false) )
+        return false;
+     end;
+  end;
+
+  if(DlRq.rec.Netting == UNSET_CHAR)
+    if( ВыполнитьНатуральныйУчетЦенныхБумаг( FD, Doc, dat, NULL ) != 0 )
+       return false;
+    end;
+    
+  end;
+
+  return true; 
+END;
+
+PRIVATE MACRO УстановитьНачальныйСтатусСделкиРЕПО( FD:SPFirstDoc ):INTEGER
+
+  if( FD != NULL ) // единичное исполнение
+     var LegOperState = DL_LEG_INITIAL;
+     if( (not IsBasket(FD.Group) ) OR IsLoan(FD.Group) )
+       if((not IsClientDeal(FD.tick.rec)) and (FD.DateArray[DATE_DEALDATE] != FD.DateArray[DATE_DEALPAY]))
+          LegOperState = DL_LEG_OUTBAL;
+       end;
+     end;
+
+     if( not ОбновитьСтатусЧастиСделки( FD.dl_leg, LegOperState ) )
+        msgbox("Ошибка при изменении статуса сделки");
+        return 1;
+     end;
+  else // массовое исполнение (корзин тут не бывает)
+     if( SP_Mass_SaveLegStatus( NULL ) != 0 )
+        return 1;
+     end;
+ 
+        if( SP_Mass_UpdateLegStatus( NULL, DL_LEG_INITIAL ) != 0 )
+           return 1;
+        end;
+  end;
+
+  return 0;
+END;
+
+MACRO УстановитьНачальныйСтатусСделки( FD:SPFirstDoc ):INTEGER
+
+  if( FD != NULL ) // единичное исполнение
+     VAR LegOperState;
+
+     if( (not IsClientDeal(FD.tick.rec)) and 
+         (FD.DateArray[DATE_DEALDATE] != FD.DateArray[DATE_DEALSETAVOIRISS]) and 
+         (FD.DateArray[DATE_DEALDATE] != FD.DateArray[DATE_DEALPAY])
+       )
+        LegOperState = DL_LEG_OUTBAL;
+     else
+        LegOperState = DL_LEG_INITIAL;
+     end;
+
+     if( not ОбновитьСтатусЧастиСделки( FD.dl_leg, LegOperState ) )
+        msgbox("Ошибка при изменении статуса сделки");
+        return 1;
+     end;
+  else // массовое исполнение
+
+     if( SP_Mass_SaveLegStatus( NULL ) != 0 )
+        return 1;
+     end;
+
+     if( SP_Mass_UpdateLegStatus( "Deals.t_ClientID = -1 AND Deals.t_DealDate != Deals.t_DealSetAvoiriss AND Deals.t_DealDate != Deals.t_DealPay", DL_LEG_OUTBAL ) != 0 )
+        return 1;
+     end;
+
+     if( SP_Mass_UpdateLegStatus( "not ( Deals.t_ClientID = -1 AND Deals.t_DealDate != Deals.t_DealSetAvoiriss AND Deals.t_DealDate != Deals.t_DealPay)", DL_LEG_INITIAL ) != 0 )
+        return 1;
+     end;
+  end;
+
+  return 0;
+END;
+
+MACRO УстановитьНачальныйСтатусСписанияЗачисления( FD:SPFirstDoc ):INTEGER
+
+  if( FD != NULL ) // единичное исполнение
+     if( not ОбновитьСтатусЧастиСделки(FD.dl_leg, DL_LEG_FORM) )
+        msgbox("Ошибка при изменении статуса сделки");
+        return 1;
+     end;
+     if ((FD.tick.rec.BofficeKind == DL_AVRWRT) and (Index(SC_GetSysTypes(FD.tick.rec.DealType), "T") > 0))
+       ConnectObjAttr(null, OBJTYPE_SECDEAL, UniID( FD.tick, OBJTYPE_SECDEAL ), 210, 1);
+     end;
+  else // массовое исполнение
+     if( SP_Mass_SaveLegStatus(NULL) != 0 )
+        return 1;
+     end;
+     if( SP_Mass_UpdateLegStatus(NULL, DL_LEG_FORM) != 0 )
+        return 1;
+     end;
+     if (SP_Mass_ExecDealInTaxAttr() != 0)
+        return 1;
+     end;
+     if (SP_Mass_SaveDealInTaxAttr() != 0)
+        return 1;
+     end;
+  end;
+
+  return 0;
+END;
+
+MACRO УстановитьНачальныеДатыСделки( FD:SPFirstDoc ):INTEGER
+
+  if( FD != NULL ) // единичное исполнение
+     DefineOprDate( FD.GetKindDate(DATE_DEALDATE),        FD.DateArray[DATE_DEALDATE]         );
+     DefineOprDate( FD.GetKindDate(DATE_DEALSETAVOIRISS), FD.DateArray[DATE_DEALSETAVOIRISS]  );
+     DefineOprDate( FD.GetKindDate(DATE_DEALPAY),         FD.DateArray[DATE_DEALPAY]          );
+     DefineOprDate( FD.GetKindDate(DATE_DEALBEGINEXEC),   FD.DateArray[DATE_DEALBEGINEXEC]    );
+
+  else // массовое исполнение
+    VAR OperDate = SP_MassOperDate();
+
+    OperDate.Insert( DATE_DEALDATE,        "t_DealDate" );
+    OperDate.Insert( DATE_DEALSETAVOIRISS, "t_DealSetAvoiriss" );
+    OperDate.Insert( DATE_DEALPAY,         "t_DealPay" );
+    OperDate.Insert( DATE_DEALBEGINEXEC,   "t_DealBeginExec" );
+
+    return OperDate.Execute( "Шаг настройки операции. Установка планируемых дат операций." );
+  end;
+
+  return 0;
+END;
+
+MACRO УстановитьНачальныйСтатусОперации( FD:SPFirstDoc ):INTEGER
+
+  if( FD != NULL ) // единичное исполнение
+    if( IsBROKER(FD.Group) OR (FD.DateArray[DATE_DEALSETAVOIRISS] != FD.DateArray[DATE_DEALPAY]) )
+      if( not InsertOprStatus( SP_OPERSTATUS_SECURDEALS_O1, SP_OPERSTATUS_SECURDEALS_O1_PAY) ) 
+         msgbox( "Ошибка при установке статуса <Оплата> операции" );
+         return 1;
+      end;
+
+      if( not InsertOprStatus( SP_OPERSTATUS_SECURDEALS_P1, SP_OPERSTATUS_SECURDEALS_P1_SET) ) 
+         msgbox( "Ошибка при установке статуса <Поставка> операции" );
+         return 1;
+      end;
+    else
+      if( not InsertOprStatus( SP_OPERSTATUS_SECURDEALS_I1, SP_OPERSTATUS_SECURDEALS_I1_RUN) ) 
+         msgbox( "Ошибка при установке статуса <Исполнить> операции" );
+         return 1;
+      end;
+    end;
+
+  else // массовое исполнение
+    VAR OperStatus = SP_MassOperStatus();
+
+    OperStatus.Insert( SP_OPERSTATUS_SECURDEALS_O1, SP_OPERSTATUS_SECURDEALS_O1_PAY, "t_DealSetAvoiriss != t_DealPay" );
+    OperStatus.Insert( SP_OPERSTATUS_SECURDEALS_P1, SP_OPERSTATUS_SECURDEALS_P1_SET, "t_DealSetAvoiriss != t_DealPay" );
+
+    OperStatus.Insert( SP_OPERSTATUS_SECURDEALS_I1, SP_OPERSTATUS_SECURDEALS_I1_RUN, "t_DealSetAvoiriss  = t_DealPay" );
+
+    return OperStatus.Execute( "Шаг настройки операции. Установка статуса операций." );
+  end;
+
+  return 0;
+END;
+
+
+PRIVATE MACRO SetDate( vFD:SPFirstDoc, KindDate:INTEGER, ValuKindDate:INTEGER )
+  if( (vFD.DateArray[ValuKindDate] != NULL) AND (vFD.DateArray[ValuKindDate] != DATE(0,0,0)) )
+     DefineOprDate( vFD.GetKindDate(KindDate), vFD.DateArray[ValuKindDate] );
+  end;
+END;
+
+PRIVATE MACRO УстановитьНачальныеДатыСделкиРЕПО( FD:SPFirstDoc, FD2:SPFirstDoc ):INTEGER
+
+  if( FD != NULL ) // единичное исполнение
+
+     SetDate( FD, DATE_DEALDATE,        DATE_DEALDATE        );
+     SetDate( FD, DATE_DEALEXEC,        DATE_DEALEXEC        );
+     SetDate( FD, DATE_DEALCOMISS,      DATE_DEALCOMISS      );
+     SetDate( FD, DATE_DEALSETAVOIRISS, DATE_DEALSETAVOIRISS );
+     SetDate( FD, DATE_DEALPAY,         DATE_DEALPAY         );
+     SetDate( FD, DATE_DEALBEGINEXEC,   DATE_DEALBEGINEXEC   );
+     DefineOprDate( FD.GetKindDate(DATE_DEALEEND),        maxDate( maxDate(FD.DateArray[DATE_DEALPAY], FD.DateArray[DATE_DEALSETAVOIRISS]), maxDate(FD.DateArray[DATE_DEALCOMISS], FD.DateArray[DATE_DEALAVANCE]) ) );
+     SetDate( FD, DATE_DEALPAY_PC,      DATE_DEALPAY_PC      );
+     SetDate( FD, DATE_DEALTRANSFER,    DATE_DEALDATE        );
+     SetDate( FD, DATE_DEALDEPOSIT,     DATE_DEALDEPOSIT     );
+     SetDate( FD, DATE_DEALAVANCE,      DATE_DEALAVANCE      );
+     SetDate( FD, DATE_DEALBEGIN_2,     DATE_DEALBEGIN_2     );
+     SetDate( FD2, DATE_DEALEXEC,          DATE_DEALEXEC );
+     SetDate( FD2, DATE_DEALSETAVOIRISS,   DATE_DEALSETAVOIRISS  );
+     SetDate( FD2, DATE_DEALPAY,           DATE_DEALPAY          );
+     SetDate( FD2, DATE_DEALBEGINEXEC,     DATE_DEALBEGINEXEC    );
+     SetDate( FD2, DATE_DEALOUTBAL_2,      DATE_DEALOUTBAL_2     );
+     SetDate( FD2, DATE_DEALTRANSFER,      DATE_DEALOUTBAL_2     );
+     SetDate( FD2, DATE_DEALDEPOSIT,       DATE_DEALDEPOSIT      );
+     SetDate( FD2, DATE_DEALAVANCE,        DATE_DEALAVANCE       );
+     DefineOprDate( FD2.GetKindDate(DATE_DEALEEND),        maxDate( maxDate(FD2.DateArray[DATE_DEALPAY], FD2.DateArray[DATE_DEALSETAVOIRISS]), maxDate(FD2.DateArray[DATE_DEALCOMISS], FD2.DateArray[DATE_DEALAVANCE]) ) );
+     DefineOprDate( FD2.GetKindDate(DATE_DEALCLOSE),       maxDate( maxDate(FD2.DateArray[DATE_DEALPAY], FD2.DateArray[DATE_DEALSETAVOIRISS]), maxDate(FD2.DateArray[DATE_DEALCOMISS], FD2.DateArray[DATE_DEALAVANCE]) ) );
+
+  else // массовое исполнение (только биржевые сделки)
+    VAR OperDate = SP_MassOperDate();
+
+    OperDate.Insert( DATE_DEALDATE,        "t_DealDate" );
+    OperDate.Insert( DATE_DEALEXEC,        "t_DealSetAvoiriss" );
+    OperDate.Insert( DATE_DEALSETAVOIRISS, "t_DealSetAvoiriss" );
+    OperDate.Insert( DATE_DEALPAY,         "t_DealPay" );
+    OperDate.Insert( DATE_DEALBEGINEXEC,   "t_DealBeginExec" );
+    OperDate.Insert( DATE_DEALCOMISS,      "t_DealComiss" );
+    OperDate.Insert( DATE_DEALTRANSFER,    "t_DealDate" );
+    OperDate.Insert( DATE_DEALEEND,        "t_DealEnd" );
+
+    OperDate.Insert_2( DATE_DEALBEGIN_2,       "t_DealBegin_2" );       
+    OperDate.Insert_2( DATE_DEALEXEC_2,        "t_DealSetAvoiriss_2" ); 
+    OperDate.Insert_2( DATE_DEALSETAVOIRISS_2, "t_DealSetAvoiriss_2" );
+    OperDate.Insert_2( DATE_DEALPAY_2,         "t_DealPay_2" );
+    OperDate.Insert_2( DATE_DEALBEGINEXEC_2,   "t_DealBeginExec_2" );
+    OperDate.Insert_2( DATE_DEALOUTBAL_2,      "t_DealBegin_2" ); /*см. ДатаПостановкиНаВнебалансВторойЧасти*/
+    OperDate.Insert_2( DATE_DEALTRANSFER_2,    "t_DealBegin_2" ); /*= DATE_DEALOUTBAL_2*/
+    OperDate.Insert_2( DATE_DEALEEND_2,        "t_DealEnd_2" );
+    OperDate.Insert_2( DATE_DEALCLOSE,         "t_DealEnd_2" );
+
+    return OperDate.Execute( "Шаг настройки операции. Установка планируемых дат операций РЕПО." );
+  end;
+
+  return 0;
+END;
+
+MACRO ИнициализироватьОперациюРЕПО( FD:SPFirstDoc, FD2:SPFirstDoc ):BOOL
+
+  if( УстановитьНачальныеДатыСделкиРЕПО( FD, FD2 ) != 0 )
+     return false;
+  end;
+
+  if( УстановитьНачальныйСтатусСделкиРЕПО( FD ) != 0 )
+     return false;
+  end;
+
+  return true;
+
+END;

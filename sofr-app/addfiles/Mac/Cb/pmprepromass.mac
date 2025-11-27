@@ -1,0 +1,265 @@
+/*
+ $Name: pmprepromass.mac
+ $Module: Ядро Banking
+ $Description: Массовое выполнение шагов "Предобработка"
+*/
+
+import CTInter, PaymInter, oralib, likepy, pm_common, pmfm, "bnk_common.mac";
+
+private const SET_CHAR   = "X";
+private const UNSET_CHAR = "";
+
+macro PutLog( msg:string )
+  /*SetOutput( "c:\\preprocess.log" );
+  println( msg );
+  SetOutput( "" );*/
+end;
+
+/* Отвергнуть платёж и исключить из дальнейших проверок.
+   До транзакции или внутри неё. */
+
+private macro PM_MakePaymentRejected( p_PaymentID:integer, p_RejectGround:string )
+  
+  var query:string = "update dpmprepro_tmp "
+                     "set t_Reject = 'X', "
+                         "t_RejectGround = :RejectGround, "
+                         "t_SkipCheck = 'X' "
+                     "where t_PaymentID = :PaymentID";
+  var params:TArray = TArray;
+  params[0] = SQLParam( "RejectGround", p_RejectGround );
+  params[1] = SQLParam( "PaymentID"   , p_PaymentID    );
+  execSQL( query, params );
+
+end;
+
+/* Простановка примечания "Причина отказа" для отвергнутых или отправленных на ручную обработку платежей.
+   Живёт здесь, пока на PL/SQL нет функциональности для работы с примечаниями.
+   Внутри транзакции. */
+
+private macro PM_MassSetNotesForRejected(IsWlIncoming : bool)
+
+  var NotWlIn : bool = true;
+  if(IsWlIncoming)
+    NotWlIn = false;
+  end;
+
+  var query:string = "select t.t_OrderID " +
+       IfThenElse(NotWlIn, ",pre.t_RejectGround ", ",pre.t_ManualGround ") +
+                           ",t.t_ID_Operation "
+                           ",t.t_ID_Step "
+                       "from V_PMMASSOP t, " +
+        IfThenElse(NotWlIn, "dpmprepro_tmp pre ", "dwlpmprep_tmp pre ") +
+                      "where t.t_SkipDocument = 0 "
+                        "and t.t_ErrorStatus  = 0 "
+                        "and pre.t_PaymentID  = t.t_OrderID " +
+    IfThenElse(NotWlIn, "and ( pre.t_RejectGround <> chr(1) and pre.t_RejectGround is not null )", 
+                        "and ( pre.t_PmState = 4  or pre.t_Manual = 'X' )");
+
+  var rs:RsdRecordset = execSQLselect( query );
+
+  while( rs.moveNext() )
+    var RejectGround : string = rs.Value(1);
+    
+    if( RejectGround and
+        AddNoteForObject( OBJTYPE_PAYMENT, 
+                          string( rs.Value(0):o:10 ),
+                          PM_NOTEKIND_DENIALGROUND, 
+                          RejectGround,
+                          {curdate},
+                          rs.Value(2),
+                          rs.Value(3) )
+      )
+      PM_SetErrorStatus( rs.Value(0), 1, "Ошибка при вставке примечания \"Причина отказа\"" );
+    end;
+
+  end;
+
+  return 0;
+end;
+
+private macro PM_MassSetTaxNotes()
+
+  var query:string = "select t.t_OrderID " +
+                           ",tax.t_Message " +
+                           ",t.t_ID_Operation "
+                           ",t.t_ID_Step "
+                       "from V_PMMASSOPFOREXE t, " +
+                           "dpmtax_tmp tax " +
+                      "where tax.t_PaymentID  = t.t_OrderID " +
+                        "and tax.t_Message != chr(1) " +
+                        "and not tax.t_Message is null ";
+
+  var rs:RsdRecordset = execSQLselect( query );
+
+  while( rs.moveNext() )
+    
+    if( AddNoteForObject( OBJTYPE_PAYMENT, 
+                          string( rs.Value(0):o:10 ),
+                          NOTEKIND_PAYM_TAXWARNING, 
+                          StrSubst(rs.Value(1), "|", "\n"),
+                          {curdate},
+                          rs.Value(2),
+                          rs.Value(3) ) )
+      PM_SetErrorStatus( rs.Value(0), 1, "Ошибка при вставке примечания \"Результат проверки налоговых реквизитов\"" );
+    end;
+
+  end;
+
+  return 0;
+end;
+
+private macro PM_MassSetCommunalNotes()
+  var errMsg = "Возможно на основании документа вносится плата за коммунальные услуги. Если это так, заполните реквизиты, необходимые для передачи сведений об оплате в ГИС ЖКХ.";
+  var err = 0;
+  var NotCheckRecipientValue = "";
+
+  GetRegistryValue( "CB\\PAYMENTS\\ГИС ЖКХ\\NotCheckRecipient", V_STRING, NotCheckRecipientValue, err );
+  StrSubst( NotCheckRecipientValue, ",", " " );
+  StrNormalization( NotCheckRecipientValue );
+  NotCheckRecipientValue = " " + NotCheckRecipientValue + " ";
+
+  if( not err )
+
+    var query:string = "select t.t_OrderID " +
+                             ",substr(log.t_Message, 26) " +
+                             ",log.t_ID_Operation " +
+                             ",log.t_ID_Step " +
+                             ",sr.t_HCSPayment " + 
+                         "from V_PMMASSOPFOREXE t, " +
+                              "dpmoprlog_tmp log, " +
+                              "dpmserv_dbt sr " +
+                        "where log.t_PaymentID  = t.t_OrderID " +
+                          "and log.t_ID_Operation = t.t_ID_Operation "
+                          "and log.t_ID_Step = t.t_ID_Step "
+                          "and sr.t_PaymentID = t.t_OrderID " +
+                          "and ( ( sr.t_HCSPayment = 'X' " +
+                                "and substr(log.t_Message, 1, 25) = 'Ошибки в реквизитах ЖКХ: ' ) " + 
+                                "or " 
+                                "( sr.t_HCSPayment = chr(0) " 
+                                "and exists ( "
+                                              " select 1" +
+                                              " from dpartyown_dbt" +  
+                                              " where  t_PartyKind = :PartyKind" +
+                                              "  and t_PartyID = " + 
+                                                               " ( select case "
+                                                                        " when pm.t_Receiver > 0 "
+                                                                        "   then pm.t_Receiver "
+                                                                        " when pm.t_Receiver <= 0" 
+                                                                        "   then (select pt.t_PartyID" +
+                                                                        "         from dpartcode_dbt code, dparty_dbt pt" +
+                                                                        "         where code.t_PartyID = pt.t_PartyID" +
+                                                                        "          and pt.t_LegalForm = :legalForm" +
+                                                                        "          and PM_SCRHLP.GetINN( code.t_Code ) =  PM_SCRHLP.GetINN( rm.t_ReceiverINN ) " +
+                                                                        "          and code.t_CodeKind = :CodeKind )" + 
+                                                                        " else -1"
+                                                                        " end as t_ReceiverID " +
+                                                                 " from dpmpaym_dbt pm, dpmrmprop_dbt rm" +  
+                                                                 " where pm.t_PaymentID = t.t_OrderID" +
+                                                                 "  and rm.t_PaymentID = pm.t_PaymentID" +
+                                                                 "  and instr(:NotCheckRecipient, (' ' || to_char(pm.t_PrimDocOrigin) || ' ') ) = 0" +
+                                                                 "  ) ) ) )";
+    var params = makeArray( SQLParam( "PartyKind", PTK_HCS_RECIEVER ), 
+                            SQLParam( "legalForm", PTLEGF_INST ),
+                            SQLParam( "CodeKind",  PTCK_INN ),
+                            SQLParam( "NotCheckRecipient", NotCheckRecipientValue ) );
+
+    var rs:RsdRecordset = execSQLselect( query );
+
+    while( rs.moveNext() )
+      if( rs.Value( "t_HCSPayment" ) == SET_CHAR )
+        if( AddNoteForObject( OBJTYPE_PAYMENT, 
+                              string( rs.Value(0):o:10 ),
+                              NOTEKIND_PAYM_HCSWARNING, 
+                              StrSubst(rs.Value(1), "|", "\n"),
+                              {curdate},
+                              rs.Value(2),
+                              rs.Value(3) ) )
+          PM_SetErrorStatus( rs.Value(0), 1, "Ошибка при вставке примечания \"Результат проверки реквизитов платежа ЖКХ\"" );
+        end;
+      else
+        if( AddNoteForObject( OBJTYPE_PAYMENT, 
+                              string( rs.Value(0):o:10 ),
+                              NOTEKIND_PAYM_HCSWARNING, 
+                              errMsg,
+                              {curdate},
+                              rs.Value(2),
+                              rs.Value(3) ) )
+          PM_SetErrorStatus( rs.Value(0), 1, "Ошибка при вставке примечания \"Результат проверки реквизитов платежа ЖКХ\"" );
+        end;
+      end;
+    end;
+
+  end;
+
+  return 0;
+end;
+
+private macro PM_MassSetGisGmpNotes()
+  var err = 0;
+
+  var query:string = "select t.t_OrderID as t_OrderID " +
+                           ",substr(log.t_Message, 26) t_Message " +
+                           ",log.t_ID_Operation as t_ID_Operation " +
+                           ",log.t_ID_Step as t_ID_Step " +
+                       "from V_PMMASSOPFOREXE t, " +
+                            "dpmoprlog_tmp log " +
+                      "where log.t_PaymentID  = t.t_OrderID " +
+                        "and log.t_ID_Operation = t.t_ID_Operation "
+                        "and log.t_ID_Step = t.t_ID_Step "
+                        "and substr(log.t_Message, 1, 25) = 'Ошибки в реквизитах ГИС ГМП: ' "; 
+
+  var rs:RsdRecordset = execSQLselect( query );
+
+  while( rs.moveNext() )
+    if( AddNoteForObject( OBJTYPE_PAYMENT, 
+                          string( rs.Value("t_OrderID"):o:10 ),
+                          NOTEKIND_PAYM_GISGMP_CHECK_RES, 
+                          StrSubst(rs.Value("t_Message"), "|", "\n"),
+                          {curdate},
+                          rs.Value("t_ID_Operation"),
+                          rs.Value("t_ID_Step") ) )
+      PM_SetErrorStatus( rs.Value("t_OrderID"), 1, "Ошибка при вставке примечания \"Результат проверки реквизитов платежа в ГИС ГМП\"" );
+    end;
+  end;
+
+  return 0;
+end;
+
+/* -----------------------------------------------------------------------------
+   Общие для платежей предтранзакционные действия.
+   ----------------------------------------------------------------------------- */
+MACRO PM_MassPreproPrepare():integer
+  
+  var stat = MassCheckTerrorPrepare(); // Проверки на терроризм
+
+  return stat;
+
+END;
+
+/* -----------------------------------------------------------------------------
+   Общие для платежей транзакционные действия.
+   ----------------------------------------------------------------------------- */
+MACRO PM_MassPreproExecute(IsWlIncoming : bool):integer
+
+  //Простановка примечания "Причина отказа" для отвергнутых платежей.
+  var stat = PM_MassSetNotesForRejected(IsWlIncoming);
+
+  if(not IsWlIncoming and (stat == 0))
+    stat = PM_MassSetTaxNotes();
+  end;
+
+  if(not IsWlIncoming and (stat == 0))
+    stat = PM_MassSetCommunalNotes();
+  end;
+
+  if(not IsWlIncoming and (stat == 0))
+    stat = PM_MassSetGisGmpNotes();
+  end;  
+
+  if(stat == 0)
+    stat = MassCheckTerrorExecute(IsWlIncoming); // Проверки на терроризм
+  end;
+
+  return 0;
+
+END;

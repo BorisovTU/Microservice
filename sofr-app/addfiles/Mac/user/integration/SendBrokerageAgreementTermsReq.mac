@@ -1,0 +1,1012 @@
+/**
+ @file SendBrokerageAgreementTermsReq.mac
+ @brief Функционал обработки запроса от ДБО Свой Бизнес по обновлению данных договоров в СОФР
+ 
+ Файл содержит функционал для обработки запроса от ДБО Свой Бизнес по обновлению данных договоров в СОФР 
+ (запрос SendBrokerageAgreementTermsReq).
+ 
+  # tag
+ - functional_block:Интеграция
+ - code_type:API
+ - Ведение договоров ЮЛ
+ - SendBrokerageAgreementTermsReq
+ - Квалифицированный инвестор
+ 
+  # changeLog
+ |date       |author         |tasks                                                     |note                                                        
+ |-----------|---------------|----------------------------------------------------------|-------------------------------------------------------------
+ |01.09.2025 |Топорков Д.В.  |BOSS-5842                                                 | Создание
+ */
+import "rs_json.mac";
+import "err_handl.mac";
+import "it_utils.mac";
+import "rshb_lib.mac";
+import "dlcontrfunc.mac";
+import "func_lib.mac";
+
+private const BROKERAGRTERMS_REQ_STATE_NEW              = 0, // Новый запрос на создание/обновление договора
+              BROKERAGRTERMS_REQ_STATE_SENDANSWER       = 1, // Отправка ответа о результатах обработки ответа
+              BROKERAGRTERMS_REQ_STATE_DEPOWAIT         = 2, // Ожидание счетов ДЕПО
+              BROKERAGRTERMS_REQ_STATE_SUPPORTINFORMING = 8, // Отправка ошибок сопровождению
+              BROKERAGRTERMS_REQ_STATE_DONE             = 9; // Обработка завершена
+
+private const PTCK_CFT = 101;
+
+private const SERV_SUBKIND_STOCK      = 8,
+              SERV_SUBKIND_STOCK_OVER = 9;
+
+private const REFERENCE_CONTRACTCODE_IN_ACCOUNT = 127,
+              CONTRACT_CATEGORY_NOTE44 = 126,
+              CATEGORY_VALUE_YES = 1,
+              CATEGORY_VALUE_NO = 2,
+              SUBCONTRACT_CATEGORY_GRANT_BROKER_RIGHTS = 6,    // Предоставлять брокеру право использования ценных бумаг в его интересах
+              SUBCONTRACT_CATEGORY_TRANSFERRED_TO_NEW_TKS = 7, // Перевод активов на новый номер ТКС произведен
+              SUBCONTRACT_CATEGORY_SEPARATE_ACCOUNTING = 8;    // Заявление клиента о переводе на обособленный учет
+              
+private const MOEXMarketID = ПолучитьБиржуПоВидуКодаДБО(DLCCK_USC),
+              SPBMarketID  = ПолучитьБиржуПоВидуКодаДБО(DLCCK_SPB_BIDCODE);
+
+/**
+@brief Класс ошибки
+*/
+private class CError(messageText)
+  var message = messageText;
+end;
+
+/**
+@brief Функция IIF
+*/
+private macro IIF(condition, valueOnTrue, valueOnFalse)
+  if (condition)
+    return valueOnTrue;
+  end;
+  return valueOnFalse;
+end;
+
+private macro RunErrorEx(message)
+  RunError(message, CError(message));
+end;
+
+/**
+@brief Класс с данными по валюте
+*/
+private class CCurrency(pFIID, pISOCode)
+  var FIID = pFIID;
+  var ISOCode = pISOCode;
+end;
+
+/**
+@brief Класс с массивом соответствий ISO код + FIID по валютам
+*/
+private class CCurrencyInfo()
+  private var currencies = TArray();
+  
+  private macro LoadCurrencyInfo(FIID, ISOCode)
+    var param, value;
+    var sql = "SELECT t_FIID, t_FI_Code " +
+                "FROM dFininstr_dbt " +
+               "WHERE t_FI_Kind = 1 ";
+    if ((ValType(ISOCode) == V_STRING) and (StrLen(ISOCode) > 0))
+      sql = sql + "AND t_FI_Code = :ficode";
+      param = "ficode";
+      value = ISOCode;
+    else
+      sql = sql + "AND t_FIID = :fiid";
+      param = "fiid";
+      value = FIID;
+    end;
+    
+    var cmd = RsdCommand(sql);
+    cmd.AddParam(param, RSDBP_IN, value);
+    
+    var rs = RsdRecordSet(cmd);
+    if (rs.MoveNext())
+      currencies(currencies.size) = CCurrency(rs.Value("t_FIID"), rs.Value("t_FI_Code"));
+    else
+      RunErrorEx("Валюта не найдена (FIID " + String(FIID) + ", FI_Code " + String(ISOCode));
+    end;
+  end;
+  
+  macro GetFIID(ISOCode)
+    var idx = 0;
+    while (idx < currencies.size)
+      if (currencies(idx).ISOCode == ISOCode)
+        return currencies(idx).FIID;
+      end;
+      
+      idx = idx + 1;
+    end;
+    
+    idx = currencies.size;
+    LoadCurrencyInfo(null, ISOCode);
+    return currencies(idx).FIID;
+  end;
+  
+  macro GetISOCode(FIID)
+    var idx = 0;
+    while (idx < currencies.size)
+      if (currencies(idx).FIID == FIID)
+        return currencies(idx).ISOCode;
+      end;
+      
+      idx = idx + 1;
+    end;
+    
+    idx = currencies.size;
+    LoadCurrencyInfo(FIID, null);
+    return currencies(idx).ISOCode;
+  end;
+  
+  private macro Init()
+    LoadCurrencyInfo(null, "810");
+    LoadCurrencyInfo(null, "840");
+  end;
+  
+  Init();
+end;
+
+private var CurrencyInfo = CCurrencyInfo();
+
+/**
+@brief Класс с данными по торговой площадке договора
+*/
+private class CTradingPlatform(pSfContrID, pServKind, pSubKind, pMarketID, pContractAccountFIIDs)
+  var sfContrID = pSfContrID;
+  var servKind = pServKind;
+  var subKind = pSubKind;
+  var marketID = pMarketID;
+  var contractAccountFIIDs = pContractAccountFIIDs; // Строка - список валют по которым открыты счета для субдоговора (в виде ",0,"  ",0,7,"  и т.д.)
+end;
+
+/**
+@brief Класс параметров торговой площадки в зависимости от кода ТП
+*/
+private class CTradingPlatformParams(tradingPlatformCode)
+  var servKind;
+  var subKind;
+  var marketID;
+  
+  private macro Init(tradingPlatformCode)
+    if (tradingPlatformCode == "MMVB")
+      servKind = PTSK_STOCKDL;                //Вид обслуживания - фондовый рынок
+      subKind  = SERV_SUBKIND_STOCK;          //Подвид площадки  - биржа
+      marketID   = MOEXMarketID;              //Идентификатор биржи
+    elif (tradingPlatformCode == "VNEB")
+      servKind   = PTSK_STOCKDL;              //Вид обслуживания - фондовый рынок
+      subKind    = SERV_SUBKIND_STOCK_OVER;   //Подвид площадки  - внебиржа
+      marketID   = -1;                        //Идентификатор биржи
+    elif (tradingPlatformCode == "SPB")
+      servKind   = PTSK_STOCKDL;              //Вид обслуживания - фондовый рынок
+      subKind    = SERV_SUBKIND_STOCK;        //Подвид площадки  - биржа
+      marketID   = SPBMarketID;               //Идентификатор биржи
+    elif (tradingPlatformCode == "FORTS")
+      servKind   = PTSK_DV;                   //Вид обслуживания - срочные контракты
+      subKind    = SERV_SUBKIND_STOCK;        //Подвид площадки  - биржа
+      marketID   = MOEXMarketID;              //Идентификатор биржи
+    elif (tradingPlatformCode == "VAL")
+      servKind   = PTSK_CM;                   //Вид обслуживания - валютный рынок
+      subKind    = SERV_SUBKIND_STOCK;        //Подвид площадки  - биржа
+      marketID   = MOEXMarketID;              //Идентификатор биржи
+    else
+      RunErrorEx("Неизвестный код торговой площадки " + tradingPlatformCode);
+    end;
+  end;
+  
+  Init(tradingPlatformCode);
+end;
+
+/**
+@brief Начать транзакцию
+*/
+private macro BeginTransaction()
+  if (not rslDefCon.isInTrans())
+    rslDefCon.beginTrans();
+  end;
+end;
+
+/**
+@brief Завершить транзакцию с учетом статуса выполнения
+*/
+private macro EndTransaction(stat)
+  if (not RslDefCon.IsInTrans())
+    return;
+  end;
+  
+  if (ValType(stat) == V_UNDEF)
+    stat = false;
+  end;
+  
+  if ((stat == true) or (stat == 0))
+    RslDefCon.CommitTrans();
+  else
+    RslDefCon.RollbackTrans();
+  end;
+end;
+
+/**
+@brief Получить значение кода договора в номере счета
+*/
+private macro GenerateAccCode()
+  var code;
+  GenerateReference(REFERENCE_CONTRACTCODE_IN_ACCOUNT, code);
+  return code;
+end;
+
+/**
+@brief Получить новый субдоговор по коду торговой площадки
+*/
+private macro GetSubContrParamsByTradingPlatformCode(dlContrPrm, EKK, tradingPlatformCode)
+  var dlContrMp = TRecHandler("dlcontrsubprm.rec");
+  var tradingPlatformParams = CTradingPlatformParams(tradingPlatformCode);
+  
+  dlContrMp.Clear();
+  dlContrMp.rec.Role = 2;                                        //Роль ПУРЦБ
+  dlContrMp.rec.MPCode     = "";                                 //Краткий код клиента, данный при регистрации на торговой площадке биржи
+  dlContrMp.rec.MPRegDate  = {curdate};                          //Дата регистрации клиента на площадке
+  dlContrMp.rec.AccCode    = GenerateAccCode();                  //Код в номере счета
+  dlContrMp.rec.DateConc   = {curdate};                          //Дата заключения
+  dlContrMp.rec.DateBegin  = {curdate};                          //Дата начала
+  dlContrMp.rec.SfPlanID   = dlContrPrm.rec.PlanID;              //Идентификатор тарифного плана
+  dlContrMp.rec.Name       = dlContrPrm.rec.Name;                //Название
+  dlContrMp.rec.FirmID     = "";                                 //Код фирмы/участника торгов
+  dlContrMp.rec.ServKind   = tradingPlatformParams.servKind;     //Вид обслуживания
+  dlContrMp.rec.SubKind    = tradingPlatformParams.subKind;      //Подвид площадки
+  dlContrMp.rec.MarketID   = tradingPlatformParams.marketID;     //Идентификатор биржи
+  
+  if (tradingPlatformCode == "MMVB")
+    dlContrMp.rec.Number     = dlContrPrm.rec.Number + "_ф";     //Номер субдоговора
+    dlContrMp.rec.MPCode     = EKK;                              //Краткий код клиента, данный при регистрации на торговой площадке биржи
+  elif (tradingPlatformCode == "VNEB")
+    dlContrMp.rec.Number     = dlContrPrm.rec.Number + "_в";     //Номер субдоговора
+  elif (tradingPlatformCode == "SPB")
+    dlContrMp.rec.Number     = dlContrPrm.rec.Number + "_s";     //Номер субдоговора
+    dlContrMp.rec.MPCode     = EKK;                              //Краткий код клиента, данный при регистрации на торговой площадке биржи
+  elif (tradingPlatformCode == "FORTS")
+    dlContrMp.rec.Number     = dlContrPrm.rec.Number + "_с";     //Номер субдоговора
+    dlContrMp.rec.MPCode     = GeneratePersonalCode(dlContrPrm.rec.partyID, false, false, DO_SERVKIND_FORTS, false, "");
+    dlContrMp.rec.FirmID     = SubStr(dlContrMp.rec.MPCode,1,4); //Код фирмы/участника торгов
+  elif (tradingPlatformCode == "VAL")
+    dlContrMp.rec.Number     = dlContrPrm.rec.Number + "_v";     //Номер субдоговора
+    dlContrMp.rec.MPCode     = "CU" + EKK;                       //Краткий код клиента, данный при регистрации на торговой площадке биржи
+  end;
+  
+  return dlContrMp;
+end;
+
+/**
+@brief Класс с функционалом обработки запроса SendBrokerageAgreementTermsReq
+*/
+private class CBrokerAgrTermsReq(pRequestID)
+  private var requestID;
+  private var inputObject;
+  private var partyID = 0;
+  private var dlContrID = 0;
+  private var dlContrPrm = TRecHandler("dlcontrprm.rec");
+  private var subContrArr = TArray();
+  private var tradingPlatforms = TArray();
+
+  /**
+  @brief Найти клиента по ЦФТ ID, выполнить проверку соответствия полей с данными из json
+  */
+  private macro FindParty()
+    var CFTCode = inputObject.clientInfo.clientID.objectID;
+    var id = ПолучитьКодСубъекта(CFTCode, PTCK_CFT);
+    
+    if ((ValType(id) != V_INTEGER) or (id <= 0))
+      RunErrorEx("Не найден клиент с ЦФТ ID " + CFTCode);
+    end;
+    
+    var party = RSBParty(id);
+    if ((party.fullName != inputObject.clientInfo.fullName) or (party.shortName != inputObject.clientInfo.shortName))
+      RunErrorEx("Наименование клиента в карточке СОФР не совпадает с наименованием клиента в запросе");
+    end;
+    
+    if (party.legalForm != PTLEGF_INST)
+      RunErrorEx("Клиент с ЦФТ ID " + CFTCode + " не является юридическим лицом");
+    end;
+    
+    return id;
+  end;
+  
+  /**
+  @brief Найти действующий ДБО
+  */
+  private macro FindDlContr()
+    var cmd = RsdCommand("SELECT dl.t_dlContrID " +
+                           "FROM dSfContr_dbt sf, dDlContr_dbt dl " +
+                          "WHERE sf.t_partyID = :partyID " +
+                            "AND sf.t_dateClose = to_date('01.01.0001', 'DD.MM.YYYY') " +
+                            "AND sf.t_id = dl.t_sfContrID");
+    cmd.AddParam("partyID", RSDBP_IN, partyID);
+    var rs = RsdRecordSet(cmd);
+    
+    if (rs.MoveNext())
+      var id = rs.Value("t_dlContrID");
+      return id;
+    end;
+    
+    return -1;
+  end;
+  
+  /**
+  @brief Создать номер для ДБО
+  */
+  private macro GenerateContrNumber(department, EKK)
+    var result = "";
+    
+    if (StrIsNumber(department) and (department != "00"))
+      result = department + "-";
+    end;
+    
+    result = result + EKK;
+    
+    return result;
+  end;
+  
+  /**
+  @brief Найти код филиала по названию
+  */
+  private macro FindDepartmentCode(department)
+    var cmd = RsdCommand("SELECT t_code FROM dDp_dep_dbt WHERE t_Name = :name");
+    cmd.AddParam("name", RSDBP_IN, department);
+    var rs = RsdRecordSet(cmd);
+    
+    if (rs.MoveNext())
+      return rs.Value("t_code");
+    end;
+    
+    RunErrorEx("Не найден филиал '" + department + "'");
+  end;
+  
+  /**
+  @brief Найти тарифный план по номеру
+  */
+  private macro FindSfPlanIDByNum(num)
+    if ((num != "33") and (num != "34") and (num != "35"))
+      RunErrorEx("Некорректный тарифный план '" + String(num) +"' ожидается 33, 34, 35");
+    end;
+    
+    var cmd = RsdCommand("SELECT t_sfPlanID FROM dSfPlan_dbt WHERE t_num = :num");
+    cmd.AddParam("num", RSDBP_IN, Int(num));
+    var rs = RsdRecordSet(cmd);
+    
+    if (rs.MoveNext())
+      return rs.Value("t_sfPlanID");
+    end;
+    
+    RunErrorEx("Не найден тарифный план '" + num + "'");
+  end;
+  
+  /**
+  @brief Найти ID записи в массиве tradingPlatforms согласно параметров
+  */
+  private macro FindTradingPlatformID(tradingPlatformCode)
+    var tradingPlatformParams = CTradingPlatformParams(tradingPlatformCode);
+    var tpIdx = 0;
+    
+    while (tpIdx < tradingPlatforms.size)
+      if ((tradingPlatforms(tpIdx).servKind == tradingPlatformParams.servKind) and 
+          (tradingPlatforms(tpIdx).subKind  == tradingPlatformParams.subKind) and
+          (tradingPlatforms(tpIdx).marketID == tradingPlatformParams.marketID))
+        return tpIdx;
+      end;
+      
+      tpIdx = tpIdx + 1;
+    end;
+    
+    return -1;
+  end;
+  
+    /**
+  @brief Проверить переданные валюты до открытия договора
+  */
+  private macro CheckCurrencies(currencies)
+    var curIdx = 0;
+    
+    while (curIdx < currencies.size)
+      var currencyID = CurrencyInfo.GetFIID(currencies.Value(curIdx).tradingCurrencyCode);
+
+      curIdx = curIdx + 1;
+    end;
+  end;
+  
+  /**
+  @brief Заполнить параметры для открытия нового ДБО
+  */
+  private macro DefineContractParameters()
+    var party = RSBParty(partyID);
+    var EKK = GeneratePersonalCode(partyID, false, false, DO_SERVKIND_STOCKDL);
+    SetGlobalParameter("CodeContractEKK", EKK);
+    
+    ClearRecord(dlContrPrm);
+    dlContrPrm.rec.DLCONTRID = 0;                  //Идентификатор. При создании нового ДБО, если больше нуля, то установить = 0
+    dlContrPrm.rec.DEPARTMENT = FindDepartmentCode(inputObject.clientInfo.regionalBranches);   //Филиал. Если 0, то ошибка "Филиал должен быть задан"
+    dlContrPrm.rec.NUMBER = GenerateContrNumber(SubStr(inputObject.clientInfo.regionalBranches, 1, 2), EKK); //Номер договора.  Если не заполнен, то при вставке выделится автоматически
+    dlContrPrm.rec.ACCCODE = GenerateAccCode();    // Код в номере л/с. Если не заполнен, то при вставке выделится автоматически 
+    dlContrPrm.rec.NAME   = inputObject.clientInfo.shortName; //Название
+    dlContrPrm.rec.DATEBEGIN = {curdate};          //Дата открытия. Если 01.01.0001, то ошибка "Не задана дата открытия ДБО"
+    dlContrPrm.rec.PARTYID = partyID;              //Клиент. Если <= 0, то ошибка "Не задан идентификатор клиента". Если > 0, то найти запись в DPARTY_DBT, где DPARTY_DBT.rec.T_PARTYID = переданному значению. Если не найдена, то ошибка "Субъект с заданным идентификатором не найден".
+    dlContrPrm.rec.PLANID = FindSfPlanIDByNum(inputObject.tariff.tariffID); //Единый тарифный план. По умолчанию 0. Если не найдена, то ошибка "Указанный единый тарифный план не найден в списке тарифных планов".
+    dlContrPrm.rec.USESUBACC = StrFor(88);         //Признак "Открывать субсчета для брокерских счетов"
+    dlContrPrm.rec.IISFIRSTDATE = date(0,0,0);     //Дата открытия первого ИИС для клиента. Если T_IIS не задан, то 01.01.0001
+    dlContrPrm.rec.IISLASTOPENDATE = date(0,0,0);  //Дата открытия ИИС клиента у брокера. Если T_IIS не задан, то 01.01.0001
+    dlContrPrm.rec.IISLASTCLOSEDATE = date(0,0,0); //Дата закрытия ИИС клиента у брокера. Если T_IIS не задан, то 01.01.0001
+    dlContrPrm.rec.REPMETHOD = 1;                  //Способ получения отчетов. Если не задан, то 1 /*Дополнительные офисы*/ Если не найдена, то ошибка "Указан неизвестный способ получения отчетов"
+    dlContrPrm.rec.USEQUIK = IIF(inputObject.agreementTerms.isQuik == true, StrFor(88), StrFor(0));         //Признак использования клиентом приложения "Quik-брокер".
+    dlContrPrm.rec.TrdRestrAttrID = IIF(party.IsNotResident, 1, 2);
+    
+    var idx = 0;
+    
+    while (idx < inputObject.tradingPlatformList.tradingPlatform.size)
+      var subContr = GetSubContrParamsByTradingPlatformCode(dlContrPrm, EKK, inputObject.tradingPlatformList.tradingPlatform.Value(idx).tradingPlatformCode);
+      subContrArr(subContrArr.size) = subContr;
+      
+      CheckCurrencies(inputObject.tradingPlatformList.tradingPlatform.Value(idx).tradingCurrencyList.tradingCurrency);
+      
+      if (not PT_BindClientWithBranch(partyID, subContr.rec.ServKind, {OperDprt}, null, {curdate}))
+        RunErrorEx("Ошибка при постановке на обслуживание");
+      end;
+      
+      idx = idx + 1;
+    end;
+  end;
+  
+  /**
+  @brief Загрузить данные по субдоговорам
+  */
+  private macro GetTradingPlatformsInfo()
+    var tpArr = TArray();
+    
+    var cmd = RsdCommand("SELECT mp.t_sfContrID, sf.t_servKind, sf.t_servKindSub as t_subKind, mp.t_marketID, " +
+                                "','||(SELECT LISTAGG(to_char(t_FIID), ',') WITHIN GROUP(ORDER BY t_FIID) " +
+                                        "FROM dDlContrAcc_dbt acc " +
+                                       "WHERE acc.t_dlContrID = mp.t_dlContrID " +
+                                         "AND acc.t_mpID = mp.t_id)||',' AS t_contrAcc " +
+                           "FROM dDlContrMP_dbt mp " +
+                           "JOIN dSfContr_dbt sf ON sf.t_ID = mp.t_sfContrID " +
+                          "WHERE t_dlcontrid = :dlcontrid " +
+                            "AND t_MPCloseDate = to_date('01.01.0001', 'DD.MM.YYYY')");
+    cmd.AddParam("dlcontrid", RSDBP_IN, dlContrID);
+    var rs = RsdRecordSet(cmd);
+    
+    while (rs.MoveNext())
+      tpArr(tpArr.size) = CTradingPlatform(rs.Value("t_sfContrID"), rs.Value("t_servKind"), rs.Value("t_subKind"), rs.Value("t_marketID"), rs.Value("t_contrAcc"));
+    end;
+    
+    return tpArr;
+  end;
+  
+  /**
+  @brief Отправить сообщение в Diasoft
+  */
+  private macro SendMessageToDiasoft()
+    var cmd = RsdCommand("BEGIN " +
+                           "IT_DIASOFT.SendBrokerContractDepo(:dlcontrid); " +
+                         "END;");
+    cmd.AddParam("dlcontrid", RSDBP_IN, dlContrID);
+    cmd.Execute();
+  end;
+  
+  /**
+  @brief Открыть для субдоговора счет указанной категории и валюты
+  */
+  private macro OpenAccount(category, sfContrID, fiid)
+    var error = "";
+    var account = TRecHandler("account.dbt");
+    
+    ClearRecord(account);
+    account.rec.open_date = {curdate};
+    account.rec.account = "";
+    account.rec.code_currency = fiid;
+    
+    if (OpenAccAndBindToContract(category, sfContrID, account, error) != 0)
+      RunErrorEx("Ошибка открытия счета категории " + String(category) + " для субдоговора " + String(sfContrID) + ": " + error);
+    end;
+  end;
+  
+  /**
+  @brief Открыть счета по всем торговым площадкам, при отсутствии счетов по переданным валютам
+  */
+  private macro OpenAccounts(tpIdx, currencies)
+    var curIdx = 0;
+
+    while (curIdx < currencies.size)
+      var currencyID = CurrencyInfo.GetFIID(currencies.Value(curIdx).tradingCurrencyCode);
+
+      if (Index(tradingPlatforms(tpIdx).contractAccountFIIDs, "," + String(currencyID) + ",") <= 0)
+        OpenAccount(CATEG_SUBCONTRACT, tradingPlatforms(tpIdx).sfContrID, currencyID);
+        OpenAccount(CATEG_SUBCONTRACT_COM, tradingPlatforms(tpIdx).sfContrID, currencyID);
+        OpenAccount(CATEG_SUBCONTRACT_VU, tradingPlatforms(tpIdx).sfContrID, currencyID);
+        OpenAccount(CATEG_SUBCONTRACT_VU_CALC, tradingPlatforms(tpIdx).sfContrID, currencyID);
+
+        tradingPlatforms(tpIdx).contractAccountFIIDs = tradingPlatforms(tpIdx).contractAccountFIIDs + String(currencyID) + ",";
+      end;
+
+      curIdx = curIdx + 1;
+    end;
+  end;
+  
+  /**
+  @brief Установить одну категорию субдоговора в случае отсутствия
+  */
+  private macro SetAbsentSubContractCategory(categories, categoryID, attrID, onDate)
+    private file objattr("objattr.dbt") key 0;
+    
+    if (categories.GetMainAttr(categoryID, onDate, objattr) != 0)
+      if (categories.ConnectAttr(categoryID, attrID, null, null, onDate) != 0)
+        RunErrorEx("Ошибка установки категории " + categoryID + ", значение " + attrID);
+      end;
+    end;
+  end;
+  
+  /**
+  @brief Установить категории субдоговора
+  */
+  private macro SetSubContractCategories(tpIdx)
+    var tradingPlatform = tradingPlatforms(tpIdx);
+    
+    if ((tradingPlatform.servKind == PTSK_STOCKDL) and (tradingPlatform.subKind == SERV_SUBKIND_STOCK))
+      var objectID = String(tradingPlatform.sfContrID:o:10);
+      var categories = RsbObjCategories(OBJTYPE_SFCONTR, objectID);
+      
+      SetAbsentSubContractCategory(categories, SUBCONTRACT_CATEGORY_GRANT_BROKER_RIGHTS, CATEGORY_VALUE_YES, {curdate});
+      SetAbsentSubContractCategory(categories, SUBCONTRACT_CATEGORY_TRANSFERRED_TO_NEW_TKS, CATEGORY_VALUE_NO, {curdate});
+      SetAbsentSubContractCategory(categories, SUBCONTRACT_CATEGORY_SEPARATE_ACCOUNTING, CATEGORY_VALUE_NO, {curdate});
+      SetAbsentSubContractCategory(categories, SUBCONTRACT_CATEGORY_EDP, CATEGORY_VALUE_NO, {curdate});
+      
+      categories.Save(objectID);
+    end;
+    
+  end;
+  
+  /**
+  @brief Обработать суб. договоры (открытие счетов, настройка категорий)
+  */
+  private macro ProcessSubContracts()
+    var idx = 0;
+    while (idx < inputObject.tradingPlatformList.tradingPlatform.size)
+      var tpIdx = FindTradingPlatformID(inputObject.tradingPlatformList.tradingPlatform.Value(idx).tradingPlatformCode);
+      
+      if (tpIdx >= 0) // Нашли подходящую торговую площадку, найдем валюты по которым не открыты счета
+        OpenAccounts(tpIdx, inputObject.tradingPlatformList.tradingPlatform.Value(idx).tradingCurrencyList.tradingCurrency);
+        SetSubContractCategories(tpIdx);
+      end;
+      
+      idx = idx + 1;
+    end;
+  end;
+  
+  /**
+  @brief Установить категории ДБО
+  */
+  private macro SetContractCategories()
+    var objectID = String(dlContrPrm.rec.dlContrID:o:34);
+    var categories = RsbObjCategories(OBJTYPE_BROKERCONTR_DL, objectID);
+    var categoryValue;
+    
+    // Уровень риска клиента
+    categoryValue = "1";
+    if (categories.ConnectAttr(CONTRACT_CATEGORY_RISKLEVEL, null, "", categoryValue, dlContrPrm.rec.DateBegin) != 0) // КСУР
+      RunErrorEx("Ошибка установки категории " + CONTRACT_CATEGORY_RISKLEVEL + ", значение " + categoryValue);
+    end;
+    
+    // Статус договора
+    categoryValue = "0";
+    if (categories.ConnectAttr(CONTRACT_CATEGORY_STATUS, null, "", categoryValue, dlContrPrm.rec.DateBegin) != 0)
+      RunErrorEx("Ошибка установки категории " + CONTRACT_CATEGORY_STATUS + ", значение " + categoryValue);
+    end;
+
+    // Категория Форма 4.4
+    categoryValue = CATEGORY_VALUE_YES;
+    if (categories.ConnectAttr(CONTRACT_CATEGORY_NOTE44, null, "", categoryValue, dlContrPrm.rec.DateBegin) != 0)
+      RunErrorEx("Ошибка установки категории " + CONTRACT_CATEGORY_NOTE44 + ", значение " + categoryValue);
+    end;
+    
+    categories.Save(objectID);
+  end;
+  
+  /**
+  @brief Установить примечания
+  */
+  private macro SetContractNotes()
+    var objectID = String(dlContrPrm.rec.dlContrID:o:34);
+    
+    if (AddNoteForObject(OBJTYPE_BROKERCONTR_DL, objectID, CONTRACT_NOTEKIND_CONS, "Технический пользователь ДБО ЮЛ", dlContrPrm.rec.DateBegin) != 0)
+      RunErrorEx("Ошибка установки примечания " + CONTRACT_NOTEKIND_CONS + " на договоре брокерского обслуживания");
+    end;
+  end;
+  
+  /**
+  @brief Установить категории на субъекте клиенте
+  */
+  private macro SetPartyAttributes()
+    var attrID, newAttrID;
+    var partyObjID = String(partyID:o:10);
+    
+    // Сегмент корпоративного бизнеса
+    if (inputObject.tariff.tariffID == "33") // Малый бизнес
+      newAttrID = 3;
+    elif (inputObject.tariff.tariffID == "34") // Крупный бизнес
+      newAttrID = 2;
+    elif (inputObject.tariff.tariffID == "35") // Финансовые институты
+      newAttrID = 1;
+    else
+      RunErrorEx("Некорректный тарифный план '" + inputObject.tariff.tariffID + "' ожидается 33, 34, 35");
+    end;
+    
+    if ((not GetMainObjAttr(null, OBJTYPE_PARTY, partyObjID, CATEG_PARTY_SEGM, attrID)) and
+        (not ConnectObjAttr(null, OBJTYPE_PARTY, partyObjID, CATEG_PARTY_SEGM, newAttrID)))
+      RunErrorEx("Ошибка установки категории Сегмент корпоративного бизнеса");
+    end;
+  end;
+  
+  /**
+  @brief Загрузить данные по существующему договору
+  */
+  private macro LoadContractData()
+    if (DL_Fill_DLContrPrmByDLContr(dlContrPrm, dlContrID, 0) != 0)
+      RunErrorEx("Ошибка загрузки параметров ДБО id " + String(dlContrID));
+    end;
+  end;
+  
+  /**
+  @brief Открыть субдоговоры для существующего договора
+  */
+  private macro OpenTradingPlatforms()
+    var error = "";
+    var idx = 0;
+    var EKK = DL_GetDlObjCodeOnDate(OBJTYPE_BROKERCONTR_DL, DLCCK_USC, dlContrID);
+    
+    while (idx < inputObject.tradingPlatformList.tradingPlatform.size)
+      var tpIdx = FindTradingPlatformID(inputObject.tradingPlatformList.tradingPlatform.Value(idx).tradingPlatformCode);
+      
+      if (tpIdx < 0)
+        var subContr = GetSubContrParamsByTradingPlatformCode(dlContrPrm, EKK, inputObject.tradingPlatformList.tradingPlatform.Value(idx).tradingPlatformCode);
+
+        if (not PT_BindClientWithBranch(partyID, subContr.rec.ServKind, {OperDprt}, null, {curdate}))
+          RunErrorEx("Ошибка при постановке на обслуживание");
+        end;
+      
+        if (DL_AddSubContrToDLCONTR(dlContrID, subContr, error) != 0)
+          RunErrorEx("Ошибка открытия открытия торговой площадки " + inputObject.tradingPlatformList.tradingPlatform.Value(idx).tradingPlatformCode +
+                     " по ДБО " + String(dlContrID) + " " + error);
+        end;
+        
+        tradingPlatforms(tradingPlatforms.size) = CTradingPlatform(0, subContr.rec.ServKind, subContr.rec.SubKind, subContr.rec.MarketID, ",,");
+      end;
+      
+      idx = idx + 1;
+    end;
+  end;
+  
+  /**
+  @brief Создать новый ДБО
+  */
+  private macro OpenNewContract()
+    var error = "";
+    
+    SetPartyAttributes();
+    DefineContractParameters();
+    
+    if (DL_CreateDLCONTR(dlContrPrm, null, subContrArr, error) != 0)
+      RunErrorEx("Ошибка создания ДБО " + error);
+    end;
+    
+    dlContrID = dlContrPrm.rec.dlContrID;
+    SetContractCategories();
+    SetContractNotes();
+  end;
+
+  /**
+  @brief Установить статус запроса
+  */
+  macro SetState(state, code, errorText)
+    var cmd = RsdCommand("{call IT_NDBOLE.BrokerageAgreementTermsReqSetState(?, ?, ?, ?)}");
+    
+    cmd.AddParam("id", RSDBP_IN, requestID);
+    cmd.AddParam("state", RSDBP_IN, state);
+    cmd.AddParam("errorCode", RSDBP_IN, code);
+    cmd.AddParam("errorText", RSDBP_IN, SubStr(errorText, 1, 300));
+    
+    cmd.Execute();
+  end;
+  
+  /**
+  @brief Обновить в буферной таблице данные по договору
+  */
+  private macro UpdateRequestContractInfo()
+    var cmd = RsdCommand("UPDATE dUserLEAgrDataReq_dbt " +
+                            "SET t_partyID = :partyid, t_dlContrID = :dlcontrid " +
+                            "WHERE t_ID = :id ");
+    cmd.AddParam("partyid", RSDBP_IN, partyID);
+    cmd.AddParam("dlcontrid", RSDBP_IN, dlContrID);
+    cmd.AddParam("id", RSDBP_IN, requestID);
+
+    cmd.Execute();
+  end;
+
+  /**
+  @brief Обновить/создать договор
+  */
+  macro UpdateContract()
+    var error = "";
+    var jsonData = IT_GetClobData("t_reqJson", "dUserLEAgrDataReq_dbt where t_id = " + requestID);
+    inputObject = RsJson.JsonDoc(jsonData);
+    inputObject = inputObject.sendBrokerageAgreementTermsReq.data;
+
+    partyID = FindParty();
+    dlContrID = FindDlContr();
+    
+    BeginTransaction();
+
+    if ((dlContrID > 0) and (inputObject.isAgreementChange == true))
+      LoadContractData();
+      tradingPlatforms = GetTradingPlatformsInfo();
+      OpenTradingPlatforms();
+    elif ((dlContrID <= 0) and (inputObject.isAgreementChange == false))
+      OpenNewContract();
+    else
+      RunErrorEx("Несоответствие IsAgreementChange наличию договора в СОФР");
+    end;
+    
+    UpdateRequestContractInfo();
+    tradingPlatforms = GetTradingPlatformsInfo();
+    ProcessSubContracts();
+
+    EndTransaction(true);
+    SendMessageToDiasoft();
+    SetState(BROKERAGRTERMS_REQ_STATE_SENDANSWER, 0, "Договор создан/обновлен");
+    
+  OnError(err)
+    EndTransaction(false);
+    
+    if ((ValType(err.Err) == V_GENOBJ) and IsEqClass("CError", err.Err))
+      error = err.Err.message;
+    else
+      error = GetFullErrorMessage(err);
+    end;
+    
+    SetState(BROKERAGRTERMS_REQ_STATE_SENDANSWER, err.code, error);
+  end;
+  
+  /**
+  @brief Действия после обновления договора - отправка запроса на генерацию уведомления
+  */
+  macro GenerateDocumentRequest()
+    var cmd = RSDCommand("{call IT_NDBOLE.GenerateDocument(?, ?, ?)}");
+    
+    cmd.AddParam("", RSDBP_IN, requestID);
+    cmd.AddParam("errorCode", RSDBP_OUT, V_INTEGER);
+    cmd.AddParam("errorDesc", RSDBP_OUT, V_STRING, 2000);
+    cmd.Execute();
+    
+    var newState = IIF(cmd.Value("errorCode") == 0, BROKERAGRTERMS_REQ_STATE_DONE, BROKERAGRTERMS_REQ_STATE_SUPPORTINFORMING);
+    
+    SetState(newState, cmd.Value("errorCode"), cmd.Value("errorDesc"));
+    
+  OnError(err)
+    SetState(BROKERAGRTERMS_REQ_STATE_SUPPORTINFORMING, err.code, "Ошибка GenerateDocument: " + GetFullErrorMessage(err));
+  end;
+  
+  /**
+  @brief Отправка ошибок сопровождению
+  */
+  macro SupportInforming()
+    var cmd = RSDCommand("select t_errorCode, t_errorText from dUserLEAgrDataReq_dbt where t_id = :requestid");
+    cmd.AddParam("requestid", RSDBP_IN, requestID);
+    var reqRS = RsdRecordset(cmd);
+    
+    if (not reqRS.MoveNext())
+      SetState(BROKERAGRTERMS_REQ_STATE_DONE, 1, "Ошибка SupportInforming: Не найден запрос с ID " + requestID);
+      return;
+    end;
+    
+    var resultCode = reqRS.Value("t_errorCode");
+    var resultText = StrNvl(reqRS.Value("t_errorText"));
+    
+    cmd = RSDCommand("{call IT_NDBOLE.SupportInforming(?, ?, ?)}");
+    
+    cmd.AddParam("", RSDBP_IN, requestID);
+    cmd.AddParam("errorCode", RSDBP_OUT, V_INTEGER);
+    cmd.AddParam("errorDesc", RSDBP_OUT, V_STRING, 2000);
+    cmd.Execute();
+    
+    if (resultCode == 0)
+      resultCode = cmd.Value("errorCode");
+    end;
+    
+    resultText = StrNvl(cmd.Value("errorDesc")) + IIF(StrLen(resultText) == 0, "", "; " + resultText);
+    
+    SetState(BROKERAGRTERMS_REQ_STATE_DONE, resultCode, resultText);
+    
+  OnError(err)
+    SetState(BROKERAGRTERMS_REQ_STATE_DONE, err.code, "Ошибка SupportInforming: " + GetFullErrorMessage(err));
+  end;
+  
+  /**
+  @brief Отправка результата обработки сообщения SendBrokerageAgreementTerms
+  */
+  macro SendAnswer()
+    var cmd = RSDCommand("select t_errorCode, t_errorText from dUserLEAgrDataReq_dbt where t_id = :requestid");
+    cmd.AddParam("requestid", RSDBP_IN, requestID);
+    var reqRS = RsdRecordset(cmd);
+    
+    if (not reqRS.MoveNext())
+      SetState(BROKERAGRTERMS_REQ_STATE_SUPPORTINFORMING, 1, "Ошибка SendBrokerageAgreementTermsResp: Не найден запрос с ID " + requestID);
+      return;
+    end;
+    
+    var resultCode = reqRS.Value("t_errorCode");
+    var resultText = StrNvl(reqRS.Value("t_errorText"));
+    
+    cmd = RSDCommand("{call IT_NDBOLE.SendBrokerageAgreementTermsResp(?, ?, ?)}");
+    
+    cmd.AddParam("", RSDBP_IN, requestID);
+    cmd.AddParam("errorCode", RSDBP_OUT, V_INTEGER);
+    cmd.AddParam("errorDesc", RSDBP_OUT, V_STRING, 2000);
+    cmd.Execute();
+    
+    if (resultCode == 0)
+      resultCode = cmd.Value("errorCode");
+    end;
+    
+    resultText = StrNvl(cmd.Value("errorDesc")) + IIF(StrLen(resultText) == 0, "", "; " + resultText);
+    
+    SetState(IIF(resultCode == 0, BROKERAGRTERMS_REQ_STATE_DEPOWAIT, BROKERAGRTERMS_REQ_STATE_SUPPORTINFORMING), resultCode, resultText);
+    
+  OnError(err)
+    SetState(BROKERAGRTERMS_REQ_STATE_SUPPORTINFORMING, err.code, "Ошибка SendBrokerageAgreementTermsResp: " + GetFullErrorMessage(err));
+  end;
+
+  /**
+  @brief Конструктор класса
+  */
+  private macro Init(pRequestID)
+    requestID = pRequestID;
+  end;
+  
+  Init(pRequestID);
+end;
+
+/**
+@brief Обработать все новые запросы
+*/
+private macro ProcessNewRequests()
+  var cmd = RsdCommand("SELECT t_id " +
+                         "FROM dUserLEAgrDataReq_dbt " +
+                        "WHERE t_state = " + BROKERAGRTERMS_REQ_STATE_NEW);
+  
+  var rs = RsdRecordSet(cmd);
+  
+  while (rs.MoveNext())
+    var request = CBrokerAgrTermsReq(rs.Value("t_id"));
+
+    request.UpdateContract();
+  end;
+end;
+
+/**
+@brief Завершить обработку запроса после обработки по счетам ДЕПО
+*/
+private macro ProcessingAfterDepoRegister()
+  private file objattr("objattr.dbt") key 0;
+  var cmd = RsdCommand("SELECT t_id, t_dlContrID " +
+                         "FROM dUserLEAgrDataReq_dbt " +
+                        "WHERE t_state = " + BROKERAGRTERMS_REQ_STATE_DEPOWAIT);
+  var rs = RsdRecordSet(cmd);
+  
+  while (rs.MoveNext())
+    var objectID = String(rs.Value("t_dlContrID"):o:34);
+    var categories = RsbObjCategories(OBJTYPE_BROKERCONTR_DL, objectID);
+
+    ClearRecord(objattr);
+    categories.GetMainAttr(CONTRACT_CATEGORY_STATUS, {curdate}, objattr);
+    
+    if (objattr.attrID == 3) // Статус договора - Обработка завершена
+      var request = CBrokerAgrTermsReq(rs.Value("t_id"));
+      
+      request.GenerateDocumentRequest();
+    end;
+  end;
+end;
+
+/**
+@brief Отправить ответ по обработанным запросам
+*/
+private macro SendRequestAnswers()
+  var cmd = RsdCommand("SELECT t_id " +
+                         "FROM dUserLEAgrDataReq_dbt " +
+                        "WHERE t_state = " + BROKERAGRTERMS_REQ_STATE_SENDANSWER);
+  
+  var rs = RsdRecordSet(cmd);
+  
+  while (rs.MoveNext())
+    var request = CBrokerAgrTermsReq(rs.Value("t_id"));
+
+    request.SendAnswer();
+  end;
+end;
+
+/**
+@brief Отправить ошибки в сопровождение
+*/
+private macro SendErrorsForSupport()
+  var cmd = RsdCommand("SELECT t_id " +
+                         "FROM dUserLEAgrDataReq_dbt " +
+                        "WHERE t_state = " + BROKERAGRTERMS_REQ_STATE_SUPPORTINFORMING);
+  
+  var rs = RsdRecordSet(cmd);
+  
+  while (rs.MoveNext())
+    var request = CBrokerAgrTermsReq(rs.Value("t_id"));
+
+    request.SupportInforming();
+  end;
+end;
+
+/**
+@brief Основная процедура обработки запросов, вызываемая планировщиком
+*/
+macro BrokerageAgreementTermsReqProcess(execmask)
+  if (ValType(execmask) != V_INTEGER)
+    execmask = 255;
+  end;
+  
+  if (CheckBits(execmask, 1) == 1)
+    ProcessNewRequests();
+  end;
+  
+  if (CheckBits(execmask, 2) == 2)
+    SendRequestAnswers();
+  end;
+  
+  if (CheckBits(execmask, 4) == 4)
+    ProcessingAfterDepoRegister();
+  end;
+  
+  if (CheckBits(execmask, 8) == 8)
+    SendErrorsForSupport();
+  end;
+end;
+
+/**
+@brief Найти последний запрос на создание/обновление договора по id договора
+*/
+private macro GetLastRequestIDByDlContrID(dlContrID)
+  var cmd = RsdCommand("SELECT NVL(MAX(t_ID), -1) as t_ID " +
+                         "FROM dUserLEAgrDataReq_dbt " +
+                        "WHERE t_dlContrID = :dlcontrid");
+  cmd.AddParam("dlcontrid", RSDBP_IN, dlContrID);
+  
+  var rs = RsdRecordSet(cmd);
+  
+  if (rs.MoveNext())
+    return Int(rs.Value("t_ID"));
+  end;
+  
+  return -1;
+end;
+
+/**
+@brief Отравить запрос на формирование уведомления о приеме ЮЛ на брокерское обслуживание
+*/
+macro ReSendNotification(dlContrID)
+  var requestID = GetLastRequestIDByDlContrID(dlContrID);
+  
+  if (requestID <= 0)
+    MsgBox("Отсутствует запрос от ДБО СБ на создание/обновление данных договора");
+  else
+    var cmd = RSDCommand("{call IT_NDBOLE.GenerateDocument(?, ?, ?)}");
+    
+    cmd.AddParam("", RSDBP_IN, requestID);
+    cmd.AddParam("errorCode", RSDBP_OUT, V_INTEGER);
+    cmd.AddParam("errorDesc", RSDBP_OUT, V_STRING, 2000);
+    cmd.Execute();
+    
+    if (cmd.Value("errorCode") != 0)
+      MsgBox("Ошибка отправки запроса: " + cmd.Value("errorDesc"));
+    else
+      MsgBox("Запрос на формирование уведомления отправлен");
+    end;
+  end;
+end;

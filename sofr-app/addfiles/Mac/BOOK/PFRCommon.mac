@@ -1,0 +1,533 @@
+/*
+$Name:        PFRCommon.mac
+$Module:      RS-Retail
+$Description: Функции для взаимодействия с ПФР
+*/
+import oralib, likepy, ic_comdata, ws_pfr_classes, common_service_caller;
+
+var ExternalData, trncntr, trnpaym;
+var recTrnPaym = TBFile( "trn_paym.dbt", "r", 0 );
+const national_currency = 0;
+const ERRORSending = 2616; // Ошибка отправки сообщения в сервис RS-Connect
+private const REGPARM_SENDERID =  "RS-CONNECT\\SENDERID\\RETAIL";
+private const REGPARM_URL =       "RS-CONNECT\\ГИС_ЖКХ\\URL";
+private const REGPARM_MAXPACKET = "RS-CONNECT\\ПФР\\RETAIL\\MAXPACKET";
+private const PaternKind = "Шаблонный";
+
+class TCountDaysInMonth
+  private var m_days = TArray();
+  macro get(month: integer, year: integer): integer
+    if (month != 2)
+      return m_days[month];
+    else
+      if (not mod(year,400) or (not mod(year,4) and mod(year,100)))
+        return 29;
+      else
+        return 28;
+      end;
+    end;
+  end;
+
+  m_days[1]=31;
+  m_days[2]=0;
+  m_days[3]=31;
+  m_days[4]=30;
+  m_days[5]=31;
+  m_days[6]=30;
+  m_days[7]=31;
+  m_days[8]=31;
+  m_days[9]=30;
+  m_days[10]=31;
+  m_days[11]=30;
+  m_days[12]=31;
+end;
+
+const CountDaysInMonth = TCountDaysInMonth();
+
+// Преобразование строки в дату
+macro DateFromString(stringDate: String)
+    var day = 1; 
+    var month = 0;
+    var year = 0;
+
+    if( stringDate != "" )
+      var str;
+      var position = strBrk(stringDate, "./-");
+      if( position > 0 )
+        str = subStr(stringDate, 1, position - 1);
+        if( StrIsNumber(str) )
+          day = Int(str);
+        end;
+        stringDate = subStr(stringDate, position + 1);
+        position = strBrk(stringDate, "./-");
+        if( position > 0 )
+          str = subStr(stringDate, 1, position - 1);
+          if( StrIsNumber(str) )
+            month = Int(str);
+          end;
+          stringDate = subStr(stringDate, position + 1);
+        else
+          month = day;
+          day = 1;
+        end;
+      end;
+      if( StrIsNumber(stringDate) )
+        year = Int(stringDate);
+      end;
+    end;
+
+    if( (month < 1) or (month > 12) or (year < 1900) or (year > 9999) )
+      return Date(0, 0, 0);
+    end;
+    
+    return Date(day, month, year);
+end;
+
+// Получение даты из переменной неизвестного типа
+macro GetUndefDate( dd )
+  if( ValType(dd) == V_DATE )
+    return dd;
+  end;
+  if( ValType(dd) == V_STRING )
+    return DateFromString(dd);
+  end;
+  return date(0,0,0);
+end;
+
+// Получение дат периода выплат из переданных строковых дат
+macro GetPeriod( BegDate, Enddate, StartPeriod, EndPeriod )
+  StartPeriod = date(0,0,0);
+  EndPeriod = date(0,0,0);
+  if( ValType(BegDate) == V_STRING )
+    StartPeriod = DateFromString(BegDate);
+
+    if( StartPeriod != date(0,0,0) )
+      if( ValType(Enddate) == V_STRING )
+        EndPeriod = DateFromString(Enddate);
+      end;
+
+      if( EndPeriod == date(0,0,0) )
+        EndPeriod = StartPeriod;
+        var Day, Mon, Year;
+        DateSplit( StartPeriod, Day, Mon, Year );
+        Day = CountDaysInMonth.get(Mon,Year);
+        EndPeriod = Date( Day, Mon, Year );
+      end;
+    end;
+  end;
+  setparm(2, StartPeriod);
+  setparm(3, EndPeriod);
+end;
+
+//Удаление нулей с левой стороны строки
+macro LTRIM0( str )
+  while( (StrLen(str) > 0) and (SubStr(str,1,1) == "0") )
+    str = SubStr(str,2);
+  end;
+  return str;
+end;
+
+// Формирование номера п/п по умолчанию
+macro FormDefaultNumPayMessage( productId: string, registryId: string, registryDate: date): string
+  return productId + "#" + registryId + "#" + String(registryDate);
+end;
+
+// Получение настроек реестра дял отправки сообщения
+macro GetRegValues( senderID, url, maxPacket )
+  var stat = 0;
+  GetRegistryValue( REGPARM_SENDERID, V_STRING, senderID, stat );
+  if( stat == 0 )
+    GetRegistryValue( REGPARM_URL, V_STRING, url, stat );
+    setparm(0, senderID);
+  end;
+  if( stat == 0 )
+    GetRegistryValue( REGPARM_MAXPACKET, V_INTEGER, maxPacket, stat );
+    if( stat != 0 )
+      maxPacket = 0;
+      stat = 0;
+    end;
+    setparm(1, url);
+    setparm(2, maxPacket);
+  else
+    stat = 2608; //Ошибка при чтении элемента реестра RS-Bank
+  end;
+  return stat;
+end;
+
+// Поиск договора с ПФР
+macro FindTrnContract( orgId, registryDate )
+  var cmd = RsdCommand(
+    "select t.*, depparm.t_OperDate " + 
+     " from dTrn_Cntr_dbt t " +
+          " inner join dDepParm_dbt depparm "+
+             " on (depparm.t_FNCash = t.t_Department and depparm.t_FlagCur = 0) "+
+    " where     t.t_BusinessCode = ? "+
+          " and t.t_IsForPFR = 'X' "+
+          " and t.t_DateContract <= ? "+
+          " and (   t.t_DateFinContract = TO_DATE ('01.01.0001', 'dd.mm.yyyy') "+
+               " or t.t_DateFinContract >= ?) "+
+          " and (   t.t_DateBreakContract = TO_DATE ('01.01.0001', 'dd.mm.yyyy') "+
+               " or t.t_DateBreakContract >= ?)");
+  cmd.addParam("",RsdBp_In,orgId);
+  cmd.addParam("",RsdBp_In,registryDate);
+  cmd.addParam("",RsdBp_In,registryDate);
+  cmd.addParam("",RsdBp_In,registryDate);
+  cmd.nullConversion=true;
+  cmd.execute();
+  trncntr = RsdRecordSet(cmd);
+  return trncntr.moveNext();
+end;
+
+// Проверка наличия операции для вида вклада
+macro CheckOperation(accountType, opNumber)
+  var cmd = RsdCommand(
+    "select t_OpFromOtherDepType from dsb_DTyp_dbt "+
+    " where t_Kind = ? and t_FlagCur = 0");
+  cmd.addParam("",RsdBp_In,accountType);
+  cmd.nullConversion=true;
+  cmd.execute();
+  var rs = RsdRecordSet(cmd);
+
+  var stat = rs.moveNext();
+  if( stat )
+    if (rs.value("t_OpFromOtherDepType") != 0)
+      cmd = RsdCommand(
+        "select t_ApType from dpc_AplTp_dbt "+
+         "where t_IsCur = 0 "+
+           "and t_TypeRec = 1003 "+
+           "and t_Type = ? "+
+           "and t_ApplType = 3010");
+      cmd.addParam("",RsdBp_In,accountType);
+      cmd.nullConversion=true;
+      cmd.execute();
+      rs = RsdRecordSet(cmd);
+      stat = rs.moveNext();
+      if( stat )
+        accountType = rs.value(0);
+      end;
+    end;
+  end;
+  
+  if( stat )
+    cmd = RsdCommand(
+      "select 1 from dsb_TypOp_dbt "+
+       "where t_Kind = ? and t_NumOpert = ? and t_IsCur = 0");
+    cmd.addParam("",RsdBp_In,accountType);
+    cmd.addParam("",RsdBp_In,opNumber);
+    cmd.nullConversion=true;
+    cmd.execute();
+    rs = RsdRecordSet(cmd);
+    stat = rs.moveNext();
+  end;
+  SetParm(0, accountType);
+  return stat;
+end;
+
+// Определение лимита операции
+macro GetLimitOperation(accountType, opNumber, operDate)
+  var cmdstr =
+    "select t_PrmD, t_ExecPattern "+
+      "from dsb_AlgOp_dbt "+
+     "where t_NumOpert = ? " +
+       "and t_NumStepAlg = 240 "+   // Шаг проверки лимита
+       "and t_IsCur = 0 "+
+       "and t_Kind = ? "+
+       "and t_FlagExe = 'X' "+      // включенный
+       "and t_ModuleNumber = 0 "+   // с незаданным модулем
+       "and t_BegDate <= ? "+       // действующий
+       "and t_PrmI = ? "            // сумма лимита в нац. валюте
+  "order by t_BegDate desc";
+  var cmd = RsdCommand(cmdstr);
+  cmd.addParam("",RsdBp_In,opNumber);
+  cmd.addParam("",RsdBp_In,accountType);
+  cmd.addParam("",RsdBp_In,operDate);
+  cmd.addParam("",RsdBp_In,national_currency);
+  cmd.nullConversion=true;
+  cmd.execute();
+  var rs = RsdRecordSet(cmd);
+
+  var stat = rs.moveNext();
+  if( stat )
+    if (rs.value("t_ExecPattern") != StrFor(0))
+      accountType = PaternKind;
+      cmd = RsdCommand(cmdstr);
+      cmd.addParam("",RsdBp_In,opNumber);
+      cmd.addParam("",RsdBp_In,accountType);
+      cmd.addParam("",RsdBp_In,operDate);
+      cmd.addParam("",RsdBp_In,national_currency);
+      cmd.nullConversion=true;
+      cmd.execute();
+      stat = rs.moveNext();
+    end;
+  end;
+  
+  var summa = $0;
+  if( stat )
+    summa = rs.value("t_PrmD");
+  end;
+  return summa;
+end;
+
+// Получение ФИО получателя
+macro GetPersonFIO( id, name1, name2, name3 )
+  var cmd = RsdCommand("SELECT t_Name1, t_Name2, t_Name3 FROM dPersn_dbt WHERE t_PersonId = ?");
+  cmd.addParam("",RsdBp_In,id);
+  cmd.execute;
+  var rs = RsdRecordSet(cmd);
+  if( rs.moveNext )
+    setparm(1, rs.value("t_Name1"));
+    setparm(2, rs.value("t_Name2"));
+    setparm(3, rs.value("t_Name3"));
+    return true;
+  end;
+  setparm(1, "");
+  setparm(2, "");
+  setparm(3, "");
+  return false;
+end; 
+
+// Получение вкладного документа
+macro GetDepDoc( appKind, appKey )
+  var cmd = RsdCommand(
+    "SELECT * FROM dsbdepdoc_dbt " +
+     "WHERE t_iapplicationkind = ? " +
+       "AND t_applicationkey = ?");
+  cmd.addParam("",RsdBp_In,appKind);
+  cmd.addParam("",RsdBp_In,appKey);
+  cmd.nullConversion = true;
+  cmd.execute();
+  return RsdRecordSet(cmd);
+end;
+
+// Поиск счета получателя
+macro FindAccount( account, accountNumber, Surname, Name, Patronymic, Department )
+  var cmdstr = 
+    "SELECT count(1) over() t_count, t.*, " +
+          " persn.t_Name1, persn.t_Name2, persn.t_Name3, persn.t_Death " +
+     " FROM dDepositr_dbt t " +
+          " INNER JOIN dPersn_dbt persn ON t.t_CodClient = persn.t_PersonId " +
+    " WHERE     t.t_Account = ?" +
+          " AND t.t_Code_Currency = 0" +
+          " AND t.t_action <> 2 " +
+          " AND t.t_action <> 11";
+  var cmd = RsdCommand(cmdstr);
+  cmd.addParam("", RsdBp_In, accountNumber);
+  cmd.execute;
+  account = RsdRecordSet(cmd);
+  var stat = account.moveNext();
+
+  if( stat )
+    if( account.value( "t_count" ) > 1 )
+      while( stat )
+        if( (StrLwr(account.value("t_name1")) == StrLwr(Surname)) and
+            (StrLwr(account.value("t_name2")) == StrLwr(Name)) and
+            ((StrLwr(account.value("t_name3")) == StrLwr(Patronymic)) or (Patronymic == "")) )
+          break;
+        else
+          stat = account.moveNext();
+        end;
+      end;
+    end;
+  end;
+
+  if( stat )
+    var DepFNcash = execStoredFunc( "rsu_rtlcommon.GetDepFNCash", V_INTEGER,
+                    makeArray( SQLParam("", account.value("t_fncash"))) );
+    if( DepFNcash != Department )
+      stat = false;
+    end;
+  end;
+  setparm(0, account);
+  return stat;   
+end; 
+
+// Поиск платежного поручения
+macro FindTrnPaym( numberContract, registryId )
+  var cmd = RsdCommand(
+    "select count(1) over( ) t_count, t.* "+
+     " from dtrn_paym_dbt t "+
+    " where t.t_NumberContract = ? "+
+      " and t.t_RegisterId = ?");
+  cmd.addParam( "", RsdBp_In, numberContract );
+  cmd.addParam( "", RsdBp_In, registryId );
+  cmd.nullConversion = true;
+  cmd.execute( );
+  var rs = RsdRecordSet(cmd);
+  var stat = rs.moveNext();
+  if( stat )
+    if( rs.value( "t_count" ) == 1 )
+      trnpaym = rs;
+    end;
+  end;
+  return stat;
+end;
+
+// Вставка записи во временную таблицу
+macro InsertTMP( number, department, accountNumber, payCode, reasonNoCarry, ground, isAccFound, account )
+  file tmp("depositrttt.tmp") key 0 write;
+  if( isAccFound )
+    tmp.referenc = account.value( "t_referenc" );
+    tmp.fncash = account.value( "t_fncash" );
+    tmp.iscur = account.value( "t_iscur" );
+    tmp.code_currency = account.value( "t_code_currency" );
+    tmp.type_account = account.value( "t_type_account" );
+    tmp.codclient = account.value( "t_codclient" );
+  else
+    tmp.referenc = 0;
+    tmp.fncash = trncntr.value( "t_department" );
+    tmp.iscur = 0;
+    tmp.code_currency = 0;
+    tmp.type_account = "";
+    tmp.codclient = 0;
+  end;
+
+  tmp.account = accountNumber;
+  tmp.remark = payCode;
+  tmp.formcontr = reasonNoCarry;
+  tmp.fio_client = ground;
+  tmp.numsession = number;
+  tmp.balacc = String(number);
+  return insert(tmp);
+end;
+
+// Создание платежного поручения по филиалу
+macro InsertFilialPayment( FNCash )
+  file trnpayf("trn_payf.dbt") key 0 write;
+  trnpayf.NumberContract = trnpaym.value("t_NumberContract");
+  trnpayf.Num_PayMessage = trnpaym.value("t_Num_PayMessage");
+  trnpayf.DateDocumentFilial = trnpaym.value("t_DateDocumentGlobal");
+  trnpayf.PaymAppKind = trnpaym.value("t_iApplicationKind");
+  trnpayf.PaymAppKey = trnpaym.value("t_ApplicationKey");
+  trnpayf.FlagCur = trnpaym.value("t_FlagCur");
+  trnpayf.Code_Currency = trnpaym.value("t_GlobalCurrency");
+  trnpayf.TypeOper = trnpaym.value("t_TypeOper");
+  trnpayf.ApplType = trnpaym.value("t_ApplType");
+  trnpayf.Ground = trnpaym.value("t_Ground");
+  trnpayf.RealFNCash = trnpaym.value("t_Department");
+  trnpayf.FNCash = FNCash;
+
+  trnpayf.NameBusines = trncntr.value("t_NameBusines");
+  trnpayf.AddressBusines = trncntr.value("t_AdressBusines");
+  trnpayf.MFO_Busines = trncntr.value("t_MFO_Busines");
+  trnpayf.Coracc_Busines = trncntr.value("t_Coracc_Busines");
+  trnpayf.Account_Busines = trncntr.value("t_Account_Busines");
+  trnpayf.KPP = trncntr.value("t_KPP");
+
+  trnpayf.Oper = {Oper};
+  trnpayf.TRN_System = 1;
+  trnpayf.NumSession = -1;
+  trnpayf.InputMethod = 2;
+  return insert(trnpayf);
+end;
+
+// Обновление сумм п/п по филиалам
+macro UpdateFilialSum( numberContract, numPayMessage )
+  var cmd = RsdCommand(
+    "update dTrn_Payf_dbt payf "+
+       "set payf.t_GlobalSumFilial = ( "+
+              "select sum(doc.t_Sum) "+
+                "from dTrn_Doc_dbt doc "+
+               "where doc.t_ListTransfer = payf.t_Autokey) "+
+     "where payf.t_NumberContract = ? "+
+       "and payf.t_Num_PayMessage = ?");
+  cmd.addParam("",RsdBp_In,numberContract);
+  cmd.addParam("",RsdBp_In,numPayMessage);
+  cmd.execute();
+end;
+
+// Сверка сумм поручения
+macro CheckPaymentSum
+  var cmd = RsdCommand(
+    "select sum(t.t_Sum) t_Sum "+
+      "from dTrn_Doc_dbt t "+
+     "where t.t_ListTransfer in ( "+
+       " select payf.t_Autokey from dTrn_Payf_dbt payf" +
+        " where payf.t_NumberContract = ? "+
+          " and payf.t_Num_PayMessage = ?)");
+  cmd.addParam("",RsdBp_In,trncntr.value("t_NumberContract"));
+  cmd.addParam("",RsdBp_In,trnpaym.value("t_Num_PayMessage"));
+  cmd.nullConversion=true;
+  cmd.execute();
+  var rs = RsdRecordSet(cmd);
+  if( rs.moveNext() )
+    if( rs.value("t_Sum") == trnpaym.value("t_GlobalSumBusines") )
+      return true;
+    end;
+  end;
+  return false;
+end;
+
+// Получение документов п/п для отправки отчета
+macro GetTrnDocsForReport( NumberContract, Num_PayMessage )
+  var cmd = RsdCommand(
+    "select count(1) over() t_TotalCount, t.* "+
+      "from dTrn_Doc_dbt t "+
+     "where (t.t_FNCash,t.t_ListTransfer) in ("+
+        "select payf.t_FNCash, payf.t_AutoKey from dTrn_Payf_dbt payf "+
+         "where payf.t_NumberContract = ? and payf.t_Num_PayMessage = ?) ");
+  cmd.addParam("",RsdBp_In,NumberContract);
+  cmd.addParam("",RsdBp_In,Num_PayMessage);
+  cmd.nullConversion=true;
+  cmd.execute();
+  return RsdRecordSet(cmd);
+end;
+
+
+// Транспортная компонента отправки одной части отчета
+private class ( CServiceCallerBase ) CSendReportPartCaller( _Param, _url, _macroNameReport, _macroFuncReport )
+   private var m_param = _Param;
+   private var m_url = _url;
+   private var m_macroNameReport = _macroNameReport;
+   private var m_macroFuncReport = _macroFuncReport;
+
+   private macro SetRequestParameters( request : @TXRRequest )
+      request.Parms = m_param;
+   end;
+   
+   private macro GetSystemURL() : String
+     var m_systemURL;
+
+     if ( ( ValType( m_url ) == V_STRING ) and ( m_url != "" ) )
+       m_systemURL = m_url;
+     else
+       GetRegistryValue( "RS-CONNECT\\ГИС_ЖКХ\\URL", V_STRING, m_systemURL );
+     end;
+
+     return m_systemURL;
+   end;
+
+   InitCServiceCallerBase( CreateGUID( ), GetSystemURL( ), m_macroNameReport, m_macroFuncReport, 300000 );
+end;
+
+// Отправка одной части отчета
+macro SendReportPart( url, macroName, macroFunc, source, report, reestrArr, errMsg )
+  var paramArray = TArray( );
+
+  paramArray[0] = source;
+  paramArray[1] = report;
+  paramArray[2] = reestrArr;
+
+  var stat = 0;
+  var caller = CSendReportPartCaller( paramArray, url, macroName, macroFunc );
+  var answer;
+  var callService_stat = caller.CallService( @answer );
+
+  if ( not callService_stat )
+    stat = 1;
+    errMsg = "Ошибка при вызове транспортной компоненты";
+  else
+    if ( GenPropID( answer, "faultString" ) != -1 )
+      stat = ERRORSending;
+      errMsg = ErrMessage( stat ) + ": " + answer.FaultString;
+    else
+      if ( ( GenPropID( answer, "ObjectError" ) != -1 ) and ( ValType( answer.ObjectError ) == V_STRING ) and ( answer.ObjectError != "" ) )
+        stat = ERRORSending;
+        errMsg = ErrMessage( stat ) + ": " + answer.ObjectError;
+      end;
+    end;
+  end;
+
+  setparm( 6, errMsg );
+
+  return stat;
+end;

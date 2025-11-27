@@ -1,0 +1,162 @@
+/*
+nontrading_resending_messages_quik.mac
+Массовая отправка операций зачисления и списания ДС из СОФР в QUIK
+*/
+
+import "nontrading_orders_quik_messages.mac", "cblogger2.mac";
+
+private file dataFile() txt;
+
+Class MessageResender()
+
+    //Формат нужного нам файла
+    private var patternFile = "*.csv";
+    
+    // Имя выбранного исходного файла с путём
+    private var nameSourceFile = "";
+
+    //cчётчики для отчётности
+    private var totalCount = 0;
+    private var successCount = 0;
+    private var errorCount = 0;
+    private var errorDetails = ""; //детализация ошибок по операциям
+
+    var logger:c_logger = LoggerFactory().NewItLog("nontrading_orders_quik_messages.mac").GetLogger();  
+
+    //метод инициирующий выбор файла , возвращает полный путь до выбранного файла
+    macro choiseFile():string                                                                           
+        var isSuccess = true; //удалось выбрать файл или нет, по дефолту считаем что да
+        isSuccess = SelectFile(nameSourceFile,patternFile,"Выберите файл с кодами операций, по которым требуется переотправка");
+        if (not isSuccess)
+            //MsgBox ("Файл не выбран!");
+            logger.Error("Не удалось выбрать файл в формате: " + patternFile +" по пути: " + nameSourceFile);
+            return "";
+        end;
+
+        return nameSourceFile;
+    end;
+
+    //метод читающий содержимое и записывает коды в массив 
+    macro getIdsFromFile(fileName:string):TArray          
+        var resultCodes = TArray();                  //методы для работы с файлом : Open() открыть, next() итерация по строкам файла, dataFile.str получить значение текущей строки, Close() закрыть файл
+        var fileIsOpened = Open(dataFile, fileName);
+
+        if(fileIsOpened)
+            while(next(dataFile)) 
+                var oprId:string = dataFile.str;
+                if(oprId == "")
+                    continue; //если пустая строка в файле, пропускаем , обрабатываем следующую, чтобы не записывать пустоту в массив с операциями
+                end; 
+
+                resultCodes(resultCodes.size()) = oprId; 
+            end;
+
+            Close(dataFile);
+        else
+            logger.Info("Не удалось обработать содержимое файла: " + fileName);    
+        end;
+
+        return resultCodes;   
+    end;
+
+    private macro responseIsNull(oprId:string):bool
+        var sql = "select case when response_time is null then 1 else 0 end as response_is_null"                                                                                                                                                                                              
+                + " from quik_sent_order_messages "
+                + " where operation_id = :1 order by create_time desc fetch first 1 rows only"; 
+                var cmd = RSDCommand(sql);
+                cmd.AddParam(":1",RSDBP_IN, oprId);
+                var result = RSDRecordSet(cmd);
+
+        if(result.moveNext)
+            if(result.value("response_is_null") == 1)
+                return true;
+            else
+                return false;    
+            end;
+        end;        
+    end;
+
+    //метод переотправки операций в QUIK
+    macro resendMessage()
+        var messageSender:MoneyOrderQuikController = MoneyOrderQuikController(); //объект нужен нам для вызова метода отправки в QUIK
+        var fileName:string = choiseFile();
+
+        if(fileName == "")
+            MsgBox("Файл не выбран, обработка невозможна!");
+            return;
+        end;
+
+        var listId:TArray = getIdsFromFile(fileName);
+        var isNeedSendMessage = true;
+        totalCount = listId.size(); //общее количество операций в файле
+        var c = 0;
+        var errDescArr = TArray();
+
+        //если больше 300 кодов достали из файла, предупреждаем о значительном времени на обработку и получаем подтверждение на дальнейшую обработку
+        if(listId.size() > 300)
+            isNeedSendMessage = MsgBoxEx("Вы уверены что хотите запустить переотправку по более чем 300 операциям? Время обработки может быть существенным и повлиять на быстродействие системы", MB_YES + MB_NO, IND_NO) == IND_YES;
+        end;                                                        
+                                                                                                    
+       if(isNeedSendMessage)
+            InitProgress(listId.size(), "Идёт обработка операций");                                                                  
+            //логика поштучной обработки каждой операции
+            for (var i, 0, listId.size() - 1, 1)
+                var sql = "select dn.t_id, dn.t_kind_operation, ms.order_type from dnptxop_dbt dn "                                                                                                                               
+                + " join quik_sent_order_messages ms on dn.t_id = ms.operation_id "                                                                
+                + " where t_code = :1 order by ms.create_time desc fetch first 1 rows only"; 
+                var cmd = RSDCommand(sql);
+                cmd.AddParam(":1",RSDBP_IN, listId(i));
+                var result = RSDRecordSet(cmd);
+                var sendSuccess = false;
+
+                if (result.moveNext)
+                    if(result.value("t_kind_operation") == 2037) 
+                        if(responseIsNull(result.value("t_id"))) //убеждаемся что отправили сообщение, но ответа не получили
+
+                            if(result.value("order_type") == 1) //Зачисление ДС
+                                messageSender.PrepareEnroll(result.value("t_id"));
+                            end;   
+                            
+                            if(result.value("order_type") == 0) //Списание ДС
+                                messageSender.PrepareWriteOff(result.value("t_id"));
+                            end;
+                            sendSuccess = messageSender.SaveAndResendLastMessageForOperation(result.value("t_id"));
+
+                            if(sendSuccess)    
+                                logger.Info("Операция № "+ listId(i) +" переотправлена в QUIK и успешно обработана");
+                                successCount = successCount + 1; 
+                            end;
+                        else
+                            logger.Info("Операция № "+ listId(i) +" находится в корректном статусе, переотправка в QUIK не произведена");
+                            errorCount = errorCount + 1;
+                            errDescArr(errDescArr.size) = listId(i) + " - корректный статус, переотправка в QUIK не произведена";  
+                        end;
+                    else
+                        logger.Info("Неверный вид операции № "+ listId(i) +" переотправка в QUIK не произведена");
+                        errorCount = errorCount + 1; 
+                        errDescArr(errDescArr.size) = listId(i) + " - неверный вид операции, переотправка в QUIK не произведена";
+                    end;
+                else
+                    logger.Error("Операция № "+ listId(i) +" не найдена!");
+                    errorCount = errorCount + 1; 
+                    errDescArr(errDescArr.size) = listId(i) + " - операция не найдена, переотправка в QUIK не произведена";        
+                end;
+
+                UseProgress(c = c + 1);   
+            end;
+            RemProgress();
+        end;  
+    //если есть обработанные с ошибкой, достаём детали по ним
+        if(errDescArr.size() > 0)
+            for(var n, 0, errDescArr.size() - 1, 1)
+                errorDetails = errorDetails + errDescArr(n) + "\n";
+            end;
+        end;
+        MsgBox("Всего операций в файле: " + totalCount + "\n" + "Успешно обработано: " +  successCount + "\n" + "Обработано с ошибкой: " + errorCount + "\n" + "Детализация ошибок: " + "\n" + errorDetails);
+
+        onError(errObj)
+        logger.ErrorClob("MessageResender. resendMessage. Операция с t_code = " + listId(i), GetFullErrMsg(errObj));
+
+    end;
+
+End;

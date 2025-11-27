@@ -1,0 +1,40 @@
+-- Триггер
+CREATE OR REPLACE TRIGGER "DSCQINV_DBT_TUR"
+   AFTER UPDATE OF T_STATE ON DSCQINV_DBT
+   FOR EACH ROW
+DECLARE
+   v_BegDate DATE;
+   v_EndDate DATE;
+BEGIN
+
+  IF( (:OLD.T_STATE = 1) AND (:NEW.T_STATE = 0) ) THEN
+     v_BegDate := GREATEST(:OLD.T_REGDATE, :OLD.T_CHANGEDATE);
+     v_EndDate := :NEW.T_CHANGEDATE - 1;
+  ELSE
+     v_BegDate := :OLD.T_CHANGEDATE;
+     v_EndDate := :NEW.T_REGDATE - 1;
+  END IF;
+
+  IF( v_BegDate > v_EndDate ) THEN
+     RAISE_APPLICATION_ERROR(-20202,''); --Неверный период действия статуса КИ
+  END IF;
+
+  IF( (:NEW.T_STATE = 0) AND (:NEW.T_KIND = 2) ) THEN
+     TRGPCKG_DSCQINVFI_TD.v_InTrgr := true;
+     UPDATE DSCQINVFI_DBT
+        SET T_STATE     = 0,
+            T_STATEDATE = :NEW.T_CHANGEDATE,
+            T_OPER      = :NEW.T_OPER,
+            T_SYSDATE   = :NEW.T_SYSDATE,
+            T_SYSTIME   = :NEW.T_SYSTIME
+      WHERE T_PARTYID = :NEW.T_PARTYID
+        AND T_STATE   = 1;
+     TRGPCKG_DSCQINVFI_TD.v_InTrgr := false;
+  END IF;
+
+  INSERT INTO DSCQINVH_DBT
+        ( T_PARTYID, T_KIND, T_STATE, T_BEGDATE, T_ENDDATE, T_OPER, T_SYSDATE, T_SYSTIME, T_CAUSE, T_CODE, T_CONTROLDATE )
+  VALUES( :NEW.T_PARTYID, :OLD.T_KIND, :OLD.T_STATE, v_BegDate, v_EndDate, :OLD.T_OPER, :OLD.T_SYSDATE, :OLD.T_SYSTIME, :OLD.T_CAUSE, :OLD.T_CODE, :OLD.T_CONTROLDATE );
+
+END DSCQINV_DBT_TUR;
+/

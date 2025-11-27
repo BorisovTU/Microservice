@@ -1,0 +1,1113 @@
+/*
+ $Name: giszhkhproc.mac
+ $Module: Ядро Banking
+ $Description: Процедура передачи сведений по платежам ЖКХ в RS-Connect
+*/
+
+import rcw, ws_rsconnectclasses, ws_integrationrsconnect, oralib, PaymInter, likepy, BankInter, bnk_ptlib, bnk_common;
+import XmlRpcInter, ServiceAction, "giszhkhproc_rep.mac", common_service_caller;
+
+// Данные для транзакции
+class ProcessTrnParm(p_Department:string, p_VSP:string, p_BeginDate:date, p_EndDate:date, p_SendAboutExec:bool, p_SendAboutAnnul:bool, p_PackCount:integer, p_RS_Connect_URL:string, p_SenderID:string )
+  
+  var RS_Connect_Url = null;
+  var SenderID:string = "";
+  var Department:string = p_Department; 
+  var VSP:string = p_VSP;
+  var BeginDate:date = p_BeginDate;
+  var EndDate:date = p_EndDate;
+  var SendAboutExec:bool = p_SendAboutExec;
+  var SendAboutAnnul:bool = p_SendAboutAnnul;
+  var PackCount:integer = p_PackCount;
+
+  var MesCount:integer = 0; // Количество сообщений, которые отправили в транзакции
+  var PMSendID = 0;
+  var Action:string;
+end;
+
+// Глобализм в котором хранятся параметры транзакции
+private var g_TrnParm:ProcessTrnParm = null;
+
+private var FlagCtrlBrk:bool = false;
+private var CtrlBrkErr = 17;
+
+private var maxNameStrLength = 160;
+
+// Класс для взаимодействия с Rs-Connect
+private class (CServiceCallerBase) CGisZhkhQueryCaller( _requestID, _ParamArray, _macroFile, _macroFunc, _systemURL, _TimeOut, _Priority )
+   private var m_ParamArray : TArray  = _ParamArray;
+   private var m_macroFunc  : string  = _macroFunc;
+   private var m_macroFile  : string  = _macroFile;
+   private var m_systemURL  : string  = _systemURL;
+   private var m_rqstID     : string  = _requestID; 
+   private var m_TmOut      : integer = _TimeOut; 
+   private var m_Prrt       : integer = _Priority; 
+
+   private macro SetRequestParameters(request : @TXRRequest)
+      request.Parms = m_ParamArray;
+   end;
+
+   InitCServiceCallerBase(m_rqstID, m_systemURL, m_macroFile, m_macroFunc, m_TmOut, m_Prrt);
+end;
+
+// Обновить pmsend по результатам обработки
+private macro UpdatePmSendAfterRequesting( item, sysdate, systime )
+
+  var params;
+  var update;
+  var Description = "";
+
+  if( item.ErrorCode )
+    Description = string( item.ErrorCode );
+  end; 
+
+  if( item.Error )
+    Description = trim(Description + " " + item.Error);
+  end; 
+  
+  if( item.OrderID )  // Все хорошо, если ясно по какому платежу пришел ответ, то есть задан item.OrderID
+      
+    update = "update dpmsend_dbt sd set sd.t_State = :State, sd.t_ExtObjectID = :ExtObjectID, sd.t_Description = :Description, sd.t_SysDate = :Sys_Date, sd.t_SysTime = :SysTime "
+              " where sd.t_ObjectID =  :PaymentID "
+              "   and sd.t_State = :WLD_STATUS_PMSEND_READY "
+                " AND NOT EXISTS "
+                            "(SELECT 1 "
+                               "FROM dpmsend_dbt sdp "
+                              "WHERE     sdp.t_ObjectID = sd.t_ObjectID "
+                                    "AND sdp.t_State <> :WLD_STATUS_PMSEND_SEND "
+                                    "AND sdp.t_ID < sd.t_ID) "
+              "returning sd.t_ID into :OutPmsendID ";
+   
+    params = makeArray( SQLParam( "State", IfThenElse( item.ObjectID, WLD_STATUS_PMSEND_SEND,  WLD_STATUS_PMSEND_SENDERROR )  ),    
+                        SQLParam( "ExtObjectID", IfThenElse(item.ObjectID, item.ObjectID, "")  ),
+                        SQLParam( "Description", Description ),
+                        SQLParam( "SysDate", sysdate ),
+                        SQLParam( "SysTime", systime ),
+                        SQLParam( "PaymentID", item.OrderID ),
+                        SQLParam( "WLD_STATUS_PMSEND_READY", WLD_STATUS_PMSEND_READY ),
+                        SQLParam( "WLD_STATUS_PMSEND_SEND", WLD_STATUS_PMSEND_SEND ),
+                        SQLParam( "OutPmsendID", V_INTEGER, RSDBP_OUT )
+                       );
+    var rs = execSQL( update, params, true );
+    AddRecLogPmSend( rs.param("OutPmsendID").value ); // OutPmsendID
+
+  else  // Пришел ответ с пустым id платежа, отвалиываем
+    if( Description )
+      CreateErrMsg( BNK_ERROR_MACROS_STR, "От rs-connect пришел ответ с пустым OrderID. Текст ошибки: " + Description );
+    else
+      CreateErrMsg( BNK_ERROR_MACROS_STR, "От rs-connect пришел ответ с пустым OrderID." );
+    end;
+    AbortTrn();                 
+  end;
+
+end;
+
+// Обновить pmsend по результатам обработки запросов начислений
+private macro UpdatePmSendAfterRequestingQueries( result, sysdate, systime )
+
+  var params;
+  var update;
+
+  var queryid = result.queryID;
+  
+  if( g_TrnParm.PMSendID > 0)      
+    update = "update dpmsend_dbt sd set sd.t_State = :State, sd.t_ExtObjectID = :ExtObjectID, sd.t_Description = :Description, sd.t_SysDate = :Sys_Date, sd.t_SysTime = :SysTime "
+              " where sd.t_ID =  :pmsendID RETURNING sd.t_ID into :OutPmsendID;";              
+   
+    params = makeArray( SQLParam( "State", IfThenElse( result.queryID != "", WLD_STATUS_PMSEND_SEND,  WLD_STATUS_PMSEND_SENDERROR )  ),    
+                        SQLParam( "ExtObjectID", IfThenElse( result.queryID != "", result.queryID, "")  ),
+                        SQLParam( "Description", result.errorText ),
+                        SQLParam( "SysDate", sysdate ),
+                        SQLParam( "SysTime", systime ),
+                        SQLParam( "pmsendID", g_TrnParm.PMSendID ),
+                        SQLParam( "OutPmsendID", V_INTEGER, RSDBP_OUT )
+                       );
+
+    var rs = execSQL( update, params, true );
+    AddRecLogPmSend( rs.param("OutPmsendID").value ); // OutPmsendID        
+  end;
+
+end;
+
+//Обновить запрос и начисления по результатам запроса начислений
+private macro UpdatePaymQueriesAfterRequesting( result, sysdate, systime )
+  
+  var update;
+  var params;
+
+    if( g_TrnParm.PMSendID > 0)      
+    update = "update dpmsend_dbt sd set sd.t_AnswerState = :AnswerState ";                           
+   
+    params = makeArray( SQLParam( "AnswerState", IfThenElse(result.statusCode != 4, WLD_STATUS_PMSENDANSWER_WAIT, 
+                                                 IfThenElse(result.errorText != "", WLD_STATUS_PMSENDANSWER_ERROR, 
+                                                 IfThenElse(result.countPayments == 0, WLD_STATUS_PMSENDANSWER_NOCHARGE, WLD_STATUS_PMSENDANSWER_RECCHARGE) ) ) )
+                      );
+
+      if(result.statusCode == 4)
+        update = update + " , sd.t_AnswerDate = :AnswerDate, sd.t_AnswerTime = :AnswerTime , sd.t_State = :State ";
+        params[params.size()] = SQLParam("AnswerDate", sysdate);
+        params[params.size()] = SQLParam("AnswerTime", systime);
+        params[params.size()] = SQLParam( "State", WLD_STATUS_PMSEND_RECANSWER);
+      end;
+
+      update = update + " where sd.t_ID = :PMSendID RETURNING sd.t_ID into :OutPmsendID;";
+      params[params.size()] = SQLParam( "PMSendID", g_TrnParm.PMSendID);
+      params[params.size()] = SQLParam( "OutPMSendID", V_INTEGER, RSDBP_OUT);
+
+      var rs = execSQL( update, params, true );
+
+      AddRecLogPmSend( rs.param(IfThenElse(result.statusCode == 4, 5, 2)).value ); // OutPmsendID
+
+      if( result.countPayments > 0 )
+
+        var insert = "insert into dpmserv_dbt (t_SupplierINN, t_SupplierName1, t_SupplierName2, t_SupplierName3, t_SupplierName, t_ReceiverINN, t_ReceiverBankCode, "
+                   "                         t_ReceiverBankName, t_ReceiverCorrAccNostro, t_ReceiverName, t_ReceiverAccount, t_Amount, t_DebetAmount, t_Ground, "
+                   "                         t_HCSDocID, t_SupplierDocNum, t_Year, t_Month, t_SupplierAccount, t_ServiceID, t_ServiceName, t_HCSAccount, t_HouseGUID, t_HouseNum, "
+                   "                         t_RoomNum, t_Address, /*PayerName1, PayerName2, PayerName3,*/ t_PayerName, t_PayerINN, t_Direct, t_PMSendID, t_CreatePaymentID, t_PaymentID, "
+                   "                         t_PayerID, t_ReceiverID, t_SupplierID, t_PayerName1, t_PayerName2, t_PayerName3, t_PayerUID, t_HCSPayment) "
+                   "                  VALUES(:SupplierINN, :SupplierName1, :SupplierName2, :SupplierName3, :SupplierName, :ReceiverINN, :ReceiverBankCode, "
+                   "                         :ReceiverBankName, :ReceiverCorrAccNostro, :ReceiverName, :ReceiverAccount, :Amount, :DebetAmount, :Ground, "
+                   "                         :HCSDocID, :SupplierDocNum, :Year, :Month, :SupplierAccount, :ServiceID, :ServiceName, :HSCAccount, :HouseGUID, :HouseNum, "
+                   "                         :RoomNum, :Address, :PayerName, :PayerINN, :Direct, :PMSendID, 0, 0, 0, 0, 0, chr(1), chr(1), chr(1), chr(1), :HCSPayment );";
+
+        var idx = 0;
+        var pmserv;
+
+        while(idx < result.countPayments)
+
+          pmserv = result.charges.get(idx);
+
+          var prm = makeArray(
+                            SQLParam("SupplierINN", pmserv.recINN + IfThenElse(pmserv.recKPP != "", "/" + pmserv.recKPP, "" ) ),
+                            SQLParam("SupplierName1", pmserv.recSurname ), 
+                            SQLParam("SupplierName2", pmserv.recName ),
+                            SQLParam("SupplierName3", pmserv.recPatronymic ),
+                            SQLParam("SupplierName", pmserv.recName ),
+                            SQLParam("ReceiverINN", pmserv.recepientINN + IfThenElse(pmserv.recepientKPP != "", "/" + pmserv.recepientKPP, "" ) ),
+                            SQLParam("ReceiverBankCode", pmserv.recepientBankBIK ),
+                            SQLParam("ReceiverBankName", pmserv.recepientBankName ),
+                            SQLParam("ReceiverCorrAccNostro", pmserv.recepientCorrBankAccount ),
+                            SQLParam("ReceiverName", pmserv.paymentRecepient ),
+                            SQLParam("ReceiverAccount", pmserv.recepientAccount ),
+                            SQLParam("Amount", double(pmserv.amount ) / 100 ),
+                            SQLParam("DebetAmount", double(pmserv.debtAmount) / 100 ),
+                            SQLParam("Ground,", pmserv.paymentPurpose ),
+                            SQLParam("HCSDocID", pmserv.paymentDocumentID ),
+                            SQLParam("SupplierDocNum", pmserv.paymentDocumentNumber ),
+                            SQLParam("Year", pmserv.year ),
+                            SQLParam("Month", pmserv.month ),
+                            SQLParam("SupplierAccount", pmserv.accountNumber ),
+                            SQLParam("ServiceID", pmserv.serviceID ),
+                            SQLParam("ServiceName", pmserv.serviceName ),
+                            SQLParam("HSCAccount", pmserv.unifiedAccountNumber ),
+                            SQLParam("HouseGUID", pmserv.FIASHouseGuid ),
+                            SQLParam("HouseNum", pmserv.apartment ),
+                            SQLParam("RoomNum", pmserv.placement ),
+                            SQLParam("Address", pmserv.addressString ),
+                            SQLParam("PayerName", pmserv.name ),
+                            SQLParam("PayerINN", pmserv.INN + IfThenElse(pmserv.KPP != "", "/" + pmserv.KPP, "" )),
+                            SQLParam("Direct", "X" ),
+                            SQLParam("PMSendID", g_TrnParm.PMSendID ),
+                            SQLParam("HCSPayment", "X" )
+                          );
+
+          execSQL( insert, prm, true );
+
+          idx = idx + 1;
+
+        end;
+
+      end;
+      
+    end;
+
+  end;
+
+
+// Отправка сообщения в Rs-Connect
+private macro SendToRsConnect( Action, orders, SenderID, SenderPointID, RS_Connect_URL, sysdate, systime ):bool
+
+  var header = RSCOrderHeader();
+  header.SenderID = SenderID;
+  header.MessageID = CreateGUID();
+  header.SenderPointID = SenderPointID;
+  
+  var paramArray = TArray();
+  paramArray[0] = header;
+  paramArray[1] = orders.size;
+  paramArray[2] = orders;
+  
+  var reqId = CreateGUID();
+  var macroFile = "ws_rsconnect_srv";
+  var macroFunc : string = "";
+  var timeOut = 0;
+  var priority = 0;
+    
+  if( Action == WLD_ACTION_PMSEND_EXEC )
+    macroFunc = "ReceiveCommonOrder";
+  elif( Action == WLD_ACTION_PMSEND_ANNUL )
+    macroFunc = "ReceiveCancelOrder";
+  end;
+ 
+  var outResponse = null;
+
+  var caller = CGisZhkhQueryCaller( reqId, paramArray, macroFile, macroFunc, RS_Connect_URL, timeOut, priority );
+  var callServiceStat = caller.CallService( @outResponse );
+
+  var res;
+  var item;
+
+  if((not callServiceStat) or (not outResponse))
+    CreateErrMsg( BNK_ERROR_MACROS_STR, "Ошибка вызова сервиса RS-Connect");
+    AbortTrn();
+  else
+    // Успешное выполнение
+    for( item, outResponse.Result )
+      UpdatePmSendAfterRequesting( item, sysdate, systime );
+    end;
+  end;
+
+  outResponse = null;
+  paramArray = null;
+
+  return true;
+end;
+
+private macro SendToRsConnectJava( Action, orders, SenderPointID, sysdate, systime ):bool
+
+  var header = CreateRscOrderHeaderJava();
+  header.messageID = CreateGUID();
+  header.senderID = g_TrnParm.SenderID;
+  header.senderPointID = SenderPointID;
+
+  var result;
+
+  if( (orders.size > 0) and (Action == WLD_ACTION_PMSEND_QUERY) )
+    
+    result = callhsSendPaymQueryToSMEV(header, orders[0], g_TrnParm.RS_Connect_URL);
+    
+    if( result )
+      UpdatePmSendAfterRequestingQueries( result, sysdate, systime );
+    end;
+
+  elif( (orders.size > 0) and (Action == WLD_ACTION_PMSEND_QUERYPAYMENTS))
+
+    result = callhsResultPaymQueryFromSMEV(header, "", orders[0], g_TrnParm.RS_Connect_URL);
+    
+    if( result )
+      UpdatePaymQueriesAfterRequesting( result, sysdate, systime );
+    end;
+
+  end;
+
+end;
+
+
+// Создание данных для отправки информации об исполнении
+private macro CreateRSCOrder( rs:RsdRecordset )
+   
+   var order = RSCOrder();
+
+   // Параметры плательщика (потребителя)
+   order.SupplierID = rs.value("t_PayerUID");
+   order.SupplierName = rs.value("t_PayerName");
+   if( order.SupplierName == "")
+     order.SupplierName = Trim(rs.value("t_PayerName1") + " " + rs.value("t_PayerName2") + " " + rs.value("t_PayerName3"));
+   end;
+   if( StrLen( order.SupplierName ) > maxNameStrLength )
+     order.SupplierName = SubStr( order.SupplierName, 1, maxNameStrLength );
+   end;
+
+   // Сведения о исполнителе услуги
+   order.RecINN = RemoveKPP(rs.value("t_SupplierINN"));
+   order.RecSurname = rs.value("t_SupplierName1");
+   order.RecFirstName = rs.value("t_SupplierName2");
+   order.RecPatronymic = rs.value("t_SupplierName3");
+   order.RecKPP = RemoveINN(rs.value("t_SupplierINN"));
+   order.RecName = rs.value("t_SupplierName");
+
+   // Сведения о получателе
+   order.RecipientINN = RemoveKPP(rs.value("t_ReceiverINN"));
+   order.RecipientKPP = RemoveINN(rs.value("t_ReceiverINN"));
+   order.RecipientBankName = rs.value("t_ReceiverBankName");
+   if( StrLen( order.RecipientBankName ) > maxNameStrLength )
+     order.RecipientBankName = SubStr( order.RecipientBankName, 1, maxNameStrLength );  
+   end;  
+   order.PaymentRecipient = rs.value("t_ReceiverName");
+   if( StrLen( order.PaymentRecipient ) > maxNameStrLength )
+     order.PaymentRecipient = SubStr( order.PaymentRecipient, 1, maxNameStrLength );  
+   end;
+   order.RecipientBIK = rs.value("t_RecipientBIK");
+   order.RecipientAccount = rs.value("t_ReceiverAccount");
+   order.RecipientCorrBankAccount = rs.value("t_RecipientBankAccount");
+
+   // Описание платежа:
+   order.OrderID = string(rs.value("t_PaymentID"));
+   order.OrderDate = rs.value("t_OrderDate");
+   order.OrderNum = rs.value("t_OrderNum");
+   order.Amount = rs.value("t_BaseAmount");
+   order.PaymentPurpose = rs.value("t_Ground");
+   order.comment  = "";
+   order.PaymentDocumentID = rs.value("t_HCSDocID");
+   order.PaymentDocumentNumber = rs.value("t_SupplierDocNum");
+
+   // Начисление
+   var Charge = RSCCharge();
+   if( rs.value("t_Year") > 0 )
+     Charge.Year = int( rs.value("t_Year"));
+   end;
+
+   if( rs.value("t_Month") > 0 )
+     Charge.Month = int(rs.value("t_Month")); 
+   end;
+
+   if( rs.value("t_SupplierAccount") != "" )
+     Charge.AccountNumber = rs.value("t_SupplierAccount");
+   end;
+   
+   if( rs.value("t_ServiceID") != "" )
+     Charge.ServiceID = rs.value("t_ServiceID");
+   end;
+
+   if( rs.value("t_HCSAccount") != "" )
+     Charge.UnifiedAccountNumber = rs.value("t_HCSAccount");
+   end;
+
+                          
+   // Описание адресной точки, по которой производится оплата
+   var AddressAndConsumer = RSCAddressAndConsumer();
+   if(rs.value("t_HouseGUID") != "")
+     AddressAndConsumer.FIASHouseGUID = rs.value("t_HouseGUID");
+   end;
+
+   if(rs.value("t_HouseNum") != "")
+     AddressAndConsumer.Apartment = rs.value("t_HouseNum");
+   end;
+
+   if(rs.value("t_RoomNum") != "")
+     AddressAndConsumer.Placement = rs.value("t_RoomNum");
+   end;
+
+   if( rs.value("t_IsNonLiving") == "" )
+     AddressAndConsumer.isNonLiving = "0";
+   else
+     AddressAndConsumer.isNonLiving = "1";
+   end;
+
+   if(rs.value("t_PayerName1") != "")
+     AddressAndConsumer.Surname = rs.value("t_PayerName1");
+   end;
+
+   if(rs.value("t_PayerName2") != "")
+     AddressAndConsumer.FirstName = rs.value("t_PayerName2");
+   end;
+
+   if(rs.value("t_PayerName3") != "")
+     AddressAndConsumer.Patronymic = rs.value("t_PayerName3");
+   end;
+
+   if(rs.value("t_SvPayerINN") != "")
+     AddressAndConsumer.INN = RemoveKPP(rs.value("t_SvPayerINN"));
+   end;
+
+   Charge.AddressAndConsumer = AddressAndConsumer;
+
+   var Charges = TArray(); // Список начислений, по которым произведены оплаты (массив RSCCharge)
+   Charges[Charges.size] = Charge;
+
+   order.Charges = Charges;
+
+  return order;
+end;
+
+// Создание данных для отправки запроса о начислении
+private macro CreateRSCQuery( rs:RsdRecordset )
+   
+   var query = CreateRscQueryJava();
+
+   if( rs.value("PaymentDocumentID") != "" )
+    query.paymentDocumentID = rs.value("PaymentDocumentID");
+   end;
+   
+   if( rs.value("Year") > 0 )
+    query.year = rs.value("Year");
+   end;
+   
+   if( rs.value("Month") > 0 )
+    query.month = rs.value("Month");
+   end;
+   
+   if( rs.value("UnifiedAccountNumber") != "" )
+    query.unifiedAccountNumber = rs.value("UnifiedAccountNumber");
+   end;
+   
+   if( rs.value("ServiceID") != "" )
+    query.serviceID = rs.value("ServiceID");
+   end;
+   
+   if( rs.value("FIASHouseGuid") != "" )
+    query.FIASHouseGuid = rs.value("FIASHouseGuid");
+   end;
+   
+   if( rs.value("PaymentDocumentNumber") != "" )
+    query.paymentDocumentNumber = rs.value("PaymentDocumentNumber");
+   end;
+   
+   if( rs.value("AccountNumber") != "" )
+    query.accountNumber = rs.value("AccountNumber");
+   end;
+   
+   if( rs.value("Surname") != "" )
+    query.surname = rs.value("Surname");
+   end;
+   
+   if( rs.value("FirstName") != "" )
+    query.firstName = rs.value("FirstName");
+   end;
+   
+   if( rs.value("Patronymic") != "" )
+    query.patronymic = rs.value("Patronymic");
+   end;
+   
+   if( rs.value("INN") != "" )
+    query.INN = rs.value("INN");
+   end;
+   
+   if( rs.value("KPP") != "" )
+    query.KPP = rs.value("KPP");
+   end;   
+
+  return query;
+end;
+
+
+// Создание данных для отправки информации об аннулировании
+private macro CreateRSCCancelOrder( rs:RsdRecordset )
+
+  var order = RSCCancelOrder();
+
+  order.OrderID = rs.value("t_PaymentID");
+  if( rs.value("t_AnnulExtObjectID") )
+    order.ObjectID = rs.value("t_AnnulExtObjectID");
+  end;
+
+  return order;
+end;
+
+// отбираем платежи и проверяем реквизиты, если ошибок нет - на отправление
+private macro HCSPaymCheck( orders, orders_exec_ID ):bool
+  var i;
+  var stat:integer = 0;
+
+  execSQL( "truncate table dpmproc_tmp" );
+  var ins = RsbSQLInsert( string("insert into dpmproc_tmp (t_PaymentID, t_State) ",
+                            "(select t_ObjectID, t_State from dpmsend_dbt right join dual on t_ID = ?)"), 1, orders_exec_ID.size );
+ 
+  var id = TArray(orders_exec_ID.size);
+
+  for( i, orders_exec_ID )
+    id[id.size] = i;
+  end;
+
+  ins.AddParam(V_INTEGER, id);
+ 
+  if (not ins.Insert())
+    CreateErrMsg( BNK_ERROR_MACROS_STR, "Ошибка при вставке платежей в таблицу pmproc.tmp" );
+  end;
+  
+  stat = execStoredFunc( "RSI_PM_HCSPROP.MassCheckCommunalProp", V_INTEGER );
+ 
+  var rs = execSQLselect( "select t_PaymentID, t_State, t_ErrorMessage from dpmproc_tmp" );
+
+  var errorOrders = TArray();
+  var orders_exec_checked = TArray();
+              
+  while ( rs and rs.moveNext() )
+    if( rs.value("t_ErrorMessage") )
+
+      var update = "update dpmsend_dbt sd set sd.t_State = :State, sd.t_Description = :Description "
+                   " where sd.t_ObjectID =  :PaymentID "
+                   "   and sd.t_State = :CurState "
+                   "returning sd.t_ID into :OutPmsendID ";
+   
+      var params = makeArray( SQLParam( "State", WLD_STATUS_PMSEND_SENDERROR ),    
+                              SQLParam( "Description", rs.value("t_ErrorMessage") ),
+                              SQLParam( "PaymentID", rs.value("t_PaymentID") ),
+                              SQLParam( "CurState", rs.value("t_State") ),
+                              SQLParam( "OutPmsendID", V_INTEGER, RSDBP_OUT )
+                             );
+
+      execSQL( update, params, true );
+      AddRecLogPmSend( params.Value(4).value ); // OutPmsendID
+
+      AddNoteForObject( OBJTYPE_PAYMENT, 
+                        string( rs.value("t_PaymentID"):o:10 ),
+                        NOTEKIND_PAYM_HCSWARNING, 
+                        rs.value("t_ErrorMessage") );
+    else
+     for( i, orders )
+       if( i.OrderID == rs.value("t_PaymentID") )
+         orders_exec_checked[orders_exec_checked.size] = i;
+       end;
+     end;
+    end;   
+  end;
+
+  orders = orders_exec_checked;    
+                            
+  execSQL("truncate table dpmproc_tmp");     
+  return true;
+  
+end;
+    
+private macro getRSConnectUrl(RS_Connect_URL:@string) : integer
+
+  var err = 0;
+
+  var RS_Connect_URL_Path = "RS-CONNECT\\ГИС_ЖКХ\\URL";
+  GetRegistryValue( RS_Connect_URL_Path, V_STRING, RS_Connect_URL, err );
+  if( ( err != 0 ) )
+    CreateErrMsg( BNK_ERROR_MACROS_STR, "Ошибка при получении значения настройки: " + RS_Connect_URL_Path );
+  end;
+
+  return err;
+end;
+
+private macro getSenderID(SenderID:@string) : integer
+
+  var err = 0;
+
+  var SenderID_Path = "RS-CONNECT\\SENDERID\\BANKING";
+  GetRegistryValue( SenderID_Path, V_STRING, SenderID, err );
+  if( ( err != 0 ) )
+    CreateErrMsg( BNK_ERROR_MACROS_STR, "Ошибка при получении значения настройки: " + SenderID_Path );
+  end;
+
+  return err;
+end;
+
+private macro MakeDpCodeListSQL( NameList : string )
+
+  var CodeList = "";
+  
+  var rs = execSQLSelect( " Select t_Code "
+                          "   From ddp_dep_dbt"
+                          "  Where t_Name in (" +  ConvertInCondToSQLFormat( NameList ) + ") "
+                        );
+                        
+  while( rs and rs.MoveNext() )
+    if(strlen(CodeList) > 0)
+      CodeList = CodeList + ", ";
+    end;
+    CodeList = CodeList + rs.value("t_Code");
+  end;
+  
+  return CodeList;
+
+end;
+
+
+// Транзакция отправки сообщений
+// При возникновении ошибки создаем ее в памяти CreateErrMsg и прерываем транзакцию AbortTrn
+private macro SendInfoForCommunalPaymentsTRN()
+
+  var err = 0;
+
+  var ActionCond;
+  
+  if( g_TrnParm.SendAboutExec and g_TrnParm.SendAboutAnnul )
+    ActionCond = "in(" + WLD_ACTION_PMSEND_EXEC + "," + WLD_ACTION_PMSEND_ANNUL + ")";
+  elif( g_TrnParm.SendAboutExec )
+    ActionCond = "= " + WLD_ACTION_PMSEND_EXEC;
+  elif ( g_TrnParm.SendAboutAnnul )
+    ActionCond = "= " + WLD_ACTION_PMSEND_ANNUL;
+  end;
+
+  var VSPCond = "";
+  if( strlen(g_TrnParm.VSP) > 0 )
+    VSPCond = "pm.t_OperNode in (" + MakeDpCodeListSQL(g_TrnParm.VSP) + ")";
+  end;
+  
+  var DepartmentCond = "";
+  if( strlen(g_TrnParm.Department) > 0 )
+    if( strlen(VSPCond) > 0 )
+      DepartmentCond = " OR ";
+    end;
+    DepartmentCond = DepartmentCond + "pm.t_StartDepartment in (" + MakeDpCodeListSQL( g_TrnParm.Department) + ")";
+  end;
+
+  var MaxPaymentPackage = 0;
+  GetRegistryValue( "RS-CONNECT\\ГИС_ЖКХ\\BANKING\\MAXPAYMENTPACKAGE", V_INTEGER, MaxPaymentPackage, err );
+  if( ( err != 0 ) )
+    MaxPaymentPackage = 0;
+  end;
+
+  var select = 
+               "select t.*, count(1) over() as t_CountRow "
+                 "from ( SELECT sv.t_PaymentID"
+                             ", sd.t_ID"
+                             ", sd.t_Action"
+                             ", pm.t_OperNode"
+                             ", sv.t_PayerUID"
+                             ", sv.t_PayerName"
+                             ", sv.t_PayerName1"
+                             ", sv.t_PayerName2"
+                             ", sv.t_PayerName3"
+                             ", sv.t_SupplierINN"
+                             ", sv.t_SupplierName1"
+                             ", sv.t_SupplierName2"
+                             ", sv.t_SupplierName3"
+                             ", sv.t_SupplierName"
+                             ", rm.t_ReceiverINN" +
+                             ", case"
+                             "    when pm.t_ReceiverBankID > 0 and (cr.t_CodeKind != 3 or cr.t_BankCode = chr(1)) then"
+                             "      RSI_RSBPARTY.PT_GetPartyCode( pm.t_ReceiverBankID, 3 )"
+                             "    when cr.t_CodeKind = 3 and cr.t_BankCode != chr(1) then"
+                             "      cr.t_BankCode"
+                             "    else"
+                             "      chr(1)"
+                             "  end as t_RecipientBIK" +
+                             ", decode(rm.t_ReceiverBankName,"
+                                       " chr(1), (select prty.t_Name from dparty_dbt prty where prty.t_PartyID = pm.t_ReceiverBankID and ROWNUM = 1),"
+                                       " rm.t_ReceiverBankName) as t_ReceiverBankName"    
+                             ", decode(rm.t_ReceiverName,"
+                                       " chr(1), (select prty.t_Name from dparty_dbt prty where prty.t_PartyID = pm.t_Receiver and ROWNUM = 1),"
+                                       " rm.t_ReceiverName) as t_ReceiverName"     
+                             ", pm.t_ReceiverAccount"
+                             ", decode(rm.t_ReceiverCorrAccNostro,"
+                                       " chr(1), (select bd.t_CorAcc from dbankdprt_dbt bd where bd.t_PartyID = pm.t_ReceiverBankID and ROWNUM = 1),"
+                                       " rm.t_ReceiverCorrAccNostro "
+                                    " ) as t_RecipientBankAccount"
+                             ", decode( rm.t_PayerChargeOffDate, to_date( '01010001', 'ddmmyyyy' ), pm.t_ValueDate, rm.t_PayerChargeOffDate ) as t_OrderDate"
+                             ", case when LENGTH(rm.t_Number) > 9 then substr( rm.t_Number, -9 ) else rm.t_Number end as t_OrderNum"
+                             ", pm.t_BaseAmount"
+                             ", rm.t_Ground"
+                             ", sv.t_HCSDocID"
+                             ", sv.t_SupplierDocNum"
+                             ", sv.t_Year"
+                             ", sv.t_Month"
+                             ", sv.t_SupplierAccount"  +
+                             ", sv.t_ServiceID"
+                             ", sv.t_HCSAccount"
+                             ", sv.t_HouseGUID"
+                             ", sv.t_HouseNum"
+                             ", sv.t_RoomNum"
+                             ", sv.t_IsNonLiving"
+                             ", sv.t_PayerINN as t_SvPayerINN"
+                             ", decode( sd.t_Action , :WLD_ACTION_PMSEND_ANNUL, ( select asd.t_ExtObjectID "
+                                                                                   "from dpmsend_dbt asd "
+                                                                                    "where asd.t_ID = ( select max(amsd.t_ID) "         
+                                                                                                         "from dpmsend_dbt amsd "
+                                                                                                         "where amsd.t_ObjectID = sd.t_ObjectID "
+                                                                                                           "and amsd.t_State = :WLD_STATUS_PMSEND_SEND1 "
+                                                                                                           "and amsd.t_Action = :WLD_ACTION_PMSEND_EXEC "
+                                                                                                           "and amsd.t_ID < sd.t_ID) ), "
+                                                      "null "
+                                     ") as t_AnnulExtObjectID"
+                         " FROM dpmserv_dbt sv, "
+                               "dpmsend_dbt sd, "
+                               "dpmpaym_dbt pm, " +      
+                               "dpmprop_dbt cr, "
+                               "dpmrmprop_dbt rm "
+                         "WHERE     sd.t_State = :WLD_STATUS_PMSEND_READY " +
+                               "AND sd.t_Action " + ActionCond + 
+                               "AND NOT EXISTS "
+                                          "(SELECT 1 "
+                                             "FROM dpmsend_dbt sdp "
+                                            "WHERE     sdp.t_ObjectID = sd.t_ObjectID "
+                                                  "AND sdp.t_State <> :WLD_STATUS_PMSEND_SEND "
+                                                  "AND sdp.t_ID < sd.t_ID) "+
+                                "AND pm.t_PaymentID = sd.t_ObjectID "
+                                "AND rm.t_PaymentID = pm.t_PaymentID "
+                                "AND cr.t_PaymentID = pm.t_PaymentID "
+                                "AND cr.t_DebetCredit = " + PRT_Credit +
+                                "AND ( " + VSPCond + DepartmentCond + ")"
+                                "AND DECODE (rm.t_PayerChargeOffDate, "
+                                           "TO_DATE ('01010001', 'ddmmyyyy'), pm.t_ValueDate, "
+                                           "rm.t_PayerChargeOffDate) BETWEEN :BeginDate and :EndDate "
+                                "AND sv.t_PaymentID = sd.t_ObjectID "
+                       "ORDER BY sd.t_Action, pm.t_OperNode"
+                    " ) t, dpmserv_dbt svl "
+                 "where svl.t_PaymentID = t.t_PaymentID " +
+                   IfThenElse( MaxPaymentPackage > 0, "and ROWNUM <= " + MaxPaymentPackage, "") +
+           " FOR UPDATE OF svl.t_PaymentID SKIP LOCKED " // Сразу же лочим, что можно залочить
+              ;
+
+  var params:TArray = makeArray( SQLParam( "WLD_ACTION_PMSEND_ANNUL", WLD_ACTION_PMSEND_ANNUL ),
+                                 SQLParam( "WLD_STATUS_PMSEND_SEND1", WLD_STATUS_PMSEND_SEND ),
+                                 SQLParam( "WLD_ACTION_PMSEND_EXEC", WLD_ACTION_PMSEND_EXEC ),
+                                 SQLParam( "WLD_STATUS_PMSEND_READY", WLD_STATUS_PMSEND_READY ),
+                                 SQLParam( "WLD_STATUS_PMSEND_SEND", WLD_STATUS_PMSEND_SEND ),
+                                 SQLParam( "BeginDate", g_TrnParm.BeginDate ),
+                                 SQLParam( "EndDate", g_TrnParm.EndDate )
+                               );
+  var prevAction = WLD_ACTION_PMSEND_NONE;
+  var firstOperNode;
+  var orders_exec = TArray();
+  var orders_annul = TArray();
+  var orders_exec_ID = TArray();
+  
+  
+  BegAction (0, "Получение данных для формирования сообщений", false);
+  
+  var rs = execSQLselect( select, params, true );
+  
+  EndAction (0);
+
+  var systime = GetSysTime();
+  var sysdate = date();   
+  var i = 0;
+
+  InitProgress( rs.value("t_CountRow"), "Обработка пачки №" + g_TrnParm.PackCount, "Формирование сообщений в Rs-Connect" );
+
+  while( rs and rs.moveNext() )
+  
+    if( prevAction == WLD_ACTION_PMSEND_NONE ) // Первая итерация
+      firstOperNode = rs.value("t_OperNode")
+    end;
+
+    if( rs.value("t_Action") == WLD_ACTION_PMSEND_EXEC )
+      orders_exec[orders_exec.size] = CreateRSCOrder( rs );
+      orders_exec_ID[orders_exec_ID.size] = rs.value("t_ID");
+    elif( rs.value("t_Action") == WLD_ACTION_PMSEND_ANNUL )
+      orders_annul[orders_annul.size] = CreateRSCCancelOrder( rs );
+    end;
+
+    prevAction = rs.value("t_Action");
+    i = i + 1;
+    UseProgress(i);
+  end;
+
+  RemProgress();
+ 
+  if( orders_exec and (orders_exec.size > 0) )
+    HCSPaymCheck( @orders_exec, orders_exec_ID );
+    BegAction (0, "Отправка сообщений об исполнении.\nПачка №" + g_TrnParm.PackCount + "\nКоличество сообщений в пачке: "+ orders_exec.size, false);
+    SendToRsConnect(WLD_ACTION_PMSEND_EXEC, orders_exec, g_TrnParm.SenderID, firstOperNode, g_TrnParm.RS_Connect_URL, sysdate, systime );
+    EndAction(0);
+  end;
+  
+  if( orders_annul and (orders_annul.size > 0) )
+    BegAction (0, "Отправка сообщений об аннулировании.\nПачка №" + g_TrnParm.PackCount + "\nКоличество сообщений в пачке: "+ orders_annul.size, false);
+    SendToRsConnect(WLD_ACTION_PMSEND_ANNUL, orders_annul, g_TrnParm.SenderID, firstOperNode, g_TrnParm.RS_Connect_URL, sysdate, systime );
+    EndAction(0);
+  end;
+  
+  g_TrnParm.MesCount = orders_exec.size + orders_annul.size;
+                            
+  return true;
+ 
+onerror(x)
+  if( x.Code == CtrlBrkErr )
+    FlagCtrlBrk = true;
+    CreateErrMsg( BNK_ERROR_MACROS_STR, x.Message );
+  else  
+    if(IsEqClass ("TRsbError", x.err) and (strlen(x.err.ToString()) > 0) )
+      CreateErrMsg( BNK_ERROR_MACROS_STR, x.err.ToString() );
+    else
+      CreateErrMsg( BNK_ERROR_MACROS_STR, x.Message );
+    end;
+    AbortTrn();
+  end;
+end;
+
+// Транзакция отправки сообщений
+// При возникновении ошибки создаем ее в памяти CreateErrMsg и прерываем транзакцию AbortTrn
+private macro SendInfoForCommunalQueriesTRN()
+
+  var select =  
+    "SELECT sd.t_ID AS ID, " +
+    "      t_HCSDocID AS PaymentDocumentID, " +
+    "      t_Year AS Year, " +
+    "      t_Month AS Month, " +
+    "      t_HCSAccount AS UnifiedAccountNumber, " +
+    "      t_ServiceID AS ServiceID, " +
+    "      t_HouseGUID AS FIASHouseGUID, " +
+    "      t_SupplierDocNum AS PaymentDocumentNumber, " +
+    "      t_SupplierAccount AS AccountNumber, " +
+    "      t_PayerName1 AS Surname, " +
+    "      t_PayerName2 AS FirstName, " +
+    "      t_PayerName3 AS Patronymic, " +
+    "      PM_SCRHLP.GetINN (t_PayerINN) AS INN, " +
+    "      PM_SCRHLP.GetKPP (t_PayerINN) AS KPP " +
+    "  FROM dpmreqcharge_dbt rq, dpmsend_dbt sd " +
+    "  WHERE rq.t_ID = SD.T_OBJECTID AND SD.T_ID = :ID " +
+" FOR UPDATE NOWAIT;";
+
+ var params:TArray = makeArray( SQLParam( "ID", g_TrnParm.PMSendID ) ); 
+  
+ BegAction (0, "Получение данных для формирования сообщений", false);
+  
+ var rs = execSQLselect( select, params, true );
+  
+ EndAction (0);
+
+  var systime = GetSysTime();
+  var sysdate = date();   
+  var i = 0;
+
+  InitProgress( 0, "", "Формирование сообщений в Rs-Connect" );
+
+  var queries = TArray();
+
+  if( rs and rs.moveNext() )
+    queries[0] = CreateRSCQuery(rs);
+    g_TrnParm.MesCount = 1;
+    UseProgress(1);
+  end;
+  
+  RemProgress();
+
+  if( queries and (queries.size > 0)  )
+    BegAction (0, "Отправка сообщения о запросе начисления", false);
+    SendToRsConnectJava(WLD_ACTION_PMSEND_QUERY, queries, {OperDprt}, sysdate, systime );
+    EndAction(0);
+  end;
+
+  return true;
+
+onerror(x)
+  if( x.Code == CtrlBrkErr )
+    FlagCtrlBrk = true;
+    CreateErrMsg( BNK_ERROR_MACROS_STR, x.Message );
+  else  
+    if(IsEqClass ("TRsbError", x.err) and (strlen(x.err.ToString()) > 0) )
+      CreateErrMsg( BNK_ERROR_MACROS_STR, x.err.ToString() );
+    else
+      CreateErrMsg( BNK_ERROR_MACROS_STR, x.Message );
+    end;
+    AbortTrn();
+  end;
+end;
+
+//Транзакция получения начислений по запросу
+private macro GetPaymentsForQueryTRN
+ 
+ var select =  "SELECT sd.t_ExtObjectID AS QueryID "
+                " FROM dpmreqcharge_dbt rq, dpmsend_dbt sd "
+                " WHERE SD.T_ID = :ID "
+           " FOR UPDATE NOWAIT;";
+
+ var prm:TArray = makeArray( SQLParam( "ID", g_TrnParm.PMSendID ) ); 
+  
+ BegAction (0, "Получение данных для формирования сообщений", false);
+  
+ var rs = execSQLselect( select, prm, true );
+  
+ EndAction (0);
+
+  var systime = GetSysTime();
+  var sysdate = date();   
+  var i = 0;
+
+  InitProgress( 0, "", "Формирование сообщений в Rs-Connect" );
+
+  var queries = TArray();
+
+  if( rs and rs.moveNext() )
+    queries[0] = rs.value("QueryID");
+    g_TrnParm.MesCount = 1;
+    UseProgress(1);
+  end;
+  
+  RemProgress();
+
+  if( queries and (queries.size > 0)  )
+    BegAction (0, "Отправка сообщения о запросе начисления", false);
+    SendToRsConnectJava(WLD_ACTION_PMSEND_QUERYPAYMENTS, queries, {OperDprt}, sysdate, systime );
+    EndAction(0);
+  end;
+end;
+
+private macro ProcessRequests(PMSendID:integer)
+  
+  var select =
+              "SELECT sd.t_ID AS ID "
+              "  FROM dpmreqcharge_dbt rq, dpmsend_dbt sd "
+              " WHERE     sd.t_Action = :WLD_ACTION_PMSEND_QUERY "
+              "      AND sd.t_State IN "
+              "             ( :WLD_STATUS_PMSEND_READY, :WLD_STATUS_PMSEND_SENDERROR) ";
+
+  if( PMSendID > 0 )
+    select = select + "      AND sd.t_ID = :PMSendID ";
+  end;
+
+  select = select + "      AND rq.t_id = sd.T_ObjectID "
+                    "      AND sd.t_objecttype = :OBJTYPE_PMREQCHARGE;";
+
+  var params:TArray = makeArray( SQLParam( "WLD_ACTION_PMSEND_QUERY", WLD_ACTION_PMSEND_QUERY ),
+                                 SQLParam( "WLD_STATUS_PMSEND_READY", WLD_STATUS_PMSEND_READY ),
+                                 SQLParam( "WLD_STATUS_PMSEND_SENDERROR", WLD_STATUS_PMSEND_SENDERROR ) );
+  
+  if( PMSendID > 0)
+    params[params.Size] = SQLParam( "PMSendID", PMSendID );
+  end;
+  
+  params[params.Size] = SQLParam( "OBJTYPE_PMREQCHARGE", OBJTYPE_PMREQCHARGE );
+
+  var rs = execSQLselect( select, params, true );
+
+  while( rs.MoveNext() )
+    g_TrnParm.PMSendID = rs.value("ID");
+
+    if( not ProcessTrn( null,  "SendInfoForCommunalQueriesTRN" ) ) 
+      //ErrorMsg = GetErrMsg();
+      break;
+    end;
+  end;
+
+end;
+
+private macro ProcessQueryPayments(PMSendID:integer)
+  
+  var select =
+              "SELECT sd.t_ID AS ID "
+              "  FROM dpmreqcharge_dbt rq, dpmsend_dbt sd "
+              " WHERE REGEXP_INSTR ( " +
+              " :Action, " +
+              "    '^' " +
+              " || sd.t_Action " +
+              " || '$|,' " +
+              " || sd.t_Action " +
+              " || '$|^' " +
+              " || sd.t_Action " +
+              " || ',|,' " +
+              " || sd.t_Action " +
+              " || ',') <> 0 " +
+              "      AND sd.t_State = "
+              "             :WLD_STATUS_PMSEND_SEND ";
+
+  if( PMSendID > 0 )
+    select = select + "      AND sd.t_ID = :PMSendID ";
+  end;
+
+  select = select + "      AND rq.t_id = sd.T_ObjectID "
+                    "      AND sd.t_objecttype = :OBJTYPE_PMREQCHARGE;";
+
+  var prm:TArray = makeArray( SQLParam( "Action", g_TrnParm.Action ),
+                                 SQLParam( "WLD_STATUS_PMSEND_SEND", WLD_STATUS_PMSEND_SEND ) );
+  
+  if( PMSendID > 0)
+    prm[prm.Size] = SQLParam( "PMSendID", PMSendID );
+  end;
+  
+  prm[prm.Size] = SQLParam( "OBJTYPE_PMREQCHARGE", OBJTYPE_PMREQCHARGE );
+
+  var rs = execSQLselect( select, prm, true );
+
+  while( rs.MoveNext() )
+    g_TrnParm.PMSendID = rs.value("ID");
+
+    if( not ProcessTrn( null,  "GetPaymentsForQueryTRN" ) ) 
+      //ErrorMsg = GetErrMsg();
+      break;
+    end;
+  end;
+
+end;
+
+/*
+  Department - строка филиалов dp_dep.Name. Допустимые значения: одно значение, несколько значений через запятую, пусто (значит все) 
+  VSP - строка узлов ТС dp_dep.Name. Допустимые значения: одно значение, несколько значений через запятую, пусто (значит все) 
+  BeginDate - Дата начала периода
+  EndDate - Дата окончания периода
+  SendAboutExec - отправить информацию об исполнении
+  SendAboutAnnul - отправить информацию об аннулировании
+  SendAboutQuery - отправить информацию о запросе начислений
+*/
+macro SendInfoForCommunalPayments( PMSendID:integer, Department:string, VSP:string, BeginDate:date, EndDate:date, SendAboutExec:bool, SendAboutAnnul:bool, SendAboutQuery:bool )
+  var OK : bool = true,
+      ErrorMsg : string = "";
+
+  g_TrnParm = ProcessTrnParm(Department, VSP, BeginDate, EndDate, SendAboutExec, SendAboutAnnul );
+
+  OK = (getRSConnectUrl(@g_TrnParm.RS_Connect_Url) == 0 );
+
+  if(OK)
+    OK = (getSenderID(@g_TrnParm.SenderID) == 0 );
+  end;
+
+  if(not OK)
+    ErrorMsg = GetErrMsg();
+  end;  
+
+  ClearLogPmSend();
+
+  if((SendAboutAnnul) or (SendAboutExec))    
+    var PackCount = 1;
+    // Делаем отправку в цикле, так как за каждую транзакцию отпраляется только первое неотправленное сообщение по каждому платежу,
+    // но может неотправленных сообщений по одному платежу быть больше одного (и они отправляются в разных транзакциях)
+    while( OK and (FlagCtrlBrk == false) ) // выход из цикла. если пользователь прервал выполнение по Alt-Break 
+      // Инициализируем параметры для транзакции
+      g_TrnParm.PackCount = PackCount;
+      if( not ProcessTrn( null,  "SendInfoForCommunalPaymentsTRN" ) ) 
+        ErrorMsg = GetErrMsg();
+        break;
+      end;
+      
+      if( g_TrnParm.MesCount == 0 )
+        break;  // Выходим из цикла, только если не было отправленных сообщений
+      end;
+      PackCount = PackCount + 1;
+    end;
+
+  end;
+
+  if(SendAboutQuery)
+    ProcessRequests(PMSendID);
+  end;
+
+  var SwitchOutput : TSwitchOutputGisZhkh = TSwitchOutputGisZhkh();
+
+  PrintLogPmSend(true);
+
+  if(not OK)
+  [
+    #
+  ](ErrorMsg);
+  end;
+
+  return OK;
+
+OnError(er)
+  ExeptionMessage(er); 
+end;
+
+macro GetChargesForQuery( PMSendID:integer, Action:string )
+
+  var OK : bool = true,
+      ErrorMsg : string = "";
+
+  g_TrnParm = ProcessTrnParm();
+
+  OK = (getRSConnectUrl(@g_TrnParm.RS_Connect_Url) == 0 );
+
+  if(OK)
+    OK = (getSenderID(@g_TrnParm.SenderID) == 0 );
+  end;
+
+  if(not OK)
+    ErrorMsg = GetErrMsg();
+  end;  
+
+  ClearLogPmSend();
+
+  if( OK )
+    g_TrnParm.Action = Action;
+    ProcessQueryPayments(PMSendID);
+  end;
+
+  var SwitchOutput : TSwitchOutputGisZhkh = TSwitchOutputGisZhkh();
+
+      
+  PrintLogPmSend(false);
+  
+
+  if(not OK)
+  [
+    #
+  ](ErrorMsg);
+  end;
+
+  return OK;
+end;
