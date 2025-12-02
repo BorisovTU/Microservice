@@ -215,6 +215,7 @@ public class KafkaConfig {
         props.put(StreamsConfig.DEFAULT_VALUE_SERDE_CLASS_CONFIG, JsonSerde.class);
         props.put(JsonDeserializer.VALUE_DEFAULT_TYPE, CorporateActionInstructionRequest.class);
         props.put(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "earliest");
+        props.put(StreamsConfig.STATE_DIR_CONFIG, ".");
         return props;
     }
 }
