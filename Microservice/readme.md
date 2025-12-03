@@ -25,12 +25,13 @@ Redis, PostgreSQL, MongoDB драйверы
 JUnit, Mockito, WireMock
 ```
 <br> 1.4. [X] ST-004: Создать botuyar-iam-starter — для быстрой интеграции IAM-функций
+<br> Требуется доработка [] ST-0041: URL для GWK токена перенести в Configuration Service
 <br> 1.5. [] ST-005: Создать botuyar-gateway-starter — для быстрой настройки gateway
 <br> 1.6. [] ST-006: Создать botuyar-i18n-starter — для подключения i18n-функций
 <br> 1.7. [] ST-007: Версионирование стартеров через Git tags и Maven Central/Nexus
 <br> 1.8. [] ST-008: Документация по подключению стартеров
 <br> 1.9. [] ST-009: Примеры приложений с использованием стартеров
-
+<br> 1.10. [] ST-010: Создать Spring Cloud Config Server — централизованное хранение конфигураций. Возможно, в дальнейшем перейдем на Service Discovery.
 
 2. IAM-сервис (Authorization Server)
 <br>2.1 [] US-001: Пользователь может аутентифицироваться с помощью логина/пароля 
