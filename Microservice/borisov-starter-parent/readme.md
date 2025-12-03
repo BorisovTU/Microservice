@@ -1,0 +1,34 @@
+✅ Что делает этот BOM:
+Управляет версиями зависимостей через <dependencyManagement>.
+Позволяет импортировать его в другие проекты, не требуя наследования.
+Обеспечивает согласованность версий библиотек в разных модулях.
+
+📌 Как использовать BOM в другом проекте:
+
+````
+<dependencyManagement>
+    <dependencies>
+        <dependency>
+            <groupId>ru.borisov.group</groupId>
+            <artifactId>borisov-starter-parent</artifactId>
+            <version>1.0.0</version>
+            <type>pom</type>
+            <scope>import</scope>
+        </dependency>
+    </dependencies>
+</dependencyManagement>
+````
+
+После этого вы можете подключать зависимости без указания версии:
+````
+<dependencies>
+    <dependency>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-starter-web</artifactId>
+    </dependency>
+    <dependency>
+        <groupId>org.projectlombok</groupId>
+        <artifactId>lombok</artifactId>
+    </dependency>
+</dependencies>
+````
