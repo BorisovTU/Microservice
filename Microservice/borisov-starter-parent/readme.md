@@ -32,3 +32,12 @@
     </dependency>
 </dependencies>
 ````
+
+ST-003:
+
+✅ Что теперь включает BOM:
+Spring Boot, Cloud, Authorization Server — с управлением версий.
+Lombok, MapStruct, Jackson — с управлением версий.
+PostgreSQL, MongoDB, Redis — драйверы.
+JUnit, Mockito, WireMock — для тестирования.
+Все зависимости можно теперь использовать без указания версии, если BOM импортирован.
