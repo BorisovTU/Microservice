@@ -1,1 +1,0 @@
-Grant create job, create external job to RSHB_SEC_TEST4;

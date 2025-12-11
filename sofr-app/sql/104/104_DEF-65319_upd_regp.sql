@@ -1,4 +1,0 @@
-BEGIN 
-    UPDATE DREGPARM_DBT SET T_TYPE = 0 WHERE T_NAME = 'ˆŒŽ’ ’.‘’€‚ŽŠ ˆ‘. KAFKA';
-END; 
-/

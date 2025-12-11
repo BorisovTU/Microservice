@@ -1,4 +1,0 @@
-DELETE
-FROM DMENUITEM_DBT
-WHERE t_ICaseItem = 20214
-  AND t_IsTemplate = CHR(0)

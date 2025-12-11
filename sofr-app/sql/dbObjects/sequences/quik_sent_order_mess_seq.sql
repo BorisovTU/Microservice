@@ -1,1 +1,0 @@
-create sequence quik_sent_order_mess_seq nocache;

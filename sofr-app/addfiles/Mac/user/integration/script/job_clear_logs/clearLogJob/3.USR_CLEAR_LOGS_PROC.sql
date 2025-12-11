@@ -1,1 +1,0 @@
---  Код перенесен в sql\dbObjects\USR_CLEAR_LOGS.prc

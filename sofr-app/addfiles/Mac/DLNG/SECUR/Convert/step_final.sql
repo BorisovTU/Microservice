@@ -1,6 +1,0 @@
-SET SERVEROUTPUT ON;
-
-BEGIN
- SC_CONVERT.ConvertMain;
-END;
-/

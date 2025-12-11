@@ -1,9 +1,0 @@
-BEGIN
-
-  UPDATE DFININSTR_DBT
-  SET T_NAME = REPLACE(T_NAME, chr(1))
-  WHERE T_NAME LIKE '%' || chr(1) || '%' 
-    AND LENGTH (T_NAME) > 1;
-  
-END;
-/
